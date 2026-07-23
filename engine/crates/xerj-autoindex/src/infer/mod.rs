@@ -410,7 +410,7 @@ pub fn infer_fields(
         if let Some((i, _)) = best {
             specs[i].es_type = "semantic_text".into();
             specs[i].notes.push(
-                "hybrid lexical+vector body (embedded server-side: lexical by default, neural/proxy if configured)".into(),
+                "hybrid lexical+vector body (embedded server-side: lexical by default; Candle neural, proxy, or experimental ONNX if configured)".into(),
             );
         }
     }
