@@ -206,10 +206,54 @@ and *present in core*, and core is safe **only** because of the
 SQLi**. That is a flow the agent now understands end-to-end: the call site, the
 `prepare()` internals, and the exact condition under which the defense is absent.
 
+## The REST surface, and an OOP substrate bug found mid-sweep
+
+REST is where core IDOR would most plausibly live, so the graph swept every
+`*_permissions_check` in core (107 methods; 33 mutating, 57 read). The first
+pass looked alarming — 24 mutating checks with "no object-scoped cap" — but
+reading them exposed a **substrate bug, not a vulnerability**: every controller
+defines a method named `get_item_permissions_check` / `update_item_permissions_check`,
+and the call graph keyed edges by **bare method name**, so 40+ controllers
+collapsed to one and `reach()` followed the wrong class's body. This is the OOP
+analogue of the ambiguous-edge problem from the first scanner.
+
+The fix — **resolve `$this->method()` to the same file (WP is one controller
+class per file)** — made the reach trustworthy:
+
+| REST surface | checks | missing object-scoped cap after fix |
+|---|--:|--:|
+| mutating (create/update/delete) | 33 | **0** real |
+| read (get_item / get_items) | 57 | **0** real |
+
+The residuals are all correct-by-design: per-user/private objects use
+object-scoped meta-caps read one hop into a helper — `check_update_permission($post)`
+→ `current_user_can('edit_post', $post->ID)`; app-passwords →
+`current_user_can('read_app_password', $user->ID, $request['uuid'])` (a 3-arg
+meta-cap); comments → `current_user_can('edit_comment', $comment->comment_ID)`.
+What's left is *global* resources (themes, taxonomies, menus, widgets, settings)
+where a site-level cap is the right gate, `create_*` (no pre-existing object to
+bind), and cross-controller delegation (autosaves → the parent posts controller).
+
+## Honest status: no missing-cap IDOR found in core AJAX or REST
+
+Across the three surfaces swept rigorously — authenticated AJAX (95), REST
+mutating (33), REST read (57) — **every state change or private-object read is
+gated by an object-scoped meta-capability.** I did not find a missing-object-cap
+IDOR in core. That is a real (negative) result, and it required three detector
+refinements and two substrate-bug fixes (infra-boundary over-approximation;
+OOP method-name collision) to state with confidence rather than as a guess.
+
+Caveat on what this method *cannot* see: it verifies that an object-scoped cap is
+**present** on the path. It does not catch **auth-bypass** bugs where the cap is
+present but *evaded* — e.g. the WP 4.7.0 REST content-injection, where an `id`
+type-juggle routed the checked-object and the mutated-object apart. That is a
+different class (parameter/type confusion, not a missing check) and needs
+taint/type reasoning on the object-resolution step, not a cap-presence sweep.
+
 ## What's next
 
-Core's `wp_ajax_*` authz is clean and one core SQL de-escape flow is verified
-safe. Remaining surfaces the same reasoning loop must still cover, to honestly
-claim "all flows": **REST `permission_callback` + `admin_post_*` for IDOR**, the
-**capability-map (`map_meta_cap`) edge cases**, and the **plugin ecosystem**,
-where the placeholder-escape and object-scoped-cap defenses are routinely absent.
+To honestly claim "all flows": sweep `admin_post_*` and the **object-resolution /
+id-type-juggling** auth-bypass class (where the cap is present but evaded), the
+**`map_meta_cap` edge cases**, and the **plugin ecosystem**, where the
+placeholder-escape and object-scoped-cap defenses are routinely absent — that is
+where the reasoning loop will actually fire on real bugs.
