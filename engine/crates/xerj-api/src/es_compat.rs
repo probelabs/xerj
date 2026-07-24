@@ -12989,12 +12989,18 @@ pub async fn refresh_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    if let Ok(idx) = state.engine.get_index(&index) {
+    let handles = match resolve_indices_for_op(&state, &index).await {
+        Ok(h) => h,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    for (_, idx) in &handles {
         let _ = idx.flush().await;
     }
+    let n = handles.len() as u32;
     Json(json!({
-        "_shards": { "total": 1, "successful": 1, "failed": 0 }
+        "_shards": { "total": n, "successful": n, "failed": 0 }
     }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -14167,6 +14173,43 @@ async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Resolve an index spec to the `Index` handles it actually matches, for the
+/// admin endpoints that act on EVERY matching index (`_refresh`,
+/// `_forcemerge`, `_cache/clear`, `_close`, `_open`,
+/// `_admin/segments/fsck`) — as opposed to `_search`, which has its own much
+/// larger resolution+merge path (closed-index rules, PIT, per-hit scoring)
+/// that doesn't belong here.
+///
+/// These endpoints previously called `state.engine.get_index(&index)`
+/// directly on the raw path segment, so a wildcard/comma spec just 404'd
+/// (or, worse, `refresh_index`/`cat_count` swallowed the error and silently
+/// reported success/zero — see the fix commit for details) instead of
+/// resolving to the indices it matched, the way ES itself behaves.
+///
+/// Mirrors ES's `allow_no_indices` default: a literal name that doesn't
+/// exist is an error, but a wildcard/`_all`/comma-list that matches nothing
+/// is not — it's a legitimate (if unhelpful) query result. Order is stable
+/// (`resolve_index_selector`'s enumeration order) so multi-index responses
+/// aren't a source of test flakiness.
+async fn resolve_indices_for_op(
+    state: &AppState,
+    spec: &str,
+) -> Result<Vec<(String, std::sync::Arc<xerj_engine::Index>)>, xerj_common::XerjError> {
+    let is_selector = spec == "_all" || spec.contains('*') || spec.contains(',');
+    let names = resolve_index_selector(state, spec).await;
+    let handles: Vec<(String, std::sync::Arc<xerj_engine::Index>)> = names
+        .into_iter()
+        .filter_map(|n| {
+            let h = state.engine.get_index(&n).ok()?;
+            Some((n, h))
+        })
+        .collect();
+    if handles.is_empty() && !is_selector {
+        return Err(xerj_common::XerjError::index_not_found(spec));
+    }
+    Ok(handles)
 }
 
 pub async fn put_alias(
@@ -17360,10 +17403,20 @@ pub async fn cat_count(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    let count = match state.engine.get_index(&index) {
-        Ok(idx) => idx.stats().await.doc_count,
-        Err(_) => 0,
-    };
+    // Sum doc counts across every index the spec matches (comma/wildcard/
+    // `_all`) — previously a wildcard/comma spec just missed the single
+    // `get_index` lookup and silently reported 0, indistinguishable from a
+    // genuinely empty index. A literal name that doesn't exist still counts
+    // as 0 here (unchanged pre-existing behavior for that case — this fix
+    // is scoped to wildcard resolution, not to making a bad literal name a
+    // hard error the way the JSON `_count` endpoint does).
+    let names = resolve_index_selector(&state, &index).await;
+    let mut count: u64 = 0;
+    for name in &names {
+        if let Ok(idx) = state.engine.get_index(name) {
+            count += idx.stats().await.doc_count;
+        }
+    }
 
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -18671,104 +18724,108 @@ pub async fn close_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    match state.engine.get_index(&index) {
-        Ok(_) => {
-            state.engine.closed_indices.insert(index.clone(), true);
-            Json(json!({
-                "acknowledged": true,
-                "shards_acknowledged": true,
-                "indices": { index: { "closed": true } }
-            }))
-            .into_response()
-        }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    let handles = match resolve_indices_for_op(&state, &index).await {
+        Ok(h) => h,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    let mut indices = serde_json::Map::new();
+    for (name, _) in &handles {
+        state.engine.closed_indices.insert(name.clone(), true);
+        indices.insert(name.clone(), json!({ "closed": true }));
     }
+    Json(json!({
+        "acknowledged": true,
+        "shards_acknowledged": true,
+        "indices": indices
+    }))
+    .into_response()
 }
 
 pub async fn open_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    match state.engine.get_index(&index) {
-        Ok(idx) => {
-            state.engine.closed_indices.remove(&index);
-            // On reopen, re-evaluate index-sort from the CURRENT mapping —
-            // dynamic mapping may have since added a `@timestamp` date
-            // field. ES sorts segments on reopen when the mapping permits.
-            let has_ts_declared = state
-                .engine
-                .index_mappings
-                .get(&index)
-                .map(|r| {
-                    let m = r.value();
-                    let t = m
-                        .pointer("/mappings/properties/@timestamp/type")
-                        .or_else(|| m.pointer("/properties/@timestamp/type"))
-                        .and_then(Value::as_str);
-                    matches!(t, Some("date") | Some("date_nanos"))
-                })
-                .unwrap_or(false);
-            // Fallback: probe any indexed doc. ES treats a
-            // successfully-ingested `@timestamp` value as evidence the
-            // field exists for sort-on-reopen purposes, even when the
-            // mapping was never formalised (pure-dynamic ingest).
-            let has_ts_via_source = if has_ts_declared {
-                true
-            } else {
-                // A minimal one-doc match_all probe.
-                let req = xerj_query::ast::SearchRequest {
-                    query: xerj_query::ast::QueryNode::MatchAll,
-                    from: 0,
-                    size: 1,
-                    track_total_hits: xerj_query::ast::TrackTotalHits::Limit(1),
-                    ..Default::default()
-                };
-                match idx.search(&req).await {
-                    Ok(r) => r
-                        .hits
-                        .first()
-                        .map(|h| h.source.get("@timestamp").is_some())
-                        .unwrap_or(false),
-                    _ => false,
-                }
+    let handles = match resolve_indices_for_op(&state, &index).await {
+        Ok(h) => h,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    for (name, idx) in &handles {
+        state.engine.closed_indices.remove(name);
+        // On reopen, re-evaluate index-sort from the CURRENT mapping —
+        // dynamic mapping may have since added a `@timestamp` date
+        // field. ES sorts segments on reopen when the mapping permits.
+        let has_ts_declared = state
+            .engine
+            .index_mappings
+            .get(name)
+            .map(|r| {
+                let m = r.value();
+                let t = m
+                    .pointer("/mappings/properties/@timestamp/type")
+                    .or_else(|| m.pointer("/properties/@timestamp/type"))
+                    .and_then(Value::as_str);
+                matches!(t, Some("date") | Some("date_nanos"))
+            })
+            .unwrap_or(false);
+        // Fallback: probe any indexed doc. ES treats a
+        // successfully-ingested `@timestamp` value as evidence the
+        // field exists for sort-on-reopen purposes, even when the
+        // mapping was never formalised (pure-dynamic ingest).
+        let has_ts_via_source = if has_ts_declared {
+            true
+        } else {
+            // A minimal one-doc match_all probe.
+            let req = xerj_query::ast::SearchRequest {
+                query: xerj_query::ast::QueryNode::MatchAll,
+                from: 0,
+                size: 1,
+                track_total_hits: xerj_query::ast::TrackTotalHits::Limit(1),
+                ..Default::default()
             };
-            let has_ts = has_ts_declared || has_ts_via_source;
-            if has_ts {
-                let existing = state
-                    .engine
-                    .index_settings
-                    .get(&index)
-                    .map(|r| r.value().clone())
-                    .unwrap_or(Value::Null);
-                let mut merged = match existing {
-                    Value::Object(m) => m,
-                    _ => serde_json::Map::new(),
-                };
-                merged.insert("__xy_index_sort_field".to_string(), json!("@timestamp"));
-                merged.insert("__xy_index_sort_order".to_string(), json!("desc"));
-                // Reopen-derived hint (dynamic @timestamp picked up at
-                // close/open): `_close` drains the whole memtable into ONE
-                // consolidated segment, so the per-refresh leaf structure ES
-                // preserves is already gone by the first post-reopen search.
-                // Mark the provenance so the search path keeps the
-                // historical per-doc `@timestamp desc` sort for these
-                // indices (the 380_sort_segments_on_timestamp.yml reopen
-                // contract) instead of the settled leaf-order semantics
-                // reserved for create-time-mapped indices.
-                merged.insert("__xy_index_sort_reopen".to_string(), json!(true));
-                state
-                    .engine
-                    .index_settings
-                    .insert(index.clone(), Value::Object(merged));
+            match idx.search(&req).await {
+                Ok(r) => r
+                    .hits
+                    .first()
+                    .map(|h| h.source.get("@timestamp").is_some())
+                    .unwrap_or(false),
+                _ => false,
             }
-            Json(json!({
-                "acknowledged": true,
-                "shards_acknowledged": true,
-            }))
-            .into_response()
+        };
+        let has_ts = has_ts_declared || has_ts_via_source;
+        if has_ts {
+            let existing = state
+                .engine
+                .index_settings
+                .get(name)
+                .map(|r| r.value().clone())
+                .unwrap_or(Value::Null);
+            let mut merged = match existing {
+                Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            merged.insert("__xy_index_sort_field".to_string(), json!("@timestamp"));
+            merged.insert("__xy_index_sort_order".to_string(), json!("desc"));
+            // Reopen-derived hint (dynamic @timestamp picked up at
+            // close/open): `_close` drains the whole memtable into ONE
+            // consolidated segment, so the per-refresh leaf structure ES
+            // preserves is already gone by the first post-reopen search.
+            // Mark the provenance so the search path keeps the
+            // historical per-doc `@timestamp desc` sort for these
+            // indices (the 380_sort_segments_on_timestamp.yml reopen
+            // contract) instead of the settled leaf-order semantics
+            // reserved for create-time-mapped indices.
+            merged.insert("__xy_index_sort_reopen".to_string(), json!(true));
+            state
+                .engine
+                .index_settings
+                .insert(name.clone(), Value::Object(merged));
         }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
+    Json(json!({
+        "acknowledged": true,
+        "shards_acknowledged": true,
+    }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18788,51 +18845,66 @@ pub async fn forcemerge(
     Path(index): Path<String>,
     Query(params): Query<ForcemergeParams>,
 ) -> impl IntoResponse {
-    match state.engine.get_index(&index) {
-        Ok(idx) => {
-            // ES semantics: SYNCHRONOUS. `force_merge` waits for any
-            // in-flight background merge pass (instead of the pre-fix
-            // behaviour of returning `merged_batches: 0` and leaving the
-            // background merge churning through the caller's read phase),
-            // then drives merge passes until the segment count converges
-            // to the target. Long-running is fine — callers wait; bound
-            // it with a generous 30-minute request timeout.
-            let target = params.max_num_segments.unwrap_or(1);
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30 * 60),
-                idx.force_merge(target),
+    let handles = match resolve_indices_for_op(&state, &index).await {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {"type": "index_not_found_exception", "reason": e.to_string()}
+                })),
             )
-            .await
-            {
-                Ok(Ok(total)) => {
-                    let segments = idx.store_snapshot().segments.len();
-                    Json(json!({
-                        "_shards": { "total": 1, "successful": 1, "failed": 0 },
-                        "merged_batches": total,
-                        "segments": segments,
-                    })).into_response()
-                }
-                Ok(Err(e)) => (
+                .into_response()
+        }
+    };
+    // ES semantics: SYNCHRONOUS, and — for a wildcard/comma spec — applies
+    // to EVERY matching index. `force_merge` waits for any in-flight
+    // background merge pass (instead of the pre-fix behaviour of returning
+    // `merged_batches: 0` and leaving the background merge churning through
+    // the caller's read phase), then drives merge passes until the segment
+    // count converges to the target. Long-running is fine — callers wait;
+    // bound each index with a generous 30-minute request timeout.
+    let target = params.max_num_segments.unwrap_or(1);
+    let mut merged_batches_total: usize = 0;
+    let mut segments_total: usize = 0;
+    for (_, idx) in &handles {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30 * 60),
+            idx.force_merge(target),
+        )
+        .await
+        {
+            Ok(Ok(total)) => {
+                merged_batches_total += total;
+                segments_total += idx.store_snapshot().segments.len();
+            }
+            Ok(Err(e)) => {
+                return (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({
                         "error": {"type": "force_merge_failed", "reason": e.to_string()}
                     })),
-                ).into_response(),
-                Err(_) => (
+                )
+                    .into_response()
+            }
+            Err(_) => {
+                return (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({
                         "error": {"type": "force_merge_timeout", "reason": "forcemerge did not complete within 30 minutes"}
                     })),
-                ).into_response(),
+                )
+                    .into_response()
             }
         }
-        Err(_) => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {"type": "index_not_found_exception", "reason": format!("no such index [{}]", index)}
-            })),
-        ).into_response(),
     }
+    let n = handles.len() as u32;
+    Json(json!({
+        "_shards": { "total": n, "successful": n, "failed": 0 },
+        "merged_batches": merged_batches_total,
+        "segments": segments_total,
+    }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18851,14 +18923,42 @@ pub async fn admin_segments_fsck(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    let idx = match state.engine.get_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    let handles = match resolve_indices_for_op(&state, &index).await {
+        Ok(h) => h,
+        Err(e) => return ApiError::new(e).into_response(),
     };
-    // Block-in-place: fsck is CPU-bound (Crc32c over potentially hundreds
-    // of MB) and we don't want to stall a tokio worker for it.
-    let report = tokio::task::block_in_place(|| idx.fsck_segments());
-    let status = if report.corrupt_sections == 0 {
+    // A wildcard/comma spec fscks every matching index; segment_ids are
+    // globally unique so the merged `segments` list needs no per-index
+    // tagging to stay unambiguous. `xerj_storage::FsckReport` isn't a type
+    // this crate depends on directly, so the merge is done on the `Value`
+    // each per-index report already serializes to, rather than pulling in
+    // a new crate dependency for one struct literal.
+    let mut segments: Vec<Value> = Vec::new();
+    let mut total_segments_checked: u64 = 0;
+    let mut total_sections_checked: u64 = 0;
+    let mut corrupt_sections: u64 = 0;
+    for (_, idx) in &handles {
+        // Block-in-place: fsck is CPU-bound (Crc32c over potentially
+        // hundreds of MB) and we don't want to stall a tokio worker for it.
+        let report = tokio::task::block_in_place(|| idx.fsck_segments());
+        let report_val = serde_json::to_value(&report).unwrap_or(json!({}));
+        total_segments_checked += report_val
+            .get("total_segments_checked")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        total_sections_checked += report_val
+            .get("total_sections_checked")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        corrupt_sections += report_val
+            .get("corrupt_sections")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if let Some(Value::Array(mut segs)) = report_val.get("segments").cloned() {
+            segments.append(&mut segs);
+        }
+    }
+    let status = if corrupt_sections == 0 {
         StatusCode::OK
     } else {
         // 500 so any monitoring (Datadog, Prometheus blackbox) treats
@@ -18867,7 +18967,12 @@ pub async fn admin_segments_fsck(
     };
     (
         status,
-        Json(serde_json::to_value(&report).unwrap_or(json!({}))),
+        Json(json!({
+            "segments": segments,
+            "total_segments_checked": total_segments_checked,
+            "total_sections_checked": total_sections_checked,
+            "corrupt_sections": corrupt_sections,
+        })),
     )
         .into_response()
 }
@@ -18968,18 +19073,20 @@ pub async fn clear_cache(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    // Validate the target index exists (404 otherwise). xerj has no
-    // separately-addressable field/query cache to purge, so there is nothing
-    // to clear — but we still report an honest _shards block computed from the
-    // real index existing on this single node.
+    // Resolve wildcard/comma/_all specs to every matching index (404 only
+    // when a literal name doesn't exist). xerj has no separately-addressable
+    // field/query cache to purge, so there is nothing to clear — but we
+    // still report an honest _shards block sized to what actually matched.
     let index = strip_remote_cluster_prefix(&index);
-    match state.engine.get_index(&index) {
-        Ok(_) => Json(json!({
-            "_shards": { "total": 1, "successful": 1, "failed": 0 }
-        }))
-        .into_response(),
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-    }
+    let handles = match resolve_indices_for_op(&state, &index).await {
+        Ok(h) => h,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    let n = handles.len() as u32;
+    Json(json!({
+        "_shards": { "total": n, "successful": n, "failed": 0 }
+    }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20867,50 +20974,70 @@ pub async fn search_template(
         Err(e) => return ApiError::new(e).into_response(),
     };
 
-    let idx = match state.engine.get_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    let handles = match resolve_indices_for_op(&state, &index).await {
+        Ok(h) => h,
+        Err(e) => return ApiError::new(e).into_response(),
     };
 
-    match idx.search(&search_req).await {
-        Ok(result) => {
-            let took_ms = started.elapsed().as_millis() as u64;
-            let total = result.total.value;
-            let max_score = result.hits.first().map(|h| h.score as f64);
-            let hits: Vec<Value> = result
-                .hits
-                .into_iter()
-                .map(|h| {
-                    let source = if h.source.is_null() {
-                        None
-                    } else {
-                        Some(h.source)
-                    };
-                    json!({
-                        "_index": &index,
-                        "_id": h.id,
-                        "_score": h.score,
-                        "_version": 1,
-                        "_seq_no": 0,
-                        "_primary_term": 1,
-                        "_source": source,
-                    })
-                })
-                .collect();
-            Json(json!({
-                "took": took_ms,
-                "timed_out": false,
-                "_shards": crate::responses::EsShards::search_success(),
-                "hits": {
-                    "total": { "value": total, "relation": "eq" },
-                    "max_score": max_score,
-                    "hits": hits,
-                },
-            }))
-            .into_response()
+    // A wildcard/comma spec searches every matching index — same as
+    // `_search` — but this is a deliberately minimal merge (score-descending
+    // only), not `search()`'s full sort/collapse/knn/PIT cross-index
+    // machinery: `_search/template` never respected `sort` in its response
+    // shape even for a single index (no `sort` field on hits below, same as
+    // before this fix), so there's nothing sort-aware to preserve here, and
+    // replicating `search()`'s ~1000-line merge path for a legacy templated
+    // endpoint would be a large, easy-to-get-subtly-wrong change for a
+    // question this sweep didn't ask.
+    let mut merged_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
+    let mut total: u64 = 0;
+    for (name, idx) in &handles {
+        match idx.search(&search_req).await {
+            Ok(result) => {
+                total += result.total.value;
+                merged_hits.extend(result.hits.into_iter().map(|h| (name.clone(), h)));
+            }
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
         }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
+    merged_hits.sort_by(|(_, a), (_, b)| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged_hits.truncate(search_req.size);
+
+    let took_ms = started.elapsed().as_millis() as u64;
+    let max_score = merged_hits.first().map(|(_, h)| h.score as f64);
+    let hits: Vec<Value> = merged_hits
+        .into_iter()
+        .map(|(hit_index, h)| {
+            let source = if h.source.is_null() {
+                None
+            } else {
+                Some(h.source)
+            };
+            json!({
+                "_index": hit_index,
+                "_id": h.id,
+                "_score": h.score,
+                "_version": 1,
+                "_seq_no": 0,
+                "_primary_term": 1,
+                "_source": source,
+            })
+        })
+        .collect();
+    Json(json!({
+        "took": took_ms,
+        "timed_out": false,
+        "_shards": crate::responses::EsShards::search_success(),
+        "hits": {
+            "total": { "value": total, "relation": "eq" },
+            "max_score": max_score,
+            "hits": hits,
+        },
+    }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -21361,9 +21488,9 @@ pub async fn terms_enum(
     Path(index): Path<String>,
     Json(body): Json<TermsEnumBody>,
 ) -> impl IntoResponse {
-    let idx = match state.engine.get_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    let handles = match resolve_indices_for_op(&state, &index).await {
+        Ok(h) => h,
+        Err(e) => return ApiError::new(e).into_response(),
     };
 
     let prefix = body.string.as_deref().unwrap_or("").to_string();
@@ -21371,61 +21498,65 @@ pub async fn terms_enum(
     let size = body.size;
     let case_insensitive = body.case_insensitive;
 
-    // Run a match_all to collect all documents, then extract unique field values.
+    // Run a match_all against every matching index, then extract unique
+    // field values across all of them — a wildcard/comma spec enumerates
+    // terms over the whole matched set, same as ES.
     let req = xerj_query::ast::SearchRequest {
         query: xerj_query::ast::QueryNode::MatchAll,
         size: 10_000,
         ..Default::default()
     };
 
-    let result = match idx.search(&req).await {
-        Ok(r) => r,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-    };
-
     let mut terms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    for hit in &result.hits {
-        if let Some(val) = hit.source.get(field.as_str()) {
-            let term_str = match val {
-                Value::String(s) => s.clone(),
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Array(arr) => {
-                    for elem in arr {
-                        if let Value::String(s) = elem {
-                            let match_str = if case_insensitive {
-                                s.to_lowercase()
-                            } else {
-                                s.clone()
-                            };
-                            let cmp_prefix = if case_insensitive {
-                                prefix.to_lowercase()
-                            } else {
-                                prefix.clone()
-                            };
-                            if match_str.starts_with(&cmp_prefix) {
-                                terms.insert(s.clone());
+    for (_, idx) in &handles {
+        let result = match idx.search(&req).await {
+            Ok(r) => r,
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        };
+
+        for hit in &result.hits {
+            if let Some(val) = hit.source.get(field.as_str()) {
+                let term_str = match val {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::Array(arr) => {
+                        for elem in arr {
+                            if let Value::String(s) = elem {
+                                let match_str = if case_insensitive {
+                                    s.to_lowercase()
+                                } else {
+                                    s.clone()
+                                };
+                                let cmp_prefix = if case_insensitive {
+                                    prefix.to_lowercase()
+                                } else {
+                                    prefix.clone()
+                                };
+                                if match_str.starts_with(&cmp_prefix) {
+                                    terms.insert(s.clone());
+                                }
                             }
                         }
+                        continue;
                     }
-                    continue;
-                }
-                _ => continue,
-            };
+                    _ => continue,
+                };
 
-            let match_str = if case_insensitive {
-                term_str.to_lowercase()
-            } else {
-                term_str.clone()
-            };
-            let cmp_prefix = if case_insensitive {
-                prefix.to_lowercase()
-            } else {
-                prefix.clone()
-            };
-            if match_str.starts_with(&cmp_prefix) {
-                terms.insert(term_str);
+                let match_str = if case_insensitive {
+                    term_str.to_lowercase()
+                } else {
+                    term_str.clone()
+                };
+                let cmp_prefix = if case_insensitive {
+                    prefix.to_lowercase()
+                } else {
+                    prefix.clone()
+                };
+                if match_str.starts_with(&cmp_prefix) {
+                    terms.insert(term_str);
+                }
             }
         }
     }
@@ -24226,9 +24357,23 @@ pub async fn async_search_submit(
         return too_many_async_searches(async_cap);
     }
 
-    let idx = match state.engine.get_or_create_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    // Wildcard/comma/`_all` specs resolve to every matching existing index
+    // (no auto-create — an empty wildcard match is a legitimate empty
+    // result, not a reason to create an index literally named e.g.
+    // `logs-*`). A single literal name keeps the pre-existing
+    // `get_or_create_index` behavior unchanged, since that's a distinct,
+    // deliberate convenience this fix isn't touching.
+    let is_selector = index == "_all" || index.contains('*') || index.contains(',');
+    let handles: Vec<(String, std::sync::Arc<xerj_engine::Index>)> = if is_selector {
+        match resolve_indices_for_op(&state, &index).await {
+            Ok(h) => h,
+            Err(e) => return ApiError::new(e).into_response(),
+        }
+    } else {
+        match state.engine.get_or_create_index(&index) {
+            Ok(i) => vec![(index.clone(), i)],
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
     };
 
     let aggs_value = body.aggs.clone().or_else(|| body.aggregations.clone());
@@ -24238,10 +24383,41 @@ pub async fn async_search_submit(
     };
 
     let started = Instant::now();
-    let result = match idx.search(&req).await {
-        Ok(r) => r,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-    };
+    // Minimal cross-index merge (score-descending hits, summed totals) —
+    // same scope decision as `search_template`'s fix: replicating
+    // `search()`'s full multi-index machinery here is disproportionate to
+    // a wildcard-resolution fix. Aggregations are NOT merged across
+    // multiple indices (see below) — that's a real, documented gap, not a
+    // silent-wrong-answer: previously a wildcard/comma spec failed
+    // outright (400/404), so "hits work, aggs omitted for multi-index" is
+    // strictly better, not a regression for anyone who could reach this
+    // code path before.
+    let mut merged_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
+    let mut total_value: u64 = 0;
+    let mut any_gte = false;
+    let mut timed_out = false;
+    let mut single_index_aggs: Option<Value> = None;
+    for (name, idx) in &handles {
+        match idx.search(&req).await {
+            Ok(result) => {
+                total_value += result.total.value;
+                any_gte = any_gte
+                    || result.total.relation == xerj_query::executor::TotalHitsRelation::Gte;
+                timed_out = timed_out || result.timed_out;
+                if handles.len() == 1 {
+                    single_index_aggs = result.aggs;
+                }
+                merged_hits.extend(result.hits.into_iter().map(|h| (name.clone(), h)));
+            }
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
+    }
+    merged_hits.sort_by(|(_, a), (_, b)| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged_hits.truncate(req.size);
     let took_ms = started.elapsed().as_millis() as u64;
 
     // TTL (RC4 blocker 11): honor the request's `keep_alive` (pre-rc.4 it
@@ -24259,13 +24435,13 @@ pub async fn async_search_submit(
     let exp_ms = now_ms + (keep_alive_secs as i64) * 1000;
 
     // Build a normal search response body to embed.
-    let max_score = result.hits.first().map(|h| h.score as f64);
-    let hits: Vec<Value> = result
-        .hits
-        .iter()
-        .map(|h| {
+    let max_score = merged_hits.first().map(|(_, h)| h.score as f64);
+    let n = handles.len() as u32;
+    let hits: Vec<Value> = merged_hits
+        .into_iter()
+        .map(|(hit_index, h)| {
             json!({
-                "_index": index,
+                "_index": hit_index,
                 "_id": h.id,
                 "_score": h.score,
                 "_source": h.source,
@@ -24274,21 +24450,22 @@ pub async fn async_search_submit(
         .collect();
     let mut search_response = json!({
         "took": took_ms,
-        "timed_out": result.timed_out,
-        "_shards": { "total": 1, "successful": 1, "skipped": 0, "failed": 0 },
+        "timed_out": timed_out,
+        "_shards": { "total": n, "successful": n, "skipped": 0, "failed": 0 },
         "hits": {
             "total": {
-                "value": result.total.value,
-                "relation": if result.total.relation == xerj_query::executor::TotalHitsRelation::Gte { "gte" } else { "eq" },
+                "value": total_value,
+                "relation": if any_gte { "gte" } else { "eq" },
             },
             "max_score": max_score,
             "hits": hits,
         }
     });
     // Include aggregations in the completed payload, same shape as `_search`
-    // (internal tracking + type tags stripped). Without this the `aggs` the
-    // caller requested are silently dropped from the async response.
-    if let Some(mut aggs) = result.aggs {
+    // (internal tracking + type tags stripped) — but only when exactly one
+    // index was searched; see the merge comment above for why multi-index
+    // aggregations are omitted rather than merged.
+    if let Some(mut aggs) = single_index_aggs {
         strip_internal_tracking(&mut aggs);
         search_response["aggregations"] = strip_type_tags(aggs);
     }
