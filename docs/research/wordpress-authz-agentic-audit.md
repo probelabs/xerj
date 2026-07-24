@@ -250,10 +250,55 @@ type-juggle routed the checked-object and the mutated-object apart. That is a
 different class (parameter/type confusion, not a missing check) and needs
 taint/type reasoning on the object-resolution step, not a cap-presence sweep.
 
+## The check-vs-use IDOR detector (the class cap-presence can't see)
+
+Cap-presence proves a capability is *checked*; it cannot prove it is checked
+against the **same object the operation acts on**. The real core-IDOR mechanism
+(e.g. WP 4.7.0's `id` type-juggle) is exactly that mismatch: `permission_check`
+resolves the object from request key **X**, the operation reads/acts on key **Y**,
+and X ≠ Y — so a validated object and a touched object diverge.
+
+`wp_checkuse_idor.py` detects the shape: for each controller, diff the
+object-identifying request keys the `*_permissions_check` binds against the keys
+the matching operation reads. On core it flags **12 candidates**; reading them
+sorts into three buckets:
+
+- **global resources** (templates, widgets, sidebars) — gated by a site cap
+  (`edit_theme_options`), so no per-object binding is expected. Not a gap.
+- **helper/delegated resolution** — the check binds the object one hop away
+  (`get_items_permissions_check`, `parent_controller`), which the key-diff misses.
+- **one genuinely risky shape — and core defends it explicitly.**
+
+That last one is the find. `WP_REST_Revisions_Controller`: the permission check
+binds the cap to `$request['parent']`
+(`current_user_can('edit_post', $parent->ID)`), but `get_item` returns the
+revision `$request['id']`. Pair a `parent` you can edit with an `id` belonging to
+a post you can't, and you'd read its draft revisions — **unless the operation
+re-verifies the relationship.** It does:
+
+```php
+$parent   = $this->get_parent( $request['parent'] );   // cap checked against this
+$revision = $this->get_revision( $request['id'] );     // this is returned
+if ( (int) $parent->ID !== (int) $revision->post_parent ) {
+    return new WP_Error( 'rest_revision_parent_id_mismatch', …, array( 'status' => 404 ) );
+}
+```
+
+Core is safe **only because of that explicit `parent_id_mismatch` guard**. The
+detector found the exact structural shape; the read decided it. And the corollary
+is the whole point:
+
+> A plugin controller or AJAX handler that checks permission on one id but acts
+> on another **without re-verifying the relationship** is a live IDOR. This
+> detector flags that shape directly. Core survives by adding the consistency
+> guard; plugins routinely omit it.
+
 ## What's next
 
-To honestly claim "all flows": sweep `admin_post_*` and the **object-resolution /
-id-type-juggling** auth-bypass class (where the cap is present but evaded), the
-**`map_meta_cap` edge cases**, and the **plugin ecosystem**, where the
-placeholder-escape and object-scoped-cap defenses are routinely absent — that is
-where the reasoning loop will actually fire on real bugs.
+The reasoning loop and its detectors (object-scoped cap-presence, check-vs-use
+mismatch, double-prepare de-escape) are now built and validated against a core
+that is — verifiably — hardened on all of them. The place they will actually
+fire is the **plugin ecosystem**, where object-scoped caps, relationship
+re-verification, and placeholder-escape are the exact defenses most often missing.
+Remaining core surfaces for completeness: `admin_post_*`, direct `wp-admin` page
+handlers, and `map_meta_cap` edge cases.
