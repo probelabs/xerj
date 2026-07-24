@@ -95,7 +95,12 @@ const WAL_FRAME_OVERHEAD: usize = 17;
 const WAL_MAX_ENTRY_LEN: u32 = 1 << 30; // 1 GiB
 
 /// BufWriter capacity shared by open/rotate/recovery reseats.
-const WAL_BUF_CAP: usize = 8 * 1024 * 1024;
+///
+/// Every append drains this userspace buffer before acknowledging the write,
+/// so a multi-megabyte capacity cannot batch across requests.  Keeping it at
+/// a conventional I/O-buffer size bounds idle retention when every index owns
+/// multiple WAL shards (the old 8 MiB capacity retained 1 GiB for 128 shards).
+const WAL_BUF_CAP: usize = 64 * 1024;
 
 // Op codes
 const OP_INDEX: u8 = 0x01;
@@ -328,6 +333,11 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
+    #[cfg(test)]
+    pub(crate) fn buffer_capacity(&self) -> usize {
+        self.writer.capacity()
+    }
+
     /// Open (or create) the WAL in `dir`.
     ///
     /// If a WAL file for the latest generation already exists it is opened for
@@ -1835,6 +1845,11 @@ mod tests {
             source: serde_json::json!({"v": 2, "pad": "x".repeat(64)}),
         });
         assert!(err.is_err(), "append during ENOSPC must NACK");
+        assert_eq!(
+            w.buffer_capacity(),
+            WAL_BUF_CAP,
+            "truncate-and-reseat recovery must preserve the bounded capacity"
+        );
 
         // Space frees up (recovery reseated the writer on a clean fd, so
         // the fault is naturally gone) — C is acked.
@@ -1907,6 +1922,27 @@ mod tests {
         assert!(clean);
         assert_eq!(entries.len(), 2, "only a and c survive: {entries:?}");
         assert_eq!(entries[1].seq_no, seq_c);
+        assert_eq!(
+            w.buffer_capacity(),
+            WAL_BUF_CAP,
+            "batch error recovery must preserve the bounded capacity"
+        );
+        drop(w);
+
+        // Batched mode flushes each acknowledged append into the kernel even
+        // though it does not fsync inline. Reopen must retain every acked
+        // frame and use the same bounded writer capacity.
+        let reopened =
+            WalWriter::open(dir.path(), 64 * 1024 * 1024, SyncMode::Batched, seq_ctr).unwrap();
+        assert_eq!(reopened.buffer_capacity(), WAL_BUF_CAP);
+        drop(reopened);
+        let replayed: Vec<_> = WalReader::new(dir.path())
+            .replay()
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[1].seq_no, seq_c);
     }
 
     /// Crash-torn tail heal at open: a partial frame left at the file
@@ -2047,6 +2083,49 @@ mod tests {
             gen0 + 1,
             "mid-file-corrupt generation must be frozen, not appended to"
         );
+    }
+
+    #[test]
+    fn bounded_buffer_survives_append_rotate_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let seq_counter = Arc::new(AtomicU64::new(1));
+        let mut writer = WalWriter::open(
+            dir.path(),
+            64 * 1024 * 1024,
+            SyncMode::Strict,
+            Arc::clone(&seq_counter),
+        )
+        .unwrap();
+        assert_eq!(writer.buffer_capacity(), WAL_BUF_CAP);
+
+        let first = WalEntry::Index {
+            doc_id: "before-rotate".into(),
+            source: serde_json::json!({"payload": "durable"}),
+        };
+        assert_eq!(writer.append(&first).unwrap(), 1);
+        writer.rotate().unwrap();
+        assert_eq!(writer.buffer_capacity(), WAL_BUF_CAP);
+
+        let second = WalEntry::Index {
+            doc_id: "after-rotate".into(),
+            source: serde_json::json!({"payload": "also durable"}),
+        };
+        assert_eq!(writer.append(&second).unwrap(), 2);
+        drop(writer);
+
+        let reopened =
+            WalWriter::open(dir.path(), 64 * 1024 * 1024, SyncMode::Strict, seq_counter).unwrap();
+        assert_eq!(reopened.buffer_capacity(), WAL_BUF_CAP);
+        drop(reopened);
+
+        let entries: Vec<_> = WalReader::new(dir.path())
+            .replay()
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq_no, 1);
+        assert_eq!(entries[1].seq_no, 2);
     }
 
     #[test]
