@@ -27038,12 +27038,16 @@ pub async fn delete_legacy_template(
 // POST /_index_template/_simulate_index/{name}
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn simulate_index_template(
-    State(state): State<AppState>,
-    Path(index_name): Path<String>,
-) -> impl IntoResponse {
-    // Pattern matcher mirroring how stored v2 templates are matched at
-    // index-creation time: supports `*`/`_all` plus leading/trailing `*`.
+/// Every stored template whose `index_patterns` matches `index_name`, using
+/// the same simplified `*`/`_all`/leading-or-trailing-`*` semantics real v2
+/// templates use at index-creation time. Shared by both simulate endpoints —
+/// `simulate_index_template` calls it with a real index name, while
+/// `simulate_index_template_body` calls it once per pattern in the candidate
+/// (unsaved) template, since there's no concrete index name to test against.
+fn templates_matching_index_name(
+    state: &AppState,
+    index_name: &str,
+) -> Vec<(String, i32, Value, Value, Vec<String>)> {
     let matches_pattern = |pat: &str| -> bool {
         if pat == "*" || pat == "_all" {
             return true;
@@ -27057,7 +27061,6 @@ pub async fn simulate_index_template(
         }
     };
 
-    // Collect every stored template whose patterns match the index name.
     let mut matching: Vec<(String, i32, Value, Value, Vec<String>)> = Vec::new();
     for entry in state.engine.templates.iter() {
         let t = entry.value();
@@ -27071,6 +27074,15 @@ pub async fn simulate_index_template(
             ));
         }
     }
+    matching
+}
+
+pub async fn simulate_index_template(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+) -> impl IntoResponse {
+    // Collect every stored template whose patterns match the index name.
+    let mut matching = templates_matching_index_name(&state, &index_name);
 
     // Highest priority wins; ties resolve by name for a stable result.
     matching.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -27098,6 +27110,75 @@ pub async fn simulate_index_template(
         },
         "overlapping": overlapping,
         "matched": matched_name
+    }))
+    .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Simulate an unsaved index template body
+// POST /_index_template/_simulate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Body-only variant of `_simulate_index/{name}`: Kibana's index template
+/// wizard (and the alerting / ECS data-quality-dashboard plugins) call this
+/// to preview a template BEFORE it's saved — there's no stored name or
+/// concrete index to resolve against, so the template definition being
+/// previewed (same shape `PUT /_index_template/{name}` accepts) is the
+/// request body itself.
+pub async fn simulate_index_template_body(
+    State(state): State<AppState>,
+    Json(body): Json<IndexTemplateBody>,
+) -> impl IntoResponse {
+    let settings = body
+        .template
+        .as_ref()
+        .and_then(|t| t.settings.clone())
+        .or(body.settings.clone())
+        .unwrap_or(json!({}));
+    let mappings = body
+        .template
+        .as_ref()
+        .and_then(|t| t.mappings.clone())
+        .or(body.mappings.clone())
+        .unwrap_or(json!({}));
+    let priority = body.priority.unwrap_or(0);
+
+    // The candidate template has no index yet to test stored templates
+    // against, so its own patterns stand in for one — same matcher
+    // `simulate_index_template` uses, run once per candidate pattern and
+    // deduped by template name (a stored template can match more than one
+    // candidate pattern).
+    let mut matching: Vec<(String, i32, Value, Value, Vec<String>)> = Vec::new();
+    for cp in &body.index_patterns {
+        for m in templates_matching_index_name(&state, cp) {
+            if !matching.iter().any(|(name, ..)| *name == m.0) {
+                matching.push(m);
+            }
+        }
+    }
+
+    // Same priority merge as `simulate_index_template`: highest priority
+    // wins, ties resolve by name — except the candidate itself only loses to
+    // a stored template that strictly outranks it, since it's the one being
+    // previewed and isn't in `matching` to compete on its own.
+    matching.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let (resolved_settings, resolved_mappings) = match matching.first() {
+        Some((_, top_priority, s, m, _)) if *top_priority > priority => (s.clone(), m.clone()),
+        _ => (settings, mappings),
+    };
+
+    let overlapping: Vec<Value> = matching
+        .iter()
+        .map(|(name, _, _, _, patterns)| json!({ "name": name, "index_patterns": patterns }))
+        .collect();
+
+    Json(json!({
+        "template": {
+            "settings": resolved_settings,
+            "mappings": resolved_mappings,
+            "aliases": {}
+        },
+        "overlapping": overlapping
     }))
     .into_response()
 }
