@@ -293,12 +293,67 @@ is the whole point:
 > detector flags that shape directly. Core survives by adding the consistency
 > guard; plugins routinely omit it.
 
+## Finishing core: the file-scope handlers and the authz engine
+
+Three surfaces remained. Two exposed the last substrate gap.
+
+**`admin_post_*`** — core registers essentially none by literal string (it is a
+plugin surface); the hook extractor found 0. Noted, not a gap in core.
+
+**Direct `wp-admin` page handlers** — the real gap. `wp-admin/post.php`,
+`users.php`, `comment.php`, etc. handle requests in a **top-level
+`switch($action)` at file scope**, not inside any function — so the
+function-only index never saw a single one of them. `wp_admin_pages.py` extends
+the substrate to extract each `case` block as a handler unit. It found 41
+state-changing file-scope handlers; the cap-presence sweep flagged 24 without an
+object-scoped cap. Reading the top ones showed **core is correctly gated** and
+the flags are an extractor artifact — the guard lives in **shared preamble,
+fall-through group heads, or a different nested switch**, not co-located with the
+`case`:
+
+- `users.php case 'delete'` → the real handler has
+  `check_admin_referer('delete-users')` + `current_user_can('delete_user', $id)`
+  per user; the extractor matched the *nested* `switch($_REQUEST['delete_option'])`
+  `case 'delete'` (what to do with the deleted user's posts), not the authz case.
+- `comment.php` delete/trash cases fall through to shared code guarded by
+  `current_user_can('edit_comment', $comment->comment_ID)`.
+
+The lesson repeats one level out: **authorization is frequently in shared scope,
+not beside the action** — a file-scope handler analyzer must gather guards from
+the enclosing switch/preamble, exactly as the interprocedural one gathers them
+across call edges.
+
+**`map_meta_cap` (the authz engine)** — fails safe. Meta-cap checked with no
+object arg → `do_not_allow`; non-existent post → `do_not_allow`; revision →
+resolve to parent, missing → `do_not_allow`. The single non-fail-closed fallback
+(unregistered post type → `edit_others_posts`) still requires an editor-level
+cap. Fail-closed by construction.
+
+## Core is verified hardened; the detectors are ready
+
+Every core authorization and SQL-escaping flow tested is object-scoped,
+relationship-checked, and fail-safe:
+
+| surface | result |
+|---|---|
+| authenticated AJAX (95) | object-scoped, 0 IDOR |
+| REST mutating (33) + read (57) | object-scoped, 0 IDOR |
+| file-scope wp-admin handlers (41) | object-scoped (guards in shared scope) |
+| `map_meta_cap` engine | fails closed |
+| check-vs-use (revisions) | defended by explicit consistency guard |
+| double-prepare SQL de-escape | neutralized by `placeholder_escape` |
+
+Getting these negatives *trustworthy* required 3 model refinements and 3
+substrate-bug fixes (infra boundary, OOP method-name collision, file-scope
+handler extraction) — each found by the agent noticing an impossible result and
+reading the real code. That is the whole method: XERJ holds the system as
+external memory; the agent builds a model, tests it, and repairs the model *and*
+the substrate when reality disagrees.
+
 ## What's next
 
-The reasoning loop and its detectors (object-scoped cap-presence, check-vs-use
-mismatch, double-prepare de-escape) are now built and validated against a core
-that is — verifiably — hardened on all of them. The place they will actually
-fire is the **plugin ecosystem**, where object-scoped caps, relationship
-re-verification, and placeholder-escape are the exact defenses most often missing.
-Remaining core surfaces for completeness: `admin_post_*`, direct `wp-admin` page
-handlers, and `map_meta_cap` edge cases.
+The detectors (object-scoped cap-presence, check-vs-use mismatch, double-prepare
+de-escape, file-scope handler authz) are built and proven against a maximally
+hardened core. They will actually fire on the **plugin ecosystem**, where
+object-scoped caps, relationship re-verification, and placeholder-escape are the
+exact defenses most often missing.
