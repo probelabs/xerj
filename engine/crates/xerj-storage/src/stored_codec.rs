@@ -535,6 +535,149 @@ pub fn decode_stored(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Values decoded from a requested subset of a ZBS2 stored section.
+///
+/// Column names use their on-disk names: `_id` and `_seq_no` are `__id` and
+/// `__seq_no`; source fields retain their original top-level names.
+#[derive(Debug, PartialEq)]
+pub struct StoredV2Projection {
+    pub num_docs: usize,
+    pub columns: HashMap<String, Vec<serde_json::Value>>,
+}
+
+/// Result of attempting a selective V2 decode.
+#[derive(Debug, PartialEq)]
+pub enum StoredV2ProjectionResult {
+    /// The section is a valid legacy/non-V2 shape. Callers may use the full
+    /// compatibility decoder.
+    NotV2,
+    /// The requested columns were decoded. Requested names absent from the
+    /// segment are absent from `columns`.
+    Projected(StoredV2Projection),
+    /// At least one requested column uses a dependency codec. The first
+    /// storage-only slice deliberately leaves dependency resolution to the
+    /// full decoder rather than decoding unrelated columns.
+    DependencyEncoded,
+}
+
+struct V2ColumnRef<'a> {
+    name: &'a str,
+    codec: ColCodec,
+    payload: &'a [u8],
+}
+
+struct V2Directory<'a> {
+    num_docs: usize,
+    columns: Vec<V2ColumnRef<'a>>,
+}
+
+/// Parse and validate the complete ZBS2 directory without decoding payloads.
+///
+/// Keeping framing validation separate from payload decoding allows callers
+/// to skip large unrelated columns while retaining the full decoder's
+/// truncation, UTF-8 and codec-id checks.
+fn parse_v2_directory(body: &[u8]) -> Result<V2Directory<'_>> {
+    let mut cur = Cursor::new(body);
+    let num_docs = cur
+        .read_u32::<LittleEndian>()
+        .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 num_docs: {e}")))?
+        as usize;
+    let num_cols = cur
+        .read_u32::<LittleEndian>()
+        .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 num_cols: {e}")))?
+        as usize;
+    let mut columns = Vec::with_capacity(num_cols);
+    let mut seen = std::collections::HashSet::with_capacity(num_cols);
+    for _ in 0..num_cols {
+        let name_len = cur
+            .read_u16::<LittleEndian>()
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 name_len: {e}")))?
+            as usize;
+        let name_start = cur.position() as usize;
+        let name_end = name_start
+            .checked_add(name_len)
+            .filter(|end| *end <= body.len())
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 truncated name")))?;
+        let name = std::str::from_utf8(&body[name_start..name_end])
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 bad name utf8: {e}")))?;
+        if !seen.insert(name) {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "v2 duplicate column name: {name}"
+            )));
+        }
+        cur.set_position(name_end as u64);
+        let codec_id = cur
+            .read_u8()
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 codec_id: {e}")))?;
+        let codec = ColCodec::from_u8(codec_id)
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 unknown codec {codec_id}")))?;
+        let payload_len = cur
+            .read_u32::<LittleEndian>()
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 payload_len: {e}")))?
+            as usize;
+        let payload_start = cur.position() as usize;
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .filter(|end| *end <= body.len())
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 truncated payload")))?;
+        columns.push(V2ColumnRef {
+            name,
+            codec,
+            payload: &body[payload_start..payload_end],
+        });
+        cur.set_position(payload_end as u64);
+    }
+    if cur.position() as usize != body.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "v2 trailing bytes after column payloads"
+        )));
+    }
+    Ok(V2Directory { num_docs, columns })
+}
+
+/// Decode only named columns from a V2 stored section.
+///
+/// This API does not change `decode_stored` or any engine behavior. It is the
+/// storage primitive for consumers that can operate on selected columns
+/// without reconstructing every `_source` object.
+pub fn decode_stored_v2_projection(
+    bytes: &[u8],
+    requested: &[&str],
+) -> Result<StoredV2ProjectionResult> {
+    if bytes.len() < 4 || &bytes[..4] != STORED_V2_MAGIC {
+        return Ok(StoredV2ProjectionResult::NotV2);
+    }
+    let directory = parse_v2_directory(&bytes[4..])?;
+    let requested: std::collections::HashSet<&str> = requested.iter().copied().collect();
+    let mut columns = HashMap::with_capacity(requested.len());
+    for column in directory
+        .columns
+        .iter()
+        .filter(|column| requested.contains(column.name))
+    {
+        let values = match column.codec {
+            ColCodec::RawJson => decode_raw_json(column.payload)?,
+            ColCodec::Lz4Json => decode_lz4_json(column.payload)?,
+            ColCodec::Constant => decode_constant(column.payload, directory.num_docs)?,
+            ColCodec::DictBitpack => decode_dict_bitpack(column.payload, directory.num_docs)?,
+            ColCodec::CrossDep => return Ok(StoredV2ProjectionResult::DependencyEncoded),
+        };
+        if values.len() != directory.num_docs {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "v2 column {} row count {} != header {}",
+                column.name,
+                values.len(),
+                directory.num_docs
+            )));
+        }
+        columns.insert(column.name.to_string(), values);
+    }
+    Ok(StoredV2ProjectionResult::Projected(StoredV2Projection {
+        num_docs: directory.num_docs,
+        columns,
+    }))
+}
+
 fn decode_stored_v2(body: &[u8]) -> Result<Vec<u8>> {
     let mut cur = Cursor::new(body);
     let num_docs = cur
@@ -1363,6 +1506,92 @@ mod tests {
         let raw = br#"[{"_id":"a"}]"#;
         let decoded = decode_stored(raw).unwrap();
         assert_eq!(&decoded, raw);
+    }
+
+    fn projection_fixture() -> (Vec<serde_json::Value>, Vec<u8>) {
+        let docs: Vec<_> = (0..256)
+            .map(|i| {
+                json!({
+                    "_id": format!("doc-{i}"),
+                    "_seq_no": i,
+                    "_source": {
+                        "category": if i % 2 == 0 { "even" } else { "odd" },
+                        "embedding": [i as f64 / 10.0, 0.25, -0.5],
+                        "large_unrequested": "the same payload repeated to compress well"
+                    }
+                })
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        assert_eq!(&encoded[..4], STORED_V2_MAGIC);
+        (docs, encoded)
+    }
+
+    #[test]
+    fn v2_projection_decodes_only_requested_columns_with_full_decode_parity() {
+        let (docs, encoded) = projection_fixture();
+        let StoredV2ProjectionResult::Projected(projected) =
+            decode_stored_v2_projection(&encoded, &["__id", "embedding"]).unwrap()
+        else {
+            panic!("fixture should support projection");
+        };
+        assert_eq!(projected.num_docs, docs.len());
+        assert_eq!(projected.columns.len(), 2);
+        assert!(!projected.columns.contains_key("large_unrequested"));
+        for (row, expected) in docs.iter().enumerate() {
+            assert_eq!(projected.columns["__id"][row], expected["_id"]);
+            assert_eq!(
+                projected.columns["embedding"][row],
+                expected["_source"]["embedding"]
+            );
+        }
+        assert_eq!(
+            decode_stored_v2_projection(&encoded, &["__seq_no"]).unwrap(),
+            StoredV2ProjectionResult::DependencyEncoded
+        );
+    }
+
+    #[test]
+    fn v2_projection_does_not_decode_unrequested_payload() {
+        let (_, mut encoded) = projection_fixture();
+        let (payload_offset, payload_len) = {
+            let directory = parse_v2_directory(&encoded[4..]).unwrap();
+            let column = directory
+                .columns
+                .iter()
+                .find(|column| column.name == "large_unrequested")
+                .unwrap();
+            (
+                column.payload.as_ptr() as usize - encoded.as_ptr() as usize,
+                column.payload.len(),
+            )
+        };
+        encoded[payload_offset + payload_len / 2] ^= 0xff;
+
+        let StoredV2ProjectionResult::Projected(projected) =
+            decode_stored_v2_projection(&encoded, &["__id"]).unwrap()
+        else {
+            panic!("an unrelated corrupt payload must not be decoded");
+        };
+        assert_eq!(projected.columns["__id"].len(), 256);
+        assert!(
+            decode_stored(&encoded).is_err(),
+            "the full decoder must still observe corrupt unrequested payloads"
+        );
+    }
+
+    #[test]
+    fn v2_projection_validates_framing_and_preserves_legacy_fallback() {
+        let (_, encoded) = projection_fixture();
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_stored_v2_projection(&trailing, &["__id"]).is_err());
+
+        let legacy = encode_stored_lz4(br#"[{"_id":"legacy"}]"#);
+        assert_eq!(
+            decode_stored_v2_projection(&legacy, &["__id"]).unwrap(),
+            StoredV2ProjectionResult::NotV2
+        );
     }
 
     #[test]
