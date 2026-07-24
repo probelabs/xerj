@@ -11913,13 +11913,27 @@ async fn process_bulk_body(
                 "_source": s,
             })
         });
+        // Real per-item `_seq_no` / `_version` — same resolvers `_mget` and
+        // GET `_doc` use (were hardcoded `_version: 1` / a wall-clock
+        // timestamp masquerading as `_seq_no`).
+        let (version, seq_no) = state
+            .engine
+            .get_index(&item.index)
+            .ok()
+            .map(|idx| {
+                (
+                    idx.lookup_version(&item.id).unwrap_or(1),
+                    idx.lookup_seq_no(&item.id).unwrap_or(0),
+                )
+            })
+            .unwrap_or((1, 0));
         let item_result = EsBulkItemResult {
             index: item.index,
             id: item.id,
-            version: 1,
+            version,
             result: item.result.unwrap_or_else(|| "deleted".to_string()),
             shards: crate::responses::EsShards::single_success(),
-            seq_no: current_timestamp_micros(),
+            seq_no,
             primary_term: 1,
             status: item.status,
             get,
@@ -12280,13 +12294,6 @@ fn native_type_to_es(ft: &FieldType) -> &'static str {
         FieldType::Object => "object",
         FieldType::Nested => "nested",
     }
-}
-
-fn current_timestamp_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
