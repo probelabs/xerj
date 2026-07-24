@@ -679,6 +679,13 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             "/_index_template/_simulate_index/:name",
             post(es_compat::simulate_index_template),
         )
+        // Body-only variant: previews an unsaved template definition (no
+        // index name) — this is what Kibana's index template wizard calls
+        // to validate a template before it's created.
+        .route(
+            "/_index_template/_simulate",
+            post(es_compat::simulate_index_template_body),
+        )
         // ── More _cat endpoints ────────────────────────────────────────────────────
         .route("/_cat/tasks", get(es_compat::cat_tasks))
         .route("/_cat/repositories", get(es_compat::cat_repositories))
