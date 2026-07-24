@@ -17,12 +17,13 @@ pub mod yaml_x;
 
 use crate::sniff::{Family, Sniffed};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// One extracted record before coercion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawRecord {
     pub fields: Map<String, Value>,
     /// Canonical, content-positional locator (byte offset / ordinal /

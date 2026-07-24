@@ -1137,6 +1137,10 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
 /// Override with `TOKIO_WORKER_THREADS` (operators on very small or very large
 /// hosts, or wanting the stock `ncpus` behaviour, can set it explicitly).
 fn main() -> Result<()> {
+    // Dispatch before creating Tokio's pool so each PDF worker stays small.
+    if matches!(std::env::args().nth(1).as_deref(), Some("__extract-pdf")) {
+        std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
+    }
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);

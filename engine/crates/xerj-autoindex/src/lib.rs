@@ -189,6 +189,8 @@ fn build_mapping(specs: &[infer::FieldSpec]) -> Value {
 // ─── the main run ────────────────────────────────────────────────────────
 
 fn run_index(cfg: IndexCfg) -> Result<i32> {
+    extract::pdf::configure_workers(cfg.pdf_workers);
+    extract::pdf::configure_timeout(cfg.pdf_timeout_secs);
     let t0 = Instant::now();
     let es = Es::new(&cfg.url, cfg.api_key.clone())?;
     es.ping()?;
