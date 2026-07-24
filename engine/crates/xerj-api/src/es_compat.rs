@@ -21700,6 +21700,57 @@ pub async fn security_create_api_key(
     .into_response()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /_security/privilege
+// GET /_security/privilege/{application}
+// GET /_security/privilege/{application}/{name}
+// ─────────────────────────────────────────────────────────────────────────────
+// xerj has no application-privilege store: `xerj_engine::rbac::Privilege` is a
+// closed enum of index-scoped operations (read/write/admin index, snapshot,
+// security admin, audit), a different concept from ES's user-defined
+// per-application privilege objects (`application`/`name`/`actions`/
+// `metadata`). Kibana polls this endpoint on startup to check/register its
+// own `kibana-.kibana` application privileges; the route didn't exist at all,
+// so every poll 404'd and Kibana logged "Error registering Kibana Privileges"
+// every ~5s (non-fatal, but noisy). Report the honest state instead of a
+// missing route: no application privileges are registered, ES-shaped `{}`
+// with 200 — that's what real ES returns for "no privileges match", as
+// opposed to "this endpoint doesn't exist".
+
+pub async fn security_get_all_privileges(State(_state): State<AppState>) -> impl IntoResponse {
+    Json(json!({})).into_response()
+}
+
+pub async fn security_get_application_privileges(
+    State(_state): State<AppState>,
+    Path(_application): Path<String>,
+) -> impl IntoResponse {
+    Json(json!({})).into_response()
+}
+
+pub async fn security_get_privilege(
+    State(_state): State<AppState>,
+    Path((application, name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // Unlike the list forms above, looking up one specific privilege by name
+    // is a resource lookup: ES responds 404 when it doesn't exist, matching
+    // the convention used for other named-resource lookups in this file
+    // (e.g. `get_task_by_id`).
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "type": "resource_not_found_exception",
+                "reason": format!(
+                    "application privilege [{name}] not found for application [{application}]"
+                ),
+            },
+            "status": 404
+        })),
+    )
+        .into_response()
+}
+
 /// Parse an ES time-value expiration (e.g. `"7d"`, `"1h"`, `"30m"`, `"500ms"`)
 /// into an ABSOLUTE expiration in epoch milliseconds relative to `now_ms`.
 /// Returns `None` when the spec is absent or unparseable — meaning the key

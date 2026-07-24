@@ -543,6 +543,18 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             "/_security/api_key",
             post(es_compat::security_create_api_key),
         )
+        .route(
+            "/_security/privilege",
+            get(es_compat::security_get_all_privileges),
+        )
+        .route(
+            "/_security/privilege/:application",
+            get(es_compat::security_get_application_privileges),
+        )
+        .route(
+            "/_security/privilege/:application/:name",
+            get(es_compat::security_get_privilege),
+        )
         // ── License ───────────────────────────────────────────────────────────
         .route(
             "/_license",
