@@ -21631,6 +21631,51 @@ pub async fn security_authenticate(State(_state): State<AppState>) -> impl IntoR
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /_security/profile/_activate — activate/create a user profile
+// ─────────────────────────────────────────────────────────────────────────────
+// The route didn't exist at all (no handler, not registered in router.rs), so
+// every call hit axum's default "no route matched" response: a bodyless 404.
+// Kibana calls this right after a successful login to get a profile UID for
+// the authenticated user; its client expects an ES-shaped JSON body back
+// (success or error) and throws on the empty 404, which Kibana's own server
+// then surfaces to the browser as a 500 ("Failed to activate user profile: "
+// — the empty reason is Kibana failing to parse a reason out of nothing).
+// xerj was never actually returning 500 itself; the fix is simply to
+// implement the endpoint.
+//
+// Same single-owner identity model as `security_authenticate` — xerj has no
+// multi-user store, so every grant (password or access_token) activates the
+// same built-in superuser profile. The uid is a fixed constant rather than
+// content-derived from the submitted credentials, so repeated logins (and
+// Kibana state keyed on this uid, e.g. space favorites) stay stable.
+pub async fn security_activate_user_profile(
+    State(_state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let _ = body;
+    let now_ms = Utc::now().timestamp_millis().max(0);
+    Json(json!({
+        "uid": "u_xerj-superuser-0000000000000000000000000000000000000_0",
+        "enabled": true,
+        "last_synchronized": now_ms,
+        "user": {
+            "username": "xerj",
+            "roles": ["superuser"],
+            "realm_name": "native",
+            "full_name": "Xerj Administrator",
+            "email": null
+        },
+        "labels": {},
+        "data": {},
+        "_doc": {
+            "_primary_term": 1,
+            "_seq_no": 0
+        }
+    }))
+    .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /_security/api_key — create API key (stub: returns admin key)
 // ─────────────────────────────────────────────────────────────────────────────
 

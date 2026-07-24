@@ -540,6 +540,10 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             get(es_compat::security_authenticate),
         )
         .route(
+            "/_security/profile/_activate",
+            post(es_compat::security_activate_user_profile),
+        )
+        .route(
             "/_security/api_key",
             post(es_compat::security_create_api_key),
         )
