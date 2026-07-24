@@ -86,6 +86,21 @@ true positives. That work is real, but it starts from a tractable 129, not 5.2M.
 - `scan_multilang.py` — tree-sitter engine for PHP/Python/Go/Rust/Java; the
   `LANGS` config carries each language's taint lists.
 - `samples/<lang>/` — minimal planted-vuln files, one per language.
+- `wp_audit_index.py` — builds the audit substrate: indexes every WordPress
+  function (code + taint facts) and every hook registration into XERJ, so an
+  agent can *interrogate* the codebase instead of loading it. Powers the field
+  test in [`docs/research/wordpress-audit-with-xerj.md`](../../research/wordpress-audit-with-xerj.md).
 
 This is triage: it surfaces real, reachable patterns so an AI can confirm
 exploitability with minimal context. See the research doc for the honest limits.
+
+## Does this actually beat grep on a real codebase?
+
+Measured, not asserted:
+[`docs/research/wordpress-audit-with-xerj.md`](../../research/wordpress-audit-with-xerj.md)
+is an honest audit journal of real WordPress core — the agent tracing unauth
+input flow and SQLi reachability by querying XERJ. Result: the same audit cost
+**~2,150 tokens via XERJ vs ~864,000 via grep-and-read** (~400×), while reading
+*every* candidate instead of skimming. It's equally honest about the limits:
+recall is bounded by the taint model, and this run's 4 SQLi candidates were all
+false positives from one fixable gap (receiver-type-blind sink matching).
