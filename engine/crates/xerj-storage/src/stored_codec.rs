@@ -554,10 +554,6 @@ pub enum StoredV2ProjectionResult {
     /// The requested columns were decoded. Requested names absent from the
     /// segment are absent from `columns`.
     Projected(StoredV2Projection),
-    /// At least one requested column uses a dependency codec. The first
-    /// storage-only slice deliberately leaves dependency resolution to the
-    /// full decoder rather than decoding unrelated columns.
-    DependencyEncoded,
 }
 
 struct V2ColumnRef<'a> {
@@ -569,6 +565,37 @@ struct V2ColumnRef<'a> {
 struct V2Directory<'a> {
     num_docs: usize,
     columns: Vec<V2ColumnRef<'a>>,
+}
+
+/// Typed columns needed by an exact kNN scan.
+pub type StoredVectorRows = Vec<Option<Vec<f32>>>;
+pub type StoredVectorChunkRows = Vec<Option<Vec<Vec<f32>>>>;
+
+#[derive(Debug, PartialEq)]
+pub struct StoredV2KnnProjection {
+    pub num_docs: usize,
+    /// Invalid or missing identity cells are represented as `None`; the
+    /// engine's version/tombstone rules decide whether to skip those rows.
+    pub ids: Vec<Option<String>>,
+    pub seq_nos: Vec<Option<u64>>,
+    pub vectors: StoredVectorRows,
+    /// `None` means the optional chunks role was not requested or its named
+    /// column is absent. It is not a corruption signal.
+    pub vector_chunks: Option<StoredVectorChunkRows>,
+}
+
+/// Result of attempting the typed kNN projection.
+#[derive(Debug, PartialEq)]
+pub enum StoredV2KnnProjectionResult {
+    /// Legacy LZ4 or headerless JSON. The caller must use the compatibility
+    /// decoder.
+    NotV2,
+    /// A valid V2 section does not contain the requested vector column.
+    MissingVectorColumn,
+    /// The requested column exists but is not a finite numeric vector shape.
+    /// Callers may preserve compatibility by using the generic decoder.
+    UnsupportedVectorShape,
+    Projected(StoredV2KnnProjection),
 }
 
 /// Parse and validate the complete ZBS2 directory without decoding payloads.
@@ -649,33 +676,288 @@ pub fn decode_stored_v2_projection(
     }
     let directory = parse_v2_directory(&bytes[4..])?;
     let requested: std::collections::HashSet<&str> = requested.iter().copied().collect();
+    let mut decoded = vec![None; directory.columns.len()];
+    let mut visiting = vec![false; directory.columns.len()];
     let mut columns = HashMap::with_capacity(requested.len());
-    for column in directory
-        .columns
-        .iter()
-        .filter(|column| requested.contains(column.name))
-    {
-        let values = match column.codec {
-            ColCodec::RawJson => decode_raw_json(column.payload)?,
-            ColCodec::Lz4Json => decode_lz4_json(column.payload)?,
-            ColCodec::Constant => decode_constant(column.payload, directory.num_docs)?,
-            ColCodec::DictBitpack => decode_dict_bitpack(column.payload, directory.num_docs)?,
-            ColCodec::CrossDep => return Ok(StoredV2ProjectionResult::DependencyEncoded),
-        };
-        if values.len() != directory.num_docs {
-            return Err(StorageError::Other(anyhow::anyhow!(
-                "v2 column {} row count {} != header {}",
-                column.name,
-                values.len(),
-                directory.num_docs
-            )));
+    for index in 0..directory.columns.len() {
+        let column = &directory.columns[index];
+        if requested.contains(column.name) {
+            let values =
+                decode_projected_column(index, &directory, &mut decoded, &mut visiting, 0)?.clone();
+            columns.insert(column.name.to_string(), values);
         }
-        columns.insert(column.name.to_string(), values);
     }
     Ok(StoredV2ProjectionResult::Projected(StoredV2Projection {
         num_docs: directory.num_docs,
         columns,
     }))
+}
+
+fn decode_cross_dep_body(payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.is_empty() {
+        return Err(StorageError::Other(anyhow::anyhow!("cross_dep empty")));
+    }
+    let body = if payload[0] == 1 {
+        zstd::decode_all(&payload[1..])
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?
+    } else if payload[0] == 0 {
+        payload[1..].to_vec()
+    } else {
+        Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep invalid compression flag {}",
+            payload[0]
+        )))?
+    };
+    Ok(body)
+}
+
+fn cross_dep_source_index(payload: &[u8]) -> Result<usize> {
+    let body = decode_cross_dep_body(payload)?;
+    Cursor::new(body)
+        .read_u32::<LittleEndian>()
+        .map(|value| value as usize)
+        .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep src_ix: {e}")))
+}
+
+fn decode_projected_column<'a>(
+    index: usize,
+    directory: &'a V2Directory<'a>,
+    decoded: &'a mut [Option<Vec<serde_json::Value>>],
+    visiting: &mut [bool],
+    depth: usize,
+) -> Result<&'a Vec<serde_json::Value>> {
+    const MAX_CROSS_DEP_DEPTH: usize = 256;
+    if depth > MAX_CROSS_DEP_DEPTH {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep dependency depth exceeds {MAX_CROSS_DEP_DEPTH}"
+        )));
+    }
+    if decoded.get(index).and_then(Option::as_ref).is_some() {
+        return Ok(decoded[index].as_ref().unwrap());
+    }
+    if index >= directory.columns.len() || index >= visiting.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep source index {index} out of range"
+        )));
+    }
+    if visiting[index] {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep dependency cycle at column {index}"
+        )));
+    }
+    visiting[index] = true;
+    let column = &directory.columns[index];
+    let values = match column.codec {
+        ColCodec::RawJson => decode_raw_json(column.payload)?,
+        ColCodec::Lz4Json => decode_lz4_json(column.payload)?,
+        ColCodec::Constant => decode_constant(column.payload, directory.num_docs)?,
+        ColCodec::DictBitpack => decode_dict_bitpack(column.payload, directory.num_docs)?,
+        ColCodec::CrossDep => {
+            let source_index = cross_dep_source_index(column.payload)?;
+            let source =
+                decode_projected_column(source_index, directory, decoded, visiting, depth + 1)?
+                    .clone();
+            let mut dependencies = vec![Vec::new(); directory.columns.len()];
+            dependencies[source_index] = source;
+            decode_cross_dep(
+                column.payload,
+                directory.num_docs,
+                &dependencies,
+                &HashMap::new(),
+            )?
+            .ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!(
+                    "cross_dep source column {source_index} was not resolved"
+                ))
+            })?
+        }
+    };
+    visiting[index] = false;
+    if values.len() != directory.num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "v2 column {} row count {} != header {}",
+            column.name,
+            values.len(),
+            directory.num_docs
+        )));
+    }
+    decoded[index] = Some(values);
+    Ok(decoded[index].as_ref().unwrap())
+}
+
+fn decoded_json_column(column: &V2ColumnRef<'_>) -> Result<Option<Vec<u8>>> {
+    match column.codec {
+        ColCodec::RawJson => zstd::decode_all(column.payload)
+            .map(Some)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("raw zstd decode: {e}"))),
+        ColCodec::Lz4Json => lz4_flex::decompress_size_prepended(column.payload)
+            .map(Some)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("lz4 decode: {e}"))),
+        ColCodec::Constant => Ok(Some(column.payload.to_vec())),
+        ColCodec::DictBitpack | ColCodec::CrossDep => Ok(None),
+    }
+}
+
+fn finite_f32_vector(values: Vec<f64>) -> Option<Vec<f32>> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value as f32;
+        if !value.is_finite() {
+            return None;
+        }
+        out.push(value);
+    }
+    Some(out)
+}
+
+fn decode_typed_vector_rows(
+    column: &V2ColumnRef<'_>,
+    num_docs: usize,
+) -> Result<Option<StoredVectorRows>> {
+    use serde_json::value::RawValue;
+    let Some(raw) = decoded_json_column(column)? else {
+        return Ok(None);
+    };
+    let rows: Vec<&RawValue> = if column.codec == ColCodec::Constant {
+        let row: &RawValue = serde_json::from_slice(&raw)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("constant decode: {e}")))?;
+        vec![row; num_docs]
+    } else {
+        serde_json::from_slice(&raw)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("vector json decode: {e}")))?
+    };
+    if rows.len() != num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "v2 vector row count {} != header {num_docs}",
+            rows.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_docs);
+    for row in rows {
+        if row.get() == "null" {
+            out.push(None);
+            continue;
+        }
+        let Ok(values) = serde_json::from_str::<Vec<f64>>(row.get()) else {
+            return Ok(None);
+        };
+        let Some(vector) = finite_f32_vector(values) else {
+            return Ok(None);
+        };
+        out.push(Some(vector));
+    }
+    Ok(Some(out))
+}
+
+fn decode_typed_vector_chunk_rows(
+    column: &V2ColumnRef<'_>,
+    num_docs: usize,
+) -> Result<Option<StoredVectorChunkRows>> {
+    use serde_json::value::RawValue;
+    let Some(raw) = decoded_json_column(column)? else {
+        return Ok(None);
+    };
+    let rows: Vec<&RawValue> = if column.codec == ColCodec::Constant {
+        let row: &RawValue = serde_json::from_slice(&raw)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("constant decode: {e}")))?;
+        vec![row; num_docs]
+    } else {
+        serde_json::from_slice(&raw)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("vector chunks json decode: {e}")))?
+    };
+    if rows.len() != num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "v2 vector chunks row count {} != header {num_docs}",
+            rows.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_docs);
+    for row in rows {
+        if row.get() == "null" {
+            out.push(None);
+            continue;
+        }
+        let Ok(chunks) = serde_json::from_str::<Vec<Vec<f64>>>(row.get()) else {
+            return Ok(None);
+        };
+        let mut typed = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let Some(chunk) = finite_f32_vector(chunk) else {
+                return Ok(None);
+            };
+            typed.push(chunk);
+        }
+        out.push(Some(typed));
+    }
+    Ok(Some(out))
+}
+
+/// Decode the identity and vector columns needed by exact kNN without
+/// reconstructing complete source documents.
+pub fn decode_stored_v2_knn_projection(
+    bytes: &[u8],
+    vector_field: &str,
+    vector_chunks_field: Option<&str>,
+) -> Result<StoredV2KnnProjectionResult> {
+    if bytes.len() < 4 || &bytes[..4] != STORED_V2_MAGIC {
+        return Ok(StoredV2KnnProjectionResult::NotV2);
+    }
+    if matches!(vector_field, "__id" | "__seq_no")
+        || vector_chunks_field
+            .is_some_and(|field| matches!(field, "__id" | "__seq_no") || field == vector_field)
+    {
+        return Ok(StoredV2KnnProjectionResult::UnsupportedVectorShape);
+    }
+    let directory = parse_v2_directory(&bytes[4..])?;
+    let Some(vector_column) = directory
+        .columns
+        .iter()
+        .find(|column| column.name == vector_field)
+    else {
+        return Ok(StoredV2KnnProjectionResult::MissingVectorColumn);
+    };
+    let Some(vectors) = decode_typed_vector_rows(vector_column, directory.num_docs)? else {
+        return Ok(StoredV2KnnProjectionResult::UnsupportedVectorShape);
+    };
+    let vector_chunks = match vector_chunks_field {
+        Some(field) => match directory.columns.iter().find(|column| column.name == field) {
+            Some(column) => match decode_typed_vector_chunk_rows(column, directory.num_docs)? {
+                Some(chunks) => Some(chunks),
+                None => return Ok(StoredV2KnnProjectionResult::UnsupportedVectorShape),
+            },
+            None => None,
+        },
+        None => None,
+    };
+    let requested = ["__id", "__seq_no"];
+    let StoredV2ProjectionResult::Projected(mut projection) =
+        decode_stored_v2_projection(bytes, &requested)?
+    else {
+        unreachable!("V2 input cannot become NotV2");
+    };
+    let ids = projection
+        .columns
+        .remove("__id")
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 missing __id column")))?
+        .into_iter()
+        .map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect();
+    let seq_nos = projection
+        .columns
+        .remove("__seq_no")
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 missing __seq_no column")))?
+        .into_iter()
+        .map(|value| value.as_u64())
+        .collect();
+    Ok(StoredV2KnnProjectionResult::Projected(
+        StoredV2KnnProjection {
+            num_docs: projection.num_docs,
+            ids,
+            seq_nos,
+            vectors,
+            vector_chunks,
+        },
+    ))
 }
 
 fn decode_stored_v2(body: &[u8]) -> Result<Vec<u8>> {
@@ -1301,13 +1583,7 @@ fn decode_cross_dep(
     if payload.is_empty() {
         return Err(StorageError::Other(anyhow::anyhow!("cross_dep empty")));
     }
-    let flag = payload[0];
-    let body = if flag == 1 {
-        zstd::decode_all(&payload[1..])
-            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?
-    } else {
-        payload[1..].to_vec()
-    };
+    let body = decode_cross_dep_body(payload)?;
     let mut cur = Cursor::new(&body[..]);
     let src_ix = cur
         .read_u32::<LittleEndian>()
@@ -1348,11 +1624,24 @@ fn decode_cross_dep(
     let mut pos = cur.position() as usize;
     let mut prev_ord = 0u32;
     for _ in 0..exc_count {
-        let delta = read_varint(&body, &mut pos) as u32;
-        let val = read_zigzag_i64(&body, &mut pos);
-        let ord = prev_ord.wrapping_add(delta);
+        let delta = u32::try_from(read_varint(&body, &mut pos)?)
+            .map_err(|_| StorageError::Other(anyhow::anyhow!("cross_dep ordinal overflow")))?;
+        let val = read_zigzag_i64(&body, &mut pos)?;
+        let ord = prev_ord
+            .checked_add(delta)
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("cross_dep ordinal overflow")))?;
+        if ord as usize >= num_docs || (!exc.is_empty() && ord <= prev_ord) {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep invalid exception ordinal {ord}"
+            )));
+        }
         exc.push((ord, val));
         prev_ord = ord;
+    }
+    if pos != body.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep trailing exception bytes"
+        )));
     }
 
     // Materialise.
@@ -1460,19 +1749,24 @@ fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn read_varint(data: &[u8], pos: &mut usize) -> u64 {
+fn read_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
     let mut v = 0u64;
     let mut shift = 0u32;
-    while *pos < data.len() {
+    while *pos < data.len() && shift < 64 {
         let b = data[*pos];
         *pos += 1;
+        if shift == 63 && b & 0x7e != 0 {
+            return Err(StorageError::Other(anyhow::anyhow!("varint overflow")));
+        }
         v |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
-            return v;
+            return Ok(v);
         }
         shift += 7;
     }
-    v
+    Err(StorageError::Other(anyhow::anyhow!(
+        "truncated or overlong varint"
+    )))
 }
 
 fn write_zigzag_i64(out: &mut Vec<u8>, v: i64) {
@@ -1480,9 +1774,9 @@ fn write_zigzag_i64(out: &mut Vec<u8>, v: i64) {
     write_varint(out, z);
 }
 
-fn read_zigzag_i64(data: &[u8], pos: &mut usize) -> i64 {
-    let z = read_varint(data, pos);
-    ((z >> 1) as i64) ^ -((z & 1) as i64)
+fn read_zigzag_i64(data: &[u8], pos: &mut usize) -> Result<i64> {
+    let z = read_varint(data, pos)?;
+    Ok(((z >> 1) as i64) ^ -((z & 1) as i64))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1517,6 +1811,10 @@ mod tests {
                     "_source": {
                         "category": if i % 2 == 0 { "even" } else { "odd" },
                         "embedding": [i as f64 / 10.0, 0.25, -0.5],
+                        "embedding_chunks": [
+                            [i as f64 / 10.0, 0.25, -0.5],
+                            [-0.0, 1.25e-10, -2]
+                        ],
                         "large_unrequested": "the same payload repeated to compress well"
                     }
                 })
@@ -1525,6 +1823,58 @@ mod tests {
         let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
         assert_eq!(&encoded[..4], STORED_V2_MAGIC);
         (docs, encoded)
+    }
+
+    fn handcrafted_v2(num_docs: u32, columns: &[(&str, u8, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(STORED_V2_MAGIC);
+        out.write_u32::<LittleEndian>(num_docs).unwrap();
+        out.write_u32::<LittleEndian>(columns.len() as u32).unwrap();
+        for (name, codec, payload) in columns {
+            out.write_u16::<LittleEndian>(name.len() as u16).unwrap();
+            out.extend_from_slice(name.as_bytes());
+            out.push(*codec);
+            out.write_u32::<LittleEndian>(payload.len() as u32).unwrap();
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    fn raw_cross_dep(source_index: u32) -> Vec<u8> {
+        let mut payload = vec![0];
+        payload.write_u32::<LittleEndian>(source_index).unwrap();
+        payload
+    }
+
+    fn valid_cross_dep(source_index: u32, mode: i64) -> Vec<u8> {
+        let mut payload = raw_cross_dep(source_index);
+        payload.write_u32::<LittleEndian>(1).unwrap();
+        payload.write_i64::<LittleEndian>(mode).unwrap();
+        payload.write_u32::<LittleEndian>(0).unwrap();
+        payload
+    }
+
+    fn lz4_json(value: &serde_json::Value) -> Vec<u8> {
+        lz4_flex::compress_prepend_size(&serde_json::to_vec(value).unwrap())
+    }
+
+    fn typed_fixture_with_columns(
+        num_docs: usize,
+        vector_codec: ColCodec,
+        vector_payload: Vec<u8>,
+        chunks: Option<(ColCodec, Vec<u8>)>,
+    ) -> Vec<u8> {
+        let ids = json!((0..num_docs).map(|i| format!("id-{i}")).collect::<Vec<_>>());
+        let seq = json!((0..num_docs).collect::<Vec<_>>());
+        let mut columns = vec![
+            ("__id", ColCodec::Lz4Json as u8, lz4_json(&ids)),
+            ("__seq_no", ColCodec::Lz4Json as u8, lz4_json(&seq)),
+            ("embedding", vector_codec as u8, vector_payload),
+        ];
+        if let Some((codec, payload)) = chunks {
+            columns.push(("embedding_chunks", codec as u8, payload));
+        }
+        handcrafted_v2(num_docs as u32, &columns)
     }
 
     #[test]
@@ -1545,10 +1895,14 @@ mod tests {
                 expected["_source"]["embedding"]
             );
         }
-        assert_eq!(
-            decode_stored_v2_projection(&encoded, &["__seq_no"]).unwrap(),
-            StoredV2ProjectionResult::DependencyEncoded
-        );
+        let StoredV2ProjectionResult::Projected(seq_projection) =
+            decode_stored_v2_projection(&encoded, &["__seq_no"]).unwrap()
+        else {
+            panic!("CROSS_DEP sequence column should resolve");
+        };
+        for (row, expected) in docs.iter().enumerate() {
+            assert_eq!(seq_projection.columns["__seq_no"][row], expected["_seq_no"]);
+        }
     }
 
     #[test]
@@ -1578,6 +1932,350 @@ mod tests {
             decode_stored(&encoded).is_err(),
             "the full decoder must still observe corrupt unrequested payloads"
         );
+    }
+
+    #[test]
+    fn v2_knn_projection_resolves_identity_and_typed_vectors() {
+        let (docs, encoded) = projection_fixture();
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", Some("embedding_chunks"))
+                .unwrap()
+        else {
+            panic!("fixture should support typed projection");
+        };
+        assert_eq!(projected.num_docs, 256);
+        assert_eq!(projected.ids[42].as_deref(), Some("doc-42"));
+        assert_eq!(projected.seq_nos[42], Some(42));
+        for row in [0, 1, 42, 255] {
+            let expected = docs[row]["_source"]["embedding"].as_array().unwrap();
+            let actual = projected.vectors[row].as_ref().unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(
+                    actual.to_bits(),
+                    (expected.as_f64().unwrap() as f32).to_bits()
+                );
+            }
+        }
+        let chunks = projected.vector_chunks.as_ref().unwrap()[7]
+            .as_ref()
+            .unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1][0].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(chunks[1][1].to_bits(), (1.25e-10f32).to_bits());
+        assert_eq!(chunks[1][2], -2.0);
+    }
+
+    #[test]
+    fn v2_knn_projection_has_explicit_legacy_missing_and_shape_outcomes() {
+        let legacy = encode_stored_lz4(br#"[{"_id":"legacy"}]"#);
+        assert_eq!(
+            decode_stored_v2_knn_projection(&legacy, "embedding", None).unwrap(),
+            StoredV2KnnProjectionResult::NotV2
+        );
+
+        let (_, encoded) = projection_fixture();
+        assert_eq!(
+            decode_stored_v2_knn_projection(&encoded, "missing", None).unwrap(),
+            StoredV2KnnProjectionResult::MissingVectorColumn
+        );
+
+        let malformed_docs: Vec<_> = (0..256)
+            .map(|i| {
+                json!({
+                    "_id": format!("bad-{i}"),
+                    "_seq_no": i,
+                    "_source": {
+                        "embedding": if i == 128 {
+                            json!([1.0, "not-a-number", 3.0])
+                        } else {
+                            json!([1.0, 2.0, 3.0])
+                        }
+                    }
+                })
+            })
+            .collect();
+        let malformed = encode_stored_v2(&serde_json::to_vec(&malformed_docs).unwrap());
+        assert_eq!(&malformed[..4], STORED_V2_MAGIC);
+        assert_eq!(
+            decode_stored_v2_knn_projection(&malformed, "embedding", None).unwrap(),
+            StoredV2KnnProjectionResult::UnsupportedVectorShape
+        );
+    }
+
+    #[test]
+    fn v2_projection_rejects_cross_dep_cycles_and_bad_source_indices() {
+        let cycle = handcrafted_v2(
+            1,
+            &[
+                ("a", ColCodec::CrossDep as u8, raw_cross_dep(1)),
+                ("b", ColCodec::CrossDep as u8, raw_cross_dep(0)),
+            ],
+        );
+        let error = decode_stored_v2_projection(&cycle, &["a"]).unwrap_err();
+        assert!(error.to_string().contains("dependency cycle"), "{error}");
+
+        let out_of_range = handcrafted_v2(1, &[("a", ColCodec::CrossDep as u8, raw_cross_dep(9))]);
+        let error = decode_stored_v2_projection(&out_of_range, &["a"]).unwrap_err();
+        assert!(error.to_string().contains("out of range"), "{error}");
+
+        let bad_flag = handcrafted_v2(1, &[("a", ColCodec::CrossDep as u8, vec![7, 0, 0, 0, 0])]);
+        let error = decode_stored_v2_projection(&bad_flag, &["a"]).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid compression flag"),
+            "{error}"
+        );
+        assert!(
+            decode_stored(&bad_flag).is_err(),
+            "full and selective decoders must reject the same bad flag"
+        );
+    }
+
+    #[test]
+    fn v2_projection_resolves_forward_multihop_and_shared_dependencies() {
+        let id_payload = serde_json::to_vec(&vec!["doc"; 4]).unwrap();
+        let seq_payload = serde_json::to_vec(&vec![0, 1, 2, 3]).unwrap();
+        let encoded = handcrafted_v2(
+            4,
+            &[
+                (
+                    "__id",
+                    ColCodec::Lz4Json as u8,
+                    lz4_flex::compress_prepend_size(&id_payload),
+                ),
+                (
+                    "__seq_no",
+                    ColCodec::Lz4Json as u8,
+                    lz4_flex::compress_prepend_size(&seq_payload),
+                ),
+                ("a", ColCodec::CrossDep as u8, valid_cross_dep(3, 10)),
+                ("b", ColCodec::CrossDep as u8, valid_cross_dep(4, 5)),
+                ("base", ColCodec::Constant as u8, br#""key""#.to_vec()),
+                ("d", ColCodec::CrossDep as u8, valid_cross_dep(4, 20)),
+            ],
+        );
+        let StoredV2ProjectionResult::Projected(projected) =
+            decode_stored_v2_projection(&encoded, &["a", "d"]).unwrap()
+        else {
+            panic!("valid recursive dependencies should project");
+        };
+        assert_eq!(
+            projected
+                .columns
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            ["a".to_string(), "d".to_string()].into_iter().collect()
+        );
+        assert_eq!(projected.columns["a"], vec![json!(10); 4]);
+        assert_eq!(projected.columns["d"], vec![json!(20); 4]);
+
+        let full: Vec<serde_json::Value> =
+            serde_json::from_slice(&decode_stored(&encoded).unwrap()).unwrap();
+        for row in full {
+            assert_eq!(row["_source"]["a"], 10);
+            assert_eq!(row["_source"]["d"], 20);
+        }
+    }
+
+    #[test]
+    fn cross_dep_checked_exceptions_reject_truncation_overflow_and_trailing_bytes() {
+        let dependencies = vec![Vec::new(), vec![json!("key"); 4]];
+        let make = |exception_bytes: &[u8]| {
+            let mut payload = valid_cross_dep(1, 7);
+            let len = payload.len();
+            payload[len - 4..].copy_from_slice(&1u32.to_le_bytes());
+            payload.extend_from_slice(exception_bytes);
+            payload
+        };
+
+        let truncated = make(&[0x80]);
+        assert!(decode_cross_dep(&truncated, 4, &dependencies, &HashMap::new()).is_err());
+
+        let overlong = make(&[0x80; 11]);
+        assert!(decode_cross_dep(&overlong, 4, &dependencies, &HashMap::new()).is_err());
+
+        let out_of_range = make(&[4, 0]);
+        assert!(decode_cross_dep(&out_of_range, 4, &dependencies, &HashMap::new()).is_err());
+
+        let mut trailing = valid_cross_dep(1, 7);
+        trailing.push(0);
+        assert!(decode_cross_dep(&trailing, 4, &dependencies, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn v2_knn_projection_preserves_384d_f32_bits_and_rejects_overflow() {
+        let docs: Vec<_> = (0..256)
+            .map(|row| {
+                let vector: Vec<f64> = (0..384)
+                    .map(|dim| (row as f64 - dim as f64) / 997.0)
+                    .collect();
+                json!({
+                    "_id": format!("wide-{row}"),
+                    "_seq_no": row,
+                    "_source": {"embedding": vector}
+                })
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        assert_eq!(&encoded[..4], STORED_V2_MAGIC);
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", None).unwrap()
+        else {
+            panic!("384d vectors should project");
+        };
+        for row in [0, 127, 255] {
+            let actual = projected.vectors[row].as_ref().unwrap();
+            assert_eq!(actual.len(), 384);
+            for dim in [0, 1, 191, 383] {
+                let expected = docs[row]["_source"]["embedding"][dim].as_f64().unwrap() as f32;
+                assert_eq!(actual[dim].to_bits(), expected.to_bits());
+            }
+        }
+
+        let overflow_docs: Vec<_> = (0..256)
+            .map(|row| {
+                json!({
+                    "_id": format!("overflow-{row}"),
+                    "_seq_no": row,
+                    "_source": {"embedding": [1e39, 0.0]}
+                })
+            })
+            .collect();
+        let overflow = encode_stored_v2(&serde_json::to_vec(&overflow_docs).unwrap());
+        assert_eq!(
+            decode_stored_v2_knn_projection(&overflow, "embedding", None).unwrap(),
+            StoredV2KnnProjectionResult::UnsupportedVectorShape
+        );
+    }
+
+    #[test]
+    fn v2_knn_projection_forced_lz4_nulls_and_optional_missing_chunks() {
+        let vectors = json!([[1.0, -0.0], null, [], [3, 4]]);
+        let chunks = json!([[[1.0, 2.0]], null, [], [[3.0], [4.0, 5.0]]]);
+        let encoded = typed_fixture_with_columns(
+            4,
+            ColCodec::Lz4Json,
+            lz4_json(&vectors),
+            Some((ColCodec::Lz4Json, lz4_json(&chunks))),
+        );
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", Some("embedding_chunks"))
+                .unwrap()
+        else {
+            panic!("forced LZ4 vectors should project");
+        };
+        assert_eq!(
+            projected.vectors[0].as_ref().unwrap()[1].to_bits(),
+            (-0.0f32).to_bits()
+        );
+        assert_eq!(projected.vectors[1], None);
+        assert_eq!(projected.vectors[2], Some(Vec::new()));
+        assert_eq!(projected.vector_chunks.as_ref().unwrap()[1], None);
+        assert_eq!(
+            projected.vector_chunks.as_ref().unwrap()[3],
+            Some(vec![vec![3.0], vec![4.0, 5.0]])
+        );
+
+        let StoredV2KnnProjectionResult::Projected(missing_chunks) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", Some("different_chunks"))
+                .unwrap()
+        else {
+            panic!("missing optional chunks must not block pooled vectors");
+        };
+        assert_eq!(missing_chunks.vector_chunks, None);
+    }
+
+    #[test]
+    fn v2_knn_projection_constant_vectors_and_identity_cell_semantics() {
+        let encoded = typed_fixture_with_columns(
+            4,
+            ColCodec::Constant,
+            br#"[1.5,-0.0]"#.to_vec(),
+            Some((ColCodec::Constant, b"null".to_vec())),
+        );
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", Some("embedding_chunks"))
+                .unwrap()
+        else {
+            panic!("constant vectors should project");
+        };
+        assert_eq!(projected.vectors, vec![Some(vec![1.5, -0.0]); 4]);
+        assert_eq!(projected.vector_chunks, Some(vec![None; 4]));
+
+        let wrong_identity = handcrafted_v2(
+            2,
+            &[
+                ("__id", ColCodec::Lz4Json as u8, lz4_json(&json!(["ok", 7]))),
+                (
+                    "__seq_no",
+                    ColCodec::Lz4Json as u8,
+                    lz4_json(&json!([0, -1])),
+                ),
+                (
+                    "embedding",
+                    ColCodec::Lz4Json as u8,
+                    lz4_json(&json!([[1.0], [2.0]])),
+                ),
+            ],
+        );
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&wrong_identity, "embedding", None).unwrap()
+        else {
+            panic!("wrong identity cells are explicit None rows");
+        };
+        assert_eq!(projected.ids, vec![Some("ok".into()), None]);
+        assert_eq!(projected.seq_nos, vec![Some(0), None]);
+    }
+
+    #[test]
+    fn v2_knn_projection_rejects_reserved_or_colliding_role_names() {
+        let (_, encoded) = projection_fixture();
+        for (vector, chunks) in [
+            ("__id", None),
+            ("__seq_no", None),
+            ("embedding", Some("__id")),
+            ("embedding", Some("__seq_no")),
+            ("embedding", Some("embedding")),
+        ] {
+            assert_eq!(
+                decode_stored_v2_knn_projection(&encoded, vector, chunks).unwrap(),
+                StoredV2KnnProjectionResult::UnsupportedVectorShape
+            );
+        }
+    }
+
+    #[test]
+    fn v2_projection_enforces_dependency_depth_boundary() {
+        let chain = |edges: usize| {
+            let mut owned: Vec<(String, u8, Vec<u8>)> = (0..edges)
+                .map(|index| {
+                    (
+                        format!("c{index}"),
+                        ColCodec::CrossDep as u8,
+                        valid_cross_dep((index + 1) as u32, index as i64),
+                    )
+                })
+                .collect();
+            owned.push((
+                format!("c{edges}"),
+                ColCodec::Constant as u8,
+                br#""base""#.to_vec(),
+            ));
+            let borrowed: Vec<_> = owned
+                .iter()
+                .map(|(name, codec, payload)| (name.as_str(), *codec, payload.clone()))
+                .collect();
+            handcrafted_v2(1, &borrowed)
+        };
+
+        let at_limit = chain(256);
+        assert!(
+            decode_stored_v2_projection(&at_limit, &["c0"]).is_ok(),
+            "256 dependency edges are supported"
+        );
+        let over_limit = chain(257);
+        let error = decode_stored_v2_projection(&over_limit, &["c0"]).unwrap_err();
+        assert!(error.to_string().contains("depth exceeds 256"), "{error}");
     }
 
     #[test]
