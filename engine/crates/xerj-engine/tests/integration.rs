@@ -3440,6 +3440,59 @@ async fn test_knn_size_windows_into_k() {
     assert_eq!(res0.total.value, 4, "size=0 still reports the pool total");
 }
 
+#[tokio::test]
+async fn test_public_vector_executor_signatures_remain_compatible() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index("deadline-vectors", Schema::empty())
+        .unwrap();
+    let idx = engine.get_index("deadline-vectors").unwrap();
+
+    for n in 0..256 {
+        idx.index_document(
+            Some(format!("d{n}")),
+            json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut request = parse_request(&json!({
+        "query": {"knn": {
+            "field": "embedding",
+            "query_vector": [1.0, 0.0, 0.0, 0.0],
+            "k": 10
+        }},
+        "size": 10
+    }))
+    .unwrap();
+    request.timeout_ms = Some(250);
+    let result = idx
+        .run_knn_brute_force(
+            &request,
+            "embedding",
+            &[1.0, 0.0, 0.0, 0.0],
+            10,
+            None,
+            "cosine",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!result.timed_out);
+
+    let semantic_future = idx.run_semantic(&request, "body", "query text", 10, None);
+    drop(semantic_future);
+    let hybrid_future = idx.run_hybrid(
+        &request,
+        vec![],
+        xerj_query::ast::FusionStrategy::Rrf { k: 60 },
+    );
+    drop(hybrid_future);
+}
+
 // ── SQL parser unit tests (inline) ────────────────────────────────────────────
 
 #[test]

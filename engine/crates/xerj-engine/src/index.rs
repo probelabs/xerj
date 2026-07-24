@@ -44,6 +44,351 @@ impl<'a> Drop for MergeFlagClear<'a> {
     }
 }
 
+#[cfg(test)]
+mod semantic_deadline_regression_tests {
+    use super::*;
+    use crate::Engine;
+    use tempfile::TempDir;
+
+    fn engine(dir: &TempDir) -> Engine {
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        Engine::new(config).expect("engine")
+    }
+
+    fn match_all(timeout_ms: u64) -> SearchRequest {
+        SearchRequest {
+            timeout_ms: Some(timeout_ms),
+            ..SearchRequest::default()
+        }
+    }
+
+    async fn wait_for_inflight(idx: &Index, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while idx.query_inflight.len() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("single-flight state did not converge");
+    }
+
+    async fn wait_for_singleflight_follower(idx: &Index) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let subscribed = idx
+                    .query_inflight
+                    .iter()
+                    .any(|entry| entry.value().receiver_count() > 0);
+                if subscribed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follower never subscribed to leader");
+    }
+
+    async fn seed_vectors(idx: &Index) {
+        for n in 0..256 {
+            idx.index_document(
+                Some(format!("v{n}")),
+                serde_json::json!({"embedding": [1.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.test_scan_checkpoint_delay_ms
+            .store(20, Ordering::Relaxed);
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn timed_out_leader_is_not_cached() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("cache-timeout", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("cache-timeout").unwrap();
+
+        let permits = idx
+            .max_concurrent_queries
+            .acquire_many(64)
+            .await
+            .expect("query semaphore");
+        let request = match_all(1);
+        let timed_out = idx.search(&request).await.unwrap();
+        assert!(timed_out.timed_out);
+        assert!(
+            idx.query_cache.is_empty(),
+            "partial timeout must never enter the result cache"
+        );
+
+        drop(permits);
+        let completed = idx.search(&request).await.unwrap();
+        assert!(!completed.timed_out);
+        assert_eq!(idx.query_cache.len(), 1);
+        let cached = idx.search(&request).await.unwrap();
+        assert!(!cached.timed_out);
+        assert_eq!(cached.took_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_singleflight_leader_drains_and_follower_recomputes() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("cancel-leader", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("cancel-leader").unwrap();
+
+        let permits = idx
+            .max_concurrent_queries
+            .acquire_many(64)
+            .await
+            .expect("query semaphore");
+        let request = match_all(250);
+
+        let leader_idx = Arc::clone(&idx);
+        let leader_request = request.clone();
+        let leader = tokio::spawn(async move { leader_idx.search(&leader_request).await });
+        wait_for_inflight(&idx, 1).await;
+
+        let follower_idx = Arc::clone(&idx);
+        let follower_request = request.clone();
+        let follower = tokio::spawn(async move { follower_idx.search(&follower_request).await });
+        wait_for_singleflight_follower(&idx).await;
+
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        drop(permits);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), follower)
+            .await
+            .expect("follower remained stuck on cancelled leader")
+            .expect("follower task")
+            .expect("follower search");
+        assert!(
+            !result.timed_out,
+            "follower must recompute within its budget"
+        );
+        wait_for_inflight(&idx, 0).await;
+        assert_eq!(idx.query_cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_multi_knn_preserves_partial_timeout_state() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("multi-timeout", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("multi-timeout").unwrap();
+        seed_vectors(&idx).await;
+        let clause = PeeledKnn {
+            field: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 10,
+            num_candidates: None,
+            filter: None,
+            boost: None,
+            similarity: None,
+        };
+        let result = idx
+            .run_multi_knn_brute_force(
+                &match_all(250),
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+                vec![clause],
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            2,
+            "single child must do partial work before parent propagation"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_multi_knn_child_stops_later_clause_scheduling() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine.create_index("multi-stop", Schema::empty()).unwrap();
+        let idx = engine.get_index("multi-stop").unwrap();
+        seed_vectors(&idx).await;
+        let clause = PeeledKnn {
+            field: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 10,
+            num_candidates: None,
+            filter: None,
+            boost: None,
+            similarity: None,
+        };
+        let result = idx
+            .run_multi_knn_brute_force(
+                &match_all(250),
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+                vec![clause.clone(), clause],
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            2,
+            "second clause must not execute after the first child times out"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_future_deadlines_stop_after_nonzero_partial_scan() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("future-deadline", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("future-deadline").unwrap();
+        seed_vectors(&idx).await;
+        let request = match_all(250);
+
+        for timeout_ms in [1, 10, 250] {
+            idx.test_scan_checkpoint_delay_ms
+                .store(timeout_ms + 10, Ordering::Relaxed);
+            idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let result = idx
+                .run_knn_brute_force_with_deadline(
+                    &request,
+                    started + std::time::Duration::from_millis(timeout_ms),
+                    "embedding",
+                    &[1.0, 0.0],
+                    10,
+                    None,
+                    "cosine",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(result.timed_out);
+            assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+            assert_eq!(
+                idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+                2,
+                "scan must pass checkpoint zero and stop at the later checkpoint"
+            );
+            assert!(started.elapsed() >= std::time::Duration::from_millis(timeout_ms));
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_hybrid_preserves_partial_timeout_state() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("hybrid-timeout", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("hybrid-timeout").unwrap();
+        seed_vectors(&idx).await;
+        let knn = QueryNode::Knn {
+            field: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 10,
+            num_candidates: None,
+            filter: None,
+            boost: None,
+            similarity: None,
+        };
+        let result = idx
+            .run_hybrid_with_deadline(
+                &match_all(250),
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+                vec![xerj_query::ast::WeightedQuery {
+                    query: knn,
+                    weight: 1.0,
+                }],
+                xerj_query::ast::FusionStrategy::Rrf { k: 60 },
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            2,
+            "hybrid child must do partial work before propagating timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_unique_semantic_requests_share_bounded_deadlines() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        let mut schema = Schema::empty();
+        let mut field = FieldConfig::new("body", FieldType::Text);
+        field.options.dimensions = Some(16);
+        field.options.similarity = Some("cosine".into());
+        field.embedding = Some(xerj_common::types::EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("body_vector".into()),
+        });
+        schema.fields.push(field);
+        engine.create_index("semantic-concurrent", schema).unwrap();
+        let idx = engine.get_index("semantic-concurrent").unwrap();
+        for n in 0..256 {
+            idx.index_document(
+                Some(format!("s{n}")),
+                serde_json::json!({"body": format!("semantic document number {n}")}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.test_scan_checkpoint_delay_ms
+            .store(200, Ordering::Relaxed);
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+
+        let started = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for n in 0..8 {
+            let idx = Arc::clone(&idx);
+            tasks.push(tokio::spawn(async move {
+                let request = SearchRequest {
+                    query: QueryNode::SemanticSearch {
+                        field: "body".into(),
+                        text: format!("unique concurrent deadline {n}"),
+                        k: 10,
+                        filter: None,
+                        boost: None,
+                    },
+                    timeout_ms: Some(100),
+                    ..SearchRequest::default()
+                };
+                idx.search(&request).await
+            }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap().unwrap();
+            assert!(result.timed_out);
+            assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        }
+        assert!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed) >= 16,
+            "all semantic requests must reach multiple cooperative scan checkpoints"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "concurrent semantic scans exceeded their own deadlines"
+        );
+    }
+}
+
 // Doc-values (columnar) fast path for size:0 + match_all + aggs — child
 // module so it can reach Index's private fields/methods via `super::`.
 #[path = "fast_aggs.rs"]
@@ -525,6 +870,10 @@ pub struct Index {
     /// from starving other indices in a multi-tenant deployment — a noisy
     /// neighbour cannot exhaust all available query slots.
     max_concurrent_queries: Arc<Semaphore>,
+    #[cfg(test)]
+    test_scan_checkpoint_delay_ms: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_scan_checkpoint_count: Arc<AtomicU64>,
     // ── Per-index enrich lookup tables ────────────────────────────────────────
     /// Named enrich tables: each table maps a key to a JSON object of extra
     /// fields to merge into matching documents at ingest time.
@@ -922,6 +1271,10 @@ impl Index {
             schema_hash_epoch: Arc::new(AtomicU64::new(0)),
             last_flush_doc_count: Arc::new(AtomicU64::new(0)),
             max_concurrent_queries: Arc::new(Semaphore::new(64)),
+            #[cfg(test)]
+            test_scan_checkpoint_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_scan_checkpoint_count: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             hnsw: Arc::new(RwLock::new(None)),
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
@@ -1152,6 +1505,10 @@ impl Index {
             name,
             schema: Arc::new(RwLock::new(schema)),
             max_concurrent_queries: Arc::new(Semaphore::new(64)),
+            #[cfg(test)]
+            test_scan_checkpoint_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_scan_checkpoint_count: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             store,
             memtable: Arc::new(memtable),
@@ -4458,7 +4815,6 @@ impl Index {
         similarity: &str,
     ) -> Option<SearchResult> {
         let started = std::time::Instant::now();
-
         if similarity != "cosine" {
             return None;
         }
@@ -4602,6 +4958,20 @@ impl Index {
     /// behaviour (BBQ disk quantisation, IVF clustering) are not
     /// necessary for wire-correctness on these tests because the
     /// expected doc order is deterministic given exact scoring.
+    async fn exact_scan_checkpoint(&self, _position: usize, deadline: std::time::Instant) -> bool {
+        tokio::task::yield_now().await;
+        #[cfg(test)]
+        {
+            self.test_scan_checkpoint_count
+                .fetch_add(1, Ordering::Relaxed);
+            let delay_ms = self.test_scan_checkpoint_delay_ms.load(Ordering::Relaxed);
+            if _position > 0 && delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+        std::time::Instant::now() >= deadline
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run_knn_brute_force(
         &self,
@@ -4614,7 +4984,41 @@ impl Index {
         boost: Option<f32>,
         min_similarity: Option<f32>,
     ) -> Result<SearchResult> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        self.run_knn_brute_force_with_deadline(
+            request,
+            deadline,
+            field,
+            query_vec,
+            k,
+            filter,
+            similarity,
+            boost,
+            min_similarity,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_knn_brute_force_with_deadline(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
+        field: &str,
+        query_vec: &[f32],
+        k: usize,
+        filter: Option<Box<QueryNode>>,
+        similarity: &str,
+        boost: Option<f32>,
+        min_similarity: Option<f32>,
+    ) -> Result<SearchResult> {
         let started = std::time::Instant::now();
+        let mut timed_out = false;
+        let trace_phases = std::env::var_os("XERJ_TRACE_SEMANTIC_PHASES").is_some();
+        if trace_phases {
+            tracing::info!(index=%self.name, field, k, "semantic_phase=start_brute");
+        }
 
         // ── Collect all candidate (doc_id, source) pairs ──────────────
         let mut candidates: Vec<(String, Value)> = Vec::new();
@@ -4627,23 +5031,40 @@ impl Index {
         let snap = self.store.snapshot();
         // Track seen IDs so later-segment copies don't duplicate memtable entries.
         let mut seen: HashSet<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
-        for meta in snap.segments.iter() {
+        'segments: for meta in snap.segments.iter() {
+            let segment_started = std::time::Instant::now();
             // Cache-backed: first KNN against this segment pays the
             // I/O + decompress + simd_json parse, every subsequent
             // query reads from `stored_value_cache`. For a 100-segment
             // index this turns repeated KNN from O(seg_count * 100MB)
             // copy work into Arc clone + iterate.
+            // `stored_values_for` may synchronously read, decompress, and
+            // parse one segment on a cold cache. That operation cannot be
+            // interrupted internally; the deadline is checked immediately
+            // before and after it, bounding the overrun to one segment load.
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
             let docs_arc = match self.stored_values_for(&meta.id) {
                 Some(a) => a,
                 None => continue,
             };
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
             // Cache-backed iteration: stored_values_for() handles the
             // I/O + decode + parse; subsequent KNN over the same segment
             // is an Arc clone. The underlying parse uses serde_json (not
             // simd_json) per ffd49ac — simd_json silently corrupts some
             // raw-bytes-flush payloads, the per-doc alloc cost is
             // irrelevant on the brute-force similarity scan.
-            for doc in docs_arc.iter() {
+            for (position, doc) in docs_arc.iter().enumerate() {
+                if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                    timed_out = true;
+                    break 'segments;
+                }
                 let id = match doc.get("_id").and_then(Value::as_str) {
                     Some(s) => s.to_string(),
                     None => continue,
@@ -4687,7 +5108,11 @@ impl Index {
                 });
                 candidates.push((id, src));
             }
+            if trace_phases {
+                tracing::info!(index=%self.name, segment=%meta.id, elapsed_ms=segment_started.elapsed().as_millis() as u64, candidates=candidates.len(), "semantic_phase=load_segment");
+            }
         }
+        let collect_elapsed = started.elapsed();
 
         // ── Determine whether this field opts into SQ8 (scalar8) ──────
         // Default fields keep the exact f32 brute-force scan below,
@@ -4711,7 +5136,11 @@ impl Index {
 
             // Post-filter candidate vectors for this field: (id, src, doc_vec).
             let mut cand: Vec<(String, Value, Vec<f32>)> = Vec::with_capacity(candidates.len());
-            for (id, src) in candidates {
+            for (position, (id, src)) in candidates.into_iter().enumerate() {
+                if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                    timed_out = true;
+                    break;
+                }
                 if let Some(ref f) = filter {
                     let mut src_with_id = src.clone();
                     if let Some(obj) = src_with_id.as_object_mut() {
@@ -4779,7 +5208,11 @@ impl Index {
             let stores = self.sq8_stores.read().await;
             if let Some(store) = stores.get(field) {
                 let mut decoded = vec![0.0f32; store.dim];
-                for (id, src, _v) in cand {
+                for (position, (id, src, _v)) in cand.into_iter().enumerate() {
+                    if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                        timed_out = true;
+                        break;
+                    }
                     let codes = match store.codes.get(&id) {
                         Some(c) if c.len() == store.dim => c,
                         _ => continue,
@@ -4799,7 +5232,11 @@ impl Index {
             // kNN and short single-chunk docs have no such companion, so they
             // fall through to the exact single-vector scan below (unchanged).
             let chunk_field = format!("{field}_chunks");
-            for (id, src) in candidates {
+            for (position, (id, src)) in candidates.into_iter().enumerate() {
+                if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                    timed_out = true;
+                    break;
+                }
                 // Apply filter: if the filter doesn't match this doc, skip.
                 if let Some(ref f) = filter {
                     let mut src_with_id = src.clone();
@@ -4814,7 +5251,13 @@ impl Index {
                 {
                     // Best-matching passage over the stored chunk vectors.
                     let mut best: Option<f32> = None;
-                    for cv in &chunks {
+                    for (chunk_position, cv) in chunks.iter().enumerate() {
+                        if chunk_position & 31 == 0
+                            && self.exact_scan_checkpoint(chunk_position, deadline).await
+                        {
+                            timed_out = true;
+                            break;
+                        }
                         let dv: Vec<f32> = match cv {
                             Value::Array(a) => a
                                 .iter()
@@ -4852,6 +5295,9 @@ impl Index {
                 scored.push((id, score, src));
             }
         }
+        if trace_phases {
+            tracing::info!(index=%self.name, collect_ms=collect_elapsed.as_millis() as u64, elapsed_ms=started.elapsed().as_millis() as u64, scored=scored.len(), "semantic_phase=scored");
+        }
 
         // ── ES `knn.similarity` cutoff ─────────────────────────────────
         // Convert the RAW-metric threshold into the equivalent
@@ -4878,7 +5324,15 @@ impl Index {
         // ── Rank, cap the candidate pool at k, then paginate ──────────
         // (shared with the HNSW path so hits format / total semantics
         // cannot drift between the exact and approximate executors)
-        Ok(knn_result_from_scored(request, scored, k, started))
+        let mut result = knn_result_from_scored(request, scored, k, started);
+        result.timed_out = timed_out;
+        if timed_out {
+            result.total.relation = TotalHitsRelation::Gte;
+        }
+        if trace_phases {
+            tracing::info!(index=%self.name, elapsed_ms=started.elapsed().as_millis() as u64, hits=result.hits.len(), "semantic_phase=complete");
+        }
+        Ok(result)
     }
 
     /// PURE multi-KNN executor (the ES top-level `knn: [...]` array form,
@@ -4892,13 +5346,19 @@ impl Index {
     async fn run_multi_knn_brute_force(
         &self,
         request: &SearchRequest,
+        deadline: std::time::Instant,
         clauses: Vec<PeeledKnn>,
     ) -> Result<SearchResult> {
         let started = std::time::Instant::now();
         let mut merged: Vec<(String, f32, Value)> = Vec::new();
         let mut slot_by_id: HashMap<String, usize> = HashMap::new();
         let mut k_sum: usize = 0;
+        let mut any_timed_out = false;
         for clause in clauses {
+            if std::time::Instant::now() >= deadline {
+                any_timed_out = true;
+                break;
+            }
             k_sum = k_sum.saturating_add(clause.k);
             let similarity = {
                 let schema = self.schema.read().await;
@@ -4912,8 +5372,9 @@ impl Index {
             sub_request.from = 0;
             sub_request.size = clause.k;
             let sub = self
-                .run_knn_brute_force(
+                .run_knn_brute_force_with_deadline(
                     &sub_request,
+                    deadline,
                     &clause.field,
                     &clause.vector,
                     clause.k,
@@ -4923,6 +5384,7 @@ impl Index {
                     clause.similarity,
                 )
                 .await?;
+            any_timed_out |= sub.timed_out;
             for hit in sub.hits {
                 match slot_by_id.get(&hit.id) {
                     Some(&i) => merged[i].1 += hit.score,
@@ -4932,8 +5394,16 @@ impl Index {
                     }
                 }
             }
+            if any_timed_out {
+                break;
+            }
         }
-        Ok(knn_result_from_scored(request, merged, k_sum, started))
+        let mut result = knn_result_from_scored(request, merged, k_sum, started);
+        result.timed_out = any_timed_out;
+        if any_timed_out {
+            result.total.relation = TotalHitsRelation::Gte;
+        }
+        Ok(result)
     }
 
     /// Brute-force nested KNN: score each parent by the best (max)
@@ -4957,6 +5427,21 @@ impl Index {
     pub async fn run_semantic(
         &self,
         request: &SearchRequest,
+        field: &str,
+        text: &str,
+        k: usize,
+        filter: Option<Box<QueryNode>>,
+    ) -> Result<SearchResult> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        self.run_semantic_with_deadline(request, deadline, field, text, k, filter)
+            .await
+    }
+
+    async fn run_semantic_with_deadline(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
         field: &str,
         text: &str,
         k: usize,
@@ -5004,7 +5489,12 @@ impl Index {
         //     ingest. A `semantic` query against a plain dense_vector field
         //     with no active backend still returns the original 400 (there
         //     is no comparable stored vector to match against).
+        let semantic_started = std::time::Instant::now();
+        let trace_phases = std::env::var_os("XERJ_TRACE_SEMANTIC_PHASES").is_some();
         let embedder = self.embedder.read().await;
+        if trace_phases {
+            tracing::info!(index=%self.name, field, k, "semantic_phase=embed_start");
+        }
         let query_vec = if embedder.is_active() {
             // `embed_batch` takes Vec<String>; we only have one text but
             // batching keeps the wire format stable for callers.
@@ -5038,18 +5528,28 @@ impl Index {
                      model and tokenizer paths).",
             )));
         };
+        drop(embedder);
+        if trace_phases {
+            tracing::info!(index=%self.name, elapsed_ms=semantic_started.elapsed().as_millis() as u64, "semantic_phase=embed_complete");
+        }
 
-        self.run_knn_brute_force(
-            request,
-            &knn_field,
-            &query_vec,
-            k,
-            filter,
-            &similarity,
-            None,
-            None,
-        )
-        .await
+        let result = self
+            .run_knn_brute_force_with_deadline(
+                request,
+                deadline,
+                &knn_field,
+                &query_vec,
+                k,
+                filter,
+                &similarity,
+                None,
+                None,
+            )
+            .await;
+        if trace_phases {
+            tracing::info!(index=%self.name, elapsed_ms=semantic_started.elapsed().as_millis() as u64, ok=result.is_ok(), "semantic_phase=request_complete");
+        }
+        result
     }
 
     /// Auto-embed `semantic_text` fields on ingest.
@@ -5345,6 +5845,19 @@ impl Index {
         sub_queries: Vec<xerj_query::ast::WeightedQuery>,
         fusion: xerj_query::ast::FusionStrategy,
     ) -> Result<SearchResult> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        self.run_hybrid_with_deadline(request, deadline, sub_queries, fusion)
+            .await
+    }
+
+    async fn run_hybrid_with_deadline(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
+        sub_queries: Vec<xerj_query::ast::WeightedQuery>,
+        fusion: xerj_query::ast::FusionStrategy,
+    ) -> Result<SearchResult> {
         let started = std::time::Instant::now();
 
         // Aggregations over a fused (RRF/Linear/Learned) result set have
@@ -5370,7 +5883,12 @@ impl Index {
         // for v0.7-P1 — the per-query latency is dominated by the kNN
         // / FTS scan, not the await ordering.)
         let mut sub_results: Vec<(Vec<Hit>, f32)> = Vec::with_capacity(sub_queries.len());
+        let mut any_timed_out = false;
         for wq in sub_queries {
+            if std::time::Instant::now() >= deadline {
+                any_timed_out = true;
+                break;
+            }
             let sub_request = SearchRequest {
                 query: wq.query.clone(),
                 from: 0,
@@ -5393,8 +5911,12 @@ impl Index {
             };
             // Box::pin to break the type-recursion (search_inner ↔
             // run_hybrid both async fn).
-            let sub_result = Box::pin(self.search_inner(&sub_request)).await?;
+            let sub_result = Box::pin(self.search_inner(&sub_request, deadline)).await?;
+            any_timed_out |= sub_result.timed_out;
             sub_results.push((sub_result.hits, wq.weight));
+            if any_timed_out {
+                break;
+            }
         }
 
         // Apply fusion.
@@ -5426,11 +5948,15 @@ impl Index {
             hits: page,
             total: TotalHits {
                 value: total_value,
-                relation: TotalHitsRelation::Eq,
+                relation: if any_timed_out {
+                    TotalHitsRelation::Gte
+                } else {
+                    TotalHitsRelation::Eq
+                },
             },
             took_ms,
             aggs: None,
-            timed_out: false,
+            timed_out: any_timed_out,
             profile: None,
             max_score: None,
         })
@@ -6266,6 +6792,21 @@ impl Index {
 
     /// Execute a search request against this index.
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
+        let request_started = std::time::Instant::now();
+        let request_deadline = request_started
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        let timed_out_result = || SearchResult {
+            hits: vec![],
+            total: xerj_query::executor::TotalHits {
+                value: 0,
+                relation: TotalHitsRelation::Gte,
+            },
+            took_ms: request_started.elapsed().as_millis() as u64,
+            aggs: None,
+            timed_out: true,
+            profile: None,
+            max_score: None,
+        };
         // M3 framework: response cache.  Hash the request shape and the
         // current dataset version; on a hit return the cloned `Arc<SearchResult>`
         // immediately, skipping the semaphore, search_inner, locks, and
@@ -6393,7 +6934,17 @@ impl Index {
                             }
                             return Ok(cloned);
                         }
-                        if rx.changed().await.is_err() {
+                        match tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(request_deadline),
+                            rx.changed(),
+                        )
+                        .await
+                        {
+                            Err(_) => return Ok(timed_out_result()),
+                            Ok(Ok(())) => continue,
+                            Ok(Err(_closed)) => {}
+                        }
+                        {
                             // Leader dropped its sender. If it succeeded it
                             // inserted the result into `query_cache` BEFORE
                             // dropping, so serve that; otherwise recompute.
@@ -6432,7 +6983,15 @@ impl Index {
         // like ES's search thread pool bounds active workers. Held (via
         // `_global_permit`) for the whole call; released on drop.
         let _global_permit = match crate::governor::global() {
-            Some(g) => Some(g.acquire_search().await?),
+            Some(g) => match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(request_deadline),
+                g.acquire_search(),
+            )
+            .await
+            {
+                Ok(result) => Some(result?),
+                Err(_) => return Ok(timed_out_result()),
+            },
             None => None,
         };
 
@@ -6440,11 +6999,19 @@ impl Index {
         // against a single index, preventing one hot index from monopolising
         // the global pool.  The permit is automatically released when
         // `_permit` is dropped at the end of this call.
-        let _permit = self.max_concurrent_queries.acquire().await.map_err(|_| {
-            EngineError::Common(xerj_common::XerjError::internal(
-                "query semaphore closed — index is shutting down",
-            ))
-        })?;
+        let _permit = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(request_deadline),
+            self.max_concurrent_queries.acquire(),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|_| {
+                EngineError::Common(xerj_common::XerjError::internal(
+                    "query semaphore closed — index is shutting down",
+                ))
+            })?,
+            Err(_) => return Ok(timed_out_result()),
+        };
 
         let search_start = std::time::Instant::now();
 
@@ -6474,7 +7041,6 @@ impl Index {
         // Determine the timeout: use the request-level timeout if set, otherwise
         // fall back to the default of 30 seconds.
         let timeout_ms = request.timeout_ms.unwrap_or(30_000);
-        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
 
         // M5.21 — run the CPU-heavy search body inside `block_in_place`
         // on multi-thread runtimes; fall back to plain await on
@@ -6483,18 +7049,22 @@ impl Index {
         // Pre-M5.21 a concurrent QPS bench collapsed to <1 QPS.  See
         // the commit body for `perf/search-block-in-place` for the
         // full root-cause analysis.
+        let cooperative_vector_query = peel_knn_query(&request.query).is_some()
+            || peel_multi_knn_query(&request.query).is_some()
+            || peel_semantic_query(&request.query).is_some();
         let is_multi_thread = tokio::runtime::Handle::current().runtime_flavor()
             == tokio::runtime::RuntimeFlavor::MultiThread;
-        let search_fut = self.search_inner(request);
-        let search_result = if is_multi_thread {
+        let search_fut = self.search_inner(request, request_deadline);
+        let search_result = if is_multi_thread && !cooperative_vector_query {
             let fut = async move {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(search_fut)
                 })
             };
-            tokio::time::timeout(timeout_duration, fut).await
+            tokio::time::timeout_at(tokio::time::Instant::from_std(request_deadline), fut).await
         } else {
-            tokio::time::timeout(timeout_duration, search_fut).await
+            tokio::time::timeout_at(tokio::time::Instant::from_std(request_deadline), search_fut)
+                .await
         };
         match search_result {
             Ok(result) => {
@@ -6584,7 +7154,11 @@ impl Index {
     }
 
     /// Inner search implementation (without timeout wrapper).
-    async fn search_inner(&self, request: &SearchRequest) -> Result<SearchResult> {
+    async fn search_inner(
+        &self,
+        request: &SearchRequest,
+        search_deadline: std::time::Instant,
+    ) -> Result<SearchResult> {
         // Check read block.
         if self.is_read_blocked().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
@@ -6650,8 +7224,6 @@ impl Index {
         // stopped.  Instead we compute a wall-clock deadline here and have
         // the O(N) loops below check it cooperatively, returning partial
         // results with `timed_out: true` (ES semantics).
-        let search_deadline: std::time::Instant = std::time::Instant::now()
-            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
         let mut deadline_exceeded = false;
         // Set when a field-sorted non-match_all scan was narrowed to the
         // per-segment top-cap sort candidates: the scan's own total tally is
@@ -6730,8 +7302,9 @@ impl Index {
                 }
             }
             return self
-                .run_knn_brute_force(
+                .run_knn_brute_force_with_deadline(
                     request,
+                    search_deadline,
                     &field,
                     &query_vec,
                     k,
@@ -6747,7 +7320,9 @@ impl Index {
         // one clause, and `hits.total` is the size of the deduplicated union
         // — matching ES 8.13 multi-kNN semantics (live-verified 2026-07-12).
         if let Some(clauses) = peel_multi_knn_query(query) {
-            return self.run_multi_knn_brute_force(request, clauses).await;
+            return self
+                .run_multi_knn_brute_force(request, search_deadline, clauses)
+                .await;
         }
         // Nested `knn` query: `nested { path: P, query: { knn { field: P.vec } } }`.
         // ES scores each parent by the best-matching nested element and
@@ -6800,7 +7375,9 @@ impl Index {
         //  - proxy timeout / 5xx → propagate the proxy's error
         //  - dim mismatch         → caught by run_knn_brute_force / HNSW
         if let Some((field, text, k, filter)) = peel_semantic_query(query) {
-            return self.run_semantic(request, &field, &text, k, filter).await;
+            return self
+                .run_semantic_with_deadline(request, search_deadline, &field, &text, k, filter)
+                .await;
         }
 
         // ── Hybrid (RRF / Linear / Learned) short-circuit ─────────────────────
@@ -6825,7 +7402,9 @@ impl Index {
         //
         // Learned: not yet implemented — falls back to RRF with a warn.
         if let Some((sub_queries, fusion)) = peel_hybrid_query(query) {
-            return self.run_hybrid(request, sub_queries, fusion).await;
+            return self
+                .run_hybrid_with_deadline(request, search_deadline, sub_queries, fusion)
+                .await;
         }
 
         // ── Max result window enforcement ──────────────────────────────────────
