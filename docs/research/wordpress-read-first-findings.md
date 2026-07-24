@@ -89,3 +89,80 @@ an un-re-verified object relationship. XERJ's contribution is to make each such
 semantic invariant, once discovered by reading, a **stored, queryable
 completeness check** over the whole indexed codebase. Precision comes from the
 read; durability and scale come from XERJ.
+
+---
+
+# Part 2 — Sanitizer composition, and making the audit cheap
+
+## The class: two protections that interact and one undoes the other
+
+The richest composition bug is **de-escape after escape before a sink**: a value
+is escaped, then a later filter (`stripslashes`, `wp_unslash`, `urldecode`,
+`html_entity_decode`) *removes* the escaping before it reaches SQL or output.
+`esc_sql($x)` then `stripslashes(...)` = injection; `esc_html($x)` then
+`html_entity_decode(...)` = XSS.
+
+Reading core's compositions, the invariant it holds everywhere is **escaper-last
+before the sink**:
+
+- `WP_Term_Query::get_terms` — `sanitize_term_field` (slashed) → `stripslashes`
+  (clean) → **`esc_sql` last** → query. Correct; the comment documents it.
+- `wp_update_term` — `sanitize_term` → `wp_unslash` → **`$wpdb->update()`**, which
+  re-escapes via format specifiers. Unslashing *before* `$wpdb->update/insert` is
+  the *required* WP convention (not doing it double-slashes). Correct.
+- `wp_widget_rss_output` — `$desc = html_entity_decode(...)` then
+  `$desc = esc_attr( wp_trim_words($desc) )` **re-escapes last**. Correct.
+
+An order-aware detector flagged **23** candidates; every one cleared on reading,
+via four false-positive drivers now understood: (1) a *safe* self-escaping
+`$wpdb->update/insert/prepare` sink misread as raw; (2) decode-then-re-escape on
+the actual output variable; (3) escape and decode on *different* variables; (4)
+plaintext-email output where decode is correct. **Core composes correctly.** But,
+as with SSRF, that verdict required *reading* — and reading 23 bodies is
+expensive.
+
+## Making it cheap: the sanitizer-sequence fingerprint (the XERJ improvement)
+
+`wp_compose_index.py` computes, once at index time, each function's ordered
+**sanitizer sequence** — a compact keyword list like
+`["ESC:esc_html","DEE:html_entity_decode","ESC:esc_attr","SNKout"]` — plus a
+`sink_raw` flag distinguishing attacker-dangerous sinks (`$wpdb->query`,
+`get_results`, `echo`) from self-escaping ones (`$wpdb->update/insert/prepare`).
+It stores these as indexed fields. The whole composition audit then becomes a
+single structured query:
+
+```
+GET wpcompose  { compose_danger:true  AND  sink_raw:true }   →  6 candidates + their fingerprints
+```
+
+The fingerprints are **self-triaging**: `wp_update_term`'s
+`[ESC:wp_slash, DEE:wp_unslash, …, SNKsafe]` shows the unslashed value reaching a
+*safe* sink; `wp_notify_moderator`'s long `SNKout` tail is email. Most candidates
+clear without pulling a single line of code.
+
+**Measured token cost of the same audit:**
+
+| approach | what it reads | tokens |
+|---|---|--:|
+| read every sanitizer-bearing function to find the bad order | 3,624 function bodies | **~1,329,000** |
+| one query over the sanitizer-sequence fingerprint | 6 fingerprints (+ read only the un-clearable) | **~490** |
+
+**≈2,700×.** The audit cost drops from O(total code size) to O(true candidates),
+because the semantic invariant was compiled into an indexed fingerprint once and
+queried, instead of re-derived by reading every time.
+
+## The generalizable pattern for XERJ
+
+This is the reusable shape for *every* invariant found by reading:
+
+1. **Read once** to discover the invariant (escaper-last; block 169.254; re-verify
+   the object relationship).
+2. **Compile it to a fingerprint field** at index time — the ordered sanitizer
+   sequence, the covered IP ranges, the checked-vs-used object keys.
+3. **Audit by querying the fingerprint**, returning only violators — tiny result,
+   no code transfer.
+4. **Read only the survivors** to confirm.
+
+Steps 2–4 are where XERJ turns a million-token reading pass into a few-hundred-token
+query — and, run against the plugin ecosystem, the same fingerprints will surface
+the escaper-last violations and incomplete validators that core doesn't have.
