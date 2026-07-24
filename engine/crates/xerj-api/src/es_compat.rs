@@ -21758,7 +21758,7 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// Minimal base64 encoder (standard alphabet, no padding variant for ES compat).
-fn base64_encode(input: &str) -> String {
+pub(crate) fn base64_encode(input: &str) -> String {
     let bytes = input.as_bytes();
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::new();
