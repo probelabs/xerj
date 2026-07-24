@@ -57,6 +57,12 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
+mod row_hydration;
+pub use row_hydration::{
+    decode_stored_v2_rows, StoredV2HydratedRow, StoredV2RowHydrationResult,
+    StoredV2RowHydrationStats,
+};
+
 // ── V1: flat LZ4 over JSON (legacy) ───────────────────────────────────────
 
 /// Magic prefix for LZ4-compressed stored sections (v1, pre-columnar).
