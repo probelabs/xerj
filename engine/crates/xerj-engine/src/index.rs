@@ -35,6 +35,34 @@ use xerj_vector::Sq8Params;
 
 use crate::aggs::run_aggs_with_all;
 
+/// A deterministic proxy for the payload retained by a JSON source tree.
+///
+/// This is test-only by design: allocator statistics and RSS are
+/// process-global and make poor assertions in a parallel unit-test process.
+/// Counting scalar payload plus container slots gives the memory regression a
+/// stable O(N) versus O(k) signal without changing production execution.
+#[cfg(test)]
+fn logical_json_source_units(value: &Value) -> u64 {
+    match value {
+        Value::Null => 1,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 8,
+        Value::String(s) => s.len() as u64,
+        Value::Array(values) => {
+            8 + values
+                .iter()
+                .map(|value| 16 + logical_json_source_units(value))
+                .sum::<u64>()
+        }
+        Value::Object(fields) => {
+            8 + fields
+                .iter()
+                .map(|(key, value)| key.len() as u64 + 16 + logical_json_source_units(value))
+                .sum::<u64>()
+        }
+    }
+}
+
 /// Clears an index's `merge_in_progress` flag on every exit path of the
 /// merge holder (background pass or forcemerge), including panics.
 struct MergeFlagClear<'a>(&'a std::sync::atomic::AtomicBool);
@@ -525,6 +553,16 @@ pub struct Index {
     /// from starving other indices in a multi-tenant deployment — a noisy
     /// neighbour cannot exhaust all available query slots.
     max_concurrent_queries: Arc<Semaphore>,
+    /// Logical exact-kNN working-set counters used by deterministic memory
+    /// regression tests. They deliberately count source-tree payload rather
+    /// than allocator/RSS bytes, which are process-global and flaky under the
+    /// parallel Rust test runner.
+    #[cfg(test)]
+    test_exact_knn_candidate_docs: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_exact_knn_candidate_source_units: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_exact_knn_winner_docs: Arc<AtomicU64>,
     // ── Per-index enrich lookup tables ────────────────────────────────────────
     /// Named enrich tables: each table maps a key to a JSON object of extra
     /// fields to merge into matching documents at ingest time.
@@ -922,6 +960,12 @@ impl Index {
             schema_hash_epoch: Arc::new(AtomicU64::new(0)),
             last_flush_doc_count: Arc::new(AtomicU64::new(0)),
             max_concurrent_queries: Arc::new(Semaphore::new(64)),
+            #[cfg(test)]
+            test_exact_knn_candidate_docs: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_exact_knn_candidate_source_units: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_exact_knn_winner_docs: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             hnsw: Arc::new(RwLock::new(None)),
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
@@ -1152,6 +1196,12 @@ impl Index {
             name,
             schema: Arc::new(RwLock::new(schema)),
             max_concurrent_queries: Arc::new(Semaphore::new(64)),
+            #[cfg(test)]
+            test_exact_knn_candidate_docs: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_exact_knn_candidate_source_units: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_exact_knn_winner_docs: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             store,
             memtable: Arc::new(memtable),
@@ -4688,6 +4738,18 @@ impl Index {
                 candidates.push((id, src));
             }
         }
+        #[cfg(test)]
+        {
+            self.test_exact_knn_candidate_docs
+                .store(candidates.len() as u64, Ordering::Relaxed);
+            self.test_exact_knn_candidate_source_units.store(
+                candidates
+                    .iter()
+                    .map(|(_, source)| logical_json_source_units(source))
+                    .sum(),
+                Ordering::Relaxed,
+            );
+        }
 
         // ── Determine whether this field opts into SQ8 (scalar8) ──────
         // Default fields keep the exact f32 brute-force scan below,
@@ -4878,7 +4940,11 @@ impl Index {
         // ── Rank, cap the candidate pool at k, then paginate ──────────
         // (shared with the HNSW path so hits format / total semantics
         // cannot drift between the exact and approximate executors)
-        Ok(knn_result_from_scored(request, scored, k, started))
+        let result = knn_result_from_scored(request, scored, k, started);
+        #[cfg(test)]
+        self.test_exact_knn_winner_docs
+            .store(result.hits.len() as u64, Ordering::Relaxed);
+        Ok(result)
     }
 
     /// PURE multi-KNN executor (the ES top-level `knn: [...]` array form,
@@ -26279,6 +26345,139 @@ mod chunk_embed_tests {
         assert!(
             max_sim > pooled_score,
             "best-passage max-sim ({max_sim}) should beat pooled ({pooled_score})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exact_knn_memory_regression_tests {
+    use super::*;
+    use crate::Engine;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[derive(Debug)]
+    struct ExactKnnObservation {
+        ids: Vec<String>,
+        scores: Vec<f32>,
+        candidate_docs: u64,
+        candidate_source_units: u64,
+        winner_docs: u64,
+    }
+
+    async fn observe(doc_count: usize, k: usize) -> ExactKnnObservation {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = Engine::new(config).expect("engine");
+        engine
+            .create_index("vector-heavy", Schema::empty())
+            .expect("create index");
+        let index = engine.get_index("vector-heavy").expect("index");
+
+        for ordinal in 0..doc_count {
+            let mut vector = vec![0.0; 384];
+            vector[0] = 1.0;
+            vector[1] = ordinal as f64 / 32.0;
+            let chunks = vec![vector.clone(), vector.clone(), vector.clone()];
+            index
+                .index_document(
+                    Some(format!("doc-{ordinal:03}")),
+                    json!({
+                        "body": "small source text",
+                        "body_vector": vector,
+                        "body_vector_chunks": chunks,
+                    }),
+                )
+                .await
+                .expect("index document");
+        }
+        index.flush().await.expect("flush");
+
+        index
+            .test_exact_knn_candidate_docs
+            .store(0, Ordering::Relaxed);
+        index
+            .test_exact_knn_candidate_source_units
+            .store(0, Ordering::Relaxed);
+        index.test_exact_knn_winner_docs.store(0, Ordering::Relaxed);
+
+        let request = SearchRequest {
+            size: k,
+            ..SearchRequest::default()
+        };
+        let mut query = vec![0.0; 384];
+        query[0] = 1.0;
+        let result = index
+            .run_knn_brute_force(
+                &request,
+                "body_vector",
+                &query,
+                k,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .expect("exact kNN");
+
+        ExactKnnObservation {
+            ids: result.hits.iter().map(|hit| hit.id.clone()).collect(),
+            scores: result.hits.iter().map(|hit| hit.score).collect(),
+            candidate_docs: index.test_exact_knn_candidate_docs.load(Ordering::Relaxed),
+            candidate_source_units: index
+                .test_exact_knn_candidate_source_units
+                .load(Ordering::Relaxed),
+            winner_docs: index.test_exact_knn_winner_docs.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Characterises the exact-kNN source-retention amplification with a
+    /// vector-heavy shape matching neural autoindex: one pooled 384-d vector
+    /// plus three passage vectors. The logical counter is deterministic in
+    /// parallel CI, unlike RSS/jemalloc process totals.
+    ///
+    /// This test intentionally records today's O(N) candidate source tree
+    /// while correctness remains fixed at k=10. The compact-scan fix should
+    /// change the final slope assertion to O(k), making this the before/after
+    /// gate without needing a large PDF corpus.
+    #[tokio::test]
+    async fn exact_knn_vector_heavy_source_working_set_scales_with_corpus() {
+        let at_32 = observe(32, 10).await;
+        let at_64 = observe(64, 10).await;
+        let at_128 = observe(128, 10).await;
+
+        let expected_ids: Vec<String> = (0..10).map(|n| format!("doc-{n:03}")).collect();
+        for observation in [&at_32, &at_64, &at_128] {
+            assert_eq!(observation.ids, expected_ids, "exact top-k IDs");
+            assert_eq!(observation.winner_docs, 10, "fixed result hydration");
+            assert!(
+                observation.scores.windows(2).all(|pair| pair[0] >= pair[1]),
+                "scores must be descending: {:?}",
+                observation.scores
+            );
+        }
+        assert_eq!(at_32.scores, at_64.scores, "32→64 score parity");
+        assert_eq!(at_32.scores, at_128.scores, "32→128 score parity");
+
+        assert_eq!(at_32.candidate_docs, 32);
+        assert_eq!(at_64.candidate_docs, 64);
+        assert_eq!(at_128.candidate_docs, 128);
+        assert_eq!(
+            at_64.candidate_source_units,
+            at_32.candidate_source_units * 2,
+            "logical retained source doubles with corpus"
+        );
+        assert_eq!(
+            at_128.candidate_source_units,
+            at_32.candidate_source_units * 4,
+            "logical retained source quadruples while k remains fixed"
+        );
+        assert_eq!(
+            at_128.candidate_docs / at_128.winner_docs,
+            12,
+            "128 complete sources are materialized to return only 10"
         );
     }
 }
