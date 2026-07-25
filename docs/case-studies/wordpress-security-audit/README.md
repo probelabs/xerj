@@ -95,6 +95,9 @@ read; scale and durability come from XERJ.
 
 - [`PLAYBOOK.md`](PLAYBOOK.md) — **step-by-step guide with the copy-paste prompts**
   to drive an AI + XERJ through this audit, and to point it at your own codebase.
+- [`COVERAGE-AUDIT.md`](COVERAGE-AUDIT.md) — **the coverage-guaranteed sink census**:
+  catalog every dangerous PHP built-in, enumerate every call site by AST, *prove*
+  zero gaps against grep, then AI-enrich into a queryable ledger (`sink-census/`).
 - [`FINDINGS.md`](FINDINGS.md) — the SSRF vulnerability, with verification and
   reachability.
 - [`REPRODUCE.md`](REPRODUCE.md) — exact commands to rebuild the index and rerun
