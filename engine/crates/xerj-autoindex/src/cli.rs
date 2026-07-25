@@ -8,7 +8,10 @@ pub struct IndexCfg {
     pub url: String,
     pub api_key: Option<String>,
     pub workers: usize,
+    pub pdf_workers: usize,
+    pub pdf_timeout_secs: u64,
     pub bulk_mb: usize,
+    pub bulk_timeout_secs: u64,
     pub prefix: String,
     pub state_dir: Option<PathBuf>,
     pub fresh: bool,
@@ -59,7 +62,12 @@ pub fn print_help() {
              --url <U>            ES-compat endpoint (default http://localhost:9200)\n\
              --api-key <K>        Authorization header (or env XERJ_API_KEY)\n\
              --workers <N>        extract workers (default min(cores,8))\n\
+             --pdf-workers <N>    concurrent PDF parser processes (default min(cores,4); max 4)\n\
+             --pdf-timeout-secs <N> per-PDF parser timeout (default 120; max 3600)\n\
              --bulk-mb <N>        bulk cut size in MB (default 8)\n\
+             --bulk-timeout-secs <N>\n\
+                                  bulk HTTP request timeout in seconds (default 300;\n\
+                                  valid range 1..=3600)\n\
              --prefix <P>         index prefix (default ax)\n\
              --state-dir <PATH>   resume journal location (default ~/.xerj/autoindex/<hash>/)\n\
              --fresh              ignore existing journal, restart (ids stay idempotent)\n\
@@ -72,6 +80,17 @@ pub fn print_help() {
              --quiet              errors only\n\
              --dataset <SLUG>     (map) show a single dataset\n\
              --help, -h           this help\n\
+         \n\
+         PDF EXTRACTION:\n\
+             Each PDF uses a fresh process. Limits: 512 MiB input, 32 MiB worker output,\n\
+             100,000 pages, and 1.5 GiB address space on Unix. This is crash/resource\n\
+             isolation, not a security sandbox; non-Unix platforms have no OS memory cap.\n\
+             Image-only pages need OCR. Page parse failures reject the whole PDF instead\n\
+             of silently creating a partial index. XERJ_PDF_WORKER_BIN is a trusted,\n\
+             developer-only executable override.\n\
+             Current cost: phase-A sampling parses/materializes each complete PDF, and\n\
+             phase-B indexing parses it again. A framed, early-stop protocol is planned;\n\
+             use fewer --pdf-workers when parent memory is constrained.\n\
          \n\
          EMBEDDINGS:\n\
              autoindex sends semantic_text to the running server; it does not choose the\n\
@@ -98,7 +117,14 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         .map(|n| n.get())
         .unwrap_or(8)
         .min(8);
+    let mut pdf_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(4);
+    let mut pdf_timeout_secs = 120u64;
     let mut bulk_mb = 8usize;
+    let mut bulk_timeout_secs = 300u64;
+    let mut bulk_timeout_explicit = false;
     let mut prefix = "ax".to_string();
     let mut state_dir: Option<PathBuf> = None;
     let mut fresh = false;
@@ -121,11 +147,36 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     .and_then(|s| s.parse().ok())
                     .ok_or("--workers needs a number")?
             }
+            "--pdf-workers" => {
+                pdf_workers = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|n| (1..=4).contains(n))
+                    .ok_or("--pdf-workers needs a number from 1 to 4")?
+            }
+            "--pdf-timeout-secs" => {
+                pdf_timeout_secs = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|n| (1..=3600).contains(n))
+                    .ok_or("--pdf-timeout-secs needs a number from 1 to 3600")?
+            }
             "--bulk-mb" => {
                 bulk_mb = it
                     .next()
                     .and_then(|s| s.parse().ok())
                     .ok_or("--bulk-mb needs a number")?
+            }
+            "--bulk-timeout-secs" => {
+                bulk_timeout_explicit = true;
+                bulk_timeout_secs = it
+                    .next()
+                    .ok_or("--bulk-timeout-secs needs a value in seconds")?
+                    .parse()
+                    .map_err(|_| "--bulk-timeout-secs needs an integer in the range 1..=3600")?;
+                if !(1..=3_600).contains(&bulk_timeout_secs) {
+                    return Err("--bulk-timeout-secs must be in the range 1..=3600 seconds".into());
+                }
             }
             "--in-flight" => {
                 let _ = it.next(); // reserved (bulks are worker-synchronous in v1)
@@ -168,6 +219,9 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     }
 
     match (sub.as_deref(), folder) {
+        (Some("map"), _) if bulk_timeout_explicit => {
+            Err("--bulk-timeout-secs applies only to indexing, not `autoindex map`".into())
+        }
         (Some("map"), _) => Ok(Cmd::Map(MapCfg {
             url,
             api_key,
@@ -175,6 +229,9 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             json,
             dataset,
         })),
+        (Some("status"), _) if bulk_timeout_explicit => {
+            Err("--bulk-timeout-secs applies only to indexing, not `autoindex status`".into())
+        }
         (Some("status"), _) => Ok(Cmd::Status(StatusCfg {
             url,
             api_key,
@@ -186,7 +243,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             url,
             api_key,
             workers: workers.max(1),
+            pdf_workers,
+            pdf_timeout_secs,
             bulk_mb: bulk_mb.clamp(1, 24),
+            bulk_timeout_secs,
             prefix,
             state_dir,
             fresh,
@@ -199,5 +259,56 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             quiet,
         })),
         _ => Ok(Cmd::Help),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse, Cmd};
+
+    fn index(args: &[&str]) -> super::IndexCfg {
+        match parse(args.iter().map(|s| s.to_string()).collect()).unwrap() {
+            Cmd::Index(cfg) => cfg,
+            other => panic!("expected index config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bulk_timeout_defaults_to_300_seconds() {
+        assert_eq!(index(&["data"]).bulk_timeout_secs, 300);
+    }
+
+    #[test]
+    fn bulk_timeout_accepts_custom_bounded_value() {
+        assert_eq!(
+            index(&["data", "--bulk-timeout-secs", "3600"]).bulk_timeout_secs,
+            3600
+        );
+    }
+
+    #[test]
+    fn bulk_timeout_rejects_missing_non_numeric_zero_and_too_large() {
+        for args in [
+            vec!["data", "--bulk-timeout-secs"],
+            vec!["data", "--bulk-timeout-secs", "slow"],
+            vec!["data", "--bulk-timeout-secs", "0"],
+            vec!["data", "--bulk-timeout-secs", "3601"],
+        ] {
+            let err = parse(args.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(err.contains("--bulk-timeout-secs"), "{err}");
+        }
+    }
+
+    #[test]
+    fn bulk_timeout_is_rejected_for_non_index_subcommands_in_any_position() {
+        for args in [
+            vec!["map", "--bulk-timeout-secs", "900"],
+            vec!["--bulk-timeout-secs", "900", "map"],
+            vec!["status", "--bulk-timeout-secs", "900"],
+            vec!["--bulk-timeout-secs", "900", "status"],
+        ] {
+            let err = parse(args.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(err.contains("applies only to indexing"), "{err}");
+        }
     }
 }
