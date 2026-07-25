@@ -21700,6 +21700,146 @@ pub async fn security_create_api_key(
     .into_response()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET    /_security/privilege
+// GET    /_security/privilege/{application}
+// GET    /_security/privilege/{application}/{name}
+// PUT    /_security/privilege
+// DELETE /_security/privilege/{application}/{name}
+// ─────────────────────────────────────────────────────────────────────────────
+// xerj has no application-privilege store built into RBAC:
+// `xerj_engine::rbac::Privilege` is a closed enum of index-scoped operations
+// (read/write/admin index, snapshot, security admin, audit), a different
+// concept from ES's user-defined per-application privilege objects
+// (`application`/`name`/`actions`/`metadata`) — so this gets its own store,
+// `state.engine.application_privileges`, keyed by `"{application}\0{name}"`.
+//
+// Kibana polls GET at startup to check its own `kibana-.kibana` application
+// privileges, and calls PUT to register them if the GET doesn't already
+// match — originally NEITHER route existed, so every poll 404'd and Kibana
+// logged "Error registering Kibana Privileges" every ~5s (non-fatal, but
+// noisy). Not enforced (same honest-surface convention as `roles`/minted API
+// keys' `role_descriptors`): privileges round-trip through this store, but
+// nothing in the auth path actually gates on them yet.
+
+pub async fn security_get_all_privileges(State(state): State<AppState>) -> impl IntoResponse {
+    Json(privileges_grouped_by_application(&state, None)).into_response()
+}
+
+pub async fn security_get_application_privileges(
+    State(state): State<AppState>,
+    Path(application): Path<String>,
+) -> impl IntoResponse {
+    Json(privileges_grouped_by_application(
+        &state,
+        Some(&application),
+    ))
+    .into_response()
+}
+
+pub async fn security_get_privilege(
+    State(state): State<AppState>,
+    Path((application, name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // Unlike the list forms above, looking up one specific privilege by name
+    // is a resource lookup: ES responds 404 when it doesn't exist, matching
+    // the convention used for other named-resource lookups in this file
+    // (e.g. `get_task_by_id`).
+    match state
+        .engine
+        .application_privileges
+        .get(&application_privilege_key(&application, &name))
+    {
+        Some(entry) => Json(json!({ application: { name: entry.value() } })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "type": "resource_not_found_exception",
+                    "reason": format!(
+                        "application privilege [{name}] not found for application [{application}]"
+                    ),
+                },
+                "status": 404
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn security_put_privileges(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let Some(apps) = body.as_object() else {
+        return ApiError::new(xerj_common::XerjError::invalid_query(
+            "request body must be an object of {application: {privilege_name: {...}}}",
+        ))
+        .into_response();
+    };
+    let mut result = serde_json::Map::new();
+    for (application, privileges) in apps {
+        let Some(privileges) = privileges.as_object() else {
+            continue;
+        };
+        let mut app_result = serde_json::Map::new();
+        for (name, spec) in privileges {
+            let key = application_privilege_key(application, name);
+            let created = !state.engine.application_privileges.contains_key(&key);
+            let stored = json!({
+                "application": application,
+                "name": name,
+                "actions": spec.get("actions").cloned().unwrap_or(json!([])),
+                "metadata": spec.get("metadata").cloned().unwrap_or(json!({})),
+            });
+            state.engine.application_privileges.insert(key, stored);
+            app_result.insert(name.clone(), json!({ "created": created }));
+        }
+        result.insert(application.clone(), Value::Object(app_result));
+    }
+    Json(Value::Object(result)).into_response()
+}
+
+pub async fn security_delete_privilege(
+    State(state): State<AppState>,
+    Path((application, name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let key = application_privilege_key(&application, &name);
+    let found = state.engine.application_privileges.remove(&key).is_some();
+    Json(json!({ "found": found })).into_response()
+}
+
+fn application_privilege_key(application: &str, name: &str) -> String {
+    format!("{application}\0{name}")
+}
+
+/// Build the ES-shaped `{application: {name: {...}}}` response, optionally
+/// filtered to one application (`None` = every application).
+fn privileges_grouped_by_application(state: &AppState, application: Option<&str>) -> Value {
+    let mut by_app: serde_json::Map<String, Value> = serde_json::Map::new();
+    for entry in state.engine.application_privileges.iter() {
+        let priv_obj = entry.value();
+        let Some(app) = priv_obj.get("application").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(want) = application {
+            if app != want {
+                continue;
+            }
+        }
+        let Some(name) = priv_obj.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        by_app
+            .entry(app.to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("inserted as object above")
+            .insert(name.to_string(), priv_obj.clone());
+    }
+    Value::Object(by_app)
+}
+
 /// Parse an ES time-value expiration (e.g. `"7d"`, `"1h"`, `"30m"`, `"500ms"`)
 /// into an ABSOLUTE expiration in epoch milliseconds relative to `now_ms`.
 /// Returns `None` when the spec is absent or unparseable — meaning the key
