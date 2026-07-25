@@ -29,11 +29,150 @@ use crate::embed::EmbeddingProxy;
 use crate::local::{local_embed, DEFAULT_DIMS};
 
 #[cfg(feature = "onnx-experimental")]
-type OnnxCell = tokio::sync::OnceCell<std::sync::Arc<crate::onnx::OnnxEmbedder>>;
+struct CancellationSafeInit<T> {
+    result: std::sync::OnceLock<std::result::Result<std::sync::Arc<T>, std::sync::Arc<str>>>,
+    started: std::sync::atomic::AtomicBool,
+    slow_warning_emitted: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "onnx-experimental")]
+struct InitCompletionGuard<T: Send + Sync + 'static> {
+    shared: std::sync::Arc<CancellationSafeInit<T>>,
+    armed: bool,
+}
+
+#[cfg(feature = "onnx-experimental")]
+impl<T: Send + Sync + 'static> Drop for InitCompletionGuard<T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let fallback = std::sync::Arc::<str>::from(
+            "ONNX initialization worker panicked before publishing a terminal result",
+        );
+        let _ = self.shared.result.set(Err(fallback));
+        self.shared.notify.notify_waiters();
+    }
+}
+
+#[cfg(feature = "onnx-experimental")]
+impl<T: Send + Sync + 'static> CancellationSafeInit<T> {
+    fn new() -> Self {
+        Self {
+            result: std::sync::OnceLock::new(),
+            started: std::sync::atomic::AtomicBool::new(false),
+            slow_warning_emitted: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn get_or_spawn<F>(
+        self: &std::sync::Arc<Self>,
+        thread_name: &str,
+        load: F,
+    ) -> Result<std::sync::Arc<T>>
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+
+        if !self.started.swap(true, Ordering::AcqRel) {
+            let shared = std::sync::Arc::clone(self);
+            let thread_name = thread_name.to_string();
+            let worker_name = thread_name.clone();
+            let started = std::time::Instant::now();
+            tracing::info!(%thread_name, "ONNX lazy initialization scheduled");
+            let spawn = std::thread::Builder::new()
+                .name(thread_name.clone())
+                .spawn(move || {
+                    let mut completion = InitCompletionGuard {
+                        shared: std::sync::Arc::clone(&shared),
+                        armed: true,
+                    };
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match load() {
+                            Ok(value) => Ok(std::sync::Arc::new(value)),
+                            Err(error) => Err(std::sync::Arc::<str>::from(format!("{error:#}"))),
+                        }))
+                        .unwrap_or_else(|payload| {
+                            let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+                                (*message).to_string()
+                            } else if let Some(message) = payload.downcast_ref::<String>() {
+                                message.clone()
+                            } else {
+                                "non-string panic payload".to_string()
+                            };
+                            Err(std::sync::Arc::<str>::from(format!(
+                                "ONNX initialization loader panicked: {detail}"
+                            )))
+                        });
+                    let elapsed_ms = started.elapsed().as_millis();
+                    let _ = shared.result.set(result);
+                    shared.notify.notify_waiters();
+                    completion.armed = false;
+
+                    let published = shared
+                        .result
+                        .get()
+                        .expect("initialization result was just published");
+                    match published {
+                        Ok(_) => tracing::info!(
+                            thread_name = %worker_name,
+                            elapsed_ms,
+                            "ONNX lazy initialization completed"
+                        ),
+                        Err(error) => tracing::error!(
+                            thread_name = %worker_name,
+                            elapsed_ms,
+                            %error,
+                            "ONNX lazy initialization failed"
+                        ),
+                    }
+                });
+            if let Err(error) = spawn {
+                let error = std::sync::Arc::<str>::from(format!(
+                    "spawn ONNX initialization thread {thread_name}: {error}"
+                ));
+                let _ = self.result.set(Err(error));
+                self.notify.notify_waiters();
+            }
+        }
+
+        loop {
+            let notified = self.notify.notified();
+            if let Some(result) = self.result.get() {
+                return result
+                    .clone()
+                    .map_err(|error| anyhow!("ONNX model initialization failed: {error}"));
+            }
+            if self
+                .slow_warning_emitted
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                notified.await;
+            } else {
+                tokio::select! {
+                    () = notified => {}
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        if !self.slow_warning_emitted.swap(
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                        ) {
+                            tracing::warn!(
+                                "ONNX lazy initialization is still running after 30 seconds"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[cfg(feature = "onnx-experimental")]
 struct OnnxShared {
-    cell: OnnxCell,
+    init: std::sync::Arc<CancellationSafeInit<crate::onnx::OnnxEmbedder>>,
     calls: std::sync::Arc<tokio::sync::Semaphore>,
     bytes: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -187,7 +326,7 @@ impl OnnxHandle {
         }
         cells.retain(|_, shared| shared.strong_count() > 0);
         let shared = std::sync::Arc::new(OnnxShared {
-            cell: OnnxCell::new(),
+            init: std::sync::Arc::new(CancellationSafeInit::new()),
             calls: std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.max_inflight_calls.max(1))),
             bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 cfg.max_inflight_input_bytes.max(1),
@@ -198,11 +337,10 @@ impl OnnxHandle {
     }
 
     async fn get(&self) -> Result<std::sync::Arc<crate::onnx::OnnxEmbedder>> {
+        let cfg = self.cfg.clone();
         self.shared
-            .cell
-            .get_or_try_init(|| async {
-                let cfg = self.cfg.clone();
-                let model = tokio::task::spawn_blocking(move || {
+            .init
+            .get_or_spawn("xerj-onnx-init", move || {
                     let model_bytes = std::fs::read(&cfg.model_path).map_err(|e| {
                         anyhow!("read ONNX model {}: {e}", cfg.model_path.display())
                     })?;
@@ -235,14 +373,9 @@ impl OnnxHandle {
                         dimensions = crate::onnx::DIMS,
                         "experimental ONNX embedding backend active; first semantic inference loaded the verified model"
                     );
-                    Ok::<_, anyhow::Error>(embedder)
-                })
-                .await
-                .map_err(|e| anyhow!("ONNX model load task panicked: {e}"))??;
-                Ok::<_, anyhow::Error>(std::sync::Arc::new(model))
+                    Ok(embedder)
             })
             .await
-            .cloned()
     }
 
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
@@ -341,9 +474,10 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 
 #[cfg(all(test, feature = "onnx-experimental"))]
 mod onnx_handle_tests {
-    use super::{OnnxConfig, OnnxHandle};
+    use super::{CancellationSafeInit, OnnxConfig, OnnxHandle};
     use crate::onnx::MicrobatchConfig;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn cfg(model_sha256: &str) -> OnnxConfig {
@@ -432,9 +566,158 @@ mod onnx_handle_tests {
         assert!(error.contains("before tokenization"), "{error}");
         assert!(error.contains("max_pending=1"), "{error}");
         assert!(
-            handle.shared.cell.get().is_none(),
+            handle.shared.init.result.get().is_none(),
             "model must remain unloaded"
         );
+    }
+
+    #[tokio::test]
+    async fn first_initialization_completes_without_a_second_caller() {
+        let init = Arc::new(CancellationSafeInit::new());
+        let value = init
+            .get_or_spawn("onnx-init-first-test", || Ok::<_, anyhow::Error>(41usize))
+            .await
+            .unwrap();
+        assert_eq!(*value, 41);
+    }
+
+    #[tokio::test]
+    async fn cancelling_first_waiter_does_not_cancel_or_duplicate_initialization() {
+        let init = Arc::new(CancellationSafeInit::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let first_init = Arc::clone(&init);
+        let first_loads = Arc::clone(&loads);
+        let first = tokio::spawn(async move {
+            first_init
+                .get_or_spawn("onnx-init-cancel-test", move || {
+                    first_loads.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    release_rx.recv().unwrap();
+                    Ok::<_, anyhow::Error>(42usize)
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        let _ = first.await;
+        release_tx.send(()).unwrap();
+
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            init.get_or_spawn("unused-duplicate-loader", || {
+                panic!("cancelled waiter must not cause a second model load")
+            }),
+        )
+        .await
+        .expect("retry must not hang")
+        .unwrap();
+        assert_eq!(*value, 42);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_callers_share_one_initialization() {
+        let init = Arc::new(CancellationSafeInit::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut callers = Vec::new();
+        for _ in 0..16 {
+            let init = Arc::clone(&init);
+            let loads = Arc::clone(&loads);
+            callers.push(tokio::spawn(async move {
+                init.get_or_spawn("onnx-init-concurrent-test", move || {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    Ok::<_, anyhow::Error>(43usize)
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        for caller in callers {
+            assert_eq!(*caller.await.unwrap(), 43);
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn loader_panic_wakes_concurrent_and_future_callers_without_retrying() {
+        let init = Arc::new(CancellationSafeInit::<usize>::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut callers = Vec::new();
+        for _ in 0..8 {
+            let init = Arc::clone(&init);
+            let loads = Arc::clone(&loads);
+            callers.push(tokio::spawn(async move {
+                init.get_or_spawn("onnx-init-panic-test", move || {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    panic!("synthetic loader panic")
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+            }));
+        }
+
+        let mut errors = Vec::new();
+        for caller in callers {
+            errors.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), caller)
+                    .await
+                    .expect("panic must wake every concurrent caller")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(errors.iter().all(|error| {
+            error.contains("loader panicked") && error.contains("synthetic loader panic")
+        }));
+
+        let future_error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            init.get_or_spawn("unused-after-panic", || {
+                panic!("a retained panic error must not retry the loader")
+            }),
+        )
+        .await
+        .expect("future caller must receive the retained error promptly")
+        .unwrap_err()
+        .to_string();
+        assert_eq!(future_error, errors[0]);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn initialization_outlives_the_runtime_that_owned_the_first_waiter() {
+        let init = Arc::new(CancellationSafeInit::new());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_init = Arc::clone(&init);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let first = runtime.spawn(async move {
+            first_init
+                .get_or_spawn("onnx-init-runtime-test", move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, anyhow::Error>(44usize)
+                })
+                .await
+        });
+        started_rx.recv().unwrap();
+        first.abort();
+        drop(runtime);
+        release_tx.send(()).unwrap();
+
+        let second_runtime = tokio::runtime::Runtime::new().unwrap();
+        let value = second_runtime
+            .block_on(init.get_or_spawn("unused-after-runtime-drop", || {
+                panic!("runtime replacement must not duplicate initialization")
+            }))
+            .unwrap();
+        assert_eq!(*value, 44);
     }
 }
 
