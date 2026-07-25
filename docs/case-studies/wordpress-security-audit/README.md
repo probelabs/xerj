@@ -101,6 +101,10 @@ read; scale and durability come from XERJ.
 - [`VERIFY-AND-TRACE.md`](VERIFY-AND-TRACE.md) — **verify the data is live in
   XERJ and trace any sink end-to-end via the API** (sink → enclosing fn → sources
   → reverse callers → authz), with `sink-census/trace_sink.py`.
+- [`sink-census/TAINT-ANALYSIS.md`](sink-census/TAINT-ANALYSIS.md) — **interprocedural
+  taint over the XERJ call graph** (source → sink, no sanitizer on path): 70
+  candidate flows on WP core, ranked, with honest real-vs-FP verification
+  (`sink-census/taint_analysis.py`).
 - [`sink-census/PHP-DANGEROUS-FUNCTIONS.md`](sink-census/PHP-DANGEROUS-FUNCTIONS.md) —
   the **full map of 275 dangerous PHP functions** (28 categories, taint-arg noted).
 - [`sink-census/PHP-SECURITY-GUIDE.md`](sink-census/PHP-SECURITY-GUIDE.md) — the

@@ -87,6 +87,14 @@ incomplete allow/deny list, e.g. SSRF missing `169.254`), and sanitizer
 *composition* order (`wp_compose_index.py`). Verify each candidate by reading,
 then by executing the flow. Trace reachability to real input.
 
+### 6b. Interprocedural taint (`taint_analysis.py`)
+Once the AST is exported, run source->sink taint over the XERJ call graph: every
+function that reads a request source, walked to every dangerous sink it can reach
+with no sanitizer on the path (ranked by severity, full path per flow). This is
+high-recall REACHABILITY triage, not precise per-argument data-flow — the SQL
+flows include WP_Query (safe) and intval-guarded sinks, so read each candidate.
+See `TAINT-ANALYSIS.md`.
+
 ## Honesty rules (these make the result trustworthy)
 1. Precision from the graph/facts; full-text only to navigate. FTS over raw code
    is noisy for security.
