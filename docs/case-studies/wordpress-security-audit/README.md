@@ -100,7 +100,7 @@ read; scale and durability come from XERJ.
   zero gaps against grep, then AI-enrich into a queryable ledger (`sink-census/`).
 - [`sink-census/PHP-DANGEROUS-FUNCTIONS.md`](sink-census/PHP-DANGEROUS-FUNCTIONS.md) —
   the **full map of 275 dangerous PHP functions** (28 categories, taint-arg noted).
-- **Copyable Claude Code skill**: [`.claude/skills/xerj-security-audit/`](../../../.claude/skills/xerj-security-audit/SKILL.md)
+- **Copyable Claude Code skill**: [`skill/SKILL.md`](skill/SKILL.md)
   — install it and run this whole workflow on your own codebase.
 - [`FINDINGS.md`](FINDINGS.md) — the SSRF vulnerability, with verification and
   reachability.

@@ -31,7 +31,7 @@ Everything here is reproducible; scripts are in
 > **The full map is the reference.** [`PHP-DANGEROUS-FUNCTIONS.md`](sink-census/PHP-DANGEROUS-FUNCTIONS.md)
 > is the readable table of all 275 functions; `sink-census/php_dangerous_functions.json`
 > is the machine-readable source. This whole recipe is packaged as a copyable
-> Claude Code skill — see [`.claude/skills/xerj-security-audit/`](../../../.claude/skills/xerj-security-audit/SKILL.md).
+> Claude Code skill — see [`skill/SKILL.md`](skill/SKILL.md).
 
 ## Step 1 — Map the dangerous built-ins (the full reference)
 
