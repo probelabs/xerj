@@ -93,10 +93,15 @@ read; scale and durability come from XERJ.
 
 ## Contents
 
+- [`PLAYBOOK.md`](PLAYBOOK.md) — **step-by-step guide with the copy-paste prompts**
+  to drive an AI + XERJ through this audit, and to point it at your own codebase.
 - [`FINDINGS.md`](FINDINGS.md) — the SSRF vulnerability, with verification and
   reachability.
-- [`REPRODUCE.md`](REPRODUCE.md) — exact steps to rebuild the index and rerun
+- [`REPRODUCE.md`](REPRODUCE.md) — exact commands to rebuild the index and rerun
   every result.
+- [`IMPROVEMENTS.md`](IMPROVEMENTS.md) — the roadmap: engine, extractor, detector,
+  and workflow improvements that close the case study.
+- [`verify_ssrf.py`](verify_ssrf.py) — self-contained, executes the finding.
 - Detectors and scripts: [`../../examples/ast-vuln-graph/`](../../examples/ast-vuln-graph/)
   (`wp_audit_index.py`, `wp_authz_graph.py`, `wp_checkuse_idor.py`,
   `wp_admin_pages.py`, `wp_ssrf_ranges.py`, `wp_compose_index.py`).
@@ -116,3 +121,15 @@ read; scale and durability come from XERJ.
   sinks, self-scoped writes, polymorphic caps) — every candidate still needs a
   human/AI read to confirm. The value is that there are few enough to read them
   all.
+
+## Run it yourself, then improve it
+
+Start with [`PLAYBOOK.md`](PLAYBOOK.md) — it has the exact prompts to drive an AI
+through this audit and to retarget it at your own stack (the taint model is data,
+not code). Then see [`IMPROVEMENTS.md`](IMPROVEMENTS.md) for the roadmap: the
+engine fixes that make the structured index strictly better than grep, the
+extractor precision levers, the detector classes still to add, and the workflow
+(AST-aware `autoindex`, findings-as-index, MCP-native auditing, CI mode) that
+would make this a one-command capability. The invitation is to point it at your
+code, add your framework's fact-lists, and compile every invariant you learn into
+a fingerprint the next audit gets for free.
