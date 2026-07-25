@@ -172,6 +172,14 @@ pub struct IndexResponse {
     pub result: String,
 }
 
+/// Result of a same-ID serialized read-transform-write operation.
+#[derive(Debug, Clone)]
+pub struct SerializedDocumentUpdate {
+    pub response: IndexResponse,
+    /// `true` when the supplied upsert body created a previously missing ID.
+    pub created: bool,
+}
+
 /// Outcome of a single-document delete (ES `DELETE /{index}/_doc/{id}`).
 ///
 /// `found == true`  → the doc was live and is now tombstoned; `seq_no` is
@@ -4041,6 +4049,54 @@ impl Index {
         }
     }
 
+    /// Serialize the load, transform, and publication of one document ID.
+    ///
+    /// The exact-ID publication guard spans the authoritative read, caller
+    /// transform, WAL/version-map update, FTS/HNSW publication, and response.
+    /// This is the engine boundary used by API-layer scripted updates: keeping
+    /// script evaluation outside this method turns `ctx._source.n += 1` into
+    /// an unguarded read-modify-write and loses concurrent increments.
+    ///
+    /// `transform` is called only for an existing source. If the ID is missing,
+    /// `upsert` is created without applying the transform (ES's default
+    /// `scripted_upsert=false` behavior); without an upsert this returns
+    /// `Ok(Ok(None))`. Transform errors are returned in the inner `Result`
+    /// without publishing a write.
+    pub async fn transform_document_serialized<E, F>(
+        &self,
+        id: &str,
+        upsert: Option<Value>,
+        transform: F,
+    ) -> Result<std::result::Result<Option<SerializedDocumentUpdate>, E>>
+    where
+        F: FnOnce(Value) -> std::result::Result<Value, E>,
+    {
+        let publication_guard = self.write_publication.lock(id.to_string()).await;
+        let (source, created) = match self.get_document(id).await? {
+            Some(existing) => match transform(existing) {
+                Ok(transformed) => (transformed, false),
+                Err(error) => return Ok(Err(error)),
+            },
+            None => match upsert {
+                Some(source) => (source, true),
+                None => return Ok(Ok(None)),
+            },
+        };
+        let response = self
+            .index_document_with_version_inner_guarded(
+                Some(id.to_string()),
+                source,
+                None,
+                None,
+                false,
+                Some(publication_guard),
+                false,
+                None,
+            )
+            .await?;
+        Ok(Ok(Some(SerializedDocumentUpdate { response, created })))
+    }
+
     /// Scan a document for vector fields and insert them into the HNSW graph.
     ///
     /// FIELD IDENTITY (see `hnsw_field`): one graph indexes exactly ONE
@@ -6187,8 +6243,6 @@ impl Index {
         let _publication_guard = self.write_publication.lock(id.to_string()).await;
         #[cfg(test)]
         self.publication_test_point(id, PublicationTestPoint::Acquired);
-        self.dataset_version.fetch_add(1, Ordering::Release);
-
         // Optimistic concurrency check (see index_document_with_version for
         // the if_primary_term rationale).
         let _ = if_primary_term;
@@ -6255,6 +6309,10 @@ impl Index {
             });
         }
 
+        // Invalidate response caches only once the OCC check has succeeded and
+        // the delete will mutate publication state. A rejected conditional
+        // delete must not make unrelated cached responses look stale.
+        self.dataset_version.fetch_add(1, Ordering::Release);
         let deleted_seq = self.store.delete(id)?;
         #[cfg(test)]
         self.publication_test_point(id, PublicationTestPoint::AfterWalVersionMap);
@@ -26530,5 +26588,83 @@ mod write_publication_integration_tests {
         assert!(delete.seq_no > put.seq_no);
         assert!(idx.get_document("same").await.unwrap().is_none());
         assert_eq!(acquired.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_serialized_transforms_do_not_lose_read_modify_write_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("atomic-transform", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("atomic-transform").unwrap();
+        idx.index_document(Some("counter".into()), json!({"n": 0}))
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(33));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let idx = Arc::clone(&idx);
+            let start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                idx.transform_document_serialized("counter", None, |mut source| {
+                    let n = source["n"].as_u64().unwrap();
+                    source["n"] = json!(n + 1);
+                    Ok::<_, ()>(source)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .response
+            }));
+        }
+        start.wait().await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(idx.get_document("counter").await.unwrap().unwrap()["n"], 32);
+    }
+
+    #[tokio::test]
+    async fn rejected_conditional_delete_does_not_invalidate_query_cache_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("delete-epoch", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("delete-epoch").unwrap();
+        let indexed = idx
+            .index_document(Some("doc".into()), json!({"live": true}))
+            .await
+            .unwrap();
+        let before = idx.dataset_version.load(Ordering::Acquire);
+
+        let error = idx
+            .delete_document_versioned("doc", Some(indexed.seq_no + 1), Some(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("version conflict"));
+        assert_eq!(
+            idx.dataset_version.load(Ordering::Acquire),
+            before,
+            "rejected OCC delete must not invalidate cached responses"
+        );
+
+        idx.delete_document_versioned("doc", Some(indexed.seq_no), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            idx.dataset_version.load(Ordering::Acquire),
+            before + 1,
+            "successful delete invalidates cached responses exactly once"
+        );
     }
 }

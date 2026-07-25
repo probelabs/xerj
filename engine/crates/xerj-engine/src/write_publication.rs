@@ -24,6 +24,17 @@ pub(crate) struct WritePublicationGuard {
     guard: Option<OwnedMutexGuard<()>>,
 }
 
+/// Owns the registry's strong reference while `lock_owned()` is pending.
+///
+/// This is deliberately separate from [`WritePublicationGuard`]: cancelling
+/// the acquire future never constructs a guard, so cleanup must live in a
+/// value that already exists before the `.await`.
+struct PendingLock {
+    coordinator: Arc<WritePublicationCoordinator>,
+    key: String,
+    lock: Option<Arc<Mutex<()>>>,
+}
+
 impl WritePublicationCoordinator {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -66,7 +77,15 @@ impl WritePublicationCoordinator {
                 hook(&key);
             }
         }
-        let guard = Arc::clone(&lock).lock_owned().await;
+        let mut pending = PendingLock {
+            coordinator: Arc::clone(self),
+            key: key.clone(),
+            lock: Some(lock),
+        };
+        let guard = Arc::clone(pending.lock.as_ref().expect("pending lock present"))
+            .lock_owned()
+            .await;
+        let lock = pending.lock.take().expect("pending lock present");
         WritePublicationGuard {
             coordinator: Arc::clone(self),
             key,
@@ -120,6 +139,27 @@ impl WritePublicationCoordinator {
     }
 }
 
+fn remove_if_idle(coordinator: &WritePublicationCoordinator, key: &str, lock: &Arc<Mutex<()>>) {
+    if let Entry::Occupied(occupied) = coordinator.locks.entry(key.to_string()) {
+        let is_same = occupied
+            .get()
+            .upgrade()
+            .map(|registered| Arc::ptr_eq(&registered, lock))
+            .unwrap_or(false);
+        if is_same && Arc::strong_count(lock) == 1 {
+            occupied.remove();
+        }
+    }
+}
+
+impl Drop for PendingLock {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.as_ref() {
+            remove_if_idle(&self.coordinator, &self.key, lock);
+        }
+    }
+}
+
 impl Drop for WritePublicationGuard {
     fn drop(&mut self) {
         // Release the mutex before attempting registry cleanup. Any queued
@@ -127,16 +167,7 @@ impl Drop for WritePublicationGuard {
         // removal below.
         self.guard.take();
 
-        if let Entry::Occupied(occupied) = self.coordinator.locks.entry(self.key.clone()) {
-            let is_same = occupied
-                .get()
-                .upgrade()
-                .map(|registered| Arc::ptr_eq(&registered, &self.lock))
-                .unwrap_or(false);
-            if is_same && Arc::strong_count(&self.lock) == 1 {
-                occupied.remove();
-            }
-        }
+        remove_if_idle(&self.coordinator, &self.key, &self.lock);
     }
 }
 
@@ -246,9 +277,9 @@ mod tests {
         assert!(waiter.await.unwrap_err().is_cancelled());
         drop(first);
 
+        assert_eq!(coordinator.registry_len(), 0);
         let guard = coordinator.lock("cancelled").await;
         drop(guard);
-        assert_eq!(coordinator.registry_len(), 0);
     }
 
     #[tokio::test]
