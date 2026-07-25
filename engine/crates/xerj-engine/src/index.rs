@@ -44,6 +44,646 @@ impl<'a> Drop for MergeFlagClear<'a> {
     }
 }
 
+#[cfg(test)]
+mod semantic_deadline_regression_tests {
+    use super::*;
+    use crate::Engine;
+    use tempfile::TempDir;
+
+    fn engine(dir: &TempDir) -> Engine {
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        Engine::new(config).expect("engine")
+    }
+
+    fn match_all(timeout_ms: u64) -> SearchRequest {
+        SearchRequest {
+            timeout_ms: Some(timeout_ms),
+            ..SearchRequest::default()
+        }
+    }
+
+    async fn wait_for_inflight(idx: &Index, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while idx.query_inflight.len() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("single-flight state did not converge");
+    }
+
+    async fn wait_for_singleflight_follower(idx: &Index) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let subscribed = idx
+                    .query_inflight
+                    .iter()
+                    .any(|entry| entry.value().receiver_count() > 0);
+                if subscribed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follower never subscribed to leader");
+    }
+
+    async fn seed_vectors(idx: &Index) {
+        for n in 0..256 {
+            idx.index_document(
+                Some(format!("v{n}")),
+                serde_json::json!({"embedding": [1.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.test_scan_checkpoint_delay_ms
+            .store(20, Ordering::Relaxed);
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn timed_out_leader_is_not_cached() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("cache-timeout", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("cache-timeout").unwrap();
+
+        let permits = idx
+            .max_concurrent_queries
+            .acquire_many(64)
+            .await
+            .expect("query semaphore");
+        let request = match_all(1);
+        let timed_out = idx.search(&request).await.unwrap();
+        assert!(timed_out.timed_out);
+        assert_eq!(
+            idx.metric_query_count.load(Ordering::Relaxed),
+            1,
+            "admission timeout must be included in query metrics"
+        );
+        assert!(
+            idx.query_cache.is_empty(),
+            "partial timeout must never enter the result cache"
+        );
+
+        drop(permits);
+        let completed = idx.search(&request).await.unwrap();
+        assert!(!completed.timed_out);
+        assert_eq!(idx.query_cache.len(), 1);
+        let cached = idx.search(&request).await.unwrap();
+        assert!(!cached.timed_out);
+        assert_eq!(cached.took_ms, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cold_vector_segment_load_does_not_block_async_worker() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine.create_index("cold-vector", Schema::empty()).unwrap();
+        let idx = engine.get_index("cold-vector").unwrap();
+        idx.index_document(
+            Some("v1".into()),
+            serde_json::json!({"embedding": [1.0, 0.0]}),
+        )
+        .await
+        .unwrap();
+        idx.flush().await.unwrap();
+        idx.stored_value_cache.clear();
+        idx.test_stored_value_load_delay_ms
+            .store(250, Ordering::Relaxed);
+        idx.test_stored_value_load_count.store(0, Ordering::Relaxed);
+
+        let mut queries = Vec::new();
+        for _ in 0..8 {
+            let query_idx = Arc::clone(&idx);
+            queries.push(tokio::spawn(async move {
+                query_idx
+                    .run_knn_brute_force(
+                        &match_all(2_000),
+                        "embedding",
+                        &[1.0, 0.0],
+                        1,
+                        None,
+                        "cosine",
+                        None,
+                        None,
+                    )
+                    .await
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while idx.test_stored_value_load_count.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cold load never reached blocking pool");
+
+        // With one runtime worker this timer cannot complete while a
+        // synchronous 250 ms segment load is running on that worker.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tokio::time::sleep(std::time::Duration::from_millis(10)),
+        )
+        .await
+        .expect("cold segment load starved the async runtime worker");
+
+        for query in queries {
+            let result = query.await.unwrap().unwrap();
+            assert!(!result.timed_out);
+            assert_eq!(result.hits.len(), 1);
+        }
+        assert_eq!(
+            idx.test_stored_value_load_count.load(Ordering::Relaxed),
+            1,
+            "concurrent cold requests must share one parse"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn request_deadline_can_drop_cold_vector_load_wait() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("cold-deadline", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("cold-deadline").unwrap();
+        idx.index_document(
+            Some("v1".into()),
+            serde_json::json!({"embedding": [1.0, 0.0]}),
+        )
+        .await
+        .unwrap();
+        idx.flush().await.unwrap();
+        idx.stored_value_cache.clear();
+        idx.test_stored_value_load_delay_ms
+            .store(250, Ordering::Relaxed);
+
+        let started = std::time::Instant::now();
+        let result = idx
+            .run_knn_brute_force(
+                &match_all(20),
+                "embedding",
+                &[1.0, 0.0],
+                1,
+                Some(Box::new(QueryNode::MatchAll)),
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "request waited for detached cold load instead of its deadline"
+        );
+
+        // `spawn_blocking` is deliberately not aborted: the immutable load
+        // completes and warms the cache for a later request.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while idx.stored_value_cache.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached load did not warm the cache");
+    }
+
+    #[tokio::test]
+    async fn retired_segment_cannot_be_reinserted_by_detached_load() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("retired-load", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("retired-load").unwrap();
+        idx.index_document(Some("v1".into()), serde_json::json!({"value": 1}))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        let old_meta = idx.store.snapshot().segments[0].clone();
+        idx.stored_value_cache.clear();
+        idx.test_stored_value_load_pause_before_publish
+            .store(true, Ordering::Release);
+        idx.test_stored_value_load_ready_to_publish
+            .store(false, Ordering::Release);
+
+        let load_idx = Arc::clone(&idx);
+        let old_id = old_meta.id.clone();
+        let load = tokio::spawn(async move { load_idx.stored_values_for_async(&old_id).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !idx
+                .test_stored_value_load_ready_to_publish
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cold load did not reach publication gate");
+
+        // Publish a replacement exactly as merge does, then perform the
+        // stored-value eviction while holding the lifecycle write guard.
+        let mut replacement = old_meta.clone();
+        replacement.id = Uuid::new_v4().to_string();
+        replacement.seg_path = format!("segments/{}.seg", replacement.id);
+        replacement.sidx_path = format!("segments/{}.sidx", replacement.id);
+        idx.store
+            .apply_merge(std::slice::from_ref(&old_meta.id), replacement)
+            .unwrap();
+        {
+            let _publication = idx.stored_value_cache_lifecycle.write();
+            idx.stored_value_cache.remove(&old_meta.id);
+        }
+        idx.test_stored_value_load_pause_before_publish
+            .store(false, Ordering::Release);
+
+        assert!(
+            load.await.unwrap().is_some(),
+            "old-snapshot caller should receive the completed immutable load"
+        );
+        assert!(
+            !idx.stored_value_cache.contains_key(&old_meta.id),
+            "detached completion resurrected a retired segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cold_load_closes_followers_and_clears_singleflight() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine.create_index("failed-load", Schema::empty()).unwrap();
+        let idx = engine.get_index("failed-load").unwrap();
+
+        let mut followers = Vec::new();
+        for _ in 0..4 {
+            let idx = Arc::clone(&idx);
+            followers.push(tokio::spawn(async move {
+                idx.stored_values_for_async("missing-segment").await
+            }));
+        }
+        for follower in followers {
+            assert!(follower.await.unwrap().is_none());
+        }
+        assert!(idx.stored_value_loads.is_empty());
+        assert!(idx.stored_value_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn singleflight_wait_timeout_is_counted() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("follower-metrics", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("follower-metrics").unwrap();
+        let request = match_all(1);
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hasher::write(&mut hasher, &bytes);
+        let key = (
+            std::hash::Hasher::finish(&hasher),
+            idx.dataset_version.load(Ordering::Acquire),
+        );
+        let (leader, _receiver) = tokio::sync::watch::channel(None);
+        idx.query_inflight.insert(key, leader);
+
+        let follower = idx.search(&request).await.unwrap();
+        assert!(follower.timed_out);
+        assert_eq!(
+            idx.metric_query_count.load(Ordering::Relaxed),
+            1,
+            "single-flight wait timeout must be counted before leader returns"
+        );
+        idx.query_inflight.remove(&key);
+    }
+
+    #[tokio::test]
+    async fn cancelled_singleflight_leader_drains_and_follower_recomputes() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("cancel-leader", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("cancel-leader").unwrap();
+
+        let permits = idx
+            .max_concurrent_queries
+            .acquire_many(64)
+            .await
+            .expect("query semaphore");
+        let request = match_all(250);
+
+        let leader_idx = Arc::clone(&idx);
+        let leader_request = request.clone();
+        let leader = tokio::spawn(async move { leader_idx.search(&leader_request).await });
+        wait_for_inflight(&idx, 1).await;
+
+        let follower_idx = Arc::clone(&idx);
+        let follower_request = request.clone();
+        let follower = tokio::spawn(async move { follower_idx.search(&follower_request).await });
+        wait_for_singleflight_follower(&idx).await;
+
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        drop(permits);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), follower)
+            .await
+            .expect("follower remained stuck on cancelled leader")
+            .expect("follower task")
+            .expect("follower search");
+        assert!(
+            !result.timed_out,
+            "follower must recompute within its budget"
+        );
+        wait_for_inflight(&idx, 0).await;
+        assert_eq!(idx.query_cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_multi_knn_preserves_partial_timeout_state() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("multi-timeout", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("multi-timeout").unwrap();
+        seed_vectors(&idx).await;
+        let clause = PeeledKnn {
+            field: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 10,
+            num_candidates: None,
+            filter: None,
+            boost: None,
+            similarity: None,
+        };
+        let result = idx
+            .run_multi_knn_brute_force(
+                &match_all(250),
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+                vec![clause],
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            2,
+            "single child must do partial work before parent propagation"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_multi_knn_child_stops_later_clause_scheduling() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine.create_index("multi-stop", Schema::empty()).unwrap();
+        let idx = engine.get_index("multi-stop").unwrap();
+        seed_vectors(&idx).await;
+        let clause = PeeledKnn {
+            field: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 10,
+            num_candidates: None,
+            filter: None,
+            boost: None,
+            similarity: None,
+        };
+        let result = idx
+            .run_multi_knn_brute_force(
+                &match_all(250),
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+                vec![clause.clone(), clause],
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            2,
+            "second clause must not execute after the first child times out"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_future_deadlines_stop_after_nonzero_partial_scan() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("future-deadline", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("future-deadline").unwrap();
+        seed_vectors(&idx).await;
+        let request = match_all(250);
+        // Isolate cooperative scan timing from the independently tested cold
+        // segment-load deadline: warm any auto-flushed segment first.
+        idx.test_scan_checkpoint_delay_ms
+            .store(0, Ordering::Relaxed);
+        idx.run_knn_brute_force_with_deadline(
+            &request,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            "embedding",
+            &[1.0, 0.0],
+            10,
+            None,
+            "cosine",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for timeout_ms in [1, 10, 250] {
+            idx.test_scan_checkpoint_delay_ms
+                .store(timeout_ms + 10, Ordering::Relaxed);
+            idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let result = idx
+                .run_knn_brute_force_with_deadline(
+                    &request,
+                    started + std::time::Duration::from_millis(timeout_ms),
+                    "embedding",
+                    &[1.0, 0.0],
+                    10,
+                    None,
+                    "cosine",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(result.timed_out);
+            assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+            assert_eq!(
+                idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+                2,
+                "scan must pass checkpoint zero and stop at the later checkpoint"
+            );
+            assert!(started.elapsed() >= std::time::Duration::from_millis(timeout_ms));
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_hybrid_preserves_partial_timeout_state() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("hybrid-timeout", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("hybrid-timeout").unwrap();
+        seed_vectors(&idx).await;
+        let knn = QueryNode::Knn {
+            field: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 10,
+            num_candidates: None,
+            filter: None,
+            boost: None,
+            similarity: None,
+        };
+        let result = idx
+            .run_hybrid_with_deadline(
+                &match_all(250),
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+                vec![xerj_query::ast::WeightedQuery {
+                    query: knn,
+                    weight: 1.0,
+                }],
+                xerj_query::ast::FusionStrategy::Rrf { k: 60 },
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            2,
+            "hybrid child must do partial work before propagating timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_knn_uses_the_shared_request_deadline() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("nested-timeout", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("nested-timeout").unwrap();
+        for n in 0..256 {
+            idx.index_document(
+                Some(format!("n{n}")),
+                serde_json::json!({"items": [{"vector": [1.0, 0.0]}]}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.test_scan_checkpoint_delay_ms
+            .store(20, Ordering::Relaxed);
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+
+        let request = SearchRequest {
+            query: QueryNode::Nested {
+                path: "items".into(),
+                query: Box::new(QueryNode::Knn {
+                    field: "items.vector".into(),
+                    vector: vec![1.0, 0.0],
+                    k: 10,
+                    num_candidates: Some(10),
+                    filter: None,
+                    boost: None,
+                    similarity: None,
+                }),
+                score_mode: None,
+            },
+            timeout_ms: Some(5),
+            ..SearchRequest::default()
+        };
+        let result = idx.search(&request).await.unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            2,
+            "nested scan must stop at its first non-zero checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_unique_semantic_requests_share_bounded_deadlines() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        let mut schema = Schema::empty();
+        let mut field = FieldConfig::new("body", FieldType::Text);
+        field.options.dimensions = Some(16);
+        field.options.similarity = Some("cosine".into());
+        field.embedding = Some(xerj_common::types::EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("body_vector".into()),
+        });
+        schema.fields.push(field);
+        engine.create_index("semantic-concurrent", schema).unwrap();
+        let idx = engine.get_index("semantic-concurrent").unwrap();
+        for n in 0..256 {
+            idx.index_document(
+                Some(format!("s{n}")),
+                serde_json::json!({"body": format!("semantic document number {n}")}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.test_scan_checkpoint_delay_ms
+            .store(200, Ordering::Relaxed);
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+
+        let started = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for n in 0..8 {
+            let idx = Arc::clone(&idx);
+            tasks.push(tokio::spawn(async move {
+                let request = SearchRequest {
+                    query: QueryNode::SemanticSearch {
+                        field: "body".into(),
+                        text: format!("unique concurrent deadline {n}"),
+                        k: 10,
+                        filter: None,
+                        boost: None,
+                    },
+                    timeout_ms: Some(100),
+                    ..SearchRequest::default()
+                };
+                idx.search(&request).await
+            }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap().unwrap();
+            assert!(result.timed_out);
+            assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        }
+        assert!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed) >= 16,
+            "all semantic requests must reach multiple cooperative scan checkpoints"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "concurrent semantic scans exceeded their own deadlines"
+        );
+    }
+}
+
 // Doc-values (columnar) fast path for size:0 + match_all + aggs — child
 // module so it can reach Index's private fields/methods via `super::`.
 #[path = "fast_aggs.rs"]
@@ -170,6 +810,14 @@ pub struct IndexResponse {
     pub seq_no: u64,
     pub version: u64,
     pub result: String,
+}
+
+/// Result of a same-ID serialized read-transform-write operation.
+#[derive(Debug, Clone)]
+pub struct SerializedDocumentUpdate {
+    pub response: IndexResponse,
+    /// `true` when the supplied upsert body created a previously missing ID.
+    pub created: bool,
 }
 
 /// Outcome of a single-document delete (ES `DELETE /{index}/_doc/{id}`).
@@ -404,6 +1052,19 @@ fn l2_normalize_vec(v: &mut [f32]) {
 
 // ── Index ────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationTestPoint {
+    Acquired,
+    AfterWalVersionMap,
+    AfterFts,
+    AfterHnsw,
+    BeforeRelease,
+}
+
+#[cfg(test)]
+type PublicationTestHook = Arc<dyn Fn(&str, PublicationTestPoint) + Send + Sync + 'static>;
+
 /// Per-index coordinator.
 ///
 /// Owns the storage layer (`IndexStore`), the FTS memtable, and the schema.
@@ -437,6 +1098,11 @@ pub struct Index {
     /// clients on N different shards run truly in parallel on the
     /// write side.  Query paths iterate all shards.
     memtable: Arc<crate::memtable::ShardedFtsMemtable>,
+    /// Exact per-document ordering shared by all publication stages wired to
+    /// this coordinator. Idle keys are removed immediately.
+    write_publication: Arc<crate::write_publication::WritePublicationCoordinator>,
+    #[cfg(test)]
+    publication_test_hook: Arc<parking_lot::RwLock<Option<PublicationTestHook>>>,
     doc_count: Arc<AtomicU64>,
     /// Counter for `update` operations that detected no change to the
     /// existing source — surfaced via `indices.stats` as
@@ -541,6 +1207,18 @@ pub struct Index {
     /// from starving other indices in a multi-tenant deployment — a noisy
     /// neighbour cannot exhaust all available query slots.
     max_concurrent_queries: Arc<Semaphore>,
+    #[cfg(test)]
+    test_scan_checkpoint_delay_ms: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_scan_checkpoint_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_stored_value_load_delay_ms: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_stored_value_load_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_stored_value_load_pause_before_publish: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    test_stored_value_load_ready_to_publish: Arc<std::sync::atomic::AtomicBool>,
     // ── Per-index enrich lookup tables ────────────────────────────────────────
     /// Named enrich tables: each table maps a key to a JSON object of extra
     /// fields to merge into matching documents at ingest time.
@@ -681,6 +1359,18 @@ pub struct Index {
     /// are immutable once flushed, so this cache is correct without
     /// invalidation. Same `Left unbounded for now` caveat as `dv_cache`.
     stored_value_cache: Arc<dashmap::DashMap<String, Arc<Vec<Value>>>>,
+    /// Serializes the short "is this segment still published? + cache insert"
+    /// transaction against merge eviction. Segment parsing never holds it.
+    stored_value_cache_lifecycle: Arc<parking_lot::RwLock<()>>,
+    /// Per-segment cancellation-safe cold-load single-flight. The sender
+    /// publishes the immutable parsed section to every concurrent vector
+    /// query; the detached producer survives cancellation of any requester.
+    stored_value_loads:
+        Arc<dashmap::DashMap<String, tokio::sync::watch::Sender<Option<Arc<Vec<Value>>>>>>,
+    /// Bounds simultaneous whole-segment decompression/parsing across distinct
+    /// cold segments. Per-segment single-flight removes duplicate work; this
+    /// bound prevents a many-segment cold storm from multiplying peak memory.
+    stored_value_load_semaphore: Arc<Semaphore>,
 
     /// Per-segment cache of the DECOMPRESSED stored section plus per-doc
     /// `(start, end)` byte offsets, used by the sorted-DV candidate path
@@ -811,6 +1501,21 @@ pub struct Index {
 }
 
 impl Index {
+    #[cfg(test)]
+    fn publication_test_point(&self, id: &str, point: PublicationTestPoint) {
+        // Clone the callback while holding the hook registry lock, then invoke
+        // it after releasing that lock. Test barriers may intentionally block.
+        let hook = self.publication_test_hook.read().clone();
+        if let Some(hook) = hook {
+            hook(id, point);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_publication_test_hook(&self, hook: Option<PublicationTestHook>) {
+        *self.publication_test_hook.write() = hook;
+    }
+
     /// Create a new index at `data_dir/<name>`.
     pub fn create(
         name: IndexName,
@@ -929,6 +1634,9 @@ impl Index {
                     config.engine.ingest_shards,
                 ),
             ),
+            write_publication: crate::write_publication::WritePublicationCoordinator::new(),
+            #[cfg(test)]
+            publication_test_hook: Arc::new(parking_lot::RwLock::new(None)),
             doc_count: Arc::new(AtomicU64::new(0)),
             noop_update_count: Arc::new(AtomicU64::new(0)),
             request_cache_seen: Arc::new(RwLock::new(RequestCacheSeen::with_capacity(65_536))),
@@ -945,6 +1653,22 @@ impl Index {
             schema_hash_epoch: Arc::new(AtomicU64::new(0)),
             last_flush_doc_count: Arc::new(AtomicU64::new(0)),
             max_concurrent_queries: Arc::new(Semaphore::new(64)),
+            #[cfg(test)]
+            test_scan_checkpoint_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_scan_checkpoint_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_stored_value_load_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_stored_value_load_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_stored_value_load_pause_before_publish: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(test)]
+            test_stored_value_load_ready_to_publish: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             hnsw: Arc::new(RwLock::new(None)),
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
@@ -979,6 +1703,9 @@ impl Index {
             id_pos_cache: Arc::new(dashmap::DashMap::new()),
             row_seq_cache: Arc::new(dashmap::DashMap::new()),
             stored_value_cache: Arc::new(dashmap::DashMap::new()),
+            stored_value_cache_lifecycle: Arc::new(parking_lot::RwLock::new(())),
+            stored_value_loads: Arc::new(dashmap::DashMap::new()),
+            stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(dashmap::DashMap::new()),
             stored_slices_cache_bytes: Arc::new(AtomicU64::new(0)),
             decoded_stored_cache: Arc::new(dashmap::DashMap::new()),
@@ -1182,9 +1909,28 @@ impl Index {
             has_date_fields: AtomicBool::new(has_dates),
             date_format_exclusions: std::sync::RwLock::new(Arc::new(Default::default())),
             max_concurrent_queries: Arc::new(Semaphore::new(64)),
+            #[cfg(test)]
+            test_scan_checkpoint_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_scan_checkpoint_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_stored_value_load_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_stored_value_load_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_stored_value_load_pause_before_publish: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(test)]
+            test_stored_value_load_ready_to_publish: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             store,
             memtable: Arc::new(memtable),
+            write_publication: crate::write_publication::WritePublicationCoordinator::new(),
+            #[cfg(test)]
+            publication_test_hook: Arc::new(parking_lot::RwLock::new(None)),
             doc_count: Arc::new(AtomicU64::new(total_doc_count)),
             noop_update_count: Arc::new(AtomicU64::new(0)),
             request_cache_seen: Arc::new(RwLock::new(RequestCacheSeen::with_capacity(65_536))),
@@ -1233,6 +1979,9 @@ impl Index {
             id_pos_cache: Arc::new(dashmap::DashMap::new()),
             row_seq_cache: Arc::new(dashmap::DashMap::new()),
             stored_value_cache: Arc::new(dashmap::DashMap::new()),
+            stored_value_cache_lifecycle: Arc::new(parking_lot::RwLock::new(())),
+            stored_value_loads: Arc::new(dashmap::DashMap::new()),
+            stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(dashmap::DashMap::new()),
             stored_slices_cache_bytes: Arc::new(AtomicU64::new(0)),
             decoded_stored_cache: Arc::new(dashmap::DashMap::new()),
@@ -1283,26 +2032,17 @@ impl Index {
     ) -> Result<IndexResponse> {
         let doc_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let strict = version_type != "external_gte";
-        // CAS against the caller's prior external version.
-        if let Some(existing) = self.external_versions.get(&doc_id) {
-            let cur = *existing;
-            let ok = if strict {
-                version > cur
-            } else {
-                version >= cur
-            };
-            if !ok {
-                return Err(EngineError::Common(
-                    xerj_common::XerjError::version_conflict(&doc_id, version, cur),
-                ));
-            }
-        }
-        self.external_versions.insert(doc_id.clone(), version);
-        let mut resp = self
-            .index_document_with_version(Some(doc_id), source, None, None)
-            .await?;
-        resp.version = version;
-        Ok(resp)
+        self.index_document_with_version_inner_guarded(
+            Some(doc_id),
+            source,
+            None,
+            None,
+            false,
+            None,
+            false,
+            Some((version, strict)),
+        )
+        .await
     }
 
     /// Index a document with optional optimistic concurrency control.
@@ -1334,6 +2074,31 @@ impl Index {
         if_primary_term: Option<u64>,
         semantic_embeddings_prepared: bool,
     ) -> Result<IndexResponse> {
+        self.index_document_with_version_inner_guarded(
+            id,
+            source,
+            if_seq_no,
+            if_primary_term,
+            semantic_embeddings_prepared,
+            None,
+            false,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn index_document_with_version_inner_guarded(
+        &self,
+        id: Option<String>,
+        source: Value,
+        if_seq_no: Option<u64>,
+        if_primary_term: Option<u64>,
+        semantic_embeddings_prepared: bool,
+        publication_guard: Option<crate::write_publication::WritePublicationGuard>,
+        create_only: bool,
+        external_version: Option<(u64, bool)>,
+    ) -> Result<IndexResponse> {
         // Check write block.
         if self.is_write_blocked().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
@@ -1347,14 +2112,38 @@ impl Index {
         // Process-wide admission: disk flood-stage block (item 3) + parent
         // memory circuit breaker (item 1). Fires before any per-index work.
         self.governor_write_gate()?;
-        // Invalidate the response cache: every doc write bumps the
-        // dataset version, which is part of the cache key, so old
-        // entries become invisible to lookups.  No clear() needed —
-        // they age out on the next 1k-entry truncation.
-        self.dataset_version.fetch_add(1, Ordering::Release);
-
         let index_start = std::time::Instant::now();
         let doc_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        // `index.default_pipeline` is resolved and executed at the API layer
+        // (xerj-api es_compat::resolve_effective_pipeline) before the document
+        // reaches the engine, so no pipeline handling is needed here.
+
+        // Auto-embed `semantic_text` fields: vectorise the field's text into
+        // its companion vector field (`<field>_vector`) so it becomes
+        // kNN-searchable. Runs before copy_to / storage so the derived vector
+        // is part of `_source` and gets picked up by HNSW indexing below.
+        let source = if semantic_embeddings_prepared {
+            source
+        } else {
+            self.apply_semantic_embeddings(source).await?
+        };
+
+        // Apply copy_to: expand the source by copying field values to their target fields.
+        let source = {
+            let schema_guard = self.schema.read().await;
+            apply_copy_to(&source, &schema_guard.schema)
+        };
+
+        // Preprocessing above is independent and can run concurrently.
+        // Everything from CAS/liveness through WAL, VM, FTS, HNSW, and the
+        // response is one exact per-document publication interval.
+        let _publication_guard = match publication_guard {
+            Some(guard) => guard,
+            None => self.write_publication.lock(doc_id.clone()).await,
+        };
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::Acquired);
 
         // Optimistic concurrency check: honour `if_seq_no` whenever it
         // is supplied. ES requires `if_primary_term` alongside it, but
@@ -1383,25 +2172,39 @@ impl Index {
             }
         }
 
-        // `index.default_pipeline` is resolved and executed at the API layer
-        // (xerj-api es_compat::resolve_effective_pipeline) before the document
-        // reaches the engine, so no pipeline handling is needed here.
+        if create_only {
+            let exists = self
+                .store
+                .version_map
+                .get(&doc_id)
+                .map(|entry| !entry.deleted)
+                .unwrap_or(false)
+                || self.memtable.contains(&doc_id);
+            if exists {
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::version_conflict(&doc_id, 0, 1),
+                ));
+            }
+        }
 
-        // Auto-embed `semantic_text` fields: vectorise the field's text into
-        // its companion vector field (`<field>_vector`) so it becomes
-        // kNN-searchable. Runs before copy_to / storage so the derived vector
-        // is part of `_source` and gets picked up by HNSW indexing below.
-        let source = if semantic_embeddings_prepared {
-            source
-        } else {
-            self.apply_semantic_embeddings(source).await?
-        };
+        if let Some((version, strict)) = external_version {
+            if let Some(existing) = self.external_versions.get(&doc_id) {
+                let current = *existing;
+                let valid = if strict {
+                    version > current
+                } else {
+                    version >= current
+                };
+                if !valid {
+                    return Err(EngineError::Common(
+                        xerj_common::XerjError::version_conflict(&doc_id, version, current),
+                    ));
+                }
+            }
+        }
 
-        // Apply copy_to: expand the source by copying field values to their target fields.
-        let source = {
-            let schema_guard = self.schema.read().await;
-            apply_copy_to(&source, &schema_guard.schema)
-        };
+        // Invalidate the response cache only after admission and CAS succeed.
+        self.dataset_version.fetch_add(1, Ordering::Release);
 
         // Detect whether this is an overwrite (existing doc) vs a new
         // insert BEFORE writing to storage. Used to set the response
@@ -1419,6 +2222,15 @@ impl Index {
 
         // Write to storage WAL.
         let seq_no = self.store.index(&doc_id, source.clone())?;
+        // External-version admission becomes durable only after the WAL write
+        // succeeds. Publishing it before `store.index` would poison an exact
+        // retry when WAL append fails.
+        if let Some((external_version, _)) = external_version {
+            self.external_versions
+                .insert(doc_id.clone(), external_version);
+        }
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::AfterWalVersionMap);
 
         // Write to FTS memtable.
         {
@@ -1427,6 +2239,8 @@ impl Index {
             mem.remove(&doc_id);
             mem.insert(doc_id.clone(), &source, &schema_guard.schema, seq_no);
         }
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::AfterFts);
 
         // Bump counter (flush thresholds / stats bookkeeping only — NOT the
         // response `_version`, which is per-doc).
@@ -1493,6 +2307,8 @@ impl Index {
 
         // Index any vector fields into the HNSW index.
         self.index_vectors(&doc_id, &source).await;
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::AfterHnsw);
 
         // Trigger a background flush if memtable exceeds size or doc-count threshold.
         self.maybe_spawn_flush().await;
@@ -1509,10 +2325,14 @@ impl Index {
 
         debug!(doc_id = doc_id.as_str(), seq_no, "document indexed");
 
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::BeforeRelease);
         Ok(IndexResponse {
             id: doc_id,
             seq_no,
-            version,
+            version: external_version
+                .map(|(version, _)| version)
+                .unwrap_or(version),
             result: if existed_before {
                 "updated".to_string()
             } else {
@@ -2528,39 +3348,17 @@ impl Index {
     ///
     /// Returns `Err(VersionConflict)` if a live document with the same ID exists.
     pub async fn create_document(&self, id: String, source: Value) -> Result<IndexResponse> {
-        // Check write block first.
-        if self.is_write_blocked().await {
-            return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
-                self.name.as_str(),
-                "write",
-            )));
-        }
-        // Process-wide admission: disk flood-stage block (item 3) + parent
-        // memory circuit breaker (item 1). Fires before any per-index work.
-        self.governor_write_gate()?;
-
-        // Fail with 409 if a live document already exists with this id.
-        let already_exists = {
-            let in_version_map = self
-                .store
-                .version_map
-                .get(&id)
-                .map(|e| !e.deleted)
-                .unwrap_or(false);
-            let in_memtable = {
-                let mem = &*self.memtable;
-                mem.contains(&id)
-            };
-            in_version_map || in_memtable
-        };
-
-        if already_exists {
-            return Err(EngineError::Common(
-                xerj_common::XerjError::version_conflict(&id, 0, 1),
-            ));
-        }
-
-        self.index_document(Some(id), source).await
+        self.index_document_with_version_inner_guarded(
+            Some(id),
+            source,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+        )
+        .await
     }
 
     /// Refresh: flush the current active memtable to a disk segment.
@@ -3740,11 +4538,26 @@ impl Index {
         if merged_batches > 0 {
             self.dataset_version.fetch_add(1, AtomicOrdering::Release);
             self.query_cache.clear();
+            // Pair with cold-load publication's read guard. `apply_merge`
+            // already removed these ids from the authoritative snapshot:
+            // a loader that checked before retirement must publish before
+            // this writer and be removed here; one that arrives after this
+            // writer sees the retired snapshot and cannot publish.
+            {
+                let _publication = self.stored_value_cache_lifecycle.write();
+                for id in &dropped_seg_ids {
+                    self.stored_value_cache.remove(id.as_str());
+                }
+            }
+            // Do not remove `stored_value_loads` here. Callers holding the
+            // pre-merge snapshot are entitled to receive that immutable
+            // producer's result; the producer removes its own single-flight
+            // key on completion, and the lifecycle transaction above
+            // prevents it from retaining the retired value in the cache.
             for id in &dropped_seg_ids {
                 self.dv_cache.remove(id.as_str());
                 self.id_pos_cache.remove(id.as_str());
                 self.row_seq_cache.remove(id.as_str());
-                self.stored_value_cache.remove(id.as_str());
                 if let Some((_, slices)) = self.stored_slices_cache.remove(id.as_str()) {
                     self.stored_slices_cache_bytes
                         .fetch_sub(slices.retained_bytes(), Ordering::Relaxed);
@@ -3878,6 +4691,7 @@ impl Index {
         upsert_doc: Option<Value>,
         doc_as_upsert: bool,
     ) -> Result<Option<IndexResponse>> {
+        let publication_guard = self.write_publication.lock(id.to_string()).await;
         match self.get_document(id).await? {
             Some(existing) => {
                 // Document exists — merge partial_doc on top.
@@ -3908,14 +4722,26 @@ impl Index {
                 // object against the existing source.
                 if merged == existing {
                     self.noop_update_count.fetch_add(1, Ordering::Relaxed);
+                    let current = self.store.version_map.get(id);
                     return Ok(Some(IndexResponse {
                         id: id.to_string(),
-                        seq_no: 0,
-                        version: 1,
+                        seq_no: current.as_ref().map(|entry| entry.seq_no).unwrap_or(0),
+                        version: current.map(|entry| entry.version).unwrap_or(1),
                         result: "noop".to_string(),
                     }));
                 }
-                let resp = self.index_document(Some(id.to_string()), merged).await?;
+                let resp = self
+                    .index_document_with_version_inner_guarded(
+                        Some(id.to_string()),
+                        merged,
+                        None,
+                        None,
+                        false,
+                        Some(publication_guard),
+                        false,
+                        None,
+                    )
+                    .await?;
                 Ok(Some(resp))
             }
             None => {
@@ -3923,7 +4749,18 @@ impl Index {
                 if doc_as_upsert {
                     // Use partial_doc as the creation body.
                     let body = partial_doc.unwrap_or(Value::Object(serde_json::Map::new()));
-                    let resp = self.index_document(Some(id.to_string()), body).await?;
+                    let resp = self
+                        .index_document_with_version_inner_guarded(
+                            Some(id.to_string()),
+                            body,
+                            None,
+                            None,
+                            false,
+                            Some(publication_guard),
+                            false,
+                            None,
+                        )
+                        .await?;
                     Ok(Some(resp))
                 } else if let Some(upsert_body) = upsert_doc {
                     // Create with upsert body, then merge partial_doc on top.
@@ -3942,13 +4779,72 @@ impl Index {
                     } else {
                         upsert_body
                     };
-                    let resp = self.index_document(Some(id.to_string()), body).await?;
+                    let resp = self
+                        .index_document_with_version_inner_guarded(
+                            Some(id.to_string()),
+                            body,
+                            None,
+                            None,
+                            false,
+                            Some(publication_guard),
+                            false,
+                            None,
+                        )
+                        .await?;
                     Ok(Some(resp))
                 } else {
                     Ok(None)
                 }
             }
         }
+    }
+
+    /// Serialize the load, transform, and publication of one document ID.
+    ///
+    /// The exact-ID publication guard spans the authoritative read, caller
+    /// transform, WAL/version-map update, FTS/HNSW publication, and response.
+    /// This is the engine boundary used by API-layer scripted updates: keeping
+    /// script evaluation outside this method turns `ctx._source.n += 1` into
+    /// an unguarded read-modify-write and loses concurrent increments.
+    ///
+    /// `transform` is called only for an existing source. If the ID is missing,
+    /// `upsert` is created without applying the transform (ES's default
+    /// `scripted_upsert=false` behavior); without an upsert this returns
+    /// `Ok(Ok(None))`. Transform errors are returned in the inner `Result`
+    /// without publishing a write.
+    pub async fn transform_document_serialized<E, F>(
+        &self,
+        id: &str,
+        upsert: Option<Value>,
+        transform: F,
+    ) -> Result<std::result::Result<Option<SerializedDocumentUpdate>, E>>
+    where
+        F: FnOnce(Value) -> std::result::Result<Value, E>,
+    {
+        let publication_guard = self.write_publication.lock(id.to_string()).await;
+        let (source, created) = match self.get_document(id).await? {
+            Some(existing) => match transform(existing) {
+                Ok(transformed) => (transformed, false),
+                Err(error) => return Ok(Err(error)),
+            },
+            None => match upsert {
+                Some(source) => (source, true),
+                None => return Ok(Ok(None)),
+            },
+        };
+        let response = self
+            .index_document_with_version_inner_guarded(
+                Some(id.to_string()),
+                source,
+                None,
+                None,
+                false,
+                Some(publication_guard),
+                false,
+                None,
+            )
+            .await?;
+        Ok(Ok(Some(SerializedDocumentUpdate { response, created })))
     }
 
     /// Scan a document for vector fields and insert them into the HNSW graph.
@@ -4258,7 +5154,7 @@ impl Index {
 
             let snap = self.store.snapshot();
             for meta in snap.segments.iter() {
-                let docs_arc = match self.stored_values_for(&meta.id) {
+                let docs_arc = match self.stored_values_for_async(&meta.id).await {
                     Some(a) => a,
                     None => {
                         // Segment unreadable (transient I/O, or merged away
@@ -4491,7 +5387,6 @@ impl Index {
         similarity: &str,
     ) -> Option<SearchResult> {
         let started = std::time::Instant::now();
-
         if similarity != "cosine" {
             return None;
         }
@@ -4635,6 +5530,20 @@ impl Index {
     /// behaviour (BBQ disk quantisation, IVF clustering) are not
     /// necessary for wire-correctness on these tests because the
     /// expected doc order is deterministic given exact scoring.
+    async fn exact_scan_checkpoint(&self, _position: usize, deadline: std::time::Instant) -> bool {
+        tokio::task::yield_now().await;
+        #[cfg(test)]
+        {
+            self.test_scan_checkpoint_count
+                .fetch_add(1, Ordering::Relaxed);
+            let delay_ms = self.test_scan_checkpoint_delay_ms.load(Ordering::Relaxed);
+            if _position > 0 && delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+        std::time::Instant::now() >= deadline
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run_knn_brute_force(
         &self,
@@ -4647,7 +5556,41 @@ impl Index {
         boost: Option<f32>,
         min_similarity: Option<f32>,
     ) -> Result<SearchResult> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        self.run_knn_brute_force_with_deadline(
+            request,
+            deadline,
+            field,
+            query_vec,
+            k,
+            filter,
+            similarity,
+            boost,
+            min_similarity,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_knn_brute_force_with_deadline(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
+        field: &str,
+        query_vec: &[f32],
+        k: usize,
+        filter: Option<Box<QueryNode>>,
+        similarity: &str,
+        boost: Option<f32>,
+        min_similarity: Option<f32>,
+    ) -> Result<SearchResult> {
         let started = std::time::Instant::now();
+        let mut timed_out = false;
+        let trace_phases = std::env::var_os("XERJ_TRACE_SEMANTIC_PHASES").is_some();
+        if trace_phases {
+            tracing::info!(index=%self.name, field, k, "semantic_phase=start_brute");
+        }
 
         // ── Collect all candidate (doc_id, source) pairs ──────────────
         let mut candidates: Vec<(String, Value)> = Vec::new();
@@ -4660,23 +5603,48 @@ impl Index {
         let snap = self.store.snapshot();
         // Track seen IDs so later-segment copies don't duplicate memtable entries.
         let mut seen: HashSet<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
-        for meta in snap.segments.iter() {
+        'segments: for meta in snap.segments.iter() {
+            let segment_started = std::time::Instant::now();
             // Cache-backed: first KNN against this segment pays the
-            // I/O + decompress + simd_json parse, every subsequent
+            // I/O + decompress + serde_json parse, every subsequent
             // query reads from `stored_value_cache`. For a 100-segment
             // index this turns repeated KNN from O(seg_count * 100MB)
             // copy work into Arc clone + iterate.
-            let docs_arc = match self.stored_values_for(&meta.id) {
-                Some(a) => a,
-                None => continue,
+            // A cold miss is coalesced and parsed on the bounded blocking
+            // pool. This executor's absolute deadline can drop the await
+            // while the detached producer finishes warming the segment.
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+            let docs_arc = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.stored_values_for_async(&meta.id),
+            )
+            .await
+            {
+                Ok(Some(a)) => a,
+                Ok(None) => continue,
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
             };
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
             // Cache-backed iteration: stored_values_for() handles the
             // I/O + decode + parse; subsequent KNN over the same segment
             // is an Arc clone. The underlying parse uses serde_json (not
             // simd_json) per ffd49ac — simd_json silently corrupts some
             // raw-bytes-flush payloads, the per-doc alloc cost is
             // irrelevant on the brute-force similarity scan.
-            for doc in docs_arc.iter() {
+            for (position, doc) in docs_arc.iter().enumerate() {
+                if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                    timed_out = true;
+                    break 'segments;
+                }
                 let id = match doc.get("_id").and_then(Value::as_str) {
                     Some(s) => s.to_string(),
                     None => continue,
@@ -4720,7 +5688,11 @@ impl Index {
                 });
                 candidates.push((id, src));
             }
+            if trace_phases {
+                tracing::info!(index=%self.name, segment=%meta.id, elapsed_ms=segment_started.elapsed().as_millis() as u64, candidates=candidates.len(), "semantic_phase=load_segment");
+            }
         }
+        let collect_elapsed = started.elapsed();
 
         // ── Determine whether this field opts into SQ8 (scalar8) ──────
         // Default fields keep the exact f32 brute-force scan below,
@@ -4744,7 +5716,11 @@ impl Index {
 
             // Post-filter candidate vectors for this field: (id, src, doc_vec).
             let mut cand: Vec<(String, Value, Vec<f32>)> = Vec::with_capacity(candidates.len());
-            for (id, src) in candidates {
+            for (position, (id, src)) in candidates.into_iter().enumerate() {
+                if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                    timed_out = true;
+                    break;
+                }
                 if let Some(ref f) = filter {
                     let mut src_with_id = src.clone();
                     if let Some(obj) = src_with_id.as_object_mut() {
@@ -4812,7 +5788,11 @@ impl Index {
             let stores = self.sq8_stores.read().await;
             if let Some(store) = stores.get(field) {
                 let mut decoded = vec![0.0f32; store.dim];
-                for (id, src, _v) in cand {
+                for (position, (id, src, _v)) in cand.into_iter().enumerate() {
+                    if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                        timed_out = true;
+                        break;
+                    }
                     let codes = match store.codes.get(&id) {
                         Some(c) if c.len() == store.dim => c,
                         _ => continue,
@@ -4832,7 +5812,11 @@ impl Index {
             // kNN and short single-chunk docs have no such companion, so they
             // fall through to the exact single-vector scan below (unchanged).
             let chunk_field = format!("{field}_chunks");
-            for (id, src) in candidates {
+            for (position, (id, src)) in candidates.into_iter().enumerate() {
+                if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                    timed_out = true;
+                    break;
+                }
                 // Apply filter: if the filter doesn't match this doc, skip.
                 if let Some(ref f) = filter {
                     let mut src_with_id = src.clone();
@@ -4847,7 +5831,13 @@ impl Index {
                 {
                     // Best-matching passage over the stored chunk vectors.
                     let mut best: Option<f32> = None;
-                    for cv in &chunks {
+                    for (chunk_position, cv) in chunks.iter().enumerate() {
+                        if chunk_position & 31 == 0
+                            && self.exact_scan_checkpoint(chunk_position, deadline).await
+                        {
+                            timed_out = true;
+                            break;
+                        }
                         let dv: Vec<f32> = match cv {
                             Value::Array(a) => a
                                 .iter()
@@ -4885,6 +5875,9 @@ impl Index {
                 scored.push((id, score, src));
             }
         }
+        if trace_phases {
+            tracing::info!(index=%self.name, collect_ms=collect_elapsed.as_millis() as u64, elapsed_ms=started.elapsed().as_millis() as u64, scored=scored.len(), "semantic_phase=scored");
+        }
 
         // ── ES `knn.similarity` cutoff ─────────────────────────────────
         // Convert the RAW-metric threshold into the equivalent
@@ -4911,7 +5904,15 @@ impl Index {
         // ── Rank, cap the candidate pool at k, then paginate ──────────
         // (shared with the HNSW path so hits format / total semantics
         // cannot drift between the exact and approximate executors)
-        Ok(knn_result_from_scored(request, scored, k, started))
+        let mut result = knn_result_from_scored(request, scored, k, started);
+        result.timed_out = timed_out;
+        if timed_out {
+            result.total.relation = TotalHitsRelation::Gte;
+        }
+        if trace_phases {
+            tracing::info!(index=%self.name, elapsed_ms=started.elapsed().as_millis() as u64, hits=result.hits.len(), "semantic_phase=complete");
+        }
+        Ok(result)
     }
 
     /// PURE multi-KNN executor (the ES top-level `knn: [...]` array form,
@@ -4925,13 +5926,19 @@ impl Index {
     async fn run_multi_knn_brute_force(
         &self,
         request: &SearchRequest,
+        deadline: std::time::Instant,
         clauses: Vec<PeeledKnn>,
     ) -> Result<SearchResult> {
         let started = std::time::Instant::now();
         let mut merged: Vec<(String, f32, Value)> = Vec::new();
         let mut slot_by_id: HashMap<String, usize> = HashMap::new();
         let mut k_sum: usize = 0;
+        let mut any_timed_out = false;
         for clause in clauses {
+            if std::time::Instant::now() >= deadline {
+                any_timed_out = true;
+                break;
+            }
             k_sum = k_sum.saturating_add(clause.k);
             let similarity = {
                 let schema = self.schema.read().await;
@@ -4945,8 +5952,9 @@ impl Index {
             sub_request.from = 0;
             sub_request.size = clause.k;
             let sub = self
-                .run_knn_brute_force(
+                .run_knn_brute_force_with_deadline(
                     &sub_request,
+                    deadline,
                     &clause.field,
                     &clause.vector,
                     clause.k,
@@ -4956,6 +5964,7 @@ impl Index {
                     clause.similarity,
                 )
                 .await?;
+            any_timed_out |= sub.timed_out;
             for hit in sub.hits {
                 match slot_by_id.get(&hit.id) {
                     Some(&i) => merged[i].1 += hit.score,
@@ -4965,8 +5974,16 @@ impl Index {
                     }
                 }
             }
+            if any_timed_out {
+                break;
+            }
         }
-        Ok(knn_result_from_scored(request, merged, k_sum, started))
+        let mut result = knn_result_from_scored(request, merged, k_sum, started);
+        result.timed_out = any_timed_out;
+        if any_timed_out {
+            result.total.relation = TotalHitsRelation::Gte;
+        }
+        Ok(result)
     }
 
     /// Brute-force nested KNN: score each parent by the best (max)
@@ -4990,6 +6007,21 @@ impl Index {
     pub async fn run_semantic(
         &self,
         request: &SearchRequest,
+        field: &str,
+        text: &str,
+        k: usize,
+        filter: Option<Box<QueryNode>>,
+    ) -> Result<SearchResult> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        self.run_semantic_with_deadline(request, deadline, field, text, k, filter)
+            .await
+    }
+
+    async fn run_semantic_with_deadline(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
         field: &str,
         text: &str,
         k: usize,
@@ -5037,7 +6069,12 @@ impl Index {
         //     ingest. A `semantic` query against a plain dense_vector field
         //     with no active backend still returns the original 400 (there
         //     is no comparable stored vector to match against).
+        let semantic_started = std::time::Instant::now();
+        let trace_phases = std::env::var_os("XERJ_TRACE_SEMANTIC_PHASES").is_some();
         let embedder = self.embedder.read().await;
+        if trace_phases {
+            tracing::info!(index=%self.name, field, k, "semantic_phase=embed_start");
+        }
         let query_vec = if embedder.is_active() {
             // `embed_batch` takes Vec<String>; we only have one text but
             // batching keeps the wire format stable for callers.
@@ -5071,18 +6108,28 @@ impl Index {
                      model and tokenizer paths).",
             )));
         };
+        drop(embedder);
+        if trace_phases {
+            tracing::info!(index=%self.name, elapsed_ms=semantic_started.elapsed().as_millis() as u64, "semantic_phase=embed_complete");
+        }
 
-        self.run_knn_brute_force(
-            request,
-            &knn_field,
-            &query_vec,
-            k,
-            filter,
-            &similarity,
-            None,
-            None,
-        )
-        .await
+        let result = self
+            .run_knn_brute_force_with_deadline(
+                request,
+                deadline,
+                &knn_field,
+                &query_vec,
+                k,
+                filter,
+                &similarity,
+                None,
+                None,
+            )
+            .await;
+        if trace_phases {
+            tracing::info!(index=%self.name, elapsed_ms=semantic_started.elapsed().as_millis() as u64, ok=result.is_ok(), "semantic_phase=request_complete");
+        }
+        result
     }
 
     /// Auto-embed `semantic_text` fields on ingest.
@@ -5378,6 +6425,19 @@ impl Index {
         sub_queries: Vec<xerj_query::ast::WeightedQuery>,
         fusion: xerj_query::ast::FusionStrategy,
     ) -> Result<SearchResult> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        self.run_hybrid_with_deadline(request, deadline, sub_queries, fusion)
+            .await
+    }
+
+    async fn run_hybrid_with_deadline(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
+        sub_queries: Vec<xerj_query::ast::WeightedQuery>,
+        fusion: xerj_query::ast::FusionStrategy,
+    ) -> Result<SearchResult> {
         let started = std::time::Instant::now();
 
         // Aggregations over a fused (RRF/Linear/Learned) result set have
@@ -5403,7 +6463,12 @@ impl Index {
         // for v0.7-P1 — the per-query latency is dominated by the kNN
         // / FTS scan, not the await ordering.)
         let mut sub_results: Vec<(Vec<Hit>, f32)> = Vec::with_capacity(sub_queries.len());
+        let mut any_timed_out = false;
         for wq in sub_queries {
+            if std::time::Instant::now() >= deadline {
+                any_timed_out = true;
+                break;
+            }
             let sub_request = SearchRequest {
                 query: wq.query.clone(),
                 from: 0,
@@ -5426,8 +6491,12 @@ impl Index {
             };
             // Box::pin to break the type-recursion (search_inner ↔
             // run_hybrid both async fn).
-            let sub_result = Box::pin(self.search_inner(&sub_request)).await?;
+            let sub_result = Box::pin(self.search_inner(&sub_request, deadline)).await?;
+            any_timed_out |= sub_result.timed_out;
             sub_results.push((sub_result.hits, wq.weight));
+            if any_timed_out {
+                break;
+            }
         }
 
         // Apply fusion.
@@ -5459,11 +6528,15 @@ impl Index {
             hits: page,
             total: TotalHits {
                 value: total_value,
-                relation: TotalHitsRelation::Eq,
+                relation: if any_timed_out {
+                    TotalHitsRelation::Gte
+                } else {
+                    TotalHitsRelation::Eq
+                },
             },
             took_ms,
             aggs: None,
-            timed_out: false,
+            timed_out: any_timed_out,
             profile: None,
             max_score: None,
         })
@@ -5489,7 +6562,39 @@ impl Index {
         post_filter: Option<Box<QueryNode>>,
         similarity: &str,
     ) -> Result<SearchResult> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        self.run_nested_knn_brute_force_with_deadline(
+            request,
+            deadline,
+            nested_path,
+            field,
+            query_vec,
+            k,
+            num_candidates,
+            pre_filter,
+            post_filter,
+            similarity,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // deadline plus ES nested-kNN request surface
+    async fn run_nested_knn_brute_force_with_deadline(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
+        nested_path: &str,
+        field: &str,
+        query_vec: &[f32],
+        k: usize,
+        num_candidates: usize,
+        pre_filter: Option<Box<QueryNode>>,
+        post_filter: Option<Box<QueryNode>>,
+        similarity: &str,
+    ) -> Result<SearchResult> {
         let started = std::time::Instant::now();
+        let mut timed_out = false;
         // The sub-field name inside each nested element.
         let subfield = field
             .strip_prefix(&format!("{}.", nested_path))
@@ -5504,15 +6609,36 @@ impl Index {
         }
         let snap = self.store.snapshot();
         let mut seen: HashSet<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
-        for meta in snap.segments.iter() {
+        'segments: for meta in snap.segments.iter() {
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
             // Cache-backed: see comment on the matching loop in
             // run_knn_brute_force.
-            let docs_arc = match self.stored_values_for(&meta.id) {
-                Some(a) => a,
-                None => continue,
+            let docs_arc = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.stored_values_for_async(&meta.id),
+            )
+            .await
+            {
+                Ok(Some(a)) => a,
+                Ok(None) => continue,
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
             };
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
             // Cache + serde_json under the hood (see stored_values_for).
-            for doc in docs_arc.iter() {
+            for (position, doc) in docs_arc.iter().enumerate() {
+                if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                    timed_out = true;
+                    break 'segments;
+                }
                 let id = match doc.get("_id").and_then(Value::as_str) {
                     Some(s) => s.to_string(),
                     None => continue,
@@ -5544,7 +6670,12 @@ impl Index {
         // ── Score each parent by best-matching nested element ─────────
         // Pre-filter is applied before scoring (alias filter, knn.filter).
         let mut scored: Vec<(String, f32, Value)> = Vec::new();
-        for (id, src) in candidates {
+        let mut nested_position = 0usize;
+        'candidates: for (position, (id, src)) in candidates.into_iter().enumerate() {
+            if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                timed_out = true;
+                break;
+            }
             if let Some(ref f) = pre_filter {
                 let mut src_with_id = src.clone();
                 if let Some(obj) = src_with_id.as_object_mut() {
@@ -5561,6 +6692,13 @@ impl Index {
             };
             let mut best: Option<f32> = None;
             for elem in &nested_arr {
+                nested_position = nested_position.saturating_add(1);
+                if nested_position & 127 == 0
+                    && self.exact_scan_checkpoint(nested_position, deadline).await
+                {
+                    timed_out = true;
+                    break 'candidates;
+                }
                 let vec_val = match elem.get(&subfield) {
                     Some(v) => v,
                     None => continue,
@@ -5624,11 +6762,15 @@ impl Index {
             hits,
             total: TotalHits {
                 value: total_value,
-                relation: TotalHitsRelation::Eq,
+                relation: if timed_out {
+                    TotalHitsRelation::Gte
+                } else {
+                    TotalHitsRelation::Eq
+                },
             },
             took_ms: started.elapsed().as_millis() as u64,
             aggs: None,
-            timed_out: false,
+            timed_out,
             profile: None,
             max_score: None,
         })
@@ -6094,8 +7236,9 @@ impl Index {
         // Process-wide admission: disk flood-stage block (item 3) + parent
         // memory circuit breaker (item 1). Fires before any per-index work.
         self.governor_write_gate()?;
-        self.dataset_version.fetch_add(1, Ordering::Release);
-
+        let _publication_guard = self.write_publication.lock(id.to_string()).await;
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::Acquired);
         // Optimistic concurrency check (see index_document_with_version for
         // the if_primary_term rationale).
         let _ = if_primary_term;
@@ -6153,6 +7296,8 @@ impl Index {
             let seq_no = existing
                 .map(|e| e.seq_no)
                 .unwrap_or_else(|| self.store.current_seq_no().saturating_sub(1));
+            #[cfg(test)]
+            self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
             return Ok(DeleteDocOutcome {
                 found: false,
                 seq_no,
@@ -6160,7 +7305,13 @@ impl Index {
             });
         }
 
+        // Invalidate response caches only once the OCC check has succeeded and
+        // the delete will mutate publication state. A rejected conditional
+        // delete must not make unrelated cached responses look stale.
+        self.dataset_version.fetch_add(1, Ordering::Release);
         let deleted_seq = self.store.delete(id)?;
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::AfterWalVersionMap);
         let existed = deleted_seq.is_some();
 
         // Remove from memtable.
@@ -6168,6 +7319,8 @@ impl Index {
             let mem = &*self.memtable;
             mem.remove(id);
         }
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::AfterFts);
 
         // v0.6.2 — propagate the delete into the HNSW graph. Pre-fix
         // a deleted doc was unfindable via _get / _search but the
@@ -6196,6 +7349,8 @@ impl Index {
                 })
                 .ok();
         }
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::AfterHnsw);
 
         if existed {
             self.doc_count.fetch_sub(1, Ordering::Relaxed);
@@ -6210,6 +7365,8 @@ impl Index {
                 .version_map
                 .bump_tombstone_version(id)
                 .unwrap_or(1);
+            #[cfg(test)]
+            self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
             return Ok(DeleteDocOutcome {
                 found: false,
                 seq_no: self.store.current_seq_no().saturating_sub(1),
@@ -6225,6 +7382,8 @@ impl Index {
             .map(|e| e.version)
             .unwrap_or(1);
         let seq_no = deleted_seq.unwrap_or_else(|| self.store.current_seq_no().saturating_sub(1));
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
         Ok(DeleteDocOutcome {
             found: true,
             seq_no,
@@ -6242,6 +7401,7 @@ impl Index {
         id: &str,
         partial_doc: Value,
     ) -> Result<Option<IndexResponse>> {
+        let publication_guard = self.write_publication.lock(id.to_string()).await;
         // Fetch existing document source.
         let existing = match self.get_document(id).await? {
             Some(src) => src,
@@ -6269,7 +7429,18 @@ impl Index {
         };
 
         // Re-index with the same ID (upsert-style).
-        let resp = self.index_document(Some(id.to_string()), merged).await?;
+        let resp = self
+            .index_document_with_version_inner_guarded(
+                Some(id.to_string()),
+                merged,
+                None,
+                None,
+                false,
+                Some(publication_guard),
+                false,
+                None,
+            )
+            .await?;
         Ok(Some(resp))
     }
 
@@ -6299,6 +7470,31 @@ impl Index {
 
     /// Execute a search request against this index.
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
+        let request_started = std::time::Instant::now();
+        let request_deadline = request_started
+            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        let timed_out_result = || {
+            let took_ms = request_started.elapsed().as_millis() as u64;
+            // Admission and single-flight waits can consume the complete
+            // deadline before `search_inner` starts. They are still real
+            // queries and must be visible in the same counters as executor
+            // timeouts; otherwise overload makes query_count under-report.
+            self.metric_query_count.fetch_add(1, Ordering::Relaxed);
+            self.metric_query_total_ms
+                .fetch_add(took_ms, Ordering::Relaxed);
+            SearchResult {
+                hits: vec![],
+                total: xerj_query::executor::TotalHits {
+                    value: 0,
+                    relation: TotalHitsRelation::Gte,
+                },
+                took_ms,
+                aggs: None,
+                timed_out: true,
+                profile: None,
+                max_score: None,
+            }
+        };
         // M3 framework: response cache.  Hash the request shape and the
         // current dataset version; on a hit return the cloned `Arc<SearchResult>`
         // immediately, skipping the semaphore, search_inner, locks, and
@@ -6426,7 +7622,17 @@ impl Index {
                             }
                             return Ok(cloned);
                         }
-                        if rx.changed().await.is_err() {
+                        match tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(request_deadline),
+                            rx.changed(),
+                        )
+                        .await
+                        {
+                            Err(_) => return Ok(timed_out_result()),
+                            Ok(Ok(())) => continue,
+                            Ok(Err(_closed)) => {}
+                        }
+                        {
                             // Leader dropped its sender. If it succeeded it
                             // inserted the result into `query_cache` BEFORE
                             // dropping, so serve that; otherwise recompute.
@@ -6465,7 +7671,15 @@ impl Index {
         // like ES's search thread pool bounds active workers. Held (via
         // `_global_permit`) for the whole call; released on drop.
         let _global_permit = match crate::governor::global() {
-            Some(g) => Some(g.acquire_search().await?),
+            Some(g) => match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(request_deadline),
+                g.acquire_search(),
+            )
+            .await
+            {
+                Ok(result) => Some(result?),
+                Err(_) => return Ok(timed_out_result()),
+            },
             None => None,
         };
 
@@ -6473,11 +7687,19 @@ impl Index {
         // against a single index, preventing one hot index from monopolising
         // the global pool.  The permit is automatically released when
         // `_permit` is dropped at the end of this call.
-        let _permit = self.max_concurrent_queries.acquire().await.map_err(|_| {
-            EngineError::Common(xerj_common::XerjError::internal(
-                "query semaphore closed — index is shutting down",
-            ))
-        })?;
+        let _permit = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(request_deadline),
+            self.max_concurrent_queries.acquire(),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|_| {
+                EngineError::Common(xerj_common::XerjError::internal(
+                    "query semaphore closed — index is shutting down",
+                ))
+            })?,
+            Err(_) => return Ok(timed_out_result()),
+        };
 
         let search_start = std::time::Instant::now();
 
@@ -6507,7 +7729,6 @@ impl Index {
         // Determine the timeout: use the request-level timeout if set, otherwise
         // fall back to the default of 30 seconds.
         let timeout_ms = request.timeout_ms.unwrap_or(30_000);
-        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
 
         // M5.21 — run the CPU-heavy search body inside `block_in_place`
         // on multi-thread runtimes; fall back to plain await on
@@ -6516,18 +7737,29 @@ impl Index {
         // Pre-M5.21 a concurrent QPS bench collapsed to <1 QPS.  See
         // the commit body for `perf/search-block-in-place` for the
         // full root-cause analysis.
+        // Hybrid remains under the M5.21 blocking boundary because it may
+        // contain an ordinary lexical child whose generic scan is not yet
+        // cooperative. Its vector children still receive the shared absolute
+        // deadline and stop at their own checkpoints. Removing the boundary
+        // for all hybrid shapes would trade timeout overrun for async-worker
+        // starvation on lexical hybrids.
+        let cooperative_vector_query = peel_knn_query(&request.query).is_some()
+            || peel_multi_knn_query(&request.query).is_some()
+            || peel_semantic_query(&request.query).is_some()
+            || peel_nested_knn_query(&request.query).is_some();
         let is_multi_thread = tokio::runtime::Handle::current().runtime_flavor()
             == tokio::runtime::RuntimeFlavor::MultiThread;
-        let search_fut = self.search_inner(request);
-        let search_result = if is_multi_thread {
+        let search_fut = self.search_inner(request, request_deadline);
+        let search_result = if is_multi_thread && !cooperative_vector_query {
             let fut = async move {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(search_fut)
                 })
             };
-            tokio::time::timeout(timeout_duration, fut).await
+            tokio::time::timeout_at(tokio::time::Instant::from_std(request_deadline), fut).await
         } else {
-            tokio::time::timeout(timeout_duration, search_fut).await
+            tokio::time::timeout_at(tokio::time::Instant::from_std(request_deadline), search_fut)
+                .await
         };
         match search_result {
             Ok(result) => {
@@ -6617,7 +7849,11 @@ impl Index {
     }
 
     /// Inner search implementation (without timeout wrapper).
-    async fn search_inner(&self, request: &SearchRequest) -> Result<SearchResult> {
+    async fn search_inner(
+        &self,
+        request: &SearchRequest,
+        search_deadline: std::time::Instant,
+    ) -> Result<SearchResult> {
         // Check read block.
         if self.is_read_blocked().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
@@ -6683,8 +7919,6 @@ impl Index {
         // stopped.  Instead we compute a wall-clock deadline here and have
         // the O(N) loops below check it cooperatively, returning partial
         // results with `timed_out: true` (ES semantics).
-        let search_deadline: std::time::Instant = std::time::Instant::now()
-            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
         let mut deadline_exceeded = false;
         // Set when a field-sorted non-match_all scan was narrowed to the
         // per-segment top-cap sort candidates: the scan's own total tally is
@@ -6763,8 +7997,9 @@ impl Index {
                 }
             }
             return self
-                .run_knn_brute_force(
+                .run_knn_brute_force_with_deadline(
                     request,
+                    search_deadline,
                     &field,
                     &query_vec,
                     k,
@@ -6780,7 +8015,9 @@ impl Index {
         // one clause, and `hits.total` is the size of the deduplicated union
         // — matching ES 8.13 multi-kNN semantics (live-verified 2026-07-12).
         if let Some(clauses) = peel_multi_knn_query(query) {
-            return self.run_multi_knn_brute_force(request, clauses).await;
+            return self
+                .run_multi_knn_brute_force(request, search_deadline, clauses)
+                .await;
         }
         // Nested `knn` query: `nested { path: P, query: { knn { field: P.vec } } }`.
         // ES scores each parent by the best-matching nested element and
@@ -6807,8 +8044,9 @@ impl Index {
             // smaller fan-out than the requested top-k makes no sense).
             let num_candidates = num_candidates_opt.unwrap_or(k).max(k);
             return self
-                .run_nested_knn_brute_force(
+                .run_nested_knn_brute_force_with_deadline(
                     request,
+                    search_deadline,
                     &nested_path,
                     &field,
                     &query_vec,
@@ -6833,7 +8071,9 @@ impl Index {
         //  - proxy timeout / 5xx → propagate the proxy's error
         //  - dim mismatch         → caught by run_knn_brute_force / HNSW
         if let Some((field, text, k, filter)) = peel_semantic_query(query) {
-            return self.run_semantic(request, &field, &text, k, filter).await;
+            return self
+                .run_semantic_with_deadline(request, search_deadline, &field, &text, k, filter)
+                .await;
         }
 
         // ── Hybrid (RRF / Linear / Learned) short-circuit ─────────────────────
@@ -6858,7 +8098,9 @@ impl Index {
         //
         // Learned: not yet implemented — falls back to RRF with a warn.
         if let Some((sub_queries, fusion)) = peel_hybrid_query(query) {
-            return self.run_hybrid(request, sub_queries, fusion).await;
+            return self
+                .run_hybrid_with_deadline(request, search_deadline, sub_queries, fusion)
+                .await;
         }
 
         // ── Max result window enforcement ──────────────────────────────────────
@@ -13524,9 +14766,8 @@ impl Index {
     /// section, and parses the result. Subsequent calls return an
     /// `Arc<Vec<Value>>` clone — no I/O, no decompress, no parse.
     /// Segments are immutable post-flush so the cache value remains
-    /// valid until the segment is removed by a merge (at which point
-    /// `stored_value_cache.clear()` flushes the entire map; see the
-    /// merge-completion site).
+    /// valid until the segment is removed by a merge (at which point its
+    /// precise entry is evicted under the lifecycle write guard).
     ///
     /// Uses `serde_json::from_slice` not `simd_json::serde::from_slice`:
     /// per ffd49ac, simd_json silently corrupts some payloads produced
@@ -13544,9 +14785,124 @@ impl Index {
         let stored_bytes = xerj_storage::stored_codec::decode_stored(stored_bytes_raw).ok()?;
         let docs: Vec<Value> = serde_json::from_slice(&stored_bytes).ok()?;
         let arc = Arc::new(docs);
-        self.stored_value_cache
-            .insert(segment_id.to_string(), Arc::clone(&arc));
+        {
+            let _publication = self.stored_value_cache_lifecycle.read();
+            if self
+                .store
+                .snapshot()
+                .segments
+                .iter()
+                .any(|meta| meta.id == segment_id)
+            {
+                self.stored_value_cache
+                    .insert(segment_id.to_string(), Arc::clone(&arc));
+            }
+        }
         Some(arc)
+    }
+
+    /// Async boundary for a cold stored-value load.
+    ///
+    /// A cache miss opens and decompresses the segment and parses its complete
+    /// stored section. That is synchronous file/CPU work and can take seconds
+    /// for a large segment, so vector queries must not run it on a Tokio
+    /// worker. Cache hits stay on the caller because they are only a DashMap
+    /// lookup and `Arc` clone.
+    ///
+    /// `spawn_blocking` tasks cannot be cancelled once started. A timed-out or
+    /// dropped request therefore leaves the load running to completion, which
+    /// is useful: it warms the immutable segment for the next request. The
+    /// segment-current check prevents such a detached completion from
+    /// resurrecting a cache entry that a concurrent merge already retired.
+    async fn stored_values_for_async(&self, segment_id: &str) -> Option<Arc<Vec<Value>>> {
+        if let Some(entry) = self.stored_value_cache.get(segment_id) {
+            return Some(Arc::clone(entry.value()));
+        }
+
+        let segment_id = segment_id.to_string();
+        let mut receiver = {
+            use dashmap::mapref::entry::Entry;
+            match self.stored_value_loads.entry(segment_id.clone()) {
+                Entry::Occupied(entry) => entry.get().subscribe(),
+                Entry::Vacant(entry) => {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    entry.insert(sender.clone());
+
+                    let store = Arc::clone(&self.store);
+                    let cache = Arc::clone(&self.stored_value_cache);
+                    let lifecycle = Arc::clone(&self.stored_value_cache_lifecycle);
+                    let loads = Arc::clone(&self.stored_value_loads);
+                    let load_semaphore = Arc::clone(&self.stored_value_load_semaphore);
+                    let load_segment_id = segment_id.clone();
+                    #[cfg(test)]
+                    let load_delay_ms = Arc::clone(&self.test_stored_value_load_delay_ms);
+                    #[cfg(test)]
+                    let load_count = Arc::clone(&self.test_stored_value_load_count);
+                    #[cfg(test)]
+                    let pause_before_publish =
+                        Arc::clone(&self.test_stored_value_load_pause_before_publish);
+                    #[cfg(test)]
+                    let ready_to_publish =
+                        Arc::clone(&self.test_stored_value_load_ready_to_publish);
+                    tokio::spawn(async move {
+                        let Ok(permit) = load_semaphore.acquire_owned().await else {
+                            loads.remove(&segment_id);
+                            return;
+                        };
+                        let blocking = tokio::task::spawn_blocking(move || {
+                            #[cfg(test)]
+                            {
+                                load_count.fetch_add(1, Ordering::Relaxed);
+                                let delay_ms = load_delay_ms.load(Ordering::Relaxed);
+                                if delay_ms > 0 {
+                                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                                }
+                            }
+                            let reader = store.open_segment(&load_segment_id).ok()?;
+                            let stored_bytes_raw = reader.section(SectionType::Stored).ok()??;
+                            let stored_bytes =
+                                xerj_storage::stored_codec::decode_stored(stored_bytes_raw).ok()?;
+                            let docs: Vec<Value> = serde_json::from_slice(&stored_bytes).ok()?;
+                            let arc = Arc::new(docs);
+                            #[cfg(test)]
+                            {
+                                ready_to_publish.store(true, Ordering::Release);
+                                while pause_before_publish.load(Ordering::Acquire) {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                            {
+                                let _publication = lifecycle.read();
+                                if store
+                                    .snapshot()
+                                    .segments
+                                    .iter()
+                                    .any(|meta| meta.id == load_segment_id)
+                                {
+                                    cache.insert(load_segment_id, Arc::clone(&arc));
+                                }
+                            }
+                            Some(arc)
+                        });
+                        if let Ok(Some(value)) = blocking.await {
+                            let _ = sender.send(Some(value));
+                        }
+                        drop(permit);
+                        loads.remove(&segment_id);
+                    });
+                    receiver
+                }
+            }
+        };
+
+        loop {
+            if let Some(value) = receiver.borrow_and_update().clone() {
+                return Some(value);
+            }
+            if receiver.changed().await.is_err() {
+                return None;
+            }
+        }
     }
 
     /// Cache-backed range pre-filter — returns the set of internal doc
@@ -26551,6 +27907,184 @@ mod chunk_embed_tests {
         assert!(
             max_sim > pooled_score,
             "best-passage max-sim ({max_sim}) should beat pooled ({pooled_score})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_publication_integration_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_holds_publication_key_through_response_before_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("publication-hook", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("publication-hook").unwrap();
+
+        let initial = idx
+            .index_document(Some("same".into()), json!({"state": "initial"}))
+            .await
+            .unwrap();
+
+        let acquired = Arc::new(AtomicUsize::new(0));
+        let pause_once = Arc::new(AtomicBool::new(false));
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let paused_tx = parking_lot::Mutex::new(Some(paused_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        let hook: PublicationTestHook = {
+            let acquired = Arc::clone(&acquired);
+            let pause_once = Arc::clone(&pause_once);
+            Arc::new(move |id, point| {
+                assert_eq!(id, "same");
+                if point == PublicationTestPoint::Acquired {
+                    acquired.fetch_add(1, Ordering::SeqCst);
+                }
+                if point == PublicationTestPoint::AfterWalVersionMap
+                    && !pause_once.swap(true, Ordering::SeqCst)
+                {
+                    paused_tx.lock().take().unwrap().send(()).unwrap();
+                    resume_rx.lock().take().unwrap().recv().unwrap();
+                }
+            })
+        };
+        idx.set_publication_test_hook(Some(hook));
+
+        let put = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move {
+                idx.index_document_with_version(
+                    Some("same".into()),
+                    json!({"state": "put"}),
+                    Some(initial.seq_no),
+                    Some(1),
+                )
+                .await
+            })
+        };
+        tokio::task::spawn_blocking(move || paused_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(acquired.load(Ordering::SeqCst), 1);
+
+        let (queued_tx, queued_rx) = std::sync::mpsc::sync_channel(1);
+        let queued_tx = Arc::new(parking_lot::Mutex::new(Some(queued_tx)));
+        idx.write_publication.set_before_mutex_await_hook({
+            let queued_tx = Arc::clone(&queued_tx);
+            Some(Arc::new(move |id| {
+                assert_eq!(id, "same");
+                queued_tx.lock().take().unwrap().send(()).unwrap();
+            }))
+        });
+        let delete = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move { idx.delete_document_versioned("same", None, None).await })
+        };
+        tokio::task::spawn_blocking(move || queued_rx.recv().unwrap())
+            .await
+            .unwrap();
+        idx.write_publication.set_before_mutex_await_hook(None);
+        assert_eq!(
+            acquired.load(Ordering::SeqCst),
+            1,
+            "delete acquired the same key while PUT was paused after WAL/VM"
+        );
+
+        resume_tx.send(()).unwrap();
+        let put = put.await.unwrap().unwrap();
+        let delete = delete.await.unwrap().unwrap();
+        idx.set_publication_test_hook(None);
+
+        assert_eq!(put.version, 2);
+        assert!(delete.found);
+        assert_eq!(delete.version, 3);
+        assert!(delete.seq_no > put.seq_no);
+        assert!(idx.get_document("same").await.unwrap().is_none());
+        assert_eq!(acquired.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_serialized_transforms_do_not_lose_read_modify_write_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("atomic-transform", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("atomic-transform").unwrap();
+        idx.index_document(Some("counter".into()), json!({"n": 0}))
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(33));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let idx = Arc::clone(&idx);
+            let start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                idx.transform_document_serialized("counter", None, |mut source| {
+                    let n = source["n"].as_u64().unwrap();
+                    source["n"] = json!(n + 1);
+                    Ok::<_, ()>(source)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .response
+            }));
+        }
+        start.wait().await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(idx.get_document("counter").await.unwrap().unwrap()["n"], 32);
+    }
+
+    #[tokio::test]
+    async fn rejected_conditional_delete_does_not_invalidate_query_cache_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("delete-epoch", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("delete-epoch").unwrap();
+        let indexed = idx
+            .index_document(Some("doc".into()), json!({"live": true}))
+            .await
+            .unwrap();
+        let before = idx.dataset_version.load(Ordering::Acquire);
+
+        let error = idx
+            .delete_document_versioned("doc", Some(indexed.seq_no + 1), Some(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("version conflict"));
+        assert_eq!(
+            idx.dataset_version.load(Ordering::Acquire),
+            before,
+            "rejected OCC delete must not invalidate cached responses"
+        );
+
+        idx.delete_document_versioned("doc", Some(indexed.seq_no), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            idx.dataset_version.load(Ordering::Acquire),
+            before + 1,
+            "successful delete invalidates cached responses exactly once"
         );
     }
 }

@@ -5402,6 +5402,168 @@ pub(crate) fn top_level_query_type(body_query: &Option<serde_json::Value>) -> &'
     }
 }
 
+/// Request-owned child task: dropping the HTTP handler aborts its search
+/// instead of leaving detached work running after a client disconnect.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(test)]
+type PendingSearchSignals = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+);
+#[cfg(test)]
+static TEST_PENDING_SEARCH_SIGNALS: std::sync::OnceLock<
+    std::sync::Mutex<Option<PendingSearchSignals>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+#[cfg(test)]
+impl Drop for SignalOnDrop {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+fn search_task_panic_response(join_err: tokio::task::JoinError, index: &str) -> Response {
+    tracing::error!(error = %join_err, index, "search task panicked");
+    ApiError::new(xerj_common::XerjError::internal(
+        "search panicked; check server logs for details",
+    ))
+    .into_response()
+}
+
+#[cfg(test)]
+mod search_task_lifetime_tests {
+    use super::{search_task_panic_response, AbortOnDrop, TEST_PENDING_SEARCH_SIGNALS};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_state() -> crate::state::AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        crate::state::AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test]
+    async fn executor_panic_becomes_http_500() {
+        let join_err = tokio::spawn(async { panic!("injected search panic") })
+            .await
+            .expect_err("task must panic");
+        let response = search_task_panic_response(join_err, "panic-test");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn es_search_route_maps_child_panic_to_json_http_500() {
+        let state = test_state();
+        state
+            .engine
+            .create_index(
+                "test-panic-search-task",
+                xerj_common::types::Schema::empty(),
+            )
+            .unwrap();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::post("/test-panic-search-task/_search")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"query":{"match_all":{}}}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], 500);
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("search panicked")),
+            "unexpected error body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_es_search_route_future_aborts_owned_child() {
+        let state = test_state();
+        state
+            .engine
+            .create_index(
+                "test-pending-search-task",
+                xerj_common::types::Schema::empty(),
+            )
+            .unwrap();
+        let app = crate::router::build_es_compat_router(state);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        *TEST_PENDING_SEARCH_SIGNALS
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((started_tx, dropped_tx));
+
+        let request = tokio::spawn(
+            app.oneshot(
+                Request::post("/test-pending-search-task/_search")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"query":{"match_all":{}}}"#))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("route child did not start")
+            .expect("start signal");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("route-owned child did not drain after request drop")
+            .expect("drop signal");
+    }
+
+    #[tokio::test]
+    async fn dropping_request_owner_aborts_and_drains_child() {
+        struct Dropped(tokio::sync::oneshot::Sender<()>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let (replacement, _) = tokio::sync::oneshot::channel();
+                let sender = std::mem::replace(&mut self.0, replacement);
+                let _ = sender.send(());
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _dropped = Dropped(dropped_tx);
+            std::future::pending::<()>().await;
+        });
+        let owner = AbortOnDrop(task);
+        tokio::task::yield_now().await;
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("aborted child did not drain")
+            .expect("drop signal");
+    }
+}
+
 pub async fn search(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -7487,8 +7649,6 @@ pub async fn search(
             .with_label_values(&[idx_name])
             .inc();
 
-        // Spawn on a new task so that a panic is caught by the JoinHandle rather
-        // than propagating up and crashing the server.
         let mut req_clone = search_req.clone();
         // PIT search: fetch more hits per-index so the post-merge PIT
         // filter can drop post-snapshot docs without starving the page.
@@ -7522,15 +7682,38 @@ pub async fn search(
                 }
             }
         }
-        let search_result = tokio::task::spawn(async move { idx.search(&req_clone).await }).await;
+        // Keep search work owned by the request future. Dropping the handler
+        // (for example when the client disconnects) aborts the child task;
+        // awaiting its JoinHandle also converts executor panics into HTTP 500
+        // instead of unwinding through axum.
+        #[cfg(test)]
+        let inject_task_panic = *idx_name == "test-panic-search-task";
+        #[cfg(test)]
+        let inject_pending_task = *idx_name == "test-pending-search-task";
+        let mut search_task = AbortOnDrop(tokio::spawn(async move {
+            #[cfg(test)]
+            if inject_task_panic {
+                panic!("injected search task panic");
+            }
+            #[cfg(test)]
+            if inject_pending_task {
+                let (started, dropped) = TEST_PENDING_SEARCH_SIGNALS
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .expect("pending-search signals lock")
+                    .take()
+                    .expect("pending-search signals");
+                let _ = started.send(());
+                let _drop_signal = SignalOnDrop(Some(dropped));
+                std::future::pending().await
+            }
+            idx.search(&req_clone).await
+        }));
+        let search_result = (&mut search_task.0).await;
 
         match search_result {
             Err(join_err) => {
-                tracing::error!(error = %join_err, index = idx_name, "search task panicked");
-                let err = xerj_common::XerjError::internal(
-                    "search panicked; check server logs for details",
-                );
-                return ApiError::new(err).into_response();
+                return search_task_panic_response(join_err, idx_name);
             }
             Ok(Err(e)) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
             Ok(Ok(result)) => {
@@ -12699,56 +12882,48 @@ pub async fn update_doc(
         if src.is_empty() {
             return update_script_bad_request("script source is required".to_string());
         }
-        match idx.get_document(&id).await {
-            Ok(Some(mut current)) => {
-                if let Err(e) = apply_painless_update(&mut current, &src, &params) {
-                    return update_script_bad_request(e);
-                }
-                return match idx.index_document(Some(id.clone()), current).await {
-                    Ok(resp) => {
-                        state.metrics.record_doc_indexed(&index);
-                        let er = crate::responses::EsDocResponse::updated(
-                            &index,
-                            &resp.id,
-                            resp.version,
-                            resp.seq_no.saturating_sub(1),
-                        );
-                        Json(er).into_response()
-                    }
-                    Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-                };
+        let upsert_body = body.upsert.clone().or_else(|| {
+            if body.doc_as_upsert {
+                body.doc.clone()
+            } else {
+                None
             }
-            Ok(None) => {
-                // Document missing: honour `upsert` / `doc_as_upsert` by
-                // indexing the upsert body as a new document. The script is
-                // not run against the upsert body (matches ES default,
-                // scripted_upsert=false).
-                let upsert_body = body.upsert.clone().or_else(|| {
-                    if body.doc_as_upsert {
-                        body.doc.clone()
-                    } else {
-                        None
-                    }
-                });
-                if let Some(up) = upsert_body {
-                    return match idx.index_document(Some(id.clone()), up).await {
-                        Ok(resp) => {
-                            state.metrics.record_doc_indexed(&index);
-                            let er = crate::responses::EsDocResponse::created(
-                                &index,
-                                &resp.id,
-                                resp.version,
-                                resp.seq_no.saturating_sub(1),
-                            );
-                            Json(er).into_response()
-                        }
-                        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-                    };
-                }
+        });
+        match idx
+            .transform_document_serialized(&id, upsert_body, move |mut current| {
+                apply_painless_update(&mut current, &src, &params)?;
+                Ok::<_, String>(current)
+            })
+            .await
+        {
+            Ok(Ok(Some(outcome))) => {
+                state.metrics.record_doc_indexed(&index);
+                let resp = outcome.response;
+                let er = if outcome.created {
+                    crate::responses::EsDocResponse::created(
+                        &index,
+                        &resp.id,
+                        resp.version,
+                        resp.seq_no.saturating_sub(1),
+                    )
+                } else {
+                    crate::responses::EsDocResponse::updated(
+                        &index,
+                        &resp.id,
+                        resp.version,
+                        resp.seq_no.saturating_sub(1),
+                    )
+                };
+                return Json(er).into_response();
+            }
+            Ok(Ok(None)) => {
                 let e = xerj_common::XerjError::document_not_found(&id, &index);
                 return ApiError::new(e).into_response();
             }
-            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Ok(Err(error)) => return update_script_bad_request(error),
+            Err(error) => {
+                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+            }
         }
     }
 
@@ -17370,27 +17545,42 @@ async fn run_update_by_query(
         if hit.source.is_null() {
             continue;
         }
-        let mut source = hit.source;
         if let Some((src, params)) = script.as_ref() {
-            if !src.is_empty() {
-                if let Err(e) = apply_painless_update(&mut source, src, params) {
-                    failures.push(json!({
-                        "id": hit.id,
-                        "cause": { "reason": e },
-                    }));
-                    continue;
-                }
-            }
-        }
-        // Re-index in place: same `_id`, mutated source → an update, not an
-        // append (verified: `index_document(Some(existing_id), source)`).
-        match idx.index_document(Some(hit.id.clone()), source).await {
-            Ok(_) => updated += 1,
-            Err(e) => {
+            if src.is_empty() {
                 failures.push(json!({
                     "id": hit.id,
-                    "cause": { "reason": e.to_string() },
+                    "cause": { "reason": "script source is required" },
                 }));
+                continue;
+            }
+            let result = idx
+                .transform_document_serialized(&hit.id, None, |mut current| {
+                    apply_painless_update(&mut current, src, params)?;
+                    Ok::<_, String>(current)
+                })
+                .await;
+            match result {
+                Ok(Ok(Some(_))) => updated += 1,
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => failures.push(json!({
+                    "id": hit.id,
+                    "cause": { "reason": error },
+                })),
+                Err(error) => failures.push(json!({
+                    "id": hit.id,
+                    "cause": { "reason": error.to_string() },
+                })),
+            }
+        } else {
+            // No script: preserve the historical re-index-in-place behavior.
+            match idx.index_document(Some(hit.id.clone()), hit.source).await {
+                Ok(_) => updated += 1,
+                Err(e) => {
+                    failures.push(json!({
+                        "id": hit.id,
+                        "cause": { "reason": e.to_string() },
+                    }));
+                }
             }
         }
     }
@@ -17410,6 +17600,102 @@ async fn run_update_by_query(
         "requests_per_second": -1,
         "throttled_until_millis": 0,
     })
+}
+
+#[cfg(test)]
+mod scripted_update_publication_tests {
+    use super::*;
+    use std::sync::Arc;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.keep();
+        let mut config = Config::default();
+        config.server.data_dir = path.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_scripted_update_requests_preserve_every_increment() {
+        let state = test_state();
+        let idx = state.engine.get_or_create_index("script-counter").unwrap();
+        idx.index_document(Some("counter".into()), json!({"n": 0}))
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(33));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let state = state.clone();
+            let start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                update_doc(
+                    State(state),
+                    Path(("script-counter".to_string(), "counter".to_string())),
+                    Query(UpdateDocParams::default()),
+                    Json(EsUpdateBody {
+                        doc: None,
+                        doc_as_upsert: false,
+                        upsert: None,
+                        script: Some(json!("ctx._source.n += 1")),
+                        detect_noop: None,
+                    }),
+                )
+                .await
+                .into_response()
+                .status()
+            }));
+        }
+        start.wait().await;
+        for task in tasks {
+            assert!(task.await.unwrap().is_success());
+        }
+
+        assert_eq!(idx.get_document("counter").await.unwrap().unwrap()["n"], 32);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_scripted_update_by_query_preserves_every_increment() {
+        let state = test_state();
+        let idx = state
+            .engine
+            .get_or_create_index("script-query-counter")
+            .unwrap();
+        idx.index_document(Some("counter".into()), json!({"n": 0}))
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(17));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let idx = Arc::clone(&idx);
+            let start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                run_update_by_query(
+                    &idx,
+                    &xerj_query::SearchRequest::default(),
+                    Some(("ctx._source.n += 1".into(), json!({}))),
+                )
+                .await
+            }));
+        }
+        start.wait().await;
+        for task in tasks {
+            assert_eq!(task.await.unwrap()["failures"], json!([]));
+        }
+
+        assert_eq!(idx.get_document("counter").await.unwrap().unwrap()["n"], 16);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
