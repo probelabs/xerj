@@ -21631,6 +21631,97 @@ pub async fn security_authenticate(State(_state): State<AppState>) -> impl IntoR
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET/POST /_security/user/_has_privileges
+// GET/POST /_security/user/{user}/_has_privileges
+// ─────────────────────────────────────────────────────────────────────────────
+// Route didn't exist at all — every call 404'd. Kibana's app shell calls this
+// right after login (during the same bootstrap pass as `_authenticate`,
+// `/_cluster/health`, `/_xpack`) to decide what UI to show the current user;
+// its client doesn't handle a 404 here gracefully and the whole page request
+// blows up with a generic 500 ("[Internal Server Error]: undefined" — Kibana
+// swallows the real cause before it reaches the client), which is a much
+// harder failure to diagnose than the 404 itself since nothing about
+// privileges appears in the error shown to the user.
+//
+// Same single-owner identity model as `security_authenticate` — xerj has no
+// per-user privilege enforcement, every authenticated caller is the one
+// built-in superuser — so answering "yes" to every privilege asked about
+// isn't a lie, it's what's actually true: nothing is denied. Echoes back
+// every cluster/index/application privilege named in the request body as
+// granted, keyed exactly the way ES's response is shaped.
+pub async fn security_has_privileges(
+    State(_state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let body = body.map(|Json(v)| v).unwrap_or(json!({}));
+
+    let mut cluster = serde_json::Map::new();
+    if let Some(names) = body.get("cluster").and_then(Value::as_array) {
+        for name in names.iter().filter_map(Value::as_str) {
+            cluster.insert(name.to_string(), Value::Bool(true));
+        }
+    }
+
+    let mut index = serde_json::Map::new();
+    if let Some(reqs) = body.get("index").and_then(Value::as_array) {
+        for req in reqs {
+            let names = req.get("names").and_then(Value::as_array);
+            let privileges = req.get("privileges").and_then(Value::as_array);
+            let (Some(names), Some(privileges)) = (names, privileges) else {
+                continue;
+            };
+            let mut priv_map = serde_json::Map::new();
+            for p in privileges.iter().filter_map(Value::as_str) {
+                priv_map.insert(p.to_string(), Value::Bool(true));
+            }
+            for name in names.iter().filter_map(Value::as_str) {
+                index.insert(name.to_string(), Value::Object(priv_map.clone()));
+            }
+        }
+    }
+
+    let mut application = serde_json::Map::new();
+    if let Some(reqs) = body.get("application").and_then(Value::as_array) {
+        for req in reqs {
+            let app = req.get("application").and_then(Value::as_str);
+            let privileges = req.get("privileges").and_then(Value::as_array);
+            let (Some(app), Some(privileges)) = (app, privileges) else {
+                continue;
+            };
+            let mut priv_map = serde_json::Map::new();
+            for p in privileges.iter().filter_map(Value::as_str) {
+                priv_map.insert(p.to_string(), Value::Bool(true));
+            }
+            let resources: Vec<String> = req
+                .get("resources")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .filter(|v: &Vec<String>| !v.is_empty())
+                .unwrap_or_else(|| vec!["*".to_string()]);
+            let mut resource_map = serde_json::Map::new();
+            for r in resources {
+                resource_map.insert(r, Value::Object(priv_map.clone()));
+            }
+            application.insert(app.to_string(), Value::Object(resource_map));
+        }
+    }
+
+    Json(json!({
+        "username": "xerj",
+        "has_all_requested": true,
+        "cluster": cluster,
+        "index": index,
+        "application": application,
+    }))
+    .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /_security/api_key — create API key (stub: returns admin key)
 // ─────────────────────────────────────────────────────────────────────────────
 
