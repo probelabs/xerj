@@ -1,8 +1,9 @@
 //! API key authentication middleware.
 //!
-//! Checks the `Authorization` header for either:
+//! Checks the `Authorization` header for any of:
 //! - `Authorization: ApiKey <key>`
 //! - `Authorization: Bearer <key>`
+//! - `Authorization: Basic <base64(user:pass)>`
 //!
 //! When `config.auth.enabled` is `false` (or `--insecure` mode was set by
 //! clearing the key), the check is skipped entirely.
@@ -77,13 +78,17 @@ pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: 
 /// Returns `true` when the request may proceed:
 /// - auth is disabled, or no admin key is configured (open mode — matches the
 ///   `--insecure` / first-run posture); or
-/// - the `Authorization` value carries the configured admin/superuser key; or
-/// - it carries a key minted by `POST /_security/api_key` (presented as
-///   `ApiKey <base64(id:api_key)>`) that is valid, not expired, and not
-///   invalidated.
+/// - the `Authorization` value carries the configured admin/superuser key
+///   (as `ApiKey <key>`/`Bearer <key>`, or as the password half of
+///   `Basic <base64(user:pass)>`); or
+/// - it carries a key minted by `POST /_security/api_key`, as either
+///   `ApiKey <base64(id:api_key)>` or `Basic <base64(id:api_key)>` — Kibana's
+///   interactive "basic" realm login sends the latter, and a minted key's
+///   `id:secret` shape is already exactly `user:pass`.
 ///
 /// `auth_header` is the raw `Authorization` header / `authorization` metadata
-/// value (e.g. `"ApiKey abc"` or `"Bearer abc"`), or `None` when absent.
+/// value (e.g. `"ApiKey abc"`, `"Bearer abc"`, or `"Basic base64(...)"`), or
+/// `None` when absent.
 pub fn is_authorized(state: &AppState, auth_header: Option<&str>) -> bool {
     let cfg = &state.config.auth;
 
@@ -92,7 +97,11 @@ pub fn is_authorized(state: &AppState, auth_header: Option<&str>) -> bool {
         return true;
     }
 
-    match auth_header.and_then(extract_key) {
+    let Some(header) = auth_header else {
+        return false;
+    };
+
+    if let Some(key) = extract_key(header) {
         // The configured admin/superuser key. Compared in constant time
         // (item 7): a plain `==` short-circuits on the first mismatching byte,
         // leaking the shared-secret prefix length via response timing. The
@@ -100,11 +109,50 @@ pub fn is_authorized(state: &AppState, auth_header: Option<&str>) -> bool {
         // the single most valuable credential in the system — must not be
         // weaker. `constant_time_eq` still returns early on a length mismatch,
         // which only reveals the key *length*, matching the created-key path.
-        Some(key) if constant_time_eq(key.as_bytes(), cfg.admin_api_key.as_bytes()) => true,
-        // A key minted by `POST /_security/api_key`.
-        Some(key) if authenticate_api_key(state, key) => true,
-        _ => false,
+        return constant_time_eq(key.as_bytes(), cfg.admin_api_key.as_bytes())
+            // A key minted by `POST /_security/api_key`.
+            || authenticate_api_key(state, key);
     }
+
+    basic_authorized(state, header)
+}
+
+/// Validate `Authorization: Basic <base64(user:pass)>`.
+///
+/// xerj has no per-username credential store — same single-owner identity
+/// model `security_authenticate` already uses — so this doesn't check the
+/// username against anything. Two things are accepted as the *password*
+/// half, both already valid credentials via the `ApiKey`/`Bearer` schemes:
+/// - the admin/superuser key (any username — mirrors ES's own "elastic"
+///   bootstrap superuser, where the secret is what's checked, not the name);
+/// - or, treating the whole decoded `user:pass` as `id:secret`, a key minted
+///   by `POST /_security/api_key` (its `id:secret` shape already matches
+///   `user:pass` exactly, so no separate encoding is needed here).
+fn basic_authorized(state: &AppState, header: &str) -> bool {
+    let Some(prefix) = header.get(..6) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case("basic ") {
+        return false;
+    }
+    let encoded = header[6..].trim();
+    let decoded = match crate::es_compat::base64_decode(encoded) {
+        Some(d) => d,
+        None => return false,
+    };
+    let decoded = match std::str::from_utf8(&decoded) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let Some((user, pass)) = decoded.split_once(':') else {
+        return false;
+    };
+
+    let cfg = &state.config.auth;
+    if constant_time_eq(pass.as_bytes(), cfg.admin_api_key.as_bytes()) {
+        return true;
+    }
+    check_minted_key(state, user, pass)
 }
 
 /// Decide whether a request to `/v1/metrics` may proceed on the strength of
@@ -145,6 +193,13 @@ fn authenticate_api_key(state: &AppState, presented: &str) -> bool {
         Some(parts) => parts,
         None => return false,
     };
+    check_minted_key(state, id, secret)
+}
+
+/// Look up a minted `POST /_security/api_key` credential by `(id, secret)`.
+/// Shared by the `ApiKey <base64(id:secret)>` and `Basic <base64(id:secret)>`
+/// paths — both decode to the same `id:secret` shape.
+fn check_minted_key(state: &AppState, id: &str, secret: &str) -> bool {
     let record = match state.engine.api_keys.get(id) {
         Some(r) => r,
         None => return false,
@@ -397,6 +452,76 @@ mod tests {
         ));
         assert!(!is_authorized(&state, Some("ApiKey short")));
         assert!(!is_authorized(&state, None));
+    }
+
+    /// Kibana's interactive "basic" realm login authenticates to ES via
+    /// `Authorization: Basic base64(user:pass)`, not `ApiKey`/`Bearer` — this
+    /// is what let the login form work at all once xerj started requiring
+    /// auth. Any username is accepted as long as the password is the admin
+    /// key (mirrors ES's own "elastic" bootstrap superuser), and a minted
+    /// `POST /_security/api_key` credential also works via Basic since its
+    /// `id:secret` shape already IS `user:pass`.
+    #[tokio::test]
+    async fn basic_auth_accepts_admin_password_and_minted_key() {
+        let admin = "admin-secret-key-0123456789abcdef";
+        let state = test_state(admin);
+        let app = app(state.clone());
+
+        // Any username, password = admin key.
+        let hdr = format!(
+            "Basic {}",
+            crate::es_compat::base64_encode(&format!("kibana_system:{admin}"))
+        );
+        assert!(is_authorized(&state, Some(&hdr)));
+
+        // Wrong password is rejected.
+        let bad_hdr = format!(
+            "Basic {}",
+            crate::es_compat::base64_encode("kibana_system:wrong-password")
+        );
+        assert!(!is_authorized(&state, Some(&bad_hdr)));
+
+        // Malformed input never panics: bad base64, no colon, too-short
+        // header, and an empty credential all just fail authorization.
+        assert!(!is_authorized(&state, Some("Basic %%%not-base64%%%")));
+        assert!(!is_authorized(
+            &state,
+            Some(&format!(
+                "Basic {}",
+                crate::es_compat::base64_encode("no-colon-here")
+            ))
+        ));
+        assert!(!is_authorized(&state, Some("Bas")));
+        assert!(!is_authorized(&state, Some("Basic ")));
+
+        // A key minted via POST /_security/api_key also works presented as
+        // Basic `id:secret` (exercised through the real handler, matching
+        // how `created_api_key_is_reauthenticatable` tests the ApiKey path).
+        let admin_hdr = format!("ApiKey {admin}");
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/_security/api_key",
+            Some(&admin_hdr),
+            r#"{"name":"kibana"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = body["id"].as_str().unwrap().to_string();
+        let secret = body["api_key"].as_str().unwrap().to_string();
+        let minted_basic_hdr = format!(
+            "Basic {}",
+            crate::es_compat::base64_encode(&format!("{id}:{secret}"))
+        );
+        let (status, _) = send(
+            &app,
+            "GET",
+            "/_security/_authenticate",
+            Some(&minted_basic_hdr),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "minted key via Basic should work");
     }
 
     /// RC4-W4 item 4: the read-only `metrics_token` scrapes `/v1/metrics` and
