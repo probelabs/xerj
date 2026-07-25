@@ -24,7 +24,7 @@ use crate::{
     responses::{
         BulkItemError, EsBulkItem, EsBulkItemAction, EsBulkItemResult, EsBulkResponse,
         EsDeleteDocResponse, EsDeleteIndexResponse, EsDocResponse, EsGetResponse, EsHit, EsHits,
-        EsHitsTotal, EsIndexResponse, EsInfoResponse, EsSearchResponse,
+        EsHitsTotal, EsIndexResponse, EsInfoResponse, EsSearchResponse, EsVersion,
     },
     state::AppState,
 };
@@ -33,12 +33,85 @@ use crate::{
 // GET / — cluster info
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn es_info(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn es_info(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     // Stable real node identity (matches _cat/nodes and _cat/master) instead of
     // a fresh random UUID per call.
     let node_name = state.engine.node_id.as_str().to_string();
-    let resp = EsInfoResponse::new(node_name, "xerj".to_string());
+    let mut resp = EsInfoResponse::new(node_name, "xerj".to_string());
+    resp.version = resolve_compat_version(&state, &headers);
     Json(resp).into_response()
+}
+
+/// Last-known-good OpenSearch version to advertise when a caller is (or is
+/// forced to be) treated as OpenSearch but neither an explicit
+/// Version to advertise when a caller is (or is forced to be) treated as
+/// OpenSearch and no explicit `--compat-version` override is set — mirrors
+/// the role `EsVersion::default()`'s hardcoded `"8.13.0"` already plays for
+/// the Elasticsearch path.
+///
+/// NOT derived from the calling client's own self-reported library version
+/// — that was the original plan (mirror whatever version the client says
+/// ITS OWN library is), but empirical testing against a real OpenSearch
+/// Dashboards 2.11.1 container disproved it: OSD's backend talks to the
+/// cluster via `opensearch-js`, and its own internal `opensearch-js`
+/// version (`1.1.0` at time of writing) has no relationship to a server
+/// version OSD would consider compatible — mirroring it verbatim made OSD
+/// log "This version of OpenSearch Dashboards (v2.11.1) is incompatible
+/// with the following OpenSearch nodes in your cluster: v1.1.0 ..." and
+/// refuse to start. A client library's own version number is simply not a
+/// reliable proxy for a compatible SERVER version. `"2.11.0"` (OSD's own
+/// version) verified empirically to pass OSD's compatibility gate.
+const FALLBACK_OPENSEARCH_VERSION: &str = "2.11.0";
+
+/// Resolve the `version` block (including the OpenSearch-only
+/// `distribution` field) to report to THIS caller, per request.
+///
+/// Two-tier priority, most explicit wins — see `CompatConfig`'s doc comment
+/// for the full rationale:
+/// 1. `state.config.compat.distribution`/`.version`, set via
+///    `--compat-distribution`/`--compat-version` (or the matching env
+///    vars) — always wins, no header inspection at all.
+/// 2. Unset: inspect the caller's `User-Agent` header. A recognized
+///    OpenSearch client (`opensearch-py`, `opensearch-js`, or anything
+///    else whose name contains "opensearch") gets `distribution:
+///    "opensearch"` and, absent a version override, `FALLBACK_OPENSEARCH_VERSION`
+///    (see its doc comment for why this isn't the client's own version). A
+///    recognized Elasticsearch client, or no recognizable client at all,
+///    is unchanged pre-existing behavior — plain Elasticsearch,
+///    `EsVersion::default()`.
+fn resolve_compat_version(state: &AppState, headers: &axum::http::HeaderMap) -> EsVersion {
+    let mut version = EsVersion::default();
+
+    let cfg = &state.config.compat;
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+
+    let is_opensearch = if !cfg.distribution.is_empty() {
+        cfg.distribution == "opensearch"
+    } else {
+        user_agent
+            .map(|ua| ua.to_ascii_lowercase().contains("opensearch"))
+            .unwrap_or(false)
+    };
+
+    if is_opensearch {
+        version.distribution = Some("opensearch".to_string());
+        version.number = if !cfg.version.is_empty() {
+            cfg.version.clone()
+        } else {
+            FALLBACK_OPENSEARCH_VERSION.to_string()
+        };
+    } else if !cfg.version.is_empty() {
+        // Elasticsearch-shaped (no `distribution` field), but the operator
+        // still wants a specific version.number reported.
+        version.number = cfg.version.clone();
+    }
+
+    version
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20314,7 +20387,20 @@ pub async fn cat_master(State(state): State<AppState>) -> impl IntoResponse {
 // GET /_nodes/{node_id}/stats
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn nodes_info(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn nodes_info(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // OpenSearch Dashboards' own initial-handshake compatibility check
+    // hits THIS endpoint (GET /_nodes?filter_path=nodes.*.version,...), not
+    // GET / — found empirically: a real OSD 2.11.1 container pointed at
+    // xerj logged "This version of OpenSearch Dashboards (v2.11.1) is
+    // incompatible with the following OpenSearch nodes in your cluster:
+    // v8.13.0 ..." even though OSD's own request carried a recognizable
+    // `opensearch-js/...` User-Agent — this handler just wasn't reading it.
+    // Same resolution `es_info` (GET /) uses.
+    let compat_version = resolve_compat_version(&state, &headers);
+    let reported_version = compat_version.number.clone();
     let (_idx_count, total_docs, store_bytes) = real_index_totals(&state).await;
     let rss_bytes = read_rss_bytes().unwrap_or(0);
     // Real host memory total from /proc/meminfo (falls back to an RSS-derived
@@ -20338,7 +20424,7 @@ pub async fn nodes_info(State(state): State<AppState>) -> impl IntoResponse {
                 "transport_address": "127.0.0.1:9300",
                 "host": "127.0.0.1",
                 "ip": "127.0.0.1",
-                "version": "8.13.0",
+                "version": reported_version,
                 "build_flavor": "default",
                 "build_type": "tar",
                 "build_hash": "xerj",
