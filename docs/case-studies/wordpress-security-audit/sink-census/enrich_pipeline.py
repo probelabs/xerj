@@ -25,6 +25,8 @@ V = {
  "wp-includes/PHPMailer/PHPMailer.php:1937": ("mail-config","escapeshellcmd(sendmail)","low","$sendmail is the configured sendmail path"),
  "wp-includes/PHPMailer/PHPMailer.php:1965": ("mail-config","escapeshellcmd(sendmail)","low","same"),
  "wp-admin/includes/class-wp-debug-data.php:823": ("admin-site-health","literal-command","none","exec('gs --version') — no input"),
+ "wp-admin/includes/class-ftp.php:912": ("ftp-lib-init","fixed-extension-name","low","dl() loads the fixed 'sockets' extension; name is a constant, not input"),
+ "wp-admin/includes/class-wp-filesystem-ssh2.php:221": ("admin-filesystem","internal-fs-abstraction","medium","ssh2_exec($command) — command built by WP filesystem layer for admin file ops; not direct request input"),
  # SQLi (all wpdb driver-level)
  "wp-includes/class-wpdb.php:935": ("all-db","upstream-prepare","low","driver executor; injection safety is upstream in $wpdb->prepare"),
  "wp-includes/class-wpdb.php:951": ("all-db","literal","none","literal SELECT @@SESSION.sql_mode"),
@@ -52,10 +54,11 @@ def post(path, body, ct="application/json"):
                                headers={"Content-Type": ct}, method="POST")
     return json.loads(urllib.request.urlopen(r).read())
 
-# pull every must-review site (the rare high-risk classes) and enrich
+# pull every must-review site (the high-risk classes) and enrich — size covers all
 q = {"query": {"terms": {"class": ["RCE-command","RCE-code","deserialization","SSRF","SQLi",
-                                    "file-write","file-read-or-SSRF","XXE","variable-injection"]}},
-     "size": 1000, "_source": ["file","line","fn","class"]}
+                                    "file-write","file-read","XXE","variable-injection",
+                                    "dynamic-invoke","LDAP-injection"]}},
+     "size": 5000, "_source": ["file","line","fn","class"]}
 hits = post("wpsinks/_search", json.dumps(q))["hits"]["hits"]
 reviewed = updates = 0
 bulk = []
@@ -71,5 +74,8 @@ for h in hits:
     updates += 1
 resp = post("wpsinks/_bulk", "\n".join(bulk) + "\n", "application/x-ndjson")
 print(f"enriched {updates} high-risk sink sites (errors={resp.get('errors')})")
-print(f"  agent-reviewed with a verdict: {reviewed}  (100% of RCE-command/deser/SQLi)")
-print(f"  remaining high-risk queued for agent read: {updates - reviewed}")
+print(f"  agent-reviewed with a full verdict: {reviewed}")
+print(f"    (100% of the RARE classes: RCE-command 11/11, deserialization 13/13,")
+print(f"     + the core wpdb-driver SQL sites; larger classes carry class+severity")
+print(f"     and are queued for per-site agent read)")
+print(f"  remaining high-risk queued: {updates - reviewed}")

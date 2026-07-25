@@ -59,6 +59,15 @@ For each high-risk site: read the arg + enclosing code, decide `reachable`
 but the enrichment is reasoned security judgement, and it accretes across runs.
 Enrich 100% of the rare classes; queue the long tail.
 
+### 5b. Trace any sink through the API (`trace_sink.py <file> <line>`)
+Joins `wpsinks -> wpaudit -> wpauthz -> reverse callers` with NO local file
+access: the sink + verdict, the enclosing function's sources/sinks/sanitizer, its
+authz guards, and who calls it + whether they read a request source. The verdict
+flags a SOURCE->SINK candidate when a source and an unsanitized sink coexist in a
+function. (Reverse callers scan `_source` `calls` arrays because of the
+array-`term` engine bug, and restrict common method names like `load`/`query` to
+the same file to avoid class collision.)
+
 ### 6. Reason about the real bugs (the parts a census can't see)
 Sink coverage ≠ total coverage. Also sweep, using the other detectors in the case
 study: object-scoped authorization / IDOR (`wp_authz_graph.py`,

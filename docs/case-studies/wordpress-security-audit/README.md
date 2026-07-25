@@ -98,6 +98,9 @@ read; scale and durability come from XERJ.
 - [`COVERAGE-AUDIT.md`](COVERAGE-AUDIT.md) — **the coverage-guaranteed sink census**:
   catalog every dangerous PHP built-in, enumerate every call site by AST, *prove*
   zero gaps against grep, then AI-enrich into a queryable ledger (`sink-census/`).
+- [`VERIFY-AND-TRACE.md`](VERIFY-AND-TRACE.md) — **verify the data is live in
+  XERJ and trace any sink end-to-end via the API** (sink → enclosing fn → sources
+  → reverse callers → authz), with `sink-census/trace_sink.py`.
 - [`sink-census/PHP-DANGEROUS-FUNCTIONS.md`](sink-census/PHP-DANGEROUS-FUNCTIONS.md) —
   the **full map of 275 dangerous PHP functions** (28 categories, taint-arg noted).
 - **Copyable Claude Code skill**: [`skill/SKILL.md`](skill/SKILL.md)
