@@ -345,6 +345,124 @@ enum Stmt {
     Block(Vec<Stmt>),
 }
 
+enum AstDropNode {
+    Stmt(Stmt),
+    Expr(Expr),
+}
+
+fn take_expr_children(expr: &mut Expr, pending: &mut Vec<AstDropNode>) {
+    match expr {
+        Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null | Expr::Ident(_) => {}
+        Expr::Member(base, _, arguments) => {
+            pending.push(AstDropNode::Expr(*std::mem::replace(
+                base,
+                Box::new(Expr::Null),
+            )));
+            pending.extend(
+                arguments
+                    .take()
+                    .into_iter()
+                    .flatten()
+                    .map(AstDropNode::Expr),
+            );
+        }
+        Expr::Index(base, index) => {
+            pending.push(AstDropNode::Expr(*std::mem::replace(
+                base,
+                Box::new(Expr::Null),
+            )));
+            pending.push(AstDropNode::Expr(*std::mem::replace(
+                index,
+                Box::new(Expr::Null),
+            )));
+        }
+        Expr::Call(_, arguments) => {
+            pending.extend(std::mem::take(arguments).into_iter().map(AstDropNode::Expr));
+        }
+        Expr::Unary(_, value) | Expr::Assign(_, value, _) => {
+            pending.push(AstDropNode::Expr(*std::mem::replace(
+                value,
+                Box::new(Expr::Null),
+            )));
+        }
+        Expr::Binary(_, left, right) => {
+            pending.push(AstDropNode::Expr(*std::mem::replace(
+                left,
+                Box::new(Expr::Null),
+            )));
+            pending.push(AstDropNode::Expr(*std::mem::replace(
+                right,
+                Box::new(Expr::Null),
+            )));
+        }
+        Expr::Ternary(condition, then_value, else_value) => {
+            for child in [condition, then_value, else_value] {
+                pending.push(AstDropNode::Expr(*std::mem::replace(
+                    child,
+                    Box::new(Expr::Null),
+                )));
+            }
+        }
+    }
+}
+
+fn take_stmt_children(stmt: &mut Stmt, pending: &mut Vec<AstDropNode>) {
+    match stmt {
+        Stmt::Expr(expr) => {
+            pending.push(AstDropNode::Expr(std::mem::replace(expr, Expr::Null)));
+        }
+        Stmt::Return(expr) => {
+            pending.extend(expr.take().into_iter().map(AstDropNode::Expr));
+        }
+        Stmt::If(condition, then_branch, else_branch) => {
+            pending.push(AstDropNode::Expr(std::mem::replace(condition, Expr::Null)));
+            pending.extend(
+                std::mem::take(then_branch)
+                    .into_iter()
+                    .map(AstDropNode::Stmt),
+            );
+            pending.extend(
+                std::mem::take(else_branch)
+                    .into_iter()
+                    .map(AstDropNode::Stmt),
+            );
+        }
+        Stmt::Block(block) => {
+            pending.extend(std::mem::take(block).into_iter().map(AstDropNode::Stmt));
+        }
+    }
+}
+
+/// Destroy arbitrary AST ownership iteratively.
+///
+/// This lives in `Drop` for both node types—not only in the public entry
+/// points—because parser error unwinding can own a partially-built deep tree
+/// that never reaches those entry points.
+fn drop_ast_iterative(mut pending: Vec<AstDropNode>) {
+    while let Some(node) = pending.pop() {
+        match node {
+            AstDropNode::Stmt(mut stmt) => take_stmt_children(&mut stmt, &mut pending),
+            AstDropNode::Expr(mut expr) => take_expr_children(&mut expr, &mut pending),
+        }
+    }
+}
+
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        take_expr_children(self, &mut pending);
+        drop_ast_iterative(pending);
+    }
+}
+
+impl Drop for Stmt {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        take_stmt_children(self, &mut pending);
+        drop_ast_iterative(pending);
+    }
+}
+
 // ── Resource limits ──────────────────────────────────────────────────────────
 
 /// Maximum recursive nesting depth accepted by the recursive-descent parser
@@ -360,7 +478,13 @@ pub(crate) const MAX_PARSE_DEPTH: usize = 100;
 /// like `1+1+1+…` which the parser builds with a loop, not recursion, and so
 /// are NOT limited by [`MAX_PARSE_DEPTH`]) cannot overflow the stack at score
 /// time.
-pub(crate) const MAX_EVAL_DEPTH: usize = 500;
+///
+/// This is intentionally lower than the parser's historical 500-node
+/// evaluator allowance: the recursive evaluator itself overflows the default
+/// Rust test/worker stack before a 500-frame guard can unwind. A 100-frame
+/// bound passes on that default stack with substantial margin; iterative AST
+/// destruction separately makes every error/unwind path safe.
+pub(crate) const MAX_EVAL_DEPTH: usize = 100;
 
 /// Maximum accepted script source length in bytes. Matches Elasticsearch's
 /// default `script.max_size_in_bytes` (64 KiB) and bounds the size of any AST
@@ -537,8 +661,8 @@ impl<'a> Parser<'a> {
         if self.match_punct('=') {
             // Disambiguate from `==` already consumed by parse_compare.
             let rhs = self.parse_assign()?;
-            if let Expr::Ident(name) = lhs {
-                return Ok(Expr::Assign(name, Box::new(rhs), false));
+            if let Expr::Ident(name) = &lhs {
+                return Ok(Expr::Assign(name.clone(), Box::new(rhs), false));
             }
             return Err("assignment target must be identifier".into());
         }
@@ -784,8 +908,9 @@ pub fn check_script_limits(src: &str) -> Result<(), String> {
     };
     let mut p = Parser::new(&toks);
     match p.parse_program() {
+        Ok(_) => Ok(()),
         Err(e) if e == TOO_DEEP_MSG => Err(e),
-        _ => Ok(()),
+        Err(_) => Ok(()),
     }
 }
 
@@ -1507,10 +1632,90 @@ mod tests {
         // evaluator would recurse over. The eval-depth guard must catch it.
         let src = format!("1{}", "+1".repeat(5000));
         let r = eval_painless(&src, &ctx(&doc, &params, 0.0));
-        assert!(
-            r.is_err(),
-            "expected eval-depth error on deep AST, got {:?}",
-            r
+        assert_eq!(r.unwrap_err(), "script evaluation exceeded maximum depth");
+    }
+
+    #[test]
+    fn evaluator_depth_limit_keeps_normal_chains_and_rejects_unsafe_ones() {
+        let doc = json!({});
+        let params = json!({});
+        let safe = format!("1{}", "+1".repeat(80));
+        assert_eq!(
+            eval_painless(&safe, &ctx(&doc, &params, 0.0))
+                .unwrap()
+                .as_f64(),
+            Some(81.0)
+        );
+        let unsafe_chain = format!("1{}", "+1".repeat(150));
+        assert_eq!(
+            eval_painless(&unsafe_chain, &ctx(&doc, &params, 0.0)).unwrap_err(),
+            "script evaluation exceeded maximum depth"
+        );
+    }
+
+    #[test]
+    fn long_flat_binary_chain_does_not_overflow_limit_check() {
+        let src = format!("1{}", "+1".repeat(5000));
+        assert_eq!(check_script_limits(&src), Ok(()));
+    }
+
+    #[test]
+    fn ordinary_drop_handles_all_child_bearing_variants_iteratively() {
+        let mut deep = Expr::Number(1.0);
+        for _ in 0..5000 {
+            deep = Expr::Binary("+".to_string(), Box::new(deep), Box::new(Expr::Number(1.0)));
+        }
+
+        let mixed = Expr::Member(
+            Box::new(Expr::Index(
+                Box::new(Expr::Call(
+                    "f".to_string(),
+                    vec![
+                        Expr::Unary(
+                            "-".to_string(),
+                            Box::new(Expr::Assign("x".to_string(), Box::new(deep), false)),
+                        ),
+                        Expr::Ternary(
+                            Box::new(Expr::Bool(true)),
+                            Box::new(Expr::String("a".to_string())),
+                            Box::new(Expr::Null),
+                        ),
+                    ],
+                )),
+                Box::new(Expr::Ident("i".to_string())),
+            )),
+            "m".to_string(),
+            Some(vec![Expr::Number(2.0)]),
+        );
+
+        drop(vec![Stmt::If(
+            Expr::Bool(true),
+            vec![Stmt::Block(vec![Stmt::Expr(mixed)])],
+            vec![Stmt::Return(Some(Expr::Null))],
+        )]);
+    }
+
+    #[test]
+    fn late_parse_error_drops_deep_partial_binary_ast_iteratively() {
+        // The parser owns the complete left-leaning tree when the final
+        // operator discovers its missing RHS. This error path never returns
+        // an AST to either public entry point.
+        let src = format!("1{}+", "+1".repeat(5000));
+        assert!(eval_painless(&src, &ctx(&json!({}), &json!({}), 0.0)).is_err());
+        assert_eq!(check_script_limits(&src), Ok(()));
+    }
+
+    #[test]
+    fn eval_depth_error_drops_ast_with_unvisited_deep_siblings_iteratively() {
+        // Evaluation fails down the left branch before visiting the equally
+        // deep right branch. Both the active path and untouched sibling must
+        // be destroyed without recursive generated Drop.
+        let left = format!("1{}", "+1".repeat(5000));
+        let right = format!("2{}", "+2".repeat(5000));
+        let src = format!("({left}) + ({right})");
+        assert_eq!(
+            eval_painless(&src, &ctx(&json!({}), &json!({}), 0.0)).unwrap_err(),
+            "script evaluation exceeded maximum depth"
         );
     }
 
