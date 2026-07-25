@@ -5044,6 +5044,259 @@ async fn test_semantic_text_bulk_preserves_item_order_status_and_vectors() {
     assert_eq!(b["content_vector"].as_array().unwrap().len(), 16);
 }
 
+#[tokio::test]
+async fn test_put_delete_recreate_publication_versions_and_visibility() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index("publication-order", Schema::empty())
+        .unwrap();
+    let idx = engine.get_index("publication-order").unwrap();
+
+    let first = idx
+        .index_document(Some("same".into()), json!({"state": "first"}))
+        .await
+        .unwrap();
+    assert_eq!(first.result, "created");
+    assert_eq!(first.version, 1);
+
+    let deleted = idx
+        .delete_document_versioned("same", None, None)
+        .await
+        .unwrap();
+    assert!(deleted.found);
+    assert_eq!(deleted.version, 2);
+    assert!(deleted.seq_no > first.seq_no);
+    assert!(idx.get_document("same").await.unwrap().is_none());
+
+    let recreated = idx
+        .index_document(Some("same".into()), json!({"state": "recreated"}))
+        .await
+        .unwrap();
+    assert_eq!(recreated.result, "created");
+    assert_eq!(recreated.version, 3);
+    assert!(recreated.seq_no > deleted.seq_no);
+    assert_eq!(
+        idx.get_document("same").await.unwrap().unwrap()["state"],
+        "recreated"
+    );
+
+    idx.flush().await.unwrap();
+    assert_eq!(
+        idx.get_document("same").await.unwrap().unwrap()["state"],
+        "recreated",
+        "latest publication must survive flush"
+    );
+}
+
+#[tokio::test]
+async fn test_conditional_put_and_delete_same_id_linearize_at_cas() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index("publication-race", Schema::empty())
+        .unwrap();
+    let idx = engine.get_index("publication-race").unwrap();
+
+    for round in 0..32 {
+        let id = format!("same-{round}");
+        let initial = idx
+            .index_document(Some(id.clone()), json!({"winner": "initial"}))
+            .await
+            .unwrap();
+        let expected_seq = initial.seq_no;
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+
+        let put = {
+            let idx = std::sync::Arc::clone(&idx);
+            let id = id.clone();
+            let start = std::sync::Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                idx.index_document_with_version(
+                    Some(id),
+                    json!({"winner": "put"}),
+                    Some(expected_seq),
+                    Some(1),
+                )
+                .await
+            })
+        };
+        let delete = {
+            let idx = std::sync::Arc::clone(&idx);
+            let id = id.clone();
+            let start = std::sync::Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                idx.delete_document_versioned(&id, Some(expected_seq), Some(1))
+                    .await
+            })
+        };
+        start.wait().await;
+
+        let put = put.await.unwrap();
+        let delete = delete.await.unwrap();
+        assert_eq!(
+            put.is_ok() as u8 + delete.is_ok() as u8,
+            1,
+            "exactly one operation may consume the same CAS precondition"
+        );
+
+        if let Ok(response) = put {
+            assert_eq!(response.version, 2);
+            assert_eq!(
+                idx.get_document(&id).await.unwrap().unwrap()["winner"],
+                "put"
+            );
+        } else {
+            let outcome = delete.unwrap();
+            assert!(outcome.found);
+            assert_eq!(outcome.version, 2);
+            assert!(idx.get_document(&id).await.unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_concurrent_create_and_updates_share_exact_publication_key() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index("publication-create-update", Schema::empty())
+        .unwrap();
+    let idx = engine.get_index("publication-create-update").unwrap();
+
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(17));
+    let mut creates = Vec::new();
+    for writer in 0..16 {
+        let idx = std::sync::Arc::clone(&idx);
+        let start = std::sync::Arc::clone(&start);
+        creates.push(tokio::spawn(async move {
+            start.wait().await;
+            idx.create_document("same".into(), json!({"created_by": writer, "base": true}))
+                .await
+        }));
+    }
+    start.wait().await;
+    let mut successes = 0;
+    for task in creates {
+        successes += task.await.unwrap().is_ok() as usize;
+    }
+    assert_eq!(successes, 1, "create-only admission must be linearized");
+
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(17));
+    let mut updates = Vec::new();
+    for writer in 0..16 {
+        let idx = std::sync::Arc::clone(&idx);
+        let start = std::sync::Arc::clone(&start);
+        updates.push(tokio::spawn(async move {
+            start.wait().await;
+            idx.update_document_with_upsert(
+                "same",
+                Some(json!({(format!("field_{writer}")): writer})),
+                None,
+                false,
+            )
+            .await
+        }));
+    }
+    start.wait().await;
+    for task in updates {
+        task.await.unwrap().unwrap().unwrap();
+    }
+
+    let source = idx.get_document("same").await.unwrap().unwrap();
+    for writer in 0..16 {
+        assert_eq!(source[format!("field_{writer}")], writer);
+    }
+
+    let changed = idx
+        .update_document("same", json!({"stable": "value"}))
+        .await
+        .unwrap()
+        .unwrap();
+    let noop = idx
+        .update_document_with_upsert("same", Some(json!({"stable": "value"})), None, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(noop.result, "noop");
+    assert_eq!(noop.seq_no, changed.seq_no);
+    assert_eq!(noop.version, changed.version);
+
+    let upsert_start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let mut upserts = Vec::new();
+    for field in ["left", "right"] {
+        let idx = std::sync::Arc::clone(&idx);
+        let start = std::sync::Arc::clone(&upsert_start);
+        upserts.push(tokio::spawn(async move {
+            start.wait().await;
+            idx.update_document_with_upsert("missing", Some(json!({(field): true})), None, true)
+                .await
+        }));
+    }
+    upsert_start.wait().await;
+    for task in upserts {
+        task.await.unwrap().unwrap().unwrap();
+    }
+    let upserted = idx.get_document("missing").await.unwrap().unwrap();
+    assert_eq!(upserted["left"], true);
+    assert_eq!(upserted["right"], true);
+}
+
+#[tokio::test]
+async fn test_concurrent_external_versions_publish_highest_source() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index("publication-external", Schema::empty())
+        .unwrap();
+    let idx = engine.get_index("publication-external").unwrap();
+    idx.index_document_external(Some("same".into()), json!({"external": 1}), 1, "external")
+        .await
+        .unwrap();
+
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for version in [2_u64, 3] {
+        let idx = std::sync::Arc::clone(&idx);
+        let start = std::sync::Arc::clone(&start);
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            (
+                version,
+                idx.index_document_external(
+                    Some("same".into()),
+                    json!({"external": version}),
+                    version,
+                    "external",
+                )
+                .await,
+            )
+        }));
+    }
+    start.wait().await;
+    let mut version_three_succeeded = false;
+    for task in tasks {
+        let (requested, result) = task.await.unwrap();
+        if requested == 3 {
+            assert_eq!(result.unwrap().version, 3);
+            version_three_succeeded = true;
+        }
+    }
+    assert!(version_three_succeeded);
+    assert_eq!(
+        idx.get_document("same").await.unwrap().unwrap()["external"],
+        3
+    );
+    assert!(
+        idx.index_document_external(Some("same".into()), json!({"external": 2}), 2, "external",)
+            .await
+            .is_err(),
+        "lower external version must remain rejected"
+    );
+}
+
 #[cfg(feature = "onnx-experimental")]
 #[tokio::test]
 async fn test_semantic_bulk_preserves_onnx_admission_429() {

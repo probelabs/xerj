@@ -28,6 +28,7 @@ pub mod rbac;
 pub mod slow_query;
 pub mod sql;
 pub mod turbo_ingest;
+mod write_publication;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
