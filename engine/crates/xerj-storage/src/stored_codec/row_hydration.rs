@@ -1,5 +1,6 @@
 use super::*;
 use serde::de::Deserializer as _;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 /// Logical work performed by row-selective hydration.
@@ -38,9 +39,74 @@ pub enum StoredV2RowHydrationResult {
     },
 }
 
+type IdentityColumns = (usize, Vec<serde_json::Value>, Vec<serde_json::Value>);
+
+pub(super) fn decode_v2_identity_columns_controlled(
+    bytes: &[u8],
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<StoredDecodeRun<Option<IdentityColumns>>> {
+    let directory = parse_v2_directory(&bytes[4..])?;
+    let id_index = directory
+        .columns
+        .iter()
+        .position(|column| column.name == "__id")
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 missing __id column")))?;
+    let seq_index = directory
+        .columns
+        .iter()
+        .position(|column| column.name == "__seq_no")
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 missing __seq_no column")))?;
+    let selected: Vec<usize> = (0..directory.num_docs).collect();
+    let mut stats = StoredV2RowHydrationStats::default();
+    let mut dict_ids = HashMap::new();
+    let mut decode =
+        |index| -> Result<std::result::Result<Vec<serde_json::Value>, Option<String>>> {
+            if decode_cancelled(checkpoint, StoredDecodePhase::BeforeColumn, index, 0) {
+                return Ok(Err(None));
+            }
+            let result = select_column_rows(
+                index,
+                &directory,
+                &selected,
+                &mut stats,
+                &mut dict_ids,
+                checkpoint,
+            )?;
+            if result.is_ok()
+                && decode_cancelled(
+                    checkpoint,
+                    StoredDecodePhase::AfterColumn,
+                    index,
+                    directory.num_docs,
+                )
+            {
+                return Ok(Err(None));
+            }
+            Ok(result)
+        };
+    let ids = match decode(id_index)? {
+        Ok(values) => values,
+        Err(None) => return Ok(StoredDecodeRun::Cancelled),
+        Err(Some(_)) => return Ok(StoredDecodeRun::Complete(None)),
+    };
+    let seq_nos = match decode(seq_index)? {
+        Ok(values) => values,
+        Err(None) => return Ok(StoredDecodeRun::Cancelled),
+        Err(Some(_)) => return Ok(StoredDecodeRun::Complete(None)),
+    };
+    Ok(StoredDecodeRun::Complete(Some((
+        directory.num_docs,
+        ids,
+        seq_nos,
+    ))))
+}
+
 struct SelectedRowsVisitor<'a> {
     selected: &'a [usize],
     expected_rows: usize,
+    column_index: usize,
+    checkpoint: &'a mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+    cancelled: &'a Cell<bool>,
 }
 
 impl<'de> serde::de::Visitor<'de> for SelectedRowsVisitor<'_> {
@@ -69,6 +135,18 @@ impl<'de> serde::de::Visitor<'de> for SelectedRowsVisitor<'_> {
                     .next_element::<serde::de::IgnoredAny>()?
                     .ok_or_else(|| serde::de::Error::custom("stored column ended early"))?;
             }
+            let processed = row + 1;
+            if processed % STORED_DECODE_CHECK_INTERVAL == 0
+                && (self.checkpoint)(StoredDecodeCheckpoint {
+                    phase: StoredDecodePhase::Rows,
+                    column_index: self.column_index,
+                    rows_processed: processed,
+                })
+                .is_break()
+            {
+                self.cancelled.set(true);
+                return Err(serde::de::Error::custom("stored decode cancelled"));
+            }
         }
         if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
             return Err(serde::de::Error::custom(
@@ -84,18 +162,28 @@ fn select_json_rows<R: std::io::Read>(
     selected: &[usize],
     expected_rows: usize,
     context: &str,
-) -> Result<Vec<serde_json::Value>> {
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Vec<serde_json::Value>, ()>> {
+    let cancelled = Cell::new(false);
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    let values = deserializer
-        .deserialize_seq(SelectedRowsVisitor {
-            selected,
-            expected_rows,
-        })
-        .map_err(|error| StorageError::Other(anyhow::anyhow!("{context}: {error}")))?;
+    let values = match deserializer.deserialize_seq(SelectedRowsVisitor {
+        selected,
+        expected_rows,
+        column_index,
+        checkpoint,
+        cancelled: &cancelled,
+    }) {
+        Ok(values) => values,
+        Err(_) if cancelled.get() => return Ok(Err(())),
+        Err(error) => {
+            return Err(StorageError::Other(anyhow::anyhow!("{context}: {error}")));
+        }
+    };
     deserializer
         .end()
         .map_err(|error| StorageError::Other(anyhow::anyhow!("{context}: {error}")))?;
-    Ok(values)
+    Ok(Ok(values))
 }
 
 fn unpack_id(packed: &[u8], bit_width: u8, ordinal: usize) -> Option<u32> {
@@ -122,7 +210,13 @@ struct SelectedDict {
     decompressed_bytes: usize,
 }
 
-fn decode_dict_rows(payload: &[u8], selected: &[usize], num_docs: usize) -> Result<SelectedDict> {
+fn decode_dict_rows(
+    payload: &[u8],
+    selected: &[usize],
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<SelectedDict, ()>> {
     let mut cursor = Cursor::new(payload);
     let dict_count = cursor
         .read_u32::<LittleEndian>()
@@ -196,6 +290,16 @@ fn decode_dict_rows(payload: &[u8], selected: &[usize], num_docs: usize) -> Resu
                 "dict id {id} outside dictionary"
             )));
         }
+        if (ordinal + 1) % STORED_DECODE_CHECK_INTERVAL == 0
+            && checkpoint(StoredDecodeCheckpoint {
+                phase: StoredDecodePhase::Rows,
+                column_index,
+                rows_processed: ordinal + 1,
+            })
+            .is_break()
+        {
+            return Ok(Err(()));
+        }
     }
     let ids: Vec<u32> = selected
         .iter()
@@ -214,7 +318,17 @@ fn decode_dict_rows(payload: &[u8], selected: &[usize], num_docs: usize) -> Resu
     needed.dedup();
     let decoder = zstd::stream::read::Decoder::new(&payload[dict_start..dict_end])
         .map_err(|error| StorageError::Other(anyhow::anyhow!("dict zstd: {error}")))?;
-    let entries = select_json_rows(decoder, &needed, dict_count, "dict json")?;
+    let entries = match select_json_rows(
+        decoder,
+        &needed,
+        dict_count,
+        "dict json",
+        column_index,
+        checkpoint,
+    )? {
+        Ok(entries) => entries,
+        Err(()) => return Ok(Err(())),
+    };
     let entries: HashMap<usize, serde_json::Value> = needed.iter().copied().zip(entries).collect();
     let values = ids
         .iter()
@@ -228,12 +342,12 @@ fn decode_dict_rows(payload: &[u8], selected: &[usize], num_docs: usize) -> Resu
             }
         })
         .collect::<Result<_>>()?;
-    Ok(SelectedDict {
+    Ok(Ok(SelectedDict {
         values,
         ids,
         selected_entries: needed.len(),
         decompressed_bytes: packed.len(),
-    })
+    }))
 }
 
 fn decode_cross_dep_rows(
@@ -242,7 +356,9 @@ fn decode_cross_dep_rows(
     source_ids: &[u32],
     num_docs: usize,
     stats: &mut StoredV2RowHydrationStats,
-) -> Result<Vec<serde_json::Value>> {
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Vec<serde_json::Value>, ()>> {
     let body = decode_cross_dep_body(column.payload)?;
     stats.decompressed_buffer_bytes += body.len();
     let mut cursor = Cursor::new(body.as_slice());
@@ -285,13 +401,23 @@ fn decode_cross_dep_rows(
             exceptions.insert(ordinal, value);
         }
         previous = ordinal;
+        if (exception_index + 1) % STORED_DECODE_CHECK_INTERVAL == 0
+            && checkpoint(StoredDecodeCheckpoint {
+                phase: StoredDecodePhase::Rows,
+                column_index,
+                rows_processed: exception_index + 1,
+            })
+            .is_break()
+        {
+            return Ok(Err(()));
+        }
     }
     if position != body.len() {
         return Err(StorageError::Other(anyhow::anyhow!(
             "cross_dep trailing exception bytes"
         )));
     }
-    Ok(selected
+    Ok(Ok(selected
         .iter()
         .zip(source_ids)
         .map(|(ordinal, source_id)| {
@@ -310,7 +436,7 @@ fn decode_cross_dep_rows(
                 }
             }
         })
-        .collect())
+        .collect()))
 }
 
 fn select_column_rows(
@@ -319,21 +445,42 @@ fn select_column_rows(
     selected: &[usize],
     stats: &mut StoredV2RowHydrationStats,
     dict_ids: &mut HashMap<usize, Vec<u32>>,
-) -> Result<std::result::Result<Vec<serde_json::Value>, String>> {
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Vec<serde_json::Value>, Option<String>>> {
     let column = &directory.columns[column_index];
     let values = match column.codec {
         ColCodec::RawJson => {
             stats.encoded_rows_visited += directory.num_docs;
             let decoder = zstd::stream::read::Decoder::new(column.payload)
                 .map_err(|error| StorageError::Other(anyhow::anyhow!("raw zstd: {error}")))?;
-            select_json_rows(decoder, selected, directory.num_docs, "raw json")?
+            match select_json_rows(
+                decoder,
+                selected,
+                directory.num_docs,
+                "raw json",
+                column_index,
+                checkpoint,
+            )? {
+                Ok(values) => values,
+                Err(()) => return Ok(Err(None)),
+            }
         }
         ColCodec::Lz4Json => {
             let raw = lz4_flex::decompress_size_prepended(column.payload)
                 .map_err(|error| StorageError::Other(anyhow::anyhow!("lz4 decode: {error}")))?;
             stats.decompressed_buffer_bytes += raw.len();
             stats.encoded_rows_visited += directory.num_docs;
-            select_json_rows(raw.as_slice(), selected, directory.num_docs, "lz4 json")?
+            match select_json_rows(
+                raw.as_slice(),
+                selected,
+                directory.num_docs,
+                "lz4 json",
+                column_index,
+                checkpoint,
+            )? {
+                Ok(values) => values,
+                Err(()) => return Ok(Err(None)),
+            }
         }
         ColCodec::Constant => {
             let value: serde_json::Value = serde_json::from_slice(column.payload)
@@ -341,7 +488,16 @@ fn select_column_rows(
             vec![value; selected.len()]
         }
         ColCodec::DictBitpack => {
-            let decoded = decode_dict_rows(column.payload, selected, directory.num_docs)?;
+            let decoded = match decode_dict_rows(
+                column.payload,
+                selected,
+                directory.num_docs,
+                column_index,
+                checkpoint,
+            )? {
+                Ok(decoded) => decoded,
+                Err(()) => return Ok(Err(None)),
+            };
             stats.selected_dictionary_entries += decoded.selected_entries;
             stats.decompressed_buffer_bytes += decoded.decompressed_bytes;
             dict_ids.insert(column_index, decoded.ids);
@@ -361,28 +517,47 @@ fn select_column_rows(
                 // validate this column's complete body and exception stream
                 // before asking the caller to use the compatibility path.
                 let placeholder_source_ids = vec![0; selected.len()];
-                decode_cross_dep_rows(
+                match decode_cross_dep_rows(
                     column,
                     selected,
                     &placeholder_source_ids,
                     directory.num_docs,
                     stats,
-                )?;
-                return Ok(Err(column.name.to_string()));
+                    column_index,
+                    checkpoint,
+                )? {
+                    Ok(_) => {}
+                    Err(()) => return Ok(Err(None)),
+                }
+                return Ok(Err(Some(column.name.to_string())));
             }
             if let std::collections::hash_map::Entry::Vacant(entry) = dict_ids.entry(source_index) {
-                let decoded = decode_dict_rows(source.payload, selected, directory.num_docs)?;
+                let decoded = match decode_dict_rows(
+                    source.payload,
+                    selected,
+                    directory.num_docs,
+                    source_index,
+                    checkpoint,
+                )? {
+                    Ok(decoded) => decoded,
+                    Err(()) => return Ok(Err(None)),
+                };
                 stats.selected_dictionary_entries += decoded.selected_entries;
                 stats.decompressed_buffer_bytes += decoded.decompressed_bytes;
                 entry.insert(decoded.ids);
             }
-            decode_cross_dep_rows(
+            match decode_cross_dep_rows(
                 column,
                 selected,
                 &dict_ids[&source_index],
                 directory.num_docs,
                 stats,
-            )?
+                column_index,
+                checkpoint,
+            )? {
+                Ok(values) => values,
+                Err(()) => return Ok(Err(None)),
+            }
         }
     };
     stats.selected_json_values += values.len();
@@ -394,8 +569,26 @@ pub fn decode_stored_v2_rows(
     bytes: &[u8],
     ordinals: &[usize],
 ) -> Result<StoredV2RowHydrationResult> {
+    match decode_stored_v2_rows_controlled(
+        bytes,
+        ordinals,
+        |_| std::ops::ControlFlow::Continue(()),
+    )? {
+        StoredDecodeRun::Complete(result) => Ok(result),
+        StoredDecodeRun::Cancelled => unreachable!("non-cancelling compatibility wrapper"),
+    }
+}
+
+pub fn decode_stored_v2_rows_controlled<F>(
+    bytes: &[u8],
+    ordinals: &[usize],
+    mut checkpoint: F,
+) -> Result<StoredDecodeRun<StoredV2RowHydrationResult>>
+where
+    F: FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+{
     if bytes.len() < 4 || &bytes[..4] != STORED_V2_MAGIC {
-        return Ok(StoredV2RowHydrationResult::NotV2);
+        return Ok(StoredDecodeRun::Complete(StoredV2RowHydrationResult::NotV2));
     }
     let directory = parse_v2_directory(&bytes[4..])?;
     let id_index = directory
@@ -420,20 +613,43 @@ pub fn decode_stored_v2_rows(
         )));
     }
     if selected.is_empty() {
-        return Ok(StoredV2RowHydrationResult::Hydrated {
-            rows: Vec::new(),
-            stats: StoredV2RowHydrationStats::default(),
-        });
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2RowHydrationResult::Hydrated {
+                rows: Vec::new(),
+                stats: StoredV2RowHydrationStats::default(),
+            },
+        ));
     }
     let mut stats = StoredV2RowHydrationStats::default();
     let mut columns = Vec::with_capacity(directory.columns.len());
     let mut dict_ids = HashMap::new();
     for index in 0..directory.columns.len() {
-        match select_column_rows(index, &directory, &selected, &mut stats, &mut dict_ids)? {
+        if decode_cancelled(&mut checkpoint, StoredDecodePhase::BeforeColumn, index, 0) {
+            return Ok(StoredDecodeRun::Cancelled);
+        }
+        match select_column_rows(
+            index,
+            &directory,
+            &selected,
+            &mut stats,
+            &mut dict_ids,
+            &mut checkpoint,
+        )? {
             Ok(values) => columns.push(values),
-            Err(column) => {
-                return Ok(StoredV2RowHydrationResult::UnsupportedDependencyShape { column });
+            Err(Some(column)) => {
+                return Ok(StoredDecodeRun::Complete(
+                    StoredV2RowHydrationResult::UnsupportedDependencyShape { column },
+                ));
             }
+            Err(None) => return Ok(StoredDecodeRun::Cancelled),
+        }
+        if decode_cancelled(
+            &mut checkpoint,
+            StoredDecodePhase::AfterColumn,
+            index,
+            directory.num_docs,
+        ) {
+            return Ok(StoredDecodeRun::Cancelled);
         }
     }
     let mut rows = Vec::with_capacity(selected.len());
@@ -457,7 +673,9 @@ pub fn decode_stored_v2_rows(
             source,
         });
     }
-    Ok(StoredV2RowHydrationResult::Hydrated { rows, stats })
+    Ok(StoredDecodeRun::Complete(
+        StoredV2RowHydrationResult::Hydrated { rows, stats },
+    ))
 }
 
 #[cfg(test)]
@@ -663,6 +881,123 @@ mod tests {
             _ => panic!("expected hydration"),
         };
         assert_eq!(selected(small), selected(large));
+    }
+
+    #[test]
+    fn controlled_hydration_has_deterministic_order_and_distinct_cancellation() {
+        let encoded = fixture(256, ColCodec::RawJson);
+        let mut observed = Vec::new();
+        let run = decode_stored_v2_rows_controlled(&encoded, &[0, 7], |point| {
+            observed.push(point);
+            if point.phase == StoredDecodePhase::Rows && point.rows_processed == 128 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(run, StoredDecodeRun::Cancelled);
+        assert_eq!(
+            observed[0],
+            StoredDecodeCheckpoint {
+                phase: StoredDecodePhase::BeforeColumn,
+                column_index: 0,
+                rows_processed: 0,
+            }
+        );
+        assert_eq!(
+            observed[1],
+            StoredDecodeCheckpoint {
+                phase: StoredDecodePhase::Rows,
+                column_index: 0,
+                rows_processed: 128,
+            }
+        );
+
+        let complete = decode_stored_v2_rows_controlled(&encoded, &[0, 7], |_| {
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(
+            complete,
+            StoredDecodeRun::Complete(decode_stored_v2_rows(&encoded, &[0, 7]).unwrap())
+        );
+    }
+
+    #[test]
+    fn controlled_hydration_cancellation_precedes_unvisited_corruption() {
+        let mut encoded = fixture(256, ColCodec::RawJson);
+        let (offset, payload_len) = {
+            let directory = parse_v2_directory(&encoded[4..]).unwrap();
+            let last = directory.columns.last().unwrap();
+            (
+                last.payload.as_ptr() as usize - encoded.as_ptr() as usize,
+                last.payload.len(),
+            )
+        };
+        encoded[offset + payload_len / 2] ^= 0xff;
+
+        assert_eq!(
+            decode_stored_v2_rows_controlled(&encoded, &[0], |_| {
+                std::ops::ControlFlow::Break(())
+            })
+            .unwrap(),
+            StoredDecodeRun::Cancelled
+        );
+        assert!(decode_stored_v2_rows_controlled(&encoded, &[0], |_| {
+            std::ops::ControlFlow::Continue(())
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn controlled_hydration_stops_before_malformed_row_129() {
+        let mut json = String::from("[");
+        for row in 0..128 {
+            if row != 0 {
+                json.push(',');
+            }
+            json.push_str(&row.to_string());
+        }
+        json.push_str(",row_129_is_invalid]");
+        let malformed = zstd::encode_all(Cursor::new(json.as_bytes()), STORED_ZSTD_LEVEL).unwrap();
+        let encoded = assemble(
+            256,
+            &[
+                (
+                    "__id",
+                    ColCodec::Constant,
+                    serde_json::to_vec(&json!("id")).unwrap(),
+                ),
+                (
+                    "__seq_no",
+                    ColCodec::Constant,
+                    serde_json::to_vec(&json!(1)).unwrap(),
+                ),
+                ("bad", ColCodec::RawJson, malformed),
+            ],
+        );
+        assert_eq!(
+            decode_stored_v2_rows_controlled(&encoded, &[0], |point| {
+                if point.column_index == 2
+                    && point.phase == StoredDecodePhase::Rows
+                    && point.rows_processed == 128
+                {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            })
+            .unwrap(),
+            StoredDecodeRun::Cancelled
+        );
+        assert!(
+            decode_stored_v2_rows_controlled(&encoded, &[0], |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .is_err(),
+            "without cancellation the parser must consume malformed row 129"
+        );
     }
 
     #[test]
