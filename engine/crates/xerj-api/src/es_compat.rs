@@ -24,7 +24,7 @@ use crate::{
     responses::{
         BulkItemError, EsBulkItem, EsBulkItemAction, EsBulkItemResult, EsBulkResponse,
         EsDeleteDocResponse, EsDeleteIndexResponse, EsDocResponse, EsGetResponse, EsHit, EsHits,
-        EsHitsTotal, EsIndexResponse, EsInfoResponse, EsSearchResponse,
+        EsHitsTotal, EsIndexResponse, EsInfoResponse, EsSearchResponse, EsVersion,
     },
     state::AppState,
 };
@@ -33,12 +33,85 @@ use crate::{
 // GET / — cluster info
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn es_info(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn es_info(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     // Stable real node identity (matches _cat/nodes and _cat/master) instead of
     // a fresh random UUID per call.
     let node_name = state.engine.node_id.as_str().to_string();
-    let resp = EsInfoResponse::new(node_name, "xerj".to_string());
+    let mut resp = EsInfoResponse::new(node_name, "xerj".to_string());
+    resp.version = resolve_compat_version(&state, &headers);
     Json(resp).into_response()
+}
+
+/// Last-known-good OpenSearch version to advertise when a caller is (or is
+/// forced to be) treated as OpenSearch but neither an explicit
+/// Version to advertise when a caller is (or is forced to be) treated as
+/// OpenSearch and no explicit `--compat-version` override is set — mirrors
+/// the role `EsVersion::default()`'s hardcoded `"8.13.0"` already plays for
+/// the Elasticsearch path.
+///
+/// NOT derived from the calling client's own self-reported library version
+/// — that was the original plan (mirror whatever version the client says
+/// ITS OWN library is), but empirical testing against a real OpenSearch
+/// Dashboards 2.11.1 container disproved it: OSD's backend talks to the
+/// cluster via `opensearch-js`, and its own internal `opensearch-js`
+/// version (`1.1.0` at time of writing) has no relationship to a server
+/// version OSD would consider compatible — mirroring it verbatim made OSD
+/// log "This version of OpenSearch Dashboards (v2.11.1) is incompatible
+/// with the following OpenSearch nodes in your cluster: v1.1.0 ..." and
+/// refuse to start. A client library's own version number is simply not a
+/// reliable proxy for a compatible SERVER version. `"2.11.0"` (OSD's own
+/// version) verified empirically to pass OSD's compatibility gate.
+const FALLBACK_OPENSEARCH_VERSION: &str = "2.11.0";
+
+/// Resolve the `version` block (including the OpenSearch-only
+/// `distribution` field) to report to THIS caller, per request.
+///
+/// Two-tier priority, most explicit wins — see `CompatConfig`'s doc comment
+/// for the full rationale:
+/// 1. `state.config.compat.distribution`/`.version`, set via
+///    `--compat-distribution`/`--compat-version` (or the matching env
+///    vars) — always wins, no header inspection at all.
+/// 2. Unset: inspect the caller's `User-Agent` header. A recognized
+///    OpenSearch client (`opensearch-py`, `opensearch-js`, or anything
+///    else whose name contains "opensearch") gets `distribution:
+///    "opensearch"` and, absent a version override, `FALLBACK_OPENSEARCH_VERSION`
+///    (see its doc comment for why this isn't the client's own version). A
+///    recognized Elasticsearch client, or no recognizable client at all,
+///    is unchanged pre-existing behavior — plain Elasticsearch,
+///    `EsVersion::default()`.
+fn resolve_compat_version(state: &AppState, headers: &axum::http::HeaderMap) -> EsVersion {
+    let mut version = EsVersion::default();
+
+    let cfg = &state.config.compat;
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+
+    let is_opensearch = if !cfg.distribution.is_empty() {
+        cfg.distribution == "opensearch"
+    } else {
+        user_agent
+            .map(|ua| ua.to_ascii_lowercase().contains("opensearch"))
+            .unwrap_or(false)
+    };
+
+    if is_opensearch {
+        version.distribution = Some("opensearch".to_string());
+        version.number = if !cfg.version.is_empty() {
+            cfg.version.clone()
+        } else {
+            FALLBACK_OPENSEARCH_VERSION.to_string()
+        };
+    } else if !cfg.version.is_empty() {
+        // Elasticsearch-shaped (no `distribution` field), but the operator
+        // still wants a specific version.number reported.
+        version.number = cfg.version.clone();
+    }
+
+    version
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5313,6 +5386,168 @@ pub(crate) fn top_level_query_type(body_query: &Option<serde_json::Value>) -> &'
     }
 }
 
+/// Request-owned child task: dropping the HTTP handler aborts its search
+/// instead of leaving detached work running after a client disconnect.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(test)]
+type PendingSearchSignals = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+);
+#[cfg(test)]
+static TEST_PENDING_SEARCH_SIGNALS: std::sync::OnceLock<
+    std::sync::Mutex<Option<PendingSearchSignals>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+#[cfg(test)]
+impl Drop for SignalOnDrop {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+fn search_task_panic_response(join_err: tokio::task::JoinError, index: &str) -> Response {
+    tracing::error!(error = %join_err, index, "search task panicked");
+    ApiError::new(xerj_common::XerjError::internal(
+        "search panicked; check server logs for details",
+    ))
+    .into_response()
+}
+
+#[cfg(test)]
+mod search_task_lifetime_tests {
+    use super::{search_task_panic_response, AbortOnDrop, TEST_PENDING_SEARCH_SIGNALS};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_state() -> crate::state::AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        crate::state::AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test]
+    async fn executor_panic_becomes_http_500() {
+        let join_err = tokio::spawn(async { panic!("injected search panic") })
+            .await
+            .expect_err("task must panic");
+        let response = search_task_panic_response(join_err, "panic-test");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn es_search_route_maps_child_panic_to_json_http_500() {
+        let state = test_state();
+        state
+            .engine
+            .create_index(
+                "test-panic-search-task",
+                xerj_common::types::Schema::empty(),
+            )
+            .unwrap();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::post("/test-panic-search-task/_search")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"query":{"match_all":{}}}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], 500);
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("search panicked")),
+            "unexpected error body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_es_search_route_future_aborts_owned_child() {
+        let state = test_state();
+        state
+            .engine
+            .create_index(
+                "test-pending-search-task",
+                xerj_common::types::Schema::empty(),
+            )
+            .unwrap();
+        let app = crate::router::build_es_compat_router(state);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        *TEST_PENDING_SEARCH_SIGNALS
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((started_tx, dropped_tx));
+
+        let request = tokio::spawn(
+            app.oneshot(
+                Request::post("/test-pending-search-task/_search")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"query":{"match_all":{}}}"#))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("route child did not start")
+            .expect("start signal");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("route-owned child did not drain after request drop")
+            .expect("drop signal");
+    }
+
+    #[tokio::test]
+    async fn dropping_request_owner_aborts_and_drains_child() {
+        struct Dropped(tokio::sync::oneshot::Sender<()>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let (replacement, _) = tokio::sync::oneshot::channel();
+                let sender = std::mem::replace(&mut self.0, replacement);
+                let _ = sender.send(());
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _dropped = Dropped(dropped_tx);
+            std::future::pending::<()>().await;
+        });
+        let owner = AbortOnDrop(task);
+        tokio::task::yield_now().await;
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("aborted child did not drain")
+            .expect("drop signal");
+    }
+}
+
 pub async fn search(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -7398,8 +7633,6 @@ pub async fn search(
             .with_label_values(&[idx_name])
             .inc();
 
-        // Spawn on a new task so that a panic is caught by the JoinHandle rather
-        // than propagating up and crashing the server.
         let mut req_clone = search_req.clone();
         // PIT search: fetch more hits per-index so the post-merge PIT
         // filter can drop post-snapshot docs without starving the page.
@@ -7433,15 +7666,38 @@ pub async fn search(
                 }
             }
         }
-        let search_result = tokio::task::spawn(async move { idx.search(&req_clone).await }).await;
+        // Keep search work owned by the request future. Dropping the handler
+        // (for example when the client disconnects) aborts the child task;
+        // awaiting its JoinHandle also converts executor panics into HTTP 500
+        // instead of unwinding through axum.
+        #[cfg(test)]
+        let inject_task_panic = *idx_name == "test-panic-search-task";
+        #[cfg(test)]
+        let inject_pending_task = *idx_name == "test-pending-search-task";
+        let mut search_task = AbortOnDrop(tokio::spawn(async move {
+            #[cfg(test)]
+            if inject_task_panic {
+                panic!("injected search task panic");
+            }
+            #[cfg(test)]
+            if inject_pending_task {
+                let (started, dropped) = TEST_PENDING_SEARCH_SIGNALS
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .expect("pending-search signals lock")
+                    .take()
+                    .expect("pending-search signals");
+                let _ = started.send(());
+                let _drop_signal = SignalOnDrop(Some(dropped));
+                std::future::pending().await
+            }
+            idx.search(&req_clone).await
+        }));
+        let search_result = (&mut search_task.0).await;
 
         match search_result {
             Err(join_err) => {
-                tracing::error!(error = %join_err, index = idx_name, "search task panicked");
-                let err = xerj_common::XerjError::internal(
-                    "search panicked; check server logs for details",
-                );
-                return ApiError::new(err).into_response();
+                return search_task_panic_response(join_err, idx_name);
             }
             Ok(Err(e)) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
             Ok(Ok(result)) => {
@@ -20314,7 +20570,20 @@ pub async fn cat_master(State(state): State<AppState>) -> impl IntoResponse {
 // GET /_nodes/{node_id}/stats
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn nodes_info(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn nodes_info(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // OpenSearch Dashboards' own initial-handshake compatibility check
+    // hits THIS endpoint (GET /_nodes?filter_path=nodes.*.version,...), not
+    // GET / — found empirically: a real OSD 2.11.1 container pointed at
+    // xerj logged "This version of OpenSearch Dashboards (v2.11.1) is
+    // incompatible with the following OpenSearch nodes in your cluster:
+    // v8.13.0 ..." even though OSD's own request carried a recognizable
+    // `opensearch-js/...` User-Agent — this handler just wasn't reading it.
+    // Same resolution `es_info` (GET /) uses.
+    let compat_version = resolve_compat_version(&state, &headers);
+    let reported_version = compat_version.number.clone();
     let (_idx_count, total_docs, store_bytes) = real_index_totals(&state).await;
     let rss_bytes = read_rss_bytes().unwrap_or(0);
     // Real host memory total from /proc/meminfo (falls back to an RSS-derived
@@ -20338,7 +20607,7 @@ pub async fn nodes_info(State(state): State<AppState>) -> impl IntoResponse {
                 "transport_address": "127.0.0.1:9300",
                 "host": "127.0.0.1",
                 "ip": "127.0.0.1",
-                "version": "8.13.0",
+                "version": reported_version,
                 "build_flavor": "default",
                 "build_type": "tar",
                 "build_hash": "xerj",
@@ -21631,6 +21900,193 @@ pub async fn security_authenticate(State(_state): State<AppState>) -> impl IntoR
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET/POST /_security/user/_has_privileges
+// GET/POST /_security/user/{user}/_has_privileges
+// ─────────────────────────────────────────────────────────────────────────────
+// Route didn't exist at all — every call 404'd. Kibana's app shell calls this
+// right after login (during the same bootstrap pass as `_authenticate`,
+// `/_cluster/health`, `/_xpack`) to decide what UI to show the current user;
+// its client doesn't handle a 404 here gracefully and the whole page request
+// blows up with a generic 500 ("[Internal Server Error]: undefined" — Kibana
+// swallows the real cause before it reaches the client), which is a much
+// harder failure to diagnose than the 404 itself since nothing about
+// privileges appears in the error shown to the user.
+//
+// Same single-owner identity model as `security_authenticate` — xerj has no
+// per-user privilege enforcement, every authenticated caller is the one
+// built-in superuser — so answering "yes" to every privilege asked about
+// isn't a lie, it's what's actually true: nothing is denied. Echoes back
+// every cluster/index/application privilege named in the request body as
+// granted, keyed exactly the way ES's response is shaped.
+pub async fn security_has_privileges(
+    State(_state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let body = body.map(|Json(v)| v).unwrap_or(json!({}));
+
+    let mut cluster = serde_json::Map::new();
+    if let Some(names) = body.get("cluster").and_then(Value::as_array) {
+        for name in names.iter().filter_map(Value::as_str) {
+            cluster.insert(name.to_string(), Value::Bool(true));
+        }
+    }
+
+    let mut index = serde_json::Map::new();
+    if let Some(reqs) = body.get("index").and_then(Value::as_array) {
+        for req in reqs {
+            let names = req.get("names").and_then(Value::as_array);
+            let privileges = req.get("privileges").and_then(Value::as_array);
+            let (Some(names), Some(privileges)) = (names, privileges) else {
+                continue;
+            };
+            let mut priv_map = serde_json::Map::new();
+            for p in privileges.iter().filter_map(Value::as_str) {
+                priv_map.insert(p.to_string(), Value::Bool(true));
+            }
+            for name in names.iter().filter_map(Value::as_str) {
+                index.insert(name.to_string(), Value::Object(priv_map.clone()));
+            }
+        }
+    }
+
+    let mut application = serde_json::Map::new();
+    if let Some(reqs) = body.get("application").and_then(Value::as_array) {
+        for req in reqs {
+            let app = req.get("application").and_then(Value::as_str);
+            let privileges = req.get("privileges").and_then(Value::as_array);
+            let (Some(app), Some(privileges)) = (app, privileges) else {
+                continue;
+            };
+            let mut priv_map = serde_json::Map::new();
+            for p in privileges.iter().filter_map(Value::as_str) {
+                priv_map.insert(p.to_string(), Value::Bool(true));
+            }
+            let resources: Vec<String> = req
+                .get("resources")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .filter(|v: &Vec<String>| !v.is_empty())
+                .unwrap_or_else(|| vec!["*".to_string()]);
+            let mut resource_map = serde_json::Map::new();
+            for r in resources {
+                resource_map.insert(r, Value::Object(priv_map.clone()));
+            }
+            application.insert(app.to_string(), Value::Object(resource_map));
+        }
+    }
+
+    Json(json!({
+        "username": "xerj",
+        "has_all_requested": true,
+        "cluster": cluster,
+        "index": index,
+        "application": application,
+    }))
+    .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /_security/profile/_activate — activate/create a user profile
+// ─────────────────────────────────────────────────────────────────────────────
+// The route didn't exist at all (no handler, not registered in router.rs), so
+// every call hit axum's default "no route matched" response: a bodyless 404.
+// Kibana calls this right after a successful login to get a profile UID for
+// the authenticated user; its client expects an ES-shaped JSON body back
+// (success or error) and throws on the empty 404, which Kibana's own server
+// then surfaces to the browser as a 500 ("Failed to activate user profile: "
+// — the empty reason is Kibana failing to parse a reason out of nothing).
+// xerj was never actually returning 500 itself; the fix is simply to
+// implement the endpoint.
+//
+// Same single-owner identity model as `security_authenticate` — xerj has no
+// multi-user store, so every grant (password or access_token) activates the
+// same built-in superuser profile. The uid is a fixed constant rather than
+// content-derived from the submitted credentials, so repeated logins (and
+// Kibana state keyed on this uid, e.g. space favorites) stay stable — also
+// shared with `security_get_user_profile` below, since a uid this endpoint
+// hands out needs to resolve when Kibana looks it back up.
+const XERJ_SUPERUSER_PROFILE_UID: &str = "u_xerj-superuser-0000000000000000000000000000000000000_0";
+
+fn xerj_superuser_profile_json(now_ms: i64) -> Value {
+    json!({
+        "uid": XERJ_SUPERUSER_PROFILE_UID,
+        "enabled": true,
+        "last_synchronized": now_ms,
+        "user": {
+            "username": "xerj",
+            "roles": ["superuser"],
+            "realm_name": "native",
+            "full_name": "Xerj Administrator",
+            "email": null
+        },
+        "labels": {},
+        "data": {},
+        "_doc": {
+            "_primary_term": 1,
+            "_seq_no": 0
+        }
+    })
+}
+
+pub async fn security_activate_user_profile(
+    State(_state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let _ = body;
+    let now_ms = Utc::now().timestamp_millis().max(0);
+    Json(xerj_superuser_profile_json(now_ms)).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /_security/profile/{uid}  (comma-separated list of uids accepted)
+// ─────────────────────────────────────────────────────────────────────────────
+// Route didn't exist at all. After `_activate` hands Kibana a profile uid,
+// its user-profile plugin re-fetches the full profile by that uid on every
+// subsequent page load — found live, one step past the `_has_privileges`
+// fix: login and `_activate` both succeeded, but the next page
+// (`/app/home`) still 500'd, logged server-side as "Failed to retrieve user
+// profile for the current user ... : ''" (empty reason — same "Kibana
+// throws on an unhandled 404" pattern as everywhere else in this family of
+// fixes). Only one uid is ever valid — the fixed constant `_activate`
+// hands out — so anything else reports back as not found, matching ES's
+// documented shape for a missing uid (`profiles: []` plus an `errors`
+// block) instead of a blanket 404.
+pub async fn security_get_user_profile(
+    State(_state): State<AppState>,
+    Path(uid): Path<String>,
+) -> impl IntoResponse {
+    let now_ms = Utc::now().timestamp_millis().max(0);
+    let mut profiles = Vec::new();
+    let mut error_details = serde_json::Map::new();
+    for requested in uid.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if requested == XERJ_SUPERUSER_PROFILE_UID {
+            profiles.push(xerj_superuser_profile_json(now_ms));
+        } else {
+            error_details.insert(
+                requested.to_string(),
+                json!({
+                    "type": "resource_not_found_exception",
+                    "reason": "profile document not found"
+                }),
+            );
+        }
+    }
+    let mut response = json!({ "profiles": profiles });
+    if !error_details.is_empty() {
+        response["errors"] = json!({
+            "count": error_details.len(),
+            "details": error_details,
+        });
+    }
+    Json(response).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /_security/api_key — create API key (stub: returns admin key)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -21700,6 +22156,158 @@ pub async fn security_create_api_key(
     .into_response()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET    /_security/privilege
+// GET    /_security/privilege/{application}
+// GET    /_security/privilege/{application}/{name}
+// PUT    /_security/privilege
+// DELETE /_security/privilege/{application}/{name}
+// ─────────────────────────────────────────────────────────────────────────────
+// xerj has no application-privilege store built into RBAC:
+// `xerj_engine::rbac::Privilege` is a closed enum of index-scoped operations
+// (read/write/admin index, snapshot, security admin, audit), a different
+// concept from ES's user-defined per-application privilege objects
+// (`application`/`name`/`actions`/`metadata`) — so this gets its own store,
+// `state.engine.application_privileges`, keyed by `"{application}\0{name}"`.
+//
+// Kibana polls GET at startup to check its own `kibana-.kibana` application
+// privileges, and calls PUT to register them if the GET doesn't already
+// match — originally NEITHER route existed, so every poll 404'd and Kibana
+// logged "Error registering Kibana Privileges" every ~5s (non-fatal, but
+// noisy). Not enforced (same honest-surface convention as `roles`/minted API
+// keys' `role_descriptors`): privileges round-trip through this store, but
+// nothing in the auth path actually gates on them yet.
+
+pub async fn security_get_all_privileges(State(state): State<AppState>) -> impl IntoResponse {
+    Json(privileges_grouped_by_application(&state, None)).into_response()
+}
+
+pub async fn security_get_application_privileges(
+    State(state): State<AppState>,
+    Path(application): Path<String>,
+) -> impl IntoResponse {
+    Json(privileges_grouped_by_application(
+        &state,
+        Some(&application),
+    ))
+    .into_response()
+}
+
+pub async fn security_get_privilege(
+    State(state): State<AppState>,
+    Path((application, name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // Unlike the list forms above, looking up one specific privilege by name
+    // is a resource lookup: ES responds 404 when it doesn't exist, matching
+    // the convention used for other named-resource lookups in this file
+    // (e.g. `get_task_by_id`).
+    match state
+        .engine
+        .application_privileges
+        .get(&application_privilege_key(&application, &name))
+    {
+        Some(entry) => Json(json!({ application: { name: entry.value() } })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "type": "resource_not_found_exception",
+                    "reason": format!(
+                        "application privilege [{name}] not found for application [{application}]"
+                    ),
+                },
+                "status": 404
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn security_put_privileges(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let Some(apps) = body.as_object() else {
+        return ApiError::new(xerj_common::XerjError::invalid_query(
+            "request body must be an object of {application: {privilege_name: {...}}}",
+        ))
+        .into_response();
+    };
+    let mut result = serde_json::Map::new();
+    for (application, privileges) in apps {
+        let Some(privileges) = privileges.as_object() else {
+            continue;
+        };
+        let mut app_result = serde_json::Map::new();
+        for (name, spec) in privileges {
+            let key = application_privilege_key(application, name);
+            let created = !state.engine.application_privileges.contains_key(&key);
+            let stored = json!({
+                "application": application,
+                "name": name,
+                "actions": spec.get("actions").cloned().unwrap_or(json!([])),
+                "metadata": spec.get("metadata").cloned().unwrap_or(json!({})),
+            });
+            state.engine.application_privileges.insert(key, stored);
+            app_result.insert(name.clone(), json!({ "created": created }));
+        }
+        result.insert(application.clone(), Value::Object(app_result));
+    }
+    Json(Value::Object(result)).into_response()
+}
+
+pub async fn security_delete_privilege(
+    State(state): State<AppState>,
+    Path((application, name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let key = application_privilege_key(&application, &name);
+    let found = state.engine.application_privileges.remove(&key).is_some();
+    // ES nests the result per application/name and 404s when nothing was
+    // deleted: {"<application>": {"<name>": {"found": bool}}} — typed clients
+    // (DeletePrivilegesResponse) index into resp[app][name].
+    let mut by_name = serde_json::Map::new();
+    by_name.insert(name, json!({ "found": found }));
+    let mut by_app = serde_json::Map::new();
+    by_app.insert(application, Value::Object(by_name));
+    let status = if found {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    (status, Json(Value::Object(by_app))).into_response()
+}
+
+fn application_privilege_key(application: &str, name: &str) -> String {
+    format!("{application}\0{name}")
+}
+
+/// Build the ES-shaped `{application: {name: {...}}}` response, optionally
+/// filtered to one application (`None` = every application).
+fn privileges_grouped_by_application(state: &AppState, application: Option<&str>) -> Value {
+    let mut by_app: serde_json::Map<String, Value> = serde_json::Map::new();
+    for entry in state.engine.application_privileges.iter() {
+        let priv_obj = entry.value();
+        let Some(app) = priv_obj.get("application").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(want) = application {
+            if app != want {
+                continue;
+            }
+        }
+        let Some(name) = priv_obj.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        by_app
+            .entry(app.to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("inserted as object above")
+            .insert(name.to_string(), priv_obj.clone());
+    }
+    Value::Object(by_app)
+}
+
 /// Parse an ES time-value expiration (e.g. `"7d"`, `"1h"`, `"30m"`, `"500ms"`)
 /// into an ABSOLUTE expiration in epoch milliseconds relative to `now_ms`.
 /// Returns `None` when the spec is absent or unparseable — meaning the key
@@ -21758,7 +22366,7 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// Minimal base64 encoder (standard alphabet, no padding variant for ES compat).
-fn base64_encode(input: &str) -> String {
+pub(crate) fn base64_encode(input: &str) -> String {
     let bytes = input.as_bytes();
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::new();

@@ -561,8 +561,36 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             get(es_compat::security_authenticate),
         )
         .route(
+            "/_security/user/_has_privileges",
+            get(es_compat::security_has_privileges).post(es_compat::security_has_privileges),
+        )
+        .route(
+            "/_security/user/:user/_has_privileges",
+            get(es_compat::security_has_privileges).post(es_compat::security_has_privileges),
+        )
+        .route(
+            "/_security/profile/_activate",
+            post(es_compat::security_activate_user_profile),
+        )
+        .route(
+            "/_security/profile/:uid",
+            get(es_compat::security_get_user_profile),
+        )
+        .route(
             "/_security/api_key",
             post(es_compat::security_create_api_key),
+        )
+        .route(
+            "/_security/privilege",
+            get(es_compat::security_get_all_privileges).put(es_compat::security_put_privileges),
+        )
+        .route(
+            "/_security/privilege/:application",
+            get(es_compat::security_get_application_privileges),
+        )
+        .route(
+            "/_security/privilege/:application/:name",
+            get(es_compat::security_get_privilege).delete(es_compat::security_delete_privilege),
         )
         // ── License ───────────────────────────────────────────────────────────
         .route(
