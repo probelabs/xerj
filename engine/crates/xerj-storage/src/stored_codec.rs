@@ -59,9 +59,48 @@ use std::io::{Cursor, Write};
 
 mod row_hydration;
 pub use row_hydration::{
-    decode_stored_v2_rows, StoredV2HydratedRow, StoredV2RowHydrationResult,
-    StoredV2RowHydrationStats,
+    decode_stored_v2_rows, decode_stored_v2_rows_controlled, StoredV2HydratedRow,
+    StoredV2RowHydrationResult, StoredV2RowHydrationStats,
 };
+
+pub const STORED_DECODE_CHECK_INTERVAL: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredDecodePhase {
+    BeforeColumn,
+    Rows,
+    AfterColumn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredDecodeCheckpoint {
+    pub phase: StoredDecodePhase,
+    pub column_index: usize,
+    pub rows_processed: usize,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StoredDecodeRun<T> {
+    Complete(T),
+    Cancelled,
+}
+
+pub(crate) fn decode_cancelled<F>(
+    checkpoint: &mut F,
+    phase: StoredDecodePhase,
+    column_index: usize,
+    rows_processed: usize,
+) -> bool
+where
+    F: FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()> + ?Sized,
+{
+    checkpoint(StoredDecodeCheckpoint {
+        phase,
+        column_index,
+        rows_processed,
+    })
+    .is_break()
+}
 
 // ── V1: flat LZ4 over JSON (legacy) ───────────────────────────────────────
 
@@ -816,6 +855,127 @@ fn finite_f32_vector(values: Vec<f64>) -> Option<Vec<f32>> {
     Some(out)
 }
 
+struct TypedVectorRowsVisitor<'a> {
+    expected_rows: usize,
+    column_index: usize,
+    checkpoint: &'a mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+    cancelled: &'a std::cell::Cell<bool>,
+}
+
+impl<'de> serde::de::Visitor<'de> for TypedVectorRowsVisitor<'_> {
+    type Value = Option<StoredVectorRows>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a vector column JSON array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut out = Vec::with_capacity(self.expected_rows);
+        let mut supported = true;
+        for row in 0..self.expected_rows {
+            let Some(value) = seq.next_element::<serde_json::Value>()? else {
+                return Err(serde::de::Error::custom("vector column ended early"));
+            };
+            let typed = match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::Array(values) => {
+                    let values = values
+                        .into_iter()
+                        .map(|value| value.as_f64())
+                        .collect::<Option<Vec<_>>>()
+                        .and_then(finite_f32_vector);
+                    let Some(values) = values else {
+                        supported = false;
+                        out.push(None);
+                        continue;
+                    };
+                    Some(values)
+                }
+                _ => {
+                    supported = false;
+                    None
+                }
+            };
+            out.push(typed);
+            let processed = row + 1;
+            if processed % STORED_DECODE_CHECK_INTERVAL == 0
+                && (self.checkpoint)(StoredDecodeCheckpoint {
+                    phase: StoredDecodePhase::Rows,
+                    column_index: self.column_index,
+                    rows_processed: processed,
+                })
+                .is_break()
+            {
+                self.cancelled.set(true);
+                return Err(serde::de::Error::custom("stored decode cancelled"));
+            }
+        }
+        if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom("vector column has extra rows"));
+        }
+        Ok(supported.then_some(out))
+    }
+}
+
+fn decode_typed_vector_rows_controlled(
+    column: &V2ColumnRef<'_>,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Option<StoredVectorRows>, ()>> {
+    if column.codec == ColCodec::Constant {
+        return decode_typed_vector_rows(column, num_docs).map(Ok);
+    }
+    match column.codec {
+        ColCodec::RawJson => {
+            let decoder = zstd::stream::read::Decoder::new(column.payload).map_err(|error| {
+                StorageError::Other(anyhow::anyhow!("raw zstd decode: {error}"))
+            })?;
+            parse_typed_vector_reader(decoder, num_docs, column_index, checkpoint)
+        }
+        ColCodec::Lz4Json => {
+            let raw = lz4_flex::decompress_size_prepended(column.payload)
+                .map_err(|error| StorageError::Other(anyhow::anyhow!("lz4 decode: {error}")))?;
+            parse_typed_vector_reader(raw.as_slice(), num_docs, column_index, checkpoint)
+        }
+        _ => Ok(Ok(None)),
+    }
+}
+
+fn parse_typed_vector_reader<R: std::io::Read>(
+    reader: R,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Option<StoredVectorRows>, ()>> {
+    use serde::de::Deserializer as _;
+    let cancelled = std::cell::Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let value = match deserializer.deserialize_seq(TypedVectorRowsVisitor {
+        expected_rows: num_docs,
+        column_index,
+        checkpoint,
+        cancelled: &cancelled,
+    }) {
+        Ok(value) => value,
+        Err(_) if cancelled.get() => return Ok(Err(())),
+        Err(error) => {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "vector json decode: {error}"
+            )));
+        }
+    };
+    if value.is_some() {
+        deserializer
+            .end()
+            .map_err(|error| StorageError::Other(anyhow::anyhow!("vector json decode: {error}")))?;
+    }
+    Ok(Ok(value))
+}
+
 fn decode_typed_vector_rows(
     column: &V2ColumnRef<'_>,
     num_docs: usize,
@@ -898,6 +1058,130 @@ fn decode_typed_vector_chunk_rows(
     Ok(Some(out))
 }
 
+fn decode_typed_vector_chunk_rows_controlled(
+    column: &V2ColumnRef<'_>,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Option<StoredVectorChunkRows>, ()>> {
+    if column.codec == ColCodec::Constant {
+        return decode_typed_vector_chunk_rows(column, num_docs).map(Ok);
+    }
+    match column.codec {
+        ColCodec::RawJson => {
+            let decoder = zstd::stream::read::Decoder::new(column.payload).map_err(|error| {
+                StorageError::Other(anyhow::anyhow!("raw zstd decode: {error}"))
+            })?;
+            parse_typed_chunk_reader(decoder, num_docs, column_index, checkpoint)
+        }
+        ColCodec::Lz4Json => {
+            let raw = lz4_flex::decompress_size_prepended(column.payload)
+                .map_err(|error| StorageError::Other(anyhow::anyhow!("lz4 decode: {error}")))?;
+            parse_typed_chunk_reader(raw.as_slice(), num_docs, column_index, checkpoint)
+        }
+        _ => Ok(Ok(None)),
+    }
+}
+
+fn parse_typed_chunk_reader<R: std::io::Read>(
+    reader: R,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Option<StoredVectorChunkRows>, ()>> {
+    use serde::de::Deserializer as _;
+    struct Visitor<'a> {
+        rows: usize,
+        column: usize,
+        checkpoint: &'a mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+        cancelled: &'a std::cell::Cell<bool>,
+    }
+    impl<'de> serde::de::Visitor<'de> for Visitor<'_> {
+        type Value = Option<StoredVectorChunkRows>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a vector chunks column JSON array")
+        }
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut out = Vec::with_capacity(self.rows);
+            let mut supported = true;
+            for row in 0..self.rows {
+                let Some(value) = seq.next_element::<serde_json::Value>()? else {
+                    return Err(serde::de::Error::custom("vector chunks ended early"));
+                };
+                let typed = match value {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::Array(chunks) => {
+                        let mut result = Vec::with_capacity(chunks.len());
+                        for chunk in chunks {
+                            let serde_json::Value::Array(values) = chunk else {
+                                supported = false;
+                                continue;
+                            };
+                            let vector = values
+                                .into_iter()
+                                .map(|value| value.as_f64())
+                                .collect::<Option<Vec<_>>>()
+                                .and_then(finite_f32_vector);
+                            let Some(vector) = vector else {
+                                supported = false;
+                                continue;
+                            };
+                            result.push(vector);
+                        }
+                        Some(result)
+                    }
+                    _ => {
+                        supported = false;
+                        None
+                    }
+                };
+                out.push(typed);
+                let processed = row + 1;
+                if processed % STORED_DECODE_CHECK_INTERVAL == 0
+                    && (self.checkpoint)(StoredDecodeCheckpoint {
+                        phase: StoredDecodePhase::Rows,
+                        column_index: self.column,
+                        rows_processed: processed,
+                    })
+                    .is_break()
+                {
+                    self.cancelled.set(true);
+                    return Err(serde::de::Error::custom("stored decode cancelled"));
+                }
+            }
+            if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("vector chunks has extra rows"));
+            }
+            Ok(supported.then_some(out))
+        }
+    }
+    let cancelled = std::cell::Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let value = match deserializer.deserialize_seq(Visitor {
+        rows: num_docs,
+        column: column_index,
+        checkpoint,
+        cancelled: &cancelled,
+    }) {
+        Ok(value) => value,
+        Err(_) if cancelled.get() => return Ok(Err(())),
+        Err(error) => {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "vector chunks json decode: {error}"
+            )));
+        }
+    };
+    if value.is_some() {
+        deserializer.end().map_err(|error| {
+            StorageError::Other(anyhow::anyhow!("vector chunks json decode: {error}"))
+        })?;
+    }
+    Ok(Ok(value))
+}
+
 /// Decode the identity and vector columns needed by exact kNN without
 /// reconstructing complete source documents.
 pub fn decode_stored_v2_knn_projection(
@@ -905,14 +1189,38 @@ pub fn decode_stored_v2_knn_projection(
     vector_field: &str,
     vector_chunks_field: Option<&str>,
 ) -> Result<StoredV2KnnProjectionResult> {
+    match decode_stored_v2_knn_projection_controlled(
+        bytes,
+        vector_field,
+        vector_chunks_field,
+        |_| std::ops::ControlFlow::Continue(()),
+    )? {
+        StoredDecodeRun::Complete(result) => Ok(result),
+        StoredDecodeRun::Cancelled => unreachable!("non-cancelling compatibility wrapper"),
+    }
+}
+
+pub fn decode_stored_v2_knn_projection_controlled<F>(
+    bytes: &[u8],
+    vector_field: &str,
+    vector_chunks_field: Option<&str>,
+    mut checkpoint: F,
+) -> Result<StoredDecodeRun<StoredV2KnnProjectionResult>>
+where
+    F: FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+{
     if bytes.len() < 4 || &bytes[..4] != STORED_V2_MAGIC {
-        return Ok(StoredV2KnnProjectionResult::NotV2);
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::NotV2,
+        ));
     }
     if matches!(vector_field, "__id" | "__seq_no")
         || vector_chunks_field
             .is_some_and(|field| matches!(field, "__id" | "__seq_no") || field == vector_field)
     {
-        return Ok(StoredV2KnnProjectionResult::UnsupportedVectorShape);
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::UnsupportedVectorShape,
+        ));
     }
     let directory = parse_v2_directory(&bytes[4..])?;
     let Some(vector_column) = directory
@@ -920,49 +1228,105 @@ pub fn decode_stored_v2_knn_projection(
         .iter()
         .find(|column| column.name == vector_field)
     else {
-        return Ok(StoredV2KnnProjectionResult::MissingVectorColumn);
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::MissingVectorColumn,
+        ));
     };
-    let Some(vectors) = decode_typed_vector_rows(vector_column, directory.num_docs)? else {
-        return Ok(StoredV2KnnProjectionResult::UnsupportedVectorShape);
+    let vector_index = directory
+        .columns
+        .iter()
+        .position(|column| std::ptr::eq(column, vector_column))
+        .unwrap();
+    if decode_cancelled(
+        &mut checkpoint,
+        StoredDecodePhase::BeforeColumn,
+        vector_index,
+        0,
+    ) {
+        return Ok(StoredDecodeRun::Cancelled);
+    }
+    let Some(vectors) = (match decode_typed_vector_rows_controlled(
+        vector_column,
+        directory.num_docs,
+        vector_index,
+        &mut checkpoint,
+    )? {
+        Ok(value) => value,
+        Err(()) => return Ok(StoredDecodeRun::Cancelled),
+    }) else {
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::UnsupportedVectorShape,
+        ));
     };
+    if decode_cancelled(
+        &mut checkpoint,
+        StoredDecodePhase::AfterColumn,
+        vector_index,
+        directory.num_docs,
+    ) {
+        return Ok(StoredDecodeRun::Cancelled);
+    }
     let vector_chunks = match vector_chunks_field {
         Some(field) => match directory.columns.iter().find(|column| column.name == field) {
-            Some(column) => match decode_typed_vector_chunk_rows(column, directory.num_docs)? {
-                Some(chunks) => Some(chunks),
-                None => return Ok(StoredV2KnnProjectionResult::UnsupportedVectorShape),
-            },
+            Some(column) => {
+                let index = directory
+                    .columns
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, column))
+                    .unwrap();
+                if decode_cancelled(&mut checkpoint, StoredDecodePhase::BeforeColumn, index, 0) {
+                    return Ok(StoredDecodeRun::Cancelled);
+                }
+                let Some(chunks) = (match decode_typed_vector_chunk_rows_controlled(
+                    column,
+                    directory.num_docs,
+                    index,
+                    &mut checkpoint,
+                )? {
+                    Ok(value) => value,
+                    Err(()) => return Ok(StoredDecodeRun::Cancelled),
+                }) else {
+                    return Ok(StoredDecodeRun::Complete(
+                        StoredV2KnnProjectionResult::UnsupportedVectorShape,
+                    ));
+                };
+                if decode_cancelled(
+                    &mut checkpoint,
+                    StoredDecodePhase::AfterColumn,
+                    index,
+                    directory.num_docs,
+                ) {
+                    return Ok(StoredDecodeRun::Cancelled);
+                }
+                Some(chunks)
+            }
             None => None,
         },
         None => None,
     };
-    let requested = ["__id", "__seq_no"];
-    let StoredV2ProjectionResult::Projected(mut projection) =
-        decode_stored_v2_projection(bytes, &requested)?
-    else {
-        unreachable!("V2 input cannot become NotV2");
-    };
-    let ids = projection
-        .columns
-        .remove("__id")
-        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 missing __id column")))?
+    let (identity_num_docs, id_values, seq_values) =
+        match row_hydration::decode_v2_identity_columns_controlled(bytes, &mut checkpoint)? {
+            StoredDecodeRun::Complete(Some(values)) => values,
+            StoredDecodeRun::Complete(None) => {
+                return Ok(StoredDecodeRun::Complete(
+                    StoredV2KnnProjectionResult::UnsupportedVectorShape,
+                ));
+            }
+            StoredDecodeRun::Cancelled => return Ok(StoredDecodeRun::Cancelled),
+        };
+    let ids = id_values
         .into_iter()
         .map(|value| value.as_str().map(ToOwned::to_owned))
         .collect();
-    let seq_nos = projection
-        .columns
-        .remove("__seq_no")
-        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 missing __seq_no column")))?
-        .into_iter()
-        .map(|value| value.as_u64())
-        .collect();
-    Ok(StoredV2KnnProjectionResult::Projected(
-        StoredV2KnnProjection {
-            num_docs: projection.num_docs,
+    let seq_nos = seq_values.into_iter().map(|value| value.as_u64()).collect();
+    Ok(StoredDecodeRun::Complete(
+        StoredV2KnnProjectionResult::Projected(StoredV2KnnProjection {
+            num_docs: identity_num_docs,
             ids,
             seq_nos,
             vectors,
             vector_chunks,
-        },
+        }),
     ))
 }
 
@@ -1969,6 +2333,144 @@ mod tests {
         assert_eq!(chunks[1][0].to_bits(), (-0.0f32).to_bits());
         assert_eq!(chunks[1][1].to_bits(), (1.25e-10f32).to_bits());
         assert_eq!(chunks[1][2], -2.0);
+    }
+
+    #[test]
+    fn controlled_knn_projection_cancels_without_changing_compatibility_outcomes() {
+        let (_, encoded) = projection_fixture();
+        let mut observed = Vec::new();
+        let run = decode_stored_v2_knn_projection_controlled(
+            &encoded,
+            "embedding",
+            Some("embedding_chunks"),
+            |point| {
+                observed.push(point);
+                if point.phase == StoredDecodePhase::Rows && point.rows_processed == 128 {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(run, StoredDecodeRun::Cancelled);
+        assert!(observed.iter().any(|point| {
+            point.phase == StoredDecodePhase::BeforeColumn && point.rows_processed == 0
+        }));
+
+        let controlled = decode_stored_v2_knn_projection_controlled(
+            &encoded,
+            "embedding",
+            Some("embedding_chunks"),
+            |_| std::ops::ControlFlow::Continue(()),
+        )
+        .unwrap();
+        assert_eq!(
+            controlled,
+            StoredDecodeRun::Complete(
+                decode_stored_v2_knn_projection(&encoded, "embedding", Some("embedding_chunks"))
+                    .unwrap()
+            )
+        );
+
+        assert_eq!(
+            decode_stored_v2_knn_projection_controlled(
+                &encode_stored_lz4(b"[]"),
+                "embedding",
+                None,
+                |_| std::ops::ControlFlow::Continue(())
+            )
+            .unwrap(),
+            StoredDecodeRun::Complete(StoredV2KnnProjectionResult::NotV2)
+        );
+    }
+
+    #[test]
+    fn controlled_knn_projection_stops_before_bad_row_129() {
+        let rows_with_bad_129 = |chunks: bool| {
+            let values: Vec<_> = (0..256)
+                .map(|row| {
+                    if row == 128 {
+                        json!("row-129-must-not-be-consumed")
+                    } else if chunks {
+                        json!([[1.0, 0.0]])
+                    } else {
+                        json!([1.0, 0.0])
+                    }
+                })
+                .collect();
+            zstd::encode_all(
+                Cursor::new(serde_json::to_vec(&values).unwrap()),
+                STORED_ZSTD_LEVEL,
+            )
+            .unwrap()
+        };
+        let constant_id = serde_json::to_vec(&json!("id")).unwrap();
+        let constant_seq = serde_json::to_vec(&json!(1)).unwrap();
+
+        for bad_column in ["embedding", "embedding_chunks"] {
+            let embedding = if bad_column == "embedding" {
+                rows_with_bad_129(false)
+            } else {
+                let values = vec![json!([1.0, 0.0]); 256];
+                zstd::encode_all(
+                    Cursor::new(serde_json::to_vec(&values).unwrap()),
+                    STORED_ZSTD_LEVEL,
+                )
+                .unwrap()
+            };
+            let chunks = if bad_column == "embedding_chunks" {
+                rows_with_bad_129(true)
+            } else {
+                let values = vec![json!([[1.0, 0.0]]); 256];
+                zstd::encode_all(
+                    Cursor::new(serde_json::to_vec(&values).unwrap()),
+                    STORED_ZSTD_LEVEL,
+                )
+                .unwrap()
+            };
+            let encoded = handcrafted_v2(
+                256,
+                &[
+                    ("__id", ColCodec::Constant as u8, constant_id.clone()),
+                    ("__seq_no", ColCodec::Constant as u8, constant_seq.clone()),
+                    ("embedding", ColCodec::RawJson as u8, embedding),
+                    ("embedding_chunks", ColCodec::RawJson as u8, chunks),
+                ],
+            );
+            let cancel_column = if bad_column == "embedding" { 2 } else { 3 };
+            assert_eq!(
+                decode_stored_v2_knn_projection_controlled(
+                    &encoded,
+                    "embedding",
+                    Some("embedding_chunks"),
+                    |point| {
+                        if point.column_index == cancel_column
+                            && point.phase == StoredDecodePhase::Rows
+                            && point.rows_processed == 128
+                        {
+                            std::ops::ControlFlow::Break(())
+                        } else {
+                            std::ops::ControlFlow::Continue(())
+                        }
+                    }
+                )
+                .unwrap(),
+                StoredDecodeRun::Cancelled,
+                "{bad_column} must cancel before consuming row 129"
+            );
+            assert_eq!(
+                decode_stored_v2_knn_projection_controlled(
+                    &encoded,
+                    "embedding",
+                    Some("embedding_chunks"),
+                    |_| std::ops::ControlFlow::Continue(())
+                )
+                .unwrap(),
+                StoredDecodeRun::Complete(StoredV2KnnProjectionResult::UnsupportedVectorShape),
+                "without cancellation {bad_column} must consume bad row 129"
+            );
+        }
     }
 
     #[test]
