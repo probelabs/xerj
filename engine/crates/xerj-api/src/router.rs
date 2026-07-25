@@ -561,6 +561,14 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             get(es_compat::security_authenticate),
         )
         .route(
+            "/_security/user/_has_privileges",
+            get(es_compat::security_has_privileges).post(es_compat::security_has_privileges),
+        )
+        .route(
+            "/_security/user/:user/_has_privileges",
+            get(es_compat::security_has_privileges).post(es_compat::security_has_privileges),
+        )
+        .route(
             "/_security/profile/_activate",
             post(es_compat::security_activate_user_profile),
         )
