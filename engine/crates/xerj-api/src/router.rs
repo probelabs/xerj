@@ -372,6 +372,10 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         .route("/_tasks/:task_id/_cancel", post(es_compat::cancel_task))
         // ── Cat templates ──────────────────────────────────────────────────
         .route("/_cat/templates", get(es_compat::cat_templates))
+        .route(
+            "/_cat/templates/:pattern",
+            get(es_compat::cat_templates_pattern),
+        )
         // ── Ingest pipelines ───────────────────────────────────────────────
         .route(
             "/_ingest/pipeline",
