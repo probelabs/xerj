@@ -1244,6 +1244,9 @@ pub async fn process_bulk_with_opts(
                             block_type,
                             ..
                         }) if block_type.contains("read_only_allow_delete") => 429,
+                        // Default-format date rejection ("failed to parse
+                        // field [..] of type [date]") — ES answers 400.
+                        EngineError::Common(xerj_common::XerjError::InvalidMapping { .. }) => 400,
                         _ => 500,
                     };
                     items[item_idx] = Some(BulkItemResult {
@@ -1694,6 +1697,8 @@ pub async fn process_bulk_with_opts(
                         block_type,
                         ..
                     }) if block_type.contains("read_only_allow_delete") => 429,
+                    // Default-format date rejection — ES answers 400.
+                    EngineError::Common(xerj_common::XerjError::InvalidMapping { .. }) => 400,
                     _ => 500,
                 };
                 items[item_idx] = Some(BulkItemResult {
