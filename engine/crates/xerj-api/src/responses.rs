@@ -527,6 +527,12 @@ pub struct EsVersion {
     pub lucene_version: String,
     pub minimum_wire_compatibility_version: String,
     pub minimum_index_compatibility_version: String,
+    /// OpenSearch-only field — real Elasticsearch never sends this key at
+    /// all, so it's `None`/omitted for an Elasticsearch-shaped response,
+    /// `Some("opensearch")` when the caller is (or is forced to be) treated
+    /// as an OpenSearch client. See `es_compat::resolve_compat_version`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<String>,
 }
 
 impl Default for EsVersion {
@@ -542,6 +548,7 @@ impl Default for EsVersion {
             lucene_version: "9.10.0".to_string(),
             minimum_wire_compatibility_version: "7.17.0".to_string(),
             minimum_index_compatibility_version: "7.0.0".to_string(),
+            distribution: None,
         }
     }
 }
