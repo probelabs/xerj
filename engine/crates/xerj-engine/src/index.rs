@@ -812,6 +812,14 @@ pub struct IndexResponse {
     pub result: String,
 }
 
+/// Result of a same-ID serialized read-transform-write operation.
+#[derive(Debug, Clone)]
+pub struct SerializedDocumentUpdate {
+    pub response: IndexResponse,
+    /// `true` when the supplied upsert body created a previously missing ID.
+    pub created: bool,
+}
+
 /// Outcome of a single-document delete (ES `DELETE /{index}/_doc/{id}`).
 ///
 /// `found == true`  → the doc was live and is now tombstoned; `seq_no` is
@@ -1044,6 +1052,19 @@ fn l2_normalize_vec(v: &mut [f32]) {
 
 // ── Index ────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationTestPoint {
+    Acquired,
+    AfterWalVersionMap,
+    AfterFts,
+    AfterHnsw,
+    BeforeRelease,
+}
+
+#[cfg(test)]
+type PublicationTestHook = Arc<dyn Fn(&str, PublicationTestPoint) + Send + Sync + 'static>;
+
 /// Per-index coordinator.
 ///
 /// Owns the storage layer (`IndexStore`), the FTS memtable, and the schema.
@@ -1061,6 +1082,11 @@ pub struct Index {
     /// clients on N different shards run truly in parallel on the
     /// write side.  Query paths iterate all shards.
     memtable: Arc<crate::memtable::ShardedFtsMemtable>,
+    /// Exact per-document ordering shared by all publication stages wired to
+    /// this coordinator. Idle keys are removed immediately.
+    write_publication: Arc<crate::write_publication::WritePublicationCoordinator>,
+    #[cfg(test)]
+    publication_test_hook: Arc<parking_lot::RwLock<Option<PublicationTestHook>>>,
     doc_count: Arc<AtomicU64>,
     /// Counter for `update` operations that detected no change to the
     /// existing source — surfaced via `indices.stats` as
@@ -1459,6 +1485,21 @@ pub struct Index {
 }
 
 impl Index {
+    #[cfg(test)]
+    fn publication_test_point(&self, id: &str, point: PublicationTestPoint) {
+        // Clone the callback while holding the hook registry lock, then invoke
+        // it after releasing that lock. Test barriers may intentionally block.
+        let hook = self.publication_test_hook.read().clone();
+        if let Some(hook) = hook {
+            hook(id, point);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_publication_test_hook(&self, hook: Option<PublicationTestHook>) {
+        *self.publication_test_hook.write() = hook;
+    }
+
     /// Create a new index at `data_dir/<name>`.
     pub fn create(
         name: IndexName,
@@ -1570,6 +1611,9 @@ impl Index {
                     config.engine.ingest_shards,
                 ),
             ),
+            write_publication: crate::write_publication::WritePublicationCoordinator::new(),
+            #[cfg(test)]
+            publication_test_hook: Arc::new(parking_lot::RwLock::new(None)),
             doc_count: Arc::new(AtomicU64::new(0)),
             noop_update_count: Arc::new(AtomicU64::new(0)),
             request_cache_seen: Arc::new(RwLock::new(RequestCacheSeen::with_capacity(65_536))),
@@ -1854,6 +1898,9 @@ impl Index {
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             store,
             memtable: Arc::new(memtable),
+            write_publication: crate::write_publication::WritePublicationCoordinator::new(),
+            #[cfg(test)]
+            publication_test_hook: Arc::new(parking_lot::RwLock::new(None)),
             doc_count: Arc::new(AtomicU64::new(total_doc_count)),
             noop_update_count: Arc::new(AtomicU64::new(0)),
             request_cache_seen: Arc::new(RwLock::new(RequestCacheSeen::with_capacity(65_536))),
@@ -1955,26 +2002,17 @@ impl Index {
     ) -> Result<IndexResponse> {
         let doc_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let strict = version_type != "external_gte";
-        // CAS against the caller's prior external version.
-        if let Some(existing) = self.external_versions.get(&doc_id) {
-            let cur = *existing;
-            let ok = if strict {
-                version > cur
-            } else {
-                version >= cur
-            };
-            if !ok {
-                return Err(EngineError::Common(
-                    xerj_common::XerjError::version_conflict(&doc_id, version, cur),
-                ));
-            }
-        }
-        self.external_versions.insert(doc_id.clone(), version);
-        let mut resp = self
-            .index_document_with_version(Some(doc_id), source, None, None)
-            .await?;
-        resp.version = version;
-        Ok(resp)
+        self.index_document_with_version_inner_guarded(
+            Some(doc_id),
+            source,
+            None,
+            None,
+            false,
+            None,
+            false,
+            Some((version, strict)),
+        )
+        .await
     }
 
     /// Index a document with optional optimistic concurrency control.
@@ -2006,6 +2044,31 @@ impl Index {
         if_primary_term: Option<u64>,
         semantic_embeddings_prepared: bool,
     ) -> Result<IndexResponse> {
+        self.index_document_with_version_inner_guarded(
+            id,
+            source,
+            if_seq_no,
+            if_primary_term,
+            semantic_embeddings_prepared,
+            None,
+            false,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn index_document_with_version_inner_guarded(
+        &self,
+        id: Option<String>,
+        source: Value,
+        if_seq_no: Option<u64>,
+        if_primary_term: Option<u64>,
+        semantic_embeddings_prepared: bool,
+        publication_guard: Option<crate::write_publication::WritePublicationGuard>,
+        create_only: bool,
+        external_version: Option<(u64, bool)>,
+    ) -> Result<IndexResponse> {
         // Check write block.
         if self.is_write_blocked().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
@@ -2016,14 +2079,38 @@ impl Index {
         // Process-wide admission: disk flood-stage block (item 3) + parent
         // memory circuit breaker (item 1). Fires before any per-index work.
         self.governor_write_gate()?;
-        // Invalidate the response cache: every doc write bumps the
-        // dataset version, which is part of the cache key, so old
-        // entries become invisible to lookups.  No clear() needed —
-        // they age out on the next 1k-entry truncation.
-        self.dataset_version.fetch_add(1, Ordering::Release);
-
         let index_start = std::time::Instant::now();
         let doc_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        // `index.default_pipeline` is resolved and executed at the API layer
+        // (xerj-api es_compat::resolve_effective_pipeline) before the document
+        // reaches the engine, so no pipeline handling is needed here.
+
+        // Auto-embed `semantic_text` fields: vectorise the field's text into
+        // its companion vector field (`<field>_vector`) so it becomes
+        // kNN-searchable. Runs before copy_to / storage so the derived vector
+        // is part of `_source` and gets picked up by HNSW indexing below.
+        let source = if semantic_embeddings_prepared {
+            source
+        } else {
+            self.apply_semantic_embeddings(source).await?
+        };
+
+        // Apply copy_to: expand the source by copying field values to their target fields.
+        let source = {
+            let schema_guard = self.schema.read().await;
+            apply_copy_to(&source, &schema_guard.schema)
+        };
+
+        // Preprocessing above is independent and can run concurrently.
+        // Everything from CAS/liveness through WAL, VM, FTS, HNSW, and the
+        // response is one exact per-document publication interval.
+        let _publication_guard = match publication_guard {
+            Some(guard) => guard,
+            None => self.write_publication.lock(doc_id.clone()).await,
+        };
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::Acquired);
 
         // Optimistic concurrency check: honour `if_seq_no` whenever it
         // is supplied. ES requires `if_primary_term` alongside it, but
@@ -2052,25 +2139,39 @@ impl Index {
             }
         }
 
-        // `index.default_pipeline` is resolved and executed at the API layer
-        // (xerj-api es_compat::resolve_effective_pipeline) before the document
-        // reaches the engine, so no pipeline handling is needed here.
+        if create_only {
+            let exists = self
+                .store
+                .version_map
+                .get(&doc_id)
+                .map(|entry| !entry.deleted)
+                .unwrap_or(false)
+                || self.memtable.contains(&doc_id);
+            if exists {
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::version_conflict(&doc_id, 0, 1),
+                ));
+            }
+        }
 
-        // Auto-embed `semantic_text` fields: vectorise the field's text into
-        // its companion vector field (`<field>_vector`) so it becomes
-        // kNN-searchable. Runs before copy_to / storage so the derived vector
-        // is part of `_source` and gets picked up by HNSW indexing below.
-        let source = if semantic_embeddings_prepared {
-            source
-        } else {
-            self.apply_semantic_embeddings(source).await?
-        };
+        if let Some((version, strict)) = external_version {
+            if let Some(existing) = self.external_versions.get(&doc_id) {
+                let current = *existing;
+                let valid = if strict {
+                    version > current
+                } else {
+                    version >= current
+                };
+                if !valid {
+                    return Err(EngineError::Common(
+                        xerj_common::XerjError::version_conflict(&doc_id, version, current),
+                    ));
+                }
+            }
+        }
 
-        // Apply copy_to: expand the source by copying field values to their target fields.
-        let source = {
-            let schema_guard = self.schema.read().await;
-            apply_copy_to(&source, &schema_guard.schema)
-        };
+        // Invalidate the response cache only after admission and CAS succeed.
+        self.dataset_version.fetch_add(1, Ordering::Release);
 
         // Detect whether this is an overwrite (existing doc) vs a new
         // insert BEFORE writing to storage. Used to set the response
@@ -2088,6 +2189,15 @@ impl Index {
 
         // Write to storage WAL.
         let seq_no = self.store.index(&doc_id, source.clone())?;
+        // External-version admission becomes durable only after the WAL write
+        // succeeds. Publishing it before `store.index` would poison an exact
+        // retry when WAL append fails.
+        if let Some((external_version, _)) = external_version {
+            self.external_versions
+                .insert(doc_id.clone(), external_version);
+        }
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::AfterWalVersionMap);
 
         // Write to FTS memtable.
         {
@@ -2096,6 +2206,8 @@ impl Index {
             mem.remove(&doc_id);
             mem.insert(doc_id.clone(), &source, &schema_guard.schema, seq_no);
         }
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::AfterFts);
 
         // Bump counter (flush thresholds / stats bookkeeping only — NOT the
         // response `_version`, which is per-doc).
@@ -2162,6 +2274,8 @@ impl Index {
 
         // Index any vector fields into the HNSW index.
         self.index_vectors(&doc_id, &source).await;
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::AfterHnsw);
 
         // Trigger a background flush if memtable exceeds size or doc-count threshold.
         self.maybe_spawn_flush().await;
@@ -2178,10 +2292,14 @@ impl Index {
 
         debug!(doc_id = doc_id.as_str(), seq_no, "document indexed");
 
+        #[cfg(test)]
+        self.publication_test_point(&doc_id, PublicationTestPoint::BeforeRelease);
         Ok(IndexResponse {
             id: doc_id,
             seq_no,
-            version,
+            version: external_version
+                .map(|(version, _)| version)
+                .unwrap_or(version),
             result: if existed_before {
                 "updated".to_string()
             } else {
@@ -3197,39 +3315,17 @@ impl Index {
     ///
     /// Returns `Err(VersionConflict)` if a live document with the same ID exists.
     pub async fn create_document(&self, id: String, source: Value) -> Result<IndexResponse> {
-        // Check write block first.
-        if self.is_write_blocked().await {
-            return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
-                self.name.as_str(),
-                "write",
-            )));
-        }
-        // Process-wide admission: disk flood-stage block (item 3) + parent
-        // memory circuit breaker (item 1). Fires before any per-index work.
-        self.governor_write_gate()?;
-
-        // Fail with 409 if a live document already exists with this id.
-        let already_exists = {
-            let in_version_map = self
-                .store
-                .version_map
-                .get(&id)
-                .map(|e| !e.deleted)
-                .unwrap_or(false);
-            let in_memtable = {
-                let mem = &*self.memtable;
-                mem.contains(&id)
-            };
-            in_version_map || in_memtable
-        };
-
-        if already_exists {
-            return Err(EngineError::Common(
-                xerj_common::XerjError::version_conflict(&id, 0, 1),
-            ));
-        }
-
-        self.index_document(Some(id), source).await
+        self.index_document_with_version_inner_guarded(
+            Some(id),
+            source,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+        )
+        .await
     }
 
     /// Refresh: flush the current active memtable to a disk segment.
@@ -4562,6 +4658,7 @@ impl Index {
         upsert_doc: Option<Value>,
         doc_as_upsert: bool,
     ) -> Result<Option<IndexResponse>> {
+        let publication_guard = self.write_publication.lock(id.to_string()).await;
         match self.get_document(id).await? {
             Some(existing) => {
                 // Document exists — merge partial_doc on top.
@@ -4592,14 +4689,26 @@ impl Index {
                 // object against the existing source.
                 if merged == existing {
                     self.noop_update_count.fetch_add(1, Ordering::Relaxed);
+                    let current = self.store.version_map.get(id);
                     return Ok(Some(IndexResponse {
                         id: id.to_string(),
-                        seq_no: 0,
-                        version: 1,
+                        seq_no: current.as_ref().map(|entry| entry.seq_no).unwrap_or(0),
+                        version: current.map(|entry| entry.version).unwrap_or(1),
                         result: "noop".to_string(),
                     }));
                 }
-                let resp = self.index_document(Some(id.to_string()), merged).await?;
+                let resp = self
+                    .index_document_with_version_inner_guarded(
+                        Some(id.to_string()),
+                        merged,
+                        None,
+                        None,
+                        false,
+                        Some(publication_guard),
+                        false,
+                        None,
+                    )
+                    .await?;
                 Ok(Some(resp))
             }
             None => {
@@ -4607,7 +4716,18 @@ impl Index {
                 if doc_as_upsert {
                     // Use partial_doc as the creation body.
                     let body = partial_doc.unwrap_or(Value::Object(serde_json::Map::new()));
-                    let resp = self.index_document(Some(id.to_string()), body).await?;
+                    let resp = self
+                        .index_document_with_version_inner_guarded(
+                            Some(id.to_string()),
+                            body,
+                            None,
+                            None,
+                            false,
+                            Some(publication_guard),
+                            false,
+                            None,
+                        )
+                        .await?;
                     Ok(Some(resp))
                 } else if let Some(upsert_body) = upsert_doc {
                     // Create with upsert body, then merge partial_doc on top.
@@ -4626,13 +4746,72 @@ impl Index {
                     } else {
                         upsert_body
                     };
-                    let resp = self.index_document(Some(id.to_string()), body).await?;
+                    let resp = self
+                        .index_document_with_version_inner_guarded(
+                            Some(id.to_string()),
+                            body,
+                            None,
+                            None,
+                            false,
+                            Some(publication_guard),
+                            false,
+                            None,
+                        )
+                        .await?;
                     Ok(Some(resp))
                 } else {
                     Ok(None)
                 }
             }
         }
+    }
+
+    /// Serialize the load, transform, and publication of one document ID.
+    ///
+    /// The exact-ID publication guard spans the authoritative read, caller
+    /// transform, WAL/version-map update, FTS/HNSW publication, and response.
+    /// This is the engine boundary used by API-layer scripted updates: keeping
+    /// script evaluation outside this method turns `ctx._source.n += 1` into
+    /// an unguarded read-modify-write and loses concurrent increments.
+    ///
+    /// `transform` is called only for an existing source. If the ID is missing,
+    /// `upsert` is created without applying the transform (ES's default
+    /// `scripted_upsert=false` behavior); without an upsert this returns
+    /// `Ok(Ok(None))`. Transform errors are returned in the inner `Result`
+    /// without publishing a write.
+    pub async fn transform_document_serialized<E, F>(
+        &self,
+        id: &str,
+        upsert: Option<Value>,
+        transform: F,
+    ) -> Result<std::result::Result<Option<SerializedDocumentUpdate>, E>>
+    where
+        F: FnOnce(Value) -> std::result::Result<Value, E>,
+    {
+        let publication_guard = self.write_publication.lock(id.to_string()).await;
+        let (source, created) = match self.get_document(id).await? {
+            Some(existing) => match transform(existing) {
+                Ok(transformed) => (transformed, false),
+                Err(error) => return Ok(Err(error)),
+            },
+            None => match upsert {
+                Some(source) => (source, true),
+                None => return Ok(Ok(None)),
+            },
+        };
+        let response = self
+            .index_document_with_version_inner_guarded(
+                Some(id.to_string()),
+                source,
+                None,
+                None,
+                false,
+                Some(publication_guard),
+                false,
+                None,
+            )
+            .await?;
+        Ok(Ok(Some(SerializedDocumentUpdate { response, created })))
     }
 
     /// Scan a document for vector fields and insert them into the HNSW graph.
@@ -7024,8 +7203,9 @@ impl Index {
         // Process-wide admission: disk flood-stage block (item 3) + parent
         // memory circuit breaker (item 1). Fires before any per-index work.
         self.governor_write_gate()?;
-        self.dataset_version.fetch_add(1, Ordering::Release);
-
+        let _publication_guard = self.write_publication.lock(id.to_string()).await;
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::Acquired);
         // Optimistic concurrency check (see index_document_with_version for
         // the if_primary_term rationale).
         let _ = if_primary_term;
@@ -7083,6 +7263,8 @@ impl Index {
             let seq_no = existing
                 .map(|e| e.seq_no)
                 .unwrap_or_else(|| self.store.current_seq_no().saturating_sub(1));
+            #[cfg(test)]
+            self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
             return Ok(DeleteDocOutcome {
                 found: false,
                 seq_no,
@@ -7090,7 +7272,13 @@ impl Index {
             });
         }
 
+        // Invalidate response caches only once the OCC check has succeeded and
+        // the delete will mutate publication state. A rejected conditional
+        // delete must not make unrelated cached responses look stale.
+        self.dataset_version.fetch_add(1, Ordering::Release);
         let deleted_seq = self.store.delete(id)?;
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::AfterWalVersionMap);
         let existed = deleted_seq.is_some();
 
         // Remove from memtable.
@@ -7098,6 +7286,8 @@ impl Index {
             let mem = &*self.memtable;
             mem.remove(id);
         }
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::AfterFts);
 
         // v0.6.2 — propagate the delete into the HNSW graph. Pre-fix
         // a deleted doc was unfindable via _get / _search but the
@@ -7126,6 +7316,8 @@ impl Index {
                 })
                 .ok();
         }
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::AfterHnsw);
 
         if existed {
             self.doc_count.fetch_sub(1, Ordering::Relaxed);
@@ -7140,6 +7332,8 @@ impl Index {
                 .version_map
                 .bump_tombstone_version(id)
                 .unwrap_or(1);
+            #[cfg(test)]
+            self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
             return Ok(DeleteDocOutcome {
                 found: false,
                 seq_no: self.store.current_seq_no().saturating_sub(1),
@@ -7155,6 +7349,8 @@ impl Index {
             .map(|e| e.version)
             .unwrap_or(1);
         let seq_no = deleted_seq.unwrap_or_else(|| self.store.current_seq_no().saturating_sub(1));
+        #[cfg(test)]
+        self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
         Ok(DeleteDocOutcome {
             found: true,
             seq_no,
@@ -7172,6 +7368,7 @@ impl Index {
         id: &str,
         partial_doc: Value,
     ) -> Result<Option<IndexResponse>> {
+        let publication_guard = self.write_publication.lock(id.to_string()).await;
         // Fetch existing document source.
         let existing = match self.get_document(id).await? {
             Some(src) => src,
@@ -7199,7 +7396,18 @@ impl Index {
         };
 
         // Re-index with the same ID (upsert-style).
-        let resp = self.index_document(Some(id.to_string()), merged).await?;
+        let resp = self
+            .index_document_with_version_inner_guarded(
+                Some(id.to_string()),
+                merged,
+                None,
+                None,
+                false,
+                Some(publication_guard),
+                false,
+                None,
+            )
+            .await?;
         Ok(Some(resp))
     }
 
@@ -27427,6 +27635,184 @@ mod chunk_embed_tests {
         assert!(
             max_sim > pooled_score,
             "best-passage max-sim ({max_sim}) should beat pooled ({pooled_score})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_publication_integration_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_holds_publication_key_through_response_before_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("publication-hook", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("publication-hook").unwrap();
+
+        let initial = idx
+            .index_document(Some("same".into()), json!({"state": "initial"}))
+            .await
+            .unwrap();
+
+        let acquired = Arc::new(AtomicUsize::new(0));
+        let pause_once = Arc::new(AtomicBool::new(false));
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let paused_tx = parking_lot::Mutex::new(Some(paused_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        let hook: PublicationTestHook = {
+            let acquired = Arc::clone(&acquired);
+            let pause_once = Arc::clone(&pause_once);
+            Arc::new(move |id, point| {
+                assert_eq!(id, "same");
+                if point == PublicationTestPoint::Acquired {
+                    acquired.fetch_add(1, Ordering::SeqCst);
+                }
+                if point == PublicationTestPoint::AfterWalVersionMap
+                    && !pause_once.swap(true, Ordering::SeqCst)
+                {
+                    paused_tx.lock().take().unwrap().send(()).unwrap();
+                    resume_rx.lock().take().unwrap().recv().unwrap();
+                }
+            })
+        };
+        idx.set_publication_test_hook(Some(hook));
+
+        let put = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move {
+                idx.index_document_with_version(
+                    Some("same".into()),
+                    json!({"state": "put"}),
+                    Some(initial.seq_no),
+                    Some(1),
+                )
+                .await
+            })
+        };
+        tokio::task::spawn_blocking(move || paused_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(acquired.load(Ordering::SeqCst), 1);
+
+        let (queued_tx, queued_rx) = std::sync::mpsc::sync_channel(1);
+        let queued_tx = Arc::new(parking_lot::Mutex::new(Some(queued_tx)));
+        idx.write_publication.set_before_mutex_await_hook({
+            let queued_tx = Arc::clone(&queued_tx);
+            Some(Arc::new(move |id| {
+                assert_eq!(id, "same");
+                queued_tx.lock().take().unwrap().send(()).unwrap();
+            }))
+        });
+        let delete = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move { idx.delete_document_versioned("same", None, None).await })
+        };
+        tokio::task::spawn_blocking(move || queued_rx.recv().unwrap())
+            .await
+            .unwrap();
+        idx.write_publication.set_before_mutex_await_hook(None);
+        assert_eq!(
+            acquired.load(Ordering::SeqCst),
+            1,
+            "delete acquired the same key while PUT was paused after WAL/VM"
+        );
+
+        resume_tx.send(()).unwrap();
+        let put = put.await.unwrap().unwrap();
+        let delete = delete.await.unwrap().unwrap();
+        idx.set_publication_test_hook(None);
+
+        assert_eq!(put.version, 2);
+        assert!(delete.found);
+        assert_eq!(delete.version, 3);
+        assert!(delete.seq_no > put.seq_no);
+        assert!(idx.get_document("same").await.unwrap().is_none());
+        assert_eq!(acquired.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_serialized_transforms_do_not_lose_read_modify_write_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("atomic-transform", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("atomic-transform").unwrap();
+        idx.index_document(Some("counter".into()), json!({"n": 0}))
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(33));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let idx = Arc::clone(&idx);
+            let start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                idx.transform_document_serialized("counter", None, |mut source| {
+                    let n = source["n"].as_u64().unwrap();
+                    source["n"] = json!(n + 1);
+                    Ok::<_, ()>(source)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .response
+            }));
+        }
+        start.wait().await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(idx.get_document("counter").await.unwrap().unwrap()["n"], 32);
+    }
+
+    #[tokio::test]
+    async fn rejected_conditional_delete_does_not_invalidate_query_cache_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("delete-epoch", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("delete-epoch").unwrap();
+        let indexed = idx
+            .index_document(Some("doc".into()), json!({"live": true}))
+            .await
+            .unwrap();
+        let before = idx.dataset_version.load(Ordering::Acquire);
+
+        let error = idx
+            .delete_document_versioned("doc", Some(indexed.seq_no + 1), Some(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("version conflict"));
+        assert_eq!(
+            idx.dataset_version.load(Ordering::Acquire),
+            before,
+            "rejected OCC delete must not invalidate cached responses"
+        );
+
+        idx.delete_document_versioned("doc", Some(indexed.seq_no), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            idx.dataset_version.load(Ordering::Acquire),
+            before + 1,
+            "successful delete invalidates cached responses exactly once"
         );
     }
 }
