@@ -15,16 +15,34 @@ import tree_sitter_php as tsphp
 
 WP = sys.argv[1]
 X = "http://127.0.0.1:9200"
-CAT = json.load(open(os.path.join(os.path.dirname(__file__), "php_sink_catalog.json")))
 parser = Parser(Language(tsphp.language_php()))
 
-CALLS  = {s["fn"]: s for s in CAT["sinks"] if s["kind"] == "call"}
-METHS  = {s["fn"]: s for s in CAT["sinks"] if s["kind"] == "method"}
-CONSTRUCT_NODES = {  # tree-sitter node type -> catalog fn
+# Load the FULL dangerous-function map (275 fns) if present, else the small set.
+_here = os.path.dirname(__file__)
+_full = os.path.join(_here, "php_dangerous_functions.json")
+CALLS, METHS = {}, {}
+if os.path.exists(_full):
+    D = json.load(open(_full))["categories"]
+    for cname, c in D.items():
+        for f in c["fns"]:
+            kind = f.get("kind", c.get("kind", "call"))
+            rec = {"class": c.get("class", cname), "arg": f.get("arg", "")}
+            if kind == "call":   CALLS[f["fn"]] = rec
+            elif kind == "method": METHS[f["fn"]] = rec
+else:
+    CAT = json.load(open(os.path.join(_here, "php_sink_catalog.json")))
+    CALLS = {s["fn"]: s for s in CAT["sinks"] if s["kind"] == "call"}
+    METHS = {s["fn"]: s for s in CAT["sinks"] if s["kind"] == "method"}
+
+CONSTRUCT_NODES = {  # tree-sitter node type -> construct name
     "echo_statement": "echo", "include_expression": "include",
     "include_once_expression": "include_once", "require_expression": "require",
     "require_once_expression": "require_once", "print_intrinsic": "print",
+    "shell_command_expression": "backtick",
 }
+CONSTRUCT_CLASS = {"echo": "XSS", "print": "XSS", "backtick": "RCE-command",
+                   "include": "LFI-RFI", "include_once": "LFI-RFI",
+                   "require": "LFI-RFI", "require_once": "LFI-RFI"}
 def txt(n): return n.text.decode("utf8", "replace")
 def last_name(t): return re.split(r"->|::|\\\\", t)[-1].strip()
 
@@ -36,7 +54,12 @@ sites = []   # each: dict(file,line,fn,kind,cls,arg)
 # AST-authoritative string/comment line ranges per file — the oracle that a grep
 # hit inside a string or comment is NOT a call (handles multi-line strings/docblocks).
 noncode_ranges = {}   # file -> list[(start_line, end_line)]
-NONCODE_NODES = {"string", "encapsed_string", "comment", "heredoc", "shell_command_expression"}
+# inline HTML/JS is `text`; strings/comments/heredoc/nowdoc are not PHP code.
+NONCODE_NODES = {"string", "encapsed_string", "comment", "heredoc", "nowdoc", "text"}
+# classes whose `new C(...)` construction is a sink
+CTOR_SINKS = {"ReflectionFunction": "dynamic-invoke", "ReflectionMethod": "dynamic-invoke",
+              "ReflectionClass": "dynamic-invoke", "ReflectionObject": "dynamic-invoke",
+              "SoapClient": "SSRF", "SplFileObject": "file-read", "SimpleXMLElement": "XXE"}
 def scan_file(path, rel):
     src = open(path, "rb").read()
     root = parser.parse(src).root_node
@@ -55,7 +78,14 @@ def scan_file(path, rel):
             if mn in METHS: fn, cls, kind = mn, METHS[mn]["class"], "method"
         elif t in CONSTRUCT_NODES:
             fn = CONSTRUCT_NODES[t]; kind = "construct"
-            cls = next(s["class"] for s in CAT["sinks"] if s["fn"] == fn)
+            cls = CONSTRUCT_CLASS.get(fn, "other")
+        elif t == "exit_statement":            # exit(...) / die(...) are constructs
+            kw = txt(n).lstrip().split("(")[0].split(";")[0].strip().lower()
+            fn = kw if kw in ("exit", "die") else "exit"; kind = "construct"; cls = "XSS-or-info"
+        elif t == "object_creation_expression":  # new ClassName(...)
+            cn = n.child_by_field_name("class") or (n.children[1] if len(n.children) > 1 else None)
+            nm = last_name(txt(cn)) if cn is not None else None
+            if nm in CTOR_SINKS: fn, cls, kind = nm, CTOR_SINKS[nm], "ctor"
         if fn:
             args = n.child_by_field_name("arguments")
             arg = (txt(args)[:200] if args is not None else txt(n)[:120])
@@ -165,12 +195,15 @@ print(f"\nCOVERAGE RECONCILIATION")
 print(f"  AST call sites: {total_ast}   grep occurrences: {total_grep}")
 print(f"  UNEXPLAINED (grep hit that is neither an AST call nor a proven non-call): {total_unexpl}")
 print(f"  => coverage {'PROVEN (0 gaps)' if total_unexpl == 0 else 'HAS GAPS — investigate'}")
-print("\n  per-sink (ast / grep / non-call buckets):")
-for fn, r in sorted(recon.items(), key=lambda x: -x[1]["ast"])[:25]:
-    if r["ast"] or r["grep"]:
+print("\n  sinks with UNEXPLAINED residual (must be 0 for a clean proof):")
+any_un = False
+for fn, r in sorted(recon.items(), key=lambda x: -x[1]["unexplained"]):
+    if r["unexplained"]:
+        any_un = True
         print(f"    {fn:22} ast={r['ast']:4} grep={r['grep']:4} nonAST={dict(r['buckets'])}")
         for ex in r["examples"]:
             print(f"        UNEXPLAINED {ex}")
+if not any_un: print("    (none — coverage proof is clean)")
 
 json.dump({"sites": sites, "recon": recon,
            "totals": {"ast": total_ast, "grep": total_grep, "unexplained": total_unexpl}},

@@ -13,13 +13,13 @@ Everything here is reproducible; scripts are in
 ## The pipeline
 
 ```
- php_sink_catalog.json   58 dangerous built-ins -> vuln class + safe/unsafe recipe
+ php_dangerous_functions.json   275 built-ins/constructs, 28 categories -> class + safe/unsafe + taint-arg
         │
         ▼  tree-sitter AST  (every call site, any formatting)
- AST census   7,192 call sites
+ AST census   11,191 call sites
         │
-        ▼  grep + AST string/comment ORACLE  (reconcile every occurrence)
- COVERAGE PROOF   8,179 grep hits = 6,825 AST calls + 1,354 proven non-calls, 0 UNEXPLAINED
+        ▼  grep + AST string/comment/inline-HTML ORACLE  (reconcile every occurrence)
+ COVERAGE PROOF   12,214 grep hits = 10,778 AST calls + proven non-calls, 0 UNEXPLAINED
         │
         ▼  bulk index
  XERJ `wpsinks`   one doc per call site (file, line, fn, class, arg)
@@ -28,16 +28,25 @@ Everything here is reproducible; scripts are in
  enriched ledger   reachable / guarded / severity / verdict — queryable
 ```
 
-## Step 1 — Catalog the dangerous built-ins
+> **The full map is the reference.** [`PHP-DANGEROUS-FUNCTIONS.md`](sink-census/PHP-DANGEROUS-FUNCTIONS.md)
+> is the readable table of all 275 functions; `sink-census/php_dangerous_functions.json`
+> is the machine-readable source. This whole recipe is packaged as a copyable
+> Claude Code skill — see [`.claude/skills/xerj-security-audit/`](../../../.claude/skills/xerj-security-audit/SKILL.md).
 
-`php_sink_catalog.json` maps 58 PHP built-ins to a **vuln class** and a
-**safe vs unsafe recipe**: command exec (`exec`,`system`,`shell_exec`,`popen`,…),
-code exec (`eval`,`assert`,`call_user_func`,`preg_replace/e`), deserialization
-(`unserialize`), file include (`include`/`require`), file read/write/delete,
-SSRF (`fsockopen`,`curl_exec`,`file_get_contents`-URL), SQL drivers, XXE, variable
-injection (`extract`,`parse_str`), header/redirect, weak crypto/random, output/XSS
-(`echo`,`printf`), info disclosure. Each entry is the *knowledge* — what makes the
-call dangerous and what the correct usage looks like.
+## Step 1 — Map the dangerous built-ins (the full reference)
+
+`php_dangerous_functions.json` maps **275 PHP built-ins/constructs across 28
+categories** to a **vuln class**, a **safe vs unsafe recipe**, and the
+**taint-relevant argument** (which arg carries the danger — critical for the
+taint graph). Categories: command exec (13), code eval (7), dynamic callables
+(27 — `call_user_func`/`array_map`/`preg_replace_callback`/…), deserialization
+(8), include loaders (5), file read (38), file write/delete/perms (24), directory
+(7), SSRF (17), SQL drivers (22), LDAP (7), XXE (10), variable injection (5),
+ReDoS/ereg (9), mail injection (4), header/redirect (4), weak crypto (7), weak
+random (9), info disclosure (12), runtime-config tamper (9), process control (9),
+reflection invoke (5), type-juggling auth-bypass (6), output/XSS. The readable
+table is [`PHP-DANGEROUS-FUNCTIONS.md`](sink-census/PHP-DANGEROUS-FUNCTIONS.md).
+This is the *knowledge* layer — extend it for your framework/language.
 
 ## Step 2 — AST census: every call site
 
@@ -47,7 +56,7 @@ calls (`->loadXML`), and language constructs (`echo`/`include`/`require`/`print`
 tree-sitter captures a real call regardless of whitespace, line breaks, or
 namespacing (`\fopen(`), which grep cannot.
 
-**Result: 7,192 call sites** of 58 built-ins across 1,492 files.
+**Result: 11,191 call sites** of 275 built-ins/constructs across 1,492 files.
 
 ## Step 3 — The coverage guarantee (the part that matters)
 
@@ -55,17 +64,18 @@ An AST census is only trustworthy if you can prove it missed nothing. The census
 does this by **reconciling every grep occurrence against the AST**, using the AST
 itself as the oracle for what is code vs string/comment:
 
-- grep finds **8,179** word/`fn(` occurrences of the catalog names.
-- **6,825** are AST call sites.
-- The remaining **1,354** are each *proven non-calls*: inside a string or comment
-  (AST string/comment node ranges), a function *definition*, a *method* call on
-  another object (`$response->header(...)` ≠ the `header()` built-in), a
-  *variable* name (`$echo`), or a namespaced call already in the AST.
+- grep finds **12,214** word/`fn(` occurrences of the catalog names.
+- **10,778** are AST call sites.
+- The remaining **1,436** are each *proven non-calls*: inside a string, comment,
+  or inline HTML/JS (AST node ranges), a function *definition*, a *method* call on
+  another object (`$response->header(...)` ≠ the `header()` built-in), a *variable*
+  name (`$echo`), a namespaced call already in the AST, or `exit`/`die`/`new`
+  handled as their own node types.
 - **UNEXPLAINED residual: 0.**
 
 ```
 COVERAGE RECONCILIATION
-  AST call sites: 6,825   grep occurrences: 8,179
+  AST call sites: 10,778   grep occurrences: 12,214
   UNEXPLAINED: 0  => coverage PROVEN (0 gaps)
 ```
 
@@ -83,18 +93,20 @@ plus empty enrichment fields. The risk profile is now one aggregation query:
 
 | class | sites | class | sites |
 |---|--:|---|--:|
-| XSS (`echo`/`print`) | 3,799 | file-write | 143 |
-| LFI/RFI (`include`/`require`) | 1,385 | file-read-or-SSRF | 135 |
-| XSS-or-formatstring (`printf`) | 558 | weak-crypto | 118 |
-| RCE-code-or-ReDoS (`preg_replace`) | 435 | file-delete | 58 |
-| RCE-code (`eval`/`call_user_func`) | 229 | **SSRF** | **21** |
-| header/redirect | 144 | **XXE** | **16** |
-| **deserialization** | **13** | **RCE-command** | **9** |
-| **SQLi (drivers)** | **5** | info-disclosure | 4 |
+| XSS (`echo`/`print`) | 3,799 | file-write | 178 |
+| LFI/RFI (`include`/`require`) | 1,385 | variable-injection | 166 |
+| type-juggle auth-bypass | 1,240 | weak-crypto | 142 |
+| XSS-or-info (`printf`/`var_dump`) | 1,034 | **SSRF** | **107** |
+| dynamic callables (2nd-order RCE) | 954 | file-delete | 61 |
+| ReDoS/ereg | 709 | **XXE** | **26** |
+| RCE-code (`eval`/`assert`) | 467 | **deserialization** | **13** |
+| file-read | 328 | **RCE-command** | **11** |
+| **SQL drivers** | **200** | dynamic-invoke (reflection) | 6 |
 
-The rare classes are the point: there are only **9** command-execution, **13**
-deserialization, and **5** driver-level SQL sinks in all of core — and now you can
-*guarantee* you've seen every one.
+The rare classes are the point: there are only **11** command-execution and **13**
+deserialization sinks in all of core — and now you can *guarantee* you've seen
+every one. (The big classes — XSS/output, type-juggle, callables — are where the
+taint graph + authz sweeps then decide *reachability*.)
 
 ## Step 5 — AI-agent enrichment (the embedding-pipeline analogue)
 
@@ -104,8 +116,9 @@ verdict back into XERJ — `reachable` (request / cache / trusted / literal),
 `guarded` (which defense: `escapeshellarg`, HMAC, `is_serialized`, allow-list,
 literal), `severity`, and a note. The ledger becomes queryable:
 
-- **594** high-risk sites enriched; **28** carry a full agent verdict — **100% of
-  the RCE-command, deserialization, and SQLi classes** — the rest queued.
+- high-risk sites enriched; the RCE-command (11), deserialization (13), and
+  driver-SQL classes carry full agent verdicts (100% of the rarest classes); the
+  rest queued.
 - Example audit query — *unreviewed medium+ deserialization sinks* — returns the
   SimplePie feed-cache POI candidates with the verdict attached
   (`File.php:88 | feed-cache-file | POI if cache dir writable`).
@@ -116,11 +129,11 @@ is a stored verdict the next audit and CI run reuse.
 
 ## The coverage statement you can now make
 
-> Every call to a known-dangerous PHP built-in in WordPress core (7,192 sites, 58
-> functions, 1,492 files) has been **enumerated with a proven-zero-gap census**,
-> indexed, and triaged by vuln class. 100% of the command-execution,
-> deserialization, and driver-SQL sinks have an AI verdict; the remaining
-> high-risk classes are queued in a queryable ledger with severity.
+> Every call to a known-dangerous PHP built-in in WordPress core (11,191 sites,
+> 275 functions across 28 categories, 1,492 files) has been **enumerated with a
+> proven-zero-gap census**, indexed, and triaged by vuln class. 100% of the
+> command-execution, deserialization, and driver-SQL sinks have an AI verdict; the
+> remaining high-risk classes are queued in a queryable ledger with severity.
 
 That is a defensible coverage claim — the thing "we read the code" can never be.
 
@@ -131,7 +144,7 @@ That is a defensible coverage claim — the thing "we read the code" can never b
   or incomplete validators (e.g. the SSRF-range gap) — those are found by the
   other detectors in this case study. Sink census is one guaranteed axis, not all.
 - **Coverage is only as complete as the catalog.** The guarantee is "every call to
-  a *catalogued* function." Extend `php_sink_catalog.json` for framework sinks
+  a *catalogued* function." Extend `php_dangerous_functions.json` for framework sinks
   (`$wpdb->query`, `wp_remote_get`), and re-run — the census + proof re-runs
   unchanged.
 - **Enrichment quality is the agent's judgement**, and every verdict cites the
