@@ -21993,7 +21993,19 @@ pub async fn security_delete_privilege(
 ) -> impl IntoResponse {
     let key = application_privilege_key(&application, &name);
     let found = state.engine.application_privileges.remove(&key).is_some();
-    Json(json!({ "found": found })).into_response()
+    // ES nests the result per application/name and 404s when nothing was
+    // deleted: {"<application>": {"<name>": {"found": bool}}} — typed clients
+    // (DeletePrivilegesResponse) index into resp[app][name].
+    let mut by_name = serde_json::Map::new();
+    by_name.insert(name, json!({ "found": found }));
+    let mut by_app = serde_json::Map::new();
+    by_app.insert(application, Value::Object(by_name));
+    let status = if found {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    (status, Json(Value::Object(by_app))).into_response()
 }
 
 fn application_privilege_key(application: &str, name: &str) -> String {
