@@ -1791,6 +1791,20 @@ impl IndexStore {
         self.seq_counter.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Reserve `count` contiguous sequence numbers without writing WAL frames.
+    ///
+    /// This exists for the explicitly volatile realtime-ingest path. Those
+    /// writes become restart-durable only after their memtable is flushed to
+    /// a segment, but they still need globally unique sequence numbers so
+    /// VersionMap, flush ordering, and overwrite semantics remain correct.
+    pub fn reserve_volatile_seq_nos(&self, count: usize) -> std::ops::Range<u64> {
+        let count = count as u64;
+        let start = self
+            .seq_counter
+            .fetch_add(count, std::sync::atomic::Ordering::AcqRel);
+        start..start.saturating_add(count)
+    }
+
     /// Delete-durability: drop `pending_deletes` entries whose delete has
     /// been SUBSUMED by a newer, segment-durable version of the same doc —
     /// the version map shows the doc live with a seq_no newer than the
@@ -3213,6 +3227,19 @@ impl IndexStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volatile_sequence_reservations_are_contiguous_and_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let first: Vec<_> = store.reserve_volatile_seq_nos(3).collect();
+        let second: Vec<_> = store.reserve_volatile_seq_nos(2).collect();
+        assert_eq!(first, vec![1, 2, 3]);
+        assert_eq!(second, vec![4, 5]);
+        assert_eq!(store.current_seq_no(), 6);
+        assert_eq!(store.reserve_volatile_seq_nos(0).count(), 0);
+        assert_eq!(store.current_seq_no(), 6);
+    }
 
     fn open_test_store(dir: &Path) -> Arc<IndexStore> {
         IndexStore::open(

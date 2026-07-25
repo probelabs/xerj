@@ -2381,9 +2381,15 @@ impl Index {
     ///
     /// # When to use
     ///
-    /// Enable with `X-Turbo-Realtime: true` on the bulk endpoint, or call
-    /// this method directly when the caller can tolerate losing the most
-    /// recent batch on crash.
+    /// This is currently an engine-library API only; no HTTP header or route
+    /// exposes volatile acknowledgement semantics. Call it directly only when
+    /// the caller can tolerate losing the most recent unflushed batch on
+    /// crash.
+    ///
+    /// Concurrent writes to the same explicit ID still require the shared
+    /// publication-order coordinator tracked separately. This method now
+    /// provides correct request-local ordering and globally unique seq_nos;
+    /// it does not claim to close that pre-existing cross-path race.
     pub async fn index_batch_turbo_realtime(
         &self,
         docs: Vec<(String, Value, Arc<[u8]>)>,
@@ -2431,13 +2437,19 @@ impl Index {
             .collect();
         drop(schema_guard);
 
-        // Step 3: Update version map (lock-free atomic operations) — no WAL.
-        // Assign monotonically increasing seq_nos from the engine's counter.
-        use std::sync::atomic::Ordering;
-        let seq_nos: Vec<u64> = processed
-            .iter()
-            .map(|_| self.doc_count.fetch_add(0, Ordering::Relaxed))
+        // Step 3: reserve real, globally unique sequence numbers without
+        // writing WAL frames. This path is intentionally volatile until
+        // flush, but its in-memory ordering/version semantics must be the
+        // same as an ordinary write.
+        let seq_nos: Vec<u64> = self
+            .store
+            .reserve_volatile_seq_nos(processed.len())
             .collect();
+
+        // Invalidate cached searches before any VersionMap/memtable
+        // publication can become visible. One generation bump invalidates the
+        // whole batch; it need not scale with the number of items.
+        self.dataset_version.fetch_add(1, Ordering::Release);
 
         // Step 4: FTS memtable insert — use standard insert() so the inverted
         // index is populated and match queries work correctly.
@@ -2446,6 +2458,17 @@ impl Index {
         let mut responses = Vec::with_capacity(batch_len);
 
         for (i, ingest) in processed.iter().enumerate() {
+            let existed_before = self
+                .store
+                .version_map
+                .get(&ingest.id)
+                .is_some_and(|entry| !entry.deleted);
+            let version = self.store.version_map.set(
+                ingest.id.clone(),
+                seq_nos[i],
+                xerj_storage::version_map::IN_MEMORY_SEGMENT_ID,
+                false,
+            );
             mem.remove(&ingest.id);
             let seq_no = seq_nos[i];
             mem.insert(
@@ -2454,21 +2477,34 @@ impl Index {
                 &schema_guard2.schema,
                 seq_no,
             );
-            let version = self.doc_count.fetch_add(1, Ordering::Relaxed) + 1;
             responses.push(IndexResponse {
                 id: ingest.id.clone(),
                 seq_no,
                 version,
-                result: "created".to_string(),
+                result: if existed_before {
+                    "updated".to_string()
+                } else {
+                    "created".to_string()
+                },
             });
+            #[cfg(test)]
+            realtime_publication_test_pause(self.name.as_str(), i);
         }
         drop(schema_guard2);
+        self.doc_count
+            .fetch_add(batch_len as u64, Ordering::Relaxed);
 
         // Step 5: schema evolution + vector indexing (post-lock).
         for ingest in &processed {
             self.evolve_schema_from_doc(&ingest.source).await;
             self.index_vectors(&ingest.id, &ingest.source).await;
         }
+
+        // Close the publication window with a second generation. A search
+        // that raced the item loop may have cached a partial batch under the
+        // pre-publication generation; the post-publication bump makes that
+        // key unreachable after this method returns.
+        self.dataset_version.fetch_add(1, Ordering::Release);
 
         // Step 6: flush threshold check.
         self.maybe_spawn_flush().await;
@@ -16549,6 +16585,271 @@ fn ensure_embedding_identity_for_new_field(
     // later writes and restarts are then checked against it.
     write_file_atomic(&marker_path, &serde_json::to_vec_pretty(&configured)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+struct RealtimePublicationTestHook {
+    index_name: String,
+    after_first_item: std::sync::Barrier,
+    resume_publication: std::sync::Barrier,
+}
+
+#[cfg(test)]
+static REALTIME_PUBLICATION_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<RealtimePublicationTestHook>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn realtime_publication_test_pause(index_name: &str, item_index: usize) {
+    if item_index != 0 {
+        return;
+    }
+    let hook = REALTIME_PUBLICATION_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook.filter(|hook| hook.index_name == index_name) {
+        hook.after_first_item.wait();
+        hook.resume_publication.wait();
+    }
+}
+
+#[cfg(test)]
+mod turbo_realtime_sequence_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn doc(id: &str, value: i64) -> (String, Value, Arc<[u8]>) {
+        let source = serde_json::json!({"value": value, "body": format!("value {value}")});
+        let bytes: Arc<[u8]> = serde_json::to_vec(&source).unwrap().into();
+        (id.to_string(), source, bytes)
+    }
+
+    fn test_index(root: &Path, name: &str) -> Arc<Index> {
+        Index::create(
+            IndexName::from_str(name).unwrap(),
+            Schema::empty(),
+            &Config::default(),
+            root,
+        )
+        .unwrap()
+    }
+
+    async fn stop_background(index: &Arc<Index>) {
+        let handle = index.merge_task.lock().take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_batch_assigns_unique_seqs_and_per_doc_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path(), "rt-sequences");
+        let dataset_before = index.dataset_version.load(Ordering::Acquire);
+
+        let responses = index
+            .index_batch_turbo_realtime(vec![doc("A", 1), doc("B", 2), doc("A", 3)], false)
+            .await
+            .unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[1].seq_no, responses[0].seq_no + 1);
+        assert_eq!(responses[2].seq_no, responses[1].seq_no + 1);
+        assert_eq!(
+            responses
+                .iter()
+                .map(|r| (r.id.as_str(), r.version, r.result.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A", 1, "created"),
+                ("B", 1, "created"),
+                ("A", 2, "updated")
+            ]
+        );
+        assert_eq!(index.store.version_map.live_count(), 2);
+        assert_eq!(
+            index.dataset_version.load(Ordering::Acquire),
+            dataset_before + 2,
+            "the realtime batch must bracket publication with cache generations"
+        );
+        let a = index.store.version_map.get("A").unwrap();
+        assert_eq!(
+            (a.seq_no, a.version, a.deleted),
+            (responses[2].seq_no, 2, false)
+        );
+        assert_eq!(index.get_document("A").await.unwrap().unwrap()["value"], 3);
+
+        let request = SearchRequest::default();
+        let first_search = index.search(&request).await.unwrap();
+        assert_eq!(
+            first_search
+                .hits
+                .iter()
+                .find(|hit| hit.id == "A")
+                .unwrap()
+                .source["value"],
+            3
+        );
+        let cache_hits_before = index.query_cache_hits.load(Ordering::Relaxed);
+        let cached_search = index.search(&request).await.unwrap();
+        assert_eq!(
+            index.query_cache_hits.load(Ordering::Relaxed),
+            cache_hits_before + 1,
+            "fixture must prove the old result was actually cached"
+        );
+        assert_eq!(
+            cached_search
+                .hits
+                .iter()
+                .find(|hit| hit.id == "A")
+                .unwrap()
+                .source["value"],
+            3
+        );
+
+        let overwrite = index
+            .index_batch_turbo_realtime(vec![doc("A", 4)], false)
+            .await
+            .unwrap();
+        assert_eq!(overwrite[0].seq_no, responses[2].seq_no + 1);
+        assert_eq!(
+            (overwrite[0].version, overwrite[0].result.as_str()),
+            (3, "updated")
+        );
+        assert_eq!(index.store.version_map.live_count(), 2);
+        assert_eq!(
+            index.dataset_version.load(Ordering::Acquire),
+            dataset_before + 4
+        );
+        assert_eq!(index.get_document("A").await.unwrap().unwrap()["value"], 4);
+        let after_overwrite = index.search(&request).await.unwrap();
+        assert_eq!(
+            after_overwrite
+                .hits
+                .iter()
+                .find(|hit| hit.id == "A")
+                .unwrap()
+                .source["value"],
+            4,
+            "realtime publication must not reuse the pre-batch cache key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_batch_cache_is_invalid_after_publication_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path(), "rt-cache-window");
+        let hook = Arc::new(RealtimePublicationTestHook {
+            index_name: "rt-cache-window".to_string(),
+            after_first_item: std::sync::Barrier::new(2),
+            resume_publication: std::sync::Barrier::new(2),
+        });
+        *REALTIME_PUBLICATION_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(Arc::clone(&hook));
+
+        let writer = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                index
+                    .index_batch_turbo_realtime(vec![doc("A", 1), doc("B", 2)], false)
+                    .await
+            })
+        };
+        hook.after_first_item.wait();
+
+        let request = SearchRequest::default();
+        let partial = index.search(&request).await.unwrap();
+        assert_eq!(partial.total.value, 1);
+        let hits_before = index.query_cache_hits.load(Ordering::Relaxed);
+        assert_eq!(index.search(&request).await.unwrap().total.value, 1);
+        assert_eq!(
+            index.query_cache_hits.load(Ordering::Relaxed),
+            hits_before + 1,
+            "the deliberately partial result must actually enter the cache"
+        );
+
+        hook.resume_publication.wait();
+        writer.await.unwrap().unwrap();
+        *REALTIME_PUBLICATION_TEST_HOOK
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap() = None;
+
+        let complete = index.search(&request).await.unwrap();
+        assert_eq!(
+            complete.total.value, 2,
+            "the partial cache key must be unreachable after the post-publication bump"
+        );
+        assert_eq!(
+            complete
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["A", "B"])
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_batch_is_restart_durable_only_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+
+        let volatile = test_index(dir.path(), "rt-volatile");
+        volatile
+            .index_batch_turbo_realtime(vec![doc("A", 1)], false)
+            .await
+            .unwrap();
+        stop_background(&volatile).await;
+        drop(volatile);
+        let reopened_volatile = Index::open(
+            IndexName::from_str("rt-volatile").unwrap(),
+            &config,
+            dir.path(),
+        )
+        .unwrap();
+        assert!(
+            reopened_volatile.get_document("A").await.unwrap().is_none(),
+            "no-WAL realtime writes must not be claimed durable before flush"
+        );
+
+        let durable = test_index(dir.path(), "rt-flushed");
+        let responses = durable
+            .index_batch_turbo_realtime(vec![doc("A", 1), doc("B", 2), doc("A", 3)], false)
+            .await
+            .unwrap();
+        durable.flush().await.unwrap();
+        stop_background(&durable).await;
+        drop(durable);
+        let reopened = Index::open(
+            IndexName::from_str("rt-flushed").unwrap(),
+            &config,
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.get_document("A").await.unwrap().unwrap()["value"],
+            3
+        );
+        assert_eq!(
+            reopened.get_document("B").await.unwrap().unwrap()["value"],
+            2
+        );
+        assert_eq!(reopened.store.version_map.live_count(), 2);
+        let a = reopened.store.version_map.get("A").unwrap();
+        assert_eq!(a.seq_no, responses[2].seq_no);
+        // Segment rebuild currently reconstructs `_version` from retained
+        // physical copies. Flush collapses A's superseded copy, so reopen
+        // reports version 1 instead of 2. That pre-existing persistence
+        // limitation affects every overwrite path and is intentionally not
+        // broadened into this realtime sequence-number fix.
+    }
 }
 
 #[cfg(test)]
