@@ -16,7 +16,10 @@ X = "http://127.0.0.1:9200"
 # ── Agent verdicts, keyed by file:line (reachable / guarded / severity / note) ──
 V = {
  # RCE-command
- "wp-includes/class-snoopy.php:1018": ("server-http-lib","escapeshellarg(URI)","low","URI escaped; Snoopy is legacy vendored HTTP lib"),
+ "wp-includes/class-snoopy.php:1018": ("server-http-lib-if-URI-attacker","escapeshellarg-NOT-option-safe","medium","OPTION INJECTION: $URI placed after curl flags with NO `--` separator; escapeshellarg stops command breakout but not curl option parsing -> $URI=\"-o/path\" writes a file (RCE) / -K reads. Snoopy legacy. Fix: add `--` before $URI."),
+ "wp-includes/block-template-utils.php:1494": ("theme-export","ziparchive-CREATE-not-extract","low","ZipArchive::open(CREATE|OVERWRITE) builds an export zip; addFile/addFromString add content -> NOT zip-slip (that is on extractTo). WP extraction (unzip_file) hand-rolls path checks, avoiding extractTo."),
+ "wp-includes/class-wp-image-editor-imagick.php:158": ("image-editor-uploaded-content","imagemagick-policy-dependent","medium","Imagick::readImage($this->file) parses attacker-UPLOADED image content -> ImageTragick/MVG/MSL/SVG delegate abuse (SSRF/RCE) if ImageMagick unpatched or policy.xml missing. WP checks file type first; content is still parsed."),
+ "wp-includes/class-wp-image-editor-imagick.php:156": ("image-editor-uploaded-content","imagemagick-policy-dependent","medium","Imagick::readImageBlob(file_get_contents($this->file)) — same ImageTragick surface on uploaded content."),
  "wp-includes/ID3/getid3.lib.php:1806": ("media-analysis","fixed-binary+internal","medium","$commandline built from configured binary paths; confirm filenames are escaped"),
  "wp-includes/ID3/getid3.php:484": ("media-analysis","fixed-binary+internal","medium","same getID3 external-tool path"),
  "wp-includes/ID3/getid3.php:1824": ("media-analysis","fixed-binary+internal","medium","same"),
@@ -57,7 +60,7 @@ def post(path, body, ct="application/json"):
 # pull every must-review site (the high-risk classes) and enrich — size covers all
 q = {"query": {"terms": {"class": ["RCE-command","RCE-code","deserialization","SSRF","SQLi",
                                     "file-write","file-read","XXE","variable-injection",
-                                    "dynamic-invoke","LDAP-injection"]}},
+                                    "dynamic-invoke","LDAP-injection","zip-slip-path-traversal","image-rce-ssrf"]}},
      "size": 5000, "_source": ["file","line","fn","class"]}
 hits = post("wpsinks/_search", json.dumps(q))["hits"]["hits"]
 reviewed = updates = 0

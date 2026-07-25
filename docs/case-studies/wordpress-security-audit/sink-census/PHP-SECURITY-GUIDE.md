@@ -3,7 +3,7 @@
 A whitebox PHP audit has **two axes**, and both must be covered to claim
 completeness:
 
-1. **Dangerous functions (sinks)** — 275 built-ins/constructs, one call = one
+1. **Dangerous functions (sinks)** — 287 built-ins/constructs, one call = one
    candidate. Enumerable and *provable* by AST census. See
    [`PHP-DANGEROUS-FUNCTIONS.md`](PHP-DANGEROUS-FUNCTIONS.md) /
    `php_dangerous_functions.json`.
@@ -16,7 +16,7 @@ completeness:
 > **Rule of thumb:** a sink tells you *where danger can happen*; a pattern tells
 > you *how safe-looking code is actually exploitable*. You need both.
 
-Measured on WordPress core: **11,191 sink sites** (proven 0-gap) + **2,077
+Measured on WordPress core: **11,223 sink sites** (proven 0-gap) + **2,077
 pattern hits** across 10 AST-detectable patterns, + the manual/semantic classes
 below that require reasoning.
 
@@ -24,8 +24,8 @@ below that require reasoning.
 
 ## Part 1 — Dangerous functions (the sink axis)
 
-Full table in [`PHP-DANGEROUS-FUNCTIONS.md`](PHP-DANGEROUS-FUNCTIONS.md). 275
-functions across 28 categories, each with vuln class, safe/unsafe recipe, and the
+Full table in [`PHP-DANGEROUS-FUNCTIONS.md`](PHP-DANGEROUS-FUNCTIONS.md). 287
+functions across 30 categories, each with vuln class, safe/unsafe recipe, and the
 taint-relevant argument: command/code exec, dynamic callables (`array_map`,
 `preg_replace_callback`), `unserialize`, include loaders, file read/write/delete/
 perms, directory, SSRF, SQL drivers, LDAP, XXE, variable-injection, ReDoS/ereg,
@@ -54,6 +54,30 @@ process-control, reflection-invoke, type-juggle functions, output/XSS. Coverage 
   *(WP core: 124.)*
 - **Non-constant-time secret compare** (`timing-compare`) — `$mac == $expected`
   leaks timing *and* juggles. **Safe:** `hash_equals`. *(WP core: 56.)*
+
+### A2. Escaper / defense that is NOT a defense
+- **`escapeshellarg` does not stop argument/option injection** (`option-injection`)
+  — it quotes a value so it can't start a *new command*, but the value can still
+  be read as an **option**. `exec('tar '.escapeshellarg($f))` with
+  `$f='--checkpoint-action=exec=sh'` runs a command; `curl … escapeshellarg($url)`
+  with `$url='-o/var/www/x.php'` writes a file (RCE). **Found in WP** `class-snoopy.php`
+  — `$URI` escaped but placed after curl flags with no `--`. **Safe:** literal `--`
+  before user args; reject leading `-`; argv-form `proc_open`.
+- **`escapeshellcmd` is weaker than `escapeshellarg`** (`escapeshellcmd-weak`) —
+  escapes command metachars but leaves argument splitting/quoting; misused as if
+  it quoted an argument.
+
+### A3. Class-based sinks (danger inside methods, not free functions)
+- **Zip Slip** (`zip-slip`) — `ZipArchive/PharData::extractTo($dir)` writes each
+  entry by its own path; a `../` entry escapes `$dir` → arbitrary write (RCE). WP
+  core avoids this by hand-rolling extraction with path checks in `unzip_file`.
+- **ImageMagick / Imagick** (`image-rce-ssrf`) — `Imagick::readImage`/`readImageBlob`
+  on attacker-uploaded content → ImageTragick (MVG/MSL/SVG delegate) SSRF/RCE if
+  ImageMagick is unpatched or `policy.xml` missing. **Found in WP** `class-wp-image-editor-imagick.php`.
+- **phar:// via any file op** (`phar-wrapper-op`) — a benign `file_exists`/
+  `getimagesize` on `phar://x.jpg` triggers `unserialize` of Phar metadata.
+- The census catalogues these as method/ctor sinks (`extractTo`, `loadHTML`,
+  `readImage`, `new ZipArchive`, `new Imagick`, …) so they're enumerated too.
 
 ### B. Input shape (the `?param[]=` family)
 - **Array injection** (`array-injection`) — sending `login[]=a` makes

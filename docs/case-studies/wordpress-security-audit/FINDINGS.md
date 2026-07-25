@@ -5,13 +5,19 @@
 | # | finding | class | severity | status |
 |---|---|---|---|---|
 | 1 | `wp_http_validate_url` allows `169.254.0.0/16` (cloud metadata) | SSRF (incomplete deny-list) | Medium (known-class) | **Real, verified, reachable** |
+| 2 | `class-snoopy.php` curl build: `escapeshellarg($URI)` after flags, no `--` | option injection (escaper ≠ injection defense) | Medium (legacy, if URI attacker-set) | **Real pattern instance** |
+| 3 | `class-wp-image-editor-imagick.php` parses uploaded image content | ImageTragick (image-rce-ssrf) | Medium (deploy-dependent) | **Real surface** |
 | — | AJAX / REST / admin authorization | IDOR / privesc | — | Verified **clean** (object-scoped) |
 | — | SQL double-`prepare` de-escape | SQLi | — | Verified **safe** (placeholder_escape) |
 | — | sanitizer composition (escape→de-escape) | XSS/SQLi | — | Verified **safe** (escaper-last) |
 
-Only finding #1 is a real weakness. The rest are documented negatives — core is
-hardened — and each was confirmed by reading the real implementation, not by a
-pattern match.
+Findings 1–3 are real (2 and 3 are known-class / deploy-dependent, stated
+honestly); the rest are documented negatives — core is hardened — each confirmed
+by reading the real implementation, not a pattern match. Findings 2 and 3 came
+from the **agentic per-call audit**: the agent read each flagged call
+(`escapeshellarg`, `Imagick::readImage`, `ZipArchive`) and wrote a verdict back to
+`wpsinks` — proving the escaper-injection and class-based-sink classes are now
+covered.
 
 ---
 
@@ -75,6 +81,33 @@ which is the case-study point.
 re-check the IP at request time (mitigates DNS-rebinding TOCTOU).
 
 ---
+
+## Finding 2 — `escapeshellarg` option injection (class: escaper-is-not-injection-protection)
+
+`wp-includes/class-snoopy.php` (legacy vendored HTTP lib) builds a curl command:
+```php
+$cmdline_params = '-k -D '.escapeshellarg($headerfile).' -H '.escapeshellarg($header)...
+exec($this->curl_path.' '.$cmdline_params.' '.escapeshellarg($URI), ...);
+```
+`$URI` is `escapeshellarg`-escaped but placed **after the flags with no `--`
+separator**. `escapeshellarg` prevents shell *command* breakout — it does **not**
+prevent curl from parsing the value as an **option**. If `$URI` is
+attacker-controlled and starts with `-`, e.g. `-o/var/www/html/x.php` (file write →
+RCE) or `-K /etc/passwd`, curl obeys it. **Honest scope:** Snoopy is legacy and
+core rarely routes attacker URLs to it; the point is the *class* — an escaper that
+is not injection protection. **Fix:** insert a literal `--` before `$URI`; reject
+leading `-`; use argv-form. This is the pattern `option-injection` in the guide.
+
+## Finding 3 — Imagick processes uploaded image content (class: image-rce-ssrf)
+
+`wp-includes/class-wp-image-editor-imagick.php` calls `Imagick::readImage($this->file)`
+/ `readImageBlob(file_get_contents($this->file))` on **attacker-uploaded** images.
+This is the ImageTragick surface (CVE-2016-3714 and kin): a crafted MVG/MSL/SVG
+image can make an unpatched/mis-configured ImageMagick perform SSRF or command
+execution via delegates. **Honest scope:** mitigated by a modern ImageMagick +
+a restrictive `policy.xml`, which WP relies on the host to provide; WP checks file
+type first but the content is still parsed. **Fix (deploy):** patched ImageMagick;
+`policy.xml` disabling `MVG/MSL/URL/EPHEMERAL/HTTPS` coders.
 
 ## Verified-clean negatives (the honest majority)
 

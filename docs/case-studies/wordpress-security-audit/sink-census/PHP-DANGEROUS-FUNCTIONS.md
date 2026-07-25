@@ -1,6 +1,6 @@
 # The PHP dangerous-function map (full reference)
 
-275 potentially-vulnerable PHP built-ins/constructs across 28 categories. Generated from `php_dangerous_functions.json`. `arg` = the taint-relevant argument (0-indexed; `cb:N`=callable at N; `recv`=receiver/URL-set-elsewhere; `self`=construct operand; `ret`=return is the sink).
+287 functions across 30 categories.
 
 ## command-exec — RCE-command
 | function | kind | arg | note |
@@ -264,6 +264,9 @@
 | `open` | method | 0 | XMLReader::open |
 | `libxml_set_external_entity_loader` | call | cb:0 |  |
 | `transformToXml` | method | 0 | XSLTProcessor + registerPHPFunctions => RCE |
+| `loadHTML` | method | 0 | DOMDocument::loadHTML — HTML parse; entity/xxe surface |
+| `setEntityLoader` | method | cb:0 | libxml external entity loader |
+| `setParserProperty` | method | 0 | XMLReader — can enable DTD/entity loading |
 
 ## xss-output — XSS
 *raw output of unescaped data; escape per context*
@@ -424,4 +427,25 @@
 | `strcasecmp` | call | 0 |  |
 | `strncmp` | call | 0 |  |
 | `hash_equals` | call | 0 | SAFE — the correct constant-time compare |
+
+## archive-extraction — zip-slip-path-traversal
+*extracting an archive writes entry paths; a `../` entry escapes the target dir (Zip Slip). Also symlink entries.*
+
+| function | kind | arg | note |
+|---|---|---|---|
+| `extractTo` | method | 0 | ZipArchive/PharData::extractTo — writes each entry; ../ escapes dir |
+| `addFile` | method | 0 | path added to archive |
+| `addFromString` | method | 0 | entry name is attacker-influenced |
+| `buildFromDirectory` | method | 0 | PharData |
+| `convertToExecutable` | method | * | PharData -> executable phar |
+
+## image-processing — image-rce-ssrf
+*Imagick reads by URL (SSRF) and historically had delegate RCE (ImageTragick, MVG/MSL); GD from-URL is SSRF.*
+
+| function | kind | arg | note |
+|---|---|---|---|
+| `readImage` | method | 0 | Imagick::readImage — URL => SSRF; format abuse |
+| `readImageBlob` | method | 0 |  |
+| `readImageFile` | method | 0 |  |
+| `setImageFormat` | method | 0 |  |
 

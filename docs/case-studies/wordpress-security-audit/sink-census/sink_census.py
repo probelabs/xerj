@@ -59,7 +59,9 @@ NONCODE_NODES = {"string", "encapsed_string", "comment", "heredoc", "nowdoc", "t
 # classes whose `new C(...)` construction is a sink
 CTOR_SINKS = {"ReflectionFunction": "dynamic-invoke", "ReflectionMethod": "dynamic-invoke",
               "ReflectionClass": "dynamic-invoke", "ReflectionObject": "dynamic-invoke",
-              "SoapClient": "SSRF", "SplFileObject": "file-read", "SimpleXMLElement": "XXE"}
+              "SoapClient": "SSRF", "SplFileObject": "file-read", "SimpleXMLElement": "XXE",
+              "ZipArchive": "zip-slip-path-traversal", "PharData": "zip-slip-path-traversal",
+              "Phar": "deserialization", "Imagick": "image-rce-ssrf", "DOMDocument": "XXE"}
 def scan_file(path, rel):
     src = open(path, "rb").read()
     root = parser.parse(src).root_node
