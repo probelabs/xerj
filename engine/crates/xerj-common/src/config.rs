@@ -82,6 +82,8 @@ pub struct Config {
     pub search_context: SearchContextConfig,
     /// Structured logging + access log — 2 settings.
     pub logging: LoggingConfig,
+    /// Elasticsearch/OpenSearch wire-compatibility identity — 2 settings.
+    pub compat: CompatConfig,
 }
 
 // Total: 5+3+2+3+10+5+3+1+6+2+4+3+4+3+2 = 56 fields (incl. cors: 2, auth: 3,
@@ -279,6 +281,43 @@ impl Default for ServerConfig {
             bind_address: "0.0.0.0".into(),
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Elasticsearch/OpenSearch wire-compatibility identity — controls what the
+/// `version`/`distribution` block in `GET /` (and any other endpoint that
+/// reports the same block) says about xerj to the calling client.
+///
+/// Three-tier resolution, most explicit wins:
+/// 1. `distribution`/`version` set here (via `--compat-distribution` /
+///    `XERJ_COMPAT_DISTRIBUTION`, `--compat-version` / `XERJ_COMPAT_VERSION`)
+///    — always wins, no per-request inspection at all. For a client that
+///    sends no `User-Agent`, or an unrecognized one, or an operator who just
+///    wants deterministic behavior without relying on request sniffing.
+/// 2. Left unset (default): xerj inspects the request's `User-Agent` header
+///    and answers per-request — an OpenSearch client and an Elasticsearch
+///    client hitting the SAME running instance each see the block shaped
+///    for their own ecosystem.
+/// 3. Neither of the above resolves anything (no override, no recognizable
+///    `User-Agent`): unchanged pre-existing behavior — plain Elasticsearch.
+///
+/// **2 settings.**
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompatConfig {
+    /// Force the reported client distribution: `"elasticsearch"` or
+    /// `"opensearch"`. Empty (default) — resolve per-request from
+    /// `User-Agent` instead (falls back to `elasticsearch`-shaped output,
+    /// i.e. no `distribution` field, when nothing is detected either way).
+    pub distribution: String,
+    /// Force the reported `version.number`. Empty (default) — when the
+    /// caller is auto-detected as OpenSearch (see `distribution` above),
+    /// reports a fixed, empirically-verified compatible OpenSearch version
+    /// instead (NOT the client's own self-reported library version — tried
+    /// that first, a real OpenSearch Dashboards container rejected it, see
+    /// `es_compat::FALLBACK_OPENSEARCH_VERSION`'s doc comment for why).
+    pub version: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

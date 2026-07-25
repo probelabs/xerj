@@ -189,8 +189,16 @@ fn build_mapping(specs: &[infer::FieldSpec]) -> Value {
 // ─── the main run ────────────────────────────────────────────────────────
 
 fn run_index(cfg: IndexCfg) -> Result<i32> {
+    extract::pdf::configure_workers(cfg.pdf_workers);
+    extract::pdf::configure_timeout(cfg.pdf_timeout_secs);
     let t0 = Instant::now();
-    let es = Es::new(&cfg.url, cfg.api_key.clone())?;
+    if !cfg.quiet {
+        eprintln!(
+            "autoindex: bulk HTTP request timeout: {}s",
+            cfg.bulk_timeout_secs
+        );
+    }
+    let es = Es::with_bulk_timeout(&cfg.url, cfg.api_key.clone(), cfg.bulk_timeout_secs)?;
     es.ping()?;
 
     let files = walk::walk(&cfg.root, cfg.follow_symlinks)?;
@@ -224,8 +232,14 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
         .state_dir
         .clone()
         .unwrap_or_else(|| state::default_state_dir(&root_str, &cfg.url, &cfg.prefix));
-    let mut journal =
-        state::Journal::open(&state_dir, &root_str, &cfg.url, &cfg.prefix, cfg.fresh)?;
+    let mut journal = state::Journal::open(
+        &state_dir,
+        &root_str,
+        &cfg.url,
+        &cfg.prefix,
+        cfg.bulk_timeout_secs,
+        cfg.fresh,
+    )?;
     let run_id = journal.run_id.clone();
     if journal.resumed && !cfg.quiet {
         eprintln!(

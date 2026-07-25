@@ -98,6 +98,39 @@ curl -s http://localhost:9200/finance-onnx-*/_search \
   -d '{"query":{"semantic":{"field":"body","query":"Which quarter had the largest operating-margin decline?","k":10}},"size":5}'
 ```
 
+### Validate cold start, cancellation, and sharing
+
+ONNX loads lazily on the first semantic request. The log must show exactly one
+`ONNX lazy initialization scheduled` line followed by one completion line.
+The first request includes model-load latency; later requests reuse that
+session.
+
+To verify cancellation safety, issue a deliberately short first request and
+then retry immediately:
+
+```bash
+curl --max-time 0.05 -sS http://localhost:9200/finance-onnx-*/_search \
+  -H 'content-type: application/json' \
+  -d '{"query":{"semantic":{"field":"body","query":"cold load","k":5}}}'
+
+curl --max-time 10 -sS http://localhost:9200/finance-onnx-*/_search \
+  -H 'content-type: application/json' \
+  -d '{"query":{"semantic":{"field":"body","query":"cold load","k":5}}}'
+```
+
+The first client may time out, but initialization remains process-owned. The
+retry waits for the same load rather than starting another session. Likewise,
+concurrent first requests share one initialization and then run through the
+existing bounded admission and microbatch policy. A warning is emitted if
+model initialization is still running after 30 seconds; the eventual
+completion or full error chain is always logged.
+
+Initialization failures, including a caught loader panic, are retained for the
+life of that shared model configuration. Every waiting or later request
+receives the same terminal error; XERJ does not silently retry a possibly
+corrupt runtime initialization or risk loading two sessions. Correct the
+assets/runtime issue and restart the process.
+
 ## Restart and vector-space safety
 
 Every ONNX semantic index stores `embedding_identity.json` with SHA-256 model

@@ -265,6 +265,15 @@ pub struct Engine {
     /// auth middleware can re-authenticate `Authorization: ApiKey <encoded>`.
     /// In-memory only (lost on restart).
     pub api_keys: Arc<DashMap<String, ApiKeyRecord>>,
+    /// `"{application}\0{name}"` → the ES-shaped privilege object
+    /// (`application`/`name`/`actions`/`metadata`). Populated by
+    /// `PUT /_security/privilege`, read by `GET /_security/privilege*`.
+    /// Not enforced (same honest-surface convention as `roles`/`api_keys`'
+    /// role_descriptors) — Kibana registers its `kibana-.kibana` privileges
+    /// here at startup so `GET` stops reporting an empty set on every
+    /// subsequent poll, but nothing actually gates on them yet.
+    /// In-memory only (lost on restart).
+    pub application_privileges: Arc<DashMap<String, Value>>,
     /// legacy index template name (v1 /_template) → template JSON
     pub legacy_templates: Arc<DashMap<String, Value>>,
     /// pipeline_name → compiled, executable Pipeline (typed transform pipeline)
@@ -382,6 +391,7 @@ impl Engine {
             rollup_jobs: Arc::new(DashMap::new()),
             ccr_auto_follow: Arc::new(DashMap::new()),
             api_keys: Arc::new(DashMap::new()),
+            application_privileges: Arc::new(DashMap::new()),
             legacy_templates: Arc::new(DashMap::new()),
             transform_pipelines: Arc::new(DashMap::new()),
             pits: Arc::new(DashMap::new()),

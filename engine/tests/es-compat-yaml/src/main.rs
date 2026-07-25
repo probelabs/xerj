@@ -89,6 +89,12 @@ fn main() {
         format!("{}", total.skipped).yellow(),
         total.passed + total.failed + total.skipped,
     );
+    // CI's "0 failures required" gate consumes this exit code — without it a
+    // regressing PR shows a green conformance check (bit us on PR #23, which
+    // went 1360→1345 passing with the job still SUCCESS).
+    if total.failed > 0 {
+        std::process::exit(1);
+    }
 }
 
 fn collect_files(cli: &Cli) -> Vec<PathBuf> {

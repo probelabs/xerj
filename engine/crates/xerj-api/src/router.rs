@@ -9,7 +9,7 @@
 //! to both.
 
 use axum::{
-    extract::{DefaultBodyLimit, Request},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderValue, Method},
     middleware::{self, Next},
     response::Response,
@@ -372,6 +372,10 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         .route("/_tasks/:task_id/_cancel", post(es_compat::cancel_task))
         // ── Cat templates ──────────────────────────────────────────────────
         .route("/_cat/templates", get(es_compat::cat_templates))
+        .route(
+            "/_cat/templates/:pattern",
+            get(es_compat::cat_templates_pattern),
+        )
         // ── Ingest pipelines ───────────────────────────────────────────────
         .route(
             "/_ingest/pipeline",
@@ -561,8 +565,36 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             get(es_compat::security_authenticate),
         )
         .route(
+            "/_security/user/_has_privileges",
+            get(es_compat::security_has_privileges).post(es_compat::security_has_privileges),
+        )
+        .route(
+            "/_security/user/:user/_has_privileges",
+            get(es_compat::security_has_privileges).post(es_compat::security_has_privileges),
+        )
+        .route(
+            "/_security/profile/_activate",
+            post(es_compat::security_activate_user_profile),
+        )
+        .route(
+            "/_security/profile/:uid",
+            get(es_compat::security_get_user_profile),
+        )
+        .route(
             "/_security/api_key",
             post(es_compat::security_create_api_key),
+        )
+        .route(
+            "/_security/privilege",
+            get(es_compat::security_get_all_privileges).put(es_compat::security_put_privileges),
+        )
+        .route(
+            "/_security/privilege/:application",
+            get(es_compat::security_get_application_privileges),
+        )
+        .route(
+            "/_security/privilege/:application/:name",
+            get(es_compat::security_get_privilege).delete(es_compat::security_delete_privilege),
         )
         // ── License ───────────────────────────────────────────────────────────
         .route(
@@ -725,8 +757,11 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         // Shared state
         .with_state(state.clone())
         // Middleware stack (applied outermost-last)
-        .layer(middleware::from_fn_with_state(state, auth_middleware))
-        .layer(middleware::from_fn(es_headers_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(state, es_headers_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(trace_layer(access_log))
         .layer(cors)
@@ -744,18 +779,34 @@ pub fn build_es_compat_router(state: AppState) -> Router {
 /// Middleware that sets ES-compatible product headers on every response.
 ///
 /// Kibana and other Elastic clients verify the presence of `X-Elastic-Product`
-/// before trusting the response.  A `Warning` header is included for
-/// compatibility with tools that check for deprecation notices.
-async fn es_headers_middleware(req: Request, next: Next) -> Response {
+/// before trusting the response. A real OpenSearch server never sends this
+/// header at all, so a caller detected (or forced, see
+/// [`es_compat::is_opensearch_caller`]) as OpenSearch must NOT receive it —
+/// some OpenSearch-ecosystem clients treat an unexpected product header as
+/// just another response header, but there's no reason to send an
+/// Elastic-specific identity marker to a client we've already decided isn't
+/// Elastic. A `Warning` header is included for Elastic callers only, for the
+/// same reason.
+async fn es_headers_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let is_opensearch = es_compat::is_opensearch_caller(&state, req.headers());
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
-    headers.insert(
-        "x-elastic-product",
-        HeaderValue::from_static("Elasticsearch"),
-    );
-    // RFC 7234 warning header — signals no specific deprecation for now.
-    if let Ok(v) = HeaderValue::from_str("299 Elasticsearch-8.13.0 \"\"") {
-        headers.insert("warning", v);
+    if is_opensearch {
+        headers.remove("x-elastic-product");
+        headers.remove("warning");
+    } else {
+        headers.insert(
+            "x-elastic-product",
+            HeaderValue::from_static("Elasticsearch"),
+        );
+        // RFC 7234 warning header — signals no specific deprecation for now.
+        if let Ok(v) = HeaderValue::from_str("299 Elasticsearch-8.13.0 \"\"") {
+            headers.insert("warning", v);
+        }
     }
     resp
 }

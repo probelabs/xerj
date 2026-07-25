@@ -80,6 +80,8 @@ struct CliArgs {
     embed_mode: Option<String>,
     onnx_model: Option<String>,
     onnx_tokenizer: Option<String>,
+    compat_distribution: Option<String>,
+    compat_version: Option<String>,
 }
 
 fn parse_args() -> CliArgs {
@@ -90,6 +92,8 @@ fn parse_args() -> CliArgs {
     let mut embed_mode = None;
     let mut onnx_model = None;
     let mut onnx_tokenizer = None;
+    let mut compat_distribution = None;
+    let mut compat_version = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -107,6 +111,8 @@ fn parse_args() -> CliArgs {
             }
             "--onnx-model" => onnx_model = args.next(),
             "--onnx-tokenizer" => onnx_tokenizer = args.next(),
+            "--compat-distribution" => compat_distribution = args.next(),
+            "--compat-version" => compat_version = args.next(),
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -129,6 +135,8 @@ fn parse_args() -> CliArgs {
         embed_mode,
         onnx_model,
         onnx_tokenizer,
+        compat_distribution,
+        compat_version,
     }
 }
 
@@ -157,6 +165,24 @@ fn print_help() {
                                                no auto-download\n\
              --onnx-model <PATH>    compatible FP32 MiniLM ONNX model\n\
              --onnx-tokenizer <PATH> tokenizer.json from the same model/export\n\
+             --compat-distribution <DIST>  Force the wire-compat client identity: elasticsearch |\n\
+                                      opensearch. Default: unset — xerj auto-detects per request\n\
+                                      from the caller's User-Agent header instead (an\n\
+                                      opensearch-py/opensearch-js client — including OpenSearch\n\
+                                      Dashboards itself — and an elasticsearch-py/elasticsearch-js\n\
+                                      client hitting the SAME running instance each see GET / and\n\
+                                      GET /_nodes shaped for their own ecosystem). Setting this\n\
+                                      pins ALL clients to one identity regardless of User-Agent —\n\
+                                      useful if a client sends no recognizable User-Agent, or you\n\
+                                      just want deterministic behavior.\n\
+                                      Example: --compat-distribution opensearch\n\
+             --compat-version <VER> Force the reported version.number (e.g. 2.11.0). Default:\n\
+                                      unset — when auto-detected as OpenSearch, reports a fixed\n\
+                                      version verified to pass OpenSearch Dashboards' own\n\
+                                      compatibility check (not the calling client's own version —\n\
+                                      client library versions aren't a reliable stand-in for a\n\
+                                      compatible server version, confirmed against a real OSD\n\
+                                      container). Example: --compat-version 2.11.0\n\
              --help,     -h         Show this help\n\
              --version,  -V         Print version and exit\n\
          \n\
@@ -170,7 +196,29 @@ fn print_help() {
              XERJ_CONFIG      Config file path\n\
              XERJ_EMBED_MODE  Embedding backend (lexical|neural|proxy|auto|onnx-experimental)\n\
              XERJ_ONNX_MODEL  FP32 ONNX model path\n\
-             XERJ_ONNX_TOKENIZER matching tokenizer.json path\n",
+             XERJ_ONNX_TOKENIZER matching tokenizer.json path\n\
+             XERJ_COMPAT_DISTRIBUTION  elasticsearch|opensearch — same as --compat-distribution\n\
+             XERJ_COMPAT_VERSION       same as --compat-version\n\
+         \n\
+         WIRE-COMPAT IDENTITY — three ways to run this, pick what fits:\n\
+         \n\
+             1. Fully automatic (default, no flags):\n\
+                  xerj -d ./data\n\
+                Every client gets a response shaped for its own ecosystem, detected from its\n\
+                User-Agent on every request. One instance serves ES and OpenSearch clients at\n\
+                once.\n\
+         \n\
+             2. Force one identity for every client, every request:\n\
+                  xerj -d ./data --compat-distribution opensearch --compat-version 2.11.0\n\
+                Or via env (handy in docker-compose):\n\
+                  XERJ_COMPAT_DISTRIBUTION=opensearch XERJ_COMPAT_VERSION=2.11.0 xerj -d ./data\n\
+                Ignores User-Agent entirely — useful for a client that doesn't send one, or when\n\
+                you want fully deterministic behavior.\n\
+         \n\
+             3. Pin only the distribution, let the version auto-detect per client:\n\
+                  xerj -d ./data --compat-distribution opensearch\n\
+                (or set only XERJ_COMPAT_VERSION and leave distribution to auto-detect — the two\n\
+                settings are resolved independently, mix and match as needed.)\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -337,6 +385,38 @@ fn load_config(args: &CliArgs) -> Result<Config> {
                 );
             }
         }
+    }
+
+    // ES/OpenSearch wire-compatibility override: `--compat-distribution` /
+    // `XERJ_COMPAT_DISTRIBUTION` (flag wins). Left unset, xerj auto-detects
+    // per request from the caller's User-Agent instead — this is only for
+    // pinning deterministic behavior (or covering a client whose
+    // User-Agent isn't recognized).
+    if let Some(dist) = args
+        .compat_distribution
+        .clone()
+        .or_else(|| std::env::var("XERJ_COMPAT_DISTRIBUTION").ok())
+    {
+        let dist = dist.trim().to_ascii_lowercase();
+        match dist.as_str() {
+            "elasticsearch" | "opensearch" => {
+                info!("compat.distribution = {dist} (forced via CLI/env)");
+                cfg.compat.distribution = dist;
+            }
+            other => {
+                anyhow::bail!(
+                    "unknown --compat-distribution '{other}'; use elasticsearch|opensearch"
+                );
+            }
+        }
+    }
+    if let Some(version) = args
+        .compat_version
+        .clone()
+        .or_else(|| std::env::var("XERJ_COMPAT_VERSION").ok())
+    {
+        info!("compat.version = {version} (forced via CLI/env)");
+        cfg.compat.version = version;
     }
 
     Ok(cfg)
@@ -813,6 +893,8 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
         embed_mode: None,
         onnx_model: None,
         onnx_tokenizer: None,
+        compat_distribution: None,
+        compat_version: None,
     };
     let mut cfg = load_config(&fake_cli)?;
     // Tracing after config so the [logging] format applies (RC4-W4 item 6).
@@ -1137,6 +1219,10 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
 /// Override with `TOKIO_WORKER_THREADS` (operators on very small or very large
 /// hosts, or wanting the stock `ncpus` behaviour, can set it explicitly).
 fn main() -> Result<()> {
+    // Dispatch before creating Tokio's pool so each PDF worker stays small.
+    if matches!(std::env::args().nth(1).as_deref(), Some("__extract-pdf")) {
+        std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
+    }
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
