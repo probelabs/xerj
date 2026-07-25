@@ -21647,15 +21647,14 @@ pub async fn security_authenticate(State(_state): State<AppState>) -> impl IntoR
 // multi-user store, so every grant (password or access_token) activates the
 // same built-in superuser profile. The uid is a fixed constant rather than
 // content-derived from the submitted credentials, so repeated logins (and
-// Kibana state keyed on this uid, e.g. space favorites) stay stable.
-pub async fn security_activate_user_profile(
-    State(_state): State<AppState>,
-    body: Option<Json<Value>>,
-) -> impl IntoResponse {
-    let _ = body;
-    let now_ms = Utc::now().timestamp_millis().max(0);
-    Json(json!({
-        "uid": "u_xerj-superuser-0000000000000000000000000000000000000_0",
+// Kibana state keyed on this uid, e.g. space favorites) stay stable — also
+// shared with `security_get_user_profile` below, since a uid this endpoint
+// hands out needs to resolve when Kibana looks it back up.
+const XERJ_SUPERUSER_PROFILE_UID: &str = "u_xerj-superuser-0000000000000000000000000000000000000_0";
+
+fn xerj_superuser_profile_json(now_ms: i64) -> Value {
+    json!({
+        "uid": XERJ_SUPERUSER_PROFILE_UID,
         "enabled": true,
         "last_synchronized": now_ms,
         "user": {
@@ -21671,8 +21670,60 @@ pub async fn security_activate_user_profile(
             "_primary_term": 1,
             "_seq_no": 0
         }
-    }))
-    .into_response()
+    })
+}
+
+pub async fn security_activate_user_profile(
+    State(_state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let _ = body;
+    let now_ms = Utc::now().timestamp_millis().max(0);
+    Json(xerj_superuser_profile_json(now_ms)).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /_security/profile/{uid}  (comma-separated list of uids accepted)
+// ─────────────────────────────────────────────────────────────────────────────
+// Route didn't exist at all. After `_activate` hands Kibana a profile uid,
+// its user-profile plugin re-fetches the full profile by that uid on every
+// subsequent page load — found live, one step past the `_has_privileges`
+// fix: login and `_activate` both succeeded, but the next page
+// (`/app/home`) still 500'd, logged server-side as "Failed to retrieve user
+// profile for the current user ... : ''" (empty reason — same "Kibana
+// throws on an unhandled 404" pattern as everywhere else in this family of
+// fixes). Only one uid is ever valid — the fixed constant `_activate`
+// hands out — so anything else reports back as not found, matching ES's
+// documented shape for a missing uid (`profiles: []` plus an `errors`
+// block) instead of a blanket 404.
+pub async fn security_get_user_profile(
+    State(_state): State<AppState>,
+    Path(uid): Path<String>,
+) -> impl IntoResponse {
+    let now_ms = Utc::now().timestamp_millis().max(0);
+    let mut profiles = Vec::new();
+    let mut error_details = serde_json::Map::new();
+    for requested in uid.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if requested == XERJ_SUPERUSER_PROFILE_UID {
+            profiles.push(xerj_superuser_profile_json(now_ms));
+        } else {
+            error_details.insert(
+                requested.to_string(),
+                json!({
+                    "type": "resource_not_found_exception",
+                    "reason": "profile document not found"
+                }),
+            );
+        }
+    }
+    let mut response = json!({ "profiles": profiles });
+    if !error_details.is_empty() {
+        response["errors"] = json!({
+            "count": error_details.len(),
+            "details": error_details,
+        });
+    }
+    Json(response).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
