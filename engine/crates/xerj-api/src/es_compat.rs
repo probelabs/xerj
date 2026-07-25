@@ -84,19 +84,8 @@ const FALLBACK_OPENSEARCH_VERSION: &str = "2.11.0";
 ///    `EsVersion::default()`.
 fn resolve_compat_version(state: &AppState, headers: &axum::http::HeaderMap) -> EsVersion {
     let mut version = EsVersion::default();
-
     let cfg = &state.config.compat;
-    let user_agent = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok());
-
-    let is_opensearch = if !cfg.distribution.is_empty() {
-        cfg.distribution == "opensearch"
-    } else {
-        user_agent
-            .map(|ua| ua.to_ascii_lowercase().contains("opensearch"))
-            .unwrap_or(false)
-    };
+    let is_opensearch = is_opensearch_caller(state, headers);
 
     if is_opensearch {
         version.distribution = Some("opensearch".to_string());
@@ -112,6 +101,33 @@ fn resolve_compat_version(state: &AppState, headers: &axum::http::HeaderMap) -> 
     }
 
     version
+}
+
+/// Is THIS caller (or is xerj forced to treat every caller as) an
+/// OpenSearch client? Shared by `resolve_compat_version` (the `version`/
+/// `distribution` block) and `router::es_headers_middleware` (the
+/// `x-elastic-product` response header — a real OpenSearch server never
+/// sends this at all, so an OpenSearch-detected caller shouldn't receive
+/// an Elastic-specific product-identity marker, on general correctness
+/// grounds — this alone was NOT sufficient to get a real OpenSearch
+/// Dashboards container past its `.kibana` saved-objects-migration 404,
+/// see PR description for what was actually confirmed).
+///
+/// Same two-tier priority as `resolve_compat_version`: an explicit
+/// `--compat-distribution` override always wins; otherwise a
+/// case-insensitive "contains opensearch" match on `User-Agent` (verified
+/// empirically against real `opensearch-py`/`opensearch-js` — including
+/// OpenSearch Dashboards' own internal client).
+pub(crate) fn is_opensearch_caller(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    let cfg = &state.config.compat;
+    if !cfg.distribution.is_empty() {
+        return cfg.distribution == "opensearch";
+    }
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|ua| ua.to_ascii_lowercase().contains("opensearch"))
+        .unwrap_or(false)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -19073,13 +19089,94 @@ pub async fn head_index(
 // GET /_cat/templates — list templates in text format
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_templates(State(state): State<AppState>) -> impl IntoResponse {
-    // name  index_patterns  order  version
+/// Query params for `/_cat/templates` (and its `{pattern}` variant).
+/// `format=json` returns a JSON array instead of the plain-text table —
+/// OpenSearch Dashboards' own `cat.templates()` call requests this.
+#[derive(Debug, Deserialize, Default)]
+pub struct CatTemplatesParams {
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+pub async fn cat_templates(
+    State(state): State<AppState>,
+    Query(params): Query<CatTemplatesParams>,
+) -> impl IntoResponse {
+    cat_templates_inner(state, None, params).await
+}
+
+/// `GET /_cat/templates/{pattern}` — the pattern-scoped variant.
+///
+/// Previously unrouted, so a wildcard-pattern call (e.g. OpenSearch
+/// Dashboards' own startup check for `opensearch_dashboards_index_template*`)
+/// fell through to the router's bare 404 fallback: no body at all, not even
+/// an ES-shaped JSON error. `opensearch-js`'s `cat.templates()` can't parse
+/// an empty body and throws — found empirically, this is what actually
+/// crashes OSD's saved-objects migration, not the (perfectly well-formed)
+/// `.kibana` 404 it hits right before this call.
+///
+/// Same `_cat` selector semantics as `/_cat/indices/{pattern}`: a WILDCARD
+/// matching nothing is an empty 200, never a 404 — a concrete template name
+/// matching nothing does 404, but templates have no equivalent of `_all`
+/// index-not-found semantics worth enforcing here since nothing currently
+/// creates a naming collision risk.
+pub async fn cat_templates_pattern(
+    State(state): State<AppState>,
+    Path(pattern): Path<String>,
+    Query(params): Query<CatTemplatesParams>,
+) -> impl IntoResponse {
+    cat_templates_inner(state, Some(pattern), params).await
+}
+
+async fn cat_templates_inner(
+    state: AppState,
+    pattern: Option<String>,
+    params: CatTemplatesParams,
+) -> axum::response::Response {
+    let matches_pattern = |name: &str| match pattern.as_deref() {
+        None => true,
+        Some(pat) => pat
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(|p| p == "_all" || p == "*" || p == name || glob_match_simple(p, name)),
+    };
+
+    let mut rows: Vec<(String, Vec<String>, i32)> = state
+        .engine
+        .templates
+        .iter()
+        .filter(|entry| matches_pattern(entry.key()))
+        .map(|entry| {
+            let t = entry.value();
+            (entry.key().clone(), t.index_patterns.clone(), t.priority)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(name, index_patterns, priority)| {
+                json!({
+                    "name": name,
+                    "index_patterns": format!("[{}]", index_patterns.join(", ")),
+                    "order": priority.to_string(),
+                    "version": "",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = Vec::new();
-    for entry in state.engine.templates.iter() {
-        let t = entry.value();
-        let patterns = t.index_patterns.join(",");
-        lines.push(format!("{} {} {} -", entry.key(), patterns, t.priority));
+    for (name, index_patterns, priority) in &rows {
+        lines.push(format!(
+            "{} {} {} -",
+            name,
+            index_patterns.join(","),
+            priority
+        ));
     }
     let body = if lines.is_empty() {
         String::new()
