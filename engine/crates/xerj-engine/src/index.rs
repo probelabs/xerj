@@ -44,6 +44,309 @@ impl<'a> Drop for MergeFlagClear<'a> {
     }
 }
 
+pub(crate) struct BackgroundTaskTracker {
+    state: parking_lot::Mutex<BackgroundTaskState>,
+    changed: tokio::sync::Notify,
+    _node_lock_lease: Arc<std::fs::File>,
+}
+
+struct BackgroundTaskState {
+    closing: bool,
+    active: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct BackgroundTaskGuard {
+    _registration: Arc<BackgroundTaskRegistration>,
+}
+
+struct BackgroundTaskRegistration(Arc<BackgroundTaskTracker>);
+
+#[cfg(test)]
+pub(crate) struct BackgroundFlushFinalizerBarrier {
+    pub(crate) entered: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release_changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl BackgroundFlushFinalizerBarrier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release_changed: std::sync::Condvar::new(),
+        })
+    }
+
+    fn enter_and_wait(&self) {
+        self.entered.notify_one();
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release_changed.wait(released).unwrap();
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release_changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct BackgroundHnswPairBarrier {
+    pub(crate) entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl BackgroundHnswPairBarrier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl BackgroundTaskTracker {
+    pub(crate) fn new(node_lock_lease: Arc<std::fs::File>) -> Arc<Self> {
+        Arc::new(Self {
+            state: parking_lot::Mutex::new(BackgroundTaskState {
+                closing: false,
+                active: 0,
+            }),
+            changed: tokio::sync::Notify::new(),
+            _node_lock_lease: node_lock_lease,
+        })
+    }
+
+    pub(crate) fn try_register(self: &Arc<Self>) -> Option<BackgroundTaskGuard> {
+        self.try_register_inner(|| {})
+    }
+
+    fn try_register_inner(
+        self: &Arc<Self>,
+        before_increment: impl FnOnce(),
+    ) -> Option<BackgroundTaskGuard> {
+        let mut state = self.state.lock();
+        if state.closing {
+            return None;
+        }
+        // Test hook deliberately pauses here while the same state lock is
+        // held. close() cannot publish closing or observe active==0 until
+        // this already-admitted registration increments the count.
+        before_increment();
+        state.active += 1;
+        drop(state);
+        Some(BackgroundTaskGuard {
+            _registration: Arc::new(BackgroundTaskRegistration(Arc::clone(self))),
+        })
+    }
+
+    pub(crate) fn close(&self) {
+        self.state.lock().closing = true;
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.state.lock().closing
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        self.cancelled_inner(|| {}).await;
+    }
+
+    async fn cancelled_inner(&self, after_check: impl FnOnce()) {
+        let mut after_check = Some(after_check);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // `notify_waiters` stores no permit. Register this waiter in
+            // Notify's queue before checking the mutex-protected predicate,
+            // otherwise close() between the check and first poll is lost.
+            changed.as_mut().enable();
+            if self.is_closing() {
+                return;
+            }
+            if let Some(hook) = after_check.take() {
+                hook();
+            }
+            changed.as_mut().await;
+        }
+    }
+
+    pub(crate) async fn wait(&self) {
+        self.wait_inner(|| {}).await;
+    }
+
+    async fn wait_inner(&self, after_check: impl FnOnce()) {
+        let mut after_check = Some(after_check);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // See cancelled_inner: enable before observing active==0 so the
+            // final guard drop cannot land in a check-to-first-poll window.
+            changed.as_mut().enable();
+            if self.state.lock().active == 0 {
+                return;
+            }
+            if let Some(hook) = after_check.take() {
+                hook();
+            }
+            changed.as_mut().await;
+        }
+    }
+}
+
+impl Drop for BackgroundTaskRegistration {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock();
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("background task registration count underflow");
+        let became_idle = state.active == 0;
+        drop(state);
+        if became_idle {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+mod background_task_tracker_tests {
+    use super::BackgroundTaskTracker;
+    use std::sync::{Arc, Barrier};
+
+    #[tokio::test]
+    async fn register_racing_close_never_admits_after_close_and_waits_last_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = Arc::new(std::fs::File::open(dir.path()).unwrap());
+        let tracker = BackgroundTaskTracker::new(lease);
+        let start = Arc::new(Barrier::new(9));
+        let mut racers = Vec::new();
+        for _ in 0..8 {
+            let tracker = Arc::clone(&tracker);
+            let start = Arc::clone(&start);
+            racers.push(std::thread::spawn(move || {
+                start.wait();
+                tracker.try_register()
+            }));
+        }
+        start.wait();
+        tracker.close();
+
+        let admitted: Vec<_> = racers
+            .into_iter()
+            .filter_map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(
+            tracker.try_register().is_none(),
+            "closing must permanently reject new work"
+        );
+
+        if let Some(guard) = admitted.first() {
+            let finalizer_clone = guard.clone();
+            drop(admitted);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), tracker.wait())
+                    .await
+                    .is_err(),
+                "one admitted-task clone must retain the shared registration"
+            );
+            drop(finalizer_clone);
+        } else {
+            drop(admitted);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), tracker.wait())
+            .await
+            .expect("all pre-close registrations were released");
+    }
+
+    #[tokio::test]
+    async fn close_cannot_observe_idle_between_registration_check_and_increment() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = Arc::new(std::fs::File::open(dir.path()).unwrap());
+        let tracker = BackgroundTaskTracker::new(lease);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        let registering_tracker = Arc::clone(&tracker);
+        let registering_entered = Arc::clone(&entered);
+        let registering_release = Arc::clone(&release);
+        let registering = std::thread::spawn(move || {
+            registering_tracker
+                .try_register_inner(|| {
+                    registering_entered.wait();
+                    registering_release.wait();
+                })
+                .expect("registration entered before close")
+        });
+        entered.wait();
+
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closing_tracker = Arc::clone(&tracker);
+        let closing = std::thread::spawn(move || {
+            closing_tracker.close();
+            closed_tx.send(()).unwrap();
+        });
+        assert!(
+            closed_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "close must serialize behind an in-progress registration"
+        );
+
+        release.wait();
+        let guard = registering.join().unwrap();
+        closing.join().unwrap();
+        assert!(tracker.try_register().is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), tracker.wait())
+                .await
+                .is_err(),
+            "close+wait must observe the registration that won the state lock"
+        );
+        drop(guard);
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_notification_between_check_and_first_poll_is_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = Arc::new(std::fs::File::open(dir.path()).unwrap());
+        let tracker = BackgroundTaskTracker::new(lease);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tracker.cancelled_inner({
+                let tracker = Arc::clone(&tracker);
+                move || tracker.close()
+            }),
+        )
+        .await
+        .expect("enabled cancellation waiter lost close() before first await");
+    }
+
+    #[tokio::test]
+    async fn idle_notification_between_check_and_first_poll_is_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = Arc::new(std::fs::File::open(dir.path()).unwrap());
+        let tracker = BackgroundTaskTracker::new(lease);
+        let guard = tracker.try_register().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tracker.wait_inner(move || drop(guard)),
+        )
+        .await
+        .expect("enabled idle waiter lost final guard drop before first await");
+    }
+}
+
 // Doc-values (columnar) fast path for size:0 + match_all + aggs — child
 // module so it can reach Index's private fields/methods via `super::`.
 #[path = "fast_aggs.rs"]
@@ -792,6 +1095,22 @@ pub struct Index {
     /// because we only ever take/replace under it, never hold across
     /// any awaits.
     pub(crate) merge_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Engine data-dir lock retained whenever this Index is Engine-owned.
+    /// Any background task that upgrades its Weak<Index> therefore keeps the
+    /// lock alive until all possible segment mutation has ended.
+    background_tasks: Arc<parking_lot::Mutex<Option<Arc<BackgroundTaskTracker>>>>,
+    #[cfg(test)]
+    background_merge_barrier:
+        Arc<parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    background_flush_finalizer_barrier:
+        Arc<parking_lot::Mutex<Option<Arc<BackgroundFlushFinalizerBarrier>>>>,
+    #[cfg(test)]
+    background_flush_tasks: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    #[cfg(test)]
+    test_force_background_flush: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    background_hnsw_pair_barrier: Arc<parking_lot::Mutex<Option<Arc<BackgroundHnswPairBarrier>>>>,
 }
 
 impl Index {
@@ -972,11 +1291,21 @@ impl Index {
             flush_signal: Arc::new(SyncFlushCoord::new()),
             external_versions: Arc::new(dashmap::DashMap::new()),
             merge_task: Arc::new(parking_lot::Mutex::new(None)),
+            background_tasks: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            background_merge_barrier: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            background_flush_finalizer_barrier: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            background_flush_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_force_background_flush: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            background_hnsw_pair_barrier: Arc::new(parking_lot::Mutex::new(None)),
         });
         // Kick off the background merge pass.  5 s cadence is aggressive
         // enough to collapse a burst of flushes quickly without burning a
         // core — every pass is cheap when there's nothing to merge.
-        index.spawn_merge_task(5);
         Ok(index)
     }
 
@@ -1219,13 +1548,22 @@ impl Index {
             flush_signal: Arc::new(SyncFlushCoord::new()),
             external_versions: Arc::new(dashmap::DashMap::new()),
             merge_task: Arc::new(parking_lot::Mutex::new(None)),
+            background_tasks: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            background_merge_barrier: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            background_flush_finalizer_barrier: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            background_flush_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_force_background_flush: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            background_hnsw_pair_barrier: Arc::new(parking_lot::Mutex::new(None)),
         });
-        index.spawn_merge_task(5);
         // RC4 W2 item 17: a flush-time-stale HNSW snapshot used to stay
         // stale for the rest of the process lifetime (ingest kept paying
         // full graph-maintenance cost while the ANN path never served).
         // Heal it in the background from the authoritative doc set.
-        index.spawn_hnsw_rebuild_if_stale();
         Ok(index)
     }
 
@@ -2285,6 +2623,10 @@ impl Index {
     /// request if the sema is already at capacity; the next batch on
     /// this shard will re-request, so there's no lost flush.
     pub(crate) fn try_spawn_sync_flush(&self, shard_idx: usize) {
+        let registration = match self.try_background_task() {
+            Some(registration) => registration,
+            None => return,
+        };
         let rt = match self.flush_signal.runtime() {
             Some(rt) => rt,
             None => return,
@@ -2313,7 +2655,10 @@ impl Index {
         let permit_cell = Arc::new(permit_cell);
         let permit_cell_cb = Arc::clone(&permit_cell);
         let flush_signal_cb = Arc::clone(&self.flush_signal);
-        rt.spawn(async move {
+        #[cfg(test)]
+        let finalizer_barrier = self.background_flush_finalizer_barrier.lock().clone();
+        let handle = rt.spawn(async move {
+            let _registration = registration;
             let on_drained = move || {
                 if let Ok(mut guard) = permit_cell_cb.lock() {
                     let _ = guard.take();
@@ -2331,6 +2676,9 @@ impl Index {
                 excluded_fts_fields,
                 on_drained,
                 warm_caches,
+                Some(_registration.clone()),
+                #[cfg(test)]
+                finalizer_barrier,
             )
             .await;
             // Fallback: if do_flush_shard aborted before on_drained fired
@@ -2355,6 +2703,10 @@ impl Index {
             dataset_version.fetch_add(1, Ordering::Release);
             query_cache.clear();
         });
+        #[cfg(test)]
+        self.background_flush_tasks.lock().push(handle);
+        #[cfg(not(test))]
+        drop(handle);
     }
 
     fn try_spawn_sync_flush_all(&self) {
@@ -2579,6 +2931,9 @@ impl Index {
                 excluded_fts_fields.clone(),
                 || {}, // serial refresh path — no permit to drop early
                 self.publish_warm_caches(),
+                None,
+                #[cfg(test)]
+                None,
             )
             .await?;
         }
@@ -2652,9 +3007,17 @@ impl Index {
                 staggered_per_shard_threshold(self.flush_doc_threshold, shard_idx, n_shards_sched);
             let per_shard_byte_t =
                 staggered_per_shard_threshold(self.flush_byte_threshold, shard_idx, n_shards_sched);
-            if docs < per_shard_doc_t && bytes < per_shard_byte_t {
+            let below_threshold = docs < per_shard_doc_t && bytes < per_shard_byte_t;
+            #[cfg(test)]
+            let below_threshold = below_threshold
+                && !(docs > 0 && self.test_force_background_flush.load(Ordering::Acquire));
+            if below_threshold {
                 continue;
             }
+            let registration = match self.try_background_task() {
+                Some(registration) => registration,
+                None => continue,
+            };
 
             // Try to acquire a flush permit non-blockingly.  A global
             // semaphore caps total concurrent flushes so we don't OOM
@@ -2688,7 +3051,10 @@ impl Index {
             };
 
             let flush_signal_cb = Arc::clone(&self.flush_signal);
-            tokio::spawn(async move {
+            #[cfg(test)]
+            let finalizer_barrier = self.background_flush_finalizer_barrier.lock().clone();
+            let handle = tokio::spawn(async move {
+                let _registration = registration;
                 // Release permit after drain (Phase 1), not after Phase 2
                 // I/O — lets new flushes dispatch while segment writes
                 // continue in parallel.
@@ -2711,6 +3077,9 @@ impl Index {
                     excluded_fts_fields,
                     on_drained,
                     warm_caches,
+                    Some(_registration.clone()),
+                    #[cfg(test)]
+                    finalizer_barrier,
                 )
                 .await;
                 if let Ok(mut guard) = permit_cell.lock() {
@@ -2729,6 +3098,10 @@ impl Index {
                 dataset_version.fetch_add(1, AtomicOrdering::Release);
                 query_cache.clear();
             });
+            #[cfg(test)]
+            self.background_flush_tasks.lock().push(handle);
+            #[cfg(not(test))]
+            drop(handle);
         }
     }
 
@@ -3772,6 +4145,37 @@ impl Index {
     /// (otherwise tokio waits for the sleep to wake before noticing the
     /// engine has been dropped — that is the bench-found shutdown hang).
     pub fn spawn_merge_task(self: &Arc<Self>, interval_secs: u64) {
+        let tasks = self.background_tasks.lock().clone();
+        self.spawn_merge_task_owned(interval_secs, tasks);
+    }
+
+    /// Replace the standalone merge loop with one owned by an Engine
+    /// lifecycle. The task retains the node-lock lease while it can mutate
+    /// segments, and observes cancellation from the last Engine owner.
+    pub(crate) fn bind_engine_lifecycle(
+        self: &Arc<Self>,
+        interval_secs: u64,
+        tasks: Arc<BackgroundTaskTracker>,
+    ) {
+        let mut binding = self.background_tasks.lock();
+        if let Some(existing) = binding.as_ref() {
+            debug_assert!(
+                Arc::ptr_eq(existing, &tasks),
+                "an Index cannot be rebound to a different Engine lifecycle"
+            );
+            return;
+        }
+        *binding = Some(Arc::clone(&tasks));
+        drop(binding);
+        self.spawn_merge_task_owned(interval_secs, Some(tasks));
+        self.spawn_hnsw_rebuild_if_stale();
+    }
+
+    fn spawn_merge_task_owned(
+        self: &Arc<Self>,
+        interval_secs: u64,
+        tasks: Option<Arc<BackgroundTaskTracker>>,
+    ) {
         let weak = Arc::downgrade(self);
         // Allow override via env for benchmarks / battle tests so merges
         // don't interfere with ingest-rate measurements.
@@ -3780,10 +4184,28 @@ impl Index {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(interval_secs);
         let interval = std::time::Duration::from_secs(effective.max(1));
+        let registration = match tasks.as_ref() {
+            Some(tasks) => match tasks.try_register() {
+                Some(guard) => guard,
+                None => return,
+            },
+            None => return,
+        };
         let handle = tokio::spawn(async move {
+            let _registration = registration;
             tracing::info!(interval_secs, "merge background task started");
             loop {
-                tokio::time::sleep(interval).await;
+                if let Some(tasks) = tasks.as_ref() {
+                    if tasks.is_closing() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => {}
+                        _ = tasks.cancelled() => return,
+                    }
+                } else {
+                    tokio::time::sleep(interval).await;
+                }
                 let idx = match weak.upgrade() {
                     Some(a) => a,
                     None => {
@@ -3791,6 +4213,13 @@ impl Index {
                         return;
                     }
                 };
+                #[cfg(test)]
+                let barrier = { idx.background_merge_barrier.lock().clone() };
+                #[cfg(test)]
+                if let Some((reached, release)) = barrier {
+                    reached.notify_waiters();
+                    release.notified().await;
+                }
                 match idx.run_merge_once().await {
                     Ok(0) => {}
                     Ok(n) => tracing::debug!(batches = n, "merge pass ran"),
@@ -3805,6 +4234,115 @@ impl Index {
         if let Some(prev) = slot.replace(handle) {
             prev.abort();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_background_merge_barrier(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let barrier = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self.background_merge_barrier.lock() = Some(barrier.clone());
+        barrier
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_background_flush_finalizer_barrier(
+        &self,
+    ) -> Arc<BackgroundFlushFinalizerBarrier> {
+        let barrier = BackgroundFlushFinalizerBarrier::new();
+        *self.background_flush_finalizer_barrier.lock() = Some(Arc::clone(&barrier));
+        barrier
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_last_background_flush(&self) {
+        self.background_flush_tasks
+            .lock()
+            .pop()
+            .expect("background flush task was not captured")
+            .abort();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_nonempty_memtable_shard(&self) -> usize {
+        self.memtable
+            .shard_loads()
+            .into_iter()
+            .find(|(_, docs, _)| *docs > 0)
+            .map(|(shard, _, _)| shard)
+            .expect("test index has no non-empty memtable shard")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn force_async_background_flush_for_test(&self) {
+        self.test_force_background_flush
+            .store(true, Ordering::Release);
+        self.maybe_spawn_flush().await;
+        self.test_force_background_flush
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_hnsw_pair_barrier(&self) -> Arc<BackgroundHnswPairBarrier> {
+        let barrier = BackgroundHnswPairBarrier::new();
+        *self.background_hnsw_pair_barrier.lock() = Some(Arc::clone(&barrier));
+        barrier
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_hnsw_stale_for_test(self: &Arc<Self>) {
+        self.hnsw_stale.store(true, Ordering::Release);
+        self.spawn_hnsw_rebuild_if_stale();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle_binding_state(&self) -> (bool, bool) {
+        (
+            self.background_tasks.lock().is_some(),
+            self.merge_task.lock().is_some(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured_background_flush_count(&self) -> usize {
+        self.background_flush_tasks.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memtable_doc_count(&self) -> usize {
+        self.memtable.doc_count()
+    }
+
+    /// Signal-free handle extraction used after Engine lifecycle cancellation.
+    pub(crate) fn take_background_task_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut handles = Vec::new();
+        if let Some(handle) = self.merge_task.lock().take() {
+            handles.push(handle);
+        }
+        if let Some(handle) = self.hnsw_rebuild_task.lock().take() {
+            // Do not abort: save_hnsw_to_disk publishes graph.bin and
+            // ids.json as two independently atomic renames. Cancellation
+            // between them can leave a mismatched pair. The tracker denies
+            // new rebuilds; this admitted one must reach its normal publish
+            // boundary while retaining the node-lock lease.
+            handles.push(handle);
+        }
+        handles
+    }
+
+    fn try_background_task(&self) -> Option<BackgroundTaskGuard> {
+        match self.background_tasks.lock().clone() {
+            Some(tasks) => tasks.try_register(),
+            None => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_task_registration_allowed(&self) -> bool {
+        self.try_background_task().is_some()
     }
 
     /// Abort the merge background task spawned by `spawn_merge_task`.
@@ -4115,6 +4653,10 @@ impl Index {
         if self.hnsw_field.read().unwrap().is_none() {
             return;
         }
+        let registration = match self.try_background_task() {
+            Some(registration) => registration,
+            None => return,
+        };
         // Single-flight: swap-in true; if it was already true a rebuild is
         // running and will publish its own outcome.
         if self
@@ -4125,6 +4667,7 @@ impl Index {
         }
         let weak = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
+            let _registration = registration;
             let idx = match weak.upgrade() {
                 Some(a) => a,
                 None => return,
@@ -5622,9 +6165,11 @@ impl Index {
     //   ids.json     { next_id, map: { "doc_id": node_id, ... } }
     //
     // Caller invariants:
-    //   * `save_hnsw_to_disk` writes both files atomically (via .tmp +
-    //     rename). A crash leaves either both old files or no files;
-    //     in the latter case startup falls back to WAL replay.
+    //   * `save_hnsw_to_disk` replaces each file atomically (via .tmp +
+    //     rename). The pair is not one filesystem transaction, so lifecycle
+    //     shutdown must await a started save rather than cancelling between
+    //     graph.bin and ids.json. A crash-time mismatch is rejected by the
+    //     integrity checks and startup falls back to WAL replay.
     //   * `load_hnsw_from_disk` is best-effort. Any error returns Ok(())
     //     and leaves `self.hnsw = None`; the next vector ingest re-
     //     creates the graph.
@@ -5658,6 +6203,13 @@ impl Index {
         if let Err(e) = hnsw.save_to(&self.hnsw_graph_path()) {
             warn!(error = %e, "HNSW save: graph serialization failed");
             return Ok(());
+        }
+        #[cfg(test)]
+        let hnsw_pair_barrier = { self.background_hnsw_pair_barrier.lock().clone() };
+        #[cfg(test)]
+        if let Some(barrier) = hnsw_pair_barrier {
+            barrier.entered.notify_one();
+            barrier.release.notified().await;
         }
         // Save the id map alongside. JSON is fine — the map is at most
         // a few hundred MB even for the largest indices and writes
@@ -10084,6 +10636,9 @@ impl Index {
                     excluded_fts_fields,
                     on_drained,
                     warm_caches,
+                    None,
+                    #[cfg(test)]
+                    None,
                 )
                 .await;
                 // Defensive: in case on_drained didn't fire.
@@ -15163,6 +15718,11 @@ async fn do_flush_shard(
     // read-path caches, threaded through because this is a free fn without
     // access to `Index`.
     warm_caches: PublishWarmCaches,
+    // Keep the one admitted-task registration alive inside the blocking
+    // finalizer too. Tokio abort only drops the async wrapper; it cannot
+    // stop a spawn_blocking closure that may still publish segment files.
+    background_task: Option<BackgroundTaskGuard>,
+    #[cfg(test)] finalizer_barrier: Option<Arc<BackgroundFlushFinalizerBarrier>>,
 ) -> Result<()> {
     // V4 M4.5: no outer flush_lock — concurrent flushes are allowed.  The
     // memtable write lock below is the only atomicity point we need for
@@ -15433,6 +15993,11 @@ async fn do_flush_shard(
     let t_finalize = std::time::Instant::now();
     let _fin_permit = crate::flush_finalize_gate().acquire().await.ok();
     let finalize_join = tokio::task::spawn_blocking(move || {
+        let _background_task = background_task;
+        #[cfg(test)]
+        if let Some(barrier) = finalizer_barrier {
+            barrier.enter_and_wait();
+        }
         crate::background_pool()
             .install(|| store.finalize_flush_with_publisher(storage_drained, build_fts))
     })

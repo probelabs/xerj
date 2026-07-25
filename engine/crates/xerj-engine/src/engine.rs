@@ -216,6 +216,19 @@ fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
 ///
 /// `Engine` is cheaply clonable (`Arc`-backed) and safe to share across
 /// async tasks.
+struct EngineLifecycle {
+    background_tasks: Arc<crate::index::BackgroundTaskTracker>,
+}
+
+impl Drop for EngineLifecycle {
+    fn drop(&mut self) {
+        // Drop cannot await Tokio tasks. It only signals; task-held Index
+        // values retain the OS node-lock lease until their work actually
+        // exits, so an immediate same-dir reopen fails safely.
+        self.background_tasks.close();
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     config: Arc<Config>,
@@ -326,6 +339,7 @@ pub struct Engine {
     /// the process: a `kill -9` releases it automatically and a stale
     /// `node.lock` file never blocks the next boot.
     _node_lock: Arc<std::fs::File>,
+    lifecycle: Arc<EngineLifecycle>,
 }
 
 impl Engine {
@@ -339,6 +353,7 @@ impl Engine {
         // and can flush segments, which must never happen while another
         // process serves the same directory.
         let node_lock = Arc::new(Self::acquire_node_lock(&data_dir)?);
+        let background_tasks = crate::index::BackgroundTaskTracker::new(Arc::clone(&node_lock));
 
         // Apply operator-tunable aggregation bucket cap. Stored in a static
         // AtomicUsize inside aggs.rs so all per-bucket-allocator hot loops
@@ -402,6 +417,7 @@ impl Engine {
                 xerj_cluster::router::ShardRouter::new(1),
             )),
             _node_lock: node_lock,
+            lifecycle: Arc::new(EngineLifecycle { background_tasks }),
         };
 
         // Scan data_dir for existing index directories.
@@ -428,6 +444,7 @@ impl Engine {
                 };
                 match Index::open(index_name.clone(), &engine.config, &data_dir) {
                     Ok(idx) => {
+                        engine.bind_index_lifecycle(&idx);
                         info!(name = name_str.as_str(), "opened existing index");
                         // Restore the raw ES mapping blob (analyzers, formats,
                         // dims — full fidelity) BEFORE any ingest/query can run,
@@ -465,6 +482,10 @@ impl Engine {
         engine.spawn_search_context_sweeper();
 
         Ok(engine)
+    }
+
+    fn bind_index_lifecycle(&self, index: &Arc<Index>) {
+        index.bind_engine_lifecycle(5, Arc::clone(&self.lifecycle.background_tasks));
     }
 
     /// Acquire the exclusive `<data_dir>/node.lock` advisory lock (RC4
@@ -717,6 +738,7 @@ impl Engine {
         }
 
         let idx = Index::create(index_name, effective_schema, &self.config, &self.data_dir)?;
+        self.bind_index_lifecycle(&idx);
         self.indices.insert(name.to_string(), idx);
         info!(name, "index created");
         Ok(())
@@ -747,6 +769,7 @@ impl Engine {
             &self.config,
             &self.data_dir,
         )?;
+        self.bind_index_lifecycle(&idx);
         self.indices.insert(name.to_string(), idx);
         info!(name, "index created with custom settings");
         Ok(())
@@ -1099,12 +1122,11 @@ impl Engine {
     /// SIGTERM hangs).  See bench `engine/reports/2026-04-25T03-30-00`
     /// for the captured regression introduced by B-2b (commit 605ac7b).
     pub async fn flush_all_force(&self) {
-        // 1. Stop all background merges so the runtime can exit once the
-        //    flush is done.  Aborts are non-blocking; the spawned task is
-        //    unwound by tokio without us needing to await it.
-        for entry in self.indices.iter() {
-            entry.value().abort_background_tasks();
-        }
+        // 1. Stop and JOIN every background task before final disk work.
+        // Aborting an async wrapper around spawn_blocking does not cancel the
+        // blocking merge writer, so a non-awaited abort could race shutdown
+        // flush or a same-process reopen.
+        self.quiesce_background_tasks().await;
         // 2. Final synchronous flush across every index.
         for entry in self.indices.iter() {
             let idx = Arc::clone(entry.value());
@@ -1116,6 +1138,28 @@ impl Engine {
                 );
             }
         }
+    }
+
+    /// Signal background cancellation and await complete task quiescence.
+    ///
+    /// This is the lifecycle barrier for tests/tools that drop an Engine and
+    /// reopen the same data directory in one process. Server shutdown reaches
+    /// it through [`Engine::flush_all_force`].
+    pub async fn quiesce_background_tasks(&self) {
+        self.lifecycle.background_tasks.close();
+        let indices: Vec<Arc<Index>> = self
+            .indices
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        let mut handles = Vec::new();
+        for index in &indices {
+            handles.extend(index.take_background_task_handles());
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        self.lifecycle.background_tasks.wait().await;
     }
 
     /// Engine health status.
@@ -1573,6 +1617,7 @@ impl Engine {
             let index_name = IndexName::new(idx_name).map_err(EngineError::Common)?;
             match Index::open(index_name, &self.config, &self.data_dir) {
                 Ok(idx) => {
+                    self.bind_index_lifecycle(&idx);
                     // Snapshot dirs carry es_mapping.json — reload it so the
                     // restored index serves the same mapping it was saved with.
                     self.load_persisted_es_mapping(idx_name);
@@ -1676,5 +1721,285 @@ fn es_type_to_field_type(es_type: &str) -> xerj_common::types::FieldType {
         "binary" => FieldType::Binary,
         "nested" => FieldType::Nested,
         _ => FieldType::Object,
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use xerj_common::types::{FieldConfig, FieldType, IndexName, Schema};
+
+    fn config(dir: &TempDir) -> Config {
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config
+    }
+
+    async fn engine_with_segments(dir: &TempDir) -> (Engine, Arc<Index>) {
+        let engine = Engine::new(config(dir)).unwrap();
+        engine.create_index("lifecycle", Schema::empty()).unwrap();
+        let index = engine.get_index("lifecycle").unwrap();
+        for batch in 0..2 {
+            for row in 0..256 {
+                let id = format!("{batch}-{row}");
+                index
+                    .index_document(Some(id), json!({"batch": batch, "row": row}))
+                    .await
+                    .unwrap();
+            }
+            index.flush().await.unwrap();
+        }
+        (engine, index)
+    }
+
+    #[tokio::test]
+    async fn raw_index_has_no_standalone_task_and_engine_binds_exactly_one_loop() {
+        let dir = TempDir::new().unwrap();
+        let raw = Index::create(
+            IndexName::new("raw").unwrap(),
+            Schema::empty(),
+            &config(&dir),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(raw.lifecycle_binding_state(), (false, false));
+        raw.spawn_merge_task(1);
+        assert_eq!(
+            raw.lifecycle_binding_state(),
+            (false, false),
+            "unbound public merge admission must not create detached work"
+        );
+        raw.index_document(Some("raw-doc".into()), json!({"value": 1}))
+            .await
+            .unwrap();
+        raw.force_async_background_flush_for_test().await;
+        assert_eq!(
+            raw.captured_background_flush_count(),
+            0,
+            "unbound threshold scheduler must not create detached work"
+        );
+        assert_eq!(raw.memtable_doc_count(), 1);
+        drop(raw);
+
+        let engine = Engine::new(config(&dir)).unwrap();
+        engine.create_index("bound", Schema::empty()).unwrap();
+        assert_eq!(
+            engine.get_index("bound").unwrap().lifecycle_binding_state(),
+            (true, true)
+        );
+        engine.quiesce_background_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn same_process_node_lock_rejects_overlap_and_releases_on_plain_drop() {
+        let dir = TempDir::new().unwrap();
+        let engine = Engine::new(config(&dir)).unwrap();
+        let error = Engine::new(config(&dir))
+            .err()
+            .expect("a live Engine must exclude another owner of its data directory");
+        assert!(error.to_string().contains("already in use"), "{error}");
+        drop(engine);
+        let reopened = Engine::new(config(&dir)).unwrap();
+        drop(reopened);
+    }
+
+    #[tokio::test]
+    async fn unquiesced_reopen_is_rejected_while_upgraded_merge_owns_lease() {
+        let dir = TempDir::new().unwrap();
+        let (engine, index) = engine_with_segments(&dir).await;
+        let (reached, release) = index.install_background_merge_barrier();
+        tokio::time::timeout(std::time::Duration::from_secs(8), reached.notified())
+            .await
+            .expect("background merge did not upgrade Index");
+
+        drop(index);
+        drop(engine);
+        let error = Engine::new(config(&dir))
+            .err()
+            .expect("task-held node-lock lease must reject same-dir reopen");
+        assert!(error.to_string().contains("already in use"), "{error}");
+
+        release.notify_waiters();
+        let reopened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(engine) = Engine::new(config(&dir)) {
+                    break engine;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("node-lock lease was not released after task exit");
+        drop(reopened);
+    }
+
+    #[tokio::test]
+    async fn awaited_quiescence_allows_reopen_and_preserves_force_merge_docs() {
+        let dir = TempDir::new().unwrap();
+        let (engine, index) = engine_with_segments(&dir).await;
+        let (reached, release) = index.install_background_merge_barrier();
+        tokio::time::timeout(std::time::Duration::from_secs(8), reached.notified())
+            .await
+            .expect("background merge did not upgrade Index");
+
+        let first_engine = engine.clone();
+        let second_engine = engine.clone();
+        let first = tokio::spawn(async move {
+            first_engine.quiesce_background_tasks().await;
+        });
+        let second = tokio::spawn(async move {
+            second_engine.quiesce_background_tasks().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!first.is_finished(), "first caller must await active merge");
+        assert!(!second.is_finished(), "second caller must share completion");
+        release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let _ = tokio::join!(first, second);
+        })
+        .await
+        .expect("concurrent quiescence callers did not complete");
+        assert!(
+            !index.background_task_registration_allowed(),
+            "closing is monotonic: flush/HNSW/merge admission must stay closed"
+        );
+
+        drop(index);
+        drop(engine);
+        let reopened = Engine::new(config(&dir)).unwrap();
+        let index = reopened.get_index("lifecycle").unwrap();
+        index.force_merge(1).await.unwrap();
+        assert_eq!(index.live_doc_count(), 512);
+        assert!(index.get_document("0-0").await.unwrap().is_some());
+        assert!(index.get_document("1-255").await.unwrap().is_some());
+        reopened.quiesce_background_tasks().await;
+    }
+
+    async fn assert_aborted_flush_wrapper_is_quiesced(synchronous: bool) {
+        let dir = TempDir::new().unwrap();
+        let engine = Engine::new(config(&dir)).unwrap();
+        engine.create_index("flush-life", Schema::empty()).unwrap();
+        let index = engine.get_index("flush-life").unwrap();
+        index
+            .index_document(Some("kept".into()), json!({"value": 7}))
+            .await
+            .unwrap();
+
+        let barrier = index.install_background_flush_finalizer_barrier();
+        if synchronous {
+            let sync_index = Arc::clone(&index);
+            tokio::task::spawn_blocking(move || {
+                sync_index.try_spawn_sync_flush(sync_index.first_nonempty_memtable_shard());
+            })
+            .await
+            .unwrap();
+        } else {
+            index.force_async_background_flush_for_test().await;
+        }
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            barrier.entered.notified(),
+        )
+        .await
+        .is_err()
+        {
+            barrier.release();
+            panic!("blocking flush finalizer did not start");
+        }
+        index.abort_last_background_flush();
+
+        let quiescing_engine = engine.clone();
+        let quiesce = tokio::spawn(async move {
+            quiescing_engine.quiesce_background_tasks().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !quiesce.is_finished(),
+            "spawn_blocking finalizer clone must keep quiescence active after outer abort"
+        );
+        assert!(
+            Engine::new(config(&dir)).is_err(),
+            "finalizer clone must retain the node-lock lease"
+        );
+
+        barrier.release();
+        tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+            .await
+            .expect("quiescence did not finish after finalizer release")
+            .unwrap();
+        drop(index);
+        drop(engine);
+
+        let reopened = Engine::new(config(&dir)).unwrap();
+        let index = reopened.get_index("flush-life").unwrap();
+        assert!(index.get_document("kept").await.unwrap().is_some());
+        reopened.quiesce_background_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn aborted_sync_flush_wrapper_cannot_outlive_quiescence_or_node_lease() {
+        assert_aborted_flush_wrapper_is_quiesced(true).await;
+    }
+
+    #[tokio::test]
+    async fn aborted_async_flush_wrapper_cannot_outlive_quiescence_or_node_lease() {
+        assert_aborted_flush_wrapper_is_quiesced(false).await;
+    }
+
+    #[tokio::test]
+    async fn hnsw_pair_publish_is_not_cancelled_between_atomic_renames() {
+        let dir = TempDir::new().unwrap();
+        let engine = Engine::new(config(&dir)).unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("vector", FieldType::Vector))
+            .unwrap();
+        engine.create_index("vectors", schema).unwrap();
+        let index = engine.get_index("vectors").unwrap();
+        index
+            .index_document(Some("v1".into()), json!({"vector": [1.0, 0.0, 0.0]}))
+            .await
+            .unwrap();
+        index.refresh().await.unwrap();
+
+        let barrier = index.install_hnsw_pair_barrier();
+        index.mark_hnsw_stale_for_test();
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            barrier.entered.notified(),
+        )
+        .await
+        .is_err()
+        {
+            barrier.release();
+            panic!("HNSW rebuild did not reach the graph/ids publish boundary");
+        }
+
+        let quiescing_engine = engine.clone();
+        let quiesce = tokio::spawn(async move {
+            quiescing_engine.quiesce_background_tasks().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !quiesce.is_finished(),
+            "quiescence must await both HNSW artifact renames"
+        );
+        barrier.release();
+        tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+            .await
+            .expect("HNSW rebuild did not finish after pair barrier release")
+            .unwrap();
+
+        let hnsw_dir = dir.path().join("vectors").join("hnsw");
+        assert!(hnsw_dir.join("graph.bin").is_file());
+        let ids: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(hnsw_dir.join("ids.json")).unwrap()).unwrap();
+        assert_eq!(ids["field"], "vector");
+        assert!(
+            ids["map"]["v1"].is_number(),
+            "the id artifact must contain the graph's v1 node mapping: {ids}"
+        );
     }
 }
