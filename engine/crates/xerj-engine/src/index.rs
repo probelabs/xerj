@@ -11810,11 +11810,13 @@ impl Index {
                     Value::String(s) => s.chars().take(64).collect(),
                     other => other.to_string().chars().take(64).collect(),
                 };
-                return Err(EngineError::Common(xerj_common::XerjError::InvalidMapping {
-                    reason: format!(
-                        "failed to parse field [{key}] of type [date] with value [{preview}]"
-                    ),
-                }));
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::InvalidMapping {
+                        reason: format!(
+                            "failed to parse field [{key}] of type [date] with value [{preview}]"
+                        ),
+                    },
+                ));
             }
         }
         Ok(())
@@ -19883,7 +19885,7 @@ pub(crate) fn default_format_date_value_ok(v: &Value) -> bool {
                 return false;
             }
             match b.len() {
-                4 => true,                                                    // yyyy
+                4 => true,                                                           // yyyy
                 7 => b[4] == b'-' && b[5].is_ascii_digit() && b[6].is_ascii_digit(), // yyyy-MM
                 _ => {
                     // yyyy-MM-dd with an optional T… time tail. The tail is
@@ -26923,7 +26925,10 @@ mod date_detection_tests {
             serde_json::json!({"nested": 1}),
             serde_json::json!(["2026-07-25", "n/a"]),
         ] {
-            assert!(!default_format_date_value_ok(&bad), "{bad} must be rejected");
+            assert!(
+                !default_format_date_value_ok(&bad),
+                "{bad} must be rejected"
+            );
         }
     }
 }

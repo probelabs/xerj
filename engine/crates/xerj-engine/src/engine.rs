@@ -820,7 +820,11 @@ impl Engine {
     pub(crate) fn mapping_date_detection(mapping: &Value) -> bool {
         mapping
             .get("date_detection")
-            .or_else(|| mapping.get("mappings").and_then(|m| m.get("date_detection")))
+            .or_else(|| {
+                mapping
+                    .get("mappings")
+                    .and_then(|m| m.get("date_detection"))
+            })
             .and_then(Value::as_bool)
             .unwrap_or(true)
     }
@@ -828,11 +832,9 @@ impl Engine {
     /// Top-level date fields carrying an explicit `format` or
     /// `ignore_malformed` in the raw mapping blob (either shape).
     fn mapping_date_exclusions(mapping: &Value) -> std::collections::HashSet<String> {
-        let props = mapping.get("properties").or_else(|| {
-            mapping
-                .get("mappings")
-                .and_then(|m| m.get("properties"))
-        });
+        let props = mapping
+            .get("properties")
+            .or_else(|| mapping.get("mappings").and_then(|m| m.get("properties")));
         let mut out = std::collections::HashSet::new();
         let Some(obj) = props.and_then(Value::as_object) else {
             return out;
