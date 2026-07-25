@@ -14462,7 +14462,43 @@ async fn resolve_indices_for_op(
     spec: &str,
 ) -> Result<Vec<(String, std::sync::Arc<xerj_engine::Index>)>, xerj_common::XerjError> {
     let is_selector = spec == "_all" || spec.contains('*') || spec.contains(',');
-    let names = resolve_index_selector(state, spec).await;
+    let all: Vec<String> = state
+        .engine
+        .list_indices()
+        .await
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    let mut names: Vec<String> = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part == "_all" || part.contains('*') {
+            for n in &all {
+                // ES excludes hidden (dot-prefixed) indices from default
+                // wildcard/_all expansion — `POST /*/_close` must never
+                // sweep in `.xerj_users`-class system indices. A pattern
+                // that itself starts with a dot opts back in, matching
+                // ES's hidden-index addressing.
+                if n.starts_with('.') && !part.starts_with('.') {
+                    continue;
+                }
+                let matches = part == "_all" || part == "*" || glob_match_simple(part, n);
+                if matches && !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+        } else {
+            // Concrete name inside a comma list: ES's default
+            // `ignore_unavailable=false` 404s the whole request on a
+            // missing name instead of silently dropping it —
+            // `POST /real,typo/_refresh` must not report success.
+            if !all.iter().any(|n| n == part) {
+                return Err(xerj_common::XerjError::index_not_found(part));
+            }
+            if !names.iter().any(|n| n == part) {
+                names.push(part.to_string());
+            }
+        }
+    }
     let handles: Vec<(String, std::sync::Arc<xerj_engine::Index>)> = names
         .into_iter()
         .filter_map(|n| {
@@ -19099,6 +19135,25 @@ pub async fn close_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
+    // ES 8's `action.destructive_requires_name` defaults to true: closing
+    // by wildcard/_all is refused outright — only concrete names may close.
+    if index == "_all" || index.contains('*') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "root_cause": [{
+                        "type": "illegal_argument_exception",
+                        "reason": "Wildcard expressions or all indices are not allowed"
+                    }],
+                    "type": "illegal_argument_exception",
+                    "reason": "Wildcard expressions or all indices are not allowed"
+                },
+                "status": 400
+            })),
+        )
+            .into_response();
+    }
     let handles = match resolve_indices_for_op(&state, &index).await {
         Ok(h) => h,
         Err(e) => return ApiError::new(e).into_response(),

@@ -6626,11 +6626,22 @@ impl Index {
                 if !seen.insert(id.clone()) {
                     continue;
                 }
-                let mut doc = doc.clone();
-                if let Some(obj) = doc.as_object_mut() {
-                    obj.remove("_id");
-                }
-                candidates.push((id, doc));
+                // Reassembled segment docs have shape
+                //   { "_id":..., "_seq_no":..., "_source": {...} }
+                // but the scoring loop's `get_field_value(src, nested_path)`
+                // expects fields at the top level (memtable shape). Without
+                // this unwrap every flushed parent's nested array resolved
+                // to None and segment-resident docs scored zero hits — the
+                // exact silent-empty class the top-level kNN collector
+                // already guards against (see run_knn_brute_force).
+                let src = doc.get("_source").cloned().unwrap_or_else(|| {
+                    let mut d = doc.clone();
+                    if let Some(obj) = d.as_object_mut() {
+                        obj.remove("_id");
+                    }
+                    d
+                });
+                candidates.push((id, src));
             }
         }
 
