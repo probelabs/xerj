@@ -32,6 +32,17 @@ For another framework/language, extend this map — it is data, not code.
 
 ### 2. Census every call site (AST)
 `python3 sink_census.py <src>` parses every file with tree-sitter and records
+
+### 2b. Census the dangerous PATTERNS (the class a sink list misses)
+`python3 pattern_census.py <src>` AST-detects the non-function vulns — loose `==`
+/ magic-hash, non-strict `in_array`, `strcmp`-with-array (`?login[]=`), `@`
+suppression, variable-variables, unsafe `setcookie`, `switch`-on-request,
+Host-header trust, ORDER-BY injection — into `wppatterns`. Semantic classes a
+census can't decide (SQL truncation, charset SQLi, second-order, phar, TOCTOU,
+upload-exec, is_numeric bypass, regex-anchor, session-fixation, wrong-context
+XSS) are catalogued in `php_dangerous_patterns.json` with detection guidance and
+swept by reasoning. FULL REFERENCE: `PHP-SECURITY-GUIDE.md` — every function AND
+pattern mapped to attack + detection + safe recipe.
 **every** call site of a catalogued function (calls, methods, constructs like
 `echo`/`include`/backtick, `new ReflectionFunction`). tree-sitter captures real
 calls regardless of formatting/namespacing — grep cannot.

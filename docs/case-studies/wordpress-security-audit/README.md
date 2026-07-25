@@ -103,6 +103,10 @@ read; scale and durability come from XERJ.
   → reverse callers → authz), with `sink-census/trace_sink.py`.
 - [`sink-census/PHP-DANGEROUS-FUNCTIONS.md`](sink-census/PHP-DANGEROUS-FUNCTIONS.md) —
   the **full map of 275 dangerous PHP functions** (28 categories, taint-arg noted).
+- [`sink-census/PHP-SECURITY-GUIDE.md`](sink-census/PHP-SECURITY-GUIDE.md) — the
+  **complete guide**: 275 functions **+** the non-function patterns (type-juggle
+  `==`, array injection `?login[]=`, SQL truncation, magic-hash, null-byte,
+  second-order, TOCTOU, timing, …) with attack + detection + safe recipe.
 - **Copyable Claude Code skill**: [`skill/SKILL.md`](skill/SKILL.md)
   — install it and run this whole workflow on your own codebase.
 - [`FINDINGS.md`](FINDINGS.md) — the SSRF vulnerability, with verification and
