@@ -17,12 +17,14 @@ encoding_rs = "0.8"
 xxhash-rust.workspace = true
 memchr.workspace = true
 rayon.workspace = true
+libc = "0.2"
 # ES-compat HTTP client. Blocking mode: all of autoindex is synchronous
 # (std threads), invoked from the server binary via spawn_blocking.
 reqwest = { workspace = true, features = ["blocking"] }
 
 # Format-family extractors (new deps, isolated to this crate):
 flate2 = "1"                                     # gzip streaming (rust backend)
+pdf_oxide = { version = "=0.3.75", default-features = false, features = ["legacy-crypto"] }
 csv = "1"                                        # streaming CSV with sniffed dialect
 quick-xml = "0.36"                               # XML pull parser + DOCX internals
 zip = { version = "2", default-features = false, features = ["deflate"] }  # DOCX container
