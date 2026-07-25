@@ -825,11 +825,10 @@ pub async fn process_bulk_with_opts(
         HashMap::new();
     // AUTO-ID plain-index actions (no explicit `_id`).  These are
     // guaranteed new — they can NEVER overwrite — so every one is a
-    // "created"/201.  That makes them safe to push through the single
-    // `index_batch_turbo_raw` batch call, whose response is hardcoded
-    // to "created".  Explicit-id index actions stay in `index_batches`
-    // and run the per-doc loop because they may overwrite and so need
-    // created-vs-updated / 201-vs-200 semantics turbo can't express.
+    // "created"/201. They use one `index_batch_turbo_raw` call. That engine
+    // path now also computes truthful per-ID outcomes, but explicit-ID actions
+    // remain on the per-document path here because their broader bulk options
+    // and conflict semantics are handled there.
     let mut auto_id_batches: HashMap<String, Vec<(usize, String, std::sync::Arc<[u8]>)>> =
         HashMap::new();
     let mut semantic_index_batches: HashMap<

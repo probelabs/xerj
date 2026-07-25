@@ -3049,6 +3049,11 @@ impl IndexStore {
                 .seq_counter
                 .fetch_add(n, std::sync::atomic::Ordering::AcqRel);
             let seq_nos: Vec<SeqNo> = (0..docs.len()).map(|i| start_seq + i as u64).collect();
+            let in_memory: std::sync::Arc<str> = std::sync::Arc::from(IN_MEMORY_SEGMENT_ID);
+            for (i, (doc_id, _, _)) in docs.iter().enumerate() {
+                self.version_map
+                    .set(doc_id, seq_nos[i], std::sync::Arc::clone(&in_memory), false);
+            }
             return Ok(seq_nos);
         }
 

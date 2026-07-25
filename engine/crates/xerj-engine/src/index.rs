@@ -44,6 +44,36 @@ impl<'a> Drop for MergeFlagClear<'a> {
     }
 }
 
+/// Cancellation-safe query-cache fence for a multi-item publication.
+///
+/// While at least one guard exists, searches bypass both cache lookup and
+/// insertion. The opening and closing generation bumps make computations
+/// that raced either edge unreachable. Drop deliberately closes the
+/// generation before decrementing the pending counter; an Acquire reader that
+/// observes zero therefore also observes the closing bump.
+struct BatchCachePublicationGuard {
+    dataset_version: Arc<AtomicU64>,
+    pending: Arc<AtomicU64>,
+}
+
+impl BatchCachePublicationGuard {
+    fn begin(dataset_version: Arc<AtomicU64>, pending: Arc<AtomicU64>) -> Self {
+        pending.fetch_add(1, Ordering::AcqRel);
+        dataset_version.fetch_add(1, Ordering::Release);
+        Self {
+            dataset_version,
+            pending,
+        }
+    }
+}
+
+impl Drop for BatchCachePublicationGuard {
+    fn drop(&mut self) {
+        self.dataset_version.fetch_add(1, Ordering::Release);
+        self.pending.fetch_sub(1, Ordering::Release);
+    }
+}
+
 // Doc-values (columnar) fast path for size:0 + match_all + aggs — child
 // module so it can reach Index's private fields/methods via `super::`.
 #[path = "fast_aggs.rs"]
@@ -409,6 +439,8 @@ fn l2_normalize_vec(v: &mut [f32]) {
 enum PublicationTestPoint {
     Acquired,
     AfterWalVersionMap,
+    BeforeFtsItem,
+    AfterFtsItem,
     AfterFts,
     AfterHnsw,
     BeforeRelease,
@@ -428,11 +460,9 @@ pub struct Index {
     store: Arc<IndexStore>,
     /// 16-shard FTS memtable.  Replaces the pre-v16 single
     /// `Arc<RwLock<FtsMemtable>>` that serialized all concurrent bulk
-    /// clients on one write lock.  Bulk batches pick one shard by
-    /// `xxh3_64(first_doc_id) & 15` and hold only that shard's mutex
-    /// for the WAL append + engine memtable push, so N concurrent
-    /// clients on N different shards run truly in parallel on the
-    /// write side.  Query paths iterate all shards.
+    /// clients on one write lock. Bulk batches partition IDs by their own
+    /// dynamic shard and publish active shards in parallel. Query paths
+    /// iterate all shards.
     memtable: Arc<crate::memtable::ShardedFtsMemtable>,
     /// Exact per-document ordering shared by all publication stages wired to
     /// this coordinator. Idle keys are removed immediately.
@@ -764,6 +794,9 @@ pub struct Index {
     /// `dataset_version.fetch_add(1)` in `index_doc`.
     pub query_cache: Arc<dashmap::DashMap<(u64, u64), Arc<SearchResult>>>,
     pub dataset_version: Arc<AtomicU64>,
+    /// Number of multi-item publications currently between their opening and
+    /// closing cache generations. Nonzero disables query-cache lookup/store.
+    batch_cache_publications: Arc<AtomicU64>,
 
     /// Single-flight coalescing map for identical in-flight reads, keyed by
     /// the SAME `(query_body_hash, dataset_version)` as `query_cache`. Under
@@ -826,6 +859,38 @@ impl Index {
     #[cfg(test)]
     fn set_publication_test_hook(&self, hook: Option<PublicationTestHook>) {
         *self.publication_test_hook.write() = hook;
+    }
+
+    /// Compute request-ordered response metadata for a batch whose document
+    /// IDs are exclusively held by `write_publication`.
+    ///
+    /// The storage batch append publishes VersionMap entries in request order.
+    /// Mirroring that transition here gives every occurrence (including
+    /// duplicates such as `[A, B, A]`) its own truthful ES `_version` and
+    /// created/updated result without abusing the index-global `doc_count`.
+    /// This is truthful only for mutation paths integrated with the same
+    /// coordinator. `index_batch_sync_raw` is explicitly not integrated yet
+    /// and must not concurrently reuse these IDs.
+    fn batch_response_metadata<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<(u64, &'static str)> {
+        let mut state: HashMap<String, (u64, bool)> = HashMap::new();
+        ids.into_iter()
+            .map(|id| {
+                let (version, live) = state.entry(id.to_owned()).or_insert_with(|| {
+                    self.store
+                        .version_map
+                        .get(id)
+                        .map(|entry| (entry.version, !entry.deleted))
+                        .unwrap_or((0, false))
+                });
+                let result = if *live { "updated" } else { "created" };
+                *version += 1;
+                *live = true;
+                (*version, result)
+            })
+            .collect()
     }
 
     /// Create a new index at `data_dir/<name>`.
@@ -1003,6 +1068,7 @@ impl Index {
             fast_date_sorted_cache: Arc::new(dashmap::DashMap::new()),
             query_cache: Arc::new(dashmap::DashMap::new()),
             dataset_version: Arc::new(AtomicU64::new(0)),
+            batch_cache_publications: Arc::new(AtomicU64::new(0)),
             query_inflight: Arc::new(dashmap::DashMap::new()),
             metric_singleflight_coalesced: Arc::new(AtomicU64::new(0)),
             flush_signal: Arc::new(SyncFlushCoord::new()),
@@ -1253,6 +1319,7 @@ impl Index {
             fast_date_sorted_cache: Arc::new(dashmap::DashMap::new()),
             query_cache: Arc::new(dashmap::DashMap::new()),
             dataset_version: Arc::new(AtomicU64::new(0)),
+            batch_cache_publications: Arc::new(AtomicU64::new(0)),
             query_inflight: Arc::new(dashmap::DashMap::new()),
             metric_singleflight_coalesced: Arc::new(AtomicU64::new(0)),
             flush_signal: Arc::new(SyncFlushCoord::new()),
@@ -1605,8 +1672,8 @@ impl Index {
     ///
     /// 1. **Parallel tokenisation** — all documents in the batch are tokenised
     ///    concurrently via Rayon before any lock is acquired.
-    /// 2. **Single lock acquisition** — the FTS memtable write lock is held for
-    ///    the entire batch rather than once per document.
+    /// 2. **Shard-batched locking** — documents are bucketed by their own FTS
+    ///    shard and inserted in request-ordered chunks per shard.
     /// 3. **Amortised WAL overhead** — WAL entries are written sequentially
     ///    inside the lock, but the expensive `fsync` cycle is paid only once for
     ///    the batch (as the underlying WAL writer is in `Batched` or `Async` mode).
@@ -1746,23 +1813,41 @@ impl Index {
         };
         drop(schema_guard);
 
-        // ── Step 3+4: WAL append + FTS memtable insert under one lock ─────
+        // Exact per-ID publication ordering begins only after tokenisation and
+        // copy_to preparation. Sorting and deduplication inside `lock_many`
+        // prevents both AB/BA deadlocks and self-deadlock for duplicate IDs.
+        let publication_guards = self
+            .write_publication
+            .lock_many(processed.iter().map(|ingest| ingest.id.as_str()))
+            .await;
+        #[cfg(test)]
+        for id in processed
+            .iter()
+            .map(|ingest| ingest.id.as_str())
+            .collect::<HashSet<_>>()
+        {
+            self.publication_test_point(id, PublicationTestPoint::Acquired);
+        }
+        let response_metadata =
+            self.batch_response_metadata(processed.iter().map(|ingest| ingest.id.as_str()));
+
+        // Cancellation-safe cache fence. Drop closes the generation even if a
+        // later schema/vector await is aborted.
+        let cache_publication = BatchCachePublicationGuard::begin(
+            Arc::clone(&self.dataset_version),
+            Arc::clone(&self.batch_cache_publications),
+        );
+
+        // ── Step 3+4: ordered WAL append + shard-batched FTS publication ──
         //
-        // The engine memtable write lock spans BOTH the WAL append and
-        // the FTS memtable push so that (a) the engine memtable and
-        // the storage memtable (inside `wal_append_batch`) see docs
-        // in identical order — flush relies on that for FTS-ordinal /
-        // stored-section alignment — and (b) no other concurrent bulk
-        // batch can race the drain-vs-push interleaving.
+        // Exact-ID publication guards span BOTH the WAL/VersionMap append and
+        // all FTS/schema/vector publication. The FTS memtable itself is
+        // sharded: every ID must be removed and inserted on its own dynamic
+        // shard, with request order retained within each shard.
         //
-        // A previous M5.0 attempt lifted the WAL out of this lock to
-        // let concurrent clients pipeline.  It regressed throughput
-        // because the two memtables DESYNCED (storage mem had the
-        // docs a batch just pushed, engine mem still had fewer) and
-        // the periodic flush would pick up a tiny storage drain and
-        // a mismatched engine drain — producing 20 k-doc flush
-        // segments where 150 k were expected, thrashing the flush
-        // path and triggering back-pressure 429s.  Rolled back.
+        // The WAL append remains inside the exact-ID publication interval so
+        // VersionMap cannot advance independently of this batch's FTS/HNSW
+        // state. `wal_append_batch` itself is WAL + VersionMap only.
         let t3 = std::time::Instant::now();
         let wal_refs: Vec<(String, Arc<Value>, Arc<[u8]>)> = processed
             .iter()
@@ -1777,13 +1862,17 @@ impl Index {
 
         let wal_t = std::time::Instant::now();
         let seq_nos = self.store.wal_append_batch(&wal_refs)?;
+        #[cfg(test)]
+        for ingest in &processed {
+            self.publication_test_point(&ingest.id, PublicationTestPoint::AfterWalVersionMap);
+        }
         // RC4 W4 item 2: WAL durability-write latency.
         if let Some(m) = crate::engine_metrics() {
             m.observe_wal_write(wal_t.elapsed().as_secs_f64());
         }
         let t3_dur = t3.elapsed();
 
-        // ── M5.1 HOT PATH: one shard lock per BATCH ───────────────────────
+        // ── M5.1 HOT PATH: one lock per active shard/chunk ────────────────
         //
         // Pre-M5.1 we called `mem.insert_pretokenized_with_seq(...)` per
         // doc, which acquired the shard mutex TWICE per doc (once for
@@ -1792,57 +1881,56 @@ impl Index {
         // concurrent clients caused a 4× throughput regression (99 k →
         // 23 k docs/s).
         //
-        // Now the bulk batch is routed to exactly ONE shard (by the
-        // first doc_id's hash) and the shard lock is held for the
-        // entire batch loop — so 4 concurrent clients routed to 4
-        // different shards run in parallel with zero per-batch lock
-        // churn.
+        // The batch is partitioned by each ID's hash. Shards run in parallel,
+        // while bounded chunks prevent one writer from monopolising a shard.
         let t4 = std::time::Instant::now();
-        let mut responses = Vec::with_capacity(batch_len);
-        let shard_idx = if processed.is_empty() {
-            0
-        } else {
-            // Use the instance method so routing matches the actual
-            // configured shard count. The static `shard_for` is hardcoded
-            // to assume 16 shards and panics on machines configured for
-            // fewer (e.g. ingest_shards=2 on a 4-core box).
-            self.memtable.shard_for_dynamic(&processed[0].id)
-        };
-        // Chunked insert — same read-under-write rationale as the raw path
-        // (`index_batch_turbo_raw`): release the shard write lock between
-        // chunks so a concurrent search stalls on a writing shard for at
-        // most one chunk, not the whole batch.  `remove()` still precedes
-        // each `insert_pretokenized_with_seq`, so overwrite semantics are
-        // preserved regardless of the chunk boundary.
-        {
-            let mut base = 0usize;
-            while base < batch_len {
-                let end = (base + MEMTABLE_INSERT_CHUNK).min(batch_len);
-                self.memtable.with_shard_mut(shard_idx, |mem| {
-                    for i in base..end {
-                        let ingest = &processed[i];
-                        mem.remove(&ingest.id);
-                        mem.insert_pretokenized_with_seq(
-                            seq_nos[i],
-                            ingest.id.clone(),
-                            Arc::clone(&ingest.source),
-                            &ingest.tokens,
-                        );
-
-                        let version = self.doc_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-                        responses.push(IndexResponse {
-                            id: ingest.id.clone(),
-                            seq_no: seq_nos[i],
-                            version,
-                            result: "created".to_string(),
-                        });
-                    }
-                });
-                base = end;
-            }
+        // Route every document to its own dynamic shard. The old shortcut
+        // routed the entire batch to docs[0]'s shard; overwriting an ID whose
+        // ordinary value lived on another shard then left the old postings
+        // searchable as a cross-shard ghost. Each bucket retains request
+        // order, so duplicate IDs remain last-write-wins.
+        use rayon::prelude::*;
+        let n_shards = self.memtable.shard_count().max(1);
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n_shards];
+        for (i, ingest) in processed.iter().enumerate() {
+            buckets[self.memtable.shard_for_dynamic(&ingest.id)].push(i);
         }
+        let memtable = &*self.memtable;
+        crate::ingest_pool().install(|| {
+            buckets.par_iter().enumerate().for_each(|(shard, idxs)| {
+                for chunk in idxs.chunks(MEMTABLE_INSERT_CHUNK) {
+                    memtable.with_shard_mut(shard, |mem| {
+                        for &i in chunk {
+                            let ingest = &processed[i];
+                            mem.remove(&ingest.id);
+                            mem.insert_pretokenized_with_seq(
+                                seq_nos[i],
+                                ingest.id.clone(),
+                                Arc::clone(&ingest.source),
+                                &ingest.tokens,
+                            );
+                        }
+                    });
+                }
+            });
+        });
+        self.doc_count
+            .fetch_add(batch_len as u64, Ordering::Relaxed);
+        let responses: Vec<IndexResponse> = processed
+            .iter()
+            .enumerate()
+            .map(|(i, ingest)| IndexResponse {
+                id: ingest.id.clone(),
+                seq_no: seq_nos[i],
+                version: response_metadata[i].0,
+                result: response_metadata[i].1.to_string(),
+            })
+            .collect();
         let t4_dur = t4.elapsed();
+        #[cfg(test)]
+        for ingest in &processed {
+            self.publication_test_point(&ingest.id, PublicationTestPoint::AfterFts);
+        }
 
         if batch_len >= 1000 {
             tracing::debug!(
@@ -1868,10 +1956,8 @@ impl Index {
         // Hoisted once-per-batch: we take the schema read lock EXACTLY
         // ONCE, scan all sources for unknown field names in one pass,
         // and only call the slow-path `evolve_schema_from_doc` when
-        // something new is actually detected.  Similarly for vectors —
-        // we detect presence-of-any-vector-field via a single pass over
-        // the first doc's object keys (sufficient for our schema model
-        // because vector fields are fixed per index, not per doc).
+        // something new is actually detected. Vector presence is checked
+        // across every item because later documents may introduce it.
         {
             let schema_guard = self.schema.read().await;
             let is_dynamic = matches!(
@@ -1900,27 +1986,36 @@ impl Index {
             }
         }
 
-        // Vector indexing is only meaningful when at least one document
-        // in the batch carries an array of numbers.  Detecting that
-        // costs a single pass over the first doc's top-level object;
-        // for log workloads (no vector fields) this skips the async
-        // HNSW lock acquire entirely.
-        if processed
-            .first()
-            .and_then(|r| r.source.as_object())
-            .map(|obj| {
-                obj.values().any(|v| {
-                    v.as_array()
-                        .map(|arr| !arr.is_empty() && arr.iter().all(Value::is_number))
-                        .unwrap_or(false)
+        // Vector indexing is only meaningful when at least one document in
+        // the batch carries an array of numbers. Scan the whole batch: dynamic
+        // data can introduce the first vector after item zero.
+        if processed.iter().any(|r| {
+            r.source
+                .as_object()
+                .map(|obj| {
+                    obj.values().any(|v| {
+                        v.as_array()
+                            .map(|arr| !arr.is_empty() && arr.iter().all(Value::is_number))
+                            .unwrap_or(false)
+                    })
                 })
-            })
-            .unwrap_or(false)
-        {
+                .unwrap_or(false)
+        }) {
             for ingest in &processed {
                 self.index_vectors(&ingest.id, &ingest.source).await;
             }
         }
+        #[cfg(test)]
+        for ingest in &processed {
+            self.publication_test_point(&ingest.id, PublicationTestPoint::AfterHnsw);
+        }
+
+        #[cfg(test)]
+        for ingest in &processed {
+            self.publication_test_point(&ingest.id, PublicationTestPoint::BeforeRelease);
+        }
+        drop(cache_publication);
+        drop(publication_guards);
 
         // ── Step 5: check flush threshold ─────────────────────────────────
         self.maybe_spawn_flush().await;
@@ -1943,17 +2038,13 @@ impl Index {
 
     /// M5.11 — ULTRA-turbo raw-bytes ingest.
     ///
-    /// Takes already-serialized NDJSON document lines and pushes them
-    /// through the WAL + memtable without ever running
-    /// `serde_json::from_str` on the document body.  The JSON parse is
-    /// deferred all the way to drain-for-flush time, where it runs on
-    /// a background task without contending with HTTP workers.
+    /// Takes already-serialized NDJSON document lines, validates/parses and
+    /// analyzes them in parallel, then publishes them through one grouped WAL
+    /// append and shard-parallel FTS insertion.
     ///
-    /// Trade-off: schema auto-evolution and vector HNSW indexing do
-    /// NOT fire on this path — the parsed `Value` they need isn't
-    /// built.  Callers must pre-register the index mapping and avoid
-    /// vector fields on this endpoint.  Nginx-style log ingest is the
-    /// canonical use case.
+    /// Trade-off: vector HNSW indexing does NOT fire on this path. Callers
+    /// must avoid vector fields on this endpoint. Nginx-style log ingest is
+    /// the canonical use case.
     pub async fn index_batch_turbo_raw(
         &self,
         docs: Vec<(String, Arc<[u8]>)>,
@@ -2014,28 +2105,6 @@ impl Index {
         let mut p_evolve_us = 0u128;
         let mut p_analyze_us = 0u128;
         let mut p_insert_us = 0u128;
-        let p_t = std::time::Instant::now();
-
-        // Build WAL refs directly from bytes.  We pass `Arc<Value::Null>`
-        // as the `source` parameter because `wal_append_batch` uses
-        // `source_bytes` when it's non-empty and never touches the
-        // Value tree on the fast path.
-        let null_val: Arc<Value> = Arc::new(Value::Null);
-        let wal_refs: Vec<(String, Arc<Value>, Arc<[u8]>)> = docs
-            .iter()
-            .map(|(id, bytes)| (id.clone(), Arc::clone(&null_val), Arc::clone(bytes)))
-            .collect();
-
-        let wal_t = std::time::Instant::now();
-        let seq_nos = self.store.wal_append_batch(&wal_refs)?;
-        // RC4 W4 item 2: WAL durability-write latency.
-        if let Some(m) = crate::engine_metrics() {
-            m.observe_wal_write(wal_t.elapsed().as_secs_f64());
-        }
-        if prof {
-            p_wal_us = p_t.elapsed().as_micros();
-        }
-
         // Insert each doc EXACTLY ONCE into the engine FTS memtable,
         // routed to the doc's OWN shard — bit-for-bit identical to the
         // per-doc `index_document` path.
@@ -2074,11 +2143,11 @@ impl Index {
         //      two rayon workers ever contend on the same lock — one
         //      bulk request now fans across min(Ncore, Nshard) cores.
         //
-        // Correctness invariants preserved bit-for-bit vs the serial
-        // loop: (a) each doc is inserted EXACTLY ONCE on its own shard
-        // with its own `seq_nos[i]`; (b) `version` = prior doc_count +
-        // position + 1, assigned in doc order via one batch-level
-        // `fetch_add`; (c) response order matches request order.
+        // Correctness invariants preserved vs the serial loop: (a) each doc
+        // is inserted EXACTLY ONCE on its own shard with its own
+        // `seq_nos[i]`; (b) per-ID versions and created/updated outcomes
+        // follow request-ordered VersionMap history; (c) response order
+        // matches request order. `doc_count` remains bookkeeping only.
         use rayon::prelude::*;
 
         // 1. Parse in parallel — each doc exactly once.  Arc-wrapped so
@@ -2093,14 +2162,9 @@ impl Index {
         let p_t = std::time::Instant::now();
         let sources: Vec<Arc<Value>> = crate::ingest_pool().install(|| {
             docs.par_iter()
-                .map(|(_, bytes)| {
-                    Arc::new(
-                        serde_json::from_slice::<Value>(bytes)
-                            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
-                    )
-                })
-                .collect()
-        });
+                .map(|(_, bytes)| serde_json::from_slice::<Value>(bytes).map(Arc::new))
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })?;
         if prof {
             p_parse_us = p_t.elapsed().as_micros();
         }
@@ -2113,11 +2177,10 @@ impl Index {
             p_evolve_us = p_t.elapsed().as_micros();
         }
 
-        // 3. Parallel shard-partitioned insert. Partition the batch by
-        // each doc's own shard, then insert each shard's sub-batch on a
-        // rayon worker holding that shard's lock exactly once — the
-        // DocumentsWriterPerThread analogue.
-        {
+        // 3. Pre-analyze and shard-partition the batch before acquiring any
+        // exact-ID publication guard. These CPU-heavy, pure operations must
+        // not extend the same-ID critical section.
+        let analyzed = {
             let schema_guard = self.schema.read().await;
             let schema = &schema_guard.schema;
             let mem = &*self.memtable;
@@ -2154,13 +2217,85 @@ impl Index {
             if prof {
                 p_analyze_us = p_t.elapsed().as_micros();
             }
-            let p_t = std::time::Instant::now();
+            analyzed
+        };
+        let mem = &*self.memtable;
+        let n_shards = mem.shard_count().max(1);
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n_shards];
+        for (i, (id, _)) in docs.iter().enumerate() {
+            buckets[mem.shard_for_dynamic(id)].push(i);
+        }
 
-            let n_shards = mem.shard_count().max(1);
-            let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n_shards];
-            for (i, (id, _)) in docs.iter().enumerate() {
-                buckets[mem.shard_for_dynamic(id)].push(i);
+        // Build the WAL view before taking guards. The bytes are already
+        // validated JSON, so no fallible preprocessing remains below.
+        let null_val: Arc<Value> = Arc::new(Value::Null);
+        let wal_refs: Vec<(String, Arc<Value>, Arc<[u8]>)> = docs
+            .iter()
+            .map(|(id, bytes)| (id.clone(), Arc::clone(&null_val), Arc::clone(bytes)))
+            .collect();
+
+        let publication_guards = self
+            .write_publication
+            .lock_many(docs.iter().map(|(id, _)| id.as_str()))
+            .await;
+        #[cfg(test)]
+        for id in docs
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<HashSet<_>>()
+        {
+            self.publication_test_point(id, PublicationTestPoint::Acquired);
+        }
+        let response_metadata =
+            self.batch_response_metadata(docs.iter().map(|(id, _)| id.as_str()));
+
+        let cache_publication = BatchCachePublicationGuard::begin(
+            Arc::clone(&self.dataset_version),
+            Arc::clone(&self.batch_cache_publications),
+        );
+        let wal_t = std::time::Instant::now();
+        let seq_nos = self.store.wal_append_batch(&wal_refs)?;
+        if let Some(m) = crate::engine_metrics() {
+            m.observe_wal_write(wal_t.elapsed().as_secs_f64());
+        }
+        if prof {
+            p_wal_us = wal_t.elapsed().as_micros();
+        }
+        #[cfg(test)]
+        for (id, _) in &docs {
+            self.publication_test_point(id, PublicationTestPoint::AfterWalVersionMap);
+        }
+
+        // 4. Publish the already-analyzed documents shard-parallel while all
+        // affected document IDs remain exclusively held.
+        let p_t = std::time::Instant::now();
+        #[cfg(test)]
+        let deterministic_test_publication = self.publication_test_hook.read().is_some();
+        #[cfg(not(test))]
+        let deterministic_test_publication = false;
+        if deterministic_test_publication {
+            // Test hooks need a deterministic item boundary with no shard
+            // lock held, so a concurrent search can deliberately cache a
+            // partial batch. Production always takes the parallel branch.
+            #[cfg(test)]
+            for i in 0..docs.len() {
+                let (id, bytes) = &docs[i];
+                self.publication_test_point(id, PublicationTestPoint::BeforeFtsItem);
+                let shard = mem.shard_for_dynamic(id);
+                mem.with_shard_mut(shard, |m| {
+                    m.remove(id);
+                    let size = (bytes.len() + id.len()) * 3 + 64;
+                    m.insert_analyzed(
+                        seq_nos[i],
+                        id.clone(),
+                        Arc::clone(&sources[i]),
+                        &analyzed[i],
+                        size,
+                    );
+                });
+                self.publication_test_point(id, PublicationTestPoint::AfterFtsItem);
             }
+        } else {
             crate::ingest_pool().install(|| {
                 buckets.par_iter().enumerate().for_each(|(shard, idxs)| {
                     if idxs.is_empty() {
@@ -2189,9 +2324,13 @@ impl Index {
                     });
                 });
             });
-            if prof {
-                p_insert_us = p_t.elapsed().as_micros();
-            }
+        }
+        if prof {
+            p_insert_us = p_t.elapsed().as_micros();
+        }
+        #[cfg(test)]
+        for (id, _) in &docs {
+            self.publication_test_point(id, PublicationTestPoint::AfterFts);
         }
 
         if prof {
@@ -2202,9 +2341,9 @@ impl Index {
             );
         }
 
-        // 4. One batch-level version stamp, assigned in request order.
-        let base = self
-            .doc_count
+        // 5. Per-ID versions/results are derived in request order while the
+        // ID set is held. `doc_count` remains bookkeeping only.
+        self.doc_count
             .fetch_add(batch_len as u64, Ordering::Relaxed);
         let responses: Vec<IndexResponse> = docs
             .iter()
@@ -2212,10 +2351,17 @@ impl Index {
             .map(|(i, (id, _))| IndexResponse {
                 id: id.clone(),
                 seq_no: seq_nos[i],
-                version: base + i as u64 + 1,
-                result: "created".to_string(),
+                version: response_metadata[i].0,
+                result: response_metadata[i].1.to_string(),
             })
             .collect();
+
+        #[cfg(test)]
+        for (id, _) in &docs {
+            self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
+        }
+        drop(cache_publication);
+        drop(publication_guards);
 
         self.maybe_spawn_flush().await;
 
@@ -2248,6 +2394,13 @@ impl Index {
     /// ingest harnesses (`xerj index`) which are not subject to per-
     /// index write blocks.  HTTP handlers should continue to use the
     /// async `index_batch_turbo_raw` which honours blocks.
+    ///
+    /// **Concurrency boundary:** this synchronous API is not yet integrated
+    /// with the async exact-ID publication coordinator. Its CLI-generated IDs
+    /// are unique, but public callers that collide with other mutation paths
+    /// can still reverse VersionMap and FTS publication. Bridging an async
+    /// mutex from a Rayon worker would defeat this path's no-runtime-crossing
+    /// contract, so that requires a separate coordinator design.
     pub fn index_batch_sync_raw(&self, docs: Vec<(String, Arc<[u8]>)>) -> Result<usize> {
         if docs.is_empty() {
             return Ok(0);
@@ -6431,15 +6584,18 @@ impl Index {
         // XERJ_DISABLE_QUERY_CACHE=1 turns off the whole-result cache so a
         // benchmark measures true per-request execution on every call (no
         // took_ms=0 clone). Read once. Normal operation is unaffected.
-        let cache_eligible = !request.profile && request.search_after.is_none() && {
-            static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            !*DISABLED.get_or_init(|| {
-                matches!(
-                    std::env::var("XERJ_DISABLE_QUERY_CACHE").as_deref(),
-                    Ok("1") | Ok("true")
-                )
-            })
-        };
+        let cache_eligible = !request.profile
+            && request.search_after.is_none()
+            && self.batch_cache_publications.load(Ordering::Acquire) == 0
+            && {
+                static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                !*DISABLED.get_or_init(|| {
+                    matches!(
+                        std::env::var("XERJ_DISABLE_QUERY_CACHE").as_deref(),
+                        Ok("1") | Ok("true")
+                    )
+                })
+            };
         let cache_key: Option<(u64, u64)> = if cache_eligible {
             // Hash the request via its serde_json representation,
             // streaming the serializer output STRAIGHT INTO the hasher.
@@ -6473,12 +6629,18 @@ impl Index {
         };
         if let Some(key) = cache_key {
             if let Some(entry) = self.query_cache.get(&key) {
-                // Query-cache HIT (RC4-W4 item 4).
-                self.query_cache_hits.fetch_add(1, Ordering::Relaxed);
-                let mut cloned = (**entry.value()).clone();
-                cloned.took_ms = 0;
-                self.metric_query_count.fetch_add(1, Ordering::Relaxed);
-                return Ok(cloned);
+                if self.batch_cache_publications.load(Ordering::Acquire) != 0
+                    || self.dataset_version.load(Ordering::Acquire) != key.1
+                {
+                    drop(entry);
+                } else {
+                    // Query-cache HIT (RC4-W4 item 4).
+                    self.query_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    let mut cloned = (**entry.value()).clone();
+                    cloned.took_ms = 0;
+                    self.metric_query_count.fetch_add(1, Ordering::Relaxed);
+                    return Ok(cloned);
+                }
             }
             // Query-cache MISS: eligible + keyed, but not present. The request
             // proceeds to single-flight coalescing / real execution below.
@@ -6683,7 +6845,11 @@ impl Index {
                         self.query_cache.clear();
                     }
                     let arc = Arc::new(r.clone());
-                    self.query_cache.insert(key, Arc::clone(&arc));
+                    if self.batch_cache_publications.load(Ordering::Acquire) == 0
+                        && self.dataset_version.load(Ordering::Acquire) == key.1
+                    {
+                        self.query_cache.insert(key, Arc::clone(&arc));
+                    }
                     // Single-flight: wake any coalesced followers with the
                     // freshly computed result (byte-identical to this cache
                     // entry). `send` returns Err if there are no followers —
@@ -26530,5 +26696,617 @@ mod write_publication_integration_tests {
         assert!(delete.seq_no > put.seq_no);
         assert!(idx.get_document("same").await.unwrap().is_none());
         assert_eq!(acquired.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod durable_batch_publication_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+
+    fn parsed(id: &str, source: Value) -> (String, Value, Arc<[u8]>) {
+        let bytes: Arc<[u8]> = serde_json::to_vec(&source).unwrap().into();
+        (id.to_owned(), source, bytes)
+    }
+
+    fn raw(id: &str, source: Value) -> (String, Arc<[u8]>) {
+        (id.to_owned(), serde_json::to_vec(&source).unwrap().into())
+    }
+
+    async fn test_index(name: &str) -> (tempfile::TempDir, crate::Engine, Arc<Index>) {
+        test_index_with_schema(name, Schema::empty()).await
+    }
+
+    async fn test_index_with_schema(
+        name: &str,
+        schema: Schema,
+    ) -> (tempfile::TempDir, crate::Engine, Arc<Index>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index(name, schema).unwrap();
+        let index = engine.get_index(name).unwrap();
+        (dir, engine, index)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parsed_duplicate_ids_return_per_occurrence_versions_in_request_order() {
+        let (_dir, _engine, index) = test_index("parsed-duplicates").await;
+        let responses = index
+            .index_batch_turbo(
+                vec![
+                    parsed("A", json!({"state": "a1"})),
+                    parsed("B", json!({"state": "b1"})),
+                    parsed("A", json!({"state": "a2"})),
+                ],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            responses
+                .iter()
+                .map(|r| (r.id.as_str(), r.version, r.result.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A", 1, "created"),
+                ("B", 1, "created"),
+                ("A", 2, "updated"),
+            ]
+        );
+        assert!(responses[0].seq_no < responses[1].seq_no);
+        assert!(responses[1].seq_no < responses[2].seq_no);
+        assert_eq!(
+            index.get_document("A").await.unwrap().unwrap()["state"],
+            "a2"
+        );
+        assert_eq!(index.store.version_map.live_count(), 2);
+        let a = index.store.version_map.get("A").unwrap();
+        assert_eq!((a.seq_no, a.version), (responses[2].seq_no, 2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_duplicate_ids_return_per_occurrence_versions_in_request_order() {
+        let (_dir, _engine, index) = test_index("raw-duplicates").await;
+        let responses = index
+            .index_batch_turbo_raw(vec![
+                raw("A", json!({"state": "a1"})),
+                raw("B", json!({"state": "b1"})),
+                raw("A", json!({"state": "a2"})),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            responses
+                .iter()
+                .map(|r| (r.id.as_str(), r.version, r.result.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A", 1, "created"),
+                ("B", 1, "created"),
+                ("A", 2, "updated"),
+            ]
+        );
+        assert_eq!(
+            index.get_document("A").await.unwrap().unwrap()["state"],
+            "a2"
+        );
+        assert_eq!(index.store.version_map.live_count(), 2);
+        let a = index.store.version_map.get("A").unwrap();
+        assert_eq!((a.seq_no, a.version), (responses[2].seq_no, 2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parsed_batch_overwrite_removes_value_from_its_own_dynamic_shard() {
+        let (_dir, _engine, index) = test_index("parsed-shards").await;
+        let target = "target";
+        let target_shard = index.memtable.shard_for_dynamic(target);
+        let first = (0..10_000)
+            .map(|i| format!("first-{i}"))
+            .find(|id| index.memtable.shard_for_dynamic(id) != target_shard)
+            .unwrap();
+
+        index
+            .index_document(Some(target.into()), json!({"state": "old"}))
+            .await
+            .unwrap();
+        index
+            .index_batch_turbo(
+                vec![
+                    parsed(&first, json!({"state": "first"})),
+                    parsed(target, json!({"state": "new"})),
+                ],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index.get_document(target).await.unwrap().unwrap()["state"],
+            "new"
+        );
+        let copies = (0..index.memtable.shard_count())
+            .filter(|&shard| index.memtable.with_shard(shard, |mem| mem.contains(target)))
+            .count();
+        assert_eq!(copies, 1, "overwrite left a cross-shard FTS ghost");
+        assert!(index
+            .memtable
+            .with_shard(target_shard, |mem| mem.contains(target)));
+    }
+
+    async fn ordinary_put_waits_for_durable_batch(raw_path: bool) {
+        let name = if raw_path {
+            "raw-vs-put"
+        } else {
+            "parsed-vs-put"
+        };
+        let (_dir, _engine, index) = test_index(name).await;
+        index
+            .index_document(Some("same".into()), json!({"state": "initial"}))
+            .await
+            .unwrap();
+
+        let paused_once = Arc::new(AtomicBool::new(false));
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let paused_tx = parking_lot::Mutex::new(Some(paused_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        index.set_publication_test_hook(Some({
+            let paused_once = Arc::clone(&paused_once);
+            Arc::new(move |id, point| {
+                if id == "same"
+                    && point == PublicationTestPoint::AfterWalVersionMap
+                    && !paused_once.swap(true, Ordering::SeqCst)
+                {
+                    paused_tx.lock().take().unwrap().send(()).unwrap();
+                    resume_rx.lock().take().unwrap().recv().unwrap();
+                }
+            })
+        }));
+
+        let batch = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                if raw_path {
+                    index
+                        .index_batch_turbo_raw(vec![raw("same", json!({"state": "batch"}))])
+                        .await
+                } else {
+                    index
+                        .index_batch_turbo(
+                            vec![parsed("same", json!({"state": "batch"}))],
+                            false,
+                            false,
+                        )
+                        .await
+                }
+            })
+        };
+        tokio::task::spawn_blocking(move || paused_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+        let waiting_tx = Arc::new(parking_lot::Mutex::new(Some(waiting_tx)));
+        index.write_publication.set_before_mutex_await_hook({
+            let waiting_tx = Arc::clone(&waiting_tx);
+            Some(Arc::new(move |id| {
+                if id == "same" {
+                    waiting_tx.lock().take().unwrap().send(()).unwrap();
+                }
+            }))
+        });
+        let put = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                index
+                    .index_document(Some("same".into()), json!({"state": "put"}))
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || waiting_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        resume_tx.send(()).unwrap();
+        let batch_response = batch.await.unwrap().unwrap();
+        let put_response = put.await.unwrap().unwrap();
+        index.write_publication.set_before_mutex_await_hook(None);
+        index.set_publication_test_hook(None);
+
+        assert!(put_response.seq_no > batch_response[0].seq_no);
+        assert_eq!(put_response.version, 3);
+        assert_eq!(
+            index.get_document("same").await.unwrap().unwrap()["state"],
+            "put"
+        );
+        let entry = index.store.version_map.get("same").unwrap();
+        assert_eq!(entry.seq_no, put_response.seq_no);
+        assert_eq!(entry.version, put_response.version);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parsed_batch_holds_same_id_through_fts_before_ordinary_put() {
+        ordinary_put_waits_for_durable_batch(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_batch_holds_same_id_through_fts_before_ordinary_put() {
+        ordinary_put_waits_for_durable_batch(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_partial_batch_is_not_cacheable_and_complete_result_follows_ack() {
+        let (_dir, _engine, index) = test_index("raw-cache-window").await;
+        let generation_before = index.dataset_version.load(Ordering::Acquire);
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let paused_tx = parking_lot::Mutex::new(Some(paused_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        index.set_publication_test_hook(Some(Arc::new(move |id, point| {
+            if id == "A" && point == PublicationTestPoint::AfterFtsItem {
+                paused_tx.lock().take().unwrap().send(()).unwrap();
+                resume_rx.lock().take().unwrap().recv().unwrap();
+            }
+        })));
+
+        let writer = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                index
+                    .index_batch_turbo_raw(vec![
+                        raw("A", json!({"state": "a"})),
+                        raw("B", json!({"state": "b"})),
+                    ])
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || paused_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let request = SearchRequest::default();
+        let partial = index.search(&request).await.unwrap();
+        assert_eq!(
+            partial
+                .hits
+                .iter()
+                .map(|h| h.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A"],
+            "fixture must observe the real between-item FTS state"
+        );
+        let hits_before = index.query_cache_hits.load(Ordering::Relaxed);
+        let cached_partial = index.search(&request).await.unwrap();
+        assert_eq!(cached_partial.hits.len(), 1);
+        assert_eq!(
+            index.query_cache_hits.load(Ordering::Relaxed),
+            hits_before,
+            "publication gate must disable cache lookup/store for partial results"
+        );
+
+        resume_tx.send(()).unwrap();
+        writer.await.unwrap().unwrap();
+        index.set_publication_test_hook(None);
+        assert_eq!(
+            index.dataset_version.load(Ordering::Acquire),
+            generation_before + 2
+        );
+        let complete = index.search(&request).await.unwrap();
+        assert_eq!(
+            complete
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["A", "B"]),
+            "post-publication generation must make the partial key unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_overwrite_invalidates_a_proven_cache_hit() {
+        let (_dir, _engine, index) = test_index("raw-cache-overwrite").await;
+        index
+            .index_document(Some("A".into()), json!({"state": "old"}))
+            .await
+            .unwrap();
+        let request = SearchRequest::default();
+        index.search(&request).await.unwrap();
+        let hits_before = index.query_cache_hits.load(Ordering::Relaxed);
+        let cached = index.search(&request).await.unwrap();
+        assert_eq!(cached.hits[0].source["state"], "old");
+        assert_eq!(
+            index.query_cache_hits.load(Ordering::Relaxed),
+            hits_before + 1,
+            "fixture must prove the old result was cached"
+        );
+        let generation_before = index.dataset_version.load(Ordering::Acquire);
+
+        let response = index
+            .index_batch_turbo_raw(vec![raw("A", json!({"state": "new"}))])
+            .await
+            .unwrap();
+        assert_eq!(
+            (response[0].version, response[0].result.as_str()),
+            (2, "updated")
+        );
+        assert_eq!(
+            index.dataset_version.load(Ordering::Acquire),
+            generation_before + 2
+        );
+        let fresh = index.search(&request).await.unwrap();
+        assert_eq!(fresh.hits[0].source["state"], "new");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_parsed_batch_closes_cache_publication_generation() {
+        let (_dir, _engine, index) = test_index("parsed-cache-abort").await;
+        index
+            .index_document(Some("A".into()), json!({"state": "old"}))
+            .await
+            .unwrap();
+        let request = SearchRequest::default();
+        index.search(&request).await.unwrap();
+        index.search(&request).await.unwrap();
+        let generation_before = index.dataset_version.load(Ordering::Acquire);
+
+        let (fts_tx, fts_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let fts_tx = parking_lot::Mutex::new(Some(fts_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        index.set_publication_test_hook(Some(Arc::new(move |id, point| {
+            if id == "A" && point == PublicationTestPoint::AfterFts {
+                fts_tx.lock().take().unwrap().send(()).unwrap();
+                resume_rx.lock().take().unwrap().recv().unwrap();
+            }
+        })));
+
+        let writer = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                index
+                    .index_batch_turbo(vec![parsed("A", json!({"state": "new"}))], false, false)
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || fts_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(index.batch_cache_publications.load(Ordering::Acquire), 1);
+
+        // Force the next post-FTS schema read to yield, then cancel the task.
+        let schema_write = index.schema.write().await;
+        resume_tx.send(()).unwrap();
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        drop(schema_write);
+        index.set_publication_test_hook(None);
+
+        assert_eq!(index.batch_cache_publications.load(Ordering::Acquire), 0);
+        assert_eq!(
+            index.dataset_version.load(Ordering::Acquire),
+            generation_before + 2,
+            "RAII drop must close the cache generation on cancellation"
+        );
+        let fresh = index.search(&request).await.unwrap();
+        assert_eq!(fresh.hits[0].source["state"], "new");
+    }
+
+    #[tokio::test]
+    async fn malformed_raw_json_is_rejected_before_wal_publication() {
+        let (_dir, _engine, index) = test_index("raw-invalid").await;
+        let bad: Arc<[u8]> = Arc::from(&b"{not-json"[..]);
+        assert!(index
+            .index_batch_turbo_raw(vec![("bad".into(), bad)])
+            .await
+            .is_err());
+        assert!(index.store.version_map.get("bad").is_none());
+        assert!(index.get_document("bad").await.unwrap().is_none());
+
+        let valid = raw("valid", json!({"state": "must-not-publish"}));
+        let bad: Arc<[u8]> = Arc::from(&b"{still-not-json"[..]);
+        assert!(index
+            .index_batch_turbo_raw(vec![valid, ("bad-2".into(), bad)])
+            .await
+            .is_err());
+        assert!(
+            index.store.version_map.get("valid").is_none(),
+            "mixed malformed batch must fail before any WAL/VM publication"
+        );
+        assert!(index.store.version_map.get("bad-2").is_none());
+    }
+
+    #[tokio::test]
+    async fn tombstoned_id_is_created_again_but_keeps_version_history() {
+        let (_dir, _engine, index) = test_index("batch-tombstone-version").await;
+        index
+            .index_document(Some("A".into()), json!({"state": "old"}))
+            .await
+            .unwrap();
+        let deleted = index
+            .delete_document_versioned("A", None, None)
+            .await
+            .unwrap();
+        assert_eq!(deleted.version, 2);
+        let response = index
+            .index_batch_turbo_raw(vec![raw("A", json!({"state": "reborn"}))])
+            .await
+            .unwrap();
+        assert_eq!(
+            (response[0].version, response[0].result.as_str()),
+            (3, "created")
+        );
+        let current = index.store.version_map.get("A").unwrap();
+        assert_eq!((current.seq_no, current.version), (response[0].seq_no, 3));
+    }
+
+    #[tokio::test]
+    async fn parsed_batch_indexes_later_and_duplicate_dense_vectors() {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("embedding", FieldType::Vector))
+            .unwrap();
+        let (_dir, _engine, index) = test_index_with_schema("parsed-later-vector", schema).await;
+
+        let responses = index
+            .index_batch_turbo(
+                vec![
+                    parsed("plain", json!({"body": "no vector"})),
+                    parsed("A", json!({"embedding": [1.0, 0.0, 0.0]})),
+                    parsed("A", json!({"embedding": [0.0, 1.0, 0.0]})),
+                ],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            responses
+                .iter()
+                .map(|r| (r.id.as_str(), r.version, r.result.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("plain", 1, "created"),
+                ("A", 1, "created"),
+                ("A", 2, "updated"),
+            ]
+        );
+        assert_eq!(
+            index.hnsw_field.read().unwrap().as_deref(),
+            Some("embedding")
+        );
+        assert_eq!(index.hnsw_id_map.read().await.len(), 1);
+        assert!(
+            index.hnsw_vector_current("A", &[0.0, 1.0, 0.0]).await,
+            "duplicate ID must leave its request-last vector current"
+        );
+        assert!(!index.hnsw_vector_current("A", &[1.0, 0.0, 0.0]).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parsed_vector_batch_holds_id_until_hnsw_before_ordinary_put() {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("embedding", FieldType::Vector))
+            .unwrap();
+        let (_dir, _engine, index) = test_index_with_schema("parsed-vector-vs-put", schema).await;
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let paused_tx = parking_lot::Mutex::new(Some(paused_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        let pause_once = Arc::new(AtomicBool::new(false));
+        index.set_publication_test_hook(Some(Arc::new(move |id, point| {
+            if id == "A"
+                && point == PublicationTestPoint::AfterFts
+                && !pause_once.swap(true, Ordering::SeqCst)
+            {
+                paused_tx.lock().take().unwrap().send(()).unwrap();
+                resume_rx.lock().take().unwrap().recv().unwrap();
+            }
+        })));
+        let batch = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                index
+                    .index_batch_turbo(
+                        vec![parsed(
+                            "A",
+                            json!({"state": "batch", "embedding": [1.0, 0.0, 0.0]}),
+                        )],
+                        false,
+                        false,
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || paused_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+        let waiting_tx = Arc::new(parking_lot::Mutex::new(Some(waiting_tx)));
+        index.write_publication.set_before_mutex_await_hook({
+            let waiting_tx = Arc::clone(&waiting_tx);
+            Some(Arc::new(move |id| {
+                if id == "A" {
+                    waiting_tx.lock().take().unwrap().send(()).unwrap();
+                }
+            }))
+        });
+        let put = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                index
+                    .index_document(
+                        Some("A".into()),
+                        json!({"state": "put", "embedding": [0.0, 1.0, 0.0]}),
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || waiting_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        resume_tx.send(()).unwrap();
+        let batch_response = batch.await.unwrap().unwrap();
+        let put_response = put.await.unwrap().unwrap();
+        index.write_publication.set_before_mutex_await_hook(None);
+        index.set_publication_test_hook(None);
+
+        assert!(put_response.seq_no > batch_response[0].seq_no);
+        assert_eq!(
+            index.get_document("A").await.unwrap().unwrap()["state"],
+            "put"
+        );
+        let current = index.store.version_map.get("A").unwrap();
+        assert_eq!(
+            (current.seq_no, current.version),
+            (put_response.seq_no, put_response.version)
+        );
+        assert!(index.hnsw_vector_current("A", &[0.0, 1.0, 0.0]).await);
+        assert!(!index.hnsw_vector_current("A", &[1.0, 0.0, 0.0]).await);
+    }
+
+    #[tokio::test]
+    async fn raw_batch_overwrite_stays_on_targets_dynamic_shard() {
+        let (_dir, _engine, index) = test_index("raw-shards").await;
+        let target = "target";
+        let target_shard = index.memtable.shard_for_dynamic(target);
+        let first = (0..10_000)
+            .map(|i| format!("raw-first-{i}"))
+            .find(|id| index.memtable.shard_for_dynamic(id) != target_shard)
+            .unwrap();
+        index
+            .index_document(Some(target.into()), json!({"body": "old-exclusive-term"}))
+            .await
+            .unwrap();
+        index
+            .index_batch_turbo_raw(vec![
+                raw(&first, json!({"body": "first"})),
+                raw(target, json!({"body": "new-exclusive-term"})),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index.get_document(target).await.unwrap().unwrap()["body"],
+            "new-exclusive-term"
+        );
+        let copies = (0..index.memtable.shard_count())
+            .filter(|&shard| index.memtable.with_shard(shard, |mem| mem.contains(target)))
+            .count();
+        assert_eq!(copies, 1);
+        assert!(index
+            .memtable
+            .with_shard(target_shard, |mem| mem.contains(target)));
     }
 }
