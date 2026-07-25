@@ -18,6 +18,8 @@ xxhash-rust.workspace = true
 memchr.workspace = true
 rayon.workspace = true
 libc = "0.2"
+tempfile.workspace = true
+fs2 = "0.4"
 # ES-compat HTTP client. Blocking mode: all of autoindex is synchronous
 # (std threads), invoked from the server binary via spawn_blocking.
 reqwest = { workspace = true, features = ["blocking"] }
@@ -33,4 +35,3 @@ serde_yaml = "0.9"                               # YAML multi-doc
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
-tempfile.workspace = true

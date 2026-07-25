@@ -131,6 +131,21 @@ impl Es {
         Err(anyhow!("PUT /{index} failed: {status} {text}"))
     }
 
+    /// Additive mapping update for fields introduced after an index was created.
+    pub fn update_mapping(&self, index: &str, body: &Value) -> Result<()> {
+        let resp = self
+            .req(reqwest::Method::PUT, &format!("/{index}/_mapping"))
+            .json(body)
+            .send()
+            .context("PUT mapping")?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = resp.text().unwrap_or_default();
+        Err(anyhow!("PUT /{index}/_mapping failed: {status} {text}"))
+    }
+
     pub fn bulk(&self, body: Vec<u8>) -> Result<BulkOutcome> {
         self.with_retry(
             "_bulk",
@@ -193,6 +208,40 @@ impl Es {
             .body(body)
             .send()
             .with_context(|| format!("bulk send (request timeout {:?})", self.bulk_timeout))
+    }
+
+    /// Remove every document matching `query` before a file-level replacement.
+    /// Refresh is requested so a retry cannot observe or retain an older
+    /// locator set alongside the replacement.
+    pub fn delete_by_query(&self, index: &str, query: &Value) -> Result<()> {
+        self.with_retry(
+            "delete_by_query",
+            || {
+                self.req(
+                    reqwest::Method::POST,
+                    &format!("/{index}/_delete_by_query?refresh=true"),
+                )
+                .json(&serde_json::json!({"query": query}))
+                .send()
+                .map_err(|e| anyhow!("delete_by_query: {e}"))
+            },
+            |resp| {
+                let status = resp.status();
+                let body: Value = resp.json().unwrap_or(Value::Null);
+                if status.is_success()
+                    && body
+                        .get("failures")
+                        .and_then(Value::as_array)
+                        .is_none_or(Vec::is_empty)
+                {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "POST /{index}/_delete_by_query failed: HTTP {status}: {body}"
+                    ))
+                }
+            },
+        )
     }
 
     pub fn refresh(&self, pattern: &str) -> Result<()> {

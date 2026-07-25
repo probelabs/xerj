@@ -10,6 +10,10 @@ pub struct FileEntry {
     pub path: PathBuf,
     /// Root-relative path with forward slashes — the stable `ax_path` value.
     pub rel: String,
+    /// Reversible platform-native identity; unlike `rel`, never lossy.
+    pub rel_id: String,
+    /// True when the discovered path itself is a symlink (target metadata follows).
+    pub is_symlink: bool,
     pub size: u64,
 }
 
@@ -42,13 +46,46 @@ pub fn walk(root: &Path, follow_symlinks: bool) -> Result<Vec<FileEntry>> {
             .unwrap_or(&p)
             .to_string_lossy()
             .replace('\\', "/");
+        let rel_id = stable_path_id(p.strip_prefix(&root_canon).unwrap_or(&p));
         out.push(FileEntry {
             path: p,
             rel,
+            rel_id,
+            is_symlink: entry
+                .path()
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink()),
             size: md.len(),
         });
     }
     // Deterministic order for clustering / naming.
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
+}
+
+#[cfg(unix)]
+fn stable_path_id(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::from("unix:");
+    for byte in path.as_os_str().as_bytes() {
+        use std::fmt::Write;
+        write!(out, "{byte:02x}").expect("write string");
+    }
+    out
+}
+
+#[cfg(windows)]
+fn stable_path_id(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    let mut out = String::from("windows:");
+    for unit in path.as_os_str().encode_wide() {
+        use std::fmt::Write;
+        write!(out, "{unit:04x}").expect("write string");
+    }
+    out
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stable_path_id(path: &Path) -> String {
+    format!("other:{}", path.to_string_lossy())
 }
