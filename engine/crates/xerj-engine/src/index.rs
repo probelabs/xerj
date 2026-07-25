@@ -18356,9 +18356,47 @@ fn apply_copy_to(source: &Value, schema: &Schema) -> Value {
     Value::Object(result)
 }
 
+/// ES's default `date_detection`: a string field with no explicit mapping
+/// (from a template or the user) is inferred as `date` when its value fully
+/// parses as a standard date/time format — real ES tries
+/// `strict_date_optional_time` (an ISO-8601 date or date-time, optional
+/// fractional seconds/offset) plus `epoch_millis` before giving up and
+/// falling back to `text`. xerj had no such check at all: every string
+/// field, including an ISO timestamp, was unconditionally inferred as
+/// `text` — e.g. xerj's own `xerj-monitoring` index (auto-created via
+/// `get_or_create_index`, no template covers it) ends up with `timestamp`
+/// mapped `text` instead of `date`.
+///
+/// The byte-prefix pre-check mirrors the one already used for sort-value
+/// date normalisation below (`looks_date`) — date-shaped strings always
+/// start `DDDD-`, so this skips the parser entirely for the overwhelming
+/// majority of string fields that aren't dates at all.
+fn looks_like_date_string(s: &str) -> bool {
+    let b = s.as_bytes();
+    let looks_date = b.len() >= 10
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4] == b'-';
+    if !looks_date {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(s).is_ok()
+        || chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+        || chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").is_ok()
+        || chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+}
+
 fn infer_field_type(val: &Value) -> FieldType {
     match val {
-        Value::String(_) => FieldType::Text,
+        Value::String(s) => {
+            if looks_like_date_string(s) {
+                FieldType::Date
+            } else {
+                FieldType::Text
+            }
+        }
         Value::Number(n) => {
             if n.is_f64() {
                 FieldType::Double
