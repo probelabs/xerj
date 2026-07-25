@@ -26,6 +26,49 @@ pub struct PlanDataset {
     pub file_count: usize,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Journal;
+
+    #[test]
+    fn legacy_journal_can_resume_with_a_custom_operational_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("journal.ndjson"),
+            concat!(
+                "{\"v\":1,\"kind\":\"run\",\"root\":\"root\",\"url\":\"url\",",
+                "\"prefix\":\"prefix\",\"run_id\":\"legacy\"}\n"
+            ),
+        )
+        .unwrap();
+        let journal = Journal::open(dir.path(), "root", "url", "prefix", 3600, false).unwrap();
+        assert!(journal.resumed);
+        drop(journal);
+        let text = std::fs::read_to_string(dir.path().join("journal.ndjson")).unwrap();
+        assert!(text.contains("\"kind\":\"resume\""));
+        assert!(text.contains("\"bulk_timeout_secs\":3600"));
+    }
+
+    #[test]
+    fn fresh_journal_records_each_runs_effective_operational_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path(), "root", "url", "prefix", 3600, true).unwrap();
+        drop(journal);
+        let text = std::fs::read_to_string(dir.path().join("journal.ndjson")).unwrap();
+        assert!(text.contains("\"bulk_timeout_secs\":3600"));
+        assert!(
+            Journal::open(dir.path(), "root", "url", "prefix", 900, false)
+                .unwrap()
+                .resumed
+        );
+        let text = std::fs::read_to_string(dir.path().join("journal.ndjson")).unwrap();
+        assert!(text.contains("\"kind\":\"run\""));
+        assert!(text.contains("\"bulk_timeout_secs\":3600"));
+        assert!(text.contains("\"kind\":\"resume\""));
+        assert!(text.contains("\"bulk_timeout_secs\":900"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileAssignment {
     pub rel: String,
@@ -87,6 +130,7 @@ impl Journal {
         root: &str,
         url: &str,
         prefix: &str,
+        bulk_timeout_secs: u64,
         fresh: bool,
     ) -> Result<Journal> {
         std::fs::create_dir_all(state_dir)
@@ -168,11 +212,13 @@ impl Journal {
         if is_new {
             j.append(&serde_json::json!({
                 "v": 1, "kind": "run", "root": root, "url": url, "prefix": prefix,
+                "bulk_timeout_secs": bulk_timeout_secs,
                 "run_id": run_id, "started": chrono::Utc::now().to_rfc3339(),
             }))?;
         } else {
             j.append(&serde_json::json!({
-                "kind": "resume", "at": chrono::Utc::now().to_rfc3339(),
+                "kind": "resume", "bulk_timeout_secs": bulk_timeout_secs,
+                "at": chrono::Utc::now().to_rfc3339(),
             }))?;
         }
         Ok(j)
