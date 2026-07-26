@@ -14012,15 +14012,25 @@ impl Index {
                         let Some(Column::Keyword(k)) = cols.get(field.as_str()) else {
                             return None;
                         };
-                        // Narrow to the leading literal's prefix range, then
-                        // run the SAME matcher as the brute path over the
-                        // (distinct) dictionary terms so match semantics
-                        // cannot drift.
-                        let lit: &str = pattern.split(['*', '?']).next().unwrap_or("");
-                        let lo = k.terms.partition_point(|t| t.as_str() < lit);
-                        let hi = lo + k.terms[lo..].partition_point(|t| t.starts_with(lit));
-                        let ords: Vec<u32> = (lo..hi)
-                            .filter(|&o| wildcard_match(&k.terms[o], pattern))
+                        // SAME predicate as the brute path (`doc_matches_query`)
+                        // and the FST route (`term_matches_wildcard`): fold BOTH
+                        // sides, whole-value OR sub-token.  The old range+match
+                        // here was case-SENSITIVE, so a cased pattern (`K*1`,
+                        // case_insensitive) found nothing in a lowercase
+                        // dictionary — DV-only keyword wildcards returned 0 hits
+                        // from segments while the memtable matched.  A folded
+                        // pattern cannot bound a byte-ordered prefix range, so
+                        // walk the whole (distinct-term) dictionary — the same
+                        // cost class as the FST expansion.
+                        let pat_lc = pattern.to_lowercase();
+                        let ords: Vec<u32> = (0..k.terms.len())
+                            .filter(|&o| {
+                                let lc = k.terms[o].to_lowercase();
+                                wildcard_match(&lc, &pat_lc)
+                                    || lc
+                                        .split(|c: char| !c.is_alphanumeric())
+                                        .any(|tok| !tok.is_empty() && wildcard_match(tok, &pat_lc))
+                            })
                             .map(|o| o as u32)
                             .collect();
                         fev.push(FilterEval::Kw {
@@ -24367,6 +24377,7 @@ fn query_node_to_fts(
             query,
             operator,
             boost,
+            analyzer,
             ..
         } => {
             // Per-clause boost (ES `{"match": {"f": {"query": …, "boost": N}}}`)
@@ -24383,8 +24394,12 @@ fn query_node_to_fts(
             }
             // Tokenize and produce a bool query over terms. Honour the
             // operator: AND → every token must match; OR → any token.
+            // The query-side `analyzer` changes MATCHING, not just scoring:
+            // `whitespace` preserves case, so "BROWN" must never equal the
+            // lowercased indexed term "brown". An unknown analyzer name
+            // projects to None → correct (slower) stored-doc scan.
             let registry = AnalyzerRegistry::default();
-            let analyzer = registry.get_analyzer("standard")?;
+            let analyzer = registry.get_analyzer(analyzer.as_deref().unwrap_or("standard"))?;
             let tokens = analyzer.analyze(query);
             if tokens.is_empty() {
                 return None;
@@ -24523,9 +24538,25 @@ fn query_node_to_fts(
             should,
             must_not,
             filter,
-            ..
+            minimum_should_match,
         } => {
             let mut bool_q = FtsBool::new();
+            // `minimum_should_match` changes MATCHING, not just scoring, and
+            // the FTS bool evaluator (`execute_bool`) enforces it — dropping
+            // it here made the segment path union the should-clauses while
+            // the memtable/stored-scan enforced it (hits.total 3 vs 1).
+            match minimum_should_match {
+                None => {}
+                Some(MinShouldMatch::Fixed(n)) => bool_q = bool_q.min_should_match(*n),
+                // Mirror `doc_matches_query`: floor of the percentage, min 1.
+                Some(MinShouldMatch::Percentage(pct)) => {
+                    let n = ((should.len() as f32 * (*pct as f32 / 100.0)).floor() as u32).max(1);
+                    bool_q = bool_q.min_should_match(n);
+                }
+                // Per-doc counts (terms_set field/script) need the doc source
+                // — not projectable; fall back to the stored-doc scan.
+                Some(_) => return None,
+            }
             let mut projected_any = false;
             // CRITICAL: if a `must` child can't be projected to FTS we
             // CANNOT lift just the projectable subset — the bool would
