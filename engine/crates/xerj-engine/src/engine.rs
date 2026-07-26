@@ -444,6 +444,12 @@ impl Engine {
                         // so GET /_mapping and mapping-dependent code paths see
                         // the same mapping as pre-restart.
                         engine.load_persisted_es_mapping(&name_str);
+                        // The index isn't registered yet, so the propagation
+                        // inside load can't find it — set the toggles on the
+                        // local handle instead.
+                        if let Some(m) = engine.index_mappings.get(name_str.as_str()) {
+                            Engine::apply_date_mapping_flags(&idx, m.value());
+                        }
                         engine.indices.insert(name_str, idx);
                     }
                     Err(e) => {
@@ -785,7 +791,72 @@ impl Engine {
                 }
             }
         }
+        self.propagate_date_detection(name, &mapping);
         self.index_mappings.insert(name.to_string(), mapping);
+    }
+
+    /// Push the mapping's `date_detection` toggle (default true) down to the
+    /// open `Index` so dynamic inference honors it. The blob shape varies by
+    /// caller (`{"date_detection": ..}` from PUT /_mapping, or nested under
+    /// `"mappings"` from index-create), so both levels are checked.
+    fn propagate_date_detection(&self, name: &str, mapping: &Value) {
+        if let Ok(idx) = self.get_index(name) {
+            Self::apply_date_mapping_flags(&idx, mapping);
+        }
+    }
+
+    /// Push both date-related mapping toggles down to an open index:
+    /// the `date_detection` bool and the set of date fields excluded from
+    /// default-format ingest validation (explicit `format` — those are
+    /// validated against their own format by the bulk path — or
+    /// `ignore_malformed`).
+    pub(crate) fn apply_date_mapping_flags(idx: &crate::index::Index, mapping: &Value) {
+        idx.set_date_detection(Self::mapping_date_detection(mapping));
+        idx.set_date_format_exclusions(Self::mapping_date_exclusions(mapping));
+    }
+
+    /// Read the `date_detection` toggle out of a raw mapping blob
+    /// (defaulting to true, like ES).
+    pub(crate) fn mapping_date_detection(mapping: &Value) -> bool {
+        mapping
+            .get("date_detection")
+            .or_else(|| {
+                mapping
+                    .get("mappings")
+                    .and_then(|m| m.get("date_detection"))
+            })
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    /// Top-level date fields carrying an explicit `format` or
+    /// `ignore_malformed` in the raw mapping blob (either shape).
+    fn mapping_date_exclusions(mapping: &Value) -> std::collections::HashSet<String> {
+        let props = mapping
+            .get("properties")
+            .or_else(|| mapping.get("mappings").and_then(|m| m.get("properties")));
+        let mut out = std::collections::HashSet::new();
+        let Some(obj) = props.and_then(Value::as_object) else {
+            return out;
+        };
+        for (fname, spec) in obj {
+            let ftype = spec.get("type").and_then(Value::as_str).unwrap_or("");
+            if ftype != "date" && ftype != "date_nanos" {
+                continue;
+            }
+            let has_format = spec
+                .get("format")
+                .and_then(Value::as_str)
+                .is_some_and(|f| !f.is_empty());
+            let ignore_malformed = spec
+                .get("ignore_malformed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if has_format || ignore_malformed {
+                out.insert(fname.clone());
+            }
+        }
+        out
     }
 
     /// Load a previously-persisted raw ES mapping blob for `name` (if any)
@@ -800,6 +871,7 @@ impl Engine {
         };
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(mapping) => {
+                self.propagate_date_detection(name, &mapping);
                 self.index_mappings.insert(name.to_string(), mapping);
             }
             Err(e) => {
@@ -1586,6 +1658,9 @@ impl Engine {
                     // Snapshot dirs carry es_mapping.json — reload it so the
                     // restored index serves the same mapping it was saved with.
                     self.load_persisted_es_mapping(idx_name);
+                    if let Some(m) = self.index_mappings.get(idx_name) {
+                        Engine::apply_date_mapping_flags(&idx, m.value());
+                    }
                     self.indices.insert(idx_name.clone(), idx);
                     info!(index = idx_name, "index restored from snapshot");
                 }

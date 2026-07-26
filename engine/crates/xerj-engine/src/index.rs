@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use regex::Regex;
@@ -1073,6 +1073,22 @@ type PublicationTestHook = Arc<dyn Fn(&str, PublicationTestPoint) + Send + Sync 
 pub struct Index {
     name: IndexName,
     schema: Arc<RwLock<ManagedSchema>>,
+    /// ES `date_detection` mapping toggle (default true). Consulted by
+    /// dynamic inference only — an explicit `date_detection: false` in the
+    /// index mapping keeps first-seen ISO-looking strings mapped as `text`.
+    /// Owned here (not in `ManagedSchema`) because the raw mapping blob is
+    /// API-layer state (`engine.index_mappings`); the engine propagates the
+    /// flag on create/open/put-mapping via [`Index::set_date_detection`].
+    date_detection: AtomicBool,
+    /// Fast bail for ingest date validation: true once the schema holds any
+    /// `date`-typed field (set at construction and when dynamic inference
+    /// adds one; never unset — a stale `true` only costs a schema read).
+    has_date_fields: AtomicBool,
+    /// Date fields whose mapping declares an explicit `format` (validated
+    /// against that format by `bulk::find_bad_date_field`) or
+    /// `ignore_malformed` — excluded from the engine's default-format
+    /// ingest validation. Engine-propagated alongside `date_detection`.
+    date_format_exclusions: std::sync::RwLock<Arc<std::collections::HashSet<String>>>,
     store: Arc<IndexStore>,
     /// 16-shard FTS memtable.  Replaces the pre-v16 single
     /// `Arc<RwLock<FtsMemtable>>` that serialized all concurrent bulk
@@ -1601,9 +1617,16 @@ impl Index {
         let registry = Arc::new(build_registry_from_settings(&settings));
 
         info!(name = name.as_str(), "index created");
+        let has_dates = managed
+            .fields()
+            .iter()
+            .any(|f| matches!(f.field_type, FieldType::Date));
         let index = Arc::new(Self {
             name,
             schema: Arc::new(RwLock::new(managed)),
+            date_detection: AtomicBool::new(true),
+            has_date_fields: AtomicBool::new(has_dates),
+            date_format_exclusions: std::sync::RwLock::new(Arc::new(Default::default())),
             store,
             memtable: Arc::new(
                 crate::memtable::ShardedFtsMemtable::with_registry_and_shards(
@@ -1875,9 +1898,16 @@ impl Index {
             doc_count = total_doc_count,
             "index opened"
         );
+        let has_dates = schema
+            .fields()
+            .iter()
+            .any(|f| matches!(f.field_type, FieldType::Date));
         let index = Arc::new(Self {
             name,
             schema: Arc::new(RwLock::new(schema)),
+            date_detection: AtomicBool::new(true),
+            has_date_fields: AtomicBool::new(has_dates),
+            date_format_exclusions: std::sync::RwLock::new(Arc::new(Default::default())),
             max_concurrent_queries: Arc::new(Semaphore::new(64)),
             #[cfg(test)]
             test_scan_checkpoint_delay_ms: Arc::new(AtomicU64::new(0)),
@@ -2076,6 +2106,9 @@ impl Index {
                 "write",
             )));
         }
+        // Default-format date validation — before any durable write so a
+        // rejected doc leaves no WAL/memtable trace.
+        self.validate_default_format_dates(&source).await?;
         // Process-wide admission: disk flood-stage block (item 3) + parent
         // memory circuit breaker (item 1). Fires before any per-index work.
         self.governor_write_gate()?;
@@ -11718,6 +11751,77 @@ impl Index {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// Set the ES `date_detection` toggle for dynamic inference. Called by
+    /// the engine whenever the index mapping is created, loaded from disk,
+    /// or replaced via PUT /_mapping.
+    pub fn set_date_detection(&self, on: bool) {
+        self.date_detection.store(on, Ordering::Relaxed);
+    }
+
+    /// Current `date_detection` state (default true, like ES).
+    pub fn date_detection_enabled(&self) -> bool {
+        self.date_detection.load(Ordering::Relaxed)
+    }
+
+    /// Replace the set of date fields excluded from default-format ingest
+    /// validation (fields with an explicit mapping `format` — validated
+    /// separately by `bulk::find_bad_date_field` — or `ignore_malformed`).
+    /// Engine-propagated together with [`Index::set_date_detection`].
+    pub fn set_date_format_exclusions(&self, excluded: std::collections::HashSet<String>) {
+        if let Ok(mut guard) = self.date_format_exclusions.write() {
+            *guard = Arc::new(excluded);
+        }
+    }
+
+    /// Reject documents whose value for a DEFAULT-format date field (most
+    /// importantly a dynamically-inferred one) cannot possibly parse under
+    /// ES's default `strict_date_optional_time||epoch_millis` — real ES
+    /// answers 400 `mapper_parsing_exception`; xerj previously accepted the
+    /// doc silently, leaving the value invisible to range queries, sorts,
+    /// and Kibana time filters. Runs on the per-doc write funnel only; the
+    /// raw-bytes turbo batch paths intentionally skip it (they never parse
+    /// doc bodies — same envelope as the pre-existing explicit-format
+    /// validation, which routes strict-format indexes off turbo entirely).
+    async fn validate_default_format_dates(&self, source: &Value) -> Result<()> {
+        if !self.has_date_fields.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let Some(obj) = source.as_object() else {
+            return Ok(());
+        };
+        let exclusions = self
+            .date_format_exclusions
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_default();
+        let schema = self.schema.read().await;
+        for (key, val) in obj {
+            if val.is_null() {
+                continue;
+            }
+            let Some(fc) = schema.field(key) else {
+                continue;
+            };
+            if !matches!(fc.field_type, FieldType::Date) || exclusions.contains(key) {
+                continue;
+            }
+            if !default_format_date_value_ok(val) {
+                let preview: String = match val {
+                    Value::String(s) => s.chars().take(64).collect(),
+                    other => other.to_string().chars().take(64).collect(),
+                };
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::InvalidMapping {
+                        reason: format!(
+                            "failed to parse field [{key}] of type [date] with value [{preview}]"
+                        ),
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Batch variant of [`evolve_schema_from_doc`]: one schema read-lock
     /// acquisition for the WHOLE batch instead of one per doc.  The per-doc
     /// variant paid a tokio `RwLock::read().await` per document — measured
@@ -11735,6 +11839,7 @@ impl Index {
             if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
                 return;
             }
+            let date_detection = self.date_detection_enabled();
             let mut out: Vec<(String, FieldConfig)> = Vec::new();
             for source in sources {
                 let Some(obj) = source.as_object() else {
@@ -11742,7 +11847,7 @@ impl Index {
                 };
                 for (key, val) in obj {
                     if !schema.schema.has_field(key) && !out.iter().any(|(k, _)| k == key) {
-                        let ft = infer_field_type(val);
+                        let ft = infer_field_type(val, date_detection);
                         out.push((key.clone(), FieldConfig::new(key.clone(), ft)));
                     }
                 }
@@ -11761,6 +11866,9 @@ impl Index {
         let mut schema_changed = false;
         for (_, fc) in new_fields {
             if !schema.schema.has_field(&fc.name) {
+                if matches!(fc.field_type, FieldType::Date) {
+                    self.has_date_fields.store(true, Ordering::Relaxed);
+                }
                 let _ = schema.schema.add_field(fc);
                 schema_changed = true;
             }
@@ -11785,10 +11893,11 @@ impl Index {
             if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
                 return;
             }
+            let date_detection = self.date_detection_enabled();
             obj.iter()
                 .filter(|(key, _)| !schema.schema.has_field(key))
                 .map(|(key, val)| {
-                    let ft = infer_field_type(val);
+                    let ft = infer_field_type(val, date_detection);
                     (key.clone(), FieldConfig::new(key.clone(), ft))
                 })
                 .collect()
@@ -11808,6 +11917,9 @@ impl Index {
         let mut schema_changed = false;
         for (_, fc) in new_fields {
             if !schema.schema.has_field(&fc.name) {
+                if matches!(fc.field_type, FieldType::Date) {
+                    self.has_date_fields.store(true, Ordering::Relaxed);
+                }
                 let _ = schema.schema.add_field(fc);
                 schema_changed = true;
             }
@@ -19712,9 +19824,96 @@ fn apply_copy_to(source: &Value, schema: &Schema) -> Value {
     Value::Object(result)
 }
 
-fn infer_field_type(val: &Value) -> FieldType {
+/// ES's default `date_detection`: a string field with no explicit mapping
+/// (from a template or the user) is inferred as `date` when its value fully
+/// parses as a standard date/time format — real ES tries its default
+/// `dynamic_date_formats` (`strict_date_optional_time` — an ISO-8601 date or
+/// date-time with optional fractional seconds/offset — plus the
+/// `yyyy/MM/dd`-style second default) before giving up and falling back to
+/// `text`; numeric strings are NOT date-detected. xerj had no such check at all: every string
+/// field, including an ISO timestamp, was unconditionally inferred as
+/// `text` — e.g. xerj's own `xerj-monitoring` index (auto-created via
+/// `get_or_create_index`, no template covers it) ends up with `timestamp`
+/// mapped `text` instead of `date`.
+///
+/// The byte-prefix pre-check mirrors the one already used for sort-value
+/// date normalisation below (`looks_date`) — date-shaped strings always
+/// start `DDDD-`, so this skips the parser entirely for the overwhelming
+/// majority of string fields that aren't dates at all.
+fn looks_like_date_string(s: &str) -> bool {
+    let b = s.as_bytes();
+    let looks_date = b.len() >= 10
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4] == b'-';
+    if !looks_date {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(s).is_ok()
+        || chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+        || chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").is_ok()
+        || chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+}
+
+/// Can `v` be a value of a DEFAULT-format date field
+/// (`strict_date_optional_time||epoch_millis`)? Used at ingest to reject
+/// values ES would refuse with `mapper_parsing_exception` — most importantly
+/// for dynamically-inferred date fields, which previously swallowed any
+/// later garbage silently (invisible to range queries, sorts, and Kibana
+/// time filters).
+///
+/// Deliberately LENIENT in what it accepts (year-only "2024", year-month
+/// "2024-07", any "yyyy-MM-ddT…" tail, epoch numbers/strings): a false
+/// accept preserves the old behavior, a false reject would break valid
+/// ingest, so only shapes that cannot possibly parse under the default
+/// formats are rejected.
+pub(crate) fn default_format_date_value_ok(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Number(_) => true, // epoch_millis
+        Value::Array(arr) => arr.iter().all(default_format_date_value_ok),
+        Value::String(s) => {
+            let s = s.trim();
+            if s.parse::<i64>().is_ok() {
+                return true; // epoch_millis as string (also bare "2024")
+            }
+            let b = s.as_bytes();
+            // yyyy prefix is mandatory for every non-epoch default format.
+            if b.len() < 4 || !b[..4].iter().all(u8::is_ascii_digit) {
+                return false;
+            }
+            match b.len() {
+                4 => true,                                                           // yyyy
+                7 => b[4] == b'-' && b[5].is_ascii_digit() && b[6].is_ascii_digit(), // yyyy-MM
+                _ => {
+                    // yyyy-MM-dd with an optional T… time tail. The tail is
+                    // not re-validated (lenient by design, see above).
+                    b.len() >= 10
+                        && b[4] == b'-'
+                        && b[7] == b'-'
+                        && b[5].is_ascii_digit()
+                        && b[6].is_ascii_digit()
+                        && b[8].is_ascii_digit()
+                        && b[9].is_ascii_digit()
+                        && (b.len() == 10 || b[10] == b'T' || b[10] == b't')
+                }
+            }
+        }
+        Value::Bool(_) | Value::Object(_) => false,
+    }
+}
+
+fn infer_field_type(val: &Value, date_detection: bool) -> FieldType {
     match val {
-        Value::String(_) => FieldType::Text,
+        Value::String(s) => {
+            if date_detection && looks_like_date_string(s) {
+                FieldType::Date
+            } else {
+                FieldType::Text
+            }
+        }
         Value::Number(n) => {
             if n.is_f64() {
                 FieldType::Double
@@ -19727,7 +19926,7 @@ fn infer_field_type(val: &Value) -> FieldType {
             // Detect type from first non-null element in the array.
             arr.iter()
                 .find(|v| !v.is_null())
-                .map(infer_field_type)
+                .map(|v| infer_field_type(v, date_detection))
                 .unwrap_or(FieldType::Text)
         }
         Value::Object(_) => FieldType::Object,
@@ -26654,6 +26853,84 @@ fn build_registry_from_settings(settings: &Value) -> AnalyzerRegistry {
 
     registry.apply_settings(analysis_root);
     registry
+}
+
+#[cfg(test)]
+mod date_detection_tests {
+    use super::*;
+
+    /// Pins the accept/reject envelope of dynamic date inference.
+    #[test]
+    fn looks_like_date_string_envelope() {
+        for good in [
+            "2026-07-25",
+            "2026-07-25T10:30:00",
+            "2026-07-25T10:30:00.123",
+            "2026-07-25T10:30:00Z",
+            "2026-07-25T10:30:00+02:00",
+        ] {
+            assert!(looks_like_date_string(good), "{good} should detect as date");
+        }
+        for bad in [
+            "n/a",
+            "hello",
+            "2026",           // conservative: bare year stays text
+            "2026-07",        // conservative: year-month stays text
+            "2026/07/25",     // slash format not in the detection set
+            "2026-invoice-1", // date-shaped prefix, garbage tail
+            "20260725",
+            "",
+        ] {
+            assert!(!looks_like_date_string(bad), "{bad} should stay text");
+        }
+    }
+
+    /// `date_detection: false` forces first-seen ISO strings to `text`.
+    #[test]
+    fn infer_respects_date_detection_toggle() {
+        let iso = Value::String("2026-07-25T10:30:00Z".into());
+        assert!(matches!(infer_field_type(&iso, true), FieldType::Date));
+        assert!(matches!(infer_field_type(&iso, false), FieldType::Text));
+        // Arrays follow the first non-null element under the same toggle.
+        let arr = serde_json::json!([null, "2026-07-25"]);
+        assert!(matches!(infer_field_type(&arr, true), FieldType::Date));
+        assert!(matches!(infer_field_type(&arr, false), FieldType::Text));
+        // Numbers are never date-detected.
+        let num = serde_json::json!(1721900000000i64);
+        assert!(matches!(infer_field_type(&num, true), FieldType::Long));
+    }
+
+    /// Ingest-time acceptance for default-format date fields: lenient on
+    /// everything ES could parse, rejecting only impossible shapes.
+    #[test]
+    fn default_format_date_value_envelope() {
+        for ok in [
+            serde_json::json!(null),
+            serde_json::json!(1721900000000i64),
+            serde_json::json!("1721900000000"),
+            serde_json::json!("2026"),
+            serde_json::json!("2026-07"),
+            serde_json::json!("2026-07-25"),
+            serde_json::json!("2026-07-25T10:30"), // partial time is valid ES
+            serde_json::json!("2026-07-25T10:30:00.123+02:00"),
+            serde_json::json!(["2026-07-25", null, 1721900000000i64]),
+        ] {
+            assert!(default_format_date_value_ok(&ok), "{ok} must be accepted");
+        }
+        for bad in [
+            serde_json::json!("n/a"),
+            serde_json::json!("hello"),
+            serde_json::json!("2026/07/25"),
+            serde_json::json!(true),
+            serde_json::json!({"nested": 1}),
+            serde_json::json!(["2026-07-25", "n/a"]),
+        ] {
+            assert!(
+                !default_format_date_value_ok(&bad),
+                "{bad} must be rejected"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

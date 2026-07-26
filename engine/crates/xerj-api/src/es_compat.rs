@@ -1433,6 +1433,9 @@ pub async fn put_mapping(
             if let Some(dyn_val) = body.get("dynamic") {
                 obj.insert("dynamic".into(), dyn_val.clone());
             }
+            if let Some(dd) = body.get("date_detection") {
+                obj.insert("date_detection".into(), dd.clone());
+            }
         } else {
             existing = body.clone();
         }
