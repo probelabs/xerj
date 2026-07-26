@@ -1077,8 +1077,17 @@ async fn get_index_inner(
             }
             continue;
         }
-        // Exact name.
-        if all.iter().any(|info| info.name == part) {
+        // Exact name — could be a real index, or an alias pointing at one
+        // (ES/OpenSearch accept both interchangeably on GET /{index}; e.g.
+        // Kibana/OSD resolve `.kibana` — always an alias, never a bare
+        // index — through this exact endpoint).
+        if let Some(targets) = state.engine.aliases.get(part) {
+            for n in targets.value() {
+                if !selected.contains(n) {
+                    selected.push(n.clone());
+                }
+            }
+        } else if all.iter().any(|info| info.name == part) {
             if !selected.contains(&part.to_string()) {
                 selected.push(part.to_string());
             }
@@ -14434,8 +14443,23 @@ async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
             }
             continue;
         }
-        // Exact name — include whether or not it exists; the caller decides.
-        if !out.contains(&part.to_string()) {
+        // Exact name — could be a real index, OR an alias pointing at one
+        // (real ES/OpenSearch accept both interchangeably on every
+        // single-index endpoint: GET/_mapping/_settings/etc.). Resolve to
+        // the underlying real index name(s) so callers keying their
+        // response by `name` (e.g. get_mapping's `index_mappings` lookup)
+        // hit the actually-stored entry instead of silently missing and
+        // falling back to a schema-derived reconstruction that drops
+        // fields like mappings._meta. Falls back to the literal name
+        // (include whether or not it exists; the caller decides) when it
+        // isn't a known alias either.
+        if let Some(targets) = state.engine.aliases.get(part) {
+            for n in targets.value() {
+                if !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+        } else if !out.contains(&part.to_string()) {
             out.push(part.to_string());
         }
     }
