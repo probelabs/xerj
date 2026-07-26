@@ -6144,6 +6144,7 @@ dependencies = [
  "fst",
  "lz4_flex",
  "memmap2",
+ "rayon",
  "roaring",
  "rustc-hash",
  "serde",

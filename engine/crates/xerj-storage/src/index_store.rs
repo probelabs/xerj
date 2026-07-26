@@ -310,6 +310,68 @@ pub struct IndexStoreConfig {
     pub num_wal_shards: usize,
 }
 
+/// A raw JSON batch that has been completely validated before publication.
+///
+/// Fields are private so callers cannot bypass validation and hand malformed
+/// bytes to the WAL writer.  The parsed form is retained only when requested
+/// by an engine path that will reuse it for schema/FTS work.
+pub type RawJsonDoc = (String, std::sync::Arc<[u8]>);
+pub type ParsedRawSources = Vec<std::sync::Arc<serde_json::Value>>;
+
+#[derive(Debug)]
+pub struct ValidatedRawBatch {
+    docs: Vec<RawJsonDoc>,
+    parsed: Option<ParsedRawSources>,
+}
+
+impl ValidatedRawBatch {
+    pub fn docs(&self) -> &[RawJsonDoc] {
+        &self.docs
+    }
+
+    pub fn parsed(&self) -> Option<&[std::sync::Arc<serde_json::Value>]> {
+        self.parsed.as_deref()
+    }
+
+    pub fn into_parts(self) -> (Vec<RawJsonDoc>, Option<ParsedRawSources>) {
+        (self.docs, self.parsed)
+    }
+}
+
+const MAX_RAW_JSON_NESTING: usize = 128;
+
+fn validate_raw_json_nesting(bytes: &[u8]) -> std::result::Result<(), String> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > MAX_RAW_JSON_NESTING {
+                    return Err(format!(
+                        "JSON nesting exceeds the supported limit of {MAX_RAW_JSON_NESTING}"
+                    ));
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl Default for IndexStoreConfig {
     fn default() -> Self {
         Self {
@@ -2889,10 +2951,72 @@ impl IndexStore {
     ///
     /// All on-disk framing is byte-identical to `wal_append_batch`; the
     /// two entries interleave freely in the WAL.
-    pub fn wal_append_batch_raw(
-        &self,
-        docs: &[(String, std::sync::Arc<[u8]>)],
-    ) -> Result<Vec<SeqNo>> {
+    /// Validate raw JSON without materializing a DOM.  The returned sealed
+    /// value is the only input accepted by [`Self::wal_append_batch_raw`].
+    pub fn validate_raw_batch(docs: Vec<RawJsonDoc>) -> Result<ValidatedRawBatch> {
+        use rayon::prelude::*;
+        docs.par_iter()
+            .enumerate()
+            .map(|(position, (doc_id, source_bytes))| {
+                validate_raw_json_nesting(source_bytes).map_err(|reason| {
+                    StorageError::RawBatchValidation {
+                        doc_id: doc_id.clone(),
+                        position: position + 1,
+                        reason,
+                    }
+                })?;
+                serde_json::from_slice::<serde::de::IgnoredAny>(source_bytes)
+                    .map(|_| ())
+                    .map_err(|error| StorageError::RawBatchValidation {
+                        doc_id: doc_id.clone(),
+                        position: position + 1,
+                        reason: error.to_string(),
+                    })
+            })
+            .collect::<Result<()>>()?;
+        Ok(ValidatedRawBatch { docs, parsed: None })
+    }
+
+    /// Validate and retain parsed values for callers that need both WAL bytes
+    /// and a JSON DOM.  This keeps the async raw ingest path to one parse.
+    pub fn parse_raw_batch(docs: Vec<RawJsonDoc>) -> Result<ValidatedRawBatch> {
+        use rayon::prelude::*;
+        let parsed = docs
+            .par_iter()
+            .enumerate()
+            .map(|(position, (doc_id, source_bytes))| {
+                validate_raw_json_nesting(source_bytes).map_err(|reason| {
+                    StorageError::RawBatchValidation {
+                        doc_id: doc_id.clone(),
+                        position: position + 1,
+                        reason,
+                    }
+                })?;
+                serde_json::from_slice(source_bytes)
+                    .map(std::sync::Arc::new)
+                    .map_err(|error| StorageError::RawBatchValidation {
+                        doc_id: doc_id.clone(),
+                        position: position + 1,
+                        reason: error.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ValidatedRawBatch {
+            docs,
+            parsed: Some(parsed),
+        })
+    }
+
+    /// Materialize parsed values from a batch whose complete JSON syntax was
+    /// already validated. This consumes the sealed proof and retains the
+    /// original immutable bytes alongside the DOM.
+    pub fn parse_validated_raw_batch(batch: ValidatedRawBatch) -> Result<ValidatedRawBatch> {
+        debug_assert!(batch.parsed.is_none());
+        Self::parse_raw_batch(batch.docs)
+    }
+
+    pub fn wal_append_batch_raw(&self, batch: &ValidatedRawBatch) -> Result<Vec<SeqNo>> {
+        let docs = batch.docs();
         if docs.is_empty() {
             return Ok(Vec::new());
         }
@@ -3010,17 +3134,15 @@ impl IndexStore {
         Ok(seq_nos)
     }
 
-    // The `docs` slice element is a WAL-batch tuple (doc_id, source JSON,
-    // pre-serialized bytes); the shape is part of the public batch API so we
-    // keep it inline rather than refactor the signature.
-    #[allow(clippy::type_complexity)]
+    /// Append parsed documents to the WAL.
+    ///
+    /// The parsed `Value` is the sole authority and is serialized here.
+    /// Accepting a second caller-provided byte representation made it possible
+    /// for live indexing and replay to observe different documents; verifying
+    /// that representation required a second full DOM parse on the hot path.
     pub fn wal_append_batch(
         &self,
-        docs: &[(
-            String,
-            std::sync::Arc<serde_json::Value>,
-            std::sync::Arc<[u8]>,
-        )],
+        docs: &[(String, std::sync::Arc<serde_json::Value>)],
     ) -> Result<Vec<SeqNo>> {
         if docs.is_empty() {
             return Ok(Vec::new());
@@ -3062,24 +3184,12 @@ impl IndexStore {
         let mut seq_nos: Vec<SeqNo> = Vec::with_capacity(docs.len());
 
         // Estimate total frame size: per-doc overhead ~80 bytes + source
-        let est_total: usize = docs
-            .iter()
-            .map(|(id, _, sb)| id.len() + sb.len() + 100)
-            .sum();
+        let est_total: usize = docs.iter().map(|(id, _source)| id.len() + 600).sum();
         let mut frames: Vec<u8> = Vec::with_capacity(est_total);
 
-        for (i, (doc_id, source, source_bytes)) in docs.iter().enumerate() {
+        for (i, (doc_id, source)) in docs.iter().enumerate() {
             let seq_no = start_seq + i as u64;
             seq_nos.push(seq_no);
-
-            let bytes_to_write: std::borrow::Cow<[u8]> = if !source_bytes.is_empty() {
-                std::borrow::Cow::Borrowed(source_bytes.as_ref())
-            } else {
-                match serde_json::to_vec(source.as_ref()) {
-                    Ok(v) => std::borrow::Cow::Owned(v),
-                    Err(_) => std::borrow::Cow::Owned(b"null".to_vec()),
-                }
-            };
 
             // Build JSON envelope directly
             let payload_start = frames.len();
@@ -3107,7 +3217,7 @@ impl IndexStore {
                 frames.extend_from_slice(doc_id.as_bytes());
             }
             frames.extend_from_slice(br#"","source":"#);
-            frames.extend_from_slice(&bytes_to_write);
+            serde_json::to_writer(&mut frames, source.as_ref())?;
             frames.extend_from_slice(b"}}");
             let payload_end = frames.len();
 
@@ -3198,7 +3308,7 @@ impl IndexStore {
         // lookups before flush resolve to `IN_MEMORY_SEGMENT_ID`.
         // This is the only per-doc side effect this method has
         // outside the WAL itself.
-        for (i, (doc_id, _source, _bytes)) in docs.iter().enumerate() {
+        for (i, (doc_id, _source)) in docs.iter().enumerate() {
             let seq_no = seq_nos[i];
             self.version_map
                 .set(doc_id, seq_no, IN_MEMORY_SEGMENT_ID, false);
@@ -3223,6 +3333,120 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn wal_bytes(store: &IndexStore) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        for entry in std::fs::read_dir(store.wal_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                files.push((
+                    path.file_name().unwrap().into(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    #[test]
+    fn raw_wal_batch_rejects_entire_invalid_batch_without_side_effects() {
+        let invalid_payloads: &[&[u8]] = &[
+            br#"{"truncated":"#,
+            br#"{"valid":true} trailing"#,
+            &[0xff, 0xfe, 0xfd],
+        ];
+
+        for (case, invalid) in invalid_payloads.iter().enumerate() {
+            for bad_at in 0..3 {
+                let dir = tempfile::tempdir().unwrap();
+                let store = open_test_store(dir.path());
+                let before_seq = store.current_seq_no();
+                let before_wal = wal_bytes(&store);
+                let mut docs = vec![
+                    (
+                        "first".to_owned(),
+                        Arc::<[u8]>::from(br#"{"v":1}"#.as_slice()),
+                    ),
+                    (
+                        "middle".to_owned(),
+                        Arc::<[u8]>::from(br#"{"v":2}"#.as_slice()),
+                    ),
+                    (
+                        "last".to_owned(),
+                        Arc::<[u8]>::from(br#"{"v":3}"#.as_slice()),
+                    ),
+                ];
+                docs[bad_at].1 = Arc::<[u8]>::from(*invalid);
+
+                let error = IndexStore::validate_raw_batch(docs.clone()).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        StorageError::RawBatchValidation {
+                            ref doc_id,
+                            position,
+                            ..
+                        } if doc_id == &docs[bad_at].0 && position == bad_at + 1
+                    ),
+                    "case {case}, position {bad_at}: {error:?}"
+                );
+                let rendered = error.to_string();
+                assert!(rendered.contains("Fix:"));
+                assert!(rendered.contains("Related help:"));
+                assert_eq!(store.current_seq_no(), before_seq);
+                assert_eq!(wal_bytes(&store), before_wal);
+                for (id, _) in &docs {
+                    assert!(store.version_map.get(id).is_none(), "{id} became visible");
+                }
+
+                drop(store);
+                let reopened = open_test_store(dir.path());
+                assert_eq!(reopened.current_seq_no(), before_seq);
+                for (id, _) in &docs {
+                    assert!(
+                        reopened.version_map.get(id).is_none(),
+                        "{id} appeared after replay"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_wal_batch_accepts_complete_scalar_object_and_array_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let docs = vec![
+            ("scalar".to_owned(), Arc::<[u8]>::from(b"42".as_slice())),
+            (
+                "object".to_owned(),
+                Arc::<[u8]>::from(br#"{"answer":42}"#.as_slice()),
+            ),
+            (
+                "array".to_owned(),
+                Arc::<[u8]>::from(br#"[1,2,3]"#.as_slice()),
+            ),
+        ];
+        let start_seq = store.current_seq_no();
+        let validated = IndexStore::validate_raw_batch(docs.clone()).unwrap();
+        assert_eq!(
+            store.wal_append_batch_raw(&validated).unwrap(),
+            vec![start_seq, start_seq + 1, start_seq + 2]
+        );
+        for (id, _) in &docs {
+            assert!(store.version_map.get(id).is_some(), "{id} not visible");
+        }
+        drop(store);
+
+        let reopened = open_test_store(dir.path());
+        for (id, _) in &docs {
+            assert!(
+                reopened.version_map.get(id).is_some(),
+                "{id} missing after replay"
+            );
+        }
     }
 
     /// RC4 W1 #8 regression — bulk-during-flush + kill -9 must lose ZERO
