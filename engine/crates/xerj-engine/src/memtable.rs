@@ -419,6 +419,28 @@ impl DocValues {
                 }
             }
             Value::Bool(b) => {
+                // Numeric column FIRST, matching the on-disk segment
+                // encoding (`build_doc_value_columns` in index.rs: a
+                // boolean is always the f64 bit-pattern of 1.0/0.0, never
+                // a keyword-only value) — the disk-segment builder reads
+                // straight from the same `Value` tree and has always
+                // gotten this right, but the memtable's own in-memory
+                // representation never populated `numeric` for booleans at
+                // all, only `keyword`. Any query still hitting a
+                // memtable-resident boolean doc through a numeric-column
+                // path (`ScoreEval::Bool`, `doc_values_numeric_count`,
+                // range/terms-agg fast paths) saw the field as absent —
+                // found empirically: a real OpenSearch Dashboards filter
+                // pill on a boolean field returned 0 hits against
+                // freshly-bulk-imported data (matches every
+                // real-world/OSD import shape — natural background flush,
+                // no explicit `_flush` — while the aggregation reading
+                // the SAME field correctly bucketed true/false, since
+                // aggregations use a different, disk-segment-only read
+                // path that was never affected).
+                let ncol = entry_no_clone(&mut self.numeric, field, Default::default);
+                pad_to(ncol, doc_index);
+                ncol.push(Some(if *b { 1.0 } else { 0.0 }));
                 let kcol = entry_no_clone(&mut self.keyword, field, Default::default);
                 pad_to(kcol, doc_index);
                 kcol.push(Some(b.to_string()));

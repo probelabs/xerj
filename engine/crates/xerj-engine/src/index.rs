@@ -13051,8 +13051,26 @@ impl Index {
             if self.memtable.doc_count() == 0 {
                 0
             } else {
-                let target_str: Option<String> = value.as_str().map(String::from);
-                let target_num: Option<f64> = value.as_f64();
+                // `value.as_str()`/`.as_f64()` both return `None` for a
+                // JSON boolean, so a boolean-field term query previously
+                // never matched a single memtable-resident doc regardless
+                // of actual content — found empirically: `mem_doc_count`
+                // was non-zero (this branch DOES run) yet a real boolean
+                // filter still undercounted to a confident, wrong 0. Match
+                // `scored_fast_plan`'s `scoring_leaf` (already correct for
+                // this exact case) and the memtable's own on-insert
+                // encoding (`push_field`'s `Value::Bool` arm, which stores
+                // BOTH the 1.0/0.0 numeric form and the "true"/"false"
+                // keyword form) by coercing bool → both representations
+                // here too.
+                let target_str: Option<String> = match value {
+                    Value::Bool(b) => Some(b.to_string()),
+                    _ => value.as_str().map(String::from),
+                };
+                let target_num: Option<f64> = match value {
+                    Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                    _ => value.as_f64(),
+                };
                 let mut m = 0u64;
                 if let Some(tgt) = target_num {
                     m += self.memtable.doc_values_numeric_count(field, tgt) as u64;
@@ -13089,7 +13107,17 @@ impl Index {
             other => other.to_string(),
         };
         let lowered = raw.to_ascii_lowercase();
-        let target_num: Option<f64> = value.as_f64();
+        // Same bool coercion as the memtable side above — `value.as_f64()`
+        // alone returns `None` for a JSON boolean, which used to make
+        // `served_by_dv` false for every segment whose on-disk column for
+        // this field is `Column::Numeric` (the boolean encoding
+        // `build_doc_value_columns` always uses), falling through to an
+        // FTS lookup that has no real content for a non-analyzed boolean
+        // field and confidently returns 0 instead of the correct count.
+        let target_num: Option<f64> = match value {
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            _ => value.as_f64(),
+        };
 
         let mut seg_matches: u64 = 0;
         for meta in &snap.segments {
@@ -21093,7 +21121,25 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
         } => {
             get_field_value(source, field)
                 .and_then(|v| match v {
-                    Value::String(s) => {
+                    // Real ES tokenizes whatever the field holds — a
+                    // `boolean`/numeric field's value is just its string
+                    // form ("true"/"false", "42") for phrase-matching
+                    // purposes. Pre-fix this arm only handled
+                    // `Value::String`, so a `match_phrase` against a
+                    // boolean field's `_source` value (a genuine JSON
+                    // `Bool`, never a `String`) fell to the `_ => None`
+                    // catch-all and NEVER matched any document, regardless
+                    // of value — found empirically alongside the parser-
+                    // level scalar-coercion fix for the *query* side
+                    // (xerj-query's `match_phrase`/`match_phrase_prefix`):
+                    // that fix stops the crash on `{query: true}`, but
+                    // without this one the (now-valid) query still
+                    // silently matched 0 documents.
+                    Value::String(_) | Value::Bool(_) | Value::Number(_) => {
+                        let s = match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
                         let field_tokens: Vec<String> = s
                             .to_lowercase()
                             .split(|c: char| !c.is_alphanumeric())
