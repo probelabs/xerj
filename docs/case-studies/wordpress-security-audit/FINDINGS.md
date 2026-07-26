@@ -5,14 +5,14 @@
 | # | finding | class | severity | status |
 |---|---|---|---|---|
 | 1 | `wp_http_validate_url` allows `169.254.0.0/16` (cloud metadata) | SSRF (incomplete deny-list) | Medium (known-class) | **Real, verified, reachable** |
-| 2 | `class-snoopy.php` curl build: `escapeshellarg($URI)` after flags, no `--` | option injection (escaper ≠ injection defense) | Medium (legacy, if URI attacker-set) | **Real pattern instance** |
+| 2 | `class-snoopy.php` curl build: `escapeshellarg($URI)` after flags, no `--` | option injection (escaper ≠ injection defense) | Informational (core) | **NOT reachable in core — bundled dead code**; valid pattern for plugins |
 | 3 | `class-wp-image-editor-imagick.php` parses uploaded image content | ImageTragick (image-rce-ssrf) | Medium (deploy-dependent) | **Real surface** |
 | — | AJAX / REST / admin authorization | IDOR / privesc | — | Verified **clean** (object-scoped) |
 | — | SQL double-`prepare` de-escape | SQLi | — | Verified **safe** (placeholder_escape) |
 | — | sanitizer composition (escape→de-escape) | XSS/SQLi | — | Verified **safe** (escaper-last) |
 
-Findings 1–3 are real (2 and 3 are known-class / deploy-dependent, stated
-honestly); the rest are documented negatives — core is hardened — each confirmed
+Finding 1 is real+reachable; finding 3 is a real deploy-dependent surface; finding 2 is
+NOT reachable in core (bundled dead code) — a valid pattern, plugin-relevant only; the rest are documented negatives — core is hardened — each confirmed
 by reading the real implementation, not a pattern match. Findings 2 and 3 came
 from the **agentic per-call audit**: the agent read each flagged call
 (`escapeshellarg`, `Imagick::readImage`, `ZipArchive`) and wrote a verdict back to
@@ -97,6 +97,8 @@ RCE) or `-K /etc/passwd`, curl obeys it. **Honest scope:** Snoopy is legacy and
 core rarely routes attacker URLs to it; the point is the *class* — an escaper that
 is not injection protection. **Fix:** insert a literal `--` before `$URI`; reject
 leading `-`; use argv-form. This is the pattern `option-injection` in the guide.
+
+**Reachability trace (added after the finding):** traced `$URI` back to source — `new Snoopy` appears **nowhere** in core, `class-snoopy.php` is **never require()'d**, no core code calls `->fetch()/->submit()`, and `curl_path` is only ever the hardcoded default. So the `exec` line is **dead code in core** — `$URI` has no path from any `$_GET/$_POST`. **Re-classified: informational for core; the option-injection *class* is real and applies to any plugin that instantiates Snoopy (or builds an exec command) with a request-controlled URL.** This is the value of tracing input vars: it separated a valid pattern from a core-reachable bug.
 
 ## Finding 3 — Imagick processes uploaded image content (class: image-rce-ssrf)
 
