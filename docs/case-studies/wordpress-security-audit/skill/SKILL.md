@@ -95,6 +95,12 @@ high-recall REACHABILITY triage, not precise per-argument data-flow — the SQL
 flows include WP_Query (safe) and intval-guarded sinks, so read each candidate.
 See `TAINT-ANALYSIS.md`.
 
+### 6c. POP-gadget hunt (`gadget_hunt.py`)
+Trace every magic method (__wakeup/__destruct/__toString/__call/...) through the
+call graph to a dangerous call — the deserialization gadget surface. Flag the
+AUTO-triggered ones (unserialize/free/print) as the live gadgets. WP core: 0.
+See `GADGET-CHAINS.md`.
+
 ## Honesty rules (these make the result trustworthy)
 1. Precision from the graph/facts; full-text only to navigate. FTS over raw code
    is noisy for security.

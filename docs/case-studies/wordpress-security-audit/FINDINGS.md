@@ -123,6 +123,13 @@ type first but the content is still parsed. **Fix (deploy):** patched ImageMagic
   explicitly guarded — `if ($parent->ID !== $revision->post_parent) return 404`.
 - **`map_meta_cap`** fails closed on missing object / missing arg.
 
+### Deserialization POP-gadget chains — none in core
+131 magic methods; **0** auto-triggered ones (`__wakeup`/`__unserialize`/
+`__destruct`/`__toString`) reach a dangerous sink. The 2 that reach any dangerous
+call are `__callStatic` (deprecation shim → WP hook dispatcher) — false positives,
+and not unserialize-triggered. So even arbitrary object injection has **no core
+gadget chain** to escalate. See `GADGET-CHAINS.md`.
+
 ### SQL de-escape (double `prepare`) — safe
 `WP_List_Table::months_dropdown` re-feeds a `prepare()`'d value (from
 `$_GET['post_status']`) into another `prepare()`. Safe **only** because
