@@ -312,7 +312,12 @@ impl Journal {
                         anyhow::bail!(
                             "journal corruption at byte {record_start} in {}: malformed \
                              newline-terminated record ({error}). Refusing to discard records \
-                             after corruption; restore the journal or use --fresh",
+                             after corruption. Restore the journal from a backup, or truncate it \
+                             to exactly {record_start} bytes to keep every completion recorded \
+                             before the corruption (files journaled after that point are \
+                             re-verified, re-indexed and re-embedded on the next run). Deleting \
+                             the whole journal (or rerunning with --fresh) also recovers, but \
+                             re-extracts and re-embeds the entire corpus",
                             jpath.display()
                         );
                     }
@@ -674,7 +679,10 @@ mod compatibility_tests {
             .expect("corruption must fail closed");
         let message = format!("{error:#}");
         assert!(message.contains("journal corruption"));
-        assert!(message.contains("use --fresh"));
+        // Recovery guidance must stay scoped and honest: byte-exact truncation
+        // keeps prior completions; discarding the journal re-embeds everything.
+        assert!(message.contains("truncate it to exactly"));
+        assert!(message.contains("re-extracts and re-embeds the entire corpus"));
     }
 
     #[test]

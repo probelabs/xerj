@@ -320,7 +320,7 @@ fn legacy_plan_without_completion_cleans_possible_partial_visibility() {
 }
 
 #[test]
-fn legacy_key_collision_fails_before_visibility_and_points_to_fresh() {
+fn legacy_key_collision_fails_before_visibility_with_scoped_guidance() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
@@ -371,7 +371,14 @@ fn legacy_key_collision_fails_before_visibility_and_points_to_fresh() {
     let error = run_index(config).unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains("collides with legacy resume key"));
-    assert!(message.contains("rerun with --fresh"));
+    assert!(message.contains("remove or move one of these two files"));
+    assert!(message.contains(
+        &state_dir
+            .path()
+            .join("journal.ndjson")
+            .display()
+            .to_string()
+    ));
     let state = endpoint.state.lock().unwrap();
     assert_eq!(state.data_bulk_number, bulks_before);
     assert_eq!(state.delete_calls, deletes_before);
@@ -640,6 +647,105 @@ fn pending_generation_b_is_superseded_when_source_changes_to_c() {
         .docs
         .values()
         .all(|doc| doc["value"].as_str() == Some("generation-c")));
+}
+
+#[test]
+fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let original = "id,value\n0,original\n1,original\n";
+    fs::write(corpus.path().join("a.csv"), original).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    // a.csv keeps its planned key by path while its OLD bytes reappear as
+    // b.csv — whose content key is exactly the planned key a.csv claims. Both
+    // files owning one ax_file key would let each replacement delete the
+    // other's freshly published documents.
+    fs::write(
+        corpus.path().join("a.csv"),
+        "id,value\n0,rewritten\n1,rewritten\n",
+    )
+    .unwrap();
+    fs::write(corpus.path().join("b.csv"), original).unwrap();
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    {
+        let locked = endpoint.state.lock().unwrap();
+        assert_eq!(locked.docs.len(), 2);
+        assert!(locked.docs.values().all(|doc| {
+            doc["ax_path"].as_str() == Some("a.csv") && doc["value"].as_str() == Some("rewritten")
+        }));
+    }
+    let replay = state::Journal::open(
+        state_dir.path(),
+        &config.root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    assert!(replay.pending_replacements.is_empty());
+    assert_eq!(replay.done.len(), 1);
+    let plan = replay.plan.clone().unwrap();
+    assert_eq!(plan.junk_files.len(), 1);
+    assert_eq!(plan.junk_files[0].rel, "b.csv");
+    assert!(plan.junk_files[0]
+        .reason
+        .contains("key ownership exclusive"));
+    drop(replay);
+
+    // The divergence is durable and deterministic: an identical rerun keeps
+    // the same owner, appends no new plan, and changes no documents.
+    let plans_before = event_count(state_dir.path(), "plan");
+    assert_eq!(run_index(config).unwrap(), 3);
+    assert_eq!(event_count(state_dir.path(), "plan"), plans_before);
+    let locked = endpoint.state.lock().unwrap();
+    assert_eq!(locked.docs.len(), 2);
+    assert!(locked
+        .docs
+        .values()
+        .all(|doc| doc["value"].as_str() == Some("rewritten")));
+}
+
+#[test]
+fn deleting_an_entire_duplicate_group_strands_no_pending_replacement() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("dup-a.csv"), "id,value\n0,dup\n1,dup\n").unwrap();
+    fs::write(corpus.path().join("dup-b.csv"), "id,value\n0,dup\n1,dup\n").unwrap();
+    fs::write(corpus.path().join("keep.csv"), "id,value\n2,keep\n3,keep\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let starts = event_count(state_dir.path(), "file_replace_start");
+
+    // The whole duplicate group disappears. There is no current file left to
+    // republish its key, so no replacement intent may be journaled — a
+    // stranded intent would be re-appended forever without ever committing.
+    fs::remove_file(corpus.path().join("dup-a.csv")).unwrap();
+    fs::remove_file(corpus.path().join("dup-b.csv")).unwrap();
+    for _ in 0..2 {
+        assert_eq!(run_index(config.clone()).unwrap(), 0);
+        assert_eq!(
+            event_count(state_dir.path(), "file_replace_start"),
+            starts,
+            "an orphaned duplicate-group key must not schedule a replacement"
+        );
+        let replay = state::Journal::open(
+            state_dir.path(),
+            &config.root.to_string_lossy(),
+            &config.url,
+            &config.prefix,
+            config.bulk_timeout_secs,
+            false,
+        )
+        .unwrap();
+        assert!(replay.pending_replacements.is_empty());
+    }
 }
 
 #[test]

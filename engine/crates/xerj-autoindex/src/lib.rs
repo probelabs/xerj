@@ -254,6 +254,7 @@ fn select_resume_plan_keys(
     files: &[walk::FileEntry],
     content_keys: &[String],
     plan: &Plan,
+    journal_path: &Path,
 ) -> Result<Vec<Option<String>>> {
     let mut planned_by_rel: HashMap<&str, &str> = HashMap::new();
     let mut planned_by_path_id: HashMap<&str, &str> = HashMap::new();
@@ -308,13 +309,28 @@ fn select_resume_plan_keys(
                 if claimed.contains(legacy_key.as_str()) || has_exact_current_owner {
                     anyhow::bail!(
                         "{} collides with legacy resume key {} already owned by {}. No documents \
-                         were changed; rerun with --fresh to build distinct full-content keys",
+                         were changed; remove or move one of these two files out of the corpus \
+                         and rerun — every other file keeps its resume state. Deleting the \
+                         journal at {} (or rerunning with --fresh) also clears the collision, \
+                         but re-extracts and re-embeds the entire corpus",
                         file.rel,
                         legacy_key,
-                        assignment.rel
+                        assignment.rel,
+                        journal_path.display()
                     );
                 }
                 Some(legacy_key)
+            } else if claimed.contains(content_key.as_str()) {
+                // Another current file already owns this planned key. Ownership
+                // must stay exclusive — two owners would each run the
+                // replacement transaction on one ax_file key and delete each
+                // other's freshly published documents. Divert this file to a
+                // deterministic path-derived key, the same discriminator scheme
+                // content::resolve uses for byte-proven digest collisions.
+                Some(format!(
+                    "{content_key}-claimed-{:032x}",
+                    xxhash_rust::xxh3::xxh3_128(file.rel_id.as_bytes())
+                ))
             } else {
                 None
             }
@@ -416,6 +432,7 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
     // filesystems. A metadata-only shortcut could leave stale live documents
     // forever after a same-size rewrite with restored or stale timestamps.
     let mut inventory = content::resolve(discovered_files)?;
+    let journal_path = journal.path().to_path_buf();
     let mut content_changed = std::collections::HashSet::new();
     let mut stale_alias_ids = Vec::new();
     let mut alias_paths_to_replace = std::collections::HashSet::new();
@@ -431,10 +448,44 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                 .iter()
                 .map(|old| catalog::duplicate_file_id(&old.file_key, &old.rel, &old.path_id)),
         );
-        let selected_plan_keys = select_resume_plan_keys(&inventory.files, &inventory.keys, plan)?;
+        let selected_plan_keys =
+            select_resume_plan_keys(&inventory.files, &inventory.keys, plan, &journal_path)?;
         for (index, planned_key) in selected_plan_keys.into_iter().enumerate() {
             let file = &inventory.files[index];
             if let Some(planned_key) = planned_key {
+                if !plan.files.contains_key(&planned_key) {
+                    // The file was diverted off a planned key exclusively
+                    // owned by another current file. Record the divergence in
+                    // the durable plan so every resume deterministically skips
+                    // this path instead of racing one ax_file key.
+                    if !plan
+                        .junk_files
+                        .iter()
+                        .any(|junk| junk.file_key == planned_key)
+                    {
+                        let owner = plan
+                            .files
+                            .get(&inventory.keys[index])
+                            .map(|assignment| assignment.rel.as_str())
+                            .unwrap_or("another file");
+                        plan.junk_files.push(JunkFile {
+                            file_key: planned_key.clone(),
+                            rel: file.rel.clone(),
+                            format: "unknown".into(),
+                            status: "skipped".into(),
+                            reason: format!(
+                                "content resolves to planned key {} owned by {owner}; skipped to \
+                                 keep key ownership exclusive (remove one of the two files and \
+                                 rerun to index the survivor)",
+                                inventory.keys[index]
+                            ),
+                            bytes: file.size,
+                        });
+                        plan_changed = true;
+                    }
+                    inventory.keys[index] = planned_key;
+                    continue;
+                }
                 let assignment = plan.files.get_mut(&planned_key).expect("planned key");
                 if assignment.rel != file.rel {
                     content_changed.insert(planned_key.clone());
@@ -480,11 +531,20 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
         // The historical global flag cannot identify which live documents
         // already carry ax_paths. Its one-time migration must rewrite every
         // canonical key; ordinary alias changes remain scoped per key.
-        content_changed.extend(alias_keys_to_reindex(
-            &previous_aliases,
-            &inventory.duplicates,
-            needs_alias_path_migration.then_some(inventory.keys.as_slice()),
-        ));
+        // A key whose entire duplicate group was deleted has no current file
+        // to republish; scheduling it would strand a pending replacement that
+        // every later run re-journals without ever committing.
+        let current_keys: std::collections::HashSet<&str> =
+            inventory.keys.iter().map(String::as_str).collect();
+        content_changed.extend(
+            alias_keys_to_reindex(
+                &previous_aliases,
+                &inventory.duplicates,
+                needs_alias_path_migration.then_some(inventory.keys.as_slice()),
+            )
+            .into_iter()
+            .filter(|key| current_keys.contains(key.as_str())),
+        );
         if needs_alias_path_migration {
             plan.alias_paths_indexed = true;
             plan_changed = true;
@@ -1632,10 +1692,57 @@ mod duplicate_integration_tests {
         let mut plan = Plan::default();
         plan.files
             .insert(legacy.clone(), legacy_assignment("b.txt"));
-        let error = select_resume_plan_keys(&inventory.files, &inventory.keys, &plan).unwrap_err();
+        let error = select_resume_plan_keys(
+            &inventory.files,
+            &inventory.keys,
+            &plan,
+            Path::new("/state/journal.ndjson"),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("collides with legacy resume key"));
-        assert!(message.contains("rerun with --fresh"));
+        // Recovery advice must stay scoped to the two colliding files and be
+        // honest that discarding the journal re-embeds the whole corpus.
+        assert!(message.contains("remove or move one of these two files"));
+        assert!(message.contains("/state/journal.ndjson"));
+        assert!(message.contains("re-extracts and re-embeds the entire corpus"));
+    }
+
+    #[test]
+    fn planned_key_claimed_by_path_diverts_the_content_claimant_deterministically() {
+        let corpus = tempfile::tempdir().unwrap();
+        // a.txt was planned under its old digest; its content has since
+        // changed, while b.txt now holds exactly the bytes a.txt was planned
+        // with — so b.txt's content key IS the planned key a.txt claims by rel.
+        fs::write(corpus.path().join("a.txt"), b"rewritten content\n").unwrap();
+        fs::write(corpus.path().join("b.txt"), b"original planned content\n").unwrap();
+        let inventory = content::resolve(walk::walk(corpus.path(), false).unwrap()).unwrap();
+        let planned_key = inventory.keys[1].clone();
+        let mut plan = Plan::default();
+        plan.files
+            .insert(planned_key.clone(), legacy_assignment("a.txt"));
+
+        let selected = select_resume_plan_keys(
+            &inventory.files,
+            &inventory.keys,
+            &plan,
+            Path::new("/state/journal.ndjson"),
+        )
+        .unwrap();
+        assert_eq!(selected[0].as_deref(), Some(planned_key.as_str()));
+        let diverted = selected[1].as_deref().expect("diverted key");
+        assert_ne!(diverted, planned_key);
+        assert!(diverted.starts_with(&format!("{planned_key}-claimed-")));
+        // The divergence is a pure function of (digest, path identity):
+        // resumes select the same exclusive owner and the same diverted key.
+        let again = select_resume_plan_keys(
+            &inventory.files,
+            &inventory.keys,
+            &plan,
+            Path::new("/state/journal.ndjson"),
+        )
+        .unwrap();
+        assert_eq!(selected, again);
     }
 
     #[test]
