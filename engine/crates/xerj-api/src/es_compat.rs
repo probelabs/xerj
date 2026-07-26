@@ -22116,13 +22116,28 @@ pub async fn xpack_info(State(state): State<AppState>) -> impl IntoResponse {
     let watcher_enabled = state
         .watcher_active
         .load(std::sync::atomic::Ordering::Relaxed);
+    // Must match GET / (`resolve_compat_version`'s `--compat-version`
+    // override) — found empirically: Kibana cross-checks the cluster
+    // version it saw on GET / against the version reported here before
+    // trusting the license block, so a mismatch (GET / correctly
+    // reporting an overridden older version, this endpoint still
+    // hardcoding "8.13.0") surfaces as an opaque "license not available"
+    // error rather than a version-mismatch message. `/_xpack` is
+    // Elastic-only (OpenSearch has no equivalent endpoint), so only the
+    // plain `--compat-version` override applies here, not the fuller
+    // OpenSearch auto-detection `resolve_compat_version` also does.
+    let reported_version = if state.config.compat.version.is_empty() {
+        "8.13.0".to_string()
+    } else {
+        state.config.compat.version.clone()
+    };
     Json(json!({
         "build": {
             "hash": "xerj",
             "date": "2024-01-01T00:00:00.000Z"
         },
         "version": {
-            "number": "8.13.0",
+            "number": reported_version,
             "build_flavor": "default",
             "build_type": "docker",
             "minimum_wire_compatibility_version": "7.17.0",
