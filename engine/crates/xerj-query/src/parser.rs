@@ -439,10 +439,13 @@ fn parse_match_phrase(params: &Value) -> Result<QueryNode> {
     let (field, value) = obj.iter().next().unwrap();
     let field = field.clone();
 
-    if let Some(query) = value.as_str() {
+    // Shorthand forms: `match_phrase: {field: "value"}`, `match_phrase:
+    // {field: 42}`, `match_phrase: {field: true}` — ES silently stringifies
+    // non-strings, same as `match` (see `scalar_to_string`).
+    if let Some(query) = scalar_to_string(value) {
         return Ok(QueryNode::MatchPhrase {
             field,
-            query: query.to_string(),
+            query,
             slop: 0,
             analyzer: None,
             boost: None,
@@ -453,7 +456,14 @@ fn parse_match_phrase(params: &Value) -> Result<QueryNode> {
         .as_object()
         .ok_or_else(|| qerr("`match_phrase` field value must be a string or object"))?;
 
-    let query = string_field(vobj, "query")?;
+    // Inside the object form, `query` can also be a number / bool — e.g.
+    // OpenSearch Dashboards filtering on a boolean field sends
+    // `match_phrase: {field: {query: true}}` verbatim (found empirically,
+    // this is what a real OSD dashboard filter on a bool field produces).
+    let query = vobj
+        .get("query")
+        .and_then(scalar_to_string)
+        .ok_or_else(|| qerr("`match_phrase.query` must be a non-empty scalar"))?;
     let slop = vobj.get("slop").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let analyzer = vobj
         .get("analyzer")
@@ -1775,10 +1785,13 @@ fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
     let (field, raw) = obj.iter().next().unwrap();
     let field = field.clone();
 
-    if let Some(query) = raw.as_str() {
+    // Shorthand forms: `match_phrase_prefix: {field: "value"}`, `{field:
+    // 42}`, `{field: true}` — ES silently stringifies non-strings, same as
+    // `match` (see `scalar_to_string`).
+    if let Some(query) = scalar_to_string(raw) {
         return Ok(QueryNode::MatchPhrasePrefix {
             field,
-            query: query.to_string(),
+            query,
             max_expansions: 50,
         });
     }
@@ -1787,7 +1800,10 @@ fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
         .as_object()
         .ok_or_else(|| qerr("`match_phrase_prefix` field value must be a string or object"))?;
 
-    let query = string_field(inner, "query")?;
+    let query = inner
+        .get("query")
+        .and_then(scalar_to_string)
+        .ok_or_else(|| qerr("`match_phrase_prefix.query` must be a non-empty scalar"))?;
     let max_expansions = inner
         .get("max_expansions")
         .and_then(Value::as_u64)
