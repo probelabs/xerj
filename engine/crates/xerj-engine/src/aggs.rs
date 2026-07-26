@@ -8571,11 +8571,22 @@ fn encode_geohash(lat: f64, lon: f64, precision: usize) -> String {
 ///   - "POINT (lon lat)"
 ///   - "lat,lon"
 ///   - GeoHash string (not parsed — returns None)
+/// Coerce a `lat`/`lon` object member to `f64`. Real ES accepts numeric
+/// OR string-encoded lat/lon inside a `{"lat": .., "lon": ..}` geo_point
+/// object (normalised to numbers at index time) — Kibana's own flights
+/// sample data ships exactly this shape (`{"lat": "50.033333", ...}`),
+/// which `.as_f64()` alone silently rejects (`None` for every doc, so
+/// every geo agg/query on that field returns empty).
+fn geo_coord(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 fn parse_geo_point(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Object(o) => {
-            let lat = o.get("lat")?.as_f64()?;
-            let lon = o.get("lon")?.as_f64()?;
+            let lat = geo_coord(o.get("lat")?)?;
+            let lon = geo_coord(o.get("lon")?)?;
             Some((lat, lon))
         }
         Value::Array(arr) if arr.len() == 2 => {
@@ -9872,8 +9883,10 @@ fn run_extended_stats<'d>(params: &Value, _docs: &'d [Value], cache: &mut FieldC
 fn extract_geo_point(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Object(obj) => {
-            let lat = obj.get("lat").and_then(Value::as_f64)?;
-            let lon = obj.get("lon").and_then(Value::as_f64)?;
+            // See `geo_coord`: string-encoded lat/lon (Kibana's own flights
+            // sample data) must be accepted, not just numeric.
+            let lat = geo_coord(obj.get("lat")?)?;
+            let lon = geo_coord(obj.get("lon")?)?;
             Some((lat, lon))
         }
         Value::String(s) => {
@@ -9909,13 +9922,13 @@ fn run_geo_bounds(params: &Value, docs: &[Value]) -> Value {
     let mut max_lon = f64::NEG_INFINITY;
 
     for doc in docs {
-        if let Some(v) = doc.get(field) {
-            if let Some((lat, lon)) = extract_geo_point(v) {
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-            }
+        // See `run_geo_centroid` — nested geo_point fields (e.g.
+        // `geoip.location`) are invisible to a flat `doc.get(field)`.
+        if let Some((lat, lon)) = extract_geo_point(get_nested_field(doc, field)) {
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
         }
     }
 
@@ -9943,12 +9956,14 @@ fn run_geo_centroid(params: &Value, docs: &[Value]) -> Value {
     let mut count = 0usize;
 
     for doc in docs {
-        if let Some(v) = doc.get(field) {
-            if let Some((lat, lon)) = extract_geo_point(v) {
-                sum_lat += lat;
-                sum_lon += lon;
-                count += 1;
-            }
+        // `get_nested_field`, not a flat `doc.get(field)` — geo_point
+        // fields are routinely nested (e.g. eCommerce's `geoip.location`),
+        // and a flat lookup never finds them (silent `null` centroid, which
+        // Kibana's map viz then crashes reading `.lon` off).
+        if let Some((lat, lon)) = extract_geo_point(get_nested_field(doc, field)) {
+            sum_lat += lat;
+            sum_lon += lon;
+            count += 1;
         }
     }
 
