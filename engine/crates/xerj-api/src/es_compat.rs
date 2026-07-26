@@ -12863,12 +12863,67 @@ pub struct EsUpdateBody {
 pub struct UpdateDocParams {
     /// `refresh=true|wait_for` — accepted without error; memtable is always visible.
     pub refresh: Option<String>,
+    /// `_source=false` suppresses the `get` block; any other value (or bare
+    /// presence) requests it. Absent + no includes/excludes → no `get` block,
+    /// matching real ES (source is NOT returned by default on `_update`).
+    #[serde(rename = "_source")]
+    pub source: Option<String>,
+    /// Comma-separated fields to include in the `get._source` block.
+    #[serde(rename = "_source_includes")]
+    pub source_includes: Option<String>,
+    /// Comma-separated fields to exclude from the `get._source` block.
+    #[serde(rename = "_source_excludes")]
+    pub source_excludes: Option<String>,
+}
+
+/// Whether `_update`'s response should carry a `get` block, per the same
+/// `_source`/`_source_includes`/`_source_excludes` semantics `GET _doc` uses.
+/// Real ES clients (e.g. Kibana's SavedObjectsRepository, which reads
+/// `body.get._source` unconditionally after every update) rely on this.
+fn update_wants_get(params: &UpdateDocParams) -> bool {
+    match params.source.as_deref() {
+        Some("false") => false,
+        Some(_) => true,
+        None => params.source_includes.is_some() || params.source_excludes.is_some(),
+    }
+}
+
+/// Build the `get` block for an `_update` response by re-fetching the
+/// now-current document and applying the same includes/excludes filtering
+/// `GET _doc` uses.
+async fn build_update_get_field(
+    idx: &std::sync::Arc<xerj_engine::index::Index>,
+    id: &str,
+    params: &UpdateDocParams,
+) -> Value {
+    let source = idx.get_document(id).await.ok().flatten();
+    match source {
+        Some(source) => {
+            let includes: Vec<String> = params
+                .source_includes
+                .as_deref()
+                .map(|s| s.split(',').map(str::trim).map(String::from).collect())
+                .unwrap_or_default();
+            let excludes: Vec<String> = params
+                .source_excludes
+                .as_deref()
+                .map(|s| s.split(',').map(str::trim).map(String::from).collect())
+                .unwrap_or_default();
+            let filtered = if includes.is_empty() && excludes.is_empty() {
+                source
+            } else {
+                filter_source_object(&source, &includes, &excludes)
+            };
+            json!({ "found": true, "_source": filtered })
+        }
+        None => json!({ "found": false }),
+    }
 }
 
 pub async fn update_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
-    Query(_params): Query<UpdateDocParams>,
+    Query(query_params): Query<UpdateDocParams>,
     Json(body): Json<EsUpdateBody>,
 ) -> impl IntoResponse {
     let idx = match state.engine.get_or_create_index(&index) {
@@ -12902,7 +12957,7 @@ pub async fn update_doc(
             Ok(Ok(Some(outcome))) => {
                 state.metrics.record_doc_indexed(&index);
                 let resp = outcome.response;
-                let er = if outcome.created {
+                let mut er = if outcome.created {
                     crate::responses::EsDocResponse::created(
                         &index,
                         &resp.id,
@@ -12917,6 +12972,9 @@ pub async fn update_doc(
                         resp.seq_no.saturating_sub(1),
                     )
                 };
+                if update_wants_get(&query_params) {
+                    er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+                }
                 return Json(er).into_response();
             }
             Ok(Ok(None)) => {
@@ -12936,12 +12994,15 @@ pub async fn update_doc(
     {
         Ok(Some(resp)) => {
             state.metrics.record_doc_indexed(&index);
-            let er = crate::responses::EsDocResponse::updated(
+            let mut er = crate::responses::EsDocResponse::updated(
                 &index,
                 &resp.id,
                 resp.version,
                 resp.seq_no.saturating_sub(1),
             );
+            if update_wants_get(&query_params) {
+                er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+            }
             Json(er).into_response()
         }
         Ok(None) => {

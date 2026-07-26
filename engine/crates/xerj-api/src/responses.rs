@@ -126,6 +126,12 @@ pub struct EsDocResponse {
     pub seq_no: u64,
     #[serde(rename = "_primary_term")]
     pub primary_term: u64,
+    /// `_update`-only: the post-update document, present only when the
+    /// caller requested it via `_source`/`_source_includes`/`_source_excludes`
+    /// (real ES's `_update` response omits `get` entirely otherwise). Index
+    /// and create responses never set this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub get: Option<Value>,
 }
 
 impl EsDocResponse {
@@ -146,6 +152,7 @@ impl EsDocResponse {
             shards: EsShards::single_success(),
             seq_no,
             primary_term: 1,
+            get: None,
         }
     }
 
@@ -163,6 +170,7 @@ impl EsDocResponse {
             shards: EsShards::single_success(),
             seq_no,
             primary_term: 1,
+            get: None,
         }
     }
 }
