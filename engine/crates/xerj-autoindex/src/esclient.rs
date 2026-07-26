@@ -131,6 +131,21 @@ impl Es {
         Err(anyhow!("PUT /{index} failed: {status} {text}"))
     }
 
+    /// Additive mapping update for fields introduced after an index was created.
+    pub fn update_mapping(&self, index: &str, body: &Value) -> Result<()> {
+        let resp = self
+            .req(reqwest::Method::PUT, &format!("/{index}/_mapping"))
+            .json(body)
+            .send()
+            .context("PUT mapping")?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = resp.text().unwrap_or_default();
+        Err(anyhow!("PUT /{index}/_mapping failed: {status} {text}"))
+    }
+
     pub fn bulk(&self, body: Vec<u8>) -> Result<BulkOutcome> {
         self.with_retry(
             "_bulk",
@@ -193,6 +208,56 @@ impl Es {
             .body(body)
             .send()
             .with_context(|| format!("bulk send (request timeout {:?})", self.bulk_timeout))
+    }
+
+    /// Remove every document matching `query` before a file-level replacement.
+    /// Refresh is requested so a retry cannot observe or retain an older
+    /// locator set alongside the replacement. The server executes ONE bounded
+    /// search-and-delete pass per call (size-capped at 10k docs), so a single
+    /// response is not complete removal: repeat until a pass deletes nothing.
+    pub fn delete_by_query(&self, index: &str, query: &Value) -> Result<()> {
+        const MAX_PASSES: usize = 1_000;
+        for _ in 0..MAX_PASSES {
+            if self.delete_by_query_pass(index, query)? == 0 {
+                return Ok(());
+            }
+        }
+        Err(anyhow!(
+            "POST /{index}/_delete_by_query still reported deletions after {MAX_PASSES} passes; \
+             refusing to treat the previous generation as fully removed"
+        ))
+    }
+
+    /// One server-side delete pass; returns the reported `deleted` count.
+    fn delete_by_query_pass(&self, index: &str, query: &Value) -> Result<u64> {
+        self.with_retry(
+            "delete_by_query",
+            || {
+                self.req(
+                    reqwest::Method::POST,
+                    &format!("/{index}/_delete_by_query?refresh=true"),
+                )
+                .json(&serde_json::json!({"query": query}))
+                .send()
+                .map_err(|e| anyhow!("delete_by_query: {e}"))
+            },
+            |resp| {
+                let status = resp.status();
+                let body: Value = resp.json().unwrap_or(Value::Null);
+                if status.is_success()
+                    && body
+                        .get("failures")
+                        .and_then(Value::as_array)
+                        .is_none_or(Vec::is_empty)
+                {
+                    Ok(body.get("deleted").and_then(Value::as_u64).unwrap_or(0))
+                } else {
+                    Err(anyhow!(
+                        "POST /{index}/_delete_by_query failed: HTTP {status}: {body}"
+                    ))
+                }
+            },
+        )
     }
 
     pub fn refresh(&self, pattern: &str) -> Result<()> {
@@ -366,7 +431,10 @@ mod tests {
     }
 
     fn success(stream: &mut std::net::TcpStream) {
-        let body = br#"{"errors":false,"items":[]}"#;
+        respond_json(stream, br#"{"errors":false,"items":[]}"#);
+    }
+
+    fn respond_json(stream: &mut std::net::TcpStream, body: &[u8]) {
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -445,6 +513,84 @@ mod tests {
         // post-failure sleep would push this past the deliberately tight cap.
         assert!(elapsed < Duration::from_millis(260), "{elapsed:?}");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn delete_by_query_repeats_until_a_pass_deletes_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_server = requests.clone();
+        let server = std::thread::spawn(move || {
+            // A previous generation larger than one server pass: the first
+            // pass removes its 10k cap and only the second reports done.
+            for body in [
+                br#"{"deleted":10000,"failures":[]}"#.as_slice(),
+                br#"{"deleted":0,"failures":[]}"#.as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests_server
+                    .lock()
+                    .unwrap()
+                    .push(read_request(&mut stream));
+                respond_json(&mut stream, body);
+            }
+        });
+        let es = Es::with_bulk_policy(
+            &format!("http://{address}"),
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        es.delete_by_query("data", &serde_json::json!({"term": {"ax_file": "key"}}))
+            .unwrap();
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            let text = String::from_utf8_lossy(request);
+            assert!(text.contains("POST /data/_delete_by_query"), "{text}");
+        }
+    }
+
+    #[test]
+    fn delete_by_query_that_never_reaches_zero_fails_at_the_pass_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut served = 0usize;
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with(b"STOP") {
+                    break;
+                }
+                respond_json(&mut stream, br#"{"deleted":10000,"failures":[]}"#);
+                served += 1;
+            }
+            served
+        });
+        let es = Es::with_bulk_policy(
+            &format!("http://{address}"),
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let error = es
+            .delete_by_query("data", &serde_json::json!({"term": {"ax_file": "key"}}))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("still reported deletions"),
+            "{error:#}"
+        );
+        let mut stop = std::net::TcpStream::connect(address).unwrap();
+        stop.write_all(b"STOP\r\n\r\n").unwrap();
+        drop(stop);
+        assert_eq!(server.join().unwrap(), 1_000);
     }
 
     #[test]
