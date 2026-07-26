@@ -8583,7 +8583,19 @@ pub async fn search(
                 .and_then(|src| src.get("enabled").and_then(Value::as_bool))
                 .map(|b| !b)
                 .unwrap_or(false);
-            let source = if suppress_source_for_stored
+            // `stored_fields` implicitly suppressing `_source` (unless the
+            // list literally contains `"_source"`) is only a DEFAULT for
+            // when the caller left `_source` unspecified. When the request
+            // also carries its own explicit top-level `_source` parameter
+            // (true/false/{includes,excludes} — e.g. Discover's actual
+            // query, which sends `stored_fields: ["*"]` AND `_source:
+            // {excludes: []}` in the same request), that explicit value
+            // always wins — found empirically: without this, `_source`
+            // came back completely absent from every Discover row despite
+            // the request explicitly asking to include it, which starved
+            // every column except the couple of fields separately pulled
+            // in via `docvalue_fields`.
+            let source = if (suppress_source_for_stored && body.source.is_none())
                 || source_body_disabled
                 || source_mapping_disabled
                 || h.source.is_null()
