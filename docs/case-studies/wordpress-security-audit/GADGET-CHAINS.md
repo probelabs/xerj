@@ -66,3 +66,38 @@ python3 gadget_hunt.py     # magic methods -> dangerous call, over the XERJ grap
 ```
 Generalize by extending `MAGIC`/`DANGER`; point `wpaudit` at a plugin/vendored lib
 to find the gadgets that core doesn't have.
+
+
+## Correction (per-method scan supersedes the first pass)
+
+The result above used `byname` (first definition per name) — a **name-collision
+bug**: only 1 of 12 `__destruct` methods was analyzed, so it under-reported.
+`magic_unsafe.py` scans **each** magic method's own body against the full 287-fn
+catalog and is the authority. Corrected finding:
+
+- **44 magic methods contain a dangerous call inside.** The one that matters is
+  **`WP_HTML_Token::__destruct` → `call_user_func($this->on_destroy, $this->bookmark_name)`**
+  (both properties settable) — a **real POP-gadget shape** (unserialize a token
+  with `on_destroy='system'`, `bookmark_name='id'` → RCE on destruct).
+- **It is defused:** the class adds `__wakeup(){ throw new LogicException('… should
+  never be unserialized'); }` (WP 6.4.2) — `unserialize` can't build the object, so
+  the `__destruct` is unreachable via object injection. This is WP's deliberate
+  hardening of a real gadget, not the absence of one.
+- Everything else is benign/not-a-gadget: IRI/Iri `__set`/`__unset` `call_user_func`
+  is internal `[$this,'set_'.$name]` dispatch (bounded, and `__set` isn't
+  unserialize-triggered); `imagick`/`PHPMailer` `__destruct` do cleanup
+  (`->clear()`, `smtpClose()`), no sink; `get_headers`/`debug_backtrace` are
+  method-name collisions.
+
+**All dangerous calls found INSIDE magic methods, by class:**
+
+| class | calls (count) | assessment |
+|---|---|---|
+| RCE-code-callable | `call_user_func` ×5, `set_error_handler` ×1, `array_filter` ×1 | 1 real gadget shape (HTML_Token, **defused**); rest internal dispatch |
+| auth-bypass-type-juggle | `in_array` ×25 | non-strict `in_array` in `__get/__isset/__set/__unset` — property-name allow-list checks, low severity |
+| weak-crypto | `md5` ×11 | SimplePie `__toString` object-identity hashing — benign (not passwords) |
+| info-disclosure | `debug_backtrace` ×1 | SimplePie `__call` debug — FP |
+| SSRF | `get_headers` ×1 | method-name collision — FP |
+
+**Net:** core has **one** genuine deserialization gadget shape and it is
+explicitly guarded; no usable POP chain via core magic methods.
