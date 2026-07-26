@@ -79,10 +79,13 @@ catalog and is the authority. Corrected finding:
   **`WP_HTML_Token::__destruct` → `call_user_func($this->on_destroy, $this->bookmark_name)`**
   (both properties settable) — a **real POP-gadget shape** (unserialize a token
   with `on_destroy='system'`, `bookmark_name='id'` → RCE on destruct).
-- **It is defused:** the class adds `__wakeup(){ throw new LogicException('… should
-  never be unserialized'); }` (WP 6.4.2) — `unserialize` can't build the object, so
-  the `__destruct` is unreachable via object injection. This is WP's deliberate
-  hardening of a real gadget, not the absence of one.
+- **It is defused — empirically verified.** The class adds `__wakeup(){ throw … }`
+  (WP 6.4.2). Tested in real PHP 7.4/8.0/8.3 (`GADGET-WAKEUP-TEST.md`): a throwing
+  `__wakeup` **suppresses `__destruct`** (PHP skips the destructor of an object whose
+  `__wakeup` threw), direct AND nested — so the gadget genuinely cannot fire. The
+  control (same `__destruct`, no `__wakeup`) DID fire, proving the guard is what
+  stops it. (This corrects an earlier note that speculated the `__destruct` survives
+  the throw — it does not, in modern PHP.)
 - Everything else is benign/not-a-gadget: IRI/Iri `__set`/`__unset` `call_user_func`
   is internal `[$this,'set_'.$name]` dispatch (bounded, and `__set` isn't
   unserialize-triggered); `imagick`/`PHPMailer` `__destruct` do cleanup
