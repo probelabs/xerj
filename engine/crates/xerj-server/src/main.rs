@@ -77,6 +77,7 @@ use xerj_engine::Engine;
 #[cfg(all(target_os = "linux", feature = "debug-profiling"))]
 mod debug_profiling;
 mod grpc;
+mod ingest_memory_trace;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -209,6 +210,12 @@ fn print_help() {
              XERJ_ONNX_TOKENIZER matching tokenizer.json path\n\
              XERJ_COMPAT_DISTRIBUTION  elasticsearch|opensearch — same as --compat-distribution\n\
              XERJ_COMPAT_VERSION       same as --compat-version\n\
+             XERJ_INGEST_MEMORY_TRACE  off|summary (default: off); summary emits bounded\n\
+                                      periodic NDJSON diagnostics, never per-item events\n\
+             XERJ_INGEST_MEMORY_SAMPLE_MS  sampler period, clamped to 25..60000 ms\n\
+             XERJ_INGEST_MEMORY_OUTPUT tracing|<PATH> (default: tracing); append NDJSON to path\n\
+                                      Merge/cache fields are reserved/unavailable in v1.\n\
+                                      Active+drained may transiently overlap across sampling.\n\
          \n\
          WIRE-COMPAT IDENTITY — three ways to run this, pick what fits:\n\
          \n\
@@ -1482,6 +1489,8 @@ async fn async_main() -> Result<()> {
     //      is the structural guard against the 112 GiB OOM class — writes get
     //      a 429 circuit_breaking_exception before the kernel OOM-kills us.
     state.engine.spawn_resource_sampler();
+
+    let _ingest_memory_trace = ingest_memory_trace::spawn(&state.engine);
     // 13. Start servers concurrently
     let rest_tls = tls_config.clone();
     let rest = tokio::spawn(async move {
