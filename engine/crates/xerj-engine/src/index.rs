@@ -8659,7 +8659,17 @@ impl Index {
             // boost, no similarity cutoff. Boost/cutoff requests go exact
             // brute force where both are applied in the right order
             // (cutoff on the unboosted transformed score, then boost).
-            if filter_opt.is_none() && boost.is_none() && min_similarity.is_none() {
+            //
+            // rc.6: an `aggs`-bearing knn also takes the exact brute-force
+            // path. ANN recall is <100%, so the retrieved top-k neighbour
+            // SET can differ slightly from exact; aggregations over that set
+            // must be exact (analytics counts, not ranked hits), so we do not
+            // let ANN approximation leak into agg buckets.
+            if filter_opt.is_none()
+                && boost.is_none()
+                && min_similarity.is_none()
+                && request.aggs.is_none()
+            {
                 if let Some(result) = self
                     .run_knn_hnsw(request, &field, &query_vec, k, num_candidates, &similarity)
                     .await
@@ -19833,6 +19843,21 @@ fn knn_result_from_scored(
     // (Hybrid/RRF ignores this total and recomputes its own from the fused
     // list, so bounding it here is safe for that path.)
     let total_value = scored.len() as u64;
+
+    // ── kNN + aggregations (rc.6) ─────────────────────────────────────
+    // ES top-level-`knn` semantics: when `aggs` accompany a knn/semantic
+    // query, the aggregations run over the RETRIEVED NEIGHBOUR SET (the
+    // top-`k` after the `num_candidates` fan-out), independent of the
+    // `from`/`size` hit-page. This makes "aggregate a semantic slice" a
+    // single request — e.g. `knn(topic) + terms(band) + significant_terms`.
+    // Computed BEFORE `scored` is consumed into hits, over all top-k
+    // sources (not the paginated page). Every knn executor (HNSW,
+    // brute-force, multi-knn) funnels through here, so all of them gain it.
+    let aggs = request.aggs.as_ref().map(|aggs_def| {
+        let sources: Vec<Value> = scored.iter().map(|(_, _, s)| s.clone()).collect();
+        crate::aggs::run_aggs(aggs_def, &sources)
+    });
+
     let hits: Vec<Hit> = if request.size == 0 {
         Vec::new()
     } else {
@@ -19861,7 +19886,7 @@ fn knn_result_from_scored(
             relation: TotalHitsRelation::Eq,
         },
         took_ms: started.elapsed().as_millis() as u64,
-        aggs: None,
+        aggs,
         timed_out: false,
         profile: None,
         max_score: None,
