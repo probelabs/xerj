@@ -222,6 +222,11 @@ fn decode_dict_rows(
         .read_u32::<LittleEndian>()
         .map_err(|error| StorageError::Other(anyhow::anyhow!("dict_count: {error}")))?
         as usize;
+    if dict_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict_count {dict_count} exceeds num_docs {num_docs}"
+        )));
+    }
     let bit_width = cursor
         .read_u8()
         .map_err(|error| StorageError::Other(anyhow::anyhow!("bit_width: {error}")))?;
@@ -258,18 +263,15 @@ fn decode_dict_rows(
         .checked_add(packed_len)
         .filter(|end| *end == payload.len())
         .ok_or_else(|| StorageError::Other(anyhow::anyhow!("dict packed truncated/trailing")))?;
-    let packed = zstd::decode_all(&payload[packed_start..packed_end])
-        .map_err(|error| StorageError::Other(anyhow::anyhow!("packed zstd: {error}")))?;
     let expected_packed_len = num_docs
         .checked_mul(bit_width as usize)
         .ok_or_else(|| StorageError::Other(anyhow::anyhow!("dict packed length overflow")))?
         .div_ceil(8);
-    if packed.len() != expected_packed_len {
-        return Err(StorageError::Other(anyhow::anyhow!(
-            "dict packed length {} != expected {expected_packed_len}",
-            packed.len()
-        )));
-    }
+    let packed = decode_zstd_exact(
+        &payload[packed_start..packed_end],
+        expected_packed_len,
+        "packed zstd",
+    )?;
     let used_bits = num_docs * bit_width as usize;
     if !used_bits.is_multiple_of(8) {
         let used_in_last = used_bits % 8;
@@ -359,7 +361,7 @@ fn decode_cross_dep_rows(
     column_index: usize,
     checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
 ) -> Result<std::result::Result<Vec<serde_json::Value>, ()>> {
-    let body = decode_cross_dep_body(column.payload)?;
+    let body = decode_cross_dep_body(column.payload, num_docs)?;
     stats.decompressed_buffer_bytes += body.len();
     let mut cursor = Cursor::new(body.as_slice());
     let _source_index = cursor
@@ -369,6 +371,11 @@ fn decode_cross_dep_rows(
         .read_u32::<LittleEndian>()
         .map_err(|error| StorageError::Other(anyhow::anyhow!("cross_dep dict_count: {error}")))?
         as usize;
+    if dict_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep dict_count {dict_count} exceeds num_docs {num_docs}"
+        )));
+    }
     let mut modes = Vec::with_capacity(dict_count);
     for _ in 0..dict_count {
         modes.push(
@@ -381,6 +388,11 @@ fn decode_cross_dep_rows(
         .read_u32::<LittleEndian>()
         .map_err(|error| StorageError::Other(anyhow::anyhow!("cross_dep exc_count: {error}")))?
         as usize;
+    if exception_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep exc_count {exception_count} exceeds num_docs {num_docs}"
+        )));
+    }
     let wanted: HashSet<u32> = selected.iter().map(|ordinal| *ordinal as u32).collect();
     let mut exceptions = HashMap::with_capacity(wanted.len().min(exception_count));
     let mut position = cursor.position() as usize;
@@ -504,7 +516,7 @@ fn select_column_rows(
             decoded.values
         }
         ColCodec::CrossDep => {
-            let source_index = cross_dep_source_index(column.payload)?;
+            let source_index = cross_dep_source_index(column.payload, directory.num_docs)?;
             let Some(source) = directory.columns.get(source_index) else {
                 return Err(StorageError::Other(anyhow::anyhow!(
                     "cross_dep source index {source_index} out of range"
@@ -569,11 +581,27 @@ pub fn decode_stored_v2_rows(
     bytes: &[u8],
     ordinals: &[usize],
 ) -> Result<StoredV2RowHydrationResult> {
-    match decode_stored_v2_rows_controlled(
-        bytes,
-        ordinals,
-        |_| std::ops::ControlFlow::Continue(()),
-    )? {
+    match decode_stored_v2_rows_projected_controlled(bytes, ordinals, None, |_| {
+        std::ops::ControlFlow::Continue(())
+    })? {
+        StoredDecodeRun::Complete(result) => Ok(result),
+        StoredDecodeRun::Cancelled => unreachable!("non-cancelling compatibility wrapper"),
+    }
+}
+
+/// Reconstruct selected ZBS2 rows and only the requested top-level `_source`
+/// fields. Identity and sequence metadata are always returned.
+///
+/// Missing requested fields remain absent, matching `_source` object
+/// semantics. An empty projection returns identity-only rows.
+pub fn decode_stored_v2_rows_projected(
+    bytes: &[u8],
+    ordinals: &[usize],
+    source_fields: &[&str],
+) -> Result<StoredV2RowHydrationResult> {
+    match decode_stored_v2_rows_projected_controlled(bytes, ordinals, Some(source_fields), |_| {
+        std::ops::ControlFlow::Continue(())
+    })? {
         StoredDecodeRun::Complete(result) => Ok(result),
         StoredDecodeRun::Cancelled => unreachable!("non-cancelling compatibility wrapper"),
     }
@@ -582,6 +610,18 @@ pub fn decode_stored_v2_rows(
 pub fn decode_stored_v2_rows_controlled<F>(
     bytes: &[u8],
     ordinals: &[usize],
+    checkpoint: F,
+) -> Result<StoredDecodeRun<StoredV2RowHydrationResult>>
+where
+    F: FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+{
+    decode_stored_v2_rows_projected_controlled(bytes, ordinals, None, checkpoint)
+}
+
+pub fn decode_stored_v2_rows_projected_controlled<F>(
+    bytes: &[u8],
+    ordinals: &[usize],
+    source_fields: Option<&[&str]>,
     mut checkpoint: F,
 ) -> Result<StoredDecodeRun<StoredV2RowHydrationResult>>
 where
@@ -621,9 +661,21 @@ where
         ));
     }
     let mut stats = StoredV2RowHydrationStats::default();
-    let mut columns = Vec::with_capacity(directory.columns.len());
+    let requested: Option<HashSet<&str>> =
+        source_fields.map(|fields| fields.iter().copied().collect());
+    let mut columns: Vec<Option<Vec<serde_json::Value>>> =
+        (0..directory.columns.len()).map(|_| None).collect();
     let mut dict_ids = HashMap::new();
     for index in 0..directory.columns.len() {
+        let column = &directory.columns[index];
+        let wanted = index == id_index
+            || index == seq_index
+            || requested
+                .as_ref()
+                .is_none_or(|fields| fields.contains(column.name));
+        if !wanted {
+            continue;
+        }
         if decode_cancelled(&mut checkpoint, StoredDecodePhase::BeforeColumn, index, 0) {
             return Ok(StoredDecodeRun::Cancelled);
         }
@@ -635,7 +687,7 @@ where
             &mut dict_ids,
             &mut checkpoint,
         )? {
-            Ok(values) => columns.push(values),
+            Ok(values) => columns[index] = Some(values),
             Err(Some(column)) => {
                 return Ok(StoredDecodeRun::Complete(
                     StoredV2RowHydrationResult::UnsupportedDependencyShape { column },
@@ -659,7 +711,10 @@ where
             if column_index == id_index || column_index == seq_index {
                 continue;
             }
-            let value = columns[column_index][selected_index].clone();
+            let Some(values) = columns[column_index].as_ref() else {
+                continue;
+            };
+            let value = values[selected_index].clone();
             if !value.is_null() {
                 source.insert(column.name.to_string(), value);
                 stats.output_values_cloned += 1;
@@ -668,8 +723,8 @@ where
         stats.output_values_cloned += 2;
         rows.push(StoredV2HydratedRow {
             ordinal,
-            id: columns[id_index][selected_index].clone(),
-            seq_no: columns[seq_index][selected_index].clone(),
+            id: columns[id_index].as_ref().unwrap()[selected_index].clone(),
+            seq_no: columns[seq_index].as_ref().unwrap()[selected_index].clone(),
             source,
         });
     }
@@ -1115,5 +1170,58 @@ mod tests {
                 full[ordinal]["_source"]
             );
         }
+    }
+
+    #[test]
+    fn row_projection_preserves_sparse_parity_and_skips_unrequested_payloads() {
+        let count = 128usize;
+        let ids: Vec<_> = (0..count).map(|row| json!(format!("id-{row}"))).collect();
+        let seqs: Vec<_> = (0..count).map(|row| json!(row)).collect();
+        let wanted: Vec<_> = (0..count)
+            .map(|row| {
+                if row % 3 == 0 {
+                    json!(format!("quarter-{row}"))
+                } else {
+                    serde_json::Value::Null
+                }
+            })
+            .collect();
+        let encoded = assemble(
+            count,
+            &[
+                ("__id", ColCodec::RawJson, raw(&ids)),
+                ("__seq_no", ColCodec::RawJson, raw(&seqs)),
+                ("wanted", ColCodec::RawJson, raw(&wanted)),
+                // Valid framing, deliberately corrupt payload. A projected
+                // read must not touch an unrelated column.
+                ("unrelated", ColCodec::RawJson, b"not-zstd".to_vec()),
+            ],
+        );
+        let selected = [0, 1, 42, 127];
+        let StoredV2RowHydrationResult::Hydrated { rows, stats } =
+            decode_stored_v2_rows_projected(&encoded, &selected, &["wanted"]).unwrap()
+        else {
+            panic!("expected projected hydration")
+        };
+        assert_eq!(rows.len(), selected.len());
+        for (row, ordinal) in rows.iter().zip(selected) {
+            assert_eq!(row.id, ids[ordinal]);
+            assert_eq!(row.seq_no, seqs[ordinal]);
+            if wanted[ordinal].is_null() {
+                assert!(!row.source.contains_key("wanted"));
+            } else {
+                assert_eq!(row.source["wanted"], wanted[ordinal]);
+            }
+            assert!(!row.source.contains_key("unrelated"));
+        }
+        assert_eq!(stats.selected_json_values, selected.len() * 3);
+        assert!(decode_stored_v2_rows(&encoded, &selected).is_err());
+
+        let StoredV2RowHydrationResult::Hydrated { rows, .. } =
+            decode_stored_v2_rows_projected(&encoded, &[7], &[]).unwrap()
+        else {
+            panic!("expected identity-only hydration")
+        };
+        assert!(rows[0].source.is_empty());
     }
 }
