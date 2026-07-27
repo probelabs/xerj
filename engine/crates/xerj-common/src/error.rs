@@ -55,6 +55,10 @@ pub enum XerjError {
     #[error("serialization error: {reason}")]
     SerializationError { reason: String },
 
+    /// A user-supplied document body is not one complete JSON value.
+    #[error("{reason}")]
+    InvalidDocumentJson { reason: String },
+
     // ── Configuration ──────────────────────────────────────────────────────
     /// The configuration file is invalid.
     #[error("config error: {reason}")]
@@ -178,6 +182,12 @@ impl XerjError {
         }
     }
 
+    pub fn invalid_document_json(reason: impl Into<String>) -> Self {
+        Self::InvalidDocumentJson {
+            reason: reason.into(),
+        }
+    }
+
     pub fn config(reason: impl Into<String>) -> Self {
         Self::ConfigError {
             reason: reason.into(),
@@ -252,6 +262,7 @@ impl XerjError {
             Self::IndexAlreadyExists { .. } | Self::VersionConflict { .. } => 409,
             Self::InvalidMapping { .. }
             | Self::InvalidQuery { .. }
+            | Self::InvalidDocumentJson { .. }
             | Self::ConfigError { .. }
             | Self::ResultWindowTooLarge { .. } => 400,
             Self::IndexBlocked { .. } => 403,

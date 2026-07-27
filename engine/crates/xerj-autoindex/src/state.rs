@@ -4,11 +4,23 @@
 //! dedupe it.
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+static FILE_DONE_IO_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+pub(crate) static FILE_DONE_IO_FAILPOINT_TEST_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn fail_next_file_done_io(boundary: u8) {
+    FILE_DONE_IO_FAILPOINT.store(boundary, std::sync::atomic::Ordering::SeqCst);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanDataset {
@@ -72,8 +84,14 @@ mod tests {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileAssignment {
     pub rel: String,
+    /// Reversible path identity used for deterministic resume matching.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path_id: String,
     pub family: String,
     pub gzip: bool,
+    /// Full-content digest used to validate durable identity across resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
     /// group (None = whole file) → dataset slug
     pub assignments: Vec<(Option<String>, String)>,
 }
@@ -88,6 +106,19 @@ pub struct JunkFile {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DuplicateFile {
+    /// Content identity of the canonical file.
+    pub file_key: String,
+    /// Root-relative alias path which was not indexed separately.
+    pub rel: String,
+    #[serde(default)]
+    pub path_id: String,
+    /// Root-relative canonical path whose records represent this content.
+    pub duplicate_of: String,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     pub datasets: Vec<PlanDataset>,
@@ -96,6 +127,12 @@ pub struct Plan {
     /// junk/skipped files recorded at scan time (never fatal)
     #[serde(default)]
     pub junk_files: Vec<JunkFile>,
+    /// Byte-identical paths represented by a canonical content file.
+    #[serde(default)]
+    pub duplicate_files: Vec<DuplicateFile>,
+    /// Canonical records have been rewritten with the `ax_paths` alias list.
+    #[serde(default)]
+    pub alias_paths_indexed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,14 +142,23 @@ pub struct FileDone {
     pub records: u64,
     pub junk: u64,
     pub bytes: u64,
+    /// Content generation committed by this record. Legacy completions have
+    /// no generation and cannot commit a newer pending replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
 }
 
 pub struct Journal {
     path: PathBuf,
     file: std::fs::File,
+    _state_lock: std::fs::File,
     pub run_id: String,
     pub resumed: bool,
     pub done: HashMap<String, FileDone>,
+    /// Durable replacement transactions which have not reached file_done.
+    /// Replay removes these keys from `done`, so a crash after destructive
+    /// publication can never make resume skip a zero/partial generation.
+    pub pending_replacements: HashMap<String, String>,
     pub plan: Option<Plan>,
 }
 
@@ -135,57 +181,146 @@ impl Journal {
     ) -> Result<Journal> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
+        let lock_path = state_dir.join(".autoindex.lock");
+        let state_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        state_lock.try_lock_exclusive().with_context(|| {
+            format!(
+                "autoindex state {} is already in use by another process; wait for it to \
+                 finish or choose a different --state-dir",
+                state_dir.display()
+            )
+        })?;
+        // Hard kills cannot run NamedTempFile::drop. Stages are owned by this
+        // journal directory and use a reserved prefix, so removing only
+        // regular files with that prefix is deterministic and scope-safe.
+        for entry in std::fs::read_dir(state_dir)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".autoindex-stage-")
+                && entry.file_type()?.is_file()
+            {
+                std::fs::remove_file(entry.path()).with_context(|| {
+                    format!("remove orphan autoindex stage {}", entry.path().display())
+                })?;
+            }
+        }
         let jpath = state_dir.join("journal.ndjson");
         if fresh && jpath.exists() {
             std::fs::remove_file(&jpath).ok();
         }
         let mut done = HashMap::new();
+        let mut pending_replacements: HashMap<String, String> = HashMap::new();
         let mut plan = None;
         let mut run_id = None;
         let mut resumed = false;
         if jpath.exists() {
             let f = std::fs::File::open(&jpath)?;
-            for line in std::io::BufReader::new(f).lines() {
-                let Ok(line) = line else { break };
-                let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                    break; // torn tail line — stop replay here
-                };
-                match v.get("kind").and_then(|k| k.as_str()) {
-                    Some("run") => {
-                        let (jr, ju, jp) = (
-                            v.get("root").and_then(|x| x.as_str()).unwrap_or(""),
-                            v.get("url").and_then(|x| x.as_str()).unwrap_or(""),
-                            v.get("prefix").and_then(|x| x.as_str()).unwrap_or(""),
-                        );
-                        if jr != root || ju != url || jp != prefix {
-                            anyhow::bail!(
+            let file_len = f.metadata()?.len();
+            let mut reader = std::io::BufReader::new(f);
+            let mut valid_end = 0u64;
+            loop {
+                let record_start = valid_end;
+                let mut bytes = Vec::new();
+                let read = reader.read_until(b'\n', &mut bytes)?;
+                if read == 0 {
+                    break;
+                }
+                let newline_terminated = bytes.last() == Some(&b'\n');
+                match serde_json::from_slice::<Value>(
+                    bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice()),
+                ) {
+                    Ok(v) if newline_terminated => {
+                        valid_end += read as u64;
+                        match v.get("kind").and_then(|k| k.as_str()) {
+                            Some("run") => {
+                                let (jr, ju, jp) = (
+                                    v.get("root").and_then(|x| x.as_str()).unwrap_or(""),
+                                    v.get("url").and_then(|x| x.as_str()).unwrap_or(""),
+                                    v.get("prefix").and_then(|x| x.as_str()).unwrap_or(""),
+                                );
+                                if jr != root || ju != url || jp != prefix {
+                                    anyhow::bail!(
                                 "journal at {} was created for root={jr} url={ju} prefix={jp}; \
                                  current run has root={root} url={url} prefix={prefix}. \
                                  Use --fresh to discard it or --state-dir for a separate state.",
                                 jpath.display()
                             );
-                        }
-                        if run_id.is_none() {
-                            run_id = v
-                                .get("run_id")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_string());
-                        }
-                        resumed = true;
-                    }
-                    Some("plan") => {
-                        if let Some(p) = v.get("plan") {
-                            if let Ok(p) = serde_json::from_value::<Plan>(p.clone()) {
-                                plan = Some(p);
+                                }
+                                if run_id.is_none() {
+                                    run_id = v
+                                        .get("run_id")
+                                        .and_then(|x| x.as_str())
+                                        .map(|s| s.to_string());
+                                }
+                                resumed = true;
                             }
+                            Some("plan") => {
+                                if let Some(p) = v.get("plan") {
+                                    if let Ok(p) = serde_json::from_value::<Plan>(p.clone()) {
+                                        plan = Some(p);
+                                    }
+                                }
+                            }
+                            Some("file_done") => {
+                                if let Ok(fd) = serde_json::from_value::<FileDone>(v.clone()) {
+                                    let commits_pending = pending_replacements
+                                        .get(&fd.file_key)
+                                        .is_none_or(|pending| {
+                                            fd.generation.as_deref() == Some(pending.as_str())
+                                        });
+                                    if commits_pending {
+                                        pending_replacements.remove(&fd.file_key);
+                                        done.insert(fd.file_key.clone(), fd);
+                                    }
+                                }
+                            }
+                            Some("file_replace_start") => {
+                                if let (Some(file_key), Some(generation)) = (
+                                    v.get("file_key").and_then(Value::as_str),
+                                    v.get("generation").and_then(Value::as_str),
+                                ) {
+                                    done.remove(file_key);
+                                    pending_replacements
+                                        .insert(file_key.to_string(), generation.to_string());
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    Some("file_done") => {
-                        if let Ok(fd) = serde_json::from_value::<FileDone>(v.clone()) {
-                            done.insert(fd.file_key.clone(), fd);
-                        }
+                    Ok(_) | Err(_)
+                        if !newline_terminated && record_start + read as u64 == file_len =>
+                    {
+                        let repair = std::fs::OpenOptions::new().write(true).open(&jpath)?;
+                        repair.set_len(record_start)?;
+                        repair.sync_data().with_context(|| {
+                            format!(
+                                "sync repaired torn journal tail at byte {record_start} in {}",
+                                jpath.display()
+                            )
+                        })?;
+                        break;
                     }
-                    _ => {}
+                    Ok(_) => unreachable!("complete JSON without newline handled as torn tail"),
+                    Err(error) => {
+                        anyhow::bail!(
+                            "journal corruption at byte {record_start} in {}: malformed \
+                             newline-terminated record ({error}). Refusing to discard records \
+                             after corruption. Restore the journal from a backup, or truncate it \
+                             to exactly {record_start} bytes to keep every completion recorded \
+                             before the corruption (files journaled after that point are \
+                             re-verified, re-indexed and re-embedded on the next run). Deleting \
+                             the whole journal (or rerunning with --fresh) also recovers, but \
+                             re-extracts and re-embeds the entire corpus",
+                            jpath.display()
+                        );
+                    }
                 }
             }
         }
@@ -204,56 +339,169 @@ impl Journal {
         let mut j = Journal {
             path: jpath,
             file,
+            _state_lock: state_lock,
             run_id: run_id.clone(),
             resumed: resumed && !is_new,
             done,
+            pending_replacements,
             plan,
         };
         if is_new {
-            j.append(&serde_json::json!({
-                "v": 1, "kind": "run", "root": root, "url": url, "prefix": prefix,
-                "bulk_timeout_secs": bulk_timeout_secs,
-                "run_id": run_id, "started": chrono::Utc::now().to_rfc3339(),
-            }))?;
+            j.append_transaction(
+                &serde_json::json!({
+                    "v": 1, "kind": "run", "root": root, "url": url, "prefix": prefix,
+                    "bulk_timeout_secs": bulk_timeout_secs,
+                    "run_id": run_id, "started": chrono::Utc::now().to_rfc3339(),
+                }),
+                "run",
+            )?;
         } else {
-            j.append(&serde_json::json!({
-                "kind": "resume", "bulk_timeout_secs": bulk_timeout_secs,
-                "at": chrono::Utc::now().to_rfc3339(),
-            }))?;
+            j.append_transaction(
+                &serde_json::json!({
+                    "kind": "resume", "bulk_timeout_secs": bulk_timeout_secs,
+                    "at": chrono::Utc::now().to_rfc3339(),
+                }),
+                "resume",
+            )?;
         }
         Ok(j)
     }
 
-    fn append(&mut self, v: &Value) -> Result<()> {
+    fn append_transaction(&mut self, v: &Value, what: &str) -> Result<()> {
         let mut line = serde_json::to_string(v)?;
         line.push('\n');
-        self.file.write_all(line.as_bytes())?;
+        let start = self.file.metadata()?.len();
+        #[cfg(test)]
+        if what == "file_done"
+            && FILE_DONE_IO_FAILPOINT
+                .compare_exchange(
+                    1,
+                    0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            anyhow::bail!("injected file_done append failure before any bytes");
+        }
+        #[cfg(test)]
+        let partial_write = what == "file_done"
+            && FILE_DONE_IO_FAILPOINT
+                .compare_exchange(
+                    3,
+                    0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok();
+        #[cfg(not(test))]
+        let partial_write = false;
+        let write_result = if partial_write {
+            let written = line.len().min(23);
+            self.file
+                .write_all(&line.as_bytes()[..written])
+                .and_then(|_| {
+                    Err(std::io::Error::other(format!(
+                        "injected partial file_done write after {written} bytes"
+                    )))
+                })
+        } else {
+            self.file.write_all(line.as_bytes())
+        };
+        if let Err(error) = write_result {
+            return self.rollback_transaction(start, what, "append", error);
+        }
+        #[cfg(test)]
+        let injected_sync_failure = what == "file_done"
+            && FILE_DONE_IO_FAILPOINT
+                .compare_exchange(
+                    2,
+                    0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok();
+        #[cfg(not(test))]
+        let injected_sync_failure = false;
+        let sync_result = if injected_sync_failure {
+            Err(std::io::Error::other("injected file_done fsync failure"))
+        } else {
+            self.file.sync_data()
+        };
+        if let Err(error) = sync_result {
+            return self.rollback_transaction(start, what, "fsync", error);
+        }
         Ok(())
     }
 
+    fn rollback_transaction(
+        &mut self,
+        start: u64,
+        what: &str,
+        operation: &str,
+        error: std::io::Error,
+    ) -> Result<()> {
+        let rollback = self.file.set_len(start).and_then(|_| self.file.sync_data());
+        match rollback {
+            Ok(()) => Err(error).context(format!(
+                "{operation} durable {what}; partial transaction was rolled back to byte {start}"
+            )),
+            Err(rollback_error) => anyhow::bail!(
+                "{operation} durable {what} failed: {error}; rollback to byte {start} also \
+                 failed: {rollback_error}. Treat journal state as ambiguous and rerun after \
+                 repairing storage"
+            ),
+        }
+    }
+
     pub fn write_plan(&mut self, plan: &Plan) -> Result<()> {
-        self.append(&serde_json::json!({"kind": "plan", "plan": plan}))?;
-        self.file.sync_data().ok();
+        self.append_transaction(&serde_json::json!({"kind": "plan", "plan": plan}), "plan")?;
         self.plan = Some(plan.clone());
         Ok(())
     }
 
     pub fn file_done(&mut self, fd: &FileDone) -> Result<()> {
+        if let Some(pending) = self.pending_replacements.get(&fd.file_key) {
+            anyhow::ensure!(
+                fd.generation.as_deref() == Some(pending.as_str()),
+                "refusing stale completion for {} generation {:?}; pending generation is {}",
+                fd.file_key,
+                fd.generation,
+                pending
+            );
+        }
         let mut v = serde_json::to_value(fd)?;
         v["kind"] = Value::String("file_done".into());
-        self.append(&v)?;
+        self.append_transaction(&v, "file_done")?;
+        self.pending_replacements.remove(&fd.file_key);
         self.done.insert(fd.file_key.clone(), fd.clone());
-        // fsync batched: every 32 completions
-        if self.done.len().is_multiple_of(32) {
-            self.file.sync_data().ok();
-        }
+        Ok(())
+    }
+
+    /// Durably invalidate an older completion before persisting a new plan or
+    /// changing live visibility. Replaying this record schedules repair until
+    /// a later durable file_done commits the generation.
+    pub fn file_replace_start(&mut self, file_key: &str, generation: &str) -> Result<()> {
+        self.append_transaction(
+            &serde_json::json!({
+                "kind": "file_replace_start",
+                "file_key": file_key,
+                "generation": generation,
+            }),
+            "file_replace_start",
+        )?;
+        self.done.remove(file_key);
+        self.pending_replacements
+            .insert(file_key.to_string(), generation.to_string());
         Ok(())
     }
 
     pub fn finish(&mut self, summary: &Value) -> Result<()> {
-        self.append(&serde_json::json!({"kind": "finish", "summary": summary,
-            "at": chrono::Utc::now().to_rfc3339()}))?;
-        self.file.sync_data().ok();
+        self.append_transaction(
+            &serde_json::json!({"kind": "finish", "summary": summary,
+                "at": chrono::Utc::now().to_rfc3339()}),
+            "finish",
+        )?;
         Ok(())
     }
 
@@ -263,5 +511,321 @@ impl Journal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    #[test]
+    fn pre_dedupe_plan_deserializes_with_empty_aliases_and_no_digest() {
+        let plan: Plan = serde_json::from_value(serde_json::json!({
+            "datasets": [],
+            "files": {
+                "legacy-key": {
+                    "rel": "report.pdf",
+                    "family": "pdf",
+                    "gzip": false,
+                    "assignments": []
+                }
+            },
+            "junk_files": []
+        }))
+        .unwrap();
+        assert!(plan.duplicate_files.is_empty());
+        assert!(plan.files["legacy-key"].content_digest.is_none());
+    }
+
+    #[test]
+    fn replacement_start_durably_invalidates_done_until_a_durable_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        let old = FileDone {
+            file_key: "file-key".into(),
+            path: "large.csv".into(),
+            records: 6_001,
+            junk: 0,
+            bytes: 100,
+            generation: Some("old-generation".into()),
+        };
+        journal.file_done(&old).unwrap();
+        journal
+            .file_replace_start("file-key", "new-generation")
+            .unwrap();
+        journal.write_plan(&Plan::default()).unwrap();
+        drop(journal);
+
+        let resumed = Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        assert!(!resumed.done.contains_key("file-key"));
+        assert_eq!(
+            resumed.pending_replacements.get("file-key"),
+            Some(&"new-generation".to_string())
+        );
+        drop(resumed);
+
+        let mut committing =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        committing
+            .file_done(&FileDone {
+                records: 2,
+                bytes: 20,
+                generation: Some("new-generation".into()),
+                ..old
+            })
+            .unwrap();
+        drop(committing);
+        let committed =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        assert_eq!(committed.done["file-key"].records, 2);
+        assert!(!committed.pending_replacements.contains_key("file-key"));
+
+        // The commit really reached the append-only file, rather than only
+        // changing the in-memory replay state.
+        let text = fs::read_to_string(dir.path().join("journal.ndjson")).unwrap();
+        assert!(text.contains("\"kind\":\"file_replace_start\""));
+        assert_eq!(text.matches("\"kind\":\"file_done\"").count(), 2);
+    }
+
+    #[test]
+    fn torn_file_done_tail_is_truncated_before_repair_commit_is_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        journal
+            .file_replace_start("file-key", "generation-2")
+            .unwrap();
+        drop(journal);
+        let path = dir.path().join("journal.ndjson");
+        let valid_len = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"kind":"file_done","file_key":"file-key","generation":"gener"#)
+            .unwrap();
+
+        let mut repaired =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        assert!(repaired.done.is_empty());
+        assert_eq!(repaired.pending_replacements["file-key"], "generation-2");
+        assert!(fs::metadata(&path).unwrap().len() > valid_len);
+        repaired
+            .file_done(&FileDone {
+                file_key: "file-key".into(),
+                path: "records.csv".into(),
+                records: 2,
+                junk: 0,
+                bytes: 20,
+                generation: Some("generation-2".into()),
+            })
+            .unwrap();
+        drop(repaired);
+
+        let reopened =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        assert_eq!(reopened.done["file-key"].records, 2);
+        assert!(reopened.pending_replacements.is_empty());
+    }
+
+    #[test]
+    fn torn_replacement_start_and_plan_tails_are_repaired_before_append() {
+        for torn in [
+            br#"{"kind":"file_replace_start","file_key":"file-key","generation":"new""#.as_slice(),
+            br#"{"kind":"plan","plan":{"datasets":[],"files":{"#.as_slice(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal =
+                Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+            drop(journal);
+            let path = dir.path().join("journal.ndjson");
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(torn)
+                .unwrap();
+
+            let repaired =
+                Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+            assert!(repaired.pending_replacements.is_empty());
+            drop(repaired);
+            // The resume appended after truncation must itself remain visible
+            // on every later replay.
+            let reopened =
+                Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+            assert!(reopened.resumed);
+        }
+    }
+
+    #[test]
+    fn malformed_newline_terminated_middle_record_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        journal.write_plan(&Plan::default()).unwrap();
+        drop(journal);
+        let path = dir.path().join("journal.ndjson");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{malformed middle}\n").unwrap();
+        file.write_all(b"{\"kind\":\"resume\"}\n").unwrap();
+        drop(file);
+
+        let error = Journal::open(dir.path(), "root", "http://engine", "ax", 300, false)
+            .err()
+            .expect("corruption must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("journal corruption"));
+        // Recovery guidance must stay scoped and honest: byte-exact truncation
+        // keeps prior completions; discarding the journal re-embeds everything.
+        assert!(message.contains("truncate it to exactly"));
+        assert!(message.contains("re-extracts and re-embeds the entire corpus"));
+    }
+
+    #[test]
+    fn stale_generation_completion_cannot_clear_newer_pending_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        journal.file_replace_start("file-key", "new").unwrap();
+        let error = journal
+            .file_done(&FileDone {
+                file_key: "file-key".into(),
+                path: "records.csv".into(),
+                records: 10,
+                junk: 0,
+                bytes: 10,
+                generation: Some("old".into()),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("refusing stale completion"));
+        assert_eq!(journal.pending_replacements["file-key"], "new");
+        assert!(!journal.done.contains_key("file-key"));
+    }
+
+    #[test]
+    fn append_and_fsync_commit_failures_leave_pending_and_replayable() {
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        for boundary in [1, 2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut journal =
+                Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+            journal.file_replace_start("file-key", "new").unwrap();
+            fail_next_file_done_io(boundary);
+            let error = journal
+                .file_done(&FileDone {
+                    file_key: "file-key".into(),
+                    path: "records.csv".into(),
+                    records: 2,
+                    junk: 0,
+                    bytes: 20,
+                    generation: Some("new".into()),
+                })
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(if boundary == 1 {
+                "append failure"
+            } else if boundary == 3 {
+                "partial file_done write"
+            } else {
+                "fsync failure"
+            }));
+            assert!(journal.done.is_empty());
+            assert_eq!(journal.pending_replacements["file-key"], "new");
+            drop(journal);
+            let replay =
+                Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+            assert!(replay.done.is_empty());
+            assert_eq!(replay.pending_replacements["file-key"], "new");
+        }
+    }
+
+    #[test]
+    fn partial_commit_is_rolled_back_before_another_worker_appends() {
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        journal
+            .file_replace_start("file-c", "generation-c")
+            .unwrap();
+        fail_next_file_done_io(3);
+        let error = journal
+            .file_done(&FileDone {
+                file_key: "file-c".into(),
+                path: "c.csv".into(),
+                records: 2,
+                junk: 0,
+                bytes: 20,
+                generation: Some("generation-c".into()),
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("after 23 bytes"));
+
+        // The mutex would now pass to another worker. Its complete record must
+        // begin exactly at the rolled-back boundary, not after a torn prefix.
+        journal
+            .file_done(&FileDone {
+                file_key: "file-d".into(),
+                path: "d.csv".into(),
+                records: 3,
+                junk: 0,
+                bytes: 30,
+                generation: Some("generation-d".into()),
+            })
+            .unwrap();
+        drop(journal);
+
+        let mut replay =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        assert_eq!(replay.pending_replacements["file-c"], "generation-c");
+        assert!(!replay.done.contains_key("file-c"));
+        assert_eq!(replay.done["file-d"].records, 3);
+        replay
+            .file_done(&FileDone {
+                file_key: "file-c".into(),
+                path: "c.csv".into(),
+                records: 2,
+                junk: 0,
+                bytes: 20,
+                generation: Some("generation-c".into()),
+            })
+            .unwrap();
+        drop(replay);
+        let committed =
+            Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        assert_eq!(committed.done.len(), 2);
+        assert!(committed.pending_replacements.is_empty());
+    }
+
+    #[test]
+    fn state_lock_precedes_safe_direct_child_orphan_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".autoindex-stage-orphan"), b"staged").unwrap();
+        fs::create_dir(dir.path().join(".autoindex-stage-directory")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            dir.path().join(".autoindex-stage-orphan-target"),
+            dir.path().join(".autoindex-stage-symlink"),
+        )
+        .unwrap();
+
+        let journal = Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
+        assert!(!dir.path().join(".autoindex-stage-orphan").exists());
+        assert!(dir.path().join(".autoindex-stage-directory").is_dir());
+        #[cfg(unix)]
+        assert!(dir.path().join(".autoindex-stage-symlink").is_symlink());
+
+        // A second opener is rejected before it can inspect or clean stages
+        // belonging to the live first process.
+        fs::write(dir.path().join(".autoindex-stage-live"), b"live stage").unwrap();
+        let error = Journal::open(dir.path(), "root", "http://engine", "ax", 300, false)
+            .err()
+            .expect("second process must not share a state directory");
+        assert!(error.to_string().contains("already in use"));
+        assert!(dir.path().join(".autoindex-stage-live").exists());
+        drop(journal);
     }
 }

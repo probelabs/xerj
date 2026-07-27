@@ -31,6 +31,7 @@ pub fn catalog_mapping() -> Value {
             "format": {"type": "keyword"},
             "status": {"type": "keyword"},
             "reason": {"type": "text"},
+            "duplicate_of": {"type": "keyword"},
             "records": {"type": "long"},
             "junk": {"type": "long"},
             "run_id": {"type": "keyword"},
@@ -59,6 +60,7 @@ pub const GOTCHAS: &[&str] = &[
     "all dates are normalized to RFC3339 UTC millis; mappings use strict_date_optional_time||epoch_millis",
     "query all data with the wildcard index pattern (e.g. ax-*) or comma lists — never multi-index aliases (they resolve to the first index only)",
     "documents were indexed with refresh at the end of the run; new writes need _refresh before they are searchable",
+    "byte-identical paths are indexed once; canonical records retain every current filename in _source.ax_paths, and exact alias resolution is available through the catalog's duplicate_files entries",
 ];
 
 pub struct DatasetDocInput<'a> {
@@ -127,6 +129,41 @@ pub fn file_doc(
             "bytes": bytes,
             "run_id": run_id,
         }),
+    )
+}
+
+pub fn duplicate_file_doc(
+    file_key: &str,
+    path: &str,
+    path_id: &str,
+    duplicate_of: &str,
+    bytes: u64,
+    run_id: &str,
+) -> (String, Value) {
+    let alias_id = duplicate_file_id(file_key, path, path_id);
+    (
+        alias_id,
+        json!({
+            "doc_kind": "file",
+            "file_key": file_key,
+            "path": path,
+            "format": "duplicate",
+            "status": "duplicate",
+            "reason": format!("byte-identical content already indexed from {duplicate_of}"),
+            "duplicate_of": duplicate_of,
+            "records": 0,
+            "junk": 0,
+            "bytes": bytes,
+            "run_id": run_id,
+        }),
+    )
+}
+
+pub fn duplicate_file_id(file_key: &str, path: &str, path_id: &str) -> String {
+    let identity = if path_id.is_empty() { path } else { path_id };
+    format!(
+        "file-alias:{}",
+        crate::ids::doc_id("duplicate-file", file_key, identity)
     )
 }
 
@@ -248,6 +285,7 @@ pub fn render_map(
     datasets: &[Value],
     correlations: &[Value],
     junk_files: &[Value],
+    duplicate_files: &[Value],
     junk_total: u64,
 ) -> String {
     let mut s = String::new();
@@ -255,10 +293,12 @@ pub fn render_map(
     if let Some(r) = run {
         let g = |k: &str| r.get(k).map(pretty_val).unwrap_or_default();
         s.push_str(&format!(
-            "run `{}` — root `{}` — {} files, {} records indexed, {} junk records, wall {}s\n\n",
+            "run `{}` — root `{}` — {} paths ({} unique content, {} duplicate aliases), {} records indexed, {} junk records, wall {}s\n\n",
             g("run_id"),
             g("root"),
             g("files_total"),
+            g("unique_content_files"),
+            g("duplicate_files"),
             g("records_total"),
             g("junk_records_total"),
             g("wall_seconds"),
@@ -400,6 +440,21 @@ pub fn render_map(
         }
     }
 
+    if !duplicate_files.is_empty() {
+        s.push_str(&format!(
+            "## Duplicate aliases ({} paths; content indexed once)\n\n",
+            duplicate_files.len()
+        ));
+        for file in duplicate_files.iter().take(30) {
+            let g = |key: &str| file.get(key).map(pretty_val).unwrap_or_default();
+            s.push_str(&format!("- `{}` → `{}`\n", g("path"), g("duplicate_of")));
+        }
+        if duplicate_files.len() > 30 {
+            s.push_str(&format!("- … and {} more\n", duplicate_files.len() - 30));
+        }
+        s.push('\n');
+    }
+
     if !correlations.is_empty() {
         s.push_str("## Cross-dataset correlations\n\n");
         for c in correlations {
@@ -488,5 +543,24 @@ fn trunc_f(s: &str) -> String {
     match s.parse::<f64>() {
         Ok(f) => format!("{f:.2}"),
         Err(_) => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_aliases_render_separately_from_junk() {
+        let duplicate = json!({
+            "path": "copy.pdf",
+            "duplicate_of": "report.pdf",
+            "status": "duplicate"
+        });
+        let rendered = render_map(None, &[], &[], &[], &[duplicate], 0);
+        assert!(rendered.contains("## Duplicate aliases"));
+        assert_eq!(rendered.matches("## Duplicate aliases").count(), 1);
+        assert!(rendered.contains("`copy.pdf` → `report.pdf`"));
+        assert!(!rendered.contains("## Junk / skipped"));
     }
 }
