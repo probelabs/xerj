@@ -1773,19 +1773,14 @@ pub async fn turbo_ingest(
     let parallel = cfg.indexing.turbo_parallel;
     let fast_analyzer = cfg.indexing.turbo_fast_analyzer;
 
-    // Build `(id, source, source_bytes)` triples, auto-generating IDs
-    // where not supplied.  The native API accepts already-parsed
-    // `Value` objects so we serialize once here (`to_vec`) to produce
-    // the WAL bytes — still one serialize total versus two in the
-    // pre-v14 path (one parse + one re-serialize).
-    let pairs: Vec<(String, Value, std::sync::Arc<[u8]>)> = docs
+    // The engine accepts one parsed authority and serializes it exactly once
+    // at the storage boundary; there is no second caller-provided byte
+    // representation that could disagree with live indexing.
+    let pairs: Vec<(String, Value)> = docs
         .into_iter()
         .map(|doc| {
             let id = extract_or_gen_id(&doc);
-            let bytes: std::sync::Arc<[u8]> = serde_json::to_vec(&doc)
-                .map(std::sync::Arc::from)
-                .unwrap_or_else(|_| std::sync::Arc::from(&[][..]));
-            (id, doc, bytes)
+            (id, doc)
         })
         .collect();
 

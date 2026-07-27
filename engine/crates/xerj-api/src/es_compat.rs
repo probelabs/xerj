@@ -12394,6 +12394,84 @@ async fn process_bulk_body(
     }
 }
 
+#[cfg(test)]
+mod malformed_bulk_route_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test]
+    async fn malformed_bulk_source_returns_actionable_public_item_error() {
+        let body = concat!(
+            "{\"index\":{\"_index\":\"route-errors\",\"_id\":\"valid-doc\"}}\n",
+            "{\"title\":\"valid\"}\n",
+            "{\"index\":{\"_index\":\"route-errors\",\"_id\":\"broken-doc\"}}\n",
+            "{\"title\":\"unterminated}\n",
+        );
+        let response = crate::router::build_es_compat_router(test_state())
+            .oneshot(
+                Request::post("/_bulk")
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        // ES bulk reports per-item parse failures inside a successful HTTP
+        // response; callers must inspect `errors` and each item's status.
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: Value = serde_json::from_slice(&bytes).expect("JSON response");
+        assert_eq!(response["errors"], true);
+        assert_eq!(response["items"][0]["index"]["status"], 201);
+
+        let failed = &response["items"][1]["index"];
+        assert_eq!(failed["_id"], "broken-doc");
+        assert_eq!(failed["status"], 400);
+        assert_eq!(
+            failed["error"]["type"], "document_parsing_exception",
+            "unexpected response: {response}"
+        );
+        let reason = failed["error"]["reason"]
+            .as_str()
+            .expect("error reason string");
+        for expected in [
+            "document ID \"broken-doc\"",
+            "bulk item position 2",
+            "parser error:",
+            "parser location: line 1, column ",
+            "Fix: replace this source line with exactly one complete UTF-8 JSON object.",
+            "Related help: xerj index --help and https://xerj.org/llms.txt",
+        ] {
+            assert!(
+                reason.contains(expected),
+                "missing {expected:?} in public reason: {reason}"
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Schema conversion helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -29133,16 +29211,14 @@ mod ml_datafeed_tests {
             19.0, 21.0, 20.0, 20.0, 22.0, 18.0, 21.0, 20.0, 19.0, 21.0, 20.0, 22.0, 96.0, 20.0,
             21.0, 19.0,
         ];
-        let mut batch: Vec<(String, Value, std::sync::Arc<[u8]>)> = Vec::new();
+        let mut batch: Vec<(String, Value)> = Vec::new();
         for (i, v) in cpu.iter().enumerate() {
             let ts = base + chrono::Duration::minutes(i as i64);
             let doc = json!({
                 "@timestamp": ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 "cpu": v,
             });
-            let bytes: std::sync::Arc<[u8]> =
-                std::sync::Arc::from(serde_json::to_vec(&doc).unwrap());
-            batch.push((format!("m{i:02}"), doc, bytes));
+            batch.push((format!("m{i:02}"), doc));
         }
         idx.index_batch_turbo(batch, false, false).await.unwrap();
 
@@ -29308,12 +29384,11 @@ mod reindex_keyset_tests {
         // Index N docs with distinct _ids into `src` via the batched turbo
         // path (one WAL append) so the test isn't dominated by per-doc fsyncs.
         let src = state.engine.get_or_create_index("src").expect("src index");
-        let mut batch: Vec<(String, Value, std::sync::Arc<[u8]>)> = Vec::with_capacity(n);
+        let mut batch: Vec<(String, Value)> = Vec::with_capacity(n);
         for i in 0..n {
             let id = format!("doc-{i:06}");
             let v = json!({ "n": i });
-            let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(serde_json::to_vec(&v).unwrap());
-            batch.push((id, v, bytes));
+            batch.push((id, v));
         }
         src.index_batch_turbo(batch, true, false)
             .await

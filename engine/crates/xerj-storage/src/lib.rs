@@ -38,7 +38,7 @@ pub use backend::{FileMetadata, LocalFsBackend, S3Backend, StorageBackend};
 pub use cache::SegmentCache;
 pub use index_store::{
     DrainedMemtable, FsckReport, FsckSectionReport, FsckSegmentReport, IndexSnapshot, IndexStore,
-    IndexStoreConfig, StorageMode,
+    IndexStoreConfig, RawJsonDoc, StorageMode, ValidatedRawBatch,
 };
 // `MergeExecutor` is intentionally NOT re-exported here: it is a
 // `#[doc(hidden)]`, storage-crate-only test helper with real footguns
@@ -97,6 +97,17 @@ pub enum StorageError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error(
+        "invalid raw JSON for document [{doc_id}] at one-based batch position {position}: \
+         {reason}. Fix: replace that document body with exactly one complete UTF-8 JSON value, \
+         then retry the batch. Related help: `xerj index --help` and https://xerj.org/llms.txt"
+    )]
+    RawBatchValidation {
+        doc_id: String,
+        position: usize,
+        reason: String,
+    },
 
     #[error("Merge aborted: {0}")]
     MergeAborted(String),

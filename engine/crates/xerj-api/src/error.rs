@@ -294,6 +294,7 @@ fn xerj_error_type(e: &XerjError) -> String {
         XerjError::StorageError { .. } | XerjError::WalError { .. } => "store_exception",
         // ── Serialization ─────────────────────────────────────────────────
         XerjError::SerializationError { .. } => "json_parse_exception",
+        XerjError::InvalidDocumentJson { .. } => "json_parse_exception",
         // ── Configuration ─────────────────────────────────────────────────
         XerjError::ConfigError { .. } => "action_request_validation_exception",
         // ── Auth ──────────────────────────────────────────────────────────
@@ -372,4 +373,25 @@ pub fn native_error(
         took_ms,
     };
     (http_status, axum::Json(body))
+}
+
+#[cfg(test)]
+mod raw_document_error_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_document_json_renders_registered_actionable_400() {
+        let reason = "invalid raw JSON for document [row-17] at one-based batch position 17: \
+                      trailing characters at line 1 column 9. Fix: replace that document body \
+                      with exactly one complete UTF-8 JSON value, then retry the batch. Related \
+                      help: `xerj index --help` and https://xerj.org/llms.txt";
+        let (status, body) = ApiError::new(XerjError::invalid_document_json(reason)).into_parts();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error.error_type, "json_parse_exception");
+        assert_eq!(body.error.root_cause[0].error_type, "json_parse_exception");
+        assert!(body.error.reason.contains("document [row-17]"));
+        assert!(body.error.reason.contains("batch position 17"));
+        assert!(body.error.reason.contains("Fix:"));
+        assert!(body.error.reason.contains("Related help:"));
+    }
 }
