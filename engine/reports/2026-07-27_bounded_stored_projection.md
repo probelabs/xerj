@@ -6,8 +6,8 @@ This report measures the storage primitive only. It does not claim an
 end-to-end engine speedup or cache-memory reduction because no engine consumer
 is included in this branch.
 
-- Source commit: `c7c4cfedcc5dafaa048996951400f02b46eaf99c`
-- Upstream base: `c2020229e70c2041c6d0b199c79a3c76ffb5e04f`
+- Source commit: `0d28f07453e206516c7390c019c1dec45c7d52be`
+- Upstream base: `16d6df0`
 - Probe source SHA-256:
   `86326cab5a4e2f7f2fb141d081855ac8ba790a3403f9103a973732a19c109953`
 - Probe: `crates/xerj-storage/examples/stored_projection_probe.rs`
