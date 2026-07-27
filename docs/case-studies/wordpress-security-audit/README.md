@@ -116,6 +116,9 @@ read; scale and durability come from XERJ.
   second-order, TOCTOU, timing, …) with attack + detection + safe recipe.
 - **Copyable Claude Code skill**: [`skill/SKILL.md`](skill/SKILL.md)
   — install it and run this whole workflow on your own codebase.
+- [`AUTHENTICATION.md`](AUTHENTICATION.md) — **the WordPress auth story across all
+  4 entry surfaces** (AJAX/REST/XML-RPC/admin-post): missing / insufficient /
+  broken-`==` / race checked; ~51× fewer tokens than reading the handlers.
 - [`FINDINGS.md`](FINDINGS.md) — the SSRF vulnerability, with verification and
   reachability.
 - [`REPRODUCE.md`](REPRODUCE.md) — exact commands to rebuild the index and rerun
