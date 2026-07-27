@@ -56,7 +56,16 @@ pub(super) fn decode_v2_identity_columns_controlled(
         .iter()
         .position(|column| column.name == "__seq_no")
         .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 missing __seq_no column")))?;
-    let selected: Vec<usize> = (0..directory.num_docs).collect();
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(directory.num_docs)
+        .map_err(|error| {
+            StorageError::Other(anyhow::anyhow!(
+                "cannot reserve {} identity row ordinals: {error}",
+                directory.num_docs
+            ))
+        })?;
+    selected.extend(0..directory.num_docs);
     let mut stats = StoredV2RowHydrationStats::default();
     let mut dict_ids = HashMap::new();
     let mut decode =
@@ -136,7 +145,7 @@ impl<'de> serde::de::Visitor<'de> for SelectedRowsVisitor<'_> {
                     .ok_or_else(|| serde::de::Error::custom("stored column ended early"))?;
             }
             let processed = row + 1;
-            if processed % STORED_DECODE_CHECK_INTERVAL == 0
+            if processed.is_multiple_of(STORED_DECODE_CHECK_INTERVAL)
                 && (self.checkpoint)(StoredDecodeCheckpoint {
                     phase: StoredDecodePhase::Rows,
                     column_index: self.column_index,
@@ -292,7 +301,7 @@ fn decode_dict_rows(
                 "dict id {id} outside dictionary"
             )));
         }
-        if (ordinal + 1) % STORED_DECODE_CHECK_INTERVAL == 0
+        if (ordinal + 1).is_multiple_of(STORED_DECODE_CHECK_INTERVAL)
             && checkpoint(StoredDecodeCheckpoint {
                 phase: StoredDecodePhase::Rows,
                 column_index,
@@ -413,7 +422,7 @@ fn decode_cross_dep_rows(
             exceptions.insert(ordinal, value);
         }
         previous = ordinal;
-        if (exception_index + 1) % STORED_DECODE_CHECK_INTERVAL == 0
+        if (exception_index + 1).is_multiple_of(STORED_DECODE_CHECK_INTERVAL)
             && checkpoint(StoredDecodeCheckpoint {
                 phase: StoredDecodePhase::Rows,
                 column_index,
