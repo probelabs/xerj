@@ -92,8 +92,9 @@ pub struct PainlessCtx<'a> {
     /// non-runtime contexts (script_score, rescore, etc.) where emit()
     /// is not used.
     pub emits: std::cell::RefCell<Vec<PainlessValue>>,
-    /// Current AST-evaluation recursion depth. Guards `eval_expr`/`exec_stmt`
-    /// against stack overflow on a deeply-nested (or long flat) AST.
+    /// Current expression-evaluation recursion depth. Statement nesting is
+    /// independently bounded by the parser, so it must not consume the exact
+    /// [`MAX_EVAL_DEPTH`] expression budget.
     eval_depth: std::cell::Cell<usize>,
 }
 
@@ -904,7 +905,6 @@ fn exec_stmt(
     ctx: &PainlessCtx,
     env: &mut HashMap<String, PainlessValue>,
 ) -> Result<ExecOutcome, String> {
-    let _guard = EvalDepthGuard::enter(&ctx.eval_depth)?;
     match s {
         Stmt::Return(opt) => {
             let v = match opt {
@@ -981,124 +981,7 @@ fn eval_expr(
                 eval_expr(f, ctx, env)
             }
         }
-        Expr::Index(base, idx) => {
-            // Special-case `doc['field']` / `params['x']`.
-            if let Expr::Ident(name) = base.as_ref() {
-                let key = match eval_expr(idx, ctx, env)? {
-                    PainlessValue::String(s) => s,
-                    PainlessValue::Number(n) => format_num(n),
-                    other => return Err(format!("non-string index: {:?}", other)),
-                };
-                if name == "doc" {
-                    // Return a marker via DocField wrapper using PainlessValue::Array
-                    // hack — we represent doc-field references as "doc:field" so that
-                    // .value can resolve them. Stored as a String value.
-                    return Ok(PainlessValue::String(format!("__docref__:{}", key)));
-                }
-                if name == "params" {
-                    // `params['_source']` → the doc source object.
-                    // ES exposes the source under that key for runtime
-                    // field scripts.
-                    if key == "_source" {
-                        return Ok(PainlessValue::from_json(ctx.doc));
-                    }
-                    let v = ctx.params.get(&key).cloned().unwrap_or(Value::Null);
-                    return Ok(PainlessValue::from_json(&v));
-                }
-            }
-            // General index access on arrays.
-            let bv = eval_expr(base, ctx, env)?;
-            let key = eval_expr(idx, ctx, env)?;
-            match (bv, key) {
-                (PainlessValue::Array(arr), PainlessValue::Number(n)) => {
-                    let i = n as usize;
-                    Ok(arr.get(i).cloned().unwrap_or(PainlessValue::Null))
-                }
-                _ => Ok(PainlessValue::Null),
-            }
-        }
-        Expr::Member(base, member, args) => {
-            // doc.field.value
-            // doc['field'].value
-            // params.foo
-            // Math.foo(args)
-            if let Expr::Ident(name) = base.as_ref() {
-                if name == "params" && args.is_none() {
-                    let v = ctx.params.get(member).cloned().unwrap_or(Value::Null);
-                    return Ok(PainlessValue::from_json(&v));
-                }
-                if name == "doc" && args.is_none() {
-                    // doc.field → marker
-                    return Ok(PainlessValue::String(format!("__docref__:{}", member)));
-                }
-                if name == "Math" {
-                    let argvs: Vec<PainlessValue> = match args {
-                        Some(args) => args
-                            .iter()
-                            .map(|a| eval_expr(a, ctx, env))
-                            .collect::<Result<_, _>>()?,
-                        None => Vec::new(),
-                    };
-                    return math_call(member, &argvs);
-                }
-            }
-            let bv = eval_expr(base, ctx, env)?;
-            // String marker → resolve doc field then access .value or .size or .length
-            if let PainlessValue::String(s) = &bv {
-                if let Some(field) = s.strip_prefix("__docref__:") {
-                    return resolve_doc_member(ctx, field, member, args, env);
-                }
-                // Methods on String: .length(), .toString(), .toLowerCase(), .toUpperCase().
-                match member.as_str() {
-                    "length" => return Ok(PainlessValue::Number(s.chars().count() as f64)),
-                    "toString" => return Ok(PainlessValue::String(s.clone())),
-                    "toLowerCase" => return Ok(PainlessValue::String(s.to_lowercase())),
-                    "toUpperCase" => return Ok(PainlessValue::String(s.to_uppercase())),
-                    // `doc['a_date_field'].value` returns the raw ISO string
-                    // (real ES returns a JodaCompatibleZonedDateTime, which
-                    // these getters read off directly) — so date accessor
-                    // methods here parse the string on demand instead. Only
-                    // dispatches for these specific getter names, so a
-                    // genuinely non-date string field still falls through
-                    // to the "unsupported member access" error below.
-                    "getHour" | "getMinute" | "getSecond" | "getDayOfMonth" | "getMonthValue"
-                    | "getYear" | "getDayOfWeek" => {
-                        if let Some(ms) = date_value_millis(s) {
-                            return date_component(ms, member);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Object methods: .toString() renders as ES-compatible
-            // HashMap.toString format `{key=value, key=value, ...}` with
-            // keys alphabetically sorted (matches Java HashMap toString
-            // for the YAML test expectation).
-            if let PainlessValue::Object(map) = &bv {
-                match member.as_str() {
-                    "toString" => return Ok(PainlessValue::String(render_es_map(map))),
-                    "size" => return Ok(PainlessValue::Number(map.len() as f64)),
-                    "isEmpty" => return Ok(PainlessValue::Bool(map.is_empty())),
-                    _ => {
-                        // Unknown member — fall through to dotted-key
-                        // lookup.
-                        if args.is_none() {
-                            if let Some(v) = map.get(member) {
-                                return Ok(PainlessValue::from_json(v));
-                            }
-                        }
-                    }
-                }
-            }
-            if let PainlessValue::Array(arr) = &bv {
-                match member.as_str() {
-                    "size" | "length" => return Ok(PainlessValue::Number(arr.len() as f64)),
-                    "isEmpty" => return Ok(PainlessValue::Bool(arr.is_empty())),
-                    _ => {}
-                }
-            }
-            Err(format!("unsupported member access .{}", member))
-        }
+        Expr::Index(_, _) | Expr::Member(_, _, _) => eval_access_chain(e, ctx, env),
         Expr::Call(name, args) => {
             let argvs: Vec<PainlessValue> = args
                 .iter()
@@ -1144,6 +1027,172 @@ fn eval_binary_chain(
         value = apply_binary(op, value, right)?;
     }
     Ok(value)
+}
+
+/// Evaluate a left-nested member/index chain without mirroring its postfix
+/// depth on the native stack.
+///
+/// The parser has already enforced the exact [`MAX_EVAL_DEPTH`] contract.
+/// This loop preserves the original evaluator's ordering: general indices
+/// evaluate base before key, `doc`/`params` special indices evaluate their key
+/// directly, and method arguments are evaluated only for the same dispatches
+/// that consumed them before this reliability fix.
+fn eval_access_chain(
+    root: &Expr,
+    ctx: &PainlessCtx,
+    env: &mut HashMap<String, PainlessValue>,
+) -> Result<PainlessValue, String> {
+    enum Step<'a> {
+        Index(&'a Expr),
+        Member(&'a str, &'a Option<Vec<Expr>>),
+    }
+
+    let mut steps = Vec::new();
+    let mut base = root;
+    loop {
+        match base {
+            Expr::Index(next_base, index) => {
+                steps.push(Step::Index(index));
+                base = next_base;
+            }
+            Expr::Member(next_base, member, args) => {
+                steps.push(Step::Member(member, args));
+                base = next_base;
+            }
+            _ => break,
+        }
+    }
+    steps.reverse();
+
+    let root_ident = match base {
+        Expr::Ident(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let mut value = None;
+    for (position, step) in steps.into_iter().enumerate() {
+        if position == 0 {
+            match (root_ident, &step) {
+                (Some("doc"), Step::Index(index)) => {
+                    let key = access_key(eval_expr(index, ctx, env)?)?;
+                    value = Some(PainlessValue::String(format!("__docref__:{key}")));
+                    continue;
+                }
+                (Some("params"), Step::Index(index)) => {
+                    let key = access_key(eval_expr(index, ctx, env)?)?;
+                    value = Some(if key == "_source" {
+                        PainlessValue::from_json(ctx.doc)
+                    } else {
+                        PainlessValue::from_json(
+                            &ctx.params.get(&key).cloned().unwrap_or(Value::Null),
+                        )
+                    });
+                    continue;
+                }
+                (Some("doc"), Step::Member(member, args)) if args.is_none() => {
+                    value = Some(PainlessValue::String(format!("__docref__:{member}")));
+                    continue;
+                }
+                (Some("params"), Step::Member(member, args)) if args.is_none() => {
+                    value = Some(PainlessValue::from_json(
+                        &ctx.params.get(*member).cloned().unwrap_or(Value::Null),
+                    ));
+                    continue;
+                }
+                (Some("Math"), Step::Member(member, args)) => {
+                    let argvs = eval_args(args, ctx, env)?;
+                    value = Some(math_call(member, &argvs)?);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        let current = match value.take() {
+            Some(value) => value,
+            None => eval_expr(base, ctx, env)?,
+        };
+        value = Some(match step {
+            Step::Index(index) => {
+                let key = eval_expr(index, ctx, env)?;
+                match (current, key) {
+                    (PainlessValue::Array(values), PainlessValue::Number(index)) => values
+                        .get(index as usize)
+                        .cloned()
+                        .unwrap_or(PainlessValue::Null),
+                    _ => PainlessValue::Null,
+                }
+            }
+            Step::Member(member, args) => eval_member_value(current, member, args, ctx, env)?,
+        });
+    }
+    value.ok_or_else(|| "internal error: empty access chain".to_string())
+}
+
+fn access_key(value: PainlessValue) -> Result<String, String> {
+    match value {
+        PainlessValue::String(value) => Ok(value),
+        PainlessValue::Number(value) => Ok(format_num(value)),
+        other => Err(format!("non-string index: {other:?}")),
+    }
+}
+
+fn eval_args(
+    args: &Option<Vec<Expr>>,
+    ctx: &PainlessCtx,
+    env: &mut HashMap<String, PainlessValue>,
+) -> Result<Vec<PainlessValue>, String> {
+    match args {
+        Some(args) => args.iter().map(|arg| eval_expr(arg, ctx, env)).collect(),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn eval_member_value(
+    value: PainlessValue,
+    member: &str,
+    args: &Option<Vec<Expr>>,
+    ctx: &PainlessCtx,
+    env: &mut HashMap<String, PainlessValue>,
+) -> Result<PainlessValue, String> {
+    if let PainlessValue::String(text) = &value {
+        if let Some(field) = text.strip_prefix("__docref__:") {
+            return resolve_doc_member(ctx, field, member, args, env);
+        }
+        match member {
+            "length" => return Ok(PainlessValue::Number(text.chars().count() as f64)),
+            "toString" => return Ok(PainlessValue::String(text.clone())),
+            "toLowerCase" => return Ok(PainlessValue::String(text.to_lowercase())),
+            "toUpperCase" => return Ok(PainlessValue::String(text.to_uppercase())),
+            "getHour" | "getMinute" | "getSecond" | "getDayOfMonth" | "getMonthValue"
+            | "getYear" | "getDayOfWeek" => {
+                if let Some(milliseconds) = date_value_millis(text) {
+                    return date_component(milliseconds, member);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let PainlessValue::Object(map) = &value {
+        match member {
+            "toString" => return Ok(PainlessValue::String(render_es_map(map))),
+            "size" => return Ok(PainlessValue::Number(map.len() as f64)),
+            "isEmpty" => return Ok(PainlessValue::Bool(map.is_empty())),
+            _ if args.is_none() => {
+                if let Some(value) = map.get(member) {
+                    return Ok(PainlessValue::from_json(value));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let PainlessValue::Array(values) = &value {
+        match member {
+            "size" | "length" => return Ok(PainlessValue::Number(values.len() as f64)),
+            "isEmpty" => return Ok(PainlessValue::Bool(values.is_empty())),
+            _ => {}
+        }
+    }
+    Err(format!("unsupported member access .{member}"))
 }
 
 fn apply_binary(
@@ -1668,6 +1717,112 @@ mod tests {
     }
 
     #[test]
+    fn postfix_chain_accepts_exact_eval_depth_boundary() {
+        let doc = json!({});
+        let params = json!({});
+        // Statement evaluation must not consume one level of the expression
+        // budget: a leaf plus 499 calls is exactly depth 500.
+        let src = format!(
+            "\"x\"{}",
+            ".toString()".repeat(MAX_EVAL_DEPTH.saturating_sub(1))
+        );
+        let value = eval_painless(&src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert!(matches!(value, PainlessValue::String(ref text) if text == "x"));
+
+        let too_deep = format!("\"x\"{}", ".toString()".repeat(MAX_EVAL_DEPTH));
+        assert_eq!(
+            eval_painless(&too_deep, &ctx(&doc, &params, 0.0)).unwrap_err(),
+            EVAL_TOO_DEEP_MSG
+        );
+    }
+
+    #[test]
+    fn index_chain_accepts_exact_boundary_without_native_recursion() {
+        let doc = json!({});
+        let params = json!({"items": [7]});
+        // params.items has depth two; 498 indices reach exactly 500.
+        let src = format!(
+            "params.items{}",
+            "[0]".repeat(MAX_EVAL_DEPTH.saturating_sub(2))
+        );
+        assert!(eval_painless(&src, &ctx(&doc, &params, 0.0)).is_ok());
+
+        let too_deep = format!(
+            "params.items{}",
+            "[0]".repeat(MAX_EVAL_DEPTH.saturating_sub(1))
+        );
+        assert_eq!(
+            eval_painless(&too_deep, &ctx(&doc, &params, 0.0)).unwrap_err(),
+            EVAL_TOO_DEEP_MSG
+        );
+    }
+
+    #[test]
+    fn argument_depth_contributes_exactly_once() {
+        let doc = json!({});
+        let params = json!({});
+        // The argument has depth 499 and the Math member-call parent makes 500.
+        let boundary_arg = format!("1{}", "+1".repeat(MAX_EVAL_DEPTH - 2));
+        let boundary = format!("Math.max(0, {boundary_arg})");
+        assert_eq!(
+            eval_painless(&boundary, &ctx(&doc, &params, 0.0))
+                .unwrap()
+                .as_f64(),
+            Some((MAX_EVAL_DEPTH - 1) as f64)
+        );
+
+        let over_limit_arg = format!("1{}", "+1".repeat(MAX_EVAL_DEPTH - 1));
+        let over_limit = format!("Math.max(0, {over_limit_arg})");
+        assert_eq!(
+            eval_painless(&over_limit, &ctx(&doc, &params, 0.0)).unwrap_err(),
+            EVAL_TOO_DEEP_MSG
+        );
+    }
+
+    #[test]
+    fn iterative_access_preserves_special_dispatch_and_error_order() {
+        let doc = json!({"date": "2024-03-04T05:06:07Z"});
+        let params = json!({"obj": {"name": "X"}, "items": [3]});
+        let context = ctx(&doc, &params, 0.0);
+
+        assert!(matches!(
+            eval_painless("params.obj.name.toLowerCase()", &context).unwrap(),
+            PainlessValue::String(value) if value == "x"
+        ));
+        assert_eq!(
+            eval_painless("params.items[0]", &context).unwrap().as_f64(),
+            Some(3.0)
+        );
+        assert_eq!(
+            eval_painless("doc['date'].value.getHour()", &context)
+                .unwrap()
+                .as_f64(),
+            Some(5.0)
+        );
+        assert_eq!(
+            eval_painless("Math.max(2, 4).toString()", &context).unwrap_err(),
+            "unsupported member access .toString"
+        );
+
+        // String methods historically ignore their syntactic argument list;
+        // the unknown call must remain unevaluated.
+        assert!(matches!(
+            eval_painless("\"X\".toLowerCase(missing())", &context).unwrap(),
+            PainlessValue::String(value) if value == "x"
+        ));
+        // General index access evaluates its base before its key.
+        assert_eq!(
+            eval_painless("missing()[alsoMissing()]", &context).unwrap_err(),
+            "unsupported function missing"
+        );
+        // The doc special form evaluates the key directly.
+        assert_eq!(
+            eval_painless("doc[missing()]", &context).unwrap_err(),
+            "unsupported function missing"
+        );
+    }
+
+    #[test]
     fn binary_depth_tracks_mixed_precedence_and_associativity() {
         let doc = json!({});
         let params = json!({});
@@ -1689,7 +1844,7 @@ mod tests {
             " && missing()".repeat(MAX_EVAL_DEPTH.saturating_sub(2))
         );
         let value = eval_painless(&src, &ctx(&doc, &params, 0.0)).unwrap();
-        assert_eq!(value.as_bool(), false);
+        assert!(!value.as_bool());
     }
 
     #[test]
@@ -1733,6 +1888,22 @@ mod tests {
         // NOT be flagged — it should keep degrading gracefully at runtime, not
         // turn into a spurious 400.
         assert!(check_script_limits("some garbage )(").is_ok());
+    }
+
+    #[test]
+    fn deeply_nested_statements_do_not_overflow_parser() {
+        let doc = json!({});
+        let params = json!({});
+        let src = format!(
+            "{}return 1;{}",
+            "if (true) {".repeat(5000),
+            "}".repeat(5000)
+        );
+        assert_eq!(
+            eval_painless(&src, &ctx(&doc, &params, 0.0)).unwrap_err(),
+            TOO_DEEP_MSG
+        );
+        assert_eq!(check_script_limits(&src).unwrap_err(), TOO_DEEP_MSG);
     }
 
     #[test]
