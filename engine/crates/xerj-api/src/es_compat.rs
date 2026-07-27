@@ -15565,6 +15565,62 @@ pub async fn field_caps(
                 arr.push(Value::String(idx_name.clone()));
             }
         }
+
+        // Multi-fields (`"fields": {"keyword": {"type": "keyword"}}`) are
+        // NOT separate entries in `schema.fields` — the engine resolves
+        // `category.keyword` at query time via dotted-path lookup, so
+        // terms aggs/sorts/filters on it work fine, but it was invisible
+        // to `_field_caps`. Kibana relies on `_field_caps` (not `_search`)
+        // to discover which fields exist when building/refreshing an
+        // index pattern, so a saved viz referencing `category.keyword`
+        // silently broke ("field not found") even though the same field
+        // worked when queried directly. Walk the same mapping shape
+        // `GET _mapping` already derives correctly and add each declared
+        // multi-field as its own field-caps entry.
+        let stored_mapping = state
+            .engine
+            .index_mappings
+            .get(idx_name.as_str())
+            .map(|v| v.clone())
+            .unwrap_or(Value::Null);
+        let properties = if stored_mapping.is_null() {
+            Value::Object(schema_to_es_properties(&schema))
+        } else {
+            stored_mapping
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        };
+        let mut multi_fields = Vec::new();
+        collect_multi_fields(&properties, "", &mut multi_fields);
+        for (name, es_type) in multi_fields {
+            if fields_filter != "*" {
+                let matches = fields_filter
+                    .split(',')
+                    .any(|f| source_field_matches(&name, f.trim()));
+                if !matches {
+                    continue;
+                }
+            }
+            let (searchable, aggregatable) = match es_type.as_str() {
+                "text" => (true, false),
+                _ => (true, true),
+            };
+            let type_map = fields_map.entry(name).or_default();
+            let type_entry = type_map.entry(es_type.clone()).or_insert_with(|| {
+                json!({
+                    "type": es_type,
+                    "searchable": searchable,
+                    "aggregatable": aggregatable,
+                    "indices": []
+                })
+            });
+            if let Some(arr) = type_entry["indices"].as_array_mut() {
+                if !arr.iter().any(|v| v.as_str() == Some(idx_name.as_str())) {
+                    arr.push(Value::String(idx_name.clone()));
+                }
+            }
+        }
     }
 
     let fields_val: serde_json::Map<String, Value> = fields_map
@@ -15577,6 +15633,43 @@ pub async fn field_caps(
         "fields": Value::Object(fields_val),
     }))
     .into_response()
+}
+
+/// Walk a mapping `properties` object and collect every declared
+/// multi-field (`"fields": {"keyword": {"type": "keyword"}}`) as a
+/// `(dotted_name, es_type)` pair — e.g. `category` with a `keyword`
+/// multi-field yields `("category.keyword", "keyword")`. Also recurses
+/// into `object`/`nested` sub-`properties` so a multi-field nested two
+/// levels deep still gets its full dotted path. Used by `_field_caps`,
+/// which otherwise only sees top-level `schema.fields` and never learns
+/// a multi-field like `category.keyword` exists.
+fn collect_multi_fields(properties: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
+    let Some(obj) = properties.as_object() else {
+        return;
+    };
+    for (name, def) in obj {
+        let full_name = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        let Some(def_obj) = def.as_object() else {
+            continue;
+        };
+        if let Some(fields) = def_obj.get("fields").and_then(Value::as_object) {
+            for (sub_name, sub_def) in fields {
+                let es_type = sub_def
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("keyword")
+                    .to_string();
+                out.push((format!("{full_name}.{sub_name}"), es_type));
+            }
+        }
+        if let Some(sub_props) = def_obj.get("properties") {
+            collect_multi_fields(sub_props, &full_name, out);
+        }
+    }
 }
 
 fn native_type_to_es_str(ft: &FieldType) -> &'static str {
