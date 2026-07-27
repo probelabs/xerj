@@ -10925,49 +10925,55 @@ impl Index {
                     deadline_exceeded = true;
                     break;
                 }
-                // Merge-race hardening (2026-07): open failures are
-                // errors, not skips — a skipped segment silently drops
-                // its docs from every aggregation bucket.  The read
-                // lease held by `snap_bg` keeps retired segment files
-                // on disk, so this only fires on genuine corruption.
-                let reader = self.store.open_segment_arc(&seg.id)?;
-                let stored_bytes_raw = match reader.section(SectionType::Stored) {
-                    Ok(Some(b)) => b,
-                    _ => continue,
+                // Cache-backed, single-flight decode: was an unconditional
+                // `open_segment_arc` + `decode_stored` + full JSON parse on
+                // EVERY search hitting this path — segments are immutable
+                // post-flush, so re-decoding the same segment's full stored
+                // section on every concurrent dashboard query (each paying
+                // the full decompress+parse again) was the dominant
+                // `hydrate+corpus` cost once data moved from memtable to
+                // segment (15-25s+ observed under a concurrent Kibana
+                // burst). `stored_values_for_async` is the same cache KNN
+                // search already relies on for this exact reason — first
+                // caller decodes and publishes, every other concurrent
+                // caller (single-flight) and every later query (cache hit)
+                // just clone the `Arc`.
+                let arr = match self.stored_values_for_async(&seg.id).await {
+                    Some(a) => a,
+                    // Segment unreadable (transient I/O, or merged away
+                    // under this pass's snapshot). A skipped segment
+                    // silently drops its docs from every aggregation
+                    // bucket, so surface it rather than continuing.
+                    None => {
+                        return Err(EngineError::Common(xerj_common::XerjError::internal(
+                            format!("segment {} unreadable during corpus assembly", seg.id),
+                        )));
+                    }
                 };
-                let stored_bytes = match xerj_storage::stored_codec::decode_stored(stored_bytes_raw)
-                {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                // serde_json — see ffd49ac. simd_json silently corrupts
-                // some M7 raw-bytes flush payloads.
-                if let Ok(arr) = serde_json::from_slice::<Vec<Value>>(&stored_bytes) {
-                    for d in arr {
-                        // Skip tombstoned docs.
-                        let id_ref = d.get("_id").and_then(Value::as_str).unwrap_or("");
-                        if let Some(ver) = self.store.version_map.get(id_ref) {
-                            if ver.deleted {
+                for d in arr.iter() {
+                    // Skip tombstoned docs.
+                    let id_ref = d.get("_id").and_then(Value::as_str).unwrap_or("");
+                    if let Some(ver) = self.store.version_map.get(id_ref) {
+                        if ver.deleted {
+                            continue;
+                        }
+                        // Superseded stale copy (b8 DEFECT T2) —
+                        // merge.rs stale-copy predicate.
+                        if let Some(doc_seq) = d.get("_seq_no").and_then(Value::as_u64) {
+                            if doc_seq < ver.seq_no {
                                 continue;
                             }
-                            // Superseded stale copy (b8 DEFECT T2) —
-                            // merge.rs stale-copy predicate.
-                            if let Some(doc_seq) = d.get("_seq_no").and_then(Value::as_u64) {
-                                if doc_seq < ver.seq_no {
-                                    continue;
-                                }
-                            }
                         }
-                        let id_owned = id_ref.to_string();
-                        let mut src = d.get("_source").cloned().unwrap_or(d);
-                        if let Some(o) = src.as_object_mut() {
-                            if !id_owned.is_empty() {
-                                o.entry("_id".to_string())
-                                    .or_insert(Value::String(id_owned));
-                            }
-                        }
-                        docs.push(src);
                     }
+                    let id_owned = id_ref.to_string();
+                    let mut src = d.get("_source").cloned().unwrap_or_else(|| d.clone());
+                    if let Some(o) = src.as_object_mut() {
+                        if !id_owned.is_empty() {
+                            o.entry("_id".to_string())
+                                .or_insert(Value::String(id_owned));
+                        }
+                    }
+                    docs.push(src);
                 }
             }
             // Enrich corpus docs with hit-level metadata so score/seq-sensitive
