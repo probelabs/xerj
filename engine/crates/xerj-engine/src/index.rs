@@ -21119,81 +21119,97 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
         QueryNode::MatchPhrase {
             field, query, slop, ..
         } => {
-            get_field_value(source, field)
-                .and_then(|v| match v {
-                    // Real ES tokenizes whatever the field holds — a
-                    // `boolean`/numeric field's value is just its string
-                    // form ("true"/"false", "42") for phrase-matching
-                    // purposes. Pre-fix this arm only handled
-                    // `Value::String`, so a `match_phrase` against a
-                    // boolean field's `_source` value (a genuine JSON
-                    // `Bool`, never a `String`) fell to the `_ => None`
-                    // catch-all and NEVER matched any document, regardless
-                    // of value — found empirically alongside the parser-
-                    // level scalar-coercion fix for the *query* side
-                    // (xerj-query's `match_phrase`/`match_phrase_prefix`):
-                    // that fix stops the crash on `{query: true}`, but
-                    // without this one the (now-valid) query still
-                    // silently matched 0 documents.
-                    Value::String(_) | Value::Bool(_) | Value::Number(_) => {
-                        let s = match v {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        let field_tokens: Vec<String> = s
-                            .to_lowercase()
-                            .split(|c: char| !c.is_alphanumeric())
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                        let query_tokens: Vec<String> = query
-                            .to_lowercase()
-                            .split(|c: char| !c.is_alphanumeric())
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                        if query_tokens.is_empty() {
-                            return Some(true);
-                        }
-                        if query_tokens.len() > field_tokens.len() {
-                            return Some(false);
-                        }
-                        // slop=0: exact contiguous phrase match in order.
-                        if *slop == 0 {
-                            let found = field_tokens
-                                .windows(query_tokens.len())
-                                .any(|w| w == query_tokens.as_slice());
-                            return Some(found);
-                        }
-                        // slop>0: ES enforces in-order positions with at
-                        // most `slop` intervening tokens between adjacent
-                        // query tokens. Find each query token AFTER the
-                        // previous one and sum the gaps.
-                        let mut last_pos: Option<usize> = None;
-                        let mut total_gaps: i64 = 0;
-                        let mut ordered_ok = true;
-                        for qt in &query_tokens {
-                            let search_start = last_pos.map(|p| p + 1).unwrap_or(0);
-                            match field_tokens[search_start..]
-                                .iter()
-                                .position(|ft| ft == qt)
-                                .map(|off| search_start + off)
-                            {
-                                Some(pos) => {
-                                    if let Some(prev) = last_pos {
-                                        total_gaps += (pos as i64 - prev as i64 - 1).max(0);
-                                    }
-                                    last_pos = Some(pos);
-                                }
-                                None => {
-                                    ordered_ok = false;
-                                    break;
-                                }
+            let query_tokens: Vec<String> = query
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            // Real ES tokenizes whatever the field holds — a
+            // `boolean`/numeric field's value is just its string form
+            // ("true"/"false", "42") for phrase-matching purposes. Pre-fix
+            // this arm only handled `Value::String`, so a `match_phrase`
+            // against a boolean field's `_source` value (a genuine JSON
+            // `Bool`, never a `String`) fell to the `_ => None` catch-all
+            // and NEVER matched any document, regardless of value — found
+            // empirically alongside the parser-level scalar-coercion fix
+            // for the *query* side (xerj-query's
+            // `match_phrase`/`match_phrase_prefix`): that fix stops the
+            // crash on `{query: true}`, but without this one the
+            // (now-valid) query still silently matched 0 documents.
+            fn matches_scalar(v: &Value, query_tokens: &[String], slop: u32) -> Option<bool> {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Bool(_) | Value::Number(_) => v.to_string(),
+                    _ => return None,
+                };
+                let field_tokens: Vec<String> = s
+                    .to_lowercase()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if query_tokens.is_empty() {
+                    return Some(true);
+                }
+                if query_tokens.len() > field_tokens.len() {
+                    return Some(false);
+                }
+                // slop=0: exact contiguous phrase match in order.
+                if slop == 0 {
+                    let found = field_tokens
+                        .windows(query_tokens.len())
+                        .any(|w| w == query_tokens);
+                    return Some(found);
+                }
+                // slop>0: ES enforces in-order positions with at most
+                // `slop` intervening tokens between adjacent query tokens.
+                // Find each query token AFTER the previous one and sum the
+                // gaps.
+                let mut last_pos: Option<usize> = None;
+                let mut total_gaps: i64 = 0;
+                let mut ordered_ok = true;
+                for qt in query_tokens {
+                    let search_start = last_pos.map(|p| p + 1).unwrap_or(0);
+                    match field_tokens[search_start..]
+                        .iter()
+                        .position(|ft| ft == qt)
+                        .map(|off| search_start + off)
+                    {
+                        Some(pos) => {
+                            if let Some(prev) = last_pos {
+                                total_gaps += (pos as i64 - prev as i64 - 1).max(0);
                             }
+                            last_pos = Some(pos);
                         }
-                        Some(ordered_ok && total_gaps <= *slop as i64)
+                        None => {
+                            ordered_ok = false;
+                            break;
+                        }
                     }
-                    _ => None,
+                }
+                Some(ordered_ok && total_gaps <= slop as i64)
+            }
+            get_field_value(source, field)
+                .and_then(|v| match &v {
+                    // Multi-valued field (e.g. eCommerce's `manufacturer`/
+                    // `category` arrays): ES matches if ANY element
+                    // satisfies the phrase — pre-fix this arm only handled
+                    // scalars, so a `match_phrase` against ANY array-valued
+                    // field (whether the plain field or a `.keyword`
+                    // multi-field sharing its value) silently matched 0
+                    // documents regardless of value.
+                    Value::Array(arr) => {
+                        if arr
+                            .iter()
+                            .any(|e| matches_scalar(e, &query_tokens, *slop) == Some(true))
+                        {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => matches_scalar(&v, &query_tokens, *slop),
                 })
                 .unwrap_or(false)
         }
@@ -21289,38 +21305,55 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
         }
 
         QueryNode::MatchPhrasePrefix { field, query, .. } => {
+            fn matches_str(s: &str, query: &str) -> Option<bool> {
+                let tokens: Vec<&str> = query.split_whitespace().collect();
+                if tokens.is_empty() {
+                    return Some(true);
+                }
+                let s_lower = s.to_lowercase();
+                let (prefix, exact_tokens) = match tokens.split_last() {
+                    Some(pair) => pair,
+                    None => return Some(true),
+                };
+                // All tokens except the last must appear as an ordered substring.
+                // Last token is a prefix match.
+                let phrase_without_last = exact_tokens.join(" ").to_lowercase();
+                let last_lower = prefix.to_lowercase();
+                if exact_tokens.is_empty() {
+                    // Only one token — prefix match on the whole query.
+                    Some(
+                        s_lower
+                            .split_whitespace()
+                            .any(|w| w.starts_with(last_lower.as_str())),
+                    )
+                } else {
+                    // Multi-token: check phrase prefix.
+                    if let Some(pos) = s_lower.find(&phrase_without_last) {
+                        let after = &s_lower[pos + phrase_without_last.len()..].trim_start();
+                        Some(after.starts_with(last_lower.as_str()))
+                    } else {
+                        Some(false)
+                    }
+                }
+            }
             get_field_value(source, field)
-                .and_then(|v| match v {
-                    Value::String(s) => {
-                        let tokens: Vec<&str> = query.split_whitespace().collect();
-                        if tokens.is_empty() {
-                            return Some(true);
-                        }
-                        let s_lower = s.to_lowercase();
-                        let (prefix, exact_tokens) = match tokens.split_last() {
-                            Some(pair) => pair,
-                            None => return Some(true),
-                        };
-                        // All tokens except the last must appear as an ordered substring.
-                        // Last token is a prefix match.
-                        let phrase_without_last = exact_tokens.join(" ").to_lowercase();
-                        let last_lower = prefix.to_lowercase();
-                        if exact_tokens.is_empty() {
-                            // Only one token — prefix match on the whole query.
-                            Some(
-                                s_lower
-                                    .split_whitespace()
-                                    .any(|w| w.starts_with(last_lower.as_str())),
-                            )
+                .and_then(|v| match &v {
+                    Value::String(s) => matches_str(s, query),
+                    // Multi-valued field: ES matches if ANY element
+                    // satisfies the phrase-prefix — pre-fix this arm only
+                    // handled a scalar string, so a `match_phrase_prefix`
+                    // against ANY array-valued field (or a `.keyword`
+                    // multi-field sharing an array field's value) silently
+                    // matched 0 documents regardless of value.
+                    Value::Array(arr) => {
+                        if arr.iter().any(|e| {
+                            e.as_str()
+                                .and_then(|s| matches_str(s, query))
+                                .unwrap_or(false)
+                        }) {
+                            Some(true)
                         } else {
-                            // Multi-token: check phrase prefix.
-                            if let Some(pos) = s_lower.find(&phrase_without_last) {
-                                let after =
-                                    &s_lower[pos + phrase_without_last.len()..].trim_start();
-                                Some(after.starts_with(last_lower.as_str()))
-                            } else {
-                                Some(false)
-                            }
+                            None
                         }
                     }
                     _ => None,
