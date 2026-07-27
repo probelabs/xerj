@@ -140,6 +140,27 @@ but **not** `manage_network_users` POSTs `action=adduser` (valid `add-user` nonc
 an existing user's email, `role=administrator`, no `noconfirmation` -> stored ->
 invitee visits the link -> becomes administrator.
 
+**Exact trigger (traced to the HTTP request):**
+```
+POST /wp-admin/network/user-new.php   (multisite; also wp-admin/user-new.php)
+Cookie: <logged-in site admin: has create_users + promote_users, NOT manage_network_users>
+Content-Type: application/x-www-form-urlencoded
+
+action=adduser
+&_wpnonce_add-user=<valid nonce from the Add-User form>
+&email=existing.network.user@example.com      # must resolve via get_user_by('email')
+&role=administrator                            # <-- injected; NOT in the inviter's editable_roles
+                                               # (omit 'noconfirmation' so the email-invitation else-branch runs)
+```
+Server stores `new_user_{key} = { user_id, email, role:'administrator' }` (line 100,
+**no `wp_ensure_editable_role`**). Second-order trigger — the invitee clicks:
+```
+GET /newbloguser/<key>/     # init hook maybe_add_existing_user_to_blog -> add_user_to_blog -> set_role('administrator')
+```
+No re-check on confirmation. Conditions to actually cross a boundary: (a) multisite,
+(b) an `editable_roles` filter that restricts this inviter below `administrator`
+(else `wp_ensure_editable_role` is a no-op and the role was assignable anyway).
+
 **Honest severity — conditional, defense-in-depth in stock.** In a *stock* install
 `get_editable_roles()` returns all roles, so `wp_ensure_editable_role` is a no-op
 and the inviter could assign that role anyway — **no boundary is crossed**. The gap
