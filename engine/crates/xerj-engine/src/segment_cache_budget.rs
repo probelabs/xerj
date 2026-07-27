@@ -140,23 +140,28 @@ impl SegmentHydrationBudget {
     }
 
     fn release(&self, category: SegmentCacheCategory, bytes: u64) {
-        checked_sub(
-            &self.category_current[category as usize],
-            bytes,
-            &self.accounting_errors,
-        );
-        checked_sub(&self.used, bytes, &self.accounting_errors);
+        let category_underflow =
+            checked_sub(&self.category_current[category as usize], bytes).is_err();
+        let total_underflow = checked_sub(&self.used, bytes).is_err();
+        if category_underflow || total_underflow {
+            self.accounting_errors.fetch_add(1, Ordering::Relaxed);
+            debug_assert!(false, "segment hydration cache accounting underflow");
+        }
     }
 }
 
-fn checked_sub(counter: &AtomicU64, bytes: u64, errors: &AtomicU64) {
-    let result = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-        current.checked_sub(bytes)
-    });
-    if result.is_err() {
-        errors.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(false, "segment hydration cache accounting underflow");
-    }
+fn checked_sub(counter: &AtomicU64, bytes: u64) -> Result<u64, u64> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(bytes))
+        })
+        .and_then(|previous| {
+            if previous < bytes {
+                Err(previous)
+            } else {
+                Ok(previous)
+            }
+        })
 }
 
 pub struct BudgetCharge {
@@ -268,9 +273,19 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             budget.release(SegmentCacheCategory::RowSequences, 8);
         }));
+        #[cfg(debug_assertions)]
         assert!(result.is_err(), "debug builds must surface double release");
+        #[cfg(not(debug_assertions))]
+        assert!(
+            result.is_ok(),
+            "release builds must record and repair underflow without panicking"
+        );
         let snapshot = budget.snapshot();
         assert_eq!(snapshot.current, 0);
+        assert_eq!(
+            snapshot.category_current[SegmentCacheCategory::RowSequences as usize],
+            0
+        );
         assert_eq!(snapshot.accounting_errors, 1);
     }
 
