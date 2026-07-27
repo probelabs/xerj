@@ -577,7 +577,11 @@ fn system_total_bytes() -> u64 {
 /// Takes the min of the two so a generous cgroup value never exceeds RAM.
 pub fn effective_memory_limit_bytes() -> u64 {
     let sys = system_total_bytes().max(1);
-    match cgroup_memory_limit_bytes() {
+    effective_memory_limit(sys, cgroup_memory_limit_bytes())
+}
+
+fn effective_memory_limit(sys: u64, cgroup: Option<u64>) -> u64 {
+    match cgroup {
         Some(c) if c > 0 && c < sys => c,
         _ => sys,
     }
@@ -588,36 +592,35 @@ pub fn effective_memory_limit_bytes() -> u64 {
 /// back to cgroup v1 (`memory.limit_in_bytes`). Returns `None` when no
 /// finite limit applies.
 #[cfg(target_os = "linux")]
-fn cgroup_memory_limit_bytes() -> Option<u64> {
-    // Sentinels used by the kernel/systemd to mean "unlimited".
-    const UNLIMITED_V1: u64 = 9_223_372_036_854_771_712; // PAGE_COUNTER_MAX * page
-    let finite = |v: u64| -> Option<u64> {
-        if v == 0 || v >= UNLIMITED_V1 {
-            None
-        } else {
-            Some(v)
-        }
-    };
+fn fold_cgroup_memory_limit(current: Option<u64>, raw: &str) -> Option<u64> {
+    const UNLIMITED_V1: u64 = 9_223_372_036_854_771_712;
+    let candidate = raw
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0 && *value < UNLIMITED_V1);
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.min(candidate)),
+        (None, Some(candidate)) => Some(candidate),
+        (current, None) => current,
+    }
+}
 
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
     // cgroup v2: /proc/self/cgroup has a single "0::<path>" line.
     if let Ok(cg) = std::fs::read_to_string("/proc/self/cgroup") {
         for line in cg.lines() {
             if let Some(path) = line.strip_prefix("0::") {
-                // Walk from the leaf cgroup up to the root, honouring the
-                // nearest finite memory.max (systemd sets MemoryMax on the
-                // scope, which may be a parent of the leaf).
+                // Walk from leaf to root and take the tightest finite limit.
+                // cgroup-v2 limits are hierarchical: a finite child value
+                // does not override a smaller finite ancestor.
                 let mut rel = path.trim().to_string();
+                let mut tightest = None;
                 loop {
                     let full = format!("/sys/fs/cgroup{rel}/memory.max");
                     if let Ok(s) = std::fs::read_to_string(&full) {
-                        let s = s.trim();
-                        if s != "max" {
-                            if let Ok(v) = s.parse::<u64>() {
-                                if let Some(v) = finite(v) {
-                                    return Some(v);
-                                }
-                            }
-                        }
+                        tightest = fold_cgroup_memory_limit(tightest, &s);
                     }
                     if rel.is_empty() || rel == "/" {
                         break;
@@ -628,15 +631,16 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
                         None => break,
                     }
                 }
+                if tightest.is_some() {
+                    return tightest;
+                }
             }
         }
     }
 
     // cgroup v1 fallback.
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-        if let Ok(v) = s.trim().parse::<u64>() {
-            return finite(v);
-        }
+        return fold_cgroup_memory_limit(None, &s);
     }
     None
 }
@@ -763,6 +767,31 @@ mod tests {
     #[test]
     fn effective_limit_is_positive() {
         assert!(effective_memory_limit_bytes() > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_uses_tightest_finite_ancestor_and_host_limit() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let child_then_parent =
+            fold_cgroup_memory_limit(fold_cgroup_memory_limit(None, "8589934592"), "4294967296");
+        assert_eq!(child_then_parent, Some(4 * GIB));
+        let parent_then_child =
+            fold_cgroup_memory_limit(fold_cgroup_memory_limit(None, "4294967296"), "8589934592");
+        assert_eq!(parent_then_child, Some(4 * GIB));
+
+        let unlimited_child =
+            fold_cgroup_memory_limit(fold_cgroup_memory_limit(None, "max"), "4294967296");
+        assert_eq!(unlimited_child, Some(4 * GIB));
+
+        let malformed =
+            fold_cgroup_memory_limit(fold_cgroup_memory_limit(None, "not-a-limit"), "max");
+        assert_eq!(malformed, None);
+        assert_eq!(fold_cgroup_memory_limit(None, "0"), None);
+        assert_eq!(fold_cgroup_memory_limit(None, "9223372036854771712"), None);
+
+        assert_eq!(effective_memory_limit(2 * GIB, Some(4 * GIB)), 2 * GIB);
+        assert_eq!(effective_memory_limit(8 * GIB, Some(4 * GIB)), 4 * GIB);
     }
 
     #[test]
