@@ -17229,6 +17229,29 @@ pub async fn nodes_stats(State(state): State<AppState>) -> impl IntoResponse {
     let free_pct = 100u64.saturating_sub(used_pct);
     let heap_used_pct = (rss_bytes * 100).checked_div(mem_total).unwrap_or(0);
     let cpu_pct = sample_cpu_percent().await;
+    let segment_hydration = xerj_engine::governor::global().map(|governor| {
+        let snapshot = governor.snapshot();
+        let gauge = snapshot.segment_hydration;
+        let capacities = state.engine.segment_hydration_cache_capacities();
+        json!({
+            "accounting": "estimated_retained_payload_and_keys_not_rss",
+            "source": format!("{:?}", snapshot.segment_hydration_source).to_ascii_lowercase(),
+            "limit_in_bytes": gauge.limit,
+            "current_in_bytes": gauge.current,
+            "peak_in_bytes": gauge.peak,
+            "admission_refusals": gauge.refused,
+            "accounting_errors": gauge.accounting_errors,
+            "categories": {
+                "stored_slices": { "current_in_bytes": gauge.category_current[0], "peak_in_bytes": gauge.category_peak[0], "map_capacity": capacities[0] },
+                "doc_values": { "current_in_bytes": gauge.category_current[1], "peak_in_bytes": gauge.category_peak[1], "map_capacity": capacities[1] },
+                "stored_values": { "current_in_bytes": gauge.category_current[2], "peak_in_bytes": gauge.category_peak[2], "map_capacity": capacities[2] },
+                "sort_shadow": { "current_in_bytes": gauge.category_current[3], "peak_in_bytes": gauge.category_peak[3], "map_capacity": capacities[3] },
+                "id_positions": { "current_in_bytes": gauge.category_current[4], "peak_in_bytes": gauge.category_peak[4], "map_capacity": capacities[4] },
+                "row_sequences": { "current_in_bytes": gauge.category_current[5], "peak_in_bytes": gauge.category_peak[5], "map_capacity": capacities[5] },
+                "decoded_stored": { "current_in_bytes": gauge.category_current[6], "peak_in_bytes": gauge.category_peak[6], "map_capacity": capacities[6] },
+            }
+        })
+    });
 
     let node_id = state.engine.node_id.as_str();
     let now_ms = std::time::SystemTime::now()
@@ -17299,6 +17322,7 @@ pub async fn nodes_stats(State(state): State<AppState>) -> impl IntoResponse {
                     // hold (vec/cenivf/clivf for bbq_disk; veb for
                     // bbq_hnsw/flat).
                     "dense_vector": dense_vector_off_heap_stats(&state),
+                    "segment_hydration_cache": segment_hydration,
                 },
                 "transport": {
                     "server_open": 1,

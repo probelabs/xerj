@@ -287,7 +287,7 @@ batch_size = 64
 # request fails with a timeout error.
 timeout_ms = 5000
 
-# ── Resource Limits (3 settings) ──────────────────────────────────────────────
+# ── Resource Limits (11 settings; omitted keys use documented defaults) ───────
 
 [limits]
 
@@ -305,6 +305,12 @@ max_concurrent_searches = 64
 # Indices that exceed this limit reject new field additions.
 # Elasticsearch uses 1000 as its default; 500 is intentionally stricter.
 max_fields_per_index = 500
+
+# Process-wide retained-payload budget for the seven immutable segment
+# hydration caches (MiB). 0 derives 20% of the effective cgroup/system memory
+# limit with no minimum floor. This is not an RSS limit: query-owned results,
+# decode scratch, mmaps, allocator fragmentation, and other caches are separate.
+max_segment_hydration_cache_mb = 0
 
 # ── Turbo Indexing (3 settings) — opt-in high-throughput mode ─────────────────
 #

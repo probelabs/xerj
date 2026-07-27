@@ -42,14 +42,42 @@ class BoundedSuiteTests(unittest.TestCase):
         self.assertEqual(parsed["data_dir"], value)
 
     def test_trace_validator_rejects_gap_and_accounting_error(self):
+        # Literal engine-emitted vocabulary: keep this fixture independent of
+        # the analyzer's expected mapping so a stale expectation cannot make
+        # the test pass tautologically.
+        engine_measurements = [
+            "serialized_size",
+            "exact_capacity",
+            "serialized_size",
+            "estimated",
+            "exact_capacity",
+            "estimated",
+            "exact_capacity",
+            "estimated",
+            "estimated",
+            "unavailable",
+            "unavailable",
+            "unavailable",
+            "unavailable",
+            "unavailable",
+            "estimated",
+            "estimated",
+            "estimated",
+            "estimated",
+            "estimated",
+            "estimated",
+            "estimated",
+        ]
         gauges = [
             {
                 "category": category,
                 "current": 0,
                 "peak": 1,
-                "measurement": analyze.MEASUREMENTS[category],
+                "measurement": measurement,
             }
-            for category in analyze.CATEGORIES
+            for category, measurement in zip(
+                analyze.CATEGORIES, engine_measurements, strict=True
+            )
         ]
         event = {
             "schema": analyze.TRACE_SCHEMA,
@@ -57,6 +85,15 @@ class BoundedSuiteTests(unittest.TestCase):
             "event": "trace_start",
             "accounting_errors": 0,
             "dropped_events": 0,
+            "segment_hydration_cache": {
+                "limit": 1024,
+                "current": 0,
+                "peak": 128,
+                "refused": 2,
+                "accounting_errors": 0,
+                "category_current": [0] * 7,
+                "category_peak": [128, 0, 0, 0, 0, 0, 0],
+            },
             "logical": gauges,
             "logical_total_current": 0,
             "allocator": {"allocated": 1, "active": 2, "resident": 3, "epoch_ok": True},
@@ -79,6 +116,16 @@ class BoundedSuiteTests(unittest.TestCase):
             result = analyze.validate_trace(path)
             self.assertIn("sequence is not contiguous from 1", result["problems"])
             self.assertIn("accounting_errors is nonzero", result["problems"])
+            self.assertEqual(
+                result["segment_hydration_cache"],
+                {
+                    "limit_bytes": 1024,
+                    "max_current_bytes": 0,
+                    "peak_bytes": 128,
+                    "admission_refusals": 2,
+                    "accounting_errors": 0,
+                },
+            )
 
     def test_trace_validator_rejects_category_and_total_corruption(self):
         gauges = [
@@ -94,6 +141,15 @@ class BoundedSuiteTests(unittest.TestCase):
             "schema": analyze.TRACE_SCHEMA,
             "accounting_errors": 0,
             "dropped_events": 0,
+            "segment_hydration_cache": {
+                "limit": 1024,
+                "current": 0,
+                "peak": 0,
+                "refused": 0,
+                "accounting_errors": 0,
+                "category_current": [0] * 7,
+                "category_peak": [0] * 7,
+            },
             "logical": gauges,
             "logical_total_current": 9,
             "allocator": {
@@ -126,6 +182,55 @@ class BoundedSuiteTests(unittest.TestCase):
             )
             self.assertTrue(
                 any("category vocabulary/order" in problem for problem in result["problems"])
+            )
+
+    def test_trace_validator_requires_segment_hydration_cache_evidence(self):
+        gauges = [
+            {
+                "category": category,
+                "current": 0,
+                "peak": 0,
+                "measurement": analyze.MEASUREMENTS[category],
+            }
+            for category in analyze.CATEGORIES
+        ]
+        base = {
+            "schema": analyze.TRACE_SCHEMA,
+            "accounting_errors": 0,
+            "dropped_events": 0,
+            "logical": gauges,
+            "logical_total_current": 0,
+            "allocator": {
+                "allocated": None,
+                "active": None,
+                "resident": None,
+                "epoch_ok": False,
+            },
+            "process": {
+                "rss": None,
+                "rss_ok": False,
+                "cpu_time_ns": None,
+                "cpu_time_ok": False,
+            },
+            "flags": {
+                "sampled": False,
+                "logical_exact": False,
+                "allocator_supported": False,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.ndjson"
+            start = {**base, "seq": 1, "event": "trace_start"}
+            stop = {**base, "seq": 2, "event": "trace_stop"}
+            path.write_text(json.dumps(start) + "\n" + json.dumps(stop) + "\n")
+            result = analyze.validate_trace(path)
+            self.assertEqual(result["segment_hydration_cache"], None)
+            self.assertEqual(
+                sum(
+                    "missing or invalid segment hydration cache snapshot" in problem
+                    for problem in result["problems"]
+                ),
+                2,
             )
 
     def test_budget_enforces_absolute_and_relational_ceilings(self):

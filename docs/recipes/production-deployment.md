@@ -209,6 +209,34 @@ transport encryption; your platform provides the rest.
 | Restrictive CORS by default (no cross-origin reads unless allow-listed) | ✅ (`[cors]`) |
 | Secrets written `0600` (admin key, auto-generated TLS key) | ✅ |
 
+### Bound retained segment hydration
+
+Every index shares one process-wide admission authority for the seven
+immutable segment hydration caches (stored bytes/slices, decoded doc values,
+parsed stored JSON, sort shadows, id positions, row sequences). By default it
+retains at most 20% of the effective cgroup memory limit:
+
+```toml
+[limits]
+# 0 = automatic: effective cgroup/system memory / 5, with no minimum floor.
+max_segment_hydration_cache_mb = 0
+```
+
+An explicit value is clamped to 50% of the effective limit. For a diagnostic
+run, `XERJ_SEGMENT_HYDRATION_CACHE_MB=off|auto|<positive MiB>` overrides the
+file. Admission refusal does not change query results: the current query uses
+the decoded value without retaining it, while publish-time warming drops an
+unadmitted value.
+
+`GET /_nodes/stats` reports
+`indices.segment_hydration_cache.{limit_in_bytes,current_in_bytes,peak_in_bytes,admission_refusals}` and
+per-category gauges/table capacities. These are conservative retained-payload
+and key estimates, **not an RSS limit**. Query-owned materialization, decode
+scratch, mmaps, allocator fragmentation, FTS state, and other caches remain
+outside this ceiling. A single highly compressed segment can therefore create
+a transient decode peak before post-build admission; bounded/streaming decode
+is a separate follow-up.
+
 **Delegated to your environment (not engine-level in this build):**
 
 | Control | Do it with |

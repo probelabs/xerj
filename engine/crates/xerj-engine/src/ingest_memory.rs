@@ -234,6 +234,10 @@ pub struct Event {
     /// Sum of all logical category currents in this coherent snapshot.
     /// This is diagnostic attribution, not an allocator/RSS identity.
     pub logical_total_current: u64,
+    /// Process-wide retained segment-hydration payload/key ceiling. Separate
+    /// from logical ingest ownership and explicitly not an RSS identity.
+    pub segment_hydration_cache:
+        Option<crate::segment_cache_budget::SegmentHydrationBudgetSnapshot>,
     /// Retain/release underflows observed since process start.
     pub accounting_errors: u64,
     /// Trace events rejected by the bounded output sink since trace start.
@@ -429,6 +433,8 @@ impl Ledger {
             scope,
             logical,
             logical_total_current,
+            segment_hydration_cache: crate::governor::global()
+                .map(|governor| governor.snapshot().segment_hydration),
             accounting_errors: self.accounting_errors.load(Ordering::Relaxed),
             dropped_events: self.dropped_events.load(Ordering::Relaxed),
             allocator: AllocatorSnapshot {
@@ -483,7 +489,14 @@ fn measurement(category: Category) -> Measurement {
         Category::MemtableActive
         | Category::ParsedSource
         | Category::PreparedDocument
-        | Category::FlushDrained => Measurement::Estimated,
+        | Category::FlushDrained
+        | Category::CacheStoredSlices
+        | Category::CacheDocValues
+        | Category::CacheStoredValues
+        | Category::CacheSortShadow
+        | Category::CacheIdPositions
+        | Category::CacheRowSequences
+        | Category::CacheDecodedStored => Measurement::Estimated,
         _ => Measurement::Unavailable,
     }
 }

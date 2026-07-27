@@ -170,7 +170,7 @@ fn fast_aggs_disabled() -> bool {
 #[derive(Clone)]
 struct SegEntry {
     id: String,
-    cols: std::sync::Arc<std::collections::BTreeMap<String, Column>>,
+    cols: super::Resident<super::DocValueMap>,
     docs: u32,
 }
 
