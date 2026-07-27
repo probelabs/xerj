@@ -24103,7 +24103,41 @@ fn get_field_value(source: &Value, field: &str) -> Option<Value> {
         }
     }
     let parts: Vec<&str> = field.split('.').collect();
-    get_field_value_parts(source, &parts)
+    if let Some(v) = get_field_value_parts(source, &parts) {
+        return Some(v);
+    }
+    // ES multi-field fallback: `<field>.<subfield>` (e.g. `category.keyword`,
+    // `name.raw`) refers to a multi-field that shares the parent field's
+    // source value — `_source` never stores a separate value for the
+    // sub-field. Without this, every `term`/`match_phrase`/etc. brute-scan
+    // match against a `.keyword` multi-field silently matched nothing
+    // (`get_field_value_parts` has no such field to walk into), even though
+    // a `terms` aggregation on the identical field worked fine — aggs
+    // resolve fields via `get_nested_field` (aggs.rs), which already has
+    // this exact fallback. Strip the trailing segment and retry against the
+    // parent, same as that function does.
+    //
+    // Only trust this fallback when the parent resolves to a LEAF value
+    // (scalar, or an array with no objects) — a real multi-field's parent
+    // is always a leaf text/keyword value. A genuine nested/object field
+    // (`obj.inner_field`) that's simply absent on this doc must NOT be
+    // masked by its parent object: returning the whole `obj` here would
+    // make `exists: {field: "obj.inner_field"}` wrongly report the field
+    // as present just because the parent object exists (regression caught
+    // by the ES-compat YAML `exists_query` suite).
+    if let Some(idx) = field.rfind('.') {
+        if let Some(v) = get_field_value(source, &field[..idx]) {
+            let is_leaf = match &v {
+                Value::Object(_) => false,
+                Value::Array(arr) => !arr.iter().any(Value::is_object),
+                _ => true,
+            };
+            if is_leaf {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 fn get_field_value_parts(cur: &Value, parts: &[&str]) -> Option<Value> {
