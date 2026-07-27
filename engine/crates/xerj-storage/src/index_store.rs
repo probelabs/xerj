@@ -3214,6 +3214,44 @@ impl IndexStore {
 mod tests {
     use super::*;
 
+    /// Structural bound: 16 empty indices × 8 WAL shards each must retain
+    /// exactly `128 × 64 KiB` of userspace buffer capacity — not the old
+    /// `128 × 8 MiB` reservation.  Asserts `buffer_capacity()` (deterministic)
+    /// rather than process RSS.
+    #[test]
+    fn empty_multi_index_wal_buffers_have_a_bounded_total_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut stores = Vec::new();
+        let mut total_capacity = 0usize;
+
+        for index in 0..16 {
+            let store = IndexStore::open(
+                root.path().join(format!("index-{index}")),
+                IndexStoreConfig {
+                    sync_mode: SyncMode::Batched,
+                    wal_batch_ms: 0,
+                    num_wal_shards: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(store.wal_shards.len(), 8);
+            total_capacity += store
+                .wal_shards
+                .iter()
+                .map(|writer| writer.lock().unwrap().buffer_capacity())
+                .sum::<usize>();
+            stores.push(store);
+        }
+
+        assert_eq!(stores.len(), 16);
+        assert_eq!(total_capacity, 16 * 8 * 64 * 1024);
+        assert!(
+            total_capacity <= 8 * 1024 * 1024,
+            "128 idle WAL shards retained {total_capacity} bytes of buffers"
+        );
+    }
+
     fn open_test_store(dir: &Path) -> Arc<IndexStore> {
         IndexStore::open(
             dir,
