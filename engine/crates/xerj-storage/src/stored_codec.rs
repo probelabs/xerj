@@ -1758,7 +1758,12 @@ fn decode_stored_v2(body: &[u8]) -> Result<Vec<u8>> {
     let id_col_ix = col_name_to_ix.get("__id").copied().unwrap_or(0);
     let seq_col_ix = col_name_to_ix.get("__seq_no").copied().unwrap_or(1);
 
-    let mut out_docs: Vec<serde_json::Value> = Vec::with_capacity(num_docs);
+    let mut out_docs: Vec<serde_json::Value> = Vec::new();
+    out_docs.try_reserve_exact(num_docs).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {num_docs} decoded stored rows: {error}"
+        ))
+    })?;
     for d in 0..num_docs {
         let mut source_map = serde_json::Map::new();
         for (cix, name) in col_names.iter().enumerate() {
@@ -2026,7 +2031,14 @@ fn try_encode_constant<B: std::borrow::Borrow<serde_json::Value>>(col: &[B]) -> 
 fn decode_constant(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json::Value>> {
     let v: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| StorageError::Other(anyhow::anyhow!("constant decode: {e}")))?;
-    Ok(vec![v; num_docs])
+    let mut values = Vec::new();
+    values.try_reserve_exact(num_docs).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {num_docs} constant stored rows: {error}"
+        ))
+    })?;
+    values.resize(num_docs, v);
+    Ok(values)
 }
 
 fn encode_dict_bitpack(entries: &[serde_json::Value], ids: &[u32]) -> Vec<u8> {
@@ -2298,7 +2310,12 @@ fn decode_cross_dep(
         .ok_or_else(|| StorageError::Other(anyhow::anyhow!("cross_dep re-dict src failed")))?;
 
     // Exceptions.
-    let mut exc: Vec<(u32, i64)> = Vec::with_capacity(exc_count);
+    let mut exc: Vec<(u32, i64)> = Vec::new();
+    exc.try_reserve_exact(exc_count).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {exc_count} cross-dependency exceptions: {error}"
+        ))
+    })?;
     let mut pos = cur.position() as usize;
     let mut prev_ord = 0u32;
     for _ in 0..exc_count {
@@ -2323,7 +2340,12 @@ fn decode_cross_dep(
     }
 
     // Materialise.
-    let mut result: Vec<serde_json::Value> = Vec::with_capacity(num_docs);
+    let mut result: Vec<serde_json::Value> = Vec::new();
+    result.try_reserve_exact(num_docs).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {num_docs} cross-dependency rows: {error}"
+        ))
+    })?;
     let mut exc_ix = 0;
     for row in 0..num_docs {
         if exc_ix < exc.len() && exc[exc_ix].0 as usize == row {
