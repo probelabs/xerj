@@ -6,7 +6,7 @@ This report measures the storage primitive only. It does not claim an
 end-to-end engine speedup or cache-memory reduction because no engine consumer
 is included in this branch.
 
-- Source commit: `0d28f07453e206516c7390c019c1dec45c7d52be`
+- Source commit: `031e9cc9286d8e8970704438acebef93f5ab72a8`
 - Upstream base: `16d6df0`
 - Probe source SHA-256:
   `86326cab5a4e2f7f2fb141d081855ac8ba790a3403f9103a973732a19c109953`
@@ -108,7 +108,7 @@ measured.
 
 ```text
 cargo test -p xerj-storage --lib
-121 passed; 0 failed; 0 ignored
+122 passed; 0 failed; 0 ignored
 
 cargo clippy -p xerj-storage --all-targets -- -D warnings
 passed
