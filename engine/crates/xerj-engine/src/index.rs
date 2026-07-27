@@ -34,6 +34,28 @@ use xerj_vector::hnsw::{HnswIndex, HnswParams};
 use xerj_vector::Sq8Params;
 
 use crate::aggs::run_aggs_with_all;
+use crate::segment_cache_budget::{CacheResident, SegmentCacheCategory, SegmentHydrationBudget};
+use crate::segment_cache_estimates as cache_estimates;
+
+pub(crate) type Resident<T> = Arc<CacheResident<T>>;
+pub(crate) type DocValueMap = std::collections::BTreeMap<String, xerj_storage::doc_values::Column>;
+
+fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudget> {
+    if let Some(governor) = crate::governor::global() {
+        return governor.segment_hydration_budget();
+    }
+    #[cfg(test)]
+    {
+        // Direct unit-test Index construction bypasses Engine::new. Keep one
+        // explicit process-wide test authority instead of silently creating a
+        // fresh per-index budget.
+        static TEST_BUDGET: std::sync::OnceLock<Arc<SegmentHydrationBudget>> =
+            std::sync::OnceLock::new();
+        Arc::clone(TEST_BUDGET.get_or_init(|| SegmentHydrationBudget::new(u64::MAX)))
+    }
+    #[cfg(not(test))]
+    panic!("Index construction requires the process ResourceGovernor to be initialised");
+}
 
 /// Clears an index's `merge_in_progress` flag on every exit path of the
 /// merge holder (background pass or forcemerge), including panics.
@@ -300,7 +322,7 @@ mod semantic_deadline_regression_tests {
             .apply_merge(std::slice::from_ref(&old_meta.id), replacement)
             .unwrap();
         {
-            let _publication = idx.stored_value_cache_lifecycle.write();
+            let _publication = idx.segment_cache_lifecycle.write();
             idx.stored_value_cache.remove(&old_meta.id);
         }
         idx.test_stored_value_load_pause_before_publish
@@ -314,6 +336,480 @@ mod semantic_deadline_regression_tests {
             !idx.stored_value_cache.contains_key(&old_meta.id),
             "detached completion resurrected a retired segment"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_hydration_publishers_refuse_retired_segment_resurrection() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("all-cache-retire", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("all-cache-retire").unwrap();
+        idx.index_document(Some("v1".into()), serde_json::json!({"value": 1}))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        let old_meta = idx.store.snapshot().segments[0].clone();
+        {
+            let _publication = idx.segment_cache_lifecycle.write();
+            idx.remove_segment_hydration_entries(&old_meta.id);
+        }
+
+        let all = (1_u64 << 7) - 1;
+        idx.test_segment_cache_publish_ready_mask
+            .store(0, Ordering::Release);
+        idx.test_segment_cache_publish_pause_mask
+            .store(all, Ordering::Release);
+
+        let mut publishers = Vec::new();
+        for category in SegmentCacheCategory::ALL {
+            let idx = Arc::clone(&idx);
+            let old_id = old_meta.id.clone();
+            publishers.push(std::thread::spawn(move || match category {
+                SegmentCacheCategory::StoredSlices => {
+                    let key = old_id.clone();
+                    let _ = idx.publish_current(
+                        &idx.stored_slices_cache,
+                        &old_id,
+                        key,
+                        category,
+                        1,
+                        StoredSlices {
+                            bytes: vec![b'{', b'}'],
+                            offsets: vec![(0, 2)],
+                        },
+                    );
+                }
+                SegmentCacheCategory::DocValues => {
+                    let key = old_id.clone();
+                    let _ = idx.publish_current(
+                        &idx.dv_cache,
+                        &old_id,
+                        key,
+                        category,
+                        1,
+                        DocValueMap::new(),
+                    );
+                }
+                SegmentCacheCategory::StoredValues => {
+                    let key = old_id.clone();
+                    let _ = idx.publish_current(
+                        &idx.stored_value_cache,
+                        &old_id,
+                        key,
+                        category,
+                        1,
+                        vec![serde_json::json!({"_id": "v1"})],
+                    );
+                }
+                SegmentCacheCategory::SortShadow => {
+                    let key = format!("{old_id}\u{1}field");
+                    let _ = idx.publish_current(
+                        &idx.sort_shadow_cache,
+                        &old_id,
+                        key,
+                        category,
+                        1,
+                        Some(Arc::new(vec![(1, 0)])),
+                    );
+                }
+                SegmentCacheCategory::IdPositions => {
+                    let key = old_id.clone();
+                    let _ = idx.publish_current(
+                        &idx.id_pos_cache,
+                        &old_id,
+                        key,
+                        category,
+                        1,
+                        std::collections::HashMap::from([(String::from("v1"), 0)]),
+                    );
+                }
+                SegmentCacheCategory::RowSequences => {
+                    let key = old_id.clone();
+                    let _ =
+                        idx.publish_current(&idx.row_seq_cache, &old_id, key, category, 1, vec![1]);
+                }
+                SegmentCacheCategory::DecodedStored => {
+                    let key = old_id.clone();
+                    let _ = idx.publish_current(
+                        &idx.decoded_stored_cache,
+                        &old_id,
+                        key,
+                        category,
+                        1,
+                        vec![b'{', b'}'],
+                    );
+                }
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while idx
+                .test_segment_cache_publish_ready_mask
+                .load(Ordering::Acquire)
+                != all
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all publishers did not reach the deterministic gate");
+
+        let mut replacement = old_meta.clone();
+        replacement.id = Uuid::new_v4().to_string();
+        replacement.seg_path = format!("segments/{}.seg", replacement.id);
+        replacement.sidx_path = format!("segments/{}.sidx", replacement.id);
+        idx.store
+            .apply_merge(std::slice::from_ref(&old_meta.id), replacement)
+            .unwrap();
+        {
+            let _publication = idx.segment_cache_lifecycle.write();
+            idx.remove_segment_hydration_entries(&old_meta.id);
+        }
+        idx.test_segment_cache_publish_pause_mask
+            .store(0, Ordering::Release);
+        for publisher in publishers {
+            publisher.join().unwrap();
+        }
+
+        assert!(!idx.stored_slices_cache.contains_key(&old_meta.id));
+        assert!(!idx.dv_cache.contains_key(&old_meta.id));
+        assert!(!idx.stored_value_cache.contains_key(&old_meta.id));
+        assert!(!idx.id_pos_cache.contains_key(&old_meta.id));
+        assert!(!idx.row_seq_cache.contains_key(&old_meta.id));
+        assert!(!idx.decoded_stored_cache.contains_key(&old_meta.id));
+        let prefix = format!("{}\u{1}", old_meta.id);
+        assert!(!idx
+            .sort_shadow_cache
+            .iter()
+            .any(|entry| entry.key().starts_with(&prefix)));
+    }
+
+    #[tokio::test]
+    async fn failed_output_cleanup_removes_every_hydration_owner() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("failed-output-cache", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("failed-output-cache").unwrap();
+        idx.index_document(Some("v1".into()), serde_json::json!({"value": 1}))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        let segment_id = idx.store.snapshot().segments[0].id.clone();
+        {
+            let _publication = idx.segment_cache_lifecycle.write();
+            idx.remove_segment_hydration_entries(&segment_id);
+        }
+
+        let _ = idx.publish_current(
+            &idx.stored_slices_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::StoredSlices,
+            1,
+            StoredSlices {
+                bytes: vec![b'{', b'}'],
+                offsets: vec![(0, 2)],
+            },
+        );
+        let _ = idx.publish_current(
+            &idx.dv_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::DocValues,
+            1,
+            DocValueMap::new(),
+        );
+        let _ = idx.publish_current(
+            &idx.stored_value_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::StoredValues,
+            1,
+            vec![serde_json::json!({"_id": "v1"})],
+        );
+        let shadow_key = format!("{segment_id}\u{1}field");
+        let _ = idx.publish_current(
+            &idx.sort_shadow_cache,
+            &segment_id,
+            shadow_key,
+            SegmentCacheCategory::SortShadow,
+            1,
+            Some(Arc::new(vec![(1, 0)])),
+        );
+        let _ = idx.publish_current(
+            &idx.id_pos_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::IdPositions,
+            1,
+            std::collections::HashMap::from([(String::from("v1"), 0)]),
+        );
+        let _ = idx.publish_current(
+            &idx.row_seq_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::RowSequences,
+            1,
+            vec![1],
+        );
+        let _ = idx.publish_current(
+            &idx.decoded_stored_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::DecodedStored,
+            1,
+            vec![b'{', b'}'],
+        );
+
+        idx.publish_warm_caches().remove_failed_output(&segment_id);
+        assert!(!idx.stored_slices_cache.contains_key(&segment_id));
+        assert!(!idx.dv_cache.contains_key(&segment_id));
+        assert!(!idx.stored_value_cache.contains_key(&segment_id));
+        assert!(!idx.id_pos_cache.contains_key(&segment_id));
+        assert!(!idx.row_seq_cache.contains_key(&segment_id));
+        assert!(!idx.decoded_stored_cache.contains_key(&segment_id));
+        let prefix = format!("{segment_id}\u{1}");
+        assert!(!idx
+            .sort_shadow_cache
+            .iter()
+            .any(|entry| entry.key().starts_with(&prefix)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepublication_lease_cleans_after_cancelled_owner_and_last_worker() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("lease-cancel", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("lease-cancel").unwrap();
+        let mut caches = idx.publish_warm_caches();
+        let budget = SegmentHydrationBudget::new(1024);
+        caches.budget = Arc::clone(&budget);
+        let segment_id = "detached-warm".to_string();
+        let lease = PrePublicationLease::known(caches.clone(), segment_id.clone());
+        let observed_cache = Arc::clone(&caches.decoded_stored);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        let owner = tokio::spawn(async move {
+            let worker_lease = lease.clone();
+            tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                let capability = PrePublication(());
+                let _ = publish_prepublication(
+                    &capability,
+                    &caches,
+                    &caches.decoded_stored,
+                    segment_id,
+                    SegmentCacheCategory::DecodedStored,
+                    64,
+                    vec![1_u8; 64],
+                );
+                drop(worker_lease);
+                done_tx.send(()).unwrap();
+            })
+            .await
+            .unwrap();
+            lease.commit();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        assert!(!observed_cache.contains_key("detached-warm"));
+        assert_eq!(budget.snapshot().current, 0);
+    }
+
+    #[tokio::test]
+    async fn prepublication_lease_cleans_after_worker_panic() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine.create_index("lease-panic", Schema::empty()).unwrap();
+        let idx = engine.get_index("lease-panic").unwrap();
+        let mut caches = idx.publish_warm_caches();
+        let budget = SegmentHydrationBudget::new(1024);
+        caches.budget = Arc::clone(&budget);
+        let segment_id = "panicked-warm".to_string();
+        let lease = PrePublicationLease::known(caches.clone(), segment_id.clone());
+        let worker = lease.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let capability = PrePublication(());
+            let _ = publish_prepublication(
+                &capability,
+                &caches,
+                &caches.row_sequences,
+                segment_id.clone(),
+                SegmentCacheCategory::RowSequences,
+                8,
+                vec![1],
+            );
+            drop(worker);
+            panic!("injected warm panic");
+        }));
+        assert!(result.is_err());
+        drop(lease);
+        assert!(!caches.row_sequences.contains_key(&segment_id));
+        assert_eq!(budget.snapshot().current, 0);
+    }
+
+    #[tokio::test]
+    async fn committed_prepublication_lease_retains_published_owner() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("lease-commit", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("lease-commit").unwrap();
+        let mut caches = idx.publish_warm_caches();
+        let budget = SegmentHydrationBudget::new(1024);
+        caches.budget = Arc::clone(&budget);
+        let segment_id = "published-warm".to_string();
+        let lease = PrePublicationLease::known(caches.clone(), segment_id.clone());
+        let capability = PrePublication(());
+        let _ = publish_prepublication(
+            &capability,
+            &caches,
+            &caches.id_positions,
+            segment_id.clone(),
+            SegmentCacheCategory::IdPositions,
+            16,
+            std::collections::HashMap::new(),
+        );
+        lease.commit();
+        drop(lease);
+        assert!(caches.id_positions.contains_key(&segment_id));
+        caches.remove_failed_output(&segment_id);
+        // Cleanup is idempotent and cannot underflow the retained budget.
+        caches.remove_failed_output(&segment_id);
+        assert_eq!(budget.snapshot().current, 0);
+        assert_eq!(budget.snapshot().accounting_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn every_hydration_refusal_returns_the_local_value_without_publication() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("cache-refusal", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("cache-refusal").unwrap();
+        idx.index_document(Some("v1".into()), serde_json::json!({"value": 1}))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        let segment_id = idx.store.snapshot().segments[0].id.clone();
+        {
+            let _publication = idx.segment_cache_lifecycle.write();
+            idx.remove_segment_hydration_entries(&segment_id);
+        }
+        let off = SegmentHydrationBudget::new(0);
+
+        let slices = idx.publish_current_with_budget(
+            &idx.stored_slices_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::StoredSlices,
+            1,
+            StoredSlices {
+                bytes: vec![b'{', b'}'],
+                offsets: vec![(0, 2)],
+            },
+            &off,
+        );
+        assert_eq!(slices.bytes, vec![b'{', b'}']);
+
+        let dv = idx.publish_current_with_budget(
+            &idx.dv_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::DocValues,
+            1,
+            DocValueMap::new(),
+            &off,
+        );
+        assert!(dv.is_empty());
+
+        let values = idx.publish_current_with_budget(
+            &idx.stored_value_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::StoredValues,
+            1,
+            vec![serde_json::json!({"_id": "v1"})],
+            &off,
+        );
+        assert_eq!(values[0]["_id"], "v1");
+
+        let shadow_key = format!("{segment_id}\u{1}field");
+        let shadow = idx.publish_current_with_budget(
+            &idx.sort_shadow_cache,
+            &segment_id,
+            shadow_key,
+            SegmentCacheCategory::SortShadow,
+            1,
+            Some(Arc::new(vec![(7, 0)])),
+            &off,
+        );
+        assert_eq!(shadow.value().as_ref().unwrap()[0], (7, 0));
+
+        let ids = idx.publish_current_with_budget(
+            &idx.id_pos_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::IdPositions,
+            1,
+            std::collections::HashMap::from([(String::from("v1"), 0)]),
+            &off,
+        );
+        assert_eq!(ids.get("v1"), Some(&0));
+
+        let rows = idx.publish_current_with_budget(
+            &idx.row_seq_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::RowSequences,
+            1,
+            vec![42],
+            &off,
+        );
+        assert_eq!(rows[0], 42);
+
+        let decoded = idx.publish_current_with_budget(
+            &idx.decoded_stored_cache,
+            &segment_id,
+            segment_id.clone(),
+            SegmentCacheCategory::DecodedStored,
+            1,
+            vec![1, 2, 3],
+            &off,
+        );
+        assert_eq!(&decoded[..], &[1, 2, 3]);
+
+        assert_eq!(off.snapshot().current, 0);
+        assert_eq!(off.snapshot().refused, 7);
+        assert!(!idx.stored_slices_cache.contains_key(&segment_id));
+        assert!(!idx.dv_cache.contains_key(&segment_id));
+        assert!(!idx.stored_value_cache.contains_key(&segment_id));
+        assert!(!idx.id_pos_cache.contains_key(&segment_id));
+        assert!(!idx.row_seq_cache.contains_key(&segment_id));
+        assert!(!idx.decoded_stored_cache.contains_key(&segment_id));
+        let prefix = format!("{segment_id}\u{1}");
+        assert!(!idx
+            .sort_shadow_cache
+            .iter()
+            .any(|entry| entry.key().starts_with(&prefix)));
     }
 
     #[tokio::test]
@@ -1219,6 +1715,10 @@ pub struct Index {
     test_stored_value_load_pause_before_publish: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     test_stored_value_load_ready_to_publish: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    test_segment_cache_publish_pause_mask: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_segment_cache_publish_ready_mask: Arc<AtomicU64>,
     // ── Per-index enrich lookup tables ────────────────────────────────────────
     /// Named enrich tables: each table maps a key to a JSON object of extra
     /// fields to merge into matching documents at ingest time.
@@ -1287,12 +1787,7 @@ pub struct Index {
     /// valid for the lifetime of the segment.  First agg against a segment
     /// decodes the `.dv` sidecar; subsequent queries hit the cache and
     /// skip I/O + LZ4 decompress + per-column decode entirely.
-    dv_cache: Arc<
-        dashmap::DashMap<
-            String,
-            Arc<std::collections::BTreeMap<String, xerj_storage::doc_values::Column>>,
-        >,
-    >,
+    dv_cache: Arc<dashmap::DashMap<String, Resident<DocValueMap>>>,
 
     /// Per-(segment, field) sorted sort-key shadow: `(f64-bits, doc_pos)`
     /// ascending by value, used by the field-sort candidate prefilter.
@@ -1305,7 +1800,7 @@ pub struct Index {
     /// per query.  Keyed by `"{segment_id}\u{1}{field}"`; same
     /// immutable-segment lifecycle as `dv_cache` (never invalidated,
     /// retired segment ids are simply never queried again).
-    sort_shadow_cache: Arc<dashmap::DashMap<String, Option<Arc<Vec<(i64, u32)>>>>>,
+    sort_shadow_cache: Arc<dashmap::DashMap<String, Resident<Option<Arc<Vec<(i64, u32)>>>>>>,
     /// Fields that have EVER been requested through `sorted_shadow_for`
     /// on this index (bounded at 16) — the publish-time warm pre-builds
     /// these fields' shadows for every new segment so the first sorted
@@ -1339,7 +1834,7 @@ pub struct Index {
     /// `StoredSlices` offset index, so it is O(#ids) and FLAT vs corpus
     /// size.  Segments are immutable → the map never goes stale; evicted by
     /// segment id at the merge-completion site alongside the other caches.
-    id_pos_cache: Arc<dashmap::DashMap<String, Arc<std::collections::HashMap<String, u32>>>>,
+    id_pos_cache: Arc<dashmap::DashMap<String, Resident<std::collections::HashMap<String, u32>>>>,
 
     /// Per-segment `stored-position → seq_no` map for the scored-family
     /// columnar fast path. Segment ROW order is NOT insertion order (the
@@ -1349,7 +1844,7 @@ pub struct Index {
     /// per segment from the (cached) `id_pos_map_for` + version map; only
     /// consulted under `!deletes_present` (seq of a live id is then stable),
     /// and evicted by segment id at the merge-completion site.
-    row_seq_cache: Arc<dashmap::DashMap<String, Arc<Vec<u64>>>>,
+    row_seq_cache: Arc<dashmap::DashMap<String, Resident<Vec<u64>>>>,
 
     /// Per-segment cache of decoded `Vec<Value>` from the stored section.
     /// KNN search and segment-scan get-document paths used to call
@@ -1358,15 +1853,16 @@ pub struct Index {
     /// vector query re-paid ~10 GB of decompress + parse work. Segments
     /// are immutable once flushed, so this cache is correct without
     /// invalidation. Same `Left unbounded for now` caveat as `dv_cache`.
-    stored_value_cache: Arc<dashmap::DashMap<String, Arc<Vec<Value>>>>,
+    stored_value_cache: Arc<dashmap::DashMap<String, Resident<Vec<Value>>>>,
     /// Serializes the short "is this segment still published? + cache insert"
     /// transaction against merge eviction. Segment parsing never holds it.
-    stored_value_cache_lifecycle: Arc<parking_lot::RwLock<()>>,
+    segment_cache_lifecycle: Arc<parking_lot::RwLock<()>>,
+    segment_hydration_budget: Arc<SegmentHydrationBudget>,
     /// Per-segment cancellation-safe cold-load single-flight. The sender
     /// publishes the immutable parsed section to every concurrent vector
     /// query; the detached producer survives cancellation of any requester.
     stored_value_loads:
-        Arc<dashmap::DashMap<String, tokio::sync::watch::Sender<Option<Arc<Vec<Value>>>>>>,
+        Arc<dashmap::DashMap<String, tokio::sync::watch::Sender<Option<Resident<Vec<Value>>>>>>,
     /// Bounds simultaneous whole-segment decompression/parsing across distinct
     /// cold segments. Per-segment single-flight removes duplicate work; this
     /// bound prevents a many-segment cold storm from multiplying peak memory.
@@ -1379,15 +1875,12 @@ pub struct Index {
     /// lookups + a per-candidate `simd_json` parse — no per-query
     /// zstd/LZ4 decompress and no O(segment-bytes) brace re-scan.
     ///
-    /// Unlike `stored_value_cache` (unbounded parsed `Value`s, ~3-6× raw
-    /// bytes) this holds the raw bytes once per segment and is BUDGETED:
-    /// `stored_slices_cache_bytes` tracks retained size and inserts stop
-    /// at `STORED_SLICES_CACHE_BUDGET` (miss → per-query decompress path,
-    /// exactly the pre-cache behaviour).  Segments are immutable, so
+    /// This holds raw bytes once per segment and shares the process-wide
+    /// segment hydration budget with all other immutable cache owners.
+    /// Refusal keeps the built value local to the current query. Segments are immutable, so
     /// entries stay valid until a merge drops the segment id (evicted at
     /// the merge-completion site alongside dv_cache/stored_value_cache).
-    stored_slices_cache: Arc<dashmap::DashMap<String, Arc<StoredSlices>>>,
-    stored_slices_cache_bytes: Arc<AtomicU64>,
+    stored_slices_cache: Arc<dashmap::DashMap<String, Resident<StoredSlices>>>,
     /// Per-segment cache of the DECOMPRESSED stored section bytes for the
     /// UNSORTED scan path (`scan_stored_section_into`).  The bounded
     /// collector already stops the scan O(from+size) docs in, but every
@@ -1397,8 +1890,7 @@ pub struct Index {
     /// misses) it WAS the match_all/bool/range read-under-write tail.
     /// Budgeted like `stored_slices_cache`; entries evicted by id at the
     /// merge-completion site.  Segments are immutable → no invalidation.
-    decoded_stored_cache: Arc<dashmap::DashMap<String, Arc<Vec<u8>>>>,
-    decoded_stored_cache_bytes: Arc<AtomicU64>,
+    decoded_stored_cache: Arc<dashmap::DashMap<String, Resident<Vec<u8>>>>,
     /// Per-(segment, query-shape) match-count cache for the
     /// `try_shortcut_count` Bool intersection arm.  The fused columnar
     /// walk is O(anchor-predicate matches) per segment PER QUERY — for a
@@ -1501,6 +1993,21 @@ pub struct Index {
 }
 
 impl Index {
+    /// Aggregate DashMap table capacities for the seven hydration families.
+    /// These are diagnostic table slots, separate from the refundable
+    /// retained-payload/key budget.
+    pub fn segment_hydration_cache_capacities(&self) -> [usize; 7] {
+        [
+            self.stored_slices_cache.capacity(),
+            self.dv_cache.capacity(),
+            self.stored_value_cache.capacity(),
+            self.sort_shadow_cache.capacity(),
+            self.id_pos_cache.capacity(),
+            self.row_seq_cache.capacity(),
+            self.decoded_stored_cache.capacity(),
+        ]
+    }
+
     #[cfg(test)]
     fn publication_test_point(&self, id: &str, point: PublicationTestPoint) {
         // Clone the callback while holding the hook registry lock, then invoke
@@ -1621,6 +2128,7 @@ impl Index {
             .fields()
             .iter()
             .any(|f| matches!(f.field_type, FieldType::Date));
+        let segment_hydration_budget = index_segment_hydration_budget(config);
         let index = Arc::new(Self {
             name,
             schema: Arc::new(RwLock::new(managed)),
@@ -1669,6 +2177,10 @@ impl Index {
             test_stored_value_load_ready_to_publish: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            #[cfg(test)]
+            test_segment_cache_publish_pause_mask: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_segment_cache_publish_ready_mask: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             hnsw: Arc::new(RwLock::new(None)),
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
@@ -1703,13 +2215,12 @@ impl Index {
             id_pos_cache: Arc::new(dashmap::DashMap::new()),
             row_seq_cache: Arc::new(dashmap::DashMap::new()),
             stored_value_cache: Arc::new(dashmap::DashMap::new()),
-            stored_value_cache_lifecycle: Arc::new(parking_lot::RwLock::new(())),
+            segment_cache_lifecycle: Arc::new(parking_lot::RwLock::new(())),
+            segment_hydration_budget,
             stored_value_loads: Arc::new(dashmap::DashMap::new()),
             stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(dashmap::DashMap::new()),
-            stored_slices_cache_bytes: Arc::new(AtomicU64::new(0)),
             decoded_stored_cache: Arc::new(dashmap::DashMap::new()),
-            decoded_stored_cache_bytes: Arc::new(AtomicU64::new(0)),
             shortcut_count_cache: Arc::new(dashmap::DashMap::new()),
             ghost_positions_cache: Arc::new(dashmap::DashMap::new()),
             regexp_expand_cache: Arc::new(dashmap::DashMap::new()),
@@ -1902,6 +2413,7 @@ impl Index {
             .fields()
             .iter()
             .any(|f| matches!(f.field_type, FieldType::Date));
+        let segment_hydration_budget = index_segment_hydration_budget(config);
         let index = Arc::new(Self {
             name,
             schema: Arc::new(RwLock::new(schema)),
@@ -1925,6 +2437,10 @@ impl Index {
             test_stored_value_load_ready_to_publish: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            #[cfg(test)]
+            test_segment_cache_publish_pause_mask: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_segment_cache_publish_ready_mask: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             store,
             memtable: Arc::new(memtable),
@@ -1979,13 +2495,12 @@ impl Index {
             id_pos_cache: Arc::new(dashmap::DashMap::new()),
             row_seq_cache: Arc::new(dashmap::DashMap::new()),
             stored_value_cache: Arc::new(dashmap::DashMap::new()),
-            stored_value_cache_lifecycle: Arc::new(parking_lot::RwLock::new(())),
+            segment_cache_lifecycle: Arc::new(parking_lot::RwLock::new(())),
+            segment_hydration_budget,
             stored_value_loads: Arc::new(dashmap::DashMap::new()),
             stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(dashmap::DashMap::new()),
-            stored_slices_cache_bytes: Arc::new(AtomicU64::new(0)),
             decoded_stored_cache: Arc::new(dashmap::DashMap::new()),
-            decoded_stored_cache_bytes: Arc::new(AtomicU64::new(0)),
             shortcut_count_cache: Arc::new(dashmap::DashMap::new()),
             ghost_positions_cache: Arc::new(dashmap::DashMap::new()),
             regexp_expand_cache: Arc::new(dashmap::DashMap::new()),
@@ -4482,17 +4997,34 @@ impl Index {
                     // completion under the mixed read/write bench).  On the
                     // blocking pool — the decompress is CPU-bound and must
                     // not stall the async merge driver.
-                    {
+                    let prepublication_lease = {
                         let w_store = Arc::clone(&self.store);
                         let w_caches = self.publish_warm_caches();
                         let w_dir = self.data_dir.join("segments");
                         let w_id = merged_meta.id.clone();
                         let w_docs = merged_meta.doc_count;
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let lease = PrePublicationLease::known(w_caches.clone(), w_id.clone());
+                        let worker_lease = lease.clone();
+                        let warm_join = tokio::task::spawn_blocking(move || {
                             warm_segment_at_publish(&w_store, &w_dir, &w_caches, &w_id, w_docs);
+                            drop(worker_lease);
                         })
                         .await;
-                    }
+                        if let Err(error) = warm_join {
+                            tracing::warn!(
+                                merged_id = merged_meta.id.as_str(),
+                                "merge: pre-publication cache warm failed: {error}"
+                            );
+                            // Warming is optional. Remove any partial entries
+                            // left before the panic, then publish the valid
+                            // merge output cold.
+                            self.publish_warm_caches()
+                                .remove_failed_output(merged_meta.id.as_str());
+                        }
+                        // Keep the parent lease armed across all work between
+                        // warm and publication.
+                        lease
+                    };
                     // Mixed-RUW: seed the merged segment's SHORTCUT-COUNT
                     // cache from its inputs, BEFORE the swap makes it
                     // visible.  Per-segment shortcut counts are PHYSICAL
@@ -4547,19 +5079,17 @@ impl Index {
                     }
                     if let Err(e) = self.store.apply_merge(&batch_slice, merged_meta.clone()) {
                         tracing::warn!("merge: apply_merge failed: {e}");
-                        // The pre-warmed slices belong to a segment that
-                        // never became visible — release them.
-                        if let Some((_, slices)) =
-                            self.stored_slices_cache.remove(merged_meta.id.as_str())
-                        {
-                            self.stored_slices_cache_bytes
-                                .fetch_sub(slices.retained_bytes(), Ordering::Relaxed);
-                        }
                         // Seeded shortcut counts for a segment that never
-                        // became visible — drop them.
+                        // became visible — drop them. The armed lease removes
+                        // all seven hydration owners when this scope exits.
                         self.shortcut_count_cache
                             .retain(|(seg, _), _| seg != merged_meta.id.as_str());
-                    } else {
+                        continue;
+                    }
+                    // `apply_merge` has made the output authoritative. No
+                    // await is permitted between publication and this commit.
+                    prepublication_lease.commit();
+                    {
                         // Write the merge output's `.ids` side-car AFTER the
                         // merge is committed: if we crashed before
                         // `apply_merge`, an output segment carrying a valid
@@ -4654,9 +5184,9 @@ impl Index {
             // this writer and be removed here; one that arrives after this
             // writer sees the retired snapshot and cannot publish.
             {
-                let _publication = self.stored_value_cache_lifecycle.write();
+                let _publication = self.segment_cache_lifecycle.write();
                 for id in &dropped_seg_ids {
-                    self.stored_value_cache.remove(id.as_str());
+                    self.remove_segment_hydration_entries(id.as_str());
                 }
             }
             // Do not remove `stored_value_loads` here. Callers holding the
@@ -4665,17 +5195,6 @@ impl Index {
             // key on completion, and the lifecycle transaction above
             // prevents it from retaining the retired value in the cache.
             for id in &dropped_seg_ids {
-                self.dv_cache.remove(id.as_str());
-                self.id_pos_cache.remove(id.as_str());
-                self.row_seq_cache.remove(id.as_str());
-                if let Some((_, slices)) = self.stored_slices_cache.remove(id.as_str()) {
-                    self.stored_slices_cache_bytes
-                        .fetch_sub(slices.retained_bytes(), Ordering::Relaxed);
-                }
-                if let Some((_, bytes)) = self.decoded_stored_cache.remove(id.as_str()) {
-                    self.decoded_stored_cache_bytes
-                        .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
-                }
                 self.fast_date_cache
                     .retain(|(seg, _), _| seg != id.as_str());
                 self.fast_date_sorted_cache
@@ -4685,8 +5204,6 @@ impl Index {
                 // merged-away segment leaked its shadows for the process
                 // lifetime under a sustained writer.
                 let shadow_prefix = format!("{}\u{1}", id.as_str());
-                self.sort_shadow_cache
-                    .retain(|k, _| !k.starts_with(&shadow_prefix));
                 self.shortcut_count_cache
                     .retain(|(seg, _), _| seg != id.as_str());
                 self.range_prefilter_cache
@@ -10422,7 +10939,7 @@ impl Index {
                         let cached_bytes: Option<Vec<u8>> = self
                             .decoded_stored_cache
                             .get(seg_id.as_str())
-                            .map(|e| e.value().as_ref().clone())
+                            .map(|e| e.value().value().clone())
                             .or_else(|| {
                                 self.stored_slices_cache
                                     .get(seg_id.as_str())
@@ -10478,40 +10995,39 @@ impl Index {
                                         bytes: stored_bytes,
                                         offsets,
                                     };
-                                    let sz = slices.retained_bytes();
-                                    if self
-                                        .stored_slices_cache_bytes
-                                        .load(Ordering::Relaxed)
-                                        .saturating_add(sz)
-                                        <= stored_slices_cache_budget()
-                                        && self
-                                            .stored_slices_cache
-                                            .insert(seg_id.clone(), Arc::new(slices))
-                                            .is_none()
-                                    {
-                                        self.stored_slices_cache_bytes
-                                            .fetch_add(sz, Ordering::Relaxed);
-                                    }
+                                    let bytes = cache_estimates::stored_slices_bytes(
+                                        &seg_id,
+                                        std::mem::size_of::<CacheResident<StoredSlices>>(),
+                                        slices.bytes.capacity(),
+                                        slices.offsets.capacity(),
+                                    );
+                                    let _ = self.publish_current(
+                                        &self.stored_slices_cache,
+                                        &seg_id,
+                                        seg_id.clone(),
+                                        SegmentCacheCategory::StoredSlices,
+                                        bytes,
+                                        slices,
+                                    );
                                 } else if !want_cache {
                                     // Unsorted path: retain the decompressed
                                     // section so the NEXT query on this
                                     // segment skips the decompress (the
                                     // read-under-write match_all/bool/range
                                     // tail fix — see `decoded_stored_cache`).
-                                    let sz = stored_bytes.len() as u64;
-                                    if self
-                                        .decoded_stored_cache_bytes
-                                        .load(Ordering::Relaxed)
-                                        .saturating_add(sz)
-                                        <= DECODED_STORED_CACHE_BUDGET
-                                        && self
-                                            .decoded_stored_cache
-                                            .insert(seg_id.clone(), Arc::new(stored_bytes))
-                                            .is_none()
-                                    {
-                                        self.decoded_stored_cache_bytes
-                                            .fetch_add(sz, Ordering::Relaxed);
-                                    }
+                                    let bytes = cache_estimates::decoded_stored_bytes(
+                                        &seg_id,
+                                        std::mem::size_of::<CacheResident<Vec<u8>>>(),
+                                        stored_bytes.capacity(),
+                                    );
+                                    let _ = self.publish_current(
+                                        &self.decoded_stored_cache,
+                                        &seg_id,
+                                        seg_id.clone(),
+                                        SegmentCacheCategory::DecodedStored,
+                                        bytes,
+                                        stored_bytes,
+                                    );
                                 }
                             }
                         }
@@ -13020,6 +13536,7 @@ impl Index {
                             field_str,
                             meta.doc_count,
                         )?;
+                        let shadow = shadow.value().as_ref()?;
                         let (slo, slo_incl, shi, shi_incl) = shadow_range_bounds(
                             gte.as_ref(),
                             gt.as_ref(),
@@ -13027,7 +13544,7 @@ impl Index {
                             lt.as_ref(),
                         )?;
                         seg_matches = seg_matches.saturating_add(shadow_range_count(
-                            &shadow, slo, shi, slo_incl, shi_incl,
+                            shadow, slo, shi, slo_incl, shi_incl,
                         ));
                     }
                     None => return None, // abandon — field absent in this segment
@@ -13395,10 +13912,124 @@ impl Index {
     fn publish_warm_caches(&self) -> PublishWarmCaches {
         PublishWarmCaches {
             slices: Arc::clone(&self.stored_slices_cache),
-            slices_bytes: Arc::clone(&self.stored_slices_cache_bytes),
             dv: Arc::clone(&self.dv_cache),
             shadow: Arc::clone(&self.sort_shadow_cache),
             shadow_fields: Arc::clone(&self.sort_shadow_fields),
+            lifecycle: Arc::clone(&self.segment_cache_lifecycle),
+            budget: Arc::clone(&self.segment_hydration_budget),
+            stored_values: Arc::clone(&self.stored_value_cache),
+            id_positions: Arc::clone(&self.id_pos_cache),
+            row_sequences: Arc::clone(&self.row_seq_cache),
+            decoded_stored: Arc::clone(&self.decoded_stored_cache),
+        }
+    }
+
+    /// Publish one already-built immutable value if its segment is still
+    /// current. Build and retained-size estimation happen before this short
+    /// transaction. Lock order: build mutex → lifecycle → DashMap shard.
+    fn publish_current<T>(
+        &self,
+        map: &dashmap::DashMap<String, Resident<T>>,
+        segment_id: &str,
+        key: String,
+        category: SegmentCacheCategory,
+        bytes: u64,
+        value: T,
+    ) -> Resident<T> {
+        self.publish_current_with_budget(
+            map,
+            segment_id,
+            key,
+            category,
+            bytes,
+            value,
+            &self.segment_hydration_budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_current_with_budget<T>(
+        &self,
+        map: &dashmap::DashMap<String, Resident<T>>,
+        segment_id: &str,
+        key: String,
+        category: SegmentCacheCategory,
+        bytes: u64,
+        value: T,
+        budget: &Arc<SegmentHydrationBudget>,
+    ) -> Resident<T> {
+        #[cfg(test)]
+        {
+            let bit = 1_u64 << category as usize;
+            self.test_segment_cache_publish_ready_mask
+                .fetch_or(bit, Ordering::Release);
+            while self
+                .test_segment_cache_publish_pause_mask
+                .load(Ordering::Acquire)
+                & bit
+                != 0
+            {
+                std::thread::yield_now();
+            }
+        }
+        let _publication = self.segment_cache_lifecycle.read();
+        if !self
+            .store
+            .snapshot()
+            .segments
+            .iter()
+            .any(|meta| meta.id == segment_id)
+        {
+            return CacheResident::uncached(value);
+        }
+        use dashmap::mapref::entry::Entry;
+        match map.entry(key) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                let Some(charge) = budget.try_charge(category, bytes) else {
+                    return CacheResident::uncached(value);
+                };
+                let resident = CacheResident::admitted(value, charge, category, bytes);
+                entry.insert(Arc::clone(&resident));
+                resident
+            }
+        }
+    }
+
+    /// Caller holds `segment_cache_lifecycle.write()`.
+    fn remove_segment_hydration_entries(&self, segment_id: &str) {
+        self.stored_value_cache.remove(segment_id);
+        self.dv_cache.remove(segment_id);
+        self.id_pos_cache.remove(segment_id);
+        self.row_seq_cache.remove(segment_id);
+        self.stored_slices_cache.remove(segment_id);
+        self.decoded_stored_cache.remove(segment_id);
+        let shadow_prefix = format!("{segment_id}\u{1}");
+        self.sort_shadow_cache
+            .retain(|key, _| !key.starts_with(&shadow_prefix));
+
+        // DashMap retains shard capacity after logical removals. Shrinking
+        // only an entirely empty map avoids locking every shard on each merge.
+        if self.stored_value_cache.is_empty() {
+            self.stored_value_cache.shrink_to_fit();
+        }
+        if self.dv_cache.is_empty() {
+            self.dv_cache.shrink_to_fit();
+        }
+        if self.id_pos_cache.is_empty() {
+            self.id_pos_cache.shrink_to_fit();
+        }
+        if self.row_seq_cache.is_empty() {
+            self.row_seq_cache.shrink_to_fit();
+        }
+        if self.stored_slices_cache.is_empty() {
+            self.stored_slices_cache.shrink_to_fit();
+        }
+        if self.decoded_stored_cache.is_empty() {
+            self.decoded_stored_cache.shrink_to_fit();
+        }
+        if self.sort_shadow_cache.is_empty() {
+            self.sort_shadow_cache.shrink_to_fit();
         }
     }
 
@@ -13406,7 +14037,7 @@ impl Index {
         &self,
         segments_dir: &std::path::Path,
         segment_id: &str,
-    ) -> Option<Arc<std::collections::BTreeMap<String, xerj_storage::doc_values::Column>>> {
+    ) -> Option<Resident<DocValueMap>> {
         if let Some(entry) = self.dv_cache.get(segment_id) {
             return Some(Arc::clone(entry.value()));
         }
@@ -13414,10 +14045,20 @@ impl Index {
         if cols.is_empty() {
             return None;
         }
-        let arc = Arc::new(cols);
-        self.dv_cache
-            .insert(segment_id.to_string(), Arc::clone(&arc));
-        Some(arc)
+        let key = segment_id.to_string();
+        let bytes = cache_estimates::doc_values_bytes(
+            &key,
+            std::mem::size_of::<CacheResident<DocValueMap>>(),
+            &cols,
+        );
+        Some(self.publish_current(
+            &self.dv_cache,
+            segment_id,
+            key,
+            SegmentCacheCategory::DocValues,
+            bytes,
+            cols,
+        ))
     }
 
     /// Columnar `function_score { match_all, field_value_factor }` fast path.
@@ -13807,7 +14448,7 @@ impl Index {
         // gate forces it to equal Σ segment doc_count (bench mapping has no
         // nulls, so this coincides with ES's field docCount).
         let mut seg_cols = Vec::with_capacity(segments.len());
-        let mut seg_seqs: Vec<Arc<Vec<u64>>> = Vec::with_capacity(segments.len());
+        let mut seg_seqs: Vec<Resident<Vec<u64>>> = Vec::with_capacity(segments.len());
         let mut seg_ghosts: Vec<Option<Arc<Vec<u64>>>> = Vec::with_capacity(segments.len());
         for meta in segments {
             seg_cols.push(self.dv_columns_for(segments_dir, &meta.id)?);
@@ -15031,7 +15672,7 @@ impl Index {
     /// catch that. serde_json handles every variant correctly and the
     /// per-doc parse cost is amortised once across the whole cache
     /// lifetime of a segment.
-    fn stored_values_for(&self, segment_id: &str) -> Option<Arc<Vec<Value>>> {
+    fn stored_values_for(&self, segment_id: &str) -> Option<Resident<Vec<Value>>> {
         if let Some(entry) = self.stored_value_cache.get(segment_id) {
             return Some(Arc::clone(entry.value()));
         }
@@ -15039,21 +15680,20 @@ impl Index {
         let stored_bytes_raw = reader.section(SectionType::Stored).ok()??;
         let stored_bytes = xerj_storage::stored_codec::decode_stored(stored_bytes_raw).ok()?;
         let docs: Vec<Value> = serde_json::from_slice(&stored_bytes).ok()?;
-        let arc = Arc::new(docs);
-        {
-            let _publication = self.stored_value_cache_lifecycle.read();
-            if self
-                .store
-                .snapshot()
-                .segments
-                .iter()
-                .any(|meta| meta.id == segment_id)
-            {
-                self.stored_value_cache
-                    .insert(segment_id.to_string(), Arc::clone(&arc));
-            }
-        }
-        Some(arc)
+        let key = segment_id.to_string();
+        let bytes = cache_estimates::stored_values_bytes(
+            &key,
+            std::mem::size_of::<CacheResident<Vec<Value>>>(),
+            &docs,
+        );
+        Some(self.publish_current(
+            &self.stored_value_cache,
+            segment_id,
+            key,
+            SegmentCacheCategory::StoredValues,
+            bytes,
+            docs,
+        ))
     }
 
     /// Async boundary for a cold stored-value load.
@@ -15069,7 +15709,7 @@ impl Index {
     /// is useful: it warms the immutable segment for the next request. The
     /// segment-current check prevents such a detached completion from
     /// resurrecting a cache entry that a concurrent merge already retired.
-    async fn stored_values_for_async(&self, segment_id: &str) -> Option<Arc<Vec<Value>>> {
+    async fn stored_values_for_async(&self, segment_id: &str) -> Option<Resident<Vec<Value>>> {
         if let Some(entry) = self.stored_value_cache.get(segment_id) {
             return Some(Arc::clone(entry.value()));
         }
@@ -15085,7 +15725,8 @@ impl Index {
 
                     let store = Arc::clone(&self.store);
                     let cache = Arc::clone(&self.stored_value_cache);
-                    let lifecycle = Arc::clone(&self.stored_value_cache_lifecycle);
+                    let lifecycle = Arc::clone(&self.segment_cache_lifecycle);
+                    let budget = Arc::clone(&self.segment_hydration_budget);
                     let loads = Arc::clone(&self.stored_value_loads);
                     let load_semaphore = Arc::clone(&self.stored_value_load_semaphore);
                     let load_segment_id = segment_id.clone();
@@ -15118,7 +15759,12 @@ impl Index {
                             let stored_bytes =
                                 xerj_storage::stored_codec::decode_stored(stored_bytes_raw).ok()?;
                             let docs: Vec<Value> = serde_json::from_slice(&stored_bytes).ok()?;
-                            let arc = Arc::new(docs);
+                            let key = load_segment_id.clone();
+                            let bytes = cache_estimates::stored_values_bytes(
+                                &key,
+                                std::mem::size_of::<CacheResident<Vec<Value>>>(),
+                                &docs,
+                            );
                             #[cfg(test)]
                             {
                                 ready_to_publish.store(true, Ordering::Release);
@@ -15126,18 +15772,40 @@ impl Index {
                                     std::thread::sleep(std::time::Duration::from_millis(1));
                                 }
                             }
-                            {
+                            let resident = {
                                 let _publication = lifecycle.read();
-                                if store
+                                if !store
                                     .snapshot()
                                     .segments
                                     .iter()
                                     .any(|meta| meta.id == load_segment_id)
                                 {
-                                    cache.insert(load_segment_id, Arc::clone(&arc));
+                                    CacheResident::uncached(docs)
+                                } else {
+                                    use dashmap::mapref::entry::Entry;
+                                    match cache.entry(key) {
+                                        Entry::Occupied(entry) => Arc::clone(entry.get()),
+                                        Entry::Vacant(entry) => {
+                                            if let Some(charge) = budget.try_charge(
+                                                SegmentCacheCategory::StoredValues,
+                                                bytes,
+                                            ) {
+                                                let resident = CacheResident::admitted(
+                                                    docs,
+                                                    charge,
+                                                    SegmentCacheCategory::StoredValues,
+                                                    bytes,
+                                                );
+                                                entry.insert(Arc::clone(&resident));
+                                                resident
+                                            } else {
+                                                CacheResident::uncached(docs)
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                            Some(arc)
+                            };
+                            Some(resident)
                         });
                         if let Ok(Some(value)) = blocking.await {
                             let _ = sender.send(Some(value));
@@ -15280,12 +15948,13 @@ impl Index {
                 let seg_doc_count = k.doc_count as u64;
                 let shadow =
                     self.sorted_shadow_for(segments_dir, segment_id, field, seg_doc_count)?;
+                let shadow = shadow.value().as_ref()?;
                 let (slo, slo_incl, shi, shi_incl) = shadow_range_bounds(gte, gt, lte, lt)?;
                 // Same selectivity precheck on the shadow scale.
-                if shadow_range_count(&shadow, slo, shi, slo_incl, shi_incl) as usize > cap {
+                if shadow_range_count(shadow, slo, shi, slo_incl, shi_incl) as usize > cap {
                     return None;
                 }
-                shadow_range_positions(&shadow, slo, shi, slo_incl, shi_incl)
+                shadow_range_positions(shadow, slo, shi, slo_incl, shi_incl)
             }
             None => return None,
         };
@@ -15391,7 +16060,7 @@ impl Index {
         &self,
         seg_id: &str,
         expect_docs: u64,
-    ) -> Option<Arc<std::collections::HashMap<String, u32>>> {
+    ) -> Option<Resident<std::collections::HashMap<String, u32>>> {
         if let Some(entry) = self.id_pos_cache.get(seg_id) {
             return Some(Arc::clone(entry.value()));
         }
@@ -15423,10 +16092,20 @@ impl Index {
         if map.len() as u64 != expect_docs {
             return None;
         }
-        let arc = Arc::new(map);
-        self.id_pos_cache
-            .insert(seg_id.to_string(), Arc::clone(&arc));
-        Some(arc)
+        let key = seg_id.to_string();
+        let bytes = cache_estimates::id_positions_bytes(
+            &key,
+            std::mem::size_of::<CacheResident<std::collections::HashMap<String, u32>>>(),
+            &map,
+        );
+        Some(self.publish_current(
+            &self.id_pos_cache,
+            seg_id,
+            key,
+            SegmentCacheCategory::IdPositions,
+            bytes,
+            map,
+        ))
     }
 
     /// Lazily-built, cached `stored-position → seq_no` array for a segment
@@ -15445,7 +16124,7 @@ impl Index {
     /// go BACK to live in place (a re-index lands in the memtable, which
     /// keeps the columnar path off entirely), so the sentinel is never
     /// observable in results.
-    fn row_seqs_for(&self, seg_id: &str, expect_docs: u64) -> Option<Arc<Vec<u64>>> {
+    fn row_seqs_for(&self, seg_id: &str, expect_docs: u64) -> Option<Resident<Vec<u64>>> {
         if let Some(entry) = self.row_seq_cache.get(seg_id) {
             return Some(Arc::clone(entry.value()));
         }
@@ -15458,10 +16137,20 @@ impl Index {
                 None => return None,
             }
         }
-        let arc = Arc::new(seqs);
-        self.row_seq_cache
-            .insert(seg_id.to_string(), Arc::clone(&arc));
-        Some(arc)
+        let key = seg_id.to_string();
+        let bytes = cache_estimates::row_sequences_bytes(
+            &key,
+            std::mem::size_of::<CacheResident<Vec<u64>>>(),
+            seqs.capacity(),
+        );
+        Some(self.publish_current(
+            &self.row_seq_cache,
+            seg_id,
+            key,
+            SegmentCacheCategory::RowSequences,
+            bytes,
+            seqs,
+        ))
     }
 
     /// Position pre-filter for an `ids` query: resolve each requested id to its
@@ -15659,7 +16348,7 @@ impl Index {
         segment_id: &str,
         field: &str,
         seg_doc_count: u64,
-    ) -> Option<Arc<Vec<(i64, u32)>>> {
+    ) -> Option<Resident<Option<Arc<Vec<(i64, u32)>>>>> {
         // Register the field so the publish-time warm pre-builds this
         // shadow for every FUTURE segment (bounded registry).
         if self.sort_shadow_fields.len() < 16 && !self.sort_shadow_fields.contains_key(field) {
@@ -15667,7 +16356,7 @@ impl Index {
         }
         let key = format!("{segment_id}\u{1}{field}");
         if let Some(entry) = self.sort_shadow_cache.get(&key) {
-            return entry.value().clone();
+            return Some(Arc::clone(entry.value()));
         }
         // A missing/unreadable dv sidecar is a TRANSIENT state (a segment can
         // become visible a beat before its sidecar read succeeds under heavy
@@ -15679,8 +16368,19 @@ impl Index {
         // sorted read full-scanned it until a merge retired it.
         let cols = self.dv_columns_for(segments_dir, segment_id)?;
         let built = build_sort_shadow(&cols, field, seg_doc_count);
-        self.sort_shadow_cache.insert(key, built.clone());
-        built
+        let bytes = cache_estimates::sort_shadow_bytes(
+            &key,
+            std::mem::size_of::<CacheResident<Option<Arc<Vec<(i64, u32)>>>>>(),
+            built.as_ref().map(|shadow| shadow.capacity()),
+        );
+        Some(self.publish_current(
+            &self.sort_shadow_cache,
+            segment_id,
+            key,
+            SegmentCacheCategory::SortShadow,
+            bytes,
+            built,
+        ))
     }
 
     fn build_sort_candidates_prefilter(
@@ -15698,6 +16398,7 @@ impl Index {
             return None;
         }
         let shadow = self.sorted_shadow_for(segments_dir, segment_id, &sf.field, seg_doc_count)?;
+        let shadow = shadow.value().as_ref()?;
         let sorted: &[(i64, u32)] = shadow.as_slice();
         if sorted.is_empty() {
             return None;
@@ -15911,6 +16612,7 @@ impl Index {
             return None;
         }
         let shadow = self.sorted_shadow_for(segments_dir, segment_id, &sf.field, seg_doc_count)?;
+        let shadow = shadow.value().as_ref()?;
         let sorted: &[(i64, u32)] = shadow.as_slice();
         if sorted.is_empty() {
             return None;
@@ -15983,7 +16685,7 @@ impl Index {
     /// never a per-doc parse).  `None` on open/decode failure or a
     /// malformed section (offsets incomplete) — caller falls back to the
     /// legacy scan.
-    fn stored_slices_for(&self, seg_id: &str, expect_docs: u64) -> Option<Arc<StoredSlices>> {
+    fn stored_slices_for(&self, seg_id: &str, expect_docs: u64) -> Option<Resident<StoredSlices>> {
         if let Some(entry) = self.stored_slices_cache.get(seg_id) {
             return Some(Arc::clone(entry.value()));
         }
@@ -16007,7 +16709,7 @@ impl Index {
         // Reuse already-decompressed bytes from `decoded_stored_cache`
         // before paying a fresh open + decompress.
         let bytes: Vec<u8> = if let Some(entry) = self.decoded_stored_cache.get(seg_id) {
-            entry.value().as_ref().clone()
+            entry.value().value().clone()
         } else {
             let reader = self.store.open_segment_arc(seg_id).ok()?;
             let raw = reader.section(SectionType::Stored).ok()??;
@@ -16020,22 +16722,22 @@ impl Index {
         if offsets.len() as u64 != expect_docs {
             return None;
         }
-        let slices = Arc::new(StoredSlices { bytes, offsets });
-        let sz = slices.retained_bytes();
-        if self
-            .stored_slices_cache_bytes
-            .load(Ordering::Relaxed)
-            .saturating_add(sz)
-            <= stored_slices_cache_budget()
-            && self
-                .stored_slices_cache
-                .insert(seg_id.to_string(), Arc::clone(&slices))
-                .is_none()
-        {
-            self.stored_slices_cache_bytes
-                .fetch_add(sz, Ordering::Relaxed);
-        }
-        Some(slices)
+        let slices = StoredSlices { bytes, offsets };
+        let key = seg_id.to_string();
+        let bytes = cache_estimates::stored_slices_bytes(
+            &key,
+            std::mem::size_of::<CacheResident<StoredSlices>>(),
+            slices.bytes.capacity(),
+            slices.offsets.capacity(),
+        );
+        Some(self.publish_current(
+            &self.stored_slices_cache,
+            seg_id,
+            key,
+            SegmentCacheCategory::StoredSlices,
+            bytes,
+            slices,
+        ))
     }
 
     /// Per-segment GHOST-position bitmap (b7 DEFECT 1c): bit `pos` set ⇔
@@ -16884,6 +17586,7 @@ impl Drop for FlushDurationTimer {
 #[derive(Clone)]
 struct FlushPublisherTestHook {
     callback: Arc<dyn Fn() -> bool + Send + Sync>,
+    after_warm: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     ledger: &'static crate::ingest_memory::Ledger,
     target_memtable: usize,
 }
@@ -17104,12 +17807,20 @@ async fn do_flush_shard(
     // build them.  The cost (~700 ns / doc) is irrelevant next to the
     // 50-100 ms segment write that follows, and 100K-doc/s ingest
     // bench numbers are unaffected.
+    let failed_warm_caches = warm_caches.clone();
+    let warmed_segment_id = Arc::new(parking_lot::Mutex::new(None::<String>));
+    let callback_warmed_segment_id = Arc::clone(&warmed_segment_id);
     let build_fts = move |meta: &xerj_storage::segment::SegmentMeta| -> xerj_storage::Result<()> {
         #[cfg(test)]
         let test_callback = test_hook
             .as_ref()
             .filter(|hook| hook.target_memtable == test_target)
             .map(|hook| Arc::clone(&hook.callback));
+        #[cfg(test)]
+        let after_warm_callback = test_hook
+            .as_ref()
+            .filter(|hook| hook.target_memtable == test_target)
+            .and_then(|hook| hook.after_warm.as_ref().map(Arc::clone));
         #[cfg(test)]
         if let Some(callback) = test_callback {
             if callback() {
@@ -17119,7 +17830,7 @@ async fn do_flush_shard(
         // Whole side-car build runs on the dedicated ingest pool so a
         // flush burst can't queue search/agg par_iters behind it on the
         // global rayon pool (read-under-write; see `crate::ingest_pool`).
-        crate::background_pool().install(|| {
+        crate::background_pool().install(|| -> xerj_storage::Result<()> {
             // ── Doc-values side-car (always built) ────────────────────
             let t_dv = std::time::Instant::now();
             {
@@ -17172,6 +17883,7 @@ async fn do_flush_shard(
             // warm left a ~250 ms visible-but-cold window per flush storm;
             // 64 racing queries each decompressed all 16 fresh segments
             // inside it — the dec≈900 ms stall episodes.)
+            *callback_warmed_segment_id.lock() = Some(meta.id.clone());
             warm_segment_at_publish(
                 &store_for_warm,
                 &segments_dir_for_dv,
@@ -17179,7 +17891,16 @@ async fn do_flush_shard(
                 meta.id.as_str(),
                 meta.doc_count,
             );
-        });
+            #[cfg(test)]
+            if let Some(callback) = after_warm_callback {
+                if callback(meta.id.as_str()) {
+                    return Err(
+                        std::io::Error::other("injected post-warm publisher failure").into(),
+                    );
+                }
+            }
+            Ok(())
+        })?;
         let _ = &segments_dir;
         let _ = &drained_fts;
 
@@ -17202,8 +17923,18 @@ async fn do_flush_shard(
     let t_finalize = std::time::Instant::now();
     let _fin_permit = crate::flush_finalize_gate().acquire().await.ok();
     let finalize_join = tokio::task::spawn_blocking(move || {
-        crate::background_pool()
-            .install(|| store.finalize_flush_with_publisher(storage_drained, build_fts))
+        // This lease lives in the blocking worker, not the async waiter:
+        // aborting an async task cannot cancel `spawn_blocking`.
+        let lease =
+            PrePublicationLease::tracked(failed_warm_caches, Arc::clone(&warmed_segment_id));
+        let result = crate::background_pool()
+            .install(|| store.finalize_flush_with_publisher(storage_drained, build_fts));
+        if matches!(result, Ok(Some(_))) {
+            // finalize_flush_with_publisher publishes the snapshot before it
+            // returns Some. Commit while still in the worker, with no await.
+            lease.commit();
+        }
+        result
     })
     .await;
     let meta = match finalize_join {
@@ -17212,7 +17943,9 @@ async fn do_flush_shard(
             tracing::warn!("storage finalize returned None — unexpected");
             return Ok(());
         }
-        Ok(Err(e)) => return Err(e.into()),
+        Ok(Err(e)) => {
+            return Err(e.into());
+        }
         Err(join_e) => {
             tracing::warn!("finalize spawn_blocking join failed: {join_e}");
             return Ok(());
@@ -23817,12 +24550,6 @@ struct StoredSlices {
     offsets: Vec<(u32, u32)>,
 }
 
-impl StoredSlices {
-    fn retained_bytes(&self) -> u64 {
-        (self.bytes.len() + self.offsets.len() * 8 + 64) as u64
-    }
-}
-
 /// Segment sort-key shadow builder — shared by the query-path
 /// `Index::sorted_shadow_for` and the publish-time warm.  See
 /// `sorted_shadow_for` for the eligibility contract (no nulls, full
@@ -23989,16 +24716,105 @@ fn shadow_range_count(
 /// handle.  All fields are the Index's own Arcs.
 #[derive(Clone)]
 struct PublishWarmCaches {
-    slices: Arc<dashmap::DashMap<String, Arc<StoredSlices>>>,
-    slices_bytes: Arc<AtomicU64>,
-    dv: Arc<
-        dashmap::DashMap<
-            String,
-            Arc<std::collections::BTreeMap<String, xerj_storage::doc_values::Column>>,
-        >,
-    >,
-    shadow: Arc<dashmap::DashMap<String, Option<Arc<Vec<(i64, u32)>>>>>,
+    slices: Arc<dashmap::DashMap<String, Resident<StoredSlices>>>,
+    dv: Arc<dashmap::DashMap<String, Resident<DocValueMap>>>,
+    shadow: Arc<dashmap::DashMap<String, Resident<Option<Arc<Vec<(i64, u32)>>>>>>,
     shadow_fields: Arc<dashmap::DashMap<String, ()>>,
+    lifecycle: Arc<parking_lot::RwLock<()>>,
+    budget: Arc<SegmentHydrationBudget>,
+    stored_values: Arc<dashmap::DashMap<String, Resident<Vec<Value>>>>,
+    id_positions: Arc<dashmap::DashMap<String, Resident<std::collections::HashMap<String, u32>>>>,
+    row_sequences: Arc<dashmap::DashMap<String, Resident<Vec<u64>>>>,
+    decoded_stored: Arc<dashmap::DashMap<String, Resident<Vec<u8>>>>,
+}
+
+/// Capability documenting the sole path allowed to bypass the authoritative
+/// snapshot-current check: flush/merge output warming immediately before
+/// publication. It is private to this module and carries no ambient authority.
+struct PrePublication(());
+
+impl PublishWarmCaches {
+    fn remove_failed_output(&self, segment_id: &str) {
+        let _publication = self.lifecycle.write();
+        self.slices.remove(segment_id);
+        self.dv.remove(segment_id);
+        self.stored_values.remove(segment_id);
+        self.id_positions.remove(segment_id);
+        self.row_sequences.remove(segment_id);
+        self.decoded_stored.remove(segment_id);
+        let prefix = format!("{segment_id}\u{1}");
+        self.shadow.retain(|key, _| !key.starts_with(&prefix));
+    }
+}
+
+/// Removes cache owners for an output that did not reach authoritative
+/// publication. The guard must live inside the blocking worker that performs
+/// the warm: aborting the async waiter does not cancel `spawn_blocking`, so an
+/// outer guard could clean too early and allow the detached worker to reinsert.
+struct PrePublicationLeaseInner {
+    caches: PublishWarmCaches,
+    segment_id: Arc<parking_lot::Mutex<Option<String>>>,
+    committed: AtomicBool,
+}
+
+impl Drop for PrePublicationLeaseInner {
+    fn drop(&mut self) {
+        if !self.committed.load(Ordering::Acquire) {
+            if let Some(segment_id) = self.segment_id.lock().take() {
+                self.caches.remove_failed_output(&segment_id);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PrePublicationLease(Arc<PrePublicationLeaseInner>);
+
+impl PrePublicationLease {
+    fn known(caches: PublishWarmCaches, segment_id: String) -> Self {
+        Self(Arc::new(PrePublicationLeaseInner {
+            caches,
+            segment_id: Arc::new(parking_lot::Mutex::new(Some(segment_id))),
+            committed: AtomicBool::new(false),
+        }))
+    }
+
+    fn tracked(
+        caches: PublishWarmCaches,
+        segment_id: Arc<parking_lot::Mutex<Option<String>>>,
+    ) -> Self {
+        Self(Arc::new(PrePublicationLeaseInner {
+            caches,
+            segment_id,
+            committed: AtomicBool::new(false),
+        }))
+    }
+
+    fn commit(&self) {
+        self.0.committed.store(true, Ordering::Release);
+    }
+}
+
+fn publish_prepublication<T>(
+    _capability: &PrePublication,
+    caches: &PublishWarmCaches,
+    map: &dashmap::DashMap<String, Resident<T>>,
+    key: String,
+    category: SegmentCacheCategory,
+    bytes: u64,
+    value: T,
+) -> Option<Resident<T>> {
+    let _publication = caches.lifecycle.read();
+    use dashmap::mapref::entry::Entry;
+    match map.entry(key) {
+        Entry::Occupied(entry) => Some(Arc::clone(entry.get())),
+        Entry::Vacant(entry) => {
+            let charge = caches.budget.try_charge(category, bytes)?;
+            let resident = CacheResident::admitted(value, charge, category, bytes);
+            entry.insert(Arc::clone(&resident));
+            Some(resident)
+        }
+    }
 }
 
 /// Warm one just-written segment's read-path caches OUTSIDE the query
@@ -24027,6 +24843,7 @@ fn warm_segment_at_publish(
     seg_id: &str,
     expect_docs: u64,
 ) {
+    let prepublication = PrePublication(());
     // Sustained-ingest escape hatch: XERJ_NO_PUBLISH_WARM=1 skips ALL
     // publish-time cache warming (stored slices + dv columns + sort
     // shadows).  Queries fall back to per-query decode-on-miss — the
@@ -24044,7 +24861,7 @@ fn warm_segment_at_publish(
     }
     // 1. Stored slices.
     if !caches.slices.contains_key(seg_id) {
-        let built: Option<Arc<StoredSlices>> = (|| {
+        let built: Option<StoredSlices> = (|| {
             let reader = store.open_segment_arc(seg_id).ok()?;
             let raw = reader.section(SectionType::Stored).ok()??;
             let bytes = xerj_storage::stored_codec::decode_stored(raw).ok()?;
@@ -24055,35 +24872,52 @@ fn warm_segment_at_publish(
             if offsets.len() as u64 != expect_docs {
                 return None;
             }
-            Some(Arc::new(StoredSlices { bytes, offsets }))
+            Some(StoredSlices { bytes, offsets })
         })();
         if let Some(slices) = built {
-            let sz = slices.retained_bytes();
-            if caches
-                .slices_bytes
-                .load(Ordering::Relaxed)
-                .saturating_add(sz)
-                <= stored_slices_cache_budget()
-                && caches.slices.insert(seg_id.to_string(), slices).is_none()
-            {
-                caches.slices_bytes.fetch_add(sz, Ordering::Relaxed);
-            }
+            let key = seg_id.to_string();
+            let bytes = cache_estimates::stored_slices_bytes(
+                &key,
+                std::mem::size_of::<CacheResident<StoredSlices>>(),
+                slices.bytes.capacity(),
+                slices.offsets.capacity(),
+            );
+            let _ = publish_prepublication(
+                &prepublication,
+                caches,
+                &caches.slices,
+                key,
+                SegmentCacheCategory::StoredSlices,
+                bytes,
+                slices,
+            );
         }
     }
     // 2. dv columns (mirrors `Index::dv_columns_for`'s miss arm).
-    let cols: Option<Arc<std::collections::BTreeMap<String, xerj_storage::doc_values::Column>>> =
-        if let Some(entry) = caches.dv.get(seg_id) {
-            Some(Arc::clone(entry.value()))
+    let cols: Option<Resident<DocValueMap>> = if let Some(entry) = caches.dv.get(seg_id) {
+        Some(Arc::clone(entry.value()))
+    } else {
+        let cols = read_doc_values_sidecar(segments_dir, seg_id);
+        if cols.is_empty() {
+            None
         } else {
-            let cols = read_doc_values_sidecar(segments_dir, seg_id);
-            if cols.is_empty() {
-                None
-            } else {
-                let arc = Arc::new(cols);
-                caches.dv.insert(seg_id.to_string(), Arc::clone(&arc));
-                Some(arc)
-            }
-        };
+            let key = seg_id.to_string();
+            let bytes = cache_estimates::doc_values_bytes(
+                &key,
+                std::mem::size_of::<CacheResident<DocValueMap>>(),
+                &cols,
+            );
+            publish_prepublication(
+                &prepublication,
+                caches,
+                &caches.dv,
+                key,
+                SegmentCacheCategory::DocValues,
+                bytes,
+                cols,
+            )
+        }
+    };
     // 3. Sort shadows for every historically-sorted field.
     if let Some(cols) = cols {
         for e in caches.shadow_fields.iter() {
@@ -24091,7 +24925,20 @@ fn warm_segment_at_publish(
             let key = format!("{seg_id}\u{1}{field}");
             if !caches.shadow.contains_key(&key) {
                 let built = build_sort_shadow(&cols, field, expect_docs);
-                caches.shadow.insert(key, built);
+                let bytes = cache_estimates::sort_shadow_bytes(
+                    &key,
+                    std::mem::size_of::<CacheResident<Option<Arc<Vec<(i64, u32)>>>>>(),
+                    built.as_ref().map(|shadow| shadow.capacity()),
+                );
+                let _ = publish_prepublication(
+                    &prepublication,
+                    caches,
+                    &caches.shadow,
+                    key,
+                    SegmentCacheCategory::SortShadow,
+                    bytes,
+                    built,
+                );
             }
         }
     }
@@ -24187,42 +25034,6 @@ fn staggered_per_shard_threshold(base_total: usize, shard_idx: usize, n_shards: 
     let pos = shard_idx as f64 / (n - 1) as f64 - 0.5; // -0.5 ..= 0.5
     ((base as f64) * (1.0 + frac * pos)).max(1.0) as usize
 }
-
-/// Retained-memory budget for `stored_slices_cache`.  Inserts stop once the
-/// budget is reached (queries then fall back to the per-query decompress
-/// path); merge eviction returns the dropped segment's bytes to the budget.
-/// 20% of host RAM, ≥2 GB floor (was a flat 3 GB, then a host-tuned 24 GB):
-/// a sustained bulk writer grows the corpus past a small flat budget DURING
-/// the read window; once the budget is full every over-budget segment is
-/// decompressed PER QUERY (insert stops, nothing evicts) — measured
-/// dec=28–30 s per match_all against a 21 M-doc corpus even fully quiesced,
-/// because with corpus-wide primary-key ties (cycled telemetry timestamps)
-/// the per-segment best-candidate rejection never strictly loses, so NO
-/// segment is skipped.  Merge eviction returns merged-away segments' bytes.
-/// The durable fix — hydrating only GLOBAL winners after a shadow-merge of
-/// per-segment candidate keys — is tracked as follow-up.
-fn stored_slices_cache_budget() -> u64 {
-    static BUDGET: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        const FLOOR: u64 = 2 * 1024 * 1024 * 1024;
-        let ram_total: Option<u64> = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| {
-                    l.split_whitespace()
-                        .nth(1)
-                        .and_then(|kb| kb.parse::<u64>().ok())
-                        .map(|kb| kb * 1024)
-                })
-        });
-        ram_total.map(|t| (t / 5).max(FLOOR)).unwrap_or(FLOOR)
-    });
-    *BUDGET
-}
-
-/// Budget for `decoded_stored_cache` (raw decompressed stored sections,
-/// ~1× the corpus JSON size).  Overflow → inserts are refused and the
-/// query falls back to the per-query decompress (pre-cache behaviour).
-const DECODED_STORED_CACHE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Entry cap for `shortcut_count_cache` (cleared wholesale when exceeded).
 const SHORTCUT_COUNT_CACHE_MAX: usize = 65_536;
@@ -29194,6 +30005,7 @@ mod flush_memory_integration_tests {
                 let _ = release_rx.lock().take().unwrap().recv();
                 inject_error
             }),
+            after_warm: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -29223,6 +30035,85 @@ mod flush_memory_integration_tests {
         );
     }
 
+    async fn run_post_warm_failure_case(name: &'static str, panic_after_warm: bool) {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index(name, Schema::empty()).unwrap();
+        let idx = engine.get_index(name).unwrap();
+        let doc_id = format!("{name}-doc");
+        idx.index_document(Some(doc_id.clone()), json!({"body": "retained", "rank": 7}))
+            .await
+            .unwrap();
+
+        let shard = idx.memtable.shard_for_dynamic(&doc_id);
+        let (field_configs, excluded_fts_fields) = {
+            let schema = idx.schema.read().await;
+            (
+                build_fts_field_configs(&schema.schema),
+                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+            )
+        };
+        let mut warm_caches = idx.publish_warm_caches();
+        let budget = SegmentHydrationBudget::new(16 * 1024 * 1024);
+        warm_caches.budget = Arc::clone(&budget);
+        let observed = warm_caches.clone();
+        let warmed_id = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let callback_id = Arc::clone(&warmed_id);
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(|| false),
+            after_warm: Some(Arc::new(move |segment_id| {
+                *callback_id.lock() = Some(segment_id.to_string());
+                assert!(
+                    observed.slices.contains_key(segment_id)
+                        || observed.dv.contains_key(segment_id),
+                    "real publisher did not warm a cache family"
+                );
+                if panic_after_warm {
+                    panic!("injected post-warm panic");
+                }
+                true
+            })),
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+        };
+
+        let result = do_flush_shard(
+            shard,
+            Arc::clone(&idx.store),
+            Arc::clone(&idx.memtable),
+            Arc::clone(&idx.registry),
+            idx.data_dir.clone(),
+            field_configs,
+            excluded_fts_fields,
+            || {},
+            warm_caches,
+            Some(hook),
+        )
+        .await;
+        if panic_after_warm {
+            assert!(result.is_ok(), "join panic is logged and kept non-fatal");
+        } else {
+            assert!(result.is_err());
+        }
+        let segment_id = warmed_id.lock().clone().expect("warm hook did not run");
+        assert!(!idx.stored_slices_cache.contains_key(&segment_id));
+        assert!(!idx.dv_cache.contains_key(&segment_id));
+        assert!(!idx.stored_value_cache.contains_key(&segment_id));
+        assert!(!idx.id_pos_cache.contains_key(&segment_id));
+        assert!(!idx.row_seq_cache.contains_key(&segment_id));
+        assert!(!idx.decoded_stored_cache.contains_key(&segment_id));
+        let prefix = format!("{segment_id}\u{1}");
+        assert!(!idx
+            .sort_shadow_cache
+            .iter()
+            .any(|entry| entry.key().starts_with(&prefix)));
+        assert_eq!(budget.snapshot().current, 0);
+        assert_eq!(budget.snapshot().accounting_errors, 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn parallel_real_flushes_route_isolated_ledgers_through_success_and_error() {
         let (success, failure) = tokio::join!(
@@ -29230,5 +30121,11 @@ mod flush_memory_integration_tests {
             run_flush_memory_case("flush-memory-failure", true),
         );
         assert_eq!((success, failure), ((), ()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_flush_cleans_warmed_owners_on_post_warm_error_and_panic() {
+        run_post_warm_failure_case("flush-post-warm-error", false).await;
+        run_post_warm_failure_case("flush-post-warm-panic", true).await;
     }
 }

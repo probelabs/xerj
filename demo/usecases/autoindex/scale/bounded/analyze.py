@@ -51,13 +51,13 @@ MEASUREMENTS = {
     "merge_json_buffer": "unavailable",
     "merge_parsed": "unavailable",
     "merge_encoded": "unavailable",
-    "cache_stored_slices": "unavailable",
-    "cache_doc_values": "unavailable",
-    "cache_stored_values": "unavailable",
-    "cache_sort_shadow": "unavailable",
-    "cache_id_positions": "unavailable",
-    "cache_row_sequences": "unavailable",
-    "cache_decoded_stored": "unavailable",
+    "cache_stored_slices": "estimated",
+    "cache_doc_values": "estimated",
+    "cache_stored_values": "estimated",
+    "cache_sort_shadow": "estimated",
+    "cache_id_positions": "estimated",
+    "cache_row_sequences": "estimated",
+    "cache_decoded_stored": "estimated",
 }
 
 
@@ -86,6 +86,7 @@ def read_ndjson(path: Path) -> list[dict]:
 def validate_trace(path: Path) -> dict:
     rows = read_ndjson(path)
     problems = []
+    hydration_snapshots = []
     if any(row.get("schema") != TRACE_SCHEMA for row in rows):
         problems.append("schema mismatch")
     seq = [row.get("seq") for row in rows]
@@ -103,6 +104,31 @@ def validate_trace(path: Path) -> dict:
     if max(int(row.get("dropped_events", 0)) for row in rows) != 0:
         problems.append("dropped_events is nonzero")
     for position, row in enumerate(rows, 1):
+        hydration = row.get("segment_hydration_cache")
+        required_hydration_fields = (
+            "limit",
+            "current",
+            "peak",
+            "refused",
+            "accounting_errors",
+        )
+        if not isinstance(hydration, dict) or any(
+            type(hydration.get(field)) is not int or hydration[field] < 0
+            for field in required_hydration_fields
+        ):
+            problems.append(
+                f"record {position}: missing or invalid segment hydration cache snapshot"
+            )
+        else:
+            hydration_snapshots.append(hydration)
+            if hydration["current"] > hydration["peak"] or hydration["peak"] > hydration["limit"]:
+                problems.append(
+                    f"record {position}: invalid segment hydration cache current/peak/limit"
+                )
+            if hydration["accounting_errors"] != 0:
+                problems.append(
+                    f"record {position}: segment hydration cache accounting_errors is nonzero"
+                )
         gauges = row.get("logical")
         if not isinstance(gauges, list) or [gauge.get("category") for gauge in gauges] != CATEGORIES:
             problems.append(f"record {position}: logical category vocabulary/order mismatch")
@@ -177,6 +203,19 @@ def validate_trace(path: Path) -> dict:
             for category in CATEGORIES
         }
         if not any("logical category vocabulary/order mismatch" in problem for problem in problems)
+        else None,
+        "segment_hydration_cache": {
+            "limit_bytes": hydration_snapshots[-1]["limit"],
+            "max_current_bytes": max(snapshot["current"] for snapshot in hydration_snapshots),
+            "peak_bytes": max(snapshot["peak"] for snapshot in hydration_snapshots),
+            "admission_refusals": max(
+                snapshot["refused"] for snapshot in hydration_snapshots
+            ),
+            "accounting_errors": max(
+                snapshot["accounting_errors"] for snapshot in hydration_snapshots
+            ),
+        }
+        if hydration_snapshots
         else None,
         "problems": problems,
     }

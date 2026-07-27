@@ -338,6 +338,17 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn segment_hydration_cache_capacities(&self) -> [usize; 7] {
+        let mut total = [0_usize; 7];
+        for index in self.indices.iter() {
+            let capacities = index.value().segment_hydration_cache_capacities();
+            for (sum, capacity) in total.iter_mut().zip(capacities) {
+                *sum = sum.saturating_add(capacity);
+            }
+        }
+        total
+    }
+
     /// Create a new engine, opening any existing indices from disk.
     pub fn new(config: Config) -> Result<Self> {
         let data_dir = PathBuf::from(&config.server.data_dir);
