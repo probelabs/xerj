@@ -460,6 +460,35 @@ fn decode_cross_dep_rows(
         .collect()))
 }
 
+fn repeat_constant_rows_controlled(
+    value: serde_json::Value,
+    output_count: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Vec<serde_json::Value>, ()>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(output_count).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {output_count} selected constant values: {error}"
+        ))
+    })?;
+    for output_index in 0..output_count {
+        values.push(value.clone());
+        let processed = output_index + 1;
+        if processed.is_multiple_of(STORED_DECODE_CHECK_INTERVAL)
+            && checkpoint(StoredDecodeCheckpoint {
+                phase: StoredDecodePhase::Rows,
+                column_index,
+                rows_processed: processed,
+            })
+            .is_break()
+        {
+            return Ok(Err(()));
+        }
+    }
+    Ok(Ok(values))
+}
+
 fn select_column_rows(
     column_index: usize,
     directory: &V2Directory<'_>,
@@ -506,7 +535,11 @@ fn select_column_rows(
         ColCodec::Constant => {
             let value: serde_json::Value = serde_json::from_slice(column.payload)
                 .map_err(|error| StorageError::Other(anyhow::anyhow!("constant: {error}")))?;
-            vec![value; selected.len()]
+            match repeat_constant_rows_controlled(value, selected.len(), column_index, checkpoint)?
+            {
+                Ok(values) => values,
+                Err(()) => return Ok(Err(None)),
+            }
         }
         ColCodec::DictBitpack => {
             let decoded = match decode_dict_rows(
@@ -985,6 +1018,81 @@ mod tests {
         assert_eq!(
             complete,
             StoredDecodeRun::Complete(decode_stored_v2_rows(&encoded, &[0, 7]).unwrap())
+        );
+    }
+
+    #[test]
+    fn controlled_constant_hydration_is_fallible_cancellable_and_preserves_parity() {
+        let encoded = assemble(
+            256,
+            &[
+                (
+                    "__id",
+                    ColCodec::Constant,
+                    serde_json::to_vec(&json!("same-id")).unwrap(),
+                ),
+                (
+                    "__seq_no",
+                    ColCodec::Constant,
+                    serde_json::to_vec(&json!(7)).unwrap(),
+                ),
+                (
+                    "body",
+                    ColCodec::Constant,
+                    serde_json::to_vec(&json!({"kind": "constant"})).unwrap(),
+                ),
+            ],
+        );
+        let selected: Vec<_> = (0..256).collect();
+        let mut observed = Vec::new();
+        let cancelled = decode_stored_v2_rows_controlled(&encoded, &selected, |point| {
+            observed.push(point);
+            if point.phase == StoredDecodePhase::Rows && point.rows_processed == 128 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(cancelled, StoredDecodeRun::Cancelled);
+        assert_eq!(
+            observed[1],
+            StoredDecodeCheckpoint {
+                phase: StoredDecodePhase::Rows,
+                column_index: 0,
+                rows_processed: 128,
+            }
+        );
+
+        let complete = decode_stored_v2_rows_controlled(&encoded, &[255, 0, 7, 7], |_| {
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(
+            complete,
+            StoredDecodeRun::Complete(decode_stored_v2_rows(&encoded, &[255, 0, 7, 7]).unwrap())
+        );
+        let StoredDecodeRun::Complete(StoredV2RowHydrationResult::Hydrated { rows, .. }) = complete
+        else {
+            panic!("expected completed constant hydration")
+        };
+        assert_eq!(
+            rows.iter().map(|row| row.ordinal).collect::<Vec<_>>(),
+            [0, 7, 255]
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row.source["body"] == json!({"kind": "constant"})));
+
+        let reserve_error =
+            repeat_constant_rows_controlled(json!(null), usize::MAX, 0, &mut |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap_err();
+        let expected = format!("cannot reserve {} selected constant values", usize::MAX);
+        assert!(
+            reserve_error.to_string().contains(&expected),
+            "allocation failure must identify the requested output count: {reserve_error}"
         );
     }
 
