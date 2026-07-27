@@ -7,6 +7,7 @@
 | 1 | `wp_http_validate_url` allows `169.254.0.0/16` (cloud metadata) | SSRF (incomplete deny-list) | Medium (known-class) | **Real, verified, reachable** |
 | 2 | `class-snoopy.php` curl build: `escapeshellarg($URI)` after flags, no `--` | option injection (escaper ≠ injection defense) | Informational (core) | **NOT reachable in core — bundled dead code**; valid pattern for plugins |
 | 3 | `class-wp-image-editor-imagick.php` parses uploaded image content | ImageTragick (image-rce-ssrf) | Medium (deploy-dependent) | **Real surface** |
+| 4 | `user-new.php:100` stores `$_REQUEST['role']` with NO `wp_ensure_editable_role()` (2 of 3 sibling role-sinks guard it) | role injection / privilege-escalation (inconsistent authz) | Medium (multisite + filtered `editable_roles`) | **Real gap — found by the per-file sweep I missed** |
 | — | AJAX / REST / admin authorization | IDOR / privesc | — | Verified **clean** (object-scoped) |
 | — | SQL double-`prepare` de-escape | SQLi | — | Verified **safe** (placeholder_escape) |
 | — | sanitizer composition (escape→de-escape) | XSS/SQLi | — | Verified **safe** (escaper-last) |
@@ -110,6 +111,43 @@ execution via delegates. **Honest scope:** mitigated by a modern ImageMagick +
 a restrictive `policy.xml`, which WP relies on the host to provide; WP checks file
 type first but the content is still parsed. **Fix (deploy):** patched ImageMagick;
 `policy.xml` disabling `MVG/MSL/URL/EPHEMERAL/HTTPS` coders.
+
+## Finding 4 — inconsistent `wp_ensure_editable_role()` -> role injection (`user-new.php`)
+
+**Found by the multi-agent per-file zero-day sweep — the structural authz graph
+missed it** (it saw a `promote_user` cap check and passed; it did not check that
+the *role-editability* guard was applied consistently).
+
+`wp-admin/user-new.php` has **three** sinks that assign a request-supplied role.
+Two are guarded, one is not:
+```php
+// line 73  (adduser, noconfirmation branch)   -> GUARDED
+wp_ensure_editable_role( $_REQUEST['role'] ); add_existing_user_to_blog([... 'role'=>$_REQUEST['role']]);
+// line 231 (createuser branch)                -> GUARDED
+wp_ensure_editable_role( $_REQUEST['role'] );
+// line 95-102 (adduser, email-invitation else branch)  -> NOT GUARDED
+add_option( 'new_user_'.$key, [ 'user_id'=>$user_id, 'email'=>..., 'role'=>$_REQUEST['role'] ] );
+$roles = get_editable_roles(); $role = $roles[ $_REQUEST['role'] ];   // AFTER the store; email only; warning not wp_die
+```
+The stored role is later applied on confirmation: `/newbloguser/{key}/` ->
+`maybe_add_existing_user_to_blog()` -> `add_existing_user_to_blog()` ->
+`add_user_to_blog()` -> `$user->set_role($role)` — **with no re-check** (only the
+default-true `can_add_user_to_blog` filter). So a role the inviter is not
+authorized to assign is persisted and applied.
+
+**Reachability:** authenticated multisite user with `promote_user` on the target
+but **not** `manage_network_users` POSTs `action=adduser` (valid `add-user` nonce),
+an existing user's email, `role=administrator`, no `noconfirmation` -> stored ->
+invitee visits the link -> becomes administrator.
+
+**Honest severity — conditional, defense-in-depth in stock.** In a *stock* install
+`get_editable_roles()` returns all roles, so `wp_ensure_editable_role` is a no-op
+and the inviter could assign that role anyway — **no boundary is crossed**. The gap
+bites where **`editable_roles` is filtered** to restrict an admin below the injected
+role (common in membership / role-manager plugins and multisite delegation), and
+only on **multisite**. It is a genuine, unconditional *inconsistency* (2 of 3 sinks
+guarded) matching upstream 7.0.2 — worth reporting to WordPress as a hardening fix,
+not a stock-install RCE. Verified by reading the real code + adversarial agent.
 
 ## Verified-clean negatives (the honest majority)
 

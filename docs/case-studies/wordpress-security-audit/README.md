@@ -116,6 +116,9 @@ read; scale and durability come from XERJ.
   second-order, TOCTOU, timing, …) with attack + detection + safe recipe.
 - **Copyable Claude Code skill**: [`skill/SKILL.md`](skill/SKILL.md)
   — install it and run this whole workflow on your own codebase.
+- [`ZERODAY-SWEEP.md`](ZERODAY-SWEEP.md) — **the multi-agent per-file zero-day
+  sweep** (222 agents, adversarial verify): found a role-injection authz gap the
+  structural graph missed. See FINDINGS.md #4.
 - [`AUTHENTICATION.md`](AUTHENTICATION.md) — **the WordPress auth story across all
   4 entry surfaces** (AJAX/REST/XML-RPC/admin-post): missing / insufficient /
   broken-`==` / race checked; ~51× fewer tokens than reading the handlers.
