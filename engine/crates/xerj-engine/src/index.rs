@@ -34,7 +34,9 @@ use xerj_vector::hnsw::{HnswIndex, HnswParams};
 use xerj_vector::Sq8Params;
 
 use crate::aggs::run_aggs_with_all;
-use crate::segment_cache_budget::{CacheResident, SegmentCacheCategory, SegmentHydrationBudget};
+use crate::segment_cache_budget::{
+    BudgetCharge, CacheResident, SegmentCacheCategory, SegmentHydrationBudget,
+};
 use crate::segment_cache_estimates as cache_estimates;
 
 pub(crate) type Resident<T> = Arc<CacheResident<T>>;
@@ -7784,18 +7786,57 @@ impl Index {
                     None => None,
                 };
             if let Some(doc_count) = seg_doc_count {
-                if let (Some(pos_map), Some(slices)) = (
-                    self.id_pos_map_for(&seg_id, doc_count),
-                    self.stored_slices_for(&seg_id, doc_count),
-                ) {
+                if let Some(pos_map) = self.id_pos_map_for(&seg_id, doc_count) {
                     if let Some(&pos) = pos_map.get(id) {
-                        if let Some(&(start, end)) = slices.offsets.get(pos as usize) {
-                            if let Some(slice) = slices.bytes.get(start as usize..end as usize) {
-                                // serde_json (not simd_json): same root cause
-                                // as the KNN cache — see ffd49ac.
-                                if let Ok(doc) = serde_json::from_slice::<Value>(slice) {
-                                    if doc.get("_id").and_then(Value::as_str) == Some(id) {
-                                        return Ok(doc.get("_source").cloned());
+                        // A warm canonical slice remains the cheapest route.
+                        if let Some(slices) = self
+                            .stored_slices_cache
+                            .get(seg_id.as_ref())
+                            .map(|entry| Arc::clone(entry.value()))
+                        {
+                            if let Some(&(start, end)) = slices.offsets.get(pos as usize) {
+                                if let Some(slice) = slices.bytes.get(start as usize..end as usize)
+                                {
+                                    if let Ok(doc) = serde_json::from_slice::<Value>(slice) {
+                                        if doc.get("_id").and_then(Value::as_str) == Some(id) {
+                                            return Ok(doc.get("_source").cloned());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // On a cold ZBS2 segment, reconstruct only the selected
+                        // row. Unsupported and legacy encodings retain the
+                        // canonical full-decode fallback below.
+                        if let Ok(reader) = self.store.open_segment_arc(&seg_id) {
+                            if let Ok(Some(raw)) = reader.section(SectionType::Stored) {
+                                if let Ok(
+                                    xerj_storage::stored_codec::StoredV2RowHydrationResult::Hydrated {
+                                        rows,
+                                        ..
+                                    },
+                                ) = xerj_storage::stored_codec::decode_stored_v2_rows(
+                                    raw,
+                                    &[pos as usize],
+                                ) {
+                                    if let Some(row) = rows.into_iter().next() {
+                                        if row.ordinal == pos as usize
+                                            && row.id.as_str() == Some(id)
+                                        {
+                                            return Ok(Some(Value::Object(row.source)));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(slices) = self.stored_slices_for(&seg_id, doc_count) {
+                            if let Some(&(start, end)) = slices.offsets.get(pos as usize) {
+                                if let Some(slice) = slices.bytes.get(start as usize..end as usize)
+                                {
+                                    if let Ok(doc) = serde_json::from_slice::<Value>(slice) {
+                                        if doc.get("_id").and_then(Value::as_str) == Some(id) {
+                                            return Ok(doc.get("_source").cloned());
+                                        }
                                     }
                                 }
                             }
@@ -13921,6 +13962,9 @@ impl Index {
             id_positions: Arc::clone(&self.id_pos_cache),
             row_sequences: Arc::clone(&self.row_seq_cache),
             decoded_stored: Arc::clone(&self.decoded_stored_cache),
+            slices_build_locks: Arc::clone(&self.stored_slices_build_locks),
+            #[cfg(test)]
+            stored_slice_full_decodes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -16045,10 +16089,10 @@ impl Index {
 
     /// Lazily-built, cached `_id → stored-position` index for a segment.
     ///
-    /// Reuses the decompressed `StoredSlices` (offset index) and extracts each
-    /// doc's `_id` from the leading bytes of its stored slice, so an `ids`
-    /// query can resolve primary keys to positions instead of scanning the
-    /// whole section.  Built once per segment (segments are immutable) and
+    /// ZBS2 segments decode only identity columns; legacy segments reuse the
+    /// decompressed `StoredSlices` offset index and extract each doc's id. An
+    /// `ids` query can therefore resolve primary keys without expanding every
+    /// source column. Built once per segment (segments are immutable) and
     /// evicted by id at the merge-completion site.
     ///
     /// Returns `None` when the slices can't be decoded OR when the map does
@@ -16064,28 +16108,78 @@ impl Index {
         if let Some(entry) = self.id_pos_cache.get(seg_id) {
             return Some(Arc::clone(entry.value()));
         }
-        let slices = self.stored_slices_for(seg_id, expect_docs)?;
-        let mut map: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::with_capacity(slices.offsets.len());
-        for (pos, &(start, end)) in slices.offsets.iter().enumerate() {
-            let slice = slices.bytes.get(start as usize..end as usize)?;
-            let id = match extract_stored_id(slice) {
-                Some(id) => id,
-                None => {
-                    // Escape-bearing or unusual layout — fall back to a full
-                    // parse for just this doc to recover its `_id`.
-                    let mut buf = slice.to_vec();
-                    match simd_json::serde::from_slice::<Value>(&mut buf) {
-                        Ok(v) => match v.get("_id").and_then(Value::as_str) {
-                            Some(s) => s.to_string(),
-                            None => continue,
-                        },
-                        Err(_) => continue,
+        // Share PR48's per-segment cold-decode flight and re-check after the
+        // wait. The compatibility fallback below releases this guard before
+        // entering `stored_slices_for`, which acquires the same flight.
+        let flight = {
+            let entry = self
+                .stored_slices_build_locks
+                .entry(seg_id.to_string())
+                .or_default();
+            Arc::clone(entry.value())
+        };
+        let v2_map = {
+            let _flight_guard = flight.lock().ok()?;
+            if let Some(entry) = self.id_pos_cache.get(seg_id) {
+                return Some(Arc::clone(entry.value()));
+            }
+            (|| {
+                let reader = self.store.open_segment_arc(seg_id).ok()?;
+                let raw = reader.section(SectionType::Stored).ok()??;
+                let ordinals: Vec<usize> = (0..usize::try_from(expect_docs).ok()?).collect();
+                let xerj_storage::stored_codec::StoredV2RowHydrationResult::Hydrated {
+                    rows, ..
+                } = xerj_storage::stored_codec::decode_stored_v2_rows_projected(
+                    raw,
+                    &ordinals,
+                    &[],
+                )
+                .ok()?
+                else {
+                    return None;
+                };
+                if rows.len() as u64 != expect_docs {
+                    return None;
+                }
+                let mut map = std::collections::HashMap::with_capacity(rows.len());
+                for row in rows {
+                    let id = row.id.as_str()?;
+                    if row.ordinal > u32::MAX as usize
+                        || map.insert(id.to_string(), row.ordinal as u32).is_some()
+                    {
+                        return None;
                     }
                 }
-            };
-            map.insert(id, pos as u32);
-        }
+                (map.len() as u64 == expect_docs).then_some(map)
+            })()
+        };
+        let map = if let Some(map) = v2_map {
+            map
+        } else {
+            let slices = self.stored_slices_for(seg_id, expect_docs)?;
+            let mut map: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::with_capacity(slices.offsets.len());
+            for (pos, &(start, end)) in slices.offsets.iter().enumerate() {
+                let slice = slices.bytes.get(start as usize..end as usize)?;
+                let id = match extract_stored_id(slice) {
+                    Some(id) => id,
+                    None => {
+                        // Escape-bearing or unusual layout — fall back to a full
+                        // parse for just this doc to recover its `_id`.
+                        let mut buf = slice.to_vec();
+                        match simd_json::serde::from_slice::<Value>(&mut buf) {
+                            Ok(v) => match v.get("_id").and_then(Value::as_str) {
+                                Some(s) => s.to_string(),
+                                None => continue,
+                            },
+                            Err(_) => continue,
+                        }
+                    }
+                };
+                map.insert(id, pos as u32);
+            }
+            map
+        };
         // Only cache + serve a COMPLETE map (every stored doc has an `_id`);
         // otherwise defer to the scan so a doc without a stored `_id` is not
         // silently dropped from `ids` results.
@@ -24488,8 +24582,12 @@ fn seg_range_positions(
 }
 
 fn brace_walk_offsets(bytes: &[u8]) -> Vec<(u32, u32)> {
+    brace_walk_offsets_reserved(bytes, 0)
+}
+
+fn brace_walk_offsets_reserved(bytes: &[u8], expected_docs: usize) -> Vec<(u32, u32)> {
     let n = bytes.len();
-    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(expected_docs);
     let mut i = 0usize;
     while i < n && (bytes[i].is_ascii_whitespace() || bytes[i] == b'[') {
         i += 1;
@@ -24726,6 +24824,9 @@ struct PublishWarmCaches {
     id_positions: Arc<dashmap::DashMap<String, Resident<std::collections::HashMap<String, u32>>>>,
     row_sequences: Arc<dashmap::DashMap<String, Resident<Vec<u64>>>>,
     decoded_stored: Arc<dashmap::DashMap<String, Resident<Vec<u8>>>>,
+    slices_build_locks: Arc<dashmap::DashMap<String, Arc<std::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    stored_slice_full_decodes: Arc<AtomicU64>,
 }
 
 /// Capability documenting the sole path allowed to bypass the authoritative
@@ -24817,6 +24918,82 @@ fn publish_prepublication<T>(
     }
 }
 
+struct PrechargedResident<T> {
+    value: T,
+    charge: BudgetCharge,
+    bytes: u64,
+}
+
+fn precharge_publish_stored_slices(
+    caches: &PublishWarmCaches,
+    segment_id: &str,
+    raw: &[u8],
+    expected_docs: u64,
+) -> Option<(BudgetCharge, u64)> {
+    let retained_payload =
+        match xerj_storage::stored_codec::stored_slices_retained_upper_bound(raw, expected_docs) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                caches.budget.record_predecode_bound_skip();
+                tracing::debug!(
+                    segment_id,
+                    expected_docs,
+                    reason = "stored frame has no finite framing-only decoded-size bound",
+                    fallback =
+                        "leave segment cold; query paths decode without retaining on refusal",
+                    "publish stored-slices warm skipped before decode"
+                );
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    segment_id,
+                    expected_docs,
+                    error = %error,
+                    fallback = "leave segment cold; query paths retain compatibility behavior",
+                    "publish stored-slices warm skipped because framing metadata is invalid"
+                );
+                return None;
+            }
+        };
+    let estimate_key = segment_id.to_string();
+    let retained_bound = retained_payload.checked_add(cache_estimates::stored_slices_bytes(
+        &estimate_key,
+        std::mem::size_of::<CacheResident<StoredSlices>>(),
+        0,
+        0,
+    ))?;
+    let charge = caches
+        .budget
+        .try_charge(SegmentCacheCategory::StoredSlices, retained_bound)?;
+    Some((charge, retained_bound))
+}
+
+fn publish_prepublication_reserved<T>(
+    _capability: &PrePublication,
+    caches: &PublishWarmCaches,
+    map: &dashmap::DashMap<String, Resident<T>>,
+    key: String,
+    category: SegmentCacheCategory,
+    precharged: PrechargedResident<T>,
+) -> Resident<T> {
+    let _publication = caches.lifecycle.read();
+    use dashmap::mapref::entry::Entry;
+    match map.entry(key) {
+        Entry::Occupied(entry) => Arc::clone(entry.get()),
+        Entry::Vacant(entry) => {
+            let resident = CacheResident::admitted(
+                precharged.value,
+                precharged.charge,
+                category,
+                precharged.bytes,
+            );
+            entry.insert(Arc::clone(&resident));
+            resident
+        }
+    }
+}
+
 /// Warm one just-written segment's read-path caches OUTSIDE the query
 /// path, BEFORE the segment becomes visible:
 ///  1. `StoredSlices` (decompressed stored section + per-doc offsets) —
@@ -24861,35 +25038,75 @@ fn warm_segment_at_publish(
     }
     // 1. Stored slices.
     if !caches.slices.contains_key(seg_id) {
-        let built: Option<StoredSlices> = (|| {
-            let reader = store.open_segment_arc(seg_id).ok()?;
-            let raw = reader.section(SectionType::Stored).ok()??;
-            let bytes = xerj_storage::stored_codec::decode_stored(raw).ok()?;
-            if bytes.len() > u32::MAX as usize {
-                return None;
-            }
-            let offsets = brace_walk_offsets(&bytes);
-            if offsets.len() as u64 != expect_docs {
-                return None;
-            }
-            Some(StoredSlices { bytes, offsets })
-        })();
-        if let Some(slices) = built {
+        let flight = {
+            let entry = caches
+                .slices_build_locks
+                .entry(seg_id.to_string())
+                .or_default();
+            Arc::clone(entry.value())
+        };
+        let _flight_guard = match flight.lock() {
+            Ok(guard) => guard,
+            // The protected data lives in the cache maps, not in the mutex;
+            // a prior builder panic cannot corrupt the lock's payload.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let built: Option<(StoredSlices, BudgetCharge, u64)> =
+            (!caches.slices.contains_key(seg_id))
+                .then(|| {
+                    (|| {
+                        let reader = store.open_segment_arc(seg_id).ok()?;
+                        let raw = reader.section(SectionType::Stored).ok()??;
+                        // Decide admission from framing metadata before expanding every
+                        // ZBS2 column and rebuilding the canonical array. Unknown or
+                        // malformed bounds fail closed; queries retain their uncached
+                        // compatibility path.
+                        let (mut charge, retained_bound) =
+                            precharge_publish_stored_slices(caches, seg_id, raw, expect_docs)?;
+                        #[cfg(test)]
+                        caches
+                            .stored_slice_full_decodes
+                            .fetch_add(1, Ordering::Relaxed);
+                        let bytes = xerj_storage::stored_codec::decode_stored(raw).ok()?;
+                        if bytes.len() > u32::MAX as usize {
+                            return None;
+                        }
+                        let offsets =
+                            brace_walk_offsets_reserved(&bytes, usize::try_from(expect_docs).ok()?);
+                        if offsets.len() as u64 != expect_docs {
+                            return None;
+                        }
+                        let slices = StoredSlices { bytes, offsets };
+                        let estimate_key = seg_id.to_string();
+                        let actual = cache_estimates::stored_slices_bytes(
+                            &estimate_key,
+                            std::mem::size_of::<CacheResident<StoredSlices>>(),
+                            slices.bytes.capacity(),
+                            slices.offsets.capacity(),
+                        );
+                        if actual > retained_bound {
+                            return None;
+                        }
+                        if !charge.shrink_to(actual) {
+                            return None;
+                        }
+                        Some((slices, charge, actual))
+                    })()
+                })
+                .flatten();
+        if let Some((slices, charge, retained_bound)) = built {
             let key = seg_id.to_string();
-            let bytes = cache_estimates::stored_slices_bytes(
-                &key,
-                std::mem::size_of::<CacheResident<StoredSlices>>(),
-                slices.bytes.capacity(),
-                slices.offsets.capacity(),
-            );
-            let _ = publish_prepublication(
+            let _ = publish_prepublication_reserved(
                 &prepublication,
                 caches,
                 &caches.slices,
                 key,
                 SegmentCacheCategory::StoredSlices,
-                bytes,
-                slices,
+                PrechargedResident {
+                    value: slices,
+                    charge,
+                    bytes: retained_bound,
+                },
             );
         }
     }
@@ -30127,5 +30344,292 @@ mod flush_memory_integration_tests {
     async fn real_flush_cleans_warmed_owners_on_post_warm_error_and_panic() {
         run_post_warm_failure_case("flush-post-warm-error", false).await;
         run_post_warm_failure_case("flush-post-warm-panic", true).await;
+    }
+
+    #[tokio::test]
+    async fn cold_v2_point_get_hydrates_one_row_with_exact_source_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("v2-point-get", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("v2-point-get").unwrap();
+        let docs: Vec<_> = (0..256)
+            .map(|row| {
+                (
+                    format!("finance-{row}"),
+                    json!({
+                        "company": if row % 2 == 0 { "Acme" } else { "Globex" },
+                        "quarter": row % 4 + 1,
+                        "year": 2020 + row % 6,
+                        "nested": {"page": row, "evidence": [row, row + 1]},
+                        "nullable": if row % 5 == 0 { Value::Null } else { json!(row) },
+                    }),
+                )
+            })
+            .collect();
+        let expected = docs[173].1.clone();
+        idx.index_batch_turbo(docs, false, false).await.unwrap();
+        idx.flush().await.unwrap();
+        let segment = idx.store.snapshot().segments[0].clone();
+        let reader = idx.store.open_segment(&segment.id).unwrap();
+        let raw = reader.section(SectionType::Stored).unwrap().unwrap();
+        assert_eq!(
+            raw.get(..4),
+            Some(xerj_storage::stored_codec::STORED_V2_MAGIC.as_slice()),
+            "fixture must exercise selective ZBS2 hydration"
+        );
+
+        {
+            let _publication = idx.segment_cache_lifecycle.write();
+            idx.remove_segment_hydration_entries(&segment.id);
+        }
+        assert_eq!(
+            idx.get_document("finance-173").await.unwrap().as_ref(),
+            Some(&expected)
+        );
+        let null_row = idx.get_document("finance-170").await.unwrap().unwrap();
+        assert_eq!(
+            null_row,
+            json!({
+                "company": "Acme",
+                "quarter": 3,
+                "year": 2022,
+                "nested": {"page": 170, "evidence": [170, 171]},
+            }),
+            "selective hydration must match canonical V2 null omission"
+        );
+        assert!(null_row.get("nullable").is_none());
+        assert!(idx.id_pos_cache.contains_key(&segment.id));
+        assert!(
+            idx.stored_slices_cache.is_empty(),
+            "point GET expanded the full stored section"
+        );
+        assert!(idx.decoded_stored_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_point_get_keeps_full_decode_fallback_and_exact_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("v1-point-get", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("v1-point-get").unwrap();
+        let expected = json!({"company": "Acme", "quarter": 4, "nested": {"page": 17}});
+        idx.index_document(Some("legacy".into()), expected.clone())
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        let segment = idx.store.snapshot().segments[0].clone();
+        let reader = idx.store.open_segment(&segment.id).unwrap();
+        let raw = reader.section(SectionType::Stored).unwrap().unwrap();
+        assert_eq!(
+            raw.get(..4),
+            Some(xerj_storage::stored_codec::STORED_LZ4_MAGIC.as_slice())
+        );
+        {
+            let _publication = idx.segment_cache_lifecycle.write();
+            idx.remove_segment_hydration_entries(&segment.id);
+        }
+        assert_eq!(
+            idx.get_document("legacy").await.unwrap().as_ref(),
+            Some(&expected)
+        );
+        assert!(
+            idx.stored_slices_cache.contains_key(&segment.id),
+            "legacy point GET did not use its compatibility path"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_warm_refuses_before_full_stored_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("publish-refusal", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("publish-refusal").unwrap();
+        let docs = (0..256)
+            .map(|row| {
+                (
+                    format!("doc-{row}"),
+                    json!({"body": "quarterly report payload".repeat(32), "row": row}),
+                )
+            })
+            .collect();
+        idx.index_batch_turbo(docs, false, false).await.unwrap();
+        idx.flush().await.unwrap();
+        let segment = idx.store.snapshot().segments[0].clone();
+        {
+            let _publication = idx.segment_cache_lifecycle.write();
+            idx.remove_segment_hydration_entries(&segment.id);
+        }
+
+        let mut caches = idx.publish_warm_caches();
+        caches.budget = SegmentHydrationBudget::new(1);
+        warm_segment_at_publish(
+            &idx.store,
+            &idx.data_dir.join("segments"),
+            &caches,
+            &segment.id,
+            segment.doc_count,
+        );
+        assert!(caches.slices.is_empty());
+        assert_eq!(
+            caches.stored_slice_full_decodes.load(Ordering::Relaxed),
+            0,
+            "stored section was expanded before admission refusal"
+        );
+        assert!(caches.budget.snapshot().refused >= 1);
+        assert_eq!(caches.budget.snapshot().current, 0);
+    }
+
+    #[tokio::test]
+    async fn occupied_prepublication_race_refunds_precharge_without_double_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("precharge-race", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("precharge-race").unwrap();
+        let mut caches = idx.publish_warm_caches();
+        caches.budget = SegmentHydrationBudget::new(1_000);
+        let capability = PrePublication(());
+        let key = "pending-output".to_string();
+        let existing = publish_prepublication(
+            &capability,
+            &caches,
+            &caches.slices,
+            key.clone(),
+            SegmentCacheCategory::StoredSlices,
+            100,
+            StoredSlices {
+                bytes: vec![b'[', b']'],
+                offsets: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(caches.budget.snapshot().current, 100);
+        let precharge = caches
+            .budget
+            .try_charge(SegmentCacheCategory::StoredSlices, 200)
+            .unwrap();
+        assert_eq!(caches.budget.snapshot().current, 300);
+        let winner = publish_prepublication_reserved(
+            &capability,
+            &caches,
+            &caches.slices,
+            key.clone(),
+            SegmentCacheCategory::StoredSlices,
+            PrechargedResident {
+                value: StoredSlices {
+                    bytes: vec![b'[', b'{', b'}', b']'],
+                    offsets: vec![(1, 3)],
+                },
+                charge: precharge,
+                bytes: 200,
+            },
+        );
+        assert!(Arc::ptr_eq(&winner, &existing));
+        assert_eq!(
+            caches.budget.snapshot().current,
+            100,
+            "losing precharge was not refunded"
+        );
+        drop(winner);
+        drop(existing);
+        caches.slices.remove(&key);
+        assert_eq!(caches.budget.snapshot().current, 0);
+        assert_eq!(caches.budget.snapshot().accounting_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn poisoned_slice_flight_and_unbounded_frame_do_not_skip_other_warm_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("poisoned-publish-warm", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("poisoned-publish-warm").unwrap();
+        let docs = (0..256)
+            .map(|row| {
+                (
+                    format!("doc-{row}"),
+                    json!({
+                        "row": row,
+                        "body": format!("quarter-{row}-{}", "evidence".repeat(32)),
+                    }),
+                )
+            })
+            .collect();
+        idx.index_batch_turbo(docs, false, false).await.unwrap();
+        idx.flush().await.unwrap();
+        let segment = idx.store.snapshot().segments[0].clone();
+        let reader = idx.store.open_segment(&segment.id).unwrap();
+        let raw = reader.section(SectionType::Stored).unwrap().unwrap();
+        assert_eq!(
+            raw.get(..4),
+            Some(xerj_storage::stored_codec::STORED_V2_MAGIC.as_slice())
+        );
+        assert_eq!(
+            xerj_storage::stored_codec::stored_slices_retained_upper_bound(raw, segment.doc_count,)
+                .unwrap(),
+            None,
+            "current stream-zstd fixture must exercise unknown-bound refusal"
+        );
+        {
+            let _publication = idx.segment_cache_lifecycle.write();
+            idx.remove_segment_hydration_entries(&segment.id);
+        }
+
+        let mut caches = idx.publish_warm_caches();
+        caches.budget = SegmentHydrationBudget::new(64 * 1024 * 1024);
+        caches.shadow_fields.insert("row".into(), ());
+        let flight = {
+            let entry = caches
+                .slices_build_locks
+                .entry(segment.id.clone())
+                .or_default();
+            Arc::clone(entry.value())
+        };
+        assert!(std::thread::spawn(move || {
+            let _guard = flight.lock().unwrap();
+            panic!("injected builder panic");
+        })
+        .join()
+        .is_err());
+
+        warm_segment_at_publish(
+            &idx.store,
+            &idx.data_dir.join("segments"),
+            &caches,
+            &segment.id,
+            segment.doc_count,
+        );
+        let snapshot = caches.budget.snapshot();
+        assert_eq!(snapshot.predecode_bound_skips, 1);
+        assert_eq!(caches.stored_slice_full_decodes.load(Ordering::Relaxed), 0);
+        assert!(caches.slices.is_empty());
+        assert!(
+            caches.dv.contains_key(&segment.id),
+            "poisoned slices flight skipped doc-values warm"
+        );
+        assert!(
+            caches
+                .shadow
+                .contains_key(&format!("{}\u{1}row", segment.id)),
+            "poisoned slices flight skipped sort-shadow warm"
+        );
     }
 }

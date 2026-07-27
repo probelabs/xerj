@@ -229,13 +229,21 @@ the decoded value without retaining it, while publish-time warming drops an
 unadmitted value.
 
 `GET /_nodes/stats` reports
-`indices.segment_hydration_cache.{limit_in_bytes,current_in_bytes,peak_in_bytes,admission_refusals}` and
+`indices.segment_hydration_cache.{limit_in_bytes,current_in_bytes,peak_in_bytes,admission_refusals,predecode_bound_skips}` and
 per-category gauges/table capacities. These are conservative retained-payload
 and key estimates, **not an RSS limit**. Query-owned materialization, decode
 scratch, mmaps, allocator fragmentation, FTS state, and other caches remain
 outside this ceiling. A single highly compressed segment can therefore create
 a transient decode peak before post-build admission; bounded/streaming decode
 is a separate follow-up.
+
+Publish-time stored-slice warming is stricter: it reserves from framing
+metadata before decoding. V1 LZ4 and uncompressed sections always expose a
+finite bound. V2 LZ4, constant, and cross-dependent columns are also bounded;
+a V2 raw-JSON column or dictionary payload whose zstd frame omits its content
+size is not. Those segments remain cold instead of being expanded speculatively,
+and increment `predecode_bound_skips`; reads remain correct through the normal
+cold fallback. Current stream-zstd encoder output commonly takes this path.
 
 **Delegated to your environment (not engine-level in this build):**
 

@@ -12493,6 +12493,100 @@ mod malformed_bulk_route_tests {
     }
 }
 
+#[cfg(test)]
+mod selective_point_get_route_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test]
+    async fn flushed_v2_get_route_preserves_status_envelope_and_source() {
+        let state = test_state();
+        let idx = state.engine.get_or_create_index("route-v2").unwrap();
+        let docs: Vec<_> = (0..256)
+            .map(|row| {
+                (
+                    format!("finance-{row}"),
+                    json!({
+                        "company": if row % 2 == 0 { "Acme" } else { "Globex" },
+                        "quarter": row % 4 + 1,
+                        "nested": {"page": row, "evidence": [row, row + 1]},
+                    }),
+                )
+            })
+            .collect();
+        let expected = docs[173].1.clone();
+        idx.index_batch_turbo(docs, false, false).await.unwrap();
+        idx.flush().await.unwrap();
+        let expected_seq = idx.lookup_seq_no("finance-173").unwrap();
+        let expected_version = idx.lookup_version("finance-173").unwrap();
+
+        let config = (*state.config).clone();
+        drop(idx);
+        drop(state);
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("cold restart");
+        let state = AppState::new(config, engine, metrics);
+        let router = crate::router::build_es_compat_router(state);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/route-v2/_doc/finance-173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["_index"], "route-v2");
+        assert_eq!(body["_id"], "finance-173");
+        assert_eq!(body["_version"], expected_version);
+        assert_eq!(body["_seq_no"], expected_seq);
+        assert_eq!(body["_primary_term"], 1);
+        assert_eq!(body["found"], true);
+        assert_eq!(body["_source"], expected);
+
+        let missing = router
+            .oneshot(
+                Request::get("/route-v2/_doc/not-present")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(missing.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["_index"], "route-v2");
+        assert_eq!(body["_id"], "not-present");
+        assert_eq!(body["found"], false);
+        assert!(body.get("_seq_no").is_none());
+        assert!(body.get("_source").is_none());
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Schema conversion helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17240,6 +17334,7 @@ pub async fn nodes_stats(State(state): State<AppState>) -> impl IntoResponse {
             "current_in_bytes": gauge.current,
             "peak_in_bytes": gauge.peak,
             "admission_refusals": gauge.refused,
+            "predecode_bound_skips": gauge.predecode_bound_skips,
             "accounting_errors": gauge.accounting_errors,
             "categories": {
                 "stored_slices": { "current_in_bytes": gauge.category_current[0], "peak_in_bytes": gauge.category_peak[0], "map_capacity": capacities[0] },

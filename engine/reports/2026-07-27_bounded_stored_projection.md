@@ -2,9 +2,18 @@
 
 ## Scope and source
 
-This report measures the storage primitive only. It does not claim an
-end-to-end engine speedup or cache-memory reduction because no engine consumer
-is included in this branch.
+This report measures the storage primitive only. The later engine composition
+uses the primitive for identity-map construction and point reads, but the
+numbers below remain storage-only measurements. They do not establish an
+end-to-end engine speedup or an RSS reduction for autoindex.
+
+The engine composition also refuses publish-time stored-slice warming before
+decode when this framing-only bound is unavailable, exposes those decisions as
+`predecode_bound_skips` in node stats, and continues warming unrelated doc-value
+and sort-shadow families. Query-time `stored_slices_for` still performs its full
+decode before retained-cache admission; bringing that miss path under the same
+predecode discipline is the immediate dependent task, not a claim of this
+report.
 
 - Source commit: `031e9cc9286d8e8970704438acebef93f5ab72a8`
 - Upstream base: `16d6df0`
@@ -108,7 +117,7 @@ measured.
 
 ```text
 cargo test -p xerj-storage --lib
-122 passed; 0 failed; 0 ignored
+123 passed; 0 failed; 0 ignored
 
 cargo clippy -p xerj-storage --all-targets -- -D warnings
 passed

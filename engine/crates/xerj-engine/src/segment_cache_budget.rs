@@ -54,6 +54,7 @@ pub struct SegmentHydrationBudgetSnapshot {
     pub current: u64,
     pub peak: u64,
     pub refused: u64,
+    pub predecode_bound_skips: u64,
     pub accounting_errors: u64,
     pub category_current: [u64; CATEGORY_COUNT],
     pub category_peak: [u64; CATEGORY_COUNT],
@@ -64,6 +65,7 @@ pub struct SegmentHydrationBudget {
     used: AtomicU64,
     peak: AtomicU64,
     refused: AtomicU64,
+    predecode_bound_skips: AtomicU64,
     accounting_errors: AtomicU64,
     category_current: [AtomicU64; CATEGORY_COUNT],
     category_peak: [AtomicU64; CATEGORY_COUNT],
@@ -76,6 +78,7 @@ impl SegmentHydrationBudget {
             used: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            predecode_bound_skips: AtomicU64::new(0),
             accounting_errors: AtomicU64::new(0),
             category_current: std::array::from_fn(|_| AtomicU64::new(0)),
             category_peak: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -131,12 +134,17 @@ impl SegmentHydrationBudget {
             current: self.used.load(Ordering::Acquire),
             peak: self.peak.load(Ordering::Acquire),
             refused: self.refused.load(Ordering::Acquire),
+            predecode_bound_skips: self.predecode_bound_skips.load(Ordering::Acquire),
             accounting_errors: self.accounting_errors.load(Ordering::Acquire),
             category_current: std::array::from_fn(|i| {
                 self.category_current[i].load(Ordering::Acquire)
             }),
             category_peak: std::array::from_fn(|i| self.category_peak[i].load(Ordering::Acquire)),
         }
+    }
+
+    pub fn record_predecode_bound_skip(&self) {
+        self.predecode_bound_skips.fetch_add(1, Ordering::Relaxed);
     }
 
     fn release(&self, category: SegmentCacheCategory, bytes: u64) {
@@ -163,6 +171,20 @@ pub struct BudgetCharge {
     budget: Arc<SegmentHydrationBudget>,
     category: SegmentCacheCategory,
     bytes: u64,
+}
+
+impl BudgetCharge {
+    pub fn shrink_to(&mut self, bytes: u64) -> bool {
+        if bytes > self.bytes {
+            return false;
+        }
+        let released = self.bytes - bytes;
+        self.bytes = bytes;
+        if released > 0 {
+            self.budget.release(self.category, released);
+        }
+        true
+    }
 }
 
 impl Drop for BudgetCharge {
@@ -232,6 +254,33 @@ mod tests {
         assert_eq!(budget.snapshot().current, 40);
         drop(reader);
         assert_eq!(budget.snapshot().current, 0);
+    }
+
+    #[test]
+    fn conservative_precharge_can_shrink_before_resident_transfer() {
+        let budget = SegmentHydrationBudget::new(128);
+        let mut charge = budget
+            .try_charge(SegmentCacheCategory::StoredSlices, 100)
+            .unwrap();
+        assert!(charge.shrink_to(60));
+        assert!(!charge.shrink_to(61));
+        assert_eq!(budget.snapshot().current, 60);
+        let resident =
+            CacheResident::admitted(vec![1_u8], charge, SegmentCacheCategory::StoredSlices, 60);
+        assert_eq!(budget.snapshot().current, 60);
+        drop(resident);
+        assert_eq!(budget.snapshot().current, 0);
+    }
+
+    #[test]
+    fn predecode_bound_skip_is_observable_without_changing_usage() {
+        let budget = SegmentHydrationBudget::new(128);
+        budget.record_predecode_bound_skip();
+        budget.record_predecode_bound_skip();
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.predecode_bound_skips, 2);
+        assert_eq!(snapshot.current, 0);
+        assert_eq!(snapshot.refused, 0);
     }
 
     #[test]
