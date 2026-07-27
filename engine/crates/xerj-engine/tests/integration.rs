@@ -5802,7 +5802,6 @@ async fn test_highlight_survives_source_filtering() {
     );
 }
 
-<<<<<<< Updated upstream
 // ── Reproduction: term/terms on a NON-FIRST array element (multi-valued keyword) ─
 // A keyword ARRAY currently stores ONLY element [0] in the single-valued
 // doc-values column (memtable `push_field`) AND the single-valued segment
@@ -5866,8 +5865,9 @@ async fn test_term_matches_non_first_array_element() {
         rt.total.value, 1,
         "terms must match a NON-FIRST array element"
     );
-=======
-// ── kNN + aggregations in a single request (rc.5) ─────────────────────────────
+}
+
+// ── kNN + aggregations in a single request (rc.6) ─────────────────────────────
 // The gap the calltree.ai analytics use-case hit: aggregate a SEMANTIC slice in
 // one call. Aggregations must run over the retrieved top-k neighbour set (ES
 // top-level-knn semantics), independent of the from/size hit page.
@@ -5880,17 +5880,35 @@ async fn test_knn_plus_aggregations_single_request() {
     vf.options.dimensions = Some(3);
     vf.options.similarity = Some("cosine".to_string());
     schema.fields.push(vf);
-    schema.fields.push(FieldConfig::new("band", FieldType::Keyword));
+    schema
+        .fields
+        .push(FieldConfig::new("band", FieldType::Keyword));
     engine.create_index("knnagg", schema).unwrap();
     let idx = engine.get_index("knnagg").unwrap();
 
     // Four docs near [1,0,0] (the "topic" cluster) split across two bands,
     // plus one far-away doc that must NOT enter the top-k or the agg buckets.
-    idx.index_document(Some("1".into()), json!({"v":[1.0,0.0,0.0],"band":"2.4GHz"})).await.unwrap();
-    idx.index_document(Some("2".into()), json!({"v":[0.98,0.02,0.0],"band":"2.4GHz"})).await.unwrap();
-    idx.index_document(Some("3".into()), json!({"v":[0.95,0.05,0.0],"band":"5GHz"})).await.unwrap();
-    idx.index_document(Some("4".into()), json!({"v":[0.9,0.1,0.0],"band":"5GHz"})).await.unwrap();
-    idx.index_document(Some("far".into()), json!({"v":[0.0,0.0,1.0],"band":"other"})).await.unwrap();
+    idx.index_document(Some("1".into()), json!({"v":[1.0,0.0,0.0],"band":"2.4GHz"}))
+        .await
+        .unwrap();
+    idx.index_document(
+        Some("2".into()),
+        json!({"v":[0.98,0.02,0.0],"band":"2.4GHz"}),
+    )
+    .await
+    .unwrap();
+    idx.index_document(Some("3".into()), json!({"v":[0.95,0.05,0.0],"band":"5GHz"}))
+        .await
+        .unwrap();
+    idx.index_document(Some("4".into()), json!({"v":[0.9,0.1,0.0],"band":"5GHz"}))
+        .await
+        .unwrap();
+    idx.index_document(
+        Some("far".into()),
+        json!({"v":[0.0,0.0,1.0],"band":"other"}),
+    )
+    .await
+    .unwrap();
 
     // knn over the topic cluster (k=4 → the 4 near docs), size:0 (analytics),
     // aggregate the retrieved set by band.
@@ -5898,20 +5916,40 @@ async fn test_knn_plus_aggregations_single_request() {
         "query": {"knn": {"field":"v","query_vector":[1.0,0.0,0.0],"k":4,"num_candidates":10}},
         "size": 0,
         "aggs": {"by_band": {"terms": {"field": "band"}}}
-    })).unwrap();
+    }))
+    .unwrap();
     let res = idx.search(&req).await.unwrap();
 
     // aggregations must be present and computed over the top-4 (not all 5).
     let aggs = res.aggs.expect("knn query must carry aggregations");
-    let buckets = aggs["by_band"]["buckets"].as_array().expect("terms buckets");
+    let buckets = aggs["by_band"]["buckets"]
+        .as_array()
+        .expect("terms buckets");
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for b in buckets {
-        counts.insert(b["key"].as_str().unwrap().to_string(), b["doc_count"].as_i64().unwrap());
+        counts.insert(
+            b["key"].as_str().unwrap().to_string(),
+            b["doc_count"].as_i64().unwrap(),
+        );
     }
-    assert_eq!(counts.get("2.4GHz"), Some(&2), "2.4GHz count over the semantic slice");
-    assert_eq!(counts.get("5GHz"), Some(&2), "5GHz count over the semantic slice");
-    assert_eq!(counts.get("other"), None, "the far doc must NOT be in the agg (excluded from top-k)");
-    assert_eq!(res.total.value, 4, "hits.total is the retrieved neighbour pool");
+    assert_eq!(
+        counts.get("2.4GHz"),
+        Some(&2),
+        "2.4GHz count over the semantic slice"
+    );
+    assert_eq!(
+        counts.get("5GHz"),
+        Some(&2),
+        "5GHz count over the semantic slice"
+    );
+    assert_eq!(
+        counts.get("other"),
+        None,
+        "the far doc must NOT be in the agg (excluded from top-k)"
+    );
+    assert_eq!(
+        res.total.value, 4,
+        "hits.total is the retrieved neighbour pool"
+    );
     assert!(res.hits.is_empty(), "size:0 returns aggs only, no hits");
->>>>>>> Stashed changes
 }
