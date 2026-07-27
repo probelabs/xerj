@@ -10902,11 +10902,21 @@ impl Index {
         let all_docs: Vec<Value> = if need_full_corpus {
             // `_id` is injected onto each source so `top_hits` / `_id`-keyed
             // aggs over the corpus still work (the fast path never provided it).
+            // Arc-share out of the memtable (cheap refcount bump under the
+            // per-shard read lock — same fix `all_docs_with_sources_arc`
+            // already applies for the fast-agg path, see its doc comment),
+            // then deep-clone into owned `Value` AFTER the lock is released.
+            // `run_aggs_with_all` needs owned `Value`, but this was previously
+            // deep-cloning the whole memtable WHILE holding the shard lock —
+            // the dominant `hydrate+corpus` cost under concurrent dashboard
+            // load, where several panel queries serialize on the same
+            // per-shard RwLock while each does a full O(doc) clone under it.
             let mut docs: Vec<Value> = self
                 .memtable
-                .all_docs_with_sources()
+                .all_docs_with_sources_arc()
                 .into_iter()
-                .map(|(id, mut v)| {
+                .map(|(id, v)| {
+                    let mut v = (*v).clone();
                     if let Some(o) = v.as_object_mut() {
                         o.entry("_id".to_string())
                             .or_insert_with(|| Value::String(id));
