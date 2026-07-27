@@ -2521,15 +2521,56 @@ fn extract_date_ranges(doc: &Value, field: &str) -> Vec<(i64, i64)> {
 
 // ── Terms aggregation ─────────────────────────────────────────────────────────
 
+/// Resolve a terms agg's bucket key(s) for one doc, from either a `field`
+/// (the common case) or a Painless `script` (e.g. Kibana's script-bucketed
+/// terms aggs like a heatmap's hour-of-day axis). Scripts are evaluated with
+/// the same `crate::painless` engine already proven correct for
+/// `script_fields`/`top_hits` — this just wires it into the one place that
+/// previously only understood `field` and silently produced zero buckets
+/// for a script-only terms agg.
+fn terms_agg_bucket_keys(field_or_script: &FieldOrScript, doc: &Value) -> Vec<String> {
+    match field_or_script {
+        FieldOrScript::Field(field) => extract_field_values(doc, field),
+        FieldOrScript::Script { source, params } => {
+            let ctx = crate::painless::PainlessCtx::new(doc, params, 0.0);
+            match crate::painless::eval_painless(source, &ctx) {
+                Ok(pv) => flatten_to_strings(&painless_value_to_json(pv)),
+                Err(_) => vec![],
+            }
+        }
+    }
+}
+
+enum FieldOrScript {
+    Field(String),
+    Script { source: String, params: Value },
+}
+
 fn run_terms(
     params: &Value,
     sub_aggs: Option<&Value>,
     docs: &[Value],
     all_docs: &[Value],
 ) -> Value {
-    let field = match params.get("field").and_then(Value::as_str) {
-        Some(f) => f,
-        None => return json!({"buckets": []}),
+    let field_or_script = match params.get("field").and_then(Value::as_str) {
+        Some(f) => FieldOrScript::Field(f.to_string()),
+        None => match params.get("script") {
+            Some(script) => {
+                let Some(source) = script
+                    .get("source")
+                    .or_else(|| script.get("inline"))
+                    .and_then(Value::as_str)
+                else {
+                    return json!({"buckets": []});
+                };
+                let script_params = script.get("params").cloned().unwrap_or(json!({}));
+                FieldOrScript::Script {
+                    source: source.to_string(),
+                    params: script_params,
+                }
+            }
+            None => return json!({"buckets": []}),
+        },
     };
     // ES semantics: size=0 means "return all buckets" (no cap).
     // Any other value caps the result; the default is 10.
@@ -2561,7 +2602,7 @@ fn run_terms(
     let bucket_cap = max_buckets();
     for doc in docs {
         let weight = doc_count_weight(doc);
-        let vals = extract_field_values(doc, field);
+        let vals = terms_agg_bucket_keys(&field_or_script, doc);
         if vals.is_empty() {
             if let Some(ph) = &missing_placeholder {
                 // Bucket cap: skip new keys past the limit, but always
@@ -2590,7 +2631,7 @@ fn run_terms(
         .unwrap_or(1);
     if min_doc_count_preview == 0 {
         for doc in all_docs {
-            for term in extract_field_values(doc, field) {
+            for term in terms_agg_bucket_keys(&field_or_script, doc) {
                 if counts.contains_key(&term) || counts.len() < bucket_cap {
                     counts.entry(term).or_insert(0);
                 }
@@ -2744,7 +2785,7 @@ fn run_terms(
             .unwrap_or(false);
         docs.iter()
             .filter(|doc| {
-                let vals = extract_field_values(doc, field);
+                let vals = terms_agg_bucket_keys(&field_or_script, doc);
                 if is_missing_bucket {
                     vals.is_empty()
                 } else {
@@ -2795,7 +2836,7 @@ fn run_terms(
             let bucket_docs: Vec<Value> = docs
                 .iter()
                 .filter(|doc| {
-                    let vals = extract_field_values(doc, field);
+                    let vals = terms_agg_bucket_keys(&field_or_script, doc);
                     if is_missing_bucket {
                         vals.is_empty()
                     } else {
