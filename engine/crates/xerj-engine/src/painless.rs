@@ -337,6 +337,30 @@ enum Expr {
     Assign(String, Box<Expr>, bool /* is_decl */),
 }
 
+/// Parser-only expression wrapper carrying the exact AST depth in O(1).
+///
+/// Left-associative operator parsers build their ASTs in loops. Without this
+/// metadata, a flat expression can create thousands of nested `Binary` nodes
+/// while the recursive-descent parser itself remains only a few frames deep.
+struct ParsedExpr {
+    expr: Expr,
+    depth: usize,
+}
+
+impl ParsedExpr {
+    fn leaf(expr: Expr) -> Self {
+        Self { expr, depth: 1 }
+    }
+
+    fn parent(expr: Expr, child_depth: usize) -> Result<Self, String> {
+        let depth = child_depth.saturating_add(1);
+        if depth > MAX_EVAL_DEPTH {
+            return Err(EVAL_TOO_DEEP_MSG.to_string());
+        }
+        Ok(Self { expr, depth })
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Stmt {
     Expr(Expr),
@@ -371,6 +395,11 @@ pub(crate) const MAX_SCRIPT_LEN: usize = 64 * 1024;
 /// (`check_script_limits`) match on it to distinguish "too complex" (a 400)
 /// from ordinary syntax errors (which degrade gracefully at runtime).
 pub(crate) const TOO_DEEP_MSG: &str = "compile error: script exceeds maximum nesting depth";
+
+/// Sentinel returned before constructing an AST that the recursive evaluator
+/// cannot safely evaluate within [`MAX_EVAL_DEPTH`].
+pub(crate) const EVAL_TOO_DEEP_MSG: &str =
+    "script evaluation exceeded maximum depth; split the expression into smaller statements";
 
 // ── Parser ───────────────────────────────────────────────────────────────────
 
@@ -465,7 +494,7 @@ impl<'a> Parser<'a> {
             } else {
                 Vec::new()
             };
-            return Ok(Stmt::If(cond, then_body, else_body));
+            return Ok(Stmt::If(cond.expr, then_body, else_body));
         }
         if self.match_keyword("return") {
             // Optional expression then ;
@@ -474,7 +503,7 @@ impl<'a> Parser<'a> {
             } else {
                 let e = self.parse_expr()?;
                 let _ = self.match_punct(';');
-                Some(e)
+                Some(e.expr)
             };
             return Ok(Stmt::Return(e));
         }
@@ -498,12 +527,14 @@ impl<'a> Parser<'a> {
                 }
                 let val = self.parse_expr()?;
                 let _ = self.match_punct(';');
-                return Ok(Stmt::Expr(Expr::Assign(name, Box::new(val), true)));
+                let depth = val.depth;
+                let expr = ParsedExpr::parent(Expr::Assign(name, Box::new(val.expr), true), depth)?;
+                return Ok(Stmt::Expr(expr.expr));
             }
         }
         let e = self.parse_expr()?;
         let _ = self.match_punct(';');
-        Ok(Stmt::Expr(e))
+        Ok(Stmt::Expr(e.expr))
     }
     fn parse_block_or_stmt(&mut self) -> Result<Vec<Stmt>, String> {
         if self.match_punct('{') {
@@ -520,10 +551,10 @@ impl<'a> Parser<'a> {
             Ok(vec![self.parse_stmt()?])
         }
     }
-    fn parse_expr(&mut self) -> Result<Expr, String> {
+    fn parse_expr(&mut self) -> Result<ParsedExpr, String> {
         self.parse_assign()
     }
-    fn parse_assign(&mut self) -> Result<Expr, String> {
+    fn parse_assign(&mut self) -> Result<ParsedExpr, String> {
         // Every expression re-entry (parens, index keys, call args, ternary
         // arms, assignment RHS) funnels through parse_assign, so guarding it
         // here bounds the whole expression-grammar recursion by nesting depth.
@@ -532,59 +563,72 @@ impl<'a> Parser<'a> {
         self.ascend();
         out
     }
-    fn parse_assign_inner(&mut self) -> Result<Expr, String> {
+    fn parse_assign_inner(&mut self) -> Result<ParsedExpr, String> {
         let lhs = self.parse_ternary()?;
         if self.match_punct('=') {
             // Disambiguate from `==` already consumed by parse_compare.
             let rhs = self.parse_assign()?;
-            if let Expr::Ident(name) = lhs {
-                return Ok(Expr::Assign(name, Box::new(rhs), false));
+            if let Expr::Ident(name) = lhs.expr {
+                let depth = rhs.depth;
+                return ParsedExpr::parent(Expr::Assign(name, Box::new(rhs.expr), false), depth);
             }
             return Err("assignment target must be identifier".into());
         }
         Ok(lhs)
     }
-    fn parse_ternary(&mut self) -> Result<Expr, String> {
+    fn parse_ternary(&mut self) -> Result<ParsedExpr, String> {
         let cond = self.parse_or()?;
         if self.match_punct('?') {
             let then_e = self.parse_assign()?;
             self.expect_punct(':')?;
             let else_e = self.parse_assign()?;
-            return Ok(Expr::Ternary(
-                Box::new(cond),
-                Box::new(then_e),
-                Box::new(else_e),
-            ));
+            let depth = cond.depth.max(then_e.depth).max(else_e.depth);
+            return ParsedExpr::parent(
+                Expr::Ternary(
+                    Box::new(cond.expr),
+                    Box::new(then_e.expr),
+                    Box::new(else_e.expr),
+                ),
+                depth,
+            );
         }
         Ok(cond)
     }
-    fn parse_or(&mut self) -> Result<Expr, String> {
+    fn parse_or(&mut self) -> Result<ParsedExpr, String> {
         let mut lhs = self.parse_and()?;
         while let Some(Tok::PunctMulti(op)) = self.peek() {
             if op == "||" {
                 self.pos += 1;
                 let rhs = self.parse_and()?;
-                lhs = Expr::Binary("||".into(), Box::new(lhs), Box::new(rhs));
+                let depth = lhs.depth.max(rhs.depth);
+                lhs = ParsedExpr::parent(
+                    Expr::Binary("||".into(), Box::new(lhs.expr), Box::new(rhs.expr)),
+                    depth,
+                )?;
             } else {
                 break;
             }
         }
         Ok(lhs)
     }
-    fn parse_and(&mut self) -> Result<Expr, String> {
+    fn parse_and(&mut self) -> Result<ParsedExpr, String> {
         let mut lhs = self.parse_eq()?;
         while let Some(Tok::PunctMulti(op)) = self.peek() {
             if op == "&&" {
                 self.pos += 1;
                 let rhs = self.parse_eq()?;
-                lhs = Expr::Binary("&&".into(), Box::new(lhs), Box::new(rhs));
+                let depth = lhs.depth.max(rhs.depth);
+                lhs = ParsedExpr::parent(
+                    Expr::Binary("&&".into(), Box::new(lhs.expr), Box::new(rhs.expr)),
+                    depth,
+                )?;
             } else {
                 break;
             }
         }
         Ok(lhs)
     }
-    fn parse_eq(&mut self) -> Result<Expr, String> {
+    fn parse_eq(&mut self) -> Result<ParsedExpr, String> {
         let mut lhs = self.parse_compare()?;
         while let Some(t) = self.peek() {
             let op = match t {
@@ -593,11 +637,15 @@ impl<'a> Parser<'a> {
             };
             self.pos += 1;
             let rhs = self.parse_compare()?;
-            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
+            let depth = lhs.depth.max(rhs.depth);
+            lhs = ParsedExpr::parent(
+                Expr::Binary(op, Box::new(lhs.expr), Box::new(rhs.expr)),
+                depth,
+            )?;
         }
         Ok(lhs)
     }
-    fn parse_compare(&mut self) -> Result<Expr, String> {
+    fn parse_compare(&mut self) -> Result<ParsedExpr, String> {
         let mut lhs = self.parse_add()?;
         while let Some(t) = self.peek() {
             let op = match t {
@@ -608,11 +656,15 @@ impl<'a> Parser<'a> {
             };
             self.pos += 1;
             let rhs = self.parse_add()?;
-            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
+            let depth = lhs.depth.max(rhs.depth);
+            lhs = ParsedExpr::parent(
+                Expr::Binary(op, Box::new(lhs.expr), Box::new(rhs.expr)),
+                depth,
+            )?;
         }
         Ok(lhs)
     }
-    fn parse_add(&mut self) -> Result<Expr, String> {
+    fn parse_add(&mut self) -> Result<ParsedExpr, String> {
         let mut lhs = self.parse_mul()?;
         while let Some(t) = self.peek() {
             let op = match t {
@@ -622,11 +674,15 @@ impl<'a> Parser<'a> {
             };
             self.pos += 1;
             let rhs = self.parse_mul()?;
-            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
+            let depth = lhs.depth.max(rhs.depth);
+            lhs = ParsedExpr::parent(
+                Expr::Binary(op, Box::new(lhs.expr), Box::new(rhs.expr)),
+                depth,
+            )?;
         }
         Ok(lhs)
     }
-    fn parse_mul(&mut self) -> Result<Expr, String> {
+    fn parse_mul(&mut self) -> Result<ParsedExpr, String> {
         let mut lhs = self.parse_unary()?;
         while let Some(t) = self.peek() {
             let op = match t {
@@ -637,11 +693,15 @@ impl<'a> Parser<'a> {
             };
             self.pos += 1;
             let rhs = self.parse_unary()?;
-            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
+            let depth = lhs.depth.max(rhs.depth);
+            lhs = ParsedExpr::parent(
+                Expr::Binary(op, Box::new(lhs.expr), Box::new(rhs.expr)),
+                depth,
+            )?;
         }
         Ok(lhs)
     }
-    fn parse_unary(&mut self) -> Result<Expr, String> {
+    fn parse_unary(&mut self) -> Result<ParsedExpr, String> {
         // Guard unary chains (`----x`, `!!!x`), which recurse through
         // parse_unary itself and so bypass the parse_assign guard.
         self.descend()?;
@@ -649,21 +709,23 @@ impl<'a> Parser<'a> {
         self.ascend();
         out
     }
-    fn parse_unary_inner(&mut self) -> Result<Expr, String> {
+    fn parse_unary_inner(&mut self) -> Result<ParsedExpr, String> {
         if self.match_punct('-') {
             let e = self.parse_unary()?;
-            return Ok(Expr::Unary("-".into(), Box::new(e)));
+            let depth = e.depth;
+            return ParsedExpr::parent(Expr::Unary("-".into(), Box::new(e.expr)), depth);
         }
         if self.match_punct('!') {
             let e = self.parse_unary()?;
-            return Ok(Expr::Unary("!".into(), Box::new(e)));
+            let depth = e.depth;
+            return ParsedExpr::parent(Expr::Unary("!".into(), Box::new(e.expr)), depth);
         }
         if self.match_punct('+') {
             return self.parse_unary();
         }
         self.parse_postfix()
     }
-    fn parse_postfix(&mut self) -> Result<Expr, String> {
+    fn parse_postfix(&mut self) -> Result<ParsedExpr, String> {
         let mut e = self.parse_primary()?;
         loop {
             if self.match_punct('.') {
@@ -675,22 +737,33 @@ impl<'a> Parser<'a> {
                 };
                 if self.match_punct('(') {
                     let args = self.parse_args(')')?;
-                    e = Expr::Member(Box::new(e), name, Some(args));
+                    let args_depth = args.iter().map(|arg| arg.depth).max().unwrap_or(0);
+                    let depth = e.depth.max(args_depth);
+                    e = ParsedExpr::parent(
+                        Expr::Member(
+                            Box::new(e.expr),
+                            name,
+                            Some(args.into_iter().map(|arg| arg.expr).collect()),
+                        ),
+                        depth,
+                    )?;
                 } else {
-                    e = Expr::Member(Box::new(e), name, None);
+                    let depth = e.depth;
+                    e = ParsedExpr::parent(Expr::Member(Box::new(e.expr), name, None), depth)?;
                 }
             } else if self.match_punct('[') {
                 let idx = self.parse_expr()?;
                 self.expect_punct(']')?;
-                e = Expr::Index(Box::new(e), Box::new(idx));
+                let depth = e.depth.max(idx.depth);
+                e = ParsedExpr::parent(Expr::Index(Box::new(e.expr), Box::new(idx.expr)), depth)?;
             } else {
                 break;
             }
         }
         Ok(e)
     }
-    fn parse_args(&mut self, end: char) -> Result<Vec<Expr>, String> {
-        let mut out: Vec<Expr> = Vec::new();
+    fn parse_args(&mut self, end: char) -> Result<Vec<ParsedExpr>, String> {
+        let mut out: Vec<ParsedExpr> = Vec::new();
         if let Some(Tok::Punct(c)) = self.peek() {
             if *c == end {
                 self.pos += 1;
@@ -709,22 +782,26 @@ impl<'a> Parser<'a> {
             other => Err(format!("expected '{}' got {:?}", end, other)),
         }
     }
-    fn parse_primary(&mut self) -> Result<Expr, String> {
+    fn parse_primary(&mut self) -> Result<ParsedExpr, String> {
         match self.eat() {
-            Some(Tok::Number(n)) => Ok(Expr::Number(n)),
-            Some(Tok::String(s)) => Ok(Expr::String(s)),
+            Some(Tok::Number(n)) => Ok(ParsedExpr::leaf(Expr::Number(n))),
+            Some(Tok::String(s)) => Ok(ParsedExpr::leaf(Expr::String(s))),
             Some(Tok::Keyword(k)) => match k.as_str() {
-                "true" => Ok(Expr::Bool(true)),
-                "false" => Ok(Expr::Bool(false)),
-                "null" => Ok(Expr::Null),
+                "true" => Ok(ParsedExpr::leaf(Expr::Bool(true))),
+                "false" => Ok(ParsedExpr::leaf(Expr::Bool(false))),
+                "null" => Ok(ParsedExpr::leaf(Expr::Null)),
                 other => Err(format!("unexpected keyword {} in expression", other)),
             },
             Some(Tok::Ident(name)) => {
                 if self.match_punct('(') {
                     let args = self.parse_args(')')?;
-                    Ok(Expr::Call(name, args))
+                    let depth = args.iter().map(|arg| arg.depth).max().unwrap_or(0);
+                    ParsedExpr::parent(
+                        Expr::Call(name, args.into_iter().map(|arg| arg.expr).collect()),
+                        depth,
+                    )
                 } else {
-                    Ok(Expr::Ident(name))
+                    Ok(ParsedExpr::leaf(Expr::Ident(name)))
                 }
             }
             Some(Tok::Punct('(')) => {
@@ -748,7 +825,7 @@ impl<'a> EvalDepthGuard<'a> {
     fn enter(cell: &'a std::cell::Cell<usize>) -> Result<Self, String> {
         let d = cell.get();
         if d >= MAX_EVAL_DEPTH {
-            return Err("script evaluation exceeded maximum depth".to_string());
+            return Err(EVAL_TOO_DEEP_MSG.to_string());
         }
         cell.set(d + 1);
         Ok(EvalDepthGuard(cell))
@@ -764,7 +841,7 @@ impl Drop for EvalDepthGuard<'_> {
 /// it, so the request layer can reject an abusive script with a 400 up front.
 ///
 /// Returns `Err` **only** for limit violations (source too long, or nesting
-/// depth beyond [`MAX_PARSE_DEPTH`]). Ordinary syntax errors — including
+/// depth beyond [`MAX_PARSE_DEPTH`] or [`MAX_EVAL_DEPTH`]). Ordinary syntax errors — including
 /// constructs outside our Painless subset — return `Ok(())` so they keep
 /// degrading gracefully at runtime (unchanged behavior), rather than becoming
 /// spurious 400s that would break otherwise-passing requests.
@@ -784,7 +861,7 @@ pub fn check_script_limits(src: &str) -> Result<(), String> {
     };
     let mut p = Parser::new(&toks);
     match p.parse_program() {
-        Err(e) if e == TOO_DEEP_MSG => Err(e),
+        Err(e) if e == TOO_DEEP_MSG || e == EVAL_TOO_DEEP_MSG => Err(e),
         _ => Ok(()),
     }
 }
@@ -895,114 +972,7 @@ fn eval_expr(
                 _ => Err(format!("bad unary {op}")),
             }
         }
-        Expr::Binary(op, a, b) => {
-            // Short-circuit && ||
-            if op == "&&" {
-                let av = eval_expr(a, ctx, env)?;
-                if !av.as_bool() {
-                    return Ok(PainlessValue::Bool(false));
-                }
-                return Ok(PainlessValue::Bool(eval_expr(b, ctx, env)?.as_bool()));
-            }
-            if op == "||" {
-                let av = eval_expr(a, ctx, env)?;
-                if av.as_bool() {
-                    return Ok(PainlessValue::Bool(true));
-                }
-                return Ok(PainlessValue::Bool(eval_expr(b, ctx, env)?.as_bool()));
-            }
-            let av = eval_expr(a, ctx, env)?;
-            let bv = eval_expr(b, ctx, env)?;
-            // String concatenation for `+`.
-            if op == "+"
-                && (matches!(av, PainlessValue::String(_))
-                    || matches!(bv, PainlessValue::String(_)))
-            {
-                let sa = match &av {
-                    PainlessValue::String(s) => s.clone(),
-                    PainlessValue::Number(n) => format_num(*n),
-                    PainlessValue::Bool(b) => b.to_string(),
-                    _ => "null".to_string(),
-                };
-                let sb = match &bv {
-                    PainlessValue::String(s) => s.clone(),
-                    PainlessValue::Number(n) => format_num(*n),
-                    PainlessValue::Bool(b) => b.to_string(),
-                    _ => "null".to_string(),
-                };
-                return Ok(PainlessValue::String(format!("{sa}{sb}")));
-            }
-            // ES Painless compares Strings as STRINGS, not numbers.
-            // `==`/`!=` follow `def` equality (Object.equals): two Strings
-            // compare by content, and a String never equals a non-String
-            // (number/bool/null). Relational operators between two Strings
-            // compare lexicographically (String.compareTo order; note ES
-            // itself throws a script_exception for `<` on Strings — we
-            // degrade to compareTo ordering instead of erroring, in line
-            // with this subset's graceful-degradation contract).
-            //
-            // Previously both operands fell through to `as_f64().unwrap_or(0.0)`,
-            // so every string compared equal to every other string (and to
-            // null): `doc['color'].value == 'red'` matched ALL docs.
-            {
-                let a_is_str = matches!(av, PainlessValue::String(_));
-                let b_is_str = matches!(bv, PainlessValue::String(_));
-                if a_is_str || b_is_str {
-                    match op.as_str() {
-                        "==" | "!=" => {
-                            let eq = match (&av, &bv) {
-                                (PainlessValue::String(x), PainlessValue::String(y)) => x == y,
-                                _ => false,
-                            };
-                            return Ok(PainlessValue::Bool(if op == "==" { eq } else { !eq }));
-                        }
-                        "<" | "<=" | ">" | ">=" if a_is_str && b_is_str => {
-                            if let (PainlessValue::String(x), PainlessValue::String(y)) = (&av, &bv)
-                            {
-                                let ord = x.cmp(y);
-                                let res = match op.as_str() {
-                                    "<" => ord == std::cmp::Ordering::Less,
-                                    "<=" => ord != std::cmp::Ordering::Greater,
-                                    ">" => ord == std::cmp::Ordering::Greater,
-                                    _ => ord != std::cmp::Ordering::Less,
-                                };
-                                return Ok(PainlessValue::Bool(res));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let an = av.as_f64().unwrap_or(0.0);
-            let bn = bv.as_f64().unwrap_or(0.0);
-            let r = match op.as_str() {
-                "+" => an + bn,
-                "-" => an - bn,
-                "*" => an * bn,
-                "/" => {
-                    if bn == 0.0 {
-                        f64::NAN
-                    } else {
-                        an / bn
-                    }
-                }
-                "%" => {
-                    if bn == 0.0 {
-                        f64::NAN
-                    } else {
-                        an % bn
-                    }
-                }
-                "<" => return Ok(PainlessValue::Bool(an < bn)),
-                "<=" => return Ok(PainlessValue::Bool(an <= bn)),
-                ">" => return Ok(PainlessValue::Bool(an > bn)),
-                ">=" => return Ok(PainlessValue::Bool(an >= bn)),
-                "==" => return Ok(PainlessValue::Bool(an == bn)),
-                "!=" => return Ok(PainlessValue::Bool(an != bn)),
-                _ => return Err(format!("bad binary {op}")),
-            };
-            Ok(PainlessValue::Number(r))
-        }
+        Expr::Binary(op, a, b) => eval_binary_chain(op, a, b, ctx, env),
         Expr::Ternary(c, t, f) => {
             let cv = eval_expr(c, ctx, env)?;
             if cv.as_bool() {
@@ -1137,6 +1107,133 @@ fn eval_expr(
             global_call(name, &argvs, ctx)
         }
     }
+}
+
+/// Evaluate the parser's left-associative binary spine without mirroring it on
+/// the native stack. Right-hand operands still use `eval_expr`; grammar
+/// recursion bounds those subtrees, while this loop handles the only
+/// unbounded binary shape the parser can construct.
+fn eval_binary_chain(
+    root_op: &str,
+    root_left: &Expr,
+    root_right: &Expr,
+    ctx: &PainlessCtx,
+    env: &mut HashMap<String, PainlessValue>,
+) -> Result<PainlessValue, String> {
+    let mut pending = vec![(root_op, root_right)];
+    let mut left = root_left;
+    while let Expr::Binary(op, next_left, right) = left {
+        pending.push((op.as_str(), right.as_ref()));
+        if pending.len() >= MAX_EVAL_DEPTH {
+            return Err(EVAL_TOO_DEEP_MSG.to_string());
+        }
+        left = next_left;
+    }
+
+    let mut value = eval_expr(left, ctx, env)?;
+    for (op, right) in pending.into_iter().rev() {
+        if op == "&&" && !value.as_bool() {
+            value = PainlessValue::Bool(false);
+            continue;
+        }
+        if op == "||" && value.as_bool() {
+            value = PainlessValue::Bool(true);
+            continue;
+        }
+        let right = eval_expr(right, ctx, env)?;
+        value = apply_binary(op, value, right)?;
+    }
+    Ok(value)
+}
+
+fn apply_binary(
+    op: &str,
+    left: PainlessValue,
+    right: PainlessValue,
+) -> Result<PainlessValue, String> {
+    if op == "&&" {
+        return Ok(PainlessValue::Bool(left.as_bool() && right.as_bool()));
+    }
+    if op == "||" {
+        return Ok(PainlessValue::Bool(left.as_bool() || right.as_bool()));
+    }
+
+    // String concatenation for `+`.
+    if op == "+"
+        && (matches!(left, PainlessValue::String(_)) || matches!(right, PainlessValue::String(_)))
+    {
+        let render = |value: &PainlessValue| match value {
+            PainlessValue::String(s) => s.clone(),
+            PainlessValue::Number(n) => format_num(*n),
+            PainlessValue::Bool(b) => b.to_string(),
+            _ => "null".to_string(),
+        };
+        return Ok(PainlessValue::String(format!(
+            "{}{}",
+            render(&left),
+            render(&right)
+        )));
+    }
+
+    // ES Painless compares Strings as strings. Equality is false across
+    // unlike types; relational comparisons between two strings use lexical
+    // ordering in this intentionally graceful subset.
+    let left_is_string = matches!(left, PainlessValue::String(_));
+    let right_is_string = matches!(right, PainlessValue::String(_));
+    if left_is_string || right_is_string {
+        match op {
+            "==" | "!=" => {
+                let equal = match (&left, &right) {
+                    (PainlessValue::String(x), PainlessValue::String(y)) => x == y,
+                    _ => false,
+                };
+                return Ok(PainlessValue::Bool(if op == "==" { equal } else { !equal }));
+            }
+            "<" | "<=" | ">" | ">=" if left_is_string && right_is_string => {
+                if let (PainlessValue::String(x), PainlessValue::String(y)) = (&left, &right) {
+                    let ordering = x.cmp(y);
+                    let result = match op {
+                        "<" => ordering == std::cmp::Ordering::Less,
+                        "<=" => ordering != std::cmp::Ordering::Greater,
+                        ">" => ordering == std::cmp::Ordering::Greater,
+                        _ => ordering != std::cmp::Ordering::Less,
+                    };
+                    return Ok(PainlessValue::Bool(result));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let left = left.as_f64().unwrap_or(0.0);
+    let right = right.as_f64().unwrap_or(0.0);
+    let value = match op {
+        "+" => left + right,
+        "-" => left - right,
+        "*" => left * right,
+        "/" => {
+            if right == 0.0 {
+                f64::NAN
+            } else {
+                left / right
+            }
+        }
+        "%" => {
+            if right == 0.0 {
+                f64::NAN
+            } else {
+                left % right
+            }
+        }
+        "<" => return Ok(PainlessValue::Bool(left < right)),
+        "<=" => return Ok(PainlessValue::Bool(left <= right)),
+        ">" => return Ok(PainlessValue::Bool(left > right)),
+        ">=" => return Ok(PainlessValue::Bool(left >= right)),
+        "==" => return Ok(PainlessValue::Bool(left == right)),
+        "!=" => return Ok(PainlessValue::Bool(left != right)),
+        _ => return Err(format!("bad binary {op}")),
+    };
+    Ok(PainlessValue::Number(value))
 }
 
 fn format_num(n: f64) -> String {
@@ -1545,15 +1642,62 @@ mod tests {
         let doc = json!({});
         let params = json!({});
         // A flat `1+1+1+…` chain is parsed with a LOOP (not deep recursion),
-        // so it passes the parser but builds a deep left-leaning AST that the
-        // evaluator would recurse over. The eval-depth guard must catch it.
+        // so it used to build a 5,001-deep left-leaning AST and abort the
+        // process on the evaluator's native stack. It must now fail while
+        // parsing, before that evaluator is entered.
         let src = format!("1{}", "+1".repeat(5000));
-        let r = eval_painless(&src, &ctx(&doc, &params, 0.0));
-        assert!(
-            r.is_err(),
-            "expected eval-depth error on deep AST, got {:?}",
-            r
+        let error = eval_painless(&src, &ctx(&doc, &params, 0.0)).unwrap_err();
+        assert_eq!(error, EVAL_TOO_DEEP_MSG);
+    }
+
+    #[test]
+    fn flat_binary_chain_accepts_exact_eval_depth_boundary() {
+        let doc = json!({});
+        let params = json!({});
+        // A leaf has depth one, so MAX_EVAL_DEPTH - 1 binary operators
+        // produce an expression whose exact evaluation depth is the limit.
+        let src = format!("1{}", "+1".repeat(MAX_EVAL_DEPTH - 1));
+        let value = eval_painless(&src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert_eq!(value.as_f64(), Some(MAX_EVAL_DEPTH as f64));
+
+        let too_deep = format!("1{}", "+1".repeat(MAX_EVAL_DEPTH));
+        assert_eq!(
+            eval_painless(&too_deep, &ctx(&doc, &params, 0.0)).unwrap_err(),
+            EVAL_TOO_DEEP_MSG
         );
+    }
+
+    #[test]
+    fn binary_depth_tracks_mixed_precedence_and_associativity() {
+        let doc = json!({});
+        let params = json!({});
+        // The exact AST is (((1 + (2 * 3)) + (4 / 2)) - 5), not a token-count
+        // approximation. This also exercises the iterative left-spine
+        // evaluator across distinct precedence levels.
+        let value = eval_painless("1 + 2 * 3 + 4 / 2 - 5", &ctx(&doc, &params, 0.0)).unwrap();
+        assert_eq!(value.as_f64(), Some(4.0));
+    }
+
+    #[test]
+    fn iterative_binary_chain_preserves_short_circuiting() {
+        let doc = json!({});
+        let params = json!({});
+        // `missing()` would return an error if evaluated. Every RHS must remain
+        // skipped even though the left-associated spine is evaluated in a loop.
+        let src = format!(
+            "false{}",
+            " && missing()".repeat(MAX_EVAL_DEPTH.saturating_sub(2))
+        );
+        let value = eval_painless(&src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert_eq!(value.as_bool(), false);
+    }
+
+    #[test]
+    fn eval_depth_error_is_actionable_and_limit_checks_report_it() {
+        let src = format!("1{}", "+1".repeat(MAX_EVAL_DEPTH));
+        let error = check_script_limits(&src).unwrap_err();
+        assert_eq!(error, EVAL_TOO_DEEP_MSG);
+        assert!(error.contains("split the expression into smaller statements"));
     }
 
     #[test]
