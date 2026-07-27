@@ -452,6 +452,12 @@ impl Ledger {
     }
 }
 
+impl Default for Ledger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub static LEDGER: Ledger = Ledger::new();
 
 /// Build one sampler-owned event. This is the only public event constructor:

@@ -16880,7 +16880,6 @@ impl Drop for FlushDurationTimer {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // free fn threading the full flush-pipeline dependency set
 #[cfg(test)]
 #[derive(Clone)]
 struct FlushPublisherTestHook {
@@ -16893,6 +16892,10 @@ tokio::task_local! {
     static FLUSH_PUBLISHER_TEST_HOOK: FlushPublisherTestHook;
 }
 
+// This deliberately remains a free function so background tasks can own every
+// flush dependency without retaining `Index`; grouping the values would only
+// hide the same pipeline dependency set behind an uninformative bag of fields.
+#[allow(clippy::too_many_arguments)]
 async fn do_flush_shard(
     shard_idx: usize,
     store: Arc<IndexStore>,
