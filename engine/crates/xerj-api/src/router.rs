@@ -19,6 +19,7 @@ use axum::{
 use tower_http::{
     classify::{ServerErrorsAsFailures, SharedClassifier},
     cors::{AllowOrigin, Any, CorsLayer},
+    decompression::RequestDecompressionLayer,
     limit::RequestBodyLimitLayer,
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
@@ -158,6 +159,13 @@ pub fn build_native_router(state: AppState) -> Router {
         // gate — bulk ingests legitimately exceed 2MB.
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(body_limit))
+        // Outermost: transparently decompress gzip-encoded request bodies
+        // (Content-Encoding: gzip) before the size limit above sees them, so
+        // the limit bounds decompressed size, not wire size. Real ES clients
+        // routinely compress writes by default (Beats, Logstash, official
+        // client libraries) — without this every such request 400s/500s
+        // trying to JSON-parse raw gzip bytes.
+        .layer(RequestDecompressionLayer::new().gzip(true))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -770,6 +778,13 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         // gate — bulk ingests legitimately exceed 2MB.
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(body_limit))
+        // Outermost: transparently decompress gzip-encoded request bodies
+        // (Content-Encoding: gzip) before the size limit above sees them, so
+        // the limit bounds decompressed size, not wire size. Real ES clients
+        // routinely compress writes by default (Beats, Logstash, official
+        // client libraries) — without this every such request 400s/500s
+        // trying to JSON-parse raw gzip bytes.
+        .layer(RequestDecompressionLayer::new().gzip(true))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
