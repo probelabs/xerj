@@ -270,16 +270,14 @@ mod tests {
             .try_charge(SegmentCacheCategory::RowSequences, 8)
             .unwrap();
         drop(charge);
+        #[cfg(debug_assertions)]
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             budget.release(SegmentCacheCategory::RowSequences, 8);
         }));
         #[cfg(debug_assertions)]
         assert!(result.is_err(), "debug builds must surface double release");
         #[cfg(not(debug_assertions))]
-        assert!(
-            result.is_ok(),
-            "release builds must record and repair underflow without panicking"
-        );
+        budget.release(SegmentCacheCategory::RowSequences, 8);
         let snapshot = budget.snapshot();
         assert_eq!(snapshot.current, 0);
         assert_eq!(
