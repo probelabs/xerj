@@ -569,6 +569,52 @@ impl Column {
             Column::Keyword(k) => k.doc_count,
         }
     }
+
+    /// Conservative deterministic estimate of heap allocations retained by
+    /// this decoded column. This is capacity accounting, not allocator/RSS
+    /// identity. The inline `Column` enum itself is owned by the caller's
+    /// map and is intentionally not counted here.
+    pub fn estimated_retained_bytes(&self) -> u64 {
+        match self {
+            Column::Numeric(column) => capacity_bytes::<i64>(column.data.capacity())
+                .saturating_add(capacity_bytes::<(i64, u32)>(column.sorted.capacity()))
+                .saturating_add(roaring_retained_bytes(&column.null_bitmap)),
+            Column::Keyword(column) => {
+                let term_storage = capacity_bytes::<String>(column.terms.capacity())
+                    .saturating_add(column.terms.iter().fold(0_u64, |total, term| {
+                        total.saturating_add(usize_to_u64(term.capacity()))
+                    }));
+                term_storage
+                    .saturating_add(usize_to_u64(column.fst_bytes.capacity()))
+                    .saturating_add(capacity_bytes::<u32>(column.ords.capacity()))
+                    .saturating_add(capacity_bytes::<u32>(column.per_ord_count.capacity()))
+                    .saturating_add(roaring_retained_bytes(&column.null_bitmap))
+            }
+        }
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn capacity_bytes<T>(capacity: usize) -> u64 {
+    usize_to_u64(capacity).saturating_mul(usize_to_u64(std::mem::size_of::<T>()))
+}
+
+fn roaring_retained_bytes(bitmap: &RoaringBitmap) -> u64 {
+    let statistics = bitmap.statistics();
+    statistics
+        .n_bytes_array_containers
+        .saturating_add(statistics.n_bytes_bitset_containers)
+        .saturating_add(statistics.n_bytes_run_containers)
+        // roaring 0.10 does not expose the container Vec capacity. One
+        // conservative three-word allowance per live container covers the
+        // key/store slot without pretending serialized size is heap size.
+        .saturating_add(
+            u64::from(statistics.n_containers)
+                .saturating_mul(usize_to_u64(3 * std::mem::size_of::<usize>())),
+        )
 }
 
 /// Encode a `field → Column` map into the binary `Columns` section payload.
@@ -776,5 +822,44 @@ mod tests {
         } else {
             panic!("expected numeric");
         }
+    }
+
+    #[test]
+    fn retained_estimates_count_numeric_keyword_capacity_and_roaring() {
+        let mut numeric = NumericColumn::from_iter(vec![Some(1), None, Some(3)]);
+        numeric.data.reserve(128);
+        numeric.sorted.reserve(64);
+        let numeric = Column::Numeric(numeric);
+        let numeric_estimate = numeric.estimated_retained_bytes();
+        let Column::Numeric(numeric_column) = &numeric else {
+            unreachable!()
+        };
+        assert!(
+            numeric_estimate
+                >= (numeric_column.data.capacity() * std::mem::size_of::<i64>()
+                    + numeric_column.sorted.capacity() * std::mem::size_of::<(i64, u32)>())
+                    as u64
+        );
+
+        let mut keyword = KeywordColumn::from_iter(vec![
+            Some(String::from("alpha")),
+            None,
+            Some(String::from("beta")),
+        ])
+        .unwrap();
+        keyword.terms.reserve(32);
+        keyword.fst_bytes.reserve(256);
+        keyword.ords.reserve(128);
+        keyword.per_ord_count.reserve(64);
+        let keyword = Column::Keyword(keyword);
+        let keyword_estimate = keyword.estimated_retained_bytes();
+        let Column::Keyword(keyword_column) = &keyword else {
+            unreachable!()
+        };
+        let vector_floor = keyword_column.terms.capacity() * std::mem::size_of::<String>()
+            + keyword_column.fst_bytes.capacity()
+            + keyword_column.ords.capacity() * std::mem::size_of::<u32>()
+            + keyword_column.per_ord_count.capacity() * std::mem::size_of::<u32>();
+        assert!(keyword_estimate >= vector_floor as u64);
     }
 }
