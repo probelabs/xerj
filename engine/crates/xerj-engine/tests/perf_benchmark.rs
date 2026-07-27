@@ -622,12 +622,11 @@ async fn perf_turbo_indexing_throughput() {
     let idx_turbo = engine_turbo.get_index("turbo_bench").unwrap();
 
     let turbo_start = Instant::now();
-    let mut batch: Vec<(String, serde_json::Value, std::sync::Arc<[u8]>)> =
-        Vec::with_capacity(TURBO_BATCH);
+    let mut batch: Vec<(String, serde_json::Value)> = Vec::with_capacity(TURBO_BATCH);
 
     for i in 0..N {
-        let empty_bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(&[][..]);
-        batch.push((format!("doc{i}"), make_doc(i), empty_bytes));
+        let source = make_doc(i);
+        batch.push((format!("doc{i}"), source));
 
         if batch.len() >= TURBO_BATCH {
             let b = std::mem::replace(&mut batch, Vec::with_capacity(TURBO_BATCH));

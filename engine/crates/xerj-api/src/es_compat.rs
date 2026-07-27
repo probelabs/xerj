@@ -1077,8 +1077,17 @@ async fn get_index_inner(
             }
             continue;
         }
-        // Exact name.
-        if all.iter().any(|info| info.name == part) {
+        // Exact name — could be a real index, or an alias pointing at one
+        // (ES/OpenSearch accept both interchangeably on GET /{index}; e.g.
+        // Kibana/OSD resolve `.kibana` — always an alias, never a bare
+        // index — through this exact endpoint).
+        if let Some(targets) = state.engine.aliases.get(part) {
+            for n in targets.value() {
+                if !selected.contains(n) {
+                    selected.push(n.clone());
+                }
+            }
+        } else if all.iter().any(|info| info.name == part) {
             if !selected.contains(&part.to_string()) {
                 selected.push(part.to_string());
             }
@@ -8583,7 +8592,19 @@ pub async fn search(
                 .and_then(|src| src.get("enabled").and_then(Value::as_bool))
                 .map(|b| !b)
                 .unwrap_or(false);
-            let source = if suppress_source_for_stored
+            // `stored_fields` implicitly suppressing `_source` (unless the
+            // list literally contains `"_source"`) is only a DEFAULT for
+            // when the caller left `_source` unspecified. When the request
+            // also carries its own explicit top-level `_source` parameter
+            // (true/false/{includes,excludes} — e.g. Discover's actual
+            // query, which sends `stored_fields: ["*"]` AND `_source:
+            // {excludes: []}` in the same request), that explicit value
+            // always wins — found empirically: without this, `_source`
+            // came back completely absent from every Discover row despite
+            // the request explicitly asking to include it, which starved
+            // every column except the couple of fields separately pulled
+            // in via `docvalue_fields`.
+            let source = if (suppress_source_for_stored && body.source.is_none())
                 || source_body_disabled
                 || source_mapping_disabled
                 || h.source.is_null()
@@ -12373,6 +12394,84 @@ async fn process_bulk_body(
     }
 }
 
+#[cfg(test)]
+mod malformed_bulk_route_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test]
+    async fn malformed_bulk_source_returns_actionable_public_item_error() {
+        let body = concat!(
+            "{\"index\":{\"_index\":\"route-errors\",\"_id\":\"valid-doc\"}}\n",
+            "{\"title\":\"valid\"}\n",
+            "{\"index\":{\"_index\":\"route-errors\",\"_id\":\"broken-doc\"}}\n",
+            "{\"title\":\"unterminated}\n",
+        );
+        let response = crate::router::build_es_compat_router(test_state())
+            .oneshot(
+                Request::post("/_bulk")
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        // ES bulk reports per-item parse failures inside a successful HTTP
+        // response; callers must inspect `errors` and each item's status.
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: Value = serde_json::from_slice(&bytes).expect("JSON response");
+        assert_eq!(response["errors"], true);
+        assert_eq!(response["items"][0]["index"]["status"], 201);
+
+        let failed = &response["items"][1]["index"];
+        assert_eq!(failed["_id"], "broken-doc");
+        assert_eq!(failed["status"], 400);
+        assert_eq!(
+            failed["error"]["type"], "document_parsing_exception",
+            "unexpected response: {response}"
+        );
+        let reason = failed["error"]["reason"]
+            .as_str()
+            .expect("error reason string");
+        for expected in [
+            "document ID \"broken-doc\"",
+            "bulk item position 2",
+            "parser error:",
+            "parser location: line 1, column ",
+            "Fix: replace this source line with exactly one complete UTF-8 JSON object.",
+            "Related help: xerj index --help and https://xerj.org/llms.txt",
+        ] {
+            assert!(
+                reason.contains(expected),
+                "missing {expected:?} in public reason: {reason}"
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Schema conversion helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -12863,12 +12962,67 @@ pub struct EsUpdateBody {
 pub struct UpdateDocParams {
     /// `refresh=true|wait_for` — accepted without error; memtable is always visible.
     pub refresh: Option<String>,
+    /// `_source=false` suppresses the `get` block; any other value (or bare
+    /// presence) requests it. Absent + no includes/excludes → no `get` block,
+    /// matching real ES (source is NOT returned by default on `_update`).
+    #[serde(rename = "_source")]
+    pub source: Option<String>,
+    /// Comma-separated fields to include in the `get._source` block.
+    #[serde(rename = "_source_includes")]
+    pub source_includes: Option<String>,
+    /// Comma-separated fields to exclude from the `get._source` block.
+    #[serde(rename = "_source_excludes")]
+    pub source_excludes: Option<String>,
+}
+
+/// Whether `_update`'s response should carry a `get` block, per the same
+/// `_source`/`_source_includes`/`_source_excludes` semantics `GET _doc` uses.
+/// Real ES clients (e.g. Kibana's SavedObjectsRepository, which reads
+/// `body.get._source` unconditionally after every update) rely on this.
+fn update_wants_get(params: &UpdateDocParams) -> bool {
+    match params.source.as_deref() {
+        Some("false") => false,
+        Some(_) => true,
+        None => params.source_includes.is_some() || params.source_excludes.is_some(),
+    }
+}
+
+/// Build the `get` block for an `_update` response by re-fetching the
+/// now-current document and applying the same includes/excludes filtering
+/// `GET _doc` uses.
+async fn build_update_get_field(
+    idx: &std::sync::Arc<xerj_engine::index::Index>,
+    id: &str,
+    params: &UpdateDocParams,
+) -> Value {
+    let source = idx.get_document(id).await.ok().flatten();
+    match source {
+        Some(source) => {
+            let includes: Vec<String> = params
+                .source_includes
+                .as_deref()
+                .map(|s| s.split(',').map(str::trim).map(String::from).collect())
+                .unwrap_or_default();
+            let excludes: Vec<String> = params
+                .source_excludes
+                .as_deref()
+                .map(|s| s.split(',').map(str::trim).map(String::from).collect())
+                .unwrap_or_default();
+            let filtered = if includes.is_empty() && excludes.is_empty() {
+                source
+            } else {
+                filter_source_object(&source, &includes, &excludes)
+            };
+            json!({ "found": true, "_source": filtered })
+        }
+        None => json!({ "found": false }),
+    }
 }
 
 pub async fn update_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
-    Query(_params): Query<UpdateDocParams>,
+    Query(query_params): Query<UpdateDocParams>,
     Json(body): Json<EsUpdateBody>,
 ) -> impl IntoResponse {
     let idx = match state.engine.get_or_create_index(&index) {
@@ -12902,7 +13056,7 @@ pub async fn update_doc(
             Ok(Ok(Some(outcome))) => {
                 state.metrics.record_doc_indexed(&index);
                 let resp = outcome.response;
-                let er = if outcome.created {
+                let mut er = if outcome.created {
                     crate::responses::EsDocResponse::created(
                         &index,
                         &resp.id,
@@ -12917,6 +13071,9 @@ pub async fn update_doc(
                         resp.seq_no.saturating_sub(1),
                     )
                 };
+                if update_wants_get(&query_params) {
+                    er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+                }
                 return Json(er).into_response();
             }
             Ok(Ok(None)) => {
@@ -12936,12 +13093,15 @@ pub async fn update_doc(
     {
         Ok(Some(resp)) => {
             state.metrics.record_doc_indexed(&index);
-            let er = crate::responses::EsDocResponse::updated(
+            let mut er = crate::responses::EsDocResponse::updated(
                 &index,
                 &resp.id,
                 resp.version,
                 resp.seq_no.saturating_sub(1),
             );
+            if update_wants_get(&query_params) {
+                er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+            }
             Json(er).into_response()
         }
         Ok(None) => {
@@ -14434,8 +14594,23 @@ async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
             }
             continue;
         }
-        // Exact name — include whether or not it exists; the caller decides.
-        if !out.contains(&part.to_string()) {
+        // Exact name — could be a real index, OR an alias pointing at one
+        // (real ES/OpenSearch accept both interchangeably on every
+        // single-index endpoint: GET/_mapping/_settings/etc.). Resolve to
+        // the underlying real index name(s) so callers keying their
+        // response by `name` (e.g. get_mapping's `index_mappings` lookup)
+        // hit the actually-stored entry instead of silently missing and
+        // falling back to a schema-derived reconstruction that drops
+        // fields like mappings._meta. Falls back to the literal name
+        // (include whether or not it exists; the caller decides) when it
+        // isn't a known alias either.
+        if let Some(targets) = state.engine.aliases.get(part) {
+            for n in targets.value() {
+                if !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+        } else if !out.contains(&part.to_string()) {
             out.push(part.to_string());
         }
     }
@@ -15468,6 +15643,62 @@ pub async fn field_caps(
                 arr.push(Value::String(idx_name.clone()));
             }
         }
+
+        // Multi-fields (`"fields": {"keyword": {"type": "keyword"}}`) are
+        // NOT separate entries in `schema.fields` — the engine resolves
+        // `category.keyword` at query time via dotted-path lookup, so
+        // terms aggs/sorts/filters on it work fine, but it was invisible
+        // to `_field_caps`. Kibana relies on `_field_caps` (not `_search`)
+        // to discover which fields exist when building/refreshing an
+        // index pattern, so a saved viz referencing `category.keyword`
+        // silently broke ("field not found") even though the same field
+        // worked when queried directly. Walk the same mapping shape
+        // `GET _mapping` already derives correctly and add each declared
+        // multi-field as its own field-caps entry.
+        let stored_mapping = state
+            .engine
+            .index_mappings
+            .get(idx_name.as_str())
+            .map(|v| v.clone())
+            .unwrap_or(Value::Null);
+        let properties = if stored_mapping.is_null() {
+            Value::Object(schema_to_es_properties(&schema))
+        } else {
+            stored_mapping
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        };
+        let mut multi_fields = Vec::new();
+        collect_multi_fields(&properties, "", &mut multi_fields);
+        for (name, es_type) in multi_fields {
+            if fields_filter != "*" {
+                let matches = fields_filter
+                    .split(',')
+                    .any(|f| source_field_matches(&name, f.trim()));
+                if !matches {
+                    continue;
+                }
+            }
+            let (searchable, aggregatable) = match es_type.as_str() {
+                "text" => (true, false),
+                _ => (true, true),
+            };
+            let type_map = fields_map.entry(name).or_default();
+            let type_entry = type_map.entry(es_type.clone()).or_insert_with(|| {
+                json!({
+                    "type": es_type,
+                    "searchable": searchable,
+                    "aggregatable": aggregatable,
+                    "indices": []
+                })
+            });
+            if let Some(arr) = type_entry["indices"].as_array_mut() {
+                if !arr.iter().any(|v| v.as_str() == Some(idx_name.as_str())) {
+                    arr.push(Value::String(idx_name.clone()));
+                }
+            }
+        }
     }
 
     let fields_val: serde_json::Map<String, Value> = fields_map
@@ -15480,6 +15711,43 @@ pub async fn field_caps(
         "fields": Value::Object(fields_val),
     }))
     .into_response()
+}
+
+/// Walk a mapping `properties` object and collect every declared
+/// multi-field (`"fields": {"keyword": {"type": "keyword"}}`) as a
+/// `(dotted_name, es_type)` pair — e.g. `category` with a `keyword`
+/// multi-field yields `("category.keyword", "keyword")`. Also recurses
+/// into `object`/`nested` sub-`properties` so a multi-field nested two
+/// levels deep still gets its full dotted path. Used by `_field_caps`,
+/// which otherwise only sees top-level `schema.fields` and never learns
+/// a multi-field like `category.keyword` exists.
+fn collect_multi_fields(properties: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
+    let Some(obj) = properties.as_object() else {
+        return;
+    };
+    for (name, def) in obj {
+        let full_name = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        let Some(def_obj) = def.as_object() else {
+            continue;
+        };
+        if let Some(fields) = def_obj.get("fields").and_then(Value::as_object) {
+            for (sub_name, sub_def) in fields {
+                let es_type = sub_def
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("keyword")
+                    .to_string();
+                out.push((format!("{full_name}.{sub_name}"), es_type));
+            }
+        }
+        if let Some(sub_props) = def_obj.get("properties") {
+            collect_multi_fields(sub_props, &full_name, out);
+        }
+    }
 }
 
 fn native_type_to_es_str(ft: &FieldType) -> &'static str {
@@ -22116,13 +22384,28 @@ pub async fn xpack_info(State(state): State<AppState>) -> impl IntoResponse {
     let watcher_enabled = state
         .watcher_active
         .load(std::sync::atomic::Ordering::Relaxed);
+    // Must match GET / (`resolve_compat_version`'s `--compat-version`
+    // override) — found empirically: Kibana cross-checks the cluster
+    // version it saw on GET / against the version reported here before
+    // trusting the license block, so a mismatch (GET / correctly
+    // reporting an overridden older version, this endpoint still
+    // hardcoding "8.13.0") surfaces as an opaque "license not available"
+    // error rather than a version-mismatch message. `/_xpack` is
+    // Elastic-only (OpenSearch has no equivalent endpoint), so only the
+    // plain `--compat-version` override applies here, not the fuller
+    // OpenSearch auto-detection `resolve_compat_version` also does.
+    let reported_version = if state.config.compat.version.is_empty() {
+        "8.13.0".to_string()
+    } else {
+        state.config.compat.version.clone()
+    };
     Json(json!({
         "build": {
             "hash": "xerj",
             "date": "2024-01-01T00:00:00.000Z"
         },
         "version": {
-            "number": "8.13.0",
+            "number": reported_version,
             "build_flavor": "default",
             "build_type": "docker",
             "minimum_wire_compatibility_version": "7.17.0",
@@ -28928,16 +29211,14 @@ mod ml_datafeed_tests {
             19.0, 21.0, 20.0, 20.0, 22.0, 18.0, 21.0, 20.0, 19.0, 21.0, 20.0, 22.0, 96.0, 20.0,
             21.0, 19.0,
         ];
-        let mut batch: Vec<(String, Value, std::sync::Arc<[u8]>)> = Vec::new();
+        let mut batch: Vec<(String, Value)> = Vec::new();
         for (i, v) in cpu.iter().enumerate() {
             let ts = base + chrono::Duration::minutes(i as i64);
             let doc = json!({
                 "@timestamp": ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 "cpu": v,
             });
-            let bytes: std::sync::Arc<[u8]> =
-                std::sync::Arc::from(serde_json::to_vec(&doc).unwrap());
-            batch.push((format!("m{i:02}"), doc, bytes));
+            batch.push((format!("m{i:02}"), doc));
         }
         idx.index_batch_turbo(batch, false, false).await.unwrap();
 
@@ -29103,12 +29384,11 @@ mod reindex_keyset_tests {
         // Index N docs with distinct _ids into `src` via the batched turbo
         // path (one WAL append) so the test isn't dominated by per-doc fsyncs.
         let src = state.engine.get_or_create_index("src").expect("src index");
-        let mut batch: Vec<(String, Value, std::sync::Arc<[u8]>)> = Vec::with_capacity(n);
+        let mut batch: Vec<(String, Value)> = Vec::with_capacity(n);
         for i in 0..n {
             let id = format!("doc-{i:06}");
             let v = json!({ "n": i });
-            let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(serde_json::to_vec(&v).unwrap());
-            batch.push((id, v, bytes));
+            batch.push((id, v));
         }
         src.index_batch_turbo(batch, true, false)
             .await

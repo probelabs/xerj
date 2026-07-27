@@ -2368,7 +2368,7 @@ impl Index {
     ///   failures are collected and returned rather than aborting the batch.
     pub async fn index_batch_turbo(
         &self,
-        docs: Vec<(String, Value, Arc<[u8]>)>,
+        docs: Vec<(String, Value)>,
         parallel: bool,
         _fast_analyzer: bool,
     ) -> Result<Vec<IndexResponse>> {
@@ -2454,8 +2454,8 @@ impl Index {
         // Build the pipeline with a batch size equal to the full input so it
         // never auto-flushes mid-way through.
         let mut pipeline = TurboIngestPipeline::new(batch_len + 1, parallel);
-        for (id, source, source_bytes) in docs {
-            pipeline.push(id, source, source_bytes);
+        for (id, source) in docs {
+            pipeline.push(id, source, Arc::<[u8]>::from([]));
         }
         // Flush collects all IngestResult values (with pre-computed tokens).
         let results = pipeline.flush();
@@ -2478,7 +2478,10 @@ impl Index {
                         id: r.id,
                         tokens: r.tokens,
                         source,
-                        source_bytes: r.source_bytes,
+                        // `copy_to` changed the parsed document.  Force WAL
+                        // serialization from that value so live indexing and
+                        // crash replay cannot observe different sources.
+                        source_bytes: Arc::<[u8]>::from([]),
                     }
                 })
                 .collect()
@@ -2507,15 +2510,9 @@ impl Index {
         // segments where 150 k were expected, thrashing the flush
         // path and triggering back-pressure 429s.  Rolled back.
         let t3 = std::time::Instant::now();
-        let wal_refs: Vec<(String, Arc<Value>, Arc<[u8]>)> = processed
+        let wal_refs: Vec<(String, Arc<Value>)> = processed
             .iter()
-            .map(|r| {
-                (
-                    r.id.clone(),
-                    Arc::clone(&r.source),
-                    Arc::clone(&r.source_bytes),
-                )
-            })
+            .map(|r| (r.id.clone(), Arc::clone(&r.source)))
             .collect();
 
         let wal_t = std::time::Instant::now();
@@ -2557,6 +2554,11 @@ impl Index {
         // most one chunk, not the whole batch.  `remove()` still precedes
         // each `insert_pretokenized_with_seq`, so overwrite semantics are
         // preserved regardless of the chunk boundary.
+        let copy_schema = if has_copy_to {
+            Some(self.schema.read().await)
+        } else {
+            None
+        };
         {
             let mut base = 0usize;
             while base < batch_len {
@@ -2565,12 +2567,25 @@ impl Index {
                     for i in base..end {
                         let ingest = &processed[i];
                         mem.remove(&ingest.id);
-                        mem.insert_pretokenized_with_seq(
-                            seq_nos[i],
-                            ingest.id.clone(),
-                            Arc::clone(&ingest.source),
-                            &ingest.tokens,
-                        );
+                        if let Some(schema) = copy_schema.as_ref() {
+                            // copy_to created fields after the turbo pipeline
+                            // emitted its (currently empty) token list. Analyze
+                            // the transformed source so the target is searchable
+                            // immediately, not only after flush/merge.
+                            mem.insert(
+                                ingest.id.clone(),
+                                &ingest.source,
+                                &schema.schema,
+                                seq_nos[i],
+                            );
+                        } else {
+                            mem.insert_pretokenized_with_seq(
+                                seq_nos[i],
+                                ingest.id.clone(),
+                                Arc::clone(&ingest.source),
+                                &ingest.tokens,
+                            );
+                        }
 
                         let version = self.doc_count.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -2585,6 +2600,7 @@ impl Index {
                 base = end;
             }
         }
+        drop(copy_schema);
         let t4_dur = t4.elapsed();
 
         if batch_len >= 1000 {
@@ -2686,17 +2702,10 @@ impl Index {
 
     /// M5.11 — ULTRA-turbo raw-bytes ingest.
     ///
-    /// Takes already-serialized NDJSON document lines and pushes them
-    /// through the WAL + memtable without ever running
-    /// `serde_json::from_str` on the document body.  The JSON parse is
-    /// deferred all the way to drain-for-flush time, where it runs on
-    /// a background task without contending with HTTP workers.
-    ///
-    /// Trade-off: schema auto-evolution and vector HNSW indexing do
-    /// NOT fire on this path — the parsed `Value` they need isn't
-    /// built.  Callers must pre-register the index mapping and avoid
-    /// vector fields on this endpoint.  Nginx-style log ingest is the
-    /// canonical use case.
+    /// Takes already-serialized NDJSON document lines, validates and parses
+    /// the complete batch once, then reuses those values for WAL, schema, and
+    /// FTS work. Validation precedes every write-side action: malformed input
+    /// cannot reserve sequence numbers, become replayable, or trigger a flush.
     pub async fn index_batch_turbo_raw(
         &self,
         docs: Vec<(String, Arc<[u8]>)>,
@@ -2704,6 +2713,7 @@ impl Index {
         if docs.is_empty() {
             return Ok(Vec::new());
         }
+        let batch_len = docs.len();
         if self.is_write_blocked().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
@@ -2713,7 +2723,16 @@ impl Index {
         // Process-wide admission: disk flood-stage block (item 3) + parent
         // memory circuit breaker (item 1). Fires before any per-index work.
         self.governor_write_gate()?;
-
+        let syntax_t = std::time::Instant::now();
+        let validated = crate::ingest_pool()
+            .install(|| xerj_storage::IndexStore::validate_raw_batch(docs))
+            .map_err(|error| match error {
+                xerj_storage::StorageError::RawBatchValidation { .. } => EngineError::Common(
+                    xerj_common::XerjError::invalid_document_json(error.to_string()),
+                ),
+                error => EngineError::Storage(error),
+            })?;
+        let syntax_elapsed = syntax_t.elapsed();
         let hard_block = self.flush_byte_threshold.saturating_mul(3);
         let soft_block = self.flush_byte_threshold.saturating_mul(2);
         {
@@ -2748,8 +2767,17 @@ impl Index {
             }
         }
 
+        let dom_t = std::time::Instant::now();
+        let validated = crate::ingest_pool()
+            .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
+            .map_err(|error| match error {
+                xerj_storage::StorageError::RawBatchValidation { .. } => EngineError::Common(
+                    xerj_common::XerjError::invalid_document_json(error.to_string()),
+                ),
+                error => EngineError::Storage(error),
+            })?;
+        let raw_parse_elapsed = syntax_elapsed.saturating_add(dom_t.elapsed());
         let index_start = std::time::Instant::now();
-        let batch_len = docs.len();
         // THROWAWAY prof (XERJ_PROF): per-phase attribution of the turbo path.
         let prof = std::env::var_os("XERJ_PROF").is_some();
         let mut p_wal_us = 0u128;
@@ -2759,18 +2787,43 @@ impl Index {
         let mut p_insert_us = 0u128;
         let p_t = std::time::Instant::now();
 
-        // Build WAL refs directly from bytes.  We pass `Arc<Value::Null>`
-        // as the `source` parameter because `wal_append_batch` uses
-        // `source_bytes` when it's non-empty and never touches the
-        // Value tree on the fast path.
-        let null_val: Arc<Value> = Arc::new(Value::Null);
-        let wal_refs: Vec<(String, Arc<Value>, Arc<[u8]>)> = docs
-            .iter()
-            .map(|(id, bytes)| (id.clone(), Arc::clone(&null_val), Arc::clone(bytes)))
-            .collect();
+        // The complete request was parsed before admission/back-pressure.
+        // Record that preflight in the optional phase profiler.
+        use rayon::prelude::*;
+        if prof {
+            p_parse_us = raw_parse_elapsed.as_micros();
+        }
 
+        let has_copy_to = {
+            let schema = self.schema.read().await;
+            schema_has_copy_to(&schema.schema)
+        };
         let wal_t = std::time::Instant::now();
-        let seq_nos = self.store.wal_append_batch(&wal_refs)?;
+        let (docs, sources, seq_nos) = if has_copy_to {
+            let (docs, parsed) = validated.into_parts();
+            let parsed = parsed.expect("parse_validated_raw_batch retains parsed values");
+            let schema = self.schema.read().await;
+            let sources: Vec<Arc<Value>> = parsed
+                .iter()
+                .map(|source| Arc::new(apply_copy_to(source, &schema.schema)))
+                .collect();
+            drop(schema);
+            let wal_docs: Vec<(String, Arc<Value>)> = docs
+                .iter()
+                .zip(&sources)
+                .map(|((id, _), source)| (id.clone(), Arc::clone(source)))
+                .collect();
+            let seq_nos = self.store.wal_append_batch(&wal_docs)?;
+            (docs, sources, seq_nos)
+        } else {
+            let seq_nos = self.store.wal_append_batch_raw(&validated)?;
+            let (docs, parsed) = validated.into_parts();
+            (
+                docs,
+                parsed.expect("parse_validated_raw_batch retains parsed values"),
+                seq_nos,
+            )
+        };
         // RC4 W4 item 2: WAL durability-write latency.
         if let Some(m) = crate::engine_metrics() {
             m.observe_wal_write(wal_t.elapsed().as_secs_f64());
@@ -2778,7 +2831,6 @@ impl Index {
         if prof {
             p_wal_us = p_t.elapsed().as_micros();
         }
-
         // Insert each doc EXACTLY ONCE into the engine FTS memtable,
         // routed to the doc's OWN shard — bit-for-bit identical to the
         // per-doc `index_document` path.
@@ -2822,32 +2874,6 @@ impl Index {
         // with its own `seq_nos[i]`; (b) `version` = prior doc_count +
         // position + 1, assigned in doc order via one batch-level
         // `fetch_add`; (c) response order matches request order.
-        use rayon::prelude::*;
-
-        // 1. Parse in parallel — each doc exactly once.  Arc-wrapped so
-        // the memtable entry can share the allocation (no deep clone at
-        // insert time — pre-fix `insert` did `Arc::new(source.clone())`
-        // per doc under the shard write lock).
-        //
-        // Runs on the dedicated ingest pool (`crate::ingest_pool`) so bulk
-        // parse bursts never queue ahead of search/agg par_iters on the
-        // global rayon pool — see the read-under-write collapse notes on
-        // `ingest_pool()`.
-        let p_t = std::time::Instant::now();
-        let sources: Vec<Arc<Value>> = crate::ingest_pool().install(|| {
-            docs.par_iter()
-                .map(|(_, bytes)| {
-                    Arc::new(
-                        serde_json::from_slice::<Value>(bytes)
-                            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
-                    )
-                })
-                .collect()
-        });
-        if prof {
-            p_parse_us = p_t.elapsed().as_micros();
-        }
-
         // 2. Dynamic mapping: evolve schema in doc order — batched (one
         // schema read-lock for the whole batch, not one per doc).
         let p_t = std::time::Instant::now();
@@ -2995,6 +3021,16 @@ impl Index {
         if docs.is_empty() {
             return Ok(0);
         }
+        let batch_len = docs.len();
+        self.governor_write_gate()?;
+        let validated = crate::ingest_pool()
+            .install(|| xerj_storage::IndexStore::validate_raw_batch(docs))
+            .map_err(|error| match error {
+                xerj_storage::StorageError::RawBatchValidation { .. } => EngineError::Common(
+                    xerj_common::XerjError::invalid_document_json(error.to_string()),
+                ),
+                error => EngineError::Storage(error),
+            })?;
 
         let hard_block = self.flush_byte_threshold.saturating_mul(3);
         let soft_block = self.flush_byte_threshold.saturating_mul(2);
@@ -3045,77 +3081,133 @@ impl Index {
         }
 
         let index_start = std::time::Instant::now();
-        let batch_len = docs.len();
-
-        // Fast-path WAL append: no Arc<Value> wrapper, no per-batch Vec
-        // allocation.  `wal_append_batch_raw` borrows docs directly.
         let wal_t = std::time::Instant::now();
-        let seq_nos = self.store.wal_append_batch_raw(&docs)?;
+        // Preserve copy_to semantics on the synchronous CLI path too. The
+        // common no-copy_to case keeps the sealed raw-byte WAL fast path.
+        // For the rare mapped case, materialize once, transform the sole
+        // source authority, and retain transformed bytes for the raw
+        // memtable so live GET, flush, and replay all observe the same value.
+        let has_copy_to = {
+            let schema = self.schema.try_read().map_err(|_| {
+                EngineError::Common(xerj_common::XerjError::resource_exhausted(
+                    "schema is being updated during synchronous ingest; retry the batch",
+                ))
+            })?;
+            schema_has_copy_to(&schema.schema)
+        };
+        let (docs, seq_nos, copy_schema) = if has_copy_to {
+            let validated = crate::ingest_pool()
+                .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
+                .map_err(EngineError::Storage)?;
+            let (raw_docs, parsed) = validated.into_parts();
+            let parsed = parsed.expect("parse_validated_raw_batch retains parsed values");
+            let schema = self.schema.try_read().map_err(|_| {
+                EngineError::Common(xerj_common::XerjError::resource_exhausted(
+                    "schema is being updated during synchronous ingest; retry the batch",
+                ))
+            })?;
+            let copy_schema = schema.schema.clone();
+            let transformed: Vec<Arc<Value>> = parsed
+                .iter()
+                .map(|source| Arc::new(apply_copy_to(source, &copy_schema)))
+                .collect();
+            drop(schema);
+            let wal_docs: Vec<(String, Arc<Value>)> = raw_docs
+                .iter()
+                .zip(&transformed)
+                .map(|((id, _), source)| (id.clone(), Arc::clone(source)))
+                .collect();
+            let seq_nos = self.store.wal_append_batch(&wal_docs)?;
+            let docs = raw_docs
+                .into_iter()
+                .zip(transformed)
+                .map(|((id, _), source)| {
+                    serde_json::to_vec(source.as_ref())
+                        .map(|bytes| (id, Arc::<[u8]>::from(bytes), Some(source)))
+                        .map_err(xerj_storage::StorageError::from)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            (docs, seq_nos, Some(copy_schema))
+        } else {
+            let seq_nos = self.store.wal_append_batch_raw(&validated)?;
+            let (docs, parsed) = validated.into_parts();
+            debug_assert!(parsed.is_none());
+            (
+                docs.into_iter()
+                    .map(|(id, bytes)| (id, bytes, None))
+                    .collect(),
+                seq_nos,
+                None,
+            )
+        };
         // RC4 W4 item 2: WAL durability-write latency.
         if let Some(m) = crate::engine_metrics() {
             m.observe_wal_write(wal_t.elapsed().as_secs_f64());
         }
 
-        // Use the instance method so routing matches the actual configured
-        // shard count. The previous `Self::shard_for` was hardcoded to a
-        // 16-shard mask and panicked on machines configured for fewer.
-        let shard_idx = self.memtable.shard_for_dynamic(&docs[0].0);
-        // Consume `docs` by value — move each (String, Arc<[u8]>) into
-        // the memtable without cloning.  The CLI bulk path generates
-        // unique doc_ids so `insert_raw_bytes_fresh` is safe (no prior
-        // entry with this id); we skip the `remove()` HashMap miss
-        // lookup that the generic `insert_raw_bytes_with_seq` preceded.
-        //
-        // READ-UNDER-WRITE stall reduction: the insert loop is CHUNKED so
-        // the shard write lock is released between chunks.  Previously a
-        // whole bulk batch (mixval: 10 000 docs) was routed to ONE shard and
-        // the write lock was held for the ENTIRE insert (~10-30 ms), so a
-        // concurrent search that touched that shard (`doc_ids_bounded`,
-        // `all_docs_with_sources_arc`, `terms_counts_columnar` all take
-        // `s.read()` on every shard) blocked for the full batch.  Chunking
-        // bounds a reader's *lock* stall on a writing shard to ONE chunk
-        // (~0.5-1.5 ms).  NOTE: measured in isolation this removes the
-        // shard-lock component of the read tail, but the mixed
-        // read-under-write p99 is dominated by CPU/scheduler contention with
-        // the full-speed ingest+flush+merge (already deprioritised via the
-        // nice-pool ladder), which this does not address — see commit body.
-        // The lock churn is trivial (batch_len/CHUNK acquisitions, e.g. 20
-        // for a 10 k batch) — nothing like the per-DOC locking that once
-        // caused the 4× ingest regression.  Correctness is unchanged:
-        // seq_nos are pre-assigned, inserts stay in seq order, and a flush
-        // drain that slips between chunks is safe (docs are independent and
-        // `take_memtable_for_flush` re-sorts by seq_no).
-        {
-            let mut docs_iter = docs.into_iter();
-            let mut i = 0usize;
-            while i < batch_len {
-                let end = (i + MEMTABLE_INSERT_CHUNK).min(batch_len);
-                self.memtable.with_shard_mut(shard_idx, |mem| {
-                    for &seq_no in &seq_nos[i..end] {
-                        let (id, bytes) = docs_iter
-                            .next()
-                            .expect("docs_iter yields exactly batch_len items");
-                        mem.insert_raw_bytes_fresh(seq_no, id, bytes);
-                    }
-                });
-                i = end;
-            }
+        // Partition by each document's own shard. The old sync path routed the
+        // entire batch to docs[0]'s shard, while GET/search route by each ID;
+        // every sibling ID hashing elsewhere was therefore invisible until
+        // flush. Preserve request order within each shard so duplicate IDs are
+        // deterministic last-write-wins.
+        let n_shards = self.memtable.shard_count().max(1);
+        let mut buckets: Vec<Vec<(u64, String, Arc<[u8]>, Option<Arc<Value>>)>> =
+            (0..n_shards).map(|_| Vec::new()).collect();
+        for (seq_no, (id, bytes, source)) in seq_nos.iter().copied().zip(docs) {
+            let shard = self.memtable.shard_for_dynamic(&id);
+            buckets[shard].push((seq_no, id, bytes, source));
         }
+        let touched_shards: Vec<usize> = crate::ingest_pool().install(|| {
+            use rayon::prelude::*;
+            buckets
+                .into_par_iter()
+                .enumerate()
+                .filter_map(|(shard, bucket)| {
+                    if bucket.is_empty() {
+                        return None;
+                    }
+                    for chunk in bucket.chunks(MEMTABLE_INSERT_CHUNK) {
+                        self.memtable.with_shard_mut(shard, |mem| {
+                            for (seq_no, id, bytes, source) in chunk {
+                                // `insert_raw_bytes_fresh` requires absence.
+                                // Remove unconditionally so an overwrite from
+                                // an earlier batch and a duplicate within this
+                                // batch have identical last-write-wins
+                                // semantics.
+                                mem.remove(id);
+                                if let (Some(source), Some(schema)) =
+                                    (source.as_ref(), copy_schema.as_ref())
+                                {
+                                    mem.insert(id.clone(), source, schema, *seq_no);
+                                } else {
+                                    mem.insert_raw_bytes_fresh(
+                                        *seq_no,
+                                        id.clone(),
+                                        Arc::clone(bytes),
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    Some(shard)
+                })
+                .collect()
+        });
         // Single batch-level atomic instead of one per doc.  At 1.7 M/s
         // × 10 k batch = 170 batches/s this cuts ~17 M atomic ops/s of
         // cache-line bouncing on `doc_count`.
         self.doc_count
             .fetch_add(batch_len as u64, Ordering::Relaxed);
 
-        // Cheap per-shard threshold check — one read-lock, one shard.
-        let n_shards = self.memtable.shard_count().max(1);
-        let per_shard_doc_t =
-            staggered_per_shard_threshold(self.flush_doc_threshold, shard_idx, n_shards);
-        let per_shard_byte_t =
-            staggered_per_shard_threshold(self.flush_byte_threshold, shard_idx, n_shards);
-        let (sd_docs, sd_bytes) = self.memtable.shard_load(shard_idx);
-        if sd_docs >= per_shard_doc_t || sd_bytes >= per_shard_byte_t {
-            self.try_spawn_sync_flush(shard_idx);
+        for shard in touched_shards {
+            let per_shard_doc_t =
+                staggered_per_shard_threshold(self.flush_doc_threshold, shard, n_shards);
+            let per_shard_byte_t =
+                staggered_per_shard_threshold(self.flush_byte_threshold, shard, n_shards);
+            let (sd_docs, sd_bytes) = self.memtable.shard_load(shard);
+            if sd_docs >= per_shard_doc_t || sd_bytes >= per_shard_byte_t {
+                self.try_spawn_sync_flush(shard);
+            }
         }
 
         let elapsed_ms = index_start.elapsed().as_millis() as u64;
@@ -10939,11 +11031,21 @@ impl Index {
         let all_docs: Vec<Value> = if need_full_corpus {
             // `_id` is injected onto each source so `top_hits` / `_id`-keyed
             // aggs over the corpus still work (the fast path never provided it).
+            // Arc-share out of the memtable (cheap refcount bump under the
+            // per-shard read lock — same fix `all_docs_with_sources_arc`
+            // already applies for the fast-agg path, see its doc comment),
+            // then deep-clone into owned `Value` AFTER the lock is released.
+            // `run_aggs_with_all` needs owned `Value`, but this was previously
+            // deep-cloning the whole memtable WHILE holding the shard lock —
+            // the dominant `hydrate+corpus` cost under concurrent dashboard
+            // load, where several panel queries serialize on the same
+            // per-shard RwLock while each does a full O(doc) clone under it.
             let mut docs: Vec<Value> = self
                 .memtable
-                .all_docs_with_sources()
+                .all_docs_with_sources_arc()
                 .into_iter()
-                .map(|(id, mut v)| {
+                .map(|(id, v)| {
+                    let mut v = (*v).clone();
                     if let Some(o) = v.as_object_mut() {
                         o.entry("_id".to_string())
                             .or_insert_with(|| Value::String(id));
@@ -10962,49 +11064,55 @@ impl Index {
                     deadline_exceeded = true;
                     break;
                 }
-                // Merge-race hardening (2026-07): open failures are
-                // errors, not skips — a skipped segment silently drops
-                // its docs from every aggregation bucket.  The read
-                // lease held by `snap_bg` keeps retired segment files
-                // on disk, so this only fires on genuine corruption.
-                let reader = self.store.open_segment_arc(&seg.id)?;
-                let stored_bytes_raw = match reader.section(SectionType::Stored) {
-                    Ok(Some(b)) => b,
-                    _ => continue,
+                // Cache-backed, single-flight decode: was an unconditional
+                // `open_segment_arc` + `decode_stored` + full JSON parse on
+                // EVERY search hitting this path — segments are immutable
+                // post-flush, so re-decoding the same segment's full stored
+                // section on every concurrent dashboard query (each paying
+                // the full decompress+parse again) was the dominant
+                // `hydrate+corpus` cost once data moved from memtable to
+                // segment (15-25s+ observed under a concurrent Kibana
+                // burst). `stored_values_for_async` is the same cache KNN
+                // search already relies on for this exact reason — first
+                // caller decodes and publishes, every other concurrent
+                // caller (single-flight) and every later query (cache hit)
+                // just clone the `Arc`.
+                let arr = match self.stored_values_for_async(&seg.id).await {
+                    Some(a) => a,
+                    // Segment unreadable (transient I/O, or merged away
+                    // under this pass's snapshot). A skipped segment
+                    // silently drops its docs from every aggregation
+                    // bucket, so surface it rather than continuing.
+                    None => {
+                        return Err(EngineError::Common(xerj_common::XerjError::internal(
+                            format!("segment {} unreadable during corpus assembly", seg.id),
+                        )));
+                    }
                 };
-                let stored_bytes = match xerj_storage::stored_codec::decode_stored(stored_bytes_raw)
-                {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                // serde_json — see ffd49ac. simd_json silently corrupts
-                // some M7 raw-bytes flush payloads.
-                if let Ok(arr) = serde_json::from_slice::<Vec<Value>>(&stored_bytes) {
-                    for d in arr {
-                        // Skip tombstoned docs.
-                        let id_ref = d.get("_id").and_then(Value::as_str).unwrap_or("");
-                        if let Some(ver) = self.store.version_map.get(id_ref) {
-                            if ver.deleted {
+                for d in arr.iter() {
+                    // Skip tombstoned docs.
+                    let id_ref = d.get("_id").and_then(Value::as_str).unwrap_or("");
+                    if let Some(ver) = self.store.version_map.get(id_ref) {
+                        if ver.deleted {
+                            continue;
+                        }
+                        // Superseded stale copy (b8 DEFECT T2) —
+                        // merge.rs stale-copy predicate.
+                        if let Some(doc_seq) = d.get("_seq_no").and_then(Value::as_u64) {
+                            if doc_seq < ver.seq_no {
                                 continue;
                             }
-                            // Superseded stale copy (b8 DEFECT T2) —
-                            // merge.rs stale-copy predicate.
-                            if let Some(doc_seq) = d.get("_seq_no").and_then(Value::as_u64) {
-                                if doc_seq < ver.seq_no {
-                                    continue;
-                                }
-                            }
                         }
-                        let id_owned = id_ref.to_string();
-                        let mut src = d.get("_source").cloned().unwrap_or(d);
-                        if let Some(o) = src.as_object_mut() {
-                            if !id_owned.is_empty() {
-                                o.entry("_id".to_string())
-                                    .or_insert(Value::String(id_owned));
-                            }
-                        }
-                        docs.push(src);
                     }
+                    let id_owned = id_ref.to_string();
+                    let mut src = d.get("_source").cloned().unwrap_or_else(|| d.clone());
+                    if let Some(o) = src.as_object_mut() {
+                        if !id_owned.is_empty() {
+                            o.entry("_id".to_string())
+                                .or_insert(Value::String(id_owned));
+                        }
+                    }
+                    docs.push(src);
                 }
             }
             // Enrich corpus docs with hit-level metadata so score/seq-sensitive
@@ -13088,8 +13196,26 @@ impl Index {
             if self.memtable.doc_count() == 0 {
                 0
             } else {
-                let target_str: Option<String> = value.as_str().map(String::from);
-                let target_num: Option<f64> = value.as_f64();
+                // `value.as_str()`/`.as_f64()` both return `None` for a
+                // JSON boolean, so a boolean-field term query previously
+                // never matched a single memtable-resident doc regardless
+                // of actual content — found empirically: `mem_doc_count`
+                // was non-zero (this branch DOES run) yet a real boolean
+                // filter still undercounted to a confident, wrong 0. Match
+                // `scored_fast_plan`'s `scoring_leaf` (already correct for
+                // this exact case) and the memtable's own on-insert
+                // encoding (`push_field`'s `Value::Bool` arm, which stores
+                // BOTH the 1.0/0.0 numeric form and the "true"/"false"
+                // keyword form) by coercing bool → both representations
+                // here too.
+                let target_str: Option<String> = match value {
+                    Value::Bool(b) => Some(b.to_string()),
+                    _ => value.as_str().map(String::from),
+                };
+                let target_num: Option<f64> = match value {
+                    Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                    _ => value.as_f64(),
+                };
                 let mut m = 0u64;
                 if let Some(tgt) = target_num {
                     m += self.memtable.doc_values_numeric_count(field, tgt) as u64;
@@ -13126,7 +13252,17 @@ impl Index {
             other => other.to_string(),
         };
         let lowered = raw.to_ascii_lowercase();
-        let target_num: Option<f64> = value.as_f64();
+        // Same bool coercion as the memtable side above — `value.as_f64()`
+        // alone returns `None` for a JSON boolean, which used to make
+        // `served_by_dv` false for every segment whose on-disk column for
+        // this field is `Column::Numeric` (the boolean encoding
+        // `build_doc_value_columns` always uses), falling through to an
+        // FTS lookup that has no real content for a non-analyzed boolean
+        // field and confidently returns 0 instead of the correct count.
+        let target_num: Option<f64> = match value {
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            _ => value.as_f64(),
+        };
 
         let mut seg_matches: u64 = 0;
         for meta in &snap.segments {
@@ -20639,6 +20775,17 @@ fn query_needs_id_injection(q: &QueryNode) -> bool {
     }
 }
 
+/// Coerce a `lat`/`lon` object member to `f64`. Real ES accepts numeric OR
+/// string-encoded lat/lon inside a `{"lat": .., "lon": ..}` geo_point object
+/// (normalised to numbers at index time) — Kibana's own flights sample data
+/// ships exactly this shape (`{"lat": "50.033333", ...}`), which `.as_f64()`
+/// alone silently rejects, turning every `geo_distance`/`geo_bounding_box`
+/// query against that field into an unconditional non-match.
+fn geo_coord(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 /// Evaluate a query against a single stored document source value.
 ///
 /// Returns true if the document matches the query.
@@ -21229,63 +21376,97 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
         QueryNode::MatchPhrase {
             field, query, slop, ..
         } => {
-            get_field_value(source, field)
-                .and_then(|v| match v {
-                    Value::String(s) => {
-                        let field_tokens: Vec<String> = s
-                            .to_lowercase()
-                            .split(|c: char| !c.is_alphanumeric())
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                        let query_tokens: Vec<String> = query
-                            .to_lowercase()
-                            .split(|c: char| !c.is_alphanumeric())
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                        if query_tokens.is_empty() {
-                            return Some(true);
-                        }
-                        if query_tokens.len() > field_tokens.len() {
-                            return Some(false);
-                        }
-                        // slop=0: exact contiguous phrase match in order.
-                        if *slop == 0 {
-                            let found = field_tokens
-                                .windows(query_tokens.len())
-                                .any(|w| w == query_tokens.as_slice());
-                            return Some(found);
-                        }
-                        // slop>0: ES enforces in-order positions with at
-                        // most `slop` intervening tokens between adjacent
-                        // query tokens. Find each query token AFTER the
-                        // previous one and sum the gaps.
-                        let mut last_pos: Option<usize> = None;
-                        let mut total_gaps: i64 = 0;
-                        let mut ordered_ok = true;
-                        for qt in &query_tokens {
-                            let search_start = last_pos.map(|p| p + 1).unwrap_or(0);
-                            match field_tokens[search_start..]
-                                .iter()
-                                .position(|ft| ft == qt)
-                                .map(|off| search_start + off)
-                            {
-                                Some(pos) => {
-                                    if let Some(prev) = last_pos {
-                                        total_gaps += (pos as i64 - prev as i64 - 1).max(0);
-                                    }
-                                    last_pos = Some(pos);
-                                }
-                                None => {
-                                    ordered_ok = false;
-                                    break;
-                                }
+            let query_tokens: Vec<String> = query
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            // Real ES tokenizes whatever the field holds — a
+            // `boolean`/numeric field's value is just its string form
+            // ("true"/"false", "42") for phrase-matching purposes. Pre-fix
+            // this arm only handled `Value::String`, so a `match_phrase`
+            // against a boolean field's `_source` value (a genuine JSON
+            // `Bool`, never a `String`) fell to the `_ => None` catch-all
+            // and NEVER matched any document, regardless of value — found
+            // empirically alongside the parser-level scalar-coercion fix
+            // for the *query* side (xerj-query's
+            // `match_phrase`/`match_phrase_prefix`): that fix stops the
+            // crash on `{query: true}`, but without this one the
+            // (now-valid) query still silently matched 0 documents.
+            fn matches_scalar(v: &Value, query_tokens: &[String], slop: u32) -> Option<bool> {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Bool(_) | Value::Number(_) => v.to_string(),
+                    _ => return None,
+                };
+                let field_tokens: Vec<String> = s
+                    .to_lowercase()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if query_tokens.is_empty() {
+                    return Some(true);
+                }
+                if query_tokens.len() > field_tokens.len() {
+                    return Some(false);
+                }
+                // slop=0: exact contiguous phrase match in order.
+                if slop == 0 {
+                    let found = field_tokens
+                        .windows(query_tokens.len())
+                        .any(|w| w == query_tokens);
+                    return Some(found);
+                }
+                // slop>0: ES enforces in-order positions with at most
+                // `slop` intervening tokens between adjacent query tokens.
+                // Find each query token AFTER the previous one and sum the
+                // gaps.
+                let mut last_pos: Option<usize> = None;
+                let mut total_gaps: i64 = 0;
+                let mut ordered_ok = true;
+                for qt in query_tokens {
+                    let search_start = last_pos.map(|p| p + 1).unwrap_or(0);
+                    match field_tokens[search_start..]
+                        .iter()
+                        .position(|ft| ft == qt)
+                        .map(|off| search_start + off)
+                    {
+                        Some(pos) => {
+                            if let Some(prev) = last_pos {
+                                total_gaps += (pos as i64 - prev as i64 - 1).max(0);
                             }
+                            last_pos = Some(pos);
                         }
-                        Some(ordered_ok && total_gaps <= *slop as i64)
+                        None => {
+                            ordered_ok = false;
+                            break;
+                        }
                     }
-                    _ => None,
+                }
+                Some(ordered_ok && total_gaps <= slop as i64)
+            }
+            get_field_value(source, field)
+                .and_then(|v| match &v {
+                    // Multi-valued field (e.g. eCommerce's `manufacturer`/
+                    // `category` arrays): ES matches if ANY element
+                    // satisfies the phrase — pre-fix this arm only handled
+                    // scalars, so a `match_phrase` against ANY array-valued
+                    // field (whether the plain field or a `.keyword`
+                    // multi-field sharing its value) silently matched 0
+                    // documents regardless of value.
+                    Value::Array(arr) => {
+                        if arr
+                            .iter()
+                            .any(|e| matches_scalar(e, &query_tokens, *slop) == Some(true))
+                        {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => matches_scalar(&v, &query_tokens, *slop),
                 })
                 .unwrap_or(false)
         }
@@ -21302,8 +21483,8 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                     // Accept {"lat": f64, "lon": f64} or [lon, lat] or "lat,lon".
                     let (doc_lat, doc_lon) = match &v {
                         Value::Object(obj) => {
-                            let dlat = obj.get("lat").and_then(|x| x.as_f64())?;
-                            let dlon = obj.get("lon").and_then(|x| x.as_f64())?;
+                            let dlat = geo_coord(obj.get("lat")?)?;
+                            let dlon = geo_coord(obj.get("lon")?)?;
                             (dlat, dlon)
                         }
                         Value::Array(arr) if arr.len() == 2 => {
@@ -21381,38 +21562,55 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
         }
 
         QueryNode::MatchPhrasePrefix { field, query, .. } => {
+            fn matches_str(s: &str, query: &str) -> Option<bool> {
+                let tokens: Vec<&str> = query.split_whitespace().collect();
+                if tokens.is_empty() {
+                    return Some(true);
+                }
+                let s_lower = s.to_lowercase();
+                let (prefix, exact_tokens) = match tokens.split_last() {
+                    Some(pair) => pair,
+                    None => return Some(true),
+                };
+                // All tokens except the last must appear as an ordered substring.
+                // Last token is a prefix match.
+                let phrase_without_last = exact_tokens.join(" ").to_lowercase();
+                let last_lower = prefix.to_lowercase();
+                if exact_tokens.is_empty() {
+                    // Only one token — prefix match on the whole query.
+                    Some(
+                        s_lower
+                            .split_whitespace()
+                            .any(|w| w.starts_with(last_lower.as_str())),
+                    )
+                } else {
+                    // Multi-token: check phrase prefix.
+                    if let Some(pos) = s_lower.find(&phrase_without_last) {
+                        let after = &s_lower[pos + phrase_without_last.len()..].trim_start();
+                        Some(after.starts_with(last_lower.as_str()))
+                    } else {
+                        Some(false)
+                    }
+                }
+            }
             get_field_value(source, field)
-                .and_then(|v| match v {
-                    Value::String(s) => {
-                        let tokens: Vec<&str> = query.split_whitespace().collect();
-                        if tokens.is_empty() {
-                            return Some(true);
-                        }
-                        let s_lower = s.to_lowercase();
-                        let (prefix, exact_tokens) = match tokens.split_last() {
-                            Some(pair) => pair,
-                            None => return Some(true),
-                        };
-                        // All tokens except the last must appear as an ordered substring.
-                        // Last token is a prefix match.
-                        let phrase_without_last = exact_tokens.join(" ").to_lowercase();
-                        let last_lower = prefix.to_lowercase();
-                        if exact_tokens.is_empty() {
-                            // Only one token — prefix match on the whole query.
-                            Some(
-                                s_lower
-                                    .split_whitespace()
-                                    .any(|w| w.starts_with(last_lower.as_str())),
-                            )
+                .and_then(|v| match &v {
+                    Value::String(s) => matches_str(s, query),
+                    // Multi-valued field: ES matches if ANY element
+                    // satisfies the phrase-prefix — pre-fix this arm only
+                    // handled a scalar string, so a `match_phrase_prefix`
+                    // against ANY array-valued field (or a `.keyword`
+                    // multi-field sharing an array field's value) silently
+                    // matched 0 documents regardless of value.
+                    Value::Array(arr) => {
+                        if arr.iter().any(|e| {
+                            e.as_str()
+                                .and_then(|s| matches_str(s, query))
+                                .unwrap_or(false)
+                        }) {
+                            Some(true)
                         } else {
-                            // Multi-token: check phrase prefix.
-                            if let Some(pos) = s_lower.find(&phrase_without_last) {
-                                let after =
-                                    &s_lower[pos + phrase_without_last.len()..].trim_start();
-                                Some(after.starts_with(last_lower.as_str()))
-                            } else {
-                                Some(false)
-                            }
+                            None
                         }
                     }
                     _ => None,
@@ -21501,8 +21699,8 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                 .and_then(|v| {
                     let (doc_lat, doc_lon) = match &v {
                         Value::Object(obj) => {
-                            let dlat = obj.get("lat").and_then(|x| x.as_f64())?;
-                            let dlon = obj.get("lon").and_then(|x| x.as_f64())?;
+                            let dlat = geo_coord(obj.get("lat")?)?;
+                            let dlon = geo_coord(obj.get("lon")?)?;
                             (dlat, dlon)
                         }
                         Value::Array(arr) if arr.len() == 2 => {
@@ -24241,7 +24439,41 @@ fn get_field_value(source: &Value, field: &str) -> Option<Value> {
         }
     }
     let parts: Vec<&str> = field.split('.').collect();
-    get_field_value_parts(source, &parts)
+    if let Some(v) = get_field_value_parts(source, &parts) {
+        return Some(v);
+    }
+    // ES multi-field fallback: `<field>.<subfield>` (e.g. `category.keyword`,
+    // `name.raw`) refers to a multi-field that shares the parent field's
+    // source value — `_source` never stores a separate value for the
+    // sub-field. Without this, every `term`/`match_phrase`/etc. brute-scan
+    // match against a `.keyword` multi-field silently matched nothing
+    // (`get_field_value_parts` has no such field to walk into), even though
+    // a `terms` aggregation on the identical field worked fine — aggs
+    // resolve fields via `get_nested_field` (aggs.rs), which already has
+    // this exact fallback. Strip the trailing segment and retry against the
+    // parent, same as that function does.
+    //
+    // Only trust this fallback when the parent resolves to a LEAF value
+    // (scalar, or an array with no objects) — a real multi-field's parent
+    // is always a leaf text/keyword value. A genuine nested/object field
+    // (`obj.inner_field`) that's simply absent on this doc must NOT be
+    // masked by its parent object: returning the whole `obj` here would
+    // make `exists: {field: "obj.inner_field"}` wrongly report the field
+    // as present just because the parent object exists (regression caught
+    // by the ES-compat YAML `exists_query` suite).
+    if let Some(idx) = field.rfind('.') {
+        if let Some(v) = get_field_value(source, &field[..idx]) {
+            let is_leaf = match &v {
+                Value::Object(_) => false,
+                Value::Array(arr) => !arr.iter().any(Value::is_object),
+                _ => true,
+            };
+            if is_leaf {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 fn get_field_value_parts(cur: &Value, parts: &[&str]) -> Option<Value> {
@@ -28271,5 +28503,553 @@ mod write_publication_integration_tests {
             before + 1,
             "successful delete invalidates cached responses exactly once"
         );
+    }
+
+    fn raw_test_docs(payloads: &[(&str, &[u8])]) -> Vec<(String, Arc<[u8]>)> {
+        payloads
+            .iter()
+            .map(|(id, bytes)| ((*id).to_owned(), Arc::<[u8]>::from(*bytes)))
+            .collect()
+    }
+
+    fn engine_wal_bytes(idx: &Index) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(idx.store.wal_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .map(|path| {
+                (
+                    path.file_name().unwrap().into(),
+                    std::fs::read(&path).unwrap(),
+                )
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    #[tokio::test]
+    async fn sync_raw_invalid_json_changes_no_engine_or_durable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("sync-raw-invalid", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("sync-raw-invalid").unwrap();
+        idx.index_document(Some("seed".to_owned()), json!({"existing": true}))
+            .await
+            .unwrap();
+
+        let invalid: &[&[u8]] = &[
+            br#"{"truncated":"#,
+            br#"{"valid":true} trailing"#,
+            &[0xff, 0xfe],
+            b"   \n\t",
+        ];
+        for (case, bad) in invalid.iter().enumerate() {
+            for bad_at in 0..3 {
+                let mut docs = raw_test_docs(&[
+                    ("first", br#"{"field":1}"#),
+                    ("middle", br#"{"field":2}"#),
+                    ("last", br#"{"field":3}"#),
+                ]);
+                docs[bad_at].1 = Arc::<[u8]>::from(*bad);
+                let ids: Vec<_> = docs.iter().map(|(id, _)| id.clone()).collect();
+                let before_seq = idx.store.current_seq_no();
+                let before_wal = engine_wal_bytes(&idx);
+                let before_vm = idx.store.version_map.len();
+                let before_mem = idx.memtable.size_bytes();
+                let before_count = idx.doc_count.load(Ordering::Acquire);
+                let before_dataset = idx.dataset_version.load(Ordering::Acquire);
+                let before_metric = idx.metric_index_count.load(Ordering::Acquire);
+                let before_schema = idx.schema.read().await.schema.clone();
+
+                let error = idx.index_batch_sync_raw(docs).unwrap_err();
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains(&format!("document [{}]", ids[bad_at]))
+                        && rendered.contains(&format!("batch position {}", bad_at + 1))
+                        && rendered.contains("Fix:")
+                        && rendered.contains("Related help:"),
+                    "case {case}, position {bad_at}: {error}"
+                );
+                assert_eq!(idx.store.current_seq_no(), before_seq);
+                assert_eq!(engine_wal_bytes(&idx), before_wal);
+                assert_eq!(idx.store.version_map.len(), before_vm);
+                assert_eq!(idx.memtable.size_bytes(), before_mem);
+                assert_eq!(idx.doc_count.load(Ordering::Acquire), before_count);
+                assert_eq!(idx.dataset_version.load(Ordering::Acquire), before_dataset);
+                assert_eq!(
+                    idx.metric_index_count.load(Ordering::Acquire),
+                    before_metric
+                );
+                assert_eq!(idx.schema.read().await.schema, before_schema);
+                for id in ids {
+                    assert!(idx.get_document(&id).await.unwrap().is_none());
+                }
+            }
+        }
+        let too_deep = format!("{}0{}", "[".repeat(256), "]".repeat(256)).into_bytes();
+        let before_seq = idx.store.current_seq_no();
+        let error = idx
+            .index_batch_sync_raw(vec![("too-deep".to_owned(), Arc::<[u8]>::from(too_deep))])
+            .unwrap_err();
+        assert!(error.to_string().contains("nesting exceeds"), "{error}");
+        assert_eq!(idx.store.current_seq_no(), before_seq);
+
+        drop(idx);
+        drop(engine);
+        let reopened = crate::Engine::new({
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            config
+        })
+        .unwrap();
+        let idx = reopened.get_index("sync-raw-invalid").unwrap();
+        assert_eq!(
+            idx.get_document("seed").await.unwrap().unwrap()["existing"],
+            true
+        );
+        for id in ["first", "middle", "last"] {
+            assert!(idx.get_document(id).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn async_raw_invalid_json_rejects_whole_batch_before_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("async-raw-invalid", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("async-raw-invalid").unwrap();
+        idx.index_document(Some("seed".to_owned()), json!({"existing": true}))
+            .await
+            .unwrap();
+        let invalid: &[&[u8]] = &[
+            br#"{"truncated":"#,
+            br#"{"valid":true} trailing"#,
+            &[0xff, 0xfe],
+            b"   \n\t",
+        ];
+        for (case, bad) in invalid.iter().enumerate() {
+            for bad_at in 0..3 {
+                let mut docs = raw_test_docs(&[
+                    ("good-first", br#"{"field":1}"#),
+                    ("middle", br#"{"field":2}"#),
+                    ("good-last", br#"{"field":3}"#),
+                ]);
+                docs[bad_at].1 = Arc::<[u8]>::from(*bad);
+                let before_seq = idx.store.current_seq_no();
+                let before_wal = engine_wal_bytes(&idx);
+                let before_schema = idx.schema.read().await.schema.clone();
+                let before_vm = idx.store.version_map.len();
+                let before_mem = idx.memtable.size_bytes();
+                let before_count = idx.doc_count.load(Ordering::Acquire);
+                let before_dataset = idx.dataset_version.load(Ordering::Acquire);
+                let before_metric = idx.metric_index_count.load(Ordering::Acquire);
+
+                let error = idx.index_batch_turbo_raw(docs).await.unwrap_err();
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains(&format!("batch position {}", bad_at + 1))
+                        && rendered.contains("Fix:")
+                        && rendered.contains("Related help:"),
+                    "case {case}, position {bad_at}: {error}"
+                );
+                assert_eq!(idx.store.current_seq_no(), before_seq);
+                assert_eq!(engine_wal_bytes(&idx), before_wal);
+                assert_eq!(idx.store.version_map.len(), before_vm);
+                assert_eq!(idx.memtable.size_bytes(), before_mem);
+                assert_eq!(idx.doc_count.load(Ordering::Acquire), before_count);
+                assert_eq!(idx.dataset_version.load(Ordering::Acquire), before_dataset);
+                assert_eq!(
+                    idx.metric_index_count.load(Ordering::Acquire),
+                    before_metric
+                );
+                assert_eq!(idx.schema.read().await.schema, before_schema);
+                assert_eq!(
+                    idx.get_document("seed").await.unwrap().unwrap()["existing"],
+                    true
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_ingest_apis_accept_complete_scalar_object_and_array_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("raw-valid", Schema::empty()).unwrap();
+        let idx = engine.get_index("raw-valid").unwrap();
+
+        assert_eq!(
+            idx.index_batch_sync_raw(raw_test_docs(&[
+                ("sync-scalar", b"42"),
+                ("sync-object", br#"{"answer":42}"#),
+                ("sync-array", b"[1,2,3]"),
+            ]))
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            idx.index_batch_turbo_raw(raw_test_docs(&[
+                ("async-scalar", b"true"),
+                ("async-object", br#"{"answer":43}"#),
+                ("async-array", b"[4,5,6]"),
+            ]))
+            .await
+            .unwrap()
+            .len(),
+            3
+        );
+        assert_eq!(idx.doc_count.load(Ordering::Acquire), 6);
+        assert_eq!(
+            idx.index_batch_sync_raw(raw_test_docs(&[
+                ("duplicate", br#"{"revision":1}"#),
+                ("duplicate", br#"{"revision":2}"#),
+            ]))
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            idx.get_document("duplicate").await.unwrap().unwrap(),
+            json!({"revision": 2})
+        );
+        let expected = [
+            ("sync-scalar", json!(42)),
+            ("sync-object", json!({"answer": 42})),
+            ("sync-array", json!([1, 2, 3])),
+            ("async-scalar", json!(true)),
+            ("async-object", json!({"answer": 43})),
+            ("async-array", json!([4, 5, 6])),
+            ("duplicate", json!({"revision": 2})),
+        ];
+        for (id, value) in &expected {
+            assert_eq!(idx.get_document(id).await.unwrap().as_ref(), Some(value));
+        }
+
+        idx.flush().await.unwrap();
+        for (id, value) in &expected {
+            assert_eq!(idx.get_document(id).await.unwrap().as_ref(), Some(value));
+        }
+        drop(idx);
+        drop(engine);
+
+        let reopened = crate::Engine::new({
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            config
+        })
+        .unwrap();
+        let idx = reopened.get_index("raw-valid").unwrap();
+        for (id, value) in &expected {
+            assert_eq!(idx.get_document(id).await.unwrap().as_ref(), Some(value));
+        }
+    }
+
+    #[tokio::test]
+    async fn turbo_copy_to_wal_replays_the_transformed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut title = FieldConfig::new("title", FieldType::Text);
+        title.options.null_value = Some(Value::String("__copy_to__:all_text".to_owned()));
+        schema.add_field(title).unwrap();
+        schema
+            .add_field(FieldConfig::new("all_text", FieldType::Text))
+            .unwrap();
+        engine.create_index("turbo-copy-to", schema).unwrap();
+        let idx = engine.get_index("turbo-copy-to").unwrap();
+        let source = json!({"title": "durable copied text"});
+
+        idx.index_batch_turbo(vec![("doc".to_owned(), source)], false, false)
+            .await
+            .unwrap();
+        let live = idx.get_document("doc").await.unwrap().unwrap();
+        assert_eq!(live["all_text"], "durable copied text");
+        let request = SearchRequest {
+            query: QueryNode::Match {
+                field: "all_text".to_owned(),
+                query: "durable copied".to_owned(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            ..SearchRequest::default()
+        };
+        // The raw sync path intentionally defers lexical analysis to flush,
+        // but the live memtable must already contain exactly one revision.
+        assert_eq!(idx.memtable.doc_count(), 1);
+        idx.flush().await.unwrap();
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        drop(idx);
+        drop(engine);
+
+        let reopened = crate::Engine::new({
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            config
+        })
+        .unwrap();
+        let replayed = reopened
+            .get_index("turbo-copy-to")
+            .unwrap()
+            .get_document("doc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed, live, "live and WAL replay sources diverged");
+        assert_eq!(
+            reopened
+                .get_index("turbo-copy-to")
+                .unwrap()
+                .search(&request)
+                .await
+                .unwrap()
+                .total
+                .value,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_turbo_copy_to_is_searchable_and_durable_after_flush_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut title = FieldConfig::new("title", FieldType::Text);
+        title.options.null_value = Some(Value::String("__copy_to__:all_text".to_owned()));
+        schema.add_field(title).unwrap();
+        schema
+            .add_field(FieldConfig::new("all_text", FieldType::Text))
+            .unwrap();
+        engine.create_index("raw-copy-to", schema).unwrap();
+        let idx = engine.get_index("raw-copy-to").unwrap();
+        idx.index_batch_turbo_raw(raw_test_docs(&[(
+            "doc",
+            br#"{"title":"raw durable copied text"}"#,
+        )]))
+        .await
+        .unwrap();
+        let expected = idx.get_document("doc").await.unwrap().unwrap();
+        assert_eq!(expected["title"], "raw durable copied text");
+        assert_eq!(expected["all_text"], "raw durable copied text");
+        let request = SearchRequest {
+            query: QueryNode::Match {
+                field: "all_text".to_owned(),
+                query: "raw durable".to_owned(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            ..SearchRequest::default()
+        };
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        idx.flush().await.unwrap();
+        assert_eq!(idx.get_document("doc").await.unwrap().unwrap(), expected);
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        drop(idx);
+        drop(engine);
+
+        let reopened = crate::Engine::new({
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            config
+        })
+        .unwrap();
+        let idx = reopened.get_index("raw-copy-to").unwrap();
+        assert_eq!(idx.get_document("doc").await.unwrap().unwrap(), expected);
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_raw_copy_to_is_searchable_and_durable_after_flush_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut title = FieldConfig::new("title", FieldType::Text);
+        title.options.null_value = Some(Value::String("__copy_to__:all_text".to_owned()));
+        schema.add_field(title).unwrap();
+        schema
+            .add_field(FieldConfig::new("all_text", FieldType::Text))
+            .unwrap();
+        engine.create_index("sync-raw-copy-to", schema).unwrap();
+        let idx = engine.get_index("sync-raw-copy-to").unwrap();
+        idx.index_batch_sync_raw(raw_test_docs(&[(
+            "doc",
+            br#"{"title":"sync durable copied text"}"#,
+        )]))
+        .unwrap();
+        let expected = idx.get_document("doc").await.unwrap().unwrap();
+        assert_eq!(expected["title"], "sync durable copied text");
+        assert_eq!(expected["all_text"], "sync durable copied text");
+        let request = SearchRequest {
+            query: QueryNode::Match {
+                field: "all_text".to_owned(),
+                query: "sync durable".to_owned(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            ..SearchRequest::default()
+        };
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        idx.flush().await.unwrap();
+        assert_eq!(idx.get_document("doc").await.unwrap().unwrap(), expected);
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        drop(idx);
+        drop(engine);
+
+        let reopened = crate::Engine::new({
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            config
+        })
+        .unwrap();
+        let idx = reopened.get_index("sync-raw-copy-to").unwrap();
+        assert_eq!(idx.get_document("doc").await.unwrap().unwrap(), expected);
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_raw_cross_batch_overwrite_is_single_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("sync-raw-overwrite", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("sync-raw-overwrite").unwrap();
+        idx.index_batch_sync_raw(raw_test_docs(&[(
+            "same-id",
+            br#"{"revision":1,"tag":"obsolete"}"#,
+        )]))
+        .unwrap();
+        idx.flush().await.unwrap();
+        idx.index_batch_sync_raw(raw_test_docs(&[(
+            "same-id",
+            br#"{"revision":2,"tag":"current"}"#,
+        )]))
+        .unwrap();
+        let expected = json!({"revision": 2, "tag": "current"});
+        assert_eq!(
+            idx.get_document("same-id").await.unwrap().as_ref(),
+            Some(&expected)
+        );
+        let request = SearchRequest {
+            query: QueryNode::Match {
+                field: "tag".to_owned(),
+                query: "current".to_owned(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            ..SearchRequest::default()
+        };
+        let obsolete_request = SearchRequest {
+            query: QueryNode::Match {
+                field: "tag".to_owned(),
+                query: "obsolete".to_owned(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            ..SearchRequest::default()
+        };
+        let aggregate_request = SearchRequest {
+            query: QueryNode::MatchAll,
+            size: 0,
+            aggs: Some(json!({
+                "tags": {"terms": {"field": "tag"}},
+                "revision_cardinality": {"cardinality": {"field": "revision"}},
+                "max_revision": {"max": {"field": "revision"}}
+            })),
+            ..SearchRequest::default()
+        };
+        assert_eq!(
+            idx.memtable.doc_count(),
+            1,
+            "cross-call overwrite must leave one live memtable entry"
+        );
+        // Ordinary sync raw ingest defers lexical analysis until flush. The
+        // disk-old/memory-new overlap must nevertheless hide stale postings;
+        // exact source, logical count, and aggregations use revision 2.
+        assert_eq!(idx.search(&obsolete_request).await.unwrap().total.value, 0);
+        let aggregate = idx.search(&aggregate_request).await.unwrap();
+        assert_eq!(aggregate.total.value, 1);
+        let aggs = aggregate.aggs.unwrap();
+        assert_eq!(aggs["revision_cardinality"]["value"], 1);
+        assert_eq!(aggs["max_revision"]["value"], 2.0);
+        assert_eq!(aggs["tags"]["buckets"].as_array().unwrap().len(), 1);
+        assert_eq!(aggs["tags"]["buckets"][0]["key"], "current");
+        drop(idx);
+        drop(engine);
+
+        // Revision 2 exists only in WAL/memory here. Restart must replay it
+        // over the durable revision-1 segment without exposing stale terms or
+        // double-counting the logical document.
+        let reopened = crate::Engine::new({
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            config
+        })
+        .unwrap();
+        let idx = reopened.get_index("sync-raw-overwrite").unwrap();
+        assert_eq!(
+            idx.get_document("same-id").await.unwrap().as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        assert_eq!(idx.search(&obsolete_request).await.unwrap().total.value, 0);
+        let aggregate = idx.search(&aggregate_request).await.unwrap();
+        assert_eq!(aggregate.total.value, 1);
+        assert_eq!(aggregate.aggs.unwrap()["max_revision"]["value"], 2.0);
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(reopened);
+
+        // The same invariants must survive publication of revision 2 and a
+        // second restart.
+        let reopened_after_second_flush = crate::Engine::new({
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            config
+        })
+        .unwrap();
+        let idx = reopened_after_second_flush
+            .get_index("sync-raw-overwrite")
+            .unwrap();
+        assert_eq!(
+            idx.get_document("same-id").await.unwrap().as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        assert_eq!(idx.search(&obsolete_request).await.unwrap().total.value, 0);
+        let aggregate = idx.search(&aggregate_request).await.unwrap();
+        assert_eq!(aggregate.total.value, 1);
+        let aggs = aggregate.aggs.unwrap();
+        assert_eq!(aggs["revision_cardinality"]["value"], 1);
+        assert_eq!(aggs["max_revision"]["value"], 2.0);
+        assert_eq!(aggs["tags"]["buckets"].as_array().unwrap().len(), 1);
+        assert_eq!(aggs["tags"]["buckets"][0]["key"], "current");
     }
 }

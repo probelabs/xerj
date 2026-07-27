@@ -2521,15 +2521,56 @@ fn extract_date_ranges(doc: &Value, field: &str) -> Vec<(i64, i64)> {
 
 // ── Terms aggregation ─────────────────────────────────────────────────────────
 
+/// Resolve a terms agg's bucket key(s) for one doc, from either a `field`
+/// (the common case) or a Painless `script` (e.g. Kibana's script-bucketed
+/// terms aggs like a heatmap's hour-of-day axis). Scripts are evaluated with
+/// the same `crate::painless` engine already proven correct for
+/// `script_fields`/`top_hits` — this just wires it into the one place that
+/// previously only understood `field` and silently produced zero buckets
+/// for a script-only terms agg.
+fn terms_agg_bucket_keys(field_or_script: &FieldOrScript, doc: &Value) -> Vec<String> {
+    match field_or_script {
+        FieldOrScript::Field(field) => extract_field_values(doc, field),
+        FieldOrScript::Script { source, params } => {
+            let ctx = crate::painless::PainlessCtx::new(doc, params, 0.0);
+            match crate::painless::eval_painless(source, &ctx) {
+                Ok(pv) => flatten_to_strings(&painless_value_to_json(pv)),
+                Err(_) => vec![],
+            }
+        }
+    }
+}
+
+enum FieldOrScript {
+    Field(String),
+    Script { source: String, params: Value },
+}
+
 fn run_terms(
     params: &Value,
     sub_aggs: Option<&Value>,
     docs: &[Value],
     all_docs: &[Value],
 ) -> Value {
-    let field = match params.get("field").and_then(Value::as_str) {
-        Some(f) => f,
-        None => return json!({"buckets": []}),
+    let field_or_script = match params.get("field").and_then(Value::as_str) {
+        Some(f) => FieldOrScript::Field(f.to_string()),
+        None => match params.get("script") {
+            Some(script) => {
+                let Some(source) = script
+                    .get("source")
+                    .or_else(|| script.get("inline"))
+                    .and_then(Value::as_str)
+                else {
+                    return json!({"buckets": []});
+                };
+                let script_params = script.get("params").cloned().unwrap_or(json!({}));
+                FieldOrScript::Script {
+                    source: source.to_string(),
+                    params: script_params,
+                }
+            }
+            None => return json!({"buckets": []}),
+        },
     };
     // ES semantics: size=0 means "return all buckets" (no cap).
     // Any other value caps the result; the default is 10.
@@ -2561,7 +2602,7 @@ fn run_terms(
     let bucket_cap = max_buckets();
     for doc in docs {
         let weight = doc_count_weight(doc);
-        let vals = extract_field_values(doc, field);
+        let vals = terms_agg_bucket_keys(&field_or_script, doc);
         if vals.is_empty() {
             if let Some(ph) = &missing_placeholder {
                 // Bucket cap: skip new keys past the limit, but always
@@ -2590,7 +2631,7 @@ fn run_terms(
         .unwrap_or(1);
     if min_doc_count_preview == 0 {
         for doc in all_docs {
-            for term in extract_field_values(doc, field) {
+            for term in terms_agg_bucket_keys(&field_or_script, doc) {
                 if counts.contains_key(&term) || counts.len() < bucket_cap {
                     counts.entry(term).or_insert(0);
                 }
@@ -2744,7 +2785,7 @@ fn run_terms(
             .unwrap_or(false);
         docs.iter()
             .filter(|doc| {
-                let vals = extract_field_values(doc, field);
+                let vals = terms_agg_bucket_keys(&field_or_script, doc);
                 if is_missing_bucket {
                     vals.is_empty()
                 } else {
@@ -2795,7 +2836,7 @@ fn run_terms(
             let bucket_docs: Vec<Value> = docs
                 .iter()
                 .filter(|doc| {
-                    let vals = extract_field_values(doc, field);
+                    let vals = terms_agg_bucket_keys(&field_or_script, doc);
                     if is_missing_bucket {
                         vals.is_empty()
                     } else {
@@ -8564,6 +8605,17 @@ fn encode_geohash(lat: f64, lon: f64, precision: usize) -> String {
     String::from_utf8(hash).unwrap_or_default()
 }
 
+/// Coerce a `lat`/`lon` object member to `f64`. Real ES accepts numeric
+/// OR string-encoded lat/lon inside a `{"lat": .., "lon": ..}` geo_point
+/// object (normalised to numbers at index time) — Kibana's own flights
+/// sample data ships exactly this shape (`{"lat": "50.033333", ...}`),
+/// which `.as_f64()` alone silently rejects (`None` for every doc, so
+/// every geo agg/query on that field returns empty).
+fn geo_coord(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 /// Extract a (lat, lon) pair from an ES geo_point value.
 /// Accepts:
 ///   - {"lat": 1.0, "lon": 2.0}
@@ -8574,8 +8626,8 @@ fn encode_geohash(lat: f64, lon: f64, precision: usize) -> String {
 fn parse_geo_point(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Object(o) => {
-            let lat = o.get("lat")?.as_f64()?;
-            let lon = o.get("lon")?.as_f64()?;
+            let lat = geo_coord(o.get("lat")?)?;
+            let lon = geo_coord(o.get("lon")?)?;
             Some((lat, lon))
         }
         Value::Array(arr) if arr.len() == 2 => {
@@ -9872,8 +9924,10 @@ fn run_extended_stats<'d>(params: &Value, _docs: &'d [Value], cache: &mut FieldC
 fn extract_geo_point(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Object(obj) => {
-            let lat = obj.get("lat").and_then(Value::as_f64)?;
-            let lon = obj.get("lon").and_then(Value::as_f64)?;
+            // See `geo_coord`: string-encoded lat/lon (Kibana's own flights
+            // sample data) must be accepted, not just numeric.
+            let lat = geo_coord(obj.get("lat")?)?;
+            let lon = geo_coord(obj.get("lon")?)?;
             Some((lat, lon))
         }
         Value::String(s) => {
@@ -9909,13 +9963,13 @@ fn run_geo_bounds(params: &Value, docs: &[Value]) -> Value {
     let mut max_lon = f64::NEG_INFINITY;
 
     for doc in docs {
-        if let Some(v) = doc.get(field) {
-            if let Some((lat, lon)) = extract_geo_point(v) {
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-            }
+        // See `run_geo_centroid` — nested geo_point fields (e.g.
+        // `geoip.location`) are invisible to a flat `doc.get(field)`.
+        if let Some((lat, lon)) = extract_geo_point(get_nested_field(doc, field)) {
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
         }
     }
 
@@ -9943,12 +9997,14 @@ fn run_geo_centroid(params: &Value, docs: &[Value]) -> Value {
     let mut count = 0usize;
 
     for doc in docs {
-        if let Some(v) = doc.get(field) {
-            if let Some((lat, lon)) = extract_geo_point(v) {
-                sum_lat += lat;
-                sum_lon += lon;
-                count += 1;
-            }
+        // `get_nested_field`, not a flat `doc.get(field)` — geo_point
+        // fields are routinely nested (e.g. eCommerce's `geoip.location`),
+        // and a flat lookup never finds them (silent `null` centroid, which
+        // Kibana's map viz then crashes reading `.lon` off).
+        if let Some((lat, lon)) = extract_geo_point(get_nested_field(doc, field)) {
+            sum_lat += lat;
+            sum_lon += lon;
+            count += 1;
         }
     }
 

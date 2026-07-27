@@ -465,6 +465,14 @@ impl Engine {
         // requests (i.e. here in `new`), and is cheap (one small JSON file).
         engine.load_persisted_api_keys();
 
+        // Restore persisted aliases so e.g. `.kibana` (always an alias,
+        // never a bare index) still resolves after a restart — see
+        // `load_persisted_aliases`'s doc comment for the concrete failure
+        // this caused (OpenSearch Dashboards stuck indefinitely on every
+        // restart, mistaking a missing-alias 404 for a still-in-progress
+        // migration by another instance).
+        engine.load_persisted_aliases();
+
         // Spawn the PIT sweeper. Pre-v0.6.2 PITs accumulated forever;
         // every open without close was a memory leak. The sweeper
         // walks `engine.pits` every `pit.sweep_interval_secs` and
@@ -967,12 +975,75 @@ impl Engine {
 
     // ── Alias methods ─────────────────────────────────────────────────────────
 
+    /// Path of the persisted alias catalog (`<data_dir>/aliases.json`).
+    fn aliases_path(&self) -> PathBuf {
+        self.data_dir.join("aliases.json")
+    }
+
+    /// Serialize the current `aliases` map to `<data_dir>/aliases.json`
+    /// atomically (temp-file + rename), mirroring `flush_api_keys`. Every
+    /// alias mutation snapshots the full map; a write failure is logged but
+    /// non-fatal (the alias still works in-memory until the next restart).
+    fn flush_aliases(&self) {
+        let snapshot: std::collections::HashMap<String, Vec<String>> = self
+            .aliases
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let bytes = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize aliases for persistence");
+                return;
+            }
+        };
+        if let Err(e) = crate::index::write_file_atomic(&self.aliases_path(), &bytes) {
+            warn!(error = %e, "failed to persist aliases.json (aliases work until restart)");
+        }
+    }
+
+    /// Load persisted aliases from `<data_dir>/aliases.json` into the
+    /// in-memory map on boot. A missing file is normal (fresh node / no
+    /// aliases ever created); a corrupt file is logged and ignored.
+    ///
+    /// Without this, `.kibana` (always an alias, never a bare index —
+    /// Kibana/OpenSearch Dashboards create it via `PUT .kibana_1` +
+    /// `POST _aliases`) silently stopped resolving on every restart: the
+    /// backing index's data survived, but the alias pointing at it didn't,
+    /// so `GET /.kibana` 404'd and OSD's saved-objects migrator concluded
+    /// the migration was still in progress (never actually completing) —
+    /// found empirically via a real OpenSearch Dashboards container stuck
+    /// on "Another OpenSearch Dashboards instance appears to be migrating
+    /// the index" on every restart, indefinitely.
+    fn load_persisted_aliases(&self) {
+        let path = self.aliases_path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        match serde_json::from_slice::<std::collections::HashMap<String, Vec<String>>>(&bytes) {
+            Ok(map) => {
+                let n = map.len();
+                for (alias, indices) in map {
+                    self.aliases.insert(alias, indices);
+                }
+                if n > 0 {
+                    info!(count = n, "restored persisted aliases");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "ignoring corrupt aliases.json");
+            }
+        }
+    }
+
     /// Add an alias pointing to an index.
     pub fn add_alias(&self, alias: &str, index: &str) {
         let mut entry = self.aliases.entry(alias.to_string()).or_default();
         if !entry.contains(&index.to_string()) {
             entry.push(index.to_string());
         }
+        drop(entry);
+        self.flush_aliases();
     }
 
     /// Remove an alias's association with an index.
@@ -982,6 +1053,7 @@ impl Engine {
         }
         // Clean up empty alias entries.
         self.aliases.retain(|_, v| !v.is_empty());
+        self.flush_aliases();
     }
 
     /// Resolve a name: if it's an alias, return the aliased index names;
@@ -1023,6 +1095,7 @@ impl Engine {
         for a in empty_aliases {
             self.aliases.remove(&a);
         }
+        self.flush_aliases();
 
         self.closed_indices.remove(name);
         self.index_settings.remove(name);
@@ -1283,6 +1356,8 @@ impl Engine {
             if !entry.contains(&new_backing) {
                 entry.push(new_backing.clone());
             }
+            drop(entry);
+            self.flush_aliases();
         } else {
             self.add_alias(name, &new_backing);
         }
@@ -1309,6 +1384,7 @@ impl Engine {
 
         // Remove the alias.
         self.aliases.remove(name);
+        self.flush_aliases();
 
         // Delete every backing index.
         for backing in &ds.backing_indices {

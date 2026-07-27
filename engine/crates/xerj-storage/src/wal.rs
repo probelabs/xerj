@@ -95,7 +95,17 @@ const WAL_FRAME_OVERHEAD: usize = 17;
 const WAL_MAX_ENTRY_LEN: u32 = 1 << 30; // 1 GiB
 
 /// BufWriter capacity shared by open/rotate/recovery reseats.
-const WAL_BUF_CAP: usize = 8 * 1024 * 1024;
+///
+/// Every append drains this userspace buffer before acknowledging the write,
+/// so a multi-megabyte capacity cannot batch across requests.  Keeping it at
+/// a conventional I/O-buffer size bounds idle retention when every index owns
+/// multiple WAL shards (the old 8 MiB capacity retained 1 GiB for 128 shards).
+///
+/// Capacity is an allocation/coalescing bound only: frame payloads may be
+/// larger than `WAL_BUF_CAP` (up to `WAL_MAX_ENTRY_LEN`).  Rust's `BufWriter`
+/// flushes and issues direct writes for oversized `write_all` slices, so
+/// correctness of large records is independent of this constant.
+const WAL_BUF_CAP: usize = 64 * 1024;
 
 // Op codes
 const OP_INDEX: u8 = 0x01;
@@ -328,6 +338,15 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
+    /// Userspace `BufWriter` capacity for this writer (test/instrumentation).
+    ///
+    /// Always equals [`WAL_BUF_CAP`] after open, rotate, truncate-reseat, and
+    /// fresh-generation recovery.  Does not grow with record size.
+    #[cfg(test)]
+    pub(crate) fn buffer_capacity(&self) -> usize {
+        self.writer.capacity()
+    }
+
     /// Open (or create) the WAL in `dir`.
     ///
     /// If a WAL file for the latest generation already exists it is opened for
@@ -1835,6 +1854,11 @@ mod tests {
             source: serde_json::json!({"v": 2, "pad": "x".repeat(64)}),
         });
         assert!(err.is_err(), "append during ENOSPC must NACK");
+        assert_eq!(
+            w.buffer_capacity(),
+            WAL_BUF_CAP,
+            "truncate-and-reseat recovery must preserve the bounded capacity"
+        );
 
         // Space frees up (recovery reseated the writer on a clean fd, so
         // the fault is naturally gone) — C is acked.
@@ -1907,6 +1931,27 @@ mod tests {
         assert!(clean);
         assert_eq!(entries.len(), 2, "only a and c survive: {entries:?}");
         assert_eq!(entries[1].seq_no, seq_c);
+        assert_eq!(
+            w.buffer_capacity(),
+            WAL_BUF_CAP,
+            "batch error recovery must preserve the bounded capacity"
+        );
+        drop(w);
+
+        // Batched mode flushes each acknowledged append into the kernel even
+        // though it does not fsync inline. Reopen must retain every acked
+        // frame and use the same bounded writer capacity.
+        let reopened =
+            WalWriter::open(dir.path(), 64 * 1024 * 1024, SyncMode::Batched, seq_ctr).unwrap();
+        assert_eq!(reopened.buffer_capacity(), WAL_BUF_CAP);
+        drop(reopened);
+        let replayed: Vec<_> = WalReader::new(dir.path())
+            .replay()
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[1].seq_no, seq_c);
     }
 
     /// Crash-torn tail heal at open: a partial frame left at the file
@@ -2069,5 +2114,205 @@ mod tests {
         let reader = WalReader::new(dir.path());
         let entries: Vec<_> = reader.replay().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn bounded_buffer_survives_append_rotate_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let seq_counter = Arc::new(AtomicU64::new(1));
+        let mut writer = WalWriter::open(
+            dir.path(),
+            64 * 1024 * 1024,
+            SyncMode::Strict,
+            Arc::clone(&seq_counter),
+        )
+        .unwrap();
+        assert_eq!(writer.buffer_capacity(), WAL_BUF_CAP);
+
+        let first = WalEntry::Index {
+            doc_id: "before-rotate".into(),
+            source: serde_json::json!({"payload": "durable"}),
+        };
+        assert_eq!(writer.append(&first).unwrap(), 1);
+        writer.rotate().unwrap();
+        assert_eq!(writer.buffer_capacity(), WAL_BUF_CAP);
+
+        let second = WalEntry::Index {
+            doc_id: "after-rotate".into(),
+            source: serde_json::json!({"payload": "also durable"}),
+        };
+        assert_eq!(writer.append(&second).unwrap(), 2);
+        drop(writer);
+
+        let reopened =
+            WalWriter::open(dir.path(), 64 * 1024 * 1024, SyncMode::Strict, seq_counter).unwrap();
+        assert_eq!(reopened.buffer_capacity(), WAL_BUF_CAP);
+        drop(reopened);
+
+        let entries: Vec<_> = WalReader::new(dir.path())
+            .replay()
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq_no, 1);
+        assert_eq!(entries[1].seq_no, 2);
+    }
+
+    /// Records smaller than, equal to, and much larger than `WAL_BUF_CAP`
+    /// must all survive append, forced rotation (truncation of generations),
+    /// reopen, and exact replay.  Capacity stays fixed regardless of payload.
+    #[test]
+    fn records_across_buffer_capacity_survive_append_rotate_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let seq_counter = Arc::new(AtomicU64::new(1));
+        let mut writer = WalWriter::open(
+            dir.path(),
+            // Force rotation after a few large frames.
+            256 * 1024,
+            SyncMode::Batched,
+            Arc::clone(&seq_counter),
+        )
+        .unwrap();
+        assert_eq!(writer.buffer_capacity(), WAL_BUF_CAP);
+
+        // High-entropy printable so LZ4 cannot collapse oversized payloads
+        // back under the buffer capacity.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mk_payload = |n: usize, salt: u32| {
+            let mut state = salt;
+            let body: String = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    alphabet[state as usize % alphabet.len()] as char
+                })
+                .collect();
+            serde_json::json!({"body": body, "n": n})
+        };
+
+        let shapes: &[(usize, &str)] = &[
+            (64, "small"),
+            (WAL_BUF_CAP, "equal-cap"),
+            (WAL_BUF_CAP * 2 + 17, "2x-cap"),
+            (131_072, "131kib"),
+        ];
+        let mut expected_ids = Vec::new();
+        for (size, label) in shapes {
+            for copy in 0..3 {
+                let doc_id = format!("{label}-{copy}");
+                let seq = writer
+                    .append(&WalEntry::Index {
+                        doc_id: doc_id.clone(),
+                        source: mk_payload(*size, (size + copy) as u32 + 0x9e37_79b9),
+                    })
+                    .unwrap();
+                assert!(seq > 0);
+                expected_ids.push(doc_id);
+                assert_eq!(
+                    writer.buffer_capacity(),
+                    WAL_BUF_CAP,
+                    "capacity must not grow with record size {size}"
+                );
+            }
+        }
+        writer.force_rotate().unwrap();
+        assert_eq!(writer.buffer_capacity(), WAL_BUF_CAP);
+
+        // One more append after rotate to prove the new generation is live.
+        let final_id = "post-rotate".to_string();
+        writer
+            .append(&WalEntry::Index {
+                doc_id: final_id.clone(),
+                source: mk_payload(128, 7),
+            })
+            .unwrap();
+        expected_ids.push(final_id);
+        drop(writer);
+
+        let reopened = WalWriter::open(
+            dir.path(),
+            256 * 1024,
+            SyncMode::Batched,
+            Arc::clone(&seq_counter),
+        )
+        .unwrap();
+        assert_eq!(reopened.buffer_capacity(), WAL_BUF_CAP);
+        drop(reopened);
+
+        let replayed: Vec<_> = WalReader::new(dir.path())
+            .replay()
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        let ids: Vec<String> = replayed
+            .iter()
+            .map(|e| match &e.entry {
+                WalEntry::Index { doc_id, .. } => doc_id.clone(),
+                other => panic!("unexpected entry {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, expected_ids);
+    }
+
+    /// Concurrent shard writers sharing one sequence counter must keep the
+    /// bounded capacity and produce an exact combined replay set.
+    #[test]
+    fn concurrent_shard_writers_preserve_capacity_and_exact_replay() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let root = tempfile::tempdir().unwrap();
+        let seq = Arc::new(AtomicU64::new(1));
+        let barrier = Arc::new(Barrier::new(5));
+        let mut handles = Vec::new();
+        for shard in 0..4 {
+            let dir = root.path().join(format!("s{shard}"));
+            fs::create_dir_all(&dir).unwrap();
+            let seq = Arc::clone(&seq);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let mut w =
+                    WalWriter::open(&dir, 64 * 1024 * 1024, SyncMode::Batched, seq).unwrap();
+                assert_eq!(w.buffer_capacity(), WAL_BUF_CAP);
+                barrier.wait();
+                for i in 0..50 {
+                    let pad = if i % 10 == 0 {
+                        "X".repeat(WAL_BUF_CAP + 256)
+                    } else {
+                        "y".repeat(32)
+                    };
+                    w.append(&WalEntry::Index {
+                        doc_id: format!("s{shard}-{i}"),
+                        source: serde_json::json!({"pad": pad}),
+                    })
+                    .unwrap();
+                }
+                w.sync().unwrap();
+                assert_eq!(w.buffer_capacity(), WAL_BUF_CAP);
+            }));
+        }
+        barrier.wait();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut total = 0usize;
+        for shard in 0..4 {
+            let dir = root.path().join(format!("s{shard}"));
+            let replayed: Vec<_> = WalReader::new(&dir)
+                .replay()
+                .unwrap()
+                .map(|e| e.unwrap())
+                .collect();
+            assert_eq!(replayed.len(), 50);
+            total += replayed.len();
+            let reopened =
+                WalWriter::open(&dir, 64 * 1024 * 1024, SyncMode::Batched, Arc::clone(&seq))
+                    .unwrap();
+            assert_eq!(reopened.buffer_capacity(), WAL_BUF_CAP);
+        }
+        assert_eq!(total, 200);
     }
 }

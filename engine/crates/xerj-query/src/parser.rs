@@ -369,6 +369,15 @@ fn parse_match(params: &Value) -> Result<QueryNode> {
     let (field, value) = obj.iter().next().unwrap();
     let field = field.clone();
 
+    // An empty query string is valid ES syntax that simply has no analyzed
+    // terms to match — real ES treats it leniently (match_none), not as a
+    // parse error. Kibana's own SavedObjectsClient `_find` builds exactly
+    // this for a trailing-`*` search term (`"*".replace(/\*$/, '')` →
+    // `""`), so without this every `_find?search=*` 400s.
+    if matches!(value, Value::String(s) if s.is_empty()) {
+        return Ok(QueryNode::MatchNone);
+    }
+
     // Shorthand forms: `match: {field: "value"}`, `match: {field: 42}`,
     // `match: {field: true}`.  ES silently stringifies non-strings.
     if let Some(query) = scalar_to_string(value) {
@@ -385,6 +394,10 @@ fn parse_match(params: &Value) -> Result<QueryNode> {
     let vobj = value
         .as_object()
         .ok_or_else(|| qerr("`match` field value must be a scalar or object"))?;
+
+    if matches!(vobj.get("query"), Some(Value::String(s)) if s.is_empty()) {
+        return Ok(QueryNode::MatchNone);
+    }
 
     // Inside the object form, `query` can also be a number / bool.
     let query = vobj
@@ -439,10 +452,18 @@ fn parse_match_phrase(params: &Value) -> Result<QueryNode> {
     let (field, value) = obj.iter().next().unwrap();
     let field = field.clone();
 
-    if let Some(query) = value.as_str() {
+    // Empty query string → match_none, not a parse error. See `parse_match`.
+    if matches!(value, Value::String(s) if s.is_empty()) {
+        return Ok(QueryNode::MatchNone);
+    }
+
+    // Shorthand forms: `match_phrase: {field: "value"}`, `match_phrase:
+    // {field: 42}`, `match_phrase: {field: true}` — ES silently stringifies
+    // non-strings, same as `match` (see `scalar_to_string`).
+    if let Some(query) = scalar_to_string(value) {
         return Ok(QueryNode::MatchPhrase {
             field,
-            query: query.to_string(),
+            query,
             slop: 0,
             analyzer: None,
             boost: None,
@@ -453,7 +474,18 @@ fn parse_match_phrase(params: &Value) -> Result<QueryNode> {
         .as_object()
         .ok_or_else(|| qerr("`match_phrase` field value must be a string or object"))?;
 
-    let query = string_field(vobj, "query")?;
+    if matches!(vobj.get("query"), Some(Value::String(s)) if s.is_empty()) {
+        return Ok(QueryNode::MatchNone);
+    }
+
+    // Inside the object form, `query` can also be a number / bool — e.g.
+    // OpenSearch Dashboards filtering on a boolean field sends
+    // `match_phrase: {field: {query: true}}` verbatim (found empirically,
+    // this is what a real OSD dashboard filter on a bool field produces).
+    let query = vobj
+        .get("query")
+        .and_then(scalar_to_string)
+        .ok_or_else(|| qerr("`match_phrase.query` must be a non-empty scalar"))?;
     let slop = vobj.get("slop").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let analyzer = vobj
         .get("analyzer")
@@ -1775,10 +1807,20 @@ fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
     let (field, raw) = obj.iter().next().unwrap();
     let field = field.clone();
 
-    if let Some(query) = raw.as_str() {
+    // Empty query string → match_none, not a parse error. See `parse_match`.
+    // This is exactly what Kibana's own SavedObjectsClient `_find` builds
+    // for a trailing-`*` search term.
+    if matches!(raw, Value::String(s) if s.is_empty()) {
+        return Ok(QueryNode::MatchNone);
+    }
+
+    // Shorthand forms: `match_phrase_prefix: {field: "value"}`, `{field:
+    // 42}`, `{field: true}` — ES silently stringifies non-strings, same as
+    // `match` (see `scalar_to_string`).
+    if let Some(query) = scalar_to_string(raw) {
         return Ok(QueryNode::MatchPhrasePrefix {
             field,
-            query: query.to_string(),
+            query,
             max_expansions: 50,
         });
     }
@@ -1787,7 +1829,14 @@ fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
         .as_object()
         .ok_or_else(|| qerr("`match_phrase_prefix` field value must be a string or object"))?;
 
-    let query = string_field(inner, "query")?;
+    if matches!(inner.get("query"), Some(Value::String(s)) if s.is_empty()) {
+        return Ok(QueryNode::MatchNone);
+    }
+
+    let query = inner
+        .get("query")
+        .and_then(scalar_to_string)
+        .ok_or_else(|| qerr("`match_phrase_prefix.query` must be a non-empty scalar"))?;
     let max_expansions = inner
         .get("max_expansions")
         .and_then(Value::as_u64)
