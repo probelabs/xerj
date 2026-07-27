@@ -76,6 +76,8 @@ debug-profiling = [
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+libc = "0.2"
 
 [target.'cfg(all(target_os = "linux", not(target_env = "msvc")))'.dependencies]
 jemalloc_pprof = { version = "0.8", features = ["symbolize"], optional = true }
