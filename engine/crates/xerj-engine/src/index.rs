@@ -20501,9 +20501,6 @@ fn postings_union_expand(
     (count, positions)
 }
 
-/// Evaluate a query against a single stored document source value.
-///
-/// Returns true if the document matches the query.
 /// Coerce a `lat`/`lon` object member to `f64`. Real ES accepts numeric OR
 /// string-encoded lat/lon inside a `{"lat": .., "lon": ..}` geo_point object
 /// (normalised to numbers at index time) — Kibana's own flights sample data
@@ -20515,6 +20512,9 @@ fn geo_coord(v: &Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+/// Evaluate a query against a single stored document source value.
+///
+/// Returns true if the document matches the query.
 fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
     match q {
         QueryNode::MatchAll => true,

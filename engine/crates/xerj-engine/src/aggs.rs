@@ -8564,13 +8564,6 @@ fn encode_geohash(lat: f64, lon: f64, precision: usize) -> String {
     String::from_utf8(hash).unwrap_or_default()
 }
 
-/// Extract a (lat, lon) pair from an ES geo_point value.
-/// Accepts:
-///   - {"lat": 1.0, "lon": 2.0}
-///   - [lon, lat]  (GeoJSON)
-///   - "POINT (lon lat)"
-///   - "lat,lon"
-///   - GeoHash string (not parsed — returns None)
 /// Coerce a `lat`/`lon` object member to `f64`. Real ES accepts numeric
 /// OR string-encoded lat/lon inside a `{"lat": .., "lon": ..}` geo_point
 /// object (normalised to numbers at index time) — Kibana's own flights
@@ -8582,6 +8575,13 @@ fn geo_coord(v: &Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+/// Extract a (lat, lon) pair from an ES geo_point value.
+/// Accepts:
+///   - {"lat": 1.0, "lon": 2.0}
+///   - [lon, lat]  (GeoJSON)
+///   - "POINT (lon lat)"
+///   - "lat,lon"
+///   - GeoHash string (not parsed — returns None)
 fn parse_geo_point(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Object(o) => {
