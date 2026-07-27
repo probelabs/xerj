@@ -5838,7 +5838,9 @@ async fn test_term_matches_non_first_array_element() {
     .unwrap();
 
     let r = idx
-        .search(&make_search(json!({"term": {"calls": "wp_safe_remote_get"}})))
+        .search(&make_search(
+            json!({"term": {"calls": "wp_safe_remote_get"}}),
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -5854,8 +5856,13 @@ async fn test_term_matches_non_first_array_element() {
     assert_eq!(r0.total.value, 1, "first element must still match");
 
     let rt = idx
-        .search(&make_search(json!({"terms": {"calls": ["wp_safe_remote_get"]}})))
+        .search(&make_search(
+            json!({"terms": {"calls": ["wp_safe_remote_get"]}}),
+        ))
         .await
         .unwrap();
-    assert_eq!(rt.total.value, 1, "terms must match a NON-FIRST array element");
+    assert_eq!(
+        rt.total.value, 1,
+        "terms must match a NON-FIRST array element"
+    );
 }
