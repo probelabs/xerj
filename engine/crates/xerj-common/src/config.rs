@@ -877,7 +877,7 @@ impl Default for EmbeddingConfig {
 
 /// Resource limits.
 ///
-/// **10 settings.**
+/// **11 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -922,6 +922,12 @@ pub struct LimitsConfig {
     /// `circuit_breaking_exception` instead of growing until the kernel
     /// OOM-kills the process.
     pub max_total_memtable_mb: u64,
+    /// Process-wide retained-payload ceiling for all immutable segment
+    /// hydration caches (default: `0` = 20% of the effective cgroup/system
+    /// memory limit). This is not an RSS ceiling: query materialization,
+    /// decode scratch, mmaps, allocator fragmentation, and unrelated caches
+    /// are outside it.
+    pub max_segment_hydration_cache_mb: u64,
     /// RSS admission watermark, as a percentage of the effective process
     /// memory limit (default: `95`). The effective limit is the cgroup
     /// memory limit when one is set (e.g. under `systemd-run -p MemoryMax=`
@@ -953,6 +959,7 @@ impl Default for LimitsConfig {
             max_mget_docs: 10_000,
             max_buckets: 65_536,
             max_total_memtable_mb: 0, // 0 = auto-derive (25% RAM, floor 2 GiB)
+            max_segment_hydration_cache_mb: 0, // 0 = 20% effective memory, no floor
             memory_watermark_percent: 95,
             disk_flood_stage_percent: 95,
         }
@@ -1367,12 +1374,13 @@ mod tests {
         //                   default_quantization, max_dimensions)
         //   logs:   2      (retention_days, time_partition)
         //   embedding: 4   (default_endpoint, default_model, batch_size, timeout_ms)
-        //   limits: 3      (max_query_memory_mb, max_concurrent_searches, max_fields_per_index)
+        //   limits: 11     (query/concurrency/mapping/body/result/mget/bucket limits,
+        //                   total memtable, segment hydration cache, RSS, disk)
         //   indexing: 3    (turbo_batch_size, turbo_parallel, turbo_fast_analyzer)
         //   logging: 2     (format, access_log)                      ← RC4-W4 item 6
         //   ─────────
-        //   total: 50 fields, minus 1 auto-generated (admin_api_key) = 49 meaningful user settings
-        let total: usize = 5 + 3 + 3 + 10 + 5 + 3 + 1 + 6 + 2 + 4 + 3 + 3 + 2;
-        assert_eq!(total, 50);
+        //   total: 58 fields, minus 1 auto-generated (admin_api_key) = 57 meaningful user settings
+        let total: usize = 5 + 3 + 3 + 10 + 5 + 3 + 1 + 6 + 2 + 4 + 11 + 3 + 2;
+        assert_eq!(total, 58);
     }
 }

@@ -26,6 +26,7 @@ pub mod ingest_memory;
 pub mod memtable;
 pub mod painless;
 pub mod rbac;
+pub mod segment_cache_budget;
 pub mod segment_cache_estimates;
 pub mod slow_query;
 pub mod sql;

@@ -32,6 +32,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use xerj_common::config::Config;
 use xerj_common::XerjError;
 
+use crate::segment_cache_budget::{SegmentHydrationBudget, SegmentHydrationBudgetSnapshot};
+
 /// The process-wide governor singleton.
 static GOVERNOR: OnceLock<Arc<ResourceGovernor>> = OnceLock::new();
 
@@ -44,6 +46,9 @@ pub const SAMPLE_INTERVAL_MS: u64 = 100;
 
 /// Process-wide resource governor. See the module docs.
 pub struct ResourceGovernor {
+    /// One admission authority shared by every index in this process.
+    segment_hydration_budget: Arc<SegmentHydrationBudget>,
+    segment_hydration_budget_source: SegmentHydrationBudgetSource,
     // ── item 1: process-wide memtable budget ────────────────────────────
     /// Ceiling on summed memtable bytes across ALL indices. `0` = disabled.
     memtable_budget_bytes: u64,
@@ -288,6 +293,8 @@ impl ResourceGovernor {
     /// surfaces.
     pub fn snapshot(&self) -> GovernorSnapshot {
         GovernorSnapshot {
+            segment_hydration: self.segment_hydration_budget.snapshot(),
+            segment_hydration_source: self.segment_hydration_budget_source,
             memtable_used_bytes: self.memtable_used_bytes.load(Ordering::Relaxed),
             memtable_budget_bytes: self.memtable_budget_bytes,
             memtable_tripped: self.memtable_tripped.load(Ordering::Relaxed),
@@ -302,6 +309,10 @@ impl ResourceGovernor {
             search_inflight: self.search_inflight.load(Ordering::Relaxed),
             search_inflight_peak: self.search_inflight_peak.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn segment_hydration_budget(&self) -> Arc<SegmentHydrationBudget> {
+        Arc::clone(&self.segment_hydration_budget)
     }
 }
 
@@ -321,6 +332,8 @@ impl Drop for SearchPermit {
 /// A cheap, `Copy`-able snapshot of governor state.
 #[derive(Debug, Clone, Copy)]
 pub struct GovernorSnapshot {
+    pub segment_hydration: SegmentHydrationBudgetSnapshot,
+    pub segment_hydration_source: SegmentHydrationBudgetSource,
     pub memtable_used_bytes: u64,
     pub memtable_budget_bytes: u64,
     pub memtable_tripped: bool,
@@ -334,6 +347,85 @@ pub struct GovernorSnapshot {
     pub max_concurrent_searches: usize,
     pub search_inflight: u64,
     pub search_inflight_peak: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SegmentHydrationBudgetSource {
+    Auto,
+    Config,
+    Env,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ResolvedSegmentHydrationBudget {
+    bytes: u64,
+    source: SegmentHydrationBudgetSource,
+    warning: Option<String>,
+}
+
+fn resolve_segment_hydration_budget(
+    effective_limit: u64,
+    configured_mb: u64,
+    env_value: Option<&str>,
+) -> ResolvedSegmentHydrationBudget {
+    const MIB: u64 = 1024 * 1024;
+    let automatic = effective_limit / 5;
+    let explicit = |mb: u64, source| {
+        let requested = mb.saturating_mul(MIB);
+        let maximum = effective_limit / 2;
+        let bytes = requested.min(maximum);
+        let warning = (requested > maximum).then(|| {
+            format!(
+                "requested segment hydration cache {} MiB exceeds 50% of effective memory; clamped to {} MiB",
+                mb,
+                bytes / MIB
+            )
+        });
+        ResolvedSegmentHydrationBudget {
+            bytes,
+            source,
+            warning,
+        }
+    };
+
+    match env_value.map(str::trim) {
+        Some("auto") => ResolvedSegmentHydrationBudget {
+            bytes: automatic,
+            source: SegmentHydrationBudgetSource::Env,
+            warning: None,
+        },
+        Some("off") => ResolvedSegmentHydrationBudget {
+            bytes: 0,
+            source: SegmentHydrationBudgetSource::Env,
+            warning: None,
+        },
+        Some(value) => match value.parse::<u64>() {
+            Ok(0) => {
+                let mut fallback =
+                    resolve_segment_hydration_budget(effective_limit, configured_mb, None);
+                fallback.warning = Some(
+                    "XERJ_SEGMENT_HYDRATION_CACHE_MB=0 is ambiguous; use auto or off; falling back to config"
+                        .to_owned(),
+                );
+                fallback
+            }
+            Ok(mb) => explicit(mb, SegmentHydrationBudgetSource::Env),
+            Err(_) => {
+                let mut fallback =
+                    resolve_segment_hydration_budget(effective_limit, configured_mb, None);
+                fallback.warning = Some(format!(
+                    "invalid XERJ_SEGMENT_HYDRATION_CACHE_MB={value:?}; expected auto, off, or a positive MiB value; falling back to config"
+                ));
+                fallback
+            }
+        },
+        None if configured_mb > 0 => explicit(configured_mb, SegmentHydrationBudgetSource::Config),
+        None => ResolvedSegmentHydrationBudget {
+            bytes: automatic,
+            source: SegmentHydrationBudgetSource::Auto,
+            warning: None,
+        },
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -368,6 +460,17 @@ fn build(config: &Config) -> ResourceGovernor {
 
     // ── RSS watermark against the effective memory limit ──
     let memory_limit_bytes = effective_memory_limit_bytes();
+    let resolved_segment_hydration = resolve_segment_hydration_budget(
+        memory_limit_bytes,
+        limits.max_segment_hydration_cache_mb,
+        std::env::var("XERJ_SEGMENT_HYDRATION_CACHE_MB")
+            .ok()
+            .as_deref(),
+    );
+    if let Some(warning) = &resolved_segment_hydration.warning {
+        tracing::warn!("{warning}");
+    }
+    let segment_hydration_budget = SegmentHydrationBudget::new(resolved_segment_hydration.bytes);
     let memory_watermark_bytes = if limits.memory_watermark_percent == 0 {
         0
     } else {
@@ -387,10 +490,14 @@ fn build(config: &Config) -> ResourceGovernor {
         max_query_memory_mb = limits.max_query_memory_mb,
         max_concurrent_searches,
         disk_flood_pct = limits.disk_flood_stage_percent,
+        segment_hydration_cache_mb = resolved_segment_hydration.bytes / (1024 * 1024),
+        segment_hydration_cache_source = ?resolved_segment_hydration.source,
         "resource governor initialised (parent circuit breaker)"
     );
 
     ResourceGovernor {
+        segment_hydration_budget,
+        segment_hydration_budget_source: resolved_segment_hydration.source,
         memtable_budget_bytes,
         memtable_used_bytes: AtomicU64::new(0),
         memtable_tripped: AtomicBool::new(false),
@@ -611,6 +718,47 @@ fn human_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_hydration_resolver_is_cgroup_proportional_and_explicit() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let auto = resolve_segment_hydration_budget(8 * GIB, 0, None);
+        assert_eq!(auto.bytes, 8 * GIB / 5);
+        assert_eq!(auto.source, SegmentHydrationBudgetSource::Auto);
+
+        let tiny = resolve_segment_hydration_budget(256 * 1024 * 1024, 0, None);
+        assert_eq!(tiny.bytes, 256 * 1024 * 1024 / 5);
+
+        let config = resolve_segment_hydration_budget(8 * GIB, 1024, None);
+        assert_eq!(config.bytes, GIB);
+        assert_eq!(config.source, SegmentHydrationBudgetSource::Config);
+
+        let off = resolve_segment_hydration_budget(8 * GIB, 1024, Some("off"));
+        assert_eq!(off.bytes, 0);
+        assert_eq!(off.source, SegmentHydrationBudgetSource::Env);
+
+        let env = resolve_segment_hydration_budget(8 * GIB, 1024, Some("2048"));
+        assert_eq!(env.bytes, 2 * GIB);
+        assert_eq!(env.source, SegmentHydrationBudgetSource::Env);
+    }
+
+    #[test]
+    fn segment_hydration_resolver_clamps_overflow_and_rejects_ambiguous_env_zero() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let clamped = resolve_segment_hydration_budget(8 * GIB, u64::MAX, None);
+        assert_eq!(clamped.bytes, 4 * GIB);
+        assert!(clamped.warning.is_some());
+
+        let invalid = resolve_segment_hydration_budget(8 * GIB, 1024, Some("bogus"));
+        assert_eq!(invalid.bytes, GIB);
+        assert_eq!(invalid.source, SegmentHydrationBudgetSource::Config);
+        assert!(invalid.warning.is_some());
+
+        let zero = resolve_segment_hydration_budget(8 * GIB, 0, Some("0"));
+        assert_eq!(zero.bytes, 8 * GIB / 5);
+        assert_eq!(zero.source, SegmentHydrationBudgetSource::Auto);
+        assert!(zero.warning.is_some());
+    }
 
     #[test]
     fn effective_limit_is_positive() {
