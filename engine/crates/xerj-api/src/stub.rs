@@ -59,7 +59,7 @@ pub fn not_implemented_yet(
             "reason": format!("{feature} is not implemented in this xerj build. {note}"),
             "feature": feature,
             "planned_milestone": milestone,
-            "roadmap": "https://github.com/xerj-ai/xerj/blob/main/engine/reports/PATH_TO_100_PCT_v0.6.0_to_v1.0.md",
+            "roadmap": "https://github.com/xerj-org/xerj/blob/main/engine/reports/PATH_TO_100_PCT_v0.6.0_to_v1.0.md",
         },
         "status": 501,
     });

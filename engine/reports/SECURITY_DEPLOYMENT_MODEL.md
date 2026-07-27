@@ -173,7 +173,7 @@ gap during procurement review.
 | Stack overflow on deep query | Query-depth cap = 64 (enforced) | Low — covered |
 
 If you have a threat we haven't considered, file an issue at
-[github.com/xerj-ai/xerj/issues](https://github.com/xerj-ai/xerj/issues)
+[github.com/xerj-org/xerj/issues](https://github.com/xerj-org/xerj/issues)
 or email security@xerj.io (use PGP key from [/security/pgp.txt]).
 
 ---

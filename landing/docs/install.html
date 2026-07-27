@@ -188,11 +188,11 @@ $ curl -s -H "Authorization: ApiKey $(sudo cat /var/lib/xerj/admin.key)" \
 
   <h2>Docker</h2>
   <p>No published image yet — build it locally from <code class="inline">engine/Dockerfile</code> (the image defaults to <code class="inline">--insecure --data-dir /data</code>, right for CI and local dev):</p>
-<pre class="code">$ docker build -t xerj:1.0.0-rc.1 engine/
+<pre class="code">$ docker build -t xerj:local engine/
 $ docker run -d --name xerj \
     -p 8080:8080 -p 9200:9200 \
     -v xerj-data:/data \
-    xerj:1.0.0-rc.1</pre>
+    xerj:local</pre>
 
   <p class="source-note">Source · engine/README.md</p>
   

@@ -245,7 +245,7 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
     <a href="/">Home</a>
     <a href="/architecture/">Architecture</a>
     <a href="/pricing/">Pricing</a>
-    <a href="https://github.com/xerj-ai/xerj">GitHub</a>
+    <a href="https://github.com/xerj-org/xerj">GitHub</a>
   </span>
 </nav>
 
@@ -256,7 +256,7 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
     Pull a real production log from <a href="https://github.com/logpai/loghub">loghub</a>.
     Ingest 12&nbsp;GiB into Xerj with one CLI command.  Query it from Xerj Console.
     Each step shows the Elasticsearch alternative — resources, time, config —
-    sourced from <a href="https://github.com/xerj-ai/xerj/tree/main/user-feedback">collected community feedback</a>
+    sourced from <a href="https://github.com/xerj-org/xerj/tree/main/user-feedback">collected community feedback</a>
     (G2, Gartner, TrustRadius, GitHub issues, Reddit, HN, Jepsen, CVE).
   </p>
   <div class="stats">
@@ -271,7 +271,7 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
     Every number above + every CLI block on this page was captured live on this
     machine on <strong style="color: var(--y);">2026-04-27</strong> against the
     <code>v1.0.0-rc.1</code> binary (commit <code>78a9bcc</code>).  Full
-    transcript: <a href="https://github.com/xerj-ai/xerj/blob/main/demo/CLI_VALIDATED_2026-04-27.md"><code>demo/CLI_VALIDATED_2026-04-27.md</code></a>.
+    transcript: <a href="https://github.com/xerj-org/xerj/blob/main/demo/CLI_VALIDATED_2026-04-27.md"><code>demo/CLI_VALIDATED_2026-04-27.md</code></a>.
   </p>
 </header>
 
@@ -325,7 +325,7 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
         because no real LLM-traffic capture ships with the repo, and the
         AI / vector / agent / anomaly / ingest dashboards need that shape
         to render meaningfully.  Generator:
-        <code><a href="https://github.com/xerj-ai/xerj/blob/main/demo/data/extras/generate_demo_corpus.py">demo/data/extras/generate_demo_corpus.py</a></code>.
+        <code><a href="https://github.com/xerj-org/xerj/blob/main/demo/data/extras/generate_demo_corpus.py">demo/data/extras/generate_demo_corpus.py</a></code>.
       </div>
     </div>
   </div>
@@ -349,7 +349,7 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
     is already running on port 9200.
   </p>
 
-  <pre class="cmd"><span class="prompt">$ </span>curl -L -o xerj.tar.gz https://github.com/xerj-ai/xerj/releases/download/v1.0.0-rc.1/xerj-1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.gz
+  <pre class="cmd"><span class="prompt">$ </span>curl -L -o xerj.tar.gz https://github.com/xerj-org/xerj/releases/download/v1.0.0-rc.1/xerj-1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.gz
 <span class="prompt">$ </span>tar xzf xerj.tar.gz
 <span class="prompt">$ </span>./xerj --insecure --data-dir ./data
 <span class="out">2026-04-27T19:11:41.6Z  INFO xerj: xerj v1.0.0-rc.1 starting
@@ -428,7 +428,7 @@ Ready: /home/claude/ai/xerj/engine/demo-data/ssh_big.ndjson</span></pre>
     <code>@timestamp · host · proc · pid · event · user · src_ip · src_port · message</code>.
     Event tags (<code>auth_failure_invalid_user</code>, <code>possible_break_in</code>,
     <code>auth_success</code>, …) come from a small regex parser
-    (<a href="https://github.com/xerj-ai/xerj/blob/main/engine/demo-data/build_corpus.py"><code>build_corpus.py</code></a>).
+    (<a href="https://github.com/xerj-org/xerj/blob/main/engine/demo-data/build_corpus.py"><code>build_corpus.py</code></a>).
   </p>
 
   <div class="se-says">
@@ -476,7 +476,7 @@ Ready: /home/claude/ai/xerj/engine/demo-data/ssh_big.ndjson</span></pre>
 
   <h3>Sustained scale — full 60.9 M / 12 GiB</h3>
   <p style="font-size: 13px; color: var(--dim); margin: 4px 0 12px;">
-    Output below is from the <a href="https://github.com/xerj-ai/xerj/blob/main/engine/reports/2026-04-25T22-50-00_xerj_vs_elasticsearch_rerun.md">2026-04-25 head-to-head bench</a>
+    Output below is from the <a href="https://github.com/xerj-org/xerj/blob/main/engine/reports/2026-04-25T22-50-00_xerj_vs_elasticsearch_rerun.md">2026-04-25 head-to-head bench</a>
     (commit <code>73c6367</code>, pre-rc).  We did <em>not</em> re-run the 22-minute 60 M ingest
     on 2026-04-27 — burst rate above is the only ingest measurement
     re-validated against rc.1.  Reproduce with
@@ -656,7 +656,7 @@ node demo/scripts/full-demo-flow.js
     sonnet / opus / gpt-5 numbers come from?".  Honest answer: the demo
     flow ingests six NDJSON corpora into the engine before the SPA
     opens.  The corpora are generated reproducibly (random.seed=42)
-    from <code><a href="https://github.com/xerj-ai/xerj/blob/main/demo/data/extras/generate_demo_corpus.py">demo/data/extras/generate_demo_corpus.py</a></code>
+    from <code><a href="https://github.com/xerj-org/xerj/blob/main/demo/data/extras/generate_demo_corpus.py">demo/data/extras/generate_demo_corpus.py</a></code>
     and pushed in via the <strong>same ES-compat <code>/_bulk</code> endpoint</strong>
     that Logstash, Filebeat, every ES SDK and your existing collectors
     already speak — there's no Xerj-specific ingest API, no SDK to
@@ -759,7 +759,7 @@ node demo/scripts/full-demo-flow.js
     the corpus, the dashboard changes.  Delete the index, the SPA's
     live adapter returns <code>null</code> and the panel collapses to
     its mock skeleton (visible difference, no silent fallback).  Code
-    path: <code><a href="https://github.com/xerj-ai/xerj/blob/main/xerj-ux/src/data/backends/xerj.js">xerj-ux/src/data/backends/xerj.js</a></code>
+    path: <code><a href="https://github.com/xerj-org/xerj/blob/main/xerj-ux/src/data/backends/xerj.js">xerj-ux/src/data/backends/xerj.js</a></code>
     function <code>liveAiOverview()</code> at line ~378.
   </p>
 
@@ -781,7 +781,7 @@ node demo/scripts/full-demo-flow.js
     (4 000 · VECTOR · INDEX), <code>ingest-events</code> (12 000 · INGEST · PIPELINE)
     — <strong>25 648 documents total</strong>.  Every dashboard below
     queries one or more of these indices.  Full transcript:
-    <a href="https://github.com/xerj-ai/xerj/blob/main/demo/INGEST_FLOW_2026-04-27.md"><code>demo/INGEST_FLOW_2026-04-27.md</code></a>.
+    <a href="https://github.com/xerj-org/xerj/blob/main/demo/INGEST_FLOW_2026-04-27.md"><code>demo/INGEST_FLOW_2026-04-27.md</code></a>.
   </p>
 
   <h3>3.5.6 — Every AI dashboard reads from those indices</h3>
@@ -988,7 +988,7 @@ node demo/scripts/full-demo-flow.js
       <div class="small">Direct doc-values column scan + topK heap.  Same
         latency profile on 60 M docs as on 100 K (block-skip indices).
         No JVM cache warmup, no per-query GC pressure spike.</div>
-      <div class="source">measured: <a href="https://github.com/xerj-ai/xerj/blob/main/engine/reports/2026-04-25T03-30-00_xerj_vs_elasticsearch_bench.md">2026-04-25 head-to-head bench</a> (terms agg p50)</div>
+      <div class="source">measured: <a href="https://github.com/xerj-org/xerj/blob/main/engine/reports/2026-04-25T03-30-00_xerj_vs_elasticsearch_bench.md">2026-04-25 head-to-head bench</a> (terms agg p50)</div>
     </div>
     <div class="es-side">
       <div class="label">Elasticsearch · terms agg p50</div>
@@ -1103,10 +1103,10 @@ node demo/scripts/full-demo-flow.js
     <strong style="color: var(--y);">Source-of-truth:</strong> the three Xerj numbers below were
     re-captured on <code>v1.0.0-rc.1</code> (commit <code>78a9bcc</code>) on
     <strong>2026-04-27</strong> — see
-    <a href="https://github.com/xerj-ai/xerj/blob/main/demo/CLI_VALIDATED_2026-04-27.md"><code>demo/CLI_VALIDATED_2026-04-27.md</code></a>
+    <a href="https://github.com/xerj-org/xerj/blob/main/demo/CLI_VALIDATED_2026-04-27.md"><code>demo/CLI_VALIDATED_2026-04-27.md</code></a>
     §9 / §11.  ES comparator numbers are unchanged from the 2026-04-25
     head-to-head bench
-    (<a href="https://github.com/xerj-ai/xerj/blob/main/engine/reports/2026-04-25T22-50-00_xerj_vs_elasticsearch_rerun.md"><code>2026-04-25T22-50-00_xerj_vs_elasticsearch_rerun.md</code></a>);
+    (<a href="https://github.com/xerj-org/xerj/blob/main/engine/reports/2026-04-25T22-50-00_xerj_vs_elasticsearch_rerun.md"><code>2026-04-25T22-50-00_xerj_vs_elasticsearch_rerun.md</code></a>);
     if a prospect wants methodology, send that file.
   </p>
 
@@ -1194,7 +1194,7 @@ node demo/scripts/full-demo-flow.js
   <p class="why">
     The migration story.  Xerj implements the Elasticsearch wire protocol —
     1305 of 1329 official ES YAML conformance tests pass on
-    <a href="https://github.com/xerj-ai/xerj/tree/main/engine/tests/es-compat-yaml">the ES 8.13 test suite</a>.
+    <a href="https://github.com/xerj-org/xerj/tree/main/engine/tests/es-compat-yaml">the ES 8.13 test suite</a>.
     That means existing curl, official ES SDKs (Python, Go, Java, JS), and
     even Kibana itself can point at port 9200 unchanged.
   </p>
@@ -1213,7 +1213,7 @@ node demo/scripts/full-demo-flow.js
       <div class="num">1305 / 1329</div>
       <div class="small">98.2 % of ES 8.13 official YAML conformance tests pass.
         The remaining 24 are documented in
-        <a href="https://github.com/xerj-ai/xerj/blob/main/engine/releases/v0.1.0/reports/PATH_TO_100_PCT_v0.6.0_to_v1.0.md"><code>PATH_TO_100_PCT</code></a>.
+        <a href="https://github.com/xerj-org/xerj/blob/main/engine/reports/PATH_TO_100_PCT_v0.6.0_to_v1.0.md"><code>PATH_TO_100_PCT</code></a>.
         This includes search DSL, all 38 query types, all aggs, bulk, scroll,
         index templates, aliases, knn, hybrid, semantic.</div>
       <div class="source">measured: <code>cargo run -p es-yaml-runner</code></div>
@@ -1241,10 +1241,10 @@ node demo/scripts/full-demo-flow.js
 <!-- ─────────────────────────────────────────────────────────── -->
 <footer>
   <div>
-    <div>Xerj · v1.0.0-rc.1 · <a href="https://github.com/xerj-ai/xerj">github.com/xerj-ai/xerj</a></div>
+    <div>Xerj · <a href="https://github.com/xerj-org/xerj">github.com/xerj-org/xerj</a></div>
     <div style="margin-top: 8px;">All numbers on this page are real, captured live on
       a 32-core box with a single NVMe SSD.  Reproduce in &lt; 5 min with the
-      <a href="https://github.com/xerj-ai/xerj/tree/main/engine/demo-data">demo-data scripts</a>:
+      <a href="https://github.com/xerj-org/xerj/tree/main/engine/demo-data">demo-data scripts</a>:
       <code>build_corpus.py</code> + <code>xerj index</code> + the curls above.
       Source dataset: <a href="https://github.com/logpai/loghub">loghub OpenSSH</a>
       (LabSZ, 2017, 71 MB / 655 K real lines).</div>
@@ -1253,7 +1253,7 @@ node demo/scripts/full-demo-flow.js
     <a href="/architecture/">Architecture</a>
     <a href="/pricing/">Pricing</a>
     <a href="/security/">Security</a>
-    <a href="https://github.com/xerj-ai/xerj/tree/main/user-feedback">ES feedback corpus</a>
+    <a href="https://github.com/xerj-org/xerj/tree/main/user-feedback">ES feedback corpus</a>
   </div>
 </footer>
 

@@ -11,11 +11,11 @@ on:
     # workflow's single linux-gnu build cannot, so a real tag never
     # discovers a broken target for the first time at release time.
     branches: [main]
+  # Manual runs take no inputs: the version and the publish decision are both
+  # derived from the ref you dispatch against (GITHUB_REF_NAME / `refs/tags/v*`).
+  # Dispatch against the TAG ref to rebuild and republish a release; dispatch
+  # against a branch for an artifacts-only cross-compile check.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to build (e.g. v0.5.9)'
-        required: true
 
 permissions:
   contents: write

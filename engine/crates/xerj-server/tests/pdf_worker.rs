@@ -96,7 +96,7 @@ fn pdf_worker_is_fresh_process_deterministic_and_preserves_page_provenance() {
     assert_eq!(first.stdout, second.stdout);
 
     let response: Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(response["extractor"], "xerj-autoindex/1.0.0-rc.4");
+    assert_eq!(response["extractor"], "xerj-autoindex/1.0.0-rc.5");
     assert_eq!(response["parser"], "pdf_oxide/0.3.75");
     assert!(response["containment"]
         .as_str()
