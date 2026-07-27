@@ -464,6 +464,25 @@ fn ensure_admin_key(cfg: &mut Config) -> Result<()> {
         return Ok(());
     }
 
+    let data_dir = Path::new(&cfg.server.data_dir);
+    let key_path = data_dir.join("admin.key");
+
+    // A prior run may have already persisted a key — reuse it instead of
+    // minting a fresh one on every restart. A regenerated key on each
+    // restart forces every client (Kibana/OSD, MCP configs, scripts) to be
+    // manually re-pointed at the new value, which is exactly what
+    // persisting to `admin.key` in the first place was meant to avoid.
+    // Only a well-formed 64-char hex string (the shape this function itself
+    // always produces) is trusted; anything else falls through to a fresh
+    // generation rather than risk starting up with a garbled credential.
+    if let Ok(existing) = std::fs::read_to_string(&key_path) {
+        let existing = existing.trim();
+        if existing.len() == 64 && existing.bytes().all(|b| b.is_ascii_hexdigit()) {
+            cfg.auth.admin_api_key = existing.to_string();
+            return Ok(());
+        }
+    }
+
     // Generate 32 random bytes → 64-char hex string
     let raw: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let key: String = raw.iter().map(|b| format!("{b:02x}")).collect();
@@ -479,10 +498,9 @@ fn ensure_admin_key(cfg: &mut Config) -> Result<()> {
     println!("╚══════════════════════════════════════════════════╝");
     println!();
 
-    let data_dir = Path::new(&cfg.server.data_dir);
     if std::fs::create_dir_all(data_dir).is_ok() {
         // 0600 — this file IS the admin credential (RC4 W2 #21).
-        if let Err(e) = write_secret_file(&data_dir.join("admin.key"), key.as_bytes()) {
+        if let Err(e) = write_secret_file(&key_path, key.as_bytes()) {
             warn!("could not persist admin.key: {e}");
         }
     }
