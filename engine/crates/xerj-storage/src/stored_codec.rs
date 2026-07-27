@@ -55,12 +55,13 @@
 use crate::{Result, StorageError};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashMap;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 
 mod row_hydration;
 pub use row_hydration::{
-    decode_stored_v2_rows, decode_stored_v2_rows_controlled, StoredV2HydratedRow,
-    StoredV2RowHydrationResult, StoredV2RowHydrationStats,
+    decode_stored_v2_rows, decode_stored_v2_rows_controlled, decode_stored_v2_rows_projected,
+    decode_stored_v2_rows_projected_controlled, StoredV2HydratedRow, StoredV2RowHydrationResult,
+    StoredV2RowHydrationStats,
 };
 
 pub const STORED_DECODE_CHECK_INTERVAL: usize = 128;
@@ -511,8 +512,12 @@ fn encode_v2_columns(
         }
         // Fallback: zstd over JSON-array of the column's values.
         let col_json = serde_json::to_vec(col).unwrap_or_default();
-        let zstd_payload = zstd::encode_all(Cursor::new(&col_json), STORED_ZSTD_LEVEL)
-            .unwrap_or_else(|_| col_json.clone());
+        // `bulk::compress` records the source size in the frame header.
+        // Publish-time cache admission can therefore bound expansion before
+        // decoding; historical stream frames without a content size safely
+        // skip warming.
+        let zstd_payload =
+            zstd::bulk::compress(&col_json, STORED_ZSTD_LEVEL).unwrap_or_else(|_| col_json.clone());
         // Choose RAW_JSON vs LZ4_JSON by size.
         let lz4_payload = lz4_flex::compress_prepend_size(&col_json);
         if lz4_payload.len() + 1 < zstd_payload.len() {
@@ -578,6 +583,230 @@ pub fn decode_stored(bytes: &[u8]) -> Result<Vec<u8>> {
             .map_err(|e| StorageError::Other(anyhow::anyhow!("LZ4 decompress failed: {e}")));
     }
     Ok(bytes.to_vec())
+}
+
+/// Conservative retained-size bound for the canonical stored bytes plus the
+/// `(start, end)` row-offset table used by the engine's `StoredSlices`.
+///
+/// This reads only framing metadata. It never decompresses a column or
+/// materialises a `serde_json::Value`, so publish-time cache admission can
+/// fail closed *before* paying the full ZBS2 expansion. `Ok(None)` means a
+/// zstd frame omitted its content-size field and therefore has no trustworthy
+/// finite bound in the current format.
+pub fn stored_slices_retained_upper_bound(bytes: &[u8], expected_docs: u64) -> Result<Option<u64>> {
+    const STORED_SLICES_STRUCT_OVERHEAD: u64 = 64;
+    const OFFSET_BYTES: u64 = 8;
+
+    let expected_offsets = expected_docs
+        .checked_mul(OFFSET_BYTES)
+        .and_then(|size| size.checked_add(STORED_SLICES_STRUCT_OVERHEAD))
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("stored retained bound overflow")))?;
+
+    let (decoded_bound, offsets_bound) = if bytes.len() >= 4 && &bytes[..4] == STORED_LZ4_MAGIC {
+        let payload = bytes
+            .get(4..8)
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("LZ4 stored size truncated")))?;
+        let decoded = u32::from_le_bytes(payload.try_into().unwrap()) as u64;
+        let offsets = decoded
+            .checked_mul(OFFSET_BYTES)
+            .and_then(|size| size.checked_add(STORED_SLICES_STRUCT_OVERHEAD))
+            .ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!("LZ4 stored offset bound overflow"))
+            })?;
+        (decoded, offsets)
+    } else if bytes.len() >= 4 && &bytes[..4] == STORED_V2_MAGIC {
+        let directory = parse_v2_directory(&bytes[4..])?;
+        if directory.num_docs as u64 != expected_docs {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "v2 num_docs {} != expected {expected_docs}",
+                directory.num_docs
+            )));
+        }
+        let rows = expected_docs;
+        // Canonical wrapper punctuation, `_id`, `_seq_no`, `_source`, commas,
+        // colons and braces fit well below 64 bytes per row. This deliberately
+        // over-counts empty/null fields.
+        let mut bound = rows
+            .checked_mul(64)
+            .and_then(|size| size.checked_add(2))
+            .ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!("v2 decoded-size bound overflow"))
+            })?;
+        for column in &directory.columns {
+            let value_bound = match column.codec {
+                ColCodec::RawJson => {
+                    let Some(size) = zstd_frame_content_size(column.payload, "raw json")? else {
+                        return Ok(None);
+                    };
+                    size
+                }
+                ColCodec::Lz4Json => lz4_uncompressed_size(column.payload, "lz4 json")?,
+                ColCodec::Constant => {
+                    (column.payload.len() as u64)
+                        .checked_mul(rows)
+                        .ok_or_else(|| {
+                            StorageError::Other(anyhow::anyhow!(
+                                "constant decoded-size bound overflow"
+                            ))
+                        })?
+                }
+                ColCodec::DictBitpack => {
+                    let Some(dictionary_bytes) =
+                        dict_json_content_size(column.payload, directory.num_docs)?
+                    else {
+                        return Ok(None);
+                    };
+                    // Every row is either null (4 bytes) or one dictionary
+                    // entry. No entry can be longer than the complete
+                    // dictionary JSON payload.
+                    dictionary_bytes.max(4).checked_mul(rows).ok_or_else(|| {
+                        StorageError::Other(anyhow::anyhow!("dict decoded-size bound overflow"))
+                    })?
+                }
+                // CROSS_DEP materialises only JSON i64 or null cells. The
+                // longest i64 decimal representation is 20 bytes.
+                ColCodec::CrossDep => rows.checked_mul(20).ok_or_else(|| {
+                    StorageError::Other(anyhow::anyhow!("cross-dep decoded-size bound overflow"))
+                })?,
+            };
+            bound = bound.checked_add(value_bound).ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!("v2 decoded-size bound overflow"))
+            })?;
+            if column.name != "__id" && column.name != "__seq_no" {
+                let encoded_name_len = serde_json::to_vec(column.name)
+                    .map_err(|error| {
+                        StorageError::Other(anyhow::anyhow!(
+                            "v2 column-name size estimate: {error}"
+                        ))
+                    })?
+                    .len() as u64;
+                let key_overhead = rows
+                    .checked_mul(encoded_name_len.saturating_add(2))
+                    .ok_or_else(|| {
+                        StorageError::Other(anyhow::anyhow!("v2 key-size bound overflow"))
+                    })?;
+                bound = bound.checked_add(key_overhead).ok_or_else(|| {
+                    StorageError::Other(anyhow::anyhow!("v2 decoded-size bound overflow"))
+                })?;
+            }
+        }
+        (bound, expected_offsets)
+    } else {
+        let decoded = bytes.len() as u64;
+        let offsets = decoded
+            .checked_mul(OFFSET_BYTES)
+            .and_then(|size| size.checked_add(STORED_SLICES_STRUCT_OVERHEAD))
+            .ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!("plain stored offset bound overflow"))
+            })?;
+        (decoded, offsets)
+    };
+    decoded_bound
+        .checked_add(offsets_bound)
+        .map(Some)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("stored retained bound overflow")))
+}
+
+fn zstd_frame_content_size(payload: &[u8], context: &str) -> Result<Option<u64>> {
+    let frame_size = zstd::zstd_safe::find_frame_compressed_size(payload).map_err(|_| {
+        StorageError::Other(anyhow::anyhow!("{context} zstd frame header is invalid"))
+    })?;
+    if frame_size != payload.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "{context} contains concatenated/trailing zstd data"
+        )));
+    }
+    zstd::zstd_safe::get_frame_content_size(payload)
+        .map_err(|_| StorageError::Other(anyhow::anyhow!("{context} zstd frame header is invalid")))
+}
+
+fn decode_zstd_exact(payload: &[u8], expected: usize, context: &str) -> Result<Vec<u8>> {
+    if zstd_frame_content_size(payload, context)?.is_some_and(|size| size != expected as u64) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "{context} content size does not match expected length"
+        )));
+    }
+    let decoder = zstd::stream::read::Decoder::new(payload)
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("{context}: {error}")))?;
+    let mut bounded = decoder.take(expected as u64 + 1);
+    let mut decoded = Vec::with_capacity(expected);
+    bounded
+        .read_to_end(&mut decoded)
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("{context}: {error}")))?;
+    if decoded.len() != expected {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "{context} decoded length {} != expected {expected}",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
+
+fn lz4_uncompressed_size(payload: &[u8], context: &str) -> Result<u64> {
+    let size = payload
+        .get(..4)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("{context} size is truncated")))?;
+    Ok(u32::from_le_bytes(size.try_into().unwrap()) as u64)
+}
+
+fn dict_json_content_size(payload: &[u8], num_docs: usize) -> Result<Option<u64>> {
+    let mut cursor = Cursor::new(payload);
+    let _dict_count = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("dict_count: {error}")))?;
+    let bit_width = cursor
+        .read_u8()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("bit_width: {error}")))?;
+    if !(1..=32).contains(&bit_width) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict invalid bit_width {bit_width}"
+        )));
+    }
+    let dict_len = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("dict_zstd_len: {error}")))?
+        as usize;
+    let dict_start = cursor.position() as usize;
+    let dict_end = dict_start
+        .checked_add(dict_len)
+        .filter(|end| *end <= payload.len())
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("dict payload truncated")))?;
+    let content_size = zstd_frame_content_size(&payload[dict_start..dict_end], "dict json")?;
+    cursor.set_position(dict_end as u64);
+    let ids_len = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("ids_len: {error}")))?
+        as usize;
+    if ids_len != num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict ids_len {ids_len} != num_docs {num_docs}"
+        )));
+    }
+    let packed_len = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("packed_zstd_len: {error}")))?
+        as usize;
+    let packed_start = cursor.position() as usize;
+    let packed_end = packed_start
+        .checked_add(packed_len)
+        .filter(|end| *end == payload.len())
+        .ok_or_else(|| {
+            StorageError::Other(anyhow::anyhow!("dict packed payload truncated/trailing"))
+        })?;
+    let packed_size = zstd_frame_content_size(&payload[packed_start..packed_end], "dict ids")?;
+    let expected_packed_size = num_docs
+        .checked_mul(bit_width as usize)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("dict packed-size overflow")))?
+        .div_ceil(8) as u64;
+    if packed_size.is_some_and(|size| size != expected_packed_size) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict packed content size does not match ids_len"
+        )));
+    }
+    if packed_size.is_none() {
+        return Ok(None);
+    }
+    Ok(content_size)
 }
 
 /// Values decoded from a requested subset of a ZBS2 stored section.
@@ -738,14 +967,44 @@ pub fn decode_stored_v2_projection(
     }))
 }
 
-fn decode_cross_dep_body(payload: &[u8]) -> Result<Vec<u8>> {
+fn decode_cross_dep_body(payload: &[u8], num_docs: usize) -> Result<Vec<u8>> {
     if payload.is_empty() {
         return Err(StorageError::Other(anyhow::anyhow!("cross_dep empty")));
     }
+    // A source dictionary cannot contain more entries than source rows.
+    // Each mode costs 8 bytes and each row contributes at most one
+    // (u32-delta, i64-zigzag) exception of at most 15 bytes.
+    let max_body = num_docs
+        .checked_mul(23)
+        .and_then(|row_bytes| 12usize.checked_add(row_bytes))
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("cross_dep size overflow")))?;
     let body = if payload[0] == 1 {
-        zstd::decode_all(&payload[1..])
-            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?
+        if zstd_frame_content_size(&payload[1..], "cross_dep")?
+            .is_some_and(|size| size > max_body as u64)
+        {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep frame exceeds maximum decoded size"
+            )));
+        }
+        let decoder = zstd::stream::read::Decoder::new(&payload[1..])
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?;
+        let mut bounded = decoder.take(max_body as u64 + 1);
+        let mut body = Vec::new();
+        bounded
+            .read_to_end(&mut body)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?;
+        if body.len() > max_body {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep decoded body exceeds limit"
+            )));
+        }
+        body
     } else if payload[0] == 0 {
+        if payload.len() - 1 > max_body {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep raw body exceeds limit"
+            )));
+        }
         payload[1..].to_vec()
     } else {
         Err(StorageError::Other(anyhow::anyhow!(
@@ -756,8 +1015,8 @@ fn decode_cross_dep_body(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn cross_dep_source_index(payload: &[u8]) -> Result<usize> {
-    let body = decode_cross_dep_body(payload)?;
+fn cross_dep_source_index(payload: &[u8], num_docs: usize) -> Result<usize> {
+    let body = decode_cross_dep_body(payload, num_docs)?;
     Cursor::new(body)
         .read_u32::<LittleEndian>()
         .map(|value| value as usize)
@@ -798,7 +1057,7 @@ fn decode_projected_column<'a>(
         ColCodec::Constant => decode_constant(column.payload, directory.num_docs)?,
         ColCodec::DictBitpack => decode_dict_bitpack(column.payload, directory.num_docs)?,
         ColCodec::CrossDep => {
-            let source_index = cross_dep_source_index(column.payload)?;
+            let source_index = cross_dep_source_index(column.payload, directory.num_docs)?;
             let source =
                 decode_projected_column(source_index, directory, decoded, visiting, depth + 1)?
                     .clone();
@@ -1768,7 +2027,7 @@ fn encode_dict_bitpack(entries: &[serde_json::Value], ids: &[u32]) -> Vec<u8> {
     // Dict entries as zstd(json array).
     let dict_json = serde_json::to_vec(entries).unwrap_or_default();
     let dict_zstd =
-        zstd::encode_all(Cursor::new(&dict_json), STORED_ZSTD_LEVEL).unwrap_or(dict_json.clone());
+        zstd::bulk::compress(&dict_json, STORED_ZSTD_LEVEL).unwrap_or(dict_json.clone());
     out.write_u32::<LittleEndian>(dict_zstd.len() as u32)
         .unwrap();
     out.extend_from_slice(&dict_zstd);
@@ -1777,8 +2036,7 @@ fn encode_dict_bitpack(entries: &[serde_json::Value], ids: &[u32]) -> Vec<u8> {
     let packed = bitpack_u32(ids, bit_width);
     // zstd over the bit-packed stream — gives another 20-40 % on log
     // data because repeated ids cluster.
-    let packed_zstd =
-        zstd::encode_all(Cursor::new(&packed), STORED_ZSTD_LEVEL).unwrap_or(packed.clone());
+    let packed_zstd = zstd::bulk::compress(&packed, STORED_ZSTD_LEVEL).unwrap_or(packed.clone());
     out.write_u32::<LittleEndian>(ids.len() as u32).unwrap();
     out.write_u32::<LittleEndian>(packed_zstd.len() as u32)
         .unwrap();
@@ -1791,9 +2049,19 @@ fn decode_dict_bitpack(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json
     let dict_count =
         cur.read_u32::<LittleEndian>()
             .map_err(|e| StorageError::Other(anyhow::anyhow!("dict_count: {e}")))? as usize;
+    if dict_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict_count {dict_count} exceeds num_docs {num_docs}"
+        )));
+    }
     let bit_width = cur
         .read_u8()
         .map_err(|e| StorageError::Other(anyhow::anyhow!("bit_width: {e}")))?;
+    if !(1..=32).contains(&bit_width) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict invalid bit_width {bit_width}"
+        )));
+    }
 
     let dict_zstd_len = cur
         .read_u32::<LittleEndian>()
@@ -1826,13 +2094,21 @@ fn decode_dict_bitpack(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json
         .map_err(|e| StorageError::Other(anyhow::anyhow!("packed_zstd_len: {e}")))?
         as usize;
     let pos = cur.position() as usize;
-    if payload.len() < pos + packed_zstd_len {
-        return Err(StorageError::Other(anyhow::anyhow!(
-            "dict bitpack packed truncated"
-        )));
-    }
-    let packed = zstd::decode_all(&payload[pos..pos + packed_zstd_len])
-        .map_err(|e| StorageError::Other(anyhow::anyhow!("packed zstd decode: {e}")))?;
+    let packed_end = pos
+        .checked_add(packed_zstd_len)
+        .filter(|end| *end == payload.len())
+        .ok_or_else(|| {
+            StorageError::Other(anyhow::anyhow!("dict bitpack packed truncated/trailing"))
+        })?;
+    let expected_packed_len = num_docs
+        .checked_mul(bit_width as usize)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("dict packed length overflow")))?
+        .div_ceil(8);
+    let packed = decode_zstd_exact(
+        &payload[pos..packed_end],
+        expected_packed_len,
+        "packed zstd decode",
+    )?;
 
     let ids = bitunpack_u32(&packed, bit_width, num_docs);
     let null_id = dict_count as u32;
@@ -1953,13 +2229,7 @@ fn decode_cross_dep(
     if payload.is_empty() {
         return Err(StorageError::Other(anyhow::anyhow!("cross_dep empty")));
     }
-    let flag = payload[0];
-    let body = if flag == 1 {
-        zstd::decode_all(&payload[1..])
-            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?
-    } else {
-        payload[1..].to_vec()
-    };
+    let body = decode_cross_dep_body(payload, num_docs)?;
     let mut cur = Cursor::new(&body[..]);
     let src_ix = cur
         .read_u32::<LittleEndian>()
@@ -1970,6 +2240,11 @@ fn decode_cross_dep(
         .read_u32::<LittleEndian>()
         .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep dict_count: {e}")))?
         as usize;
+    if dict_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep dict_count {dict_count} exceeds num_docs {num_docs}"
+        )));
+    }
     let mut mode_values: Vec<i64> = Vec::with_capacity(dict_count);
     for _ in 0..dict_count {
         mode_values.push(
@@ -1981,6 +2256,11 @@ fn decode_cross_dep(
         .read_u32::<LittleEndian>()
         .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep exc_count: {e}")))?
         as usize;
+    if exc_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep exc_count {exc_count} exceeds num_docs {num_docs}"
+        )));
+    }
 
     // Rebuild the source column's dict ids by re-running `dict_encode_column`
     // on the already-decoded source column.
@@ -2000,11 +2280,24 @@ fn decode_cross_dep(
     let mut pos = cur.position() as usize;
     let mut prev_ord = 0u32;
     for _ in 0..exc_count {
-        let delta = read_varint(&body, &mut pos) as u32;
-        let val = read_zigzag_i64(&body, &mut pos);
-        let ord = prev_ord.wrapping_add(delta);
+        let delta = u32::try_from(read_varint(&body, &mut pos)?)
+            .map_err(|_| StorageError::Other(anyhow::anyhow!("cross_dep ordinal overflow")))?;
+        let val = read_zigzag_i64(&body, &mut pos)?;
+        let ord = prev_ord
+            .checked_add(delta)
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("cross_dep ordinal overflow")))?;
+        if ord as usize >= num_docs || (!exc.is_empty() && ord <= prev_ord) {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep invalid exception ordinal {ord}"
+            )));
+        }
         exc.push((ord, val));
         prev_ord = ord;
+    }
+    if pos != body.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep trailing exception bytes"
+        )));
     }
 
     // Materialise.
@@ -2112,19 +2405,24 @@ fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn read_varint(data: &[u8], pos: &mut usize) -> u64 {
+fn read_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
     let mut v = 0u64;
     let mut shift = 0u32;
-    while *pos < data.len() {
+    while *pos < data.len() && shift < 64 {
         let b = data[*pos];
         *pos += 1;
+        if shift == 63 && b & 0x7e != 0 {
+            return Err(StorageError::Other(anyhow::anyhow!("varint overflow")));
+        }
         v |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
-            return v;
+            return Ok(v);
         }
         shift += 7;
     }
-    v
+    Err(StorageError::Other(anyhow::anyhow!(
+        "truncated or overlong varint"
+    )))
 }
 
 fn write_zigzag_i64(out: &mut Vec<u8>, v: i64) {
@@ -2132,9 +2430,9 @@ fn write_zigzag_i64(out: &mut Vec<u8>, v: i64) {
     write_varint(out, z);
 }
 
-fn read_zigzag_i64(data: &[u8], pos: &mut usize) -> i64 {
-    let z = read_varint(data, pos);
-    ((z >> 1) as i64) ^ -((z & 1) as i64)
+fn read_zigzag_i64(data: &[u8], pos: &mut usize) -> Result<i64> {
+    let z = read_varint(data, pos)?;
+    Ok(((z >> 1) as i64) ^ -((z & 1) as i64))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -2233,6 +2531,101 @@ mod tests {
             columns.push(("embedding_chunks", codec as u8, payload));
         }
         handcrafted_v2(num_docs as u32, &columns)
+    }
+
+    #[test]
+    fn retained_upper_bound_covers_real_decode_and_all_v2_codecs() {
+        let num_docs = 4usize;
+        let ids = json!(["a", "b", "a", "b"]);
+        let raw_values = json!([
+            {"nested": [1, 2]},
+            null,
+            {"nested": [3]},
+            {"text": "longer"}
+        ]);
+        let raw_payload =
+            zstd::bulk::compress(&serde_json::to_vec(&raw_values).unwrap(), STORED_ZSTD_LEVEL)
+                .unwrap();
+        let dict_payload = encode_dict_bitpack(&[json!("east"), json!("west")], &[0, 1, 0, 1]);
+        let encoded = handcrafted_v2(
+            num_docs as u32,
+            &[
+                ("__id", ColCodec::Lz4Json as u8, lz4_json(&ids)),
+                (
+                    "__seq_no",
+                    ColCodec::Constant as u8,
+                    serde_json::to_vec(&json!(7)).unwrap(),
+                ),
+                ("raw", ColCodec::RawJson as u8, raw_payload),
+                ("region", ColCodec::DictBitpack as u8, dict_payload),
+                (
+                    "amount",
+                    ColCodec::CrossDep as u8,
+                    valid_cross_dep(3, i64::MIN),
+                ),
+            ],
+        );
+        let decoded = decode_stored(&encoded).unwrap();
+        let bound = stored_slices_retained_upper_bound(&encoded, num_docs as u64)
+            .unwrap()
+            .unwrap();
+        let actual_retained = decoded.len() as u64 + num_docs as u64 * 8 + 64;
+        assert!(
+            bound >= actual_retained,
+            "bound {bound} < actual retained {actual_retained}"
+        );
+
+        let legacy = encode_stored_lz4(&decoded);
+        assert!(
+            stored_slices_retained_upper_bound(&legacy, num_docs as u64)
+                .unwrap()
+                .unwrap()
+                >= actual_retained
+        );
+        assert!(stored_slices_retained_upper_bound(&encoded, 5).is_err());
+    }
+
+    #[test]
+    fn retained_upper_bound_fails_closed_for_unknown_zstd_content_size() {
+        let values = serde_json::to_vec(&json!(["a", "b"])).unwrap();
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), STORED_ZSTD_LEVEL).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&values).unwrap();
+        let payload = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&payload).unwrap(),
+            None
+        );
+        let encoded = handcrafted_v2(
+            2,
+            &[
+                ("__id", ColCodec::RawJson as u8, payload),
+                (
+                    "__seq_no",
+                    ColCodec::Constant as u8,
+                    serde_json::to_vec(&json!(1)).unwrap(),
+                ),
+            ],
+        );
+        assert_eq!(
+            stored_slices_retained_upper_bound(&encoded, 2).unwrap(),
+            None
+        );
+
+        let first = zstd::bulk::compress(&values, STORED_ZSTD_LEVEL).unwrap();
+        let second = zstd::bulk::compress(b"[]", STORED_ZSTD_LEVEL).unwrap();
+        let concatenated = handcrafted_v2(
+            2,
+            &[
+                ("__id", ColCodec::RawJson as u8, [first, second].concat()),
+                (
+                    "__seq_no",
+                    ColCodec::Constant as u8,
+                    serde_json::to_vec(&json!(1)).unwrap(),
+                ),
+            ],
+        );
+        assert!(stored_slices_retained_upper_bound(&concatenated, 2).is_err());
     }
 
     #[test]
@@ -2596,6 +2989,30 @@ mod tests {
         let mut trailing = valid_cross_dep(1, 7);
         trailing.push(0);
         assert!(decode_cross_dep(&trailing, 4, &dependencies, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn malformed_cardinality_and_cross_dep_expansion_are_bounded() {
+        let oversized_dict = ((DICT_MAX_CARDINALITY + 1) as u32).to_le_bytes().to_vec();
+        assert!(decode_dict_bitpack(&oversized_dict, 1).is_err());
+
+        let dependencies = vec![vec![json!("key")]];
+        let mut oversized_cross = vec![0];
+        oversized_cross.extend_from_slice(&0u32.to_le_bytes());
+        oversized_cross.extend_from_slice(&((DICT_MAX_CARDINALITY + 1) as u32).to_le_bytes());
+        assert!(decode_cross_dep(&oversized_cross, 1, &dependencies, &HashMap::new()).is_err());
+
+        let mut too_many_exceptions = valid_cross_dep(0, 7);
+        let count_offset = 1 + 4 + 4 + 8;
+        too_many_exceptions[count_offset..count_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_cross_dep(&too_many_exceptions, 1, &dependencies, &HashMap::new()).is_err());
+
+        let decoded_limit = 12 + 23;
+        let compressed =
+            zstd::bulk::compress(&vec![0; decoded_limit + 1], STORED_ZSTD_LEVEL).unwrap();
+        let mut bomb = vec![1];
+        bomb.extend_from_slice(&compressed);
+        assert!(decode_cross_dep(&bomb, 1, &dependencies, &HashMap::new()).is_err());
     }
 
     #[test]
