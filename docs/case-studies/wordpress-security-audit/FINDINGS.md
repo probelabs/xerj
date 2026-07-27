@@ -168,7 +168,7 @@ bites where **`editable_roles` is filtered** to restrict an admin below the inje
 role (common in membership / role-manager plugins and multisite delegation), and
 only on **multisite**. It is a genuine, unconditional *inconsistency* (2 of 3 sinks
 guarded) matching upstream 7.0.2 — worth reporting to WordPress as a hardening fix,
-not a stock-install RCE. Verified by reading the real code + adversarial agent.
+not a stock-install RCE. Verified by reading the real code + adversarial agent. Full step-by-step attack (requests + code) in [ATTACK-SCENARIO-role-injection.md](ATTACK-SCENARIO-role-injection.md).
 
 ## Verified-clean negatives (the honest majority)
 
