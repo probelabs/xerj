@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XERJ.ai — AI security review of a codebase too big to read</title>
-<meta name="description" content="An AI agent audits real WordPress core — 1,492 PHP files, ~619k lines — through XERJ: the structured audit summed to ~26,000 tokens vs ~5,200,000 to load the tree once. Sources in docs/case-studies/wordpress-security-audit.">
-<meta property="og:title" content="XERJ.ai — AI security review of a codebase too big to read">
-<meta property="og:description" content="An AI agent audits real WordPress core through XERJ instead of reading it: a ~26,000-token structured audit vs ~5,200,000 tokens to load the tree once — measured on a real audit, counter-examples included.">
+<title>XERJ.ai — Index once, query the invariant: an AI code-security audit method</title>
+<meta name="description" content="The method: read once to learn the rule, compile that invariant into a queryable fingerprint over a codebase indexed as security facts, query it so only the violators come back, then read only the survivors. Proved on real WordPress core — ~26,000 tokens for the whole structured audit vs ~5,200,000 to load the tree once. Sources in docs/case-studies/wordpress-security-audit.">
+<meta property="og:title" content="XERJ.ai — Index once, query the invariant: an AI code-security audit method">
+<meta property="og:description" content="A repeatable code-security audit method: read once to learn the rule, compile that invariant into a fingerprint over the tree indexed as taint and authorization facts, query for the violators, read only the survivors. The proof run is real WordPress core — ~26,000 tokens against ~5,200,000 to load it once, counter-examples included.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -49,15 +49,15 @@
 
 <div class="uc-hero">
   <div class="uc-eyebrow">USE CASE · AI SECURITY REVIEW</div>
-  <h1>SECURITY REVIEW<br>OF A CODEBASE<br><span class="accent">TOO BIG TO READ.</span></h1>
-  <p class="uc-lead">Real WordPress core is 1,492 PHP files and ~619,000 lines — about 26× a 200k-token context window, so an agent that reads everything must chunk, and chunking destroys the cross-file traces where authorization bugs live. In this case study an AI agent used XERJ as its retrieval substrate instead: index the whole tree in ≈3.6 seconds, then interrogate it. The entire structured audit summed to ~26,000 tokens, against ~5,200,000 just to load core once.</p>
+  <h1>INDEX ONCE.<br>QUERY THE INVARIANT.<br><span class="accent">READ THE SURVIVORS.</span></h1>
+  <p class="uc-lead">This is a method, and it is four steps. Read once to learn the rule — the invariant you actually care about. Compile it into a queryable fingerprint over the tree indexed as security <em>facts</em>: one document per function carrying its taint sources, its sinks, whether it sanitizes, and its outgoing call edges. Query the fingerprint, so only the violators come back. Read only the survivors — and execute the check where the code can be executed; in the proof run that was the SSRF validator, ported and run. XERJ is the agent's second brain in that loop: it holds a whole codebase's structure as queryable facts, so the agent reasons over all of it without ever loading the whole tree into context — it reads only the survivors the queries name. The proof run below is real WordPress core — 1,492 PHP files, ~619,000 lines, about 26× a 200k-token context window — indexed in ≈3.6 seconds. The entire structured audit summed to ~26,000 tokens, against ~5,200,000 just to load the tree once.</p>
   <div class="kicker"><span>FOR</span><span class="dash">·</span><span>CISO</span><span class="dash">·</span><span>APPSEC ENGINEER</span><span class="dash">·</span><span>SECURITY RESEARCHER</span></div>
 </div>
 
 <!-- Hero chart -->
 <section class="scene-section" style="border-top:0; padding-top:0;">
   <div class="viz-block">
-    <div class="kicker"><span>TOKENS TO THE ANSWER · REAL WORDPRESS CORE · EACH ROW SCALED TO ITS OWN BASELINE</span></div>
+    <div class="kicker"><span>TOKENS TO THE ANSWER · ONE ROW PER AUDIT TECHNIQUE · MEASURED ON THE PROOF RUN (WORDPRESS CORE) · EACH ROW SCALED TO ITS OWN BASELINE</span></div>
     <div class="cmp-bars">
     <div class="cmp-bars-head">
       <span></span>
@@ -125,8 +125,8 @@
 
   <div class="stat">
     <div class="num">~26,000</div>
-    <div class="label">TOKENS FOR THE AUDIT</div>
-    <div class="ctx">vs ~5,200,000 to load core once · sum of per-phase costs</div>
+    <div class="label">TOKENS FOR THE STRUCTURED AUDIT</div>
+    <div class="ctx">vs ~5,200,000 to load core once · sum of per-phase costs · the per-file sweep is a separate ~10.8M, stated below</div>
   </div>
 
   <div class="stat">
@@ -183,7 +183,7 @@
     <div class="cell num delta">0</div>
     <div class="cell source">the set the ~6,600-token posture query covered · the 41 admin-post handlers are file-scope guards audited separately · missing · insufficient · broken-'==' · race — all four failure classes checked on every state-changing entry point · map_meta_cap fails closed · source: AUTHENTICATION.md</div>
   </div>
-  <p class="wide">That is the honest headline of the audit: on the flows tested, core is hardened. The zeros are scoped exactly as the source scopes them — no missing, insufficient, broken-'==' or race auth flaw on any state-changing entry point, and 0 IDOR across the swept sets: 95 authenticated AJAX handlers and 90 REST permission checks. The negative result is the result — and it is only worth anything because the census can show what was covered.</p>
+  <p class="wide">That is the honest headline of the structural pass: on the flows tested, core is hardened. The zeros are scoped exactly as the source scopes them — no missing, insufficient, broken-'==' or race auth flaw on any state-changing entry point, and 0 IDOR across the swept sets: 95 authenticated AJAX handlers and 90 REST permission checks. The negative result is the result — and it is only worth anything because the census can show what was covered. Note precisely what those zeros are, though: they are what a presence-and-scoping model can prove. They cannot express "a guard the sibling sinks have is absent here", which is exactly the shape the later per-file read caught in <code class="inline">wp-admin/user-new.php</code> — stated in full further down.</p>
 </section>
 
 
@@ -334,7 +334,60 @@
   <h2 class="scene" style="font-size:var(--fs-56);">THE HEADLINE FINDING, <span class="accent">STATED PLAINLY.</span></h2>
   <p class="wide">Core's SSRF gatekeeper — <code class="inline">wp_http_validate_url</code>, which guards <code class="inline">wp_safe_remote_get/post/request</code> and XML-RPC pingbacks — rejects loopback, 10/8, 0/8, 172.16/12 and 192.168/16, but not 169.254.0.0/16, the link-local range that contains the cloud-metadata endpoint 169.254.169.254. CGNAT 100.64/10 and IPv6 are missing as well. It surfaced by <em>reading</em> the range coverage: a pattern scanner cannot see an allow-list that is merely incomplete.</p>
   <p class="wide">It was then verified by execution rather than by argument. With no PHP runtime available, the validator was ported line-for-line to Python — same scheme filter, same <code class="inline">strpbrk(host, ':#?[]')</code>, same octet test — and run with real DNS resolution: 127.0.0.1, 10.1.2.3, 192.168.0.1 and [::1] were rejected, and the metadata URL was allowed. Reachability was traced to real input: <code class="inline">WP_XMLRPC_Server::pingback_ping</code> takes an attacker-supplied source URL where XML-RPC is enabled, and <code class="inline">WP_REST_URL_Details_Controller::get_remote_url</code> takes a user-supplied <code class="inline">url</code> parameter at author level. The finding was independently re-discovered by a per-file sweep at <code class="inline">wp-includes/http.php:598</code>.</p>
-  <p class="wide"><strong>The honest framing the case study insists on:</strong> this is a known-<em>class</em> limitation at Medium severity, not a novel 0-day and not claimed as one. Core has long treated <code class="inline">wp_http_validate_url</code> as best-effort and points hardening at the <code class="inline">http_request_host_is_external</code> filter; exploitation requires the SSRF path enabled in a cloud environment, and nothing was exploited here — the ALLOWED verdict is the validator's own, on a ported copy. The suggested remediation is defense-in-depth: add 169.254.0.0/16, 100.64.0.0/10 and IPv6 loopback/ULA to the default deny-list, and re-resolve the host at request time to blunt DNS-rebinding TOCTOU. And it is the headline of <em>three</em> Medium-severity results, not the only one: the other two are the deploy-dependent ImageTragick surface in the Imagick image editor, which parses uploaded image content, and the role-injection inconsistency in <code class="inline">wp-admin/user-new.php</code> described under 04 below.</p>
+  <p class="wide"><strong>The honest framing the case study insists on:</strong> this is a known-<em>class</em> limitation at Medium severity, not a novel 0-day and not claimed as one. Core has long treated <code class="inline">wp_http_validate_url</code> as best-effort and points hardening at the <code class="inline">http_request_host_is_external</code> filter; exploitation requires the SSRF path enabled in a cloud environment, and nothing was exploited here — the ALLOWED verdict is the validator's own, on a ported copy. The suggested remediation is defense-in-depth: add 169.254.0.0/16, 100.64.0.0/10 and IPv6 loopback/ULA to the default deny-list, and re-resolve the host at request time to blunt DNS-rebinding TOCTOU. And it is the headline of <em>three</em> Medium-severity results, not the only one: the other two are the deploy-dependent ImageTragick surface in the Imagick image editor, which parses uploaded image content, and the role-guard inconsistency in <code class="inline">wp-admin/user-new.php</code>, which the next section states in full. The published table carries one further numbered entry, at informational severity — an option-injection pattern in the bundled Snoopy library that traces to dead code in core and matters only to plugins — and then the documented negatives. Four findings, three of them Medium, none claimed above the severity the source assigns it.</p>
+</section>
+
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">THE GUARD ITS SIBLINGS HAVE, <span class="accent">MISSING HERE.</span></h2>
+  <p class="wide">The second result worth stating at full length is an <em>inconsistency</em>, not an absence — and inconsistency is the shape a presence-of-a-check model is structurally unable to see. In upstream WordPress 7.0.2, <code class="inline">wp-admin/user-new.php</code> holds three sinks that assign a request-supplied role. Two call the role-editability guard <code class="inline">wp_ensure_editable_role()</code>, introduced in WordPress 6.8.0. The third does not. That half is unconditional. The escalation it enables is not, and both halves belong in the same breath: on a stock install <code class="inline">get_editable_roles()</code> returns every role, so <code class="inline">wp_ensure_editable_role()</code> is a no-op, the inviter could already assign the role legitimately, and <strong>no privilege boundary is crossed</strong> — in stock this is defense-in-depth, not escalation.</p>
+  <pre class="code"><span class="comment"># wp-admin/user-new.php — three sinks, one request-supplied role</span>
+
+<span class="comment"># line 73 · adduser + noconfirmation branch — GUARDED</span>
+wp_ensure_editable_role( $_REQUEST['role'] );
+add_existing_user_to_blog([ ... 'role' => $_REQUEST['role'] ]);
+
+<span class="comment"># line 231 · createuser branch — GUARDED</span>
+wp_ensure_editable_role( $_REQUEST['role'] );
+
+<span class="comment"># lines 95-102 · adduser email-invitation else branch — NOT GUARDED</span>
+$newuser_key = wp_generate_password( 20, false );
+add_option( 'new_user_' . $newuser_key, array(
+    'user_id' => $user_id,
+    'email'   => $user_details->user_email,
+    'role'    => $_REQUEST['role'],   <span class="comment"># stored verbatim at line 100</span>
+) );
+$roles = get_editable_roles();
+$role  = $roles[ $_REQUEST['role'] ]; <span class="comment"># AFTER the store · feeds the email text · warning, not wp_die</span></pre>
+  <p class="wide">The <code class="inline">get_editable_roles()</code> lookup two lines below the store is not a gate: it runs after the value is already persisted, it feeds the invitation email text, and an out-of-policy role produces a warning rather than a <code class="inline">wp_die</code>. The authorization that <em>is</em> present on this path is real but coarse — <code class="inline">current_user_can( 'promote_user', $target )</code> asks whether this user may promote that user at all, not whether they may hand out <em>that</em> role. Saying "there is no capability check here" would be false; saying the check is role-agnostic is the accurate claim.</p>
+  <p class="wide">Traced from the code, the trigger is one POST and one later click. Nothing below was fired at anything: these requests are reconstructed from the real implementation, and the finding was verified by <em>reading</em> WordPress 7.0.2 plus an independent agent whose only job was to refute it. No live or lab WordPress instance was attacked anywhere in this audit — the only finding verified by executing a port of core's own code was Finding 1's SSRF verdict, obtained from a ported copy of the validator. The run's other executed check was a PHP-semantics control test — whether a throwing <code class="inline">__wakeup</code> suppresses a <code class="inline">__destruct</code> gadget — run on synthetic classes in Docker PHP 7.4.33/8.0.30/8.3.32, not on WordPress code and not against any instance.</p>
+  <pre class="code"><span class="comment"># the site-admin Add User screen — the file whose lines 73 / 95-102 / 231 are quoted above</span>
+POST /wp-admin/user-new.php HTTP/1.1
+Host: site.victim.network.example
+Cookie: wordpress_logged_in_&lt;hash&gt;=&lt;restricted-admin session&gt;
+Content-Type: application/x-www-form-urlencoded
+
+action=adduser&amp;_wpnonce_add-user=&lt;nonce from the Add-User form&gt;&amp;_wp_http_referer=%2Fwp-admin%2Fuser-new.php&amp;email=attacker-alt%40example.com&amp;role=administrator
+
+<span class="comment"># noconfirmation is OMITTED — supplying it routes to the guarded line-73 branch</span>
+<span class="comment"># email must resolve to an existing user via get_user_by('email')</span>
+<span class="comment"># server effect: add_option() writes new_user_{key} = { user_id, email, role:'administrator' }</span>
+<span class="comment">#   at user-new.php:100, with no wp_ensure_editable_role() anywhere on that path</span>
+
+<span class="comment"># SECOND ORDER — the invited address, chosen by the inviter, visits the link</span>
+GET /newbloguser/&lt;key-from-email&gt;/ HTTP/1.1
+Host: site.victim.network.example
+
+<span class="comment"># maybe_add_existing_user_to_blog() in wp-includes/ms-functions.php runs on every</span>
+<span class="comment"># request (init hook), reads the tainted role back out of the option, and applies it:</span>
+<span class="comment">#   add_existing_user_to_blog() -> add_user_to_blog( $blog_id, $user_id, $role )</span>
+<span class="comment">#     apply_filters( 'can_add_user_to_blog', true, ... );  // defaults to TRUE</span>
+<span class="comment">#     $user->set_role( $role );                            // no cap / editable-role re-check</span></pre>
+  <p class="wide">There is no re-check on confirmation: the only thing standing between the stored role and <code class="inline">set_role()</code> is the default-true <code class="inline">can_add_user_to_blog</code> filter. So a role the inviter was not authorized to assign is persisted and later applied — and "later" is load-bearing, because the escalation is second-order and requires the invited, attacker-controlled address to actually visit <code class="inline">/newbloguser/&lt;key&gt;/</code>. It does not happen at store time and it does not happen without that interaction.</p>
+  <p class="wide"><strong>Everything that has to be true — with the finding, not under it.</strong> Multisite: the vulnerable branch is the multisite add-existing-user invitation flow, so a single-site install is not the target here. An authenticated session holding <code class="inline">create_users</code> and <code class="inline">promote_users</code> over the target but not <code class="inline">manage_network_users</code>. A valid <code class="inline">add-user</code> nonce harvested from the real form — the intent check is satisfied normally, not bypassed. <code class="inline">noconfirmation</code> omitted, so the email-invitation branch runs. An <code class="inline">email</code> that resolves to an existing network user, and, for the escalation to benefit anyone, an address the attacker controls. And the deciding precondition: an <code class="inline">editable_roles</code> filter that restricts this inviter below the injected role — the shape membership plugins, role managers and multi-tenant "site manager" delegation setups create. Without that filter, <code class="inline">wp_ensure_editable_role()</code> would have been a no-op anyway and the inviter could already have assigned the role. Medium, conditional, real. Not a stock-install escalation, not code execution of any kind, not unauthenticated, not instantaneous. It is worth reporting to WordPress as a hardening fix, and it is not claimed as anything beyond that. The fix is one line: call <code class="inline">wp_ensure_editable_role( $_REQUEST['role'] );</code> at the top of the email-invitation branch, matching its two siblings.</p>
+  <p class="wide"><strong>Which technique found it, and which missed it — that is the transferable part.</strong> It came out of the exhaustive per-file sweep: 883 security-relevant files, 177 review batches, 222 agents, ~10.8M tokens, ~31 minutes, 44 candidates cut to 5 by adversarial verification. The verify phase was itself truncated and the source says so: all 177 review batches finished, so every one of the 883 files was analysed, but only 36 of the 44 candidates were machine-verified — 8 were dropped when the run hit a usage limit and were hand-read by the lead afterwards, of which two remain plausible-but-unconfirmed and are excluded from the 5. It is confirmed item #1 in that table, at <code class="inline">wp-admin/user-new.php:100</code>, and one of only two the lead independently re-read; the sweep's other lead-read item is its independent re-discovery of the SSRF range gap at <code class="inline">wp-includes/http.php:598</code>, which is the control showing the sweep was working rather than lucky. (The sweep is published as <code class="inline">ZERODAY-SWEEP.md</code>; the file name describes what it went looking for, not what it found — nothing here is a 0-day, and the remaining three confirmed items sit at adversarial-verifier confidence, reported as candidates rather than asserted.) What missed it is the structural authorization graph — the cheap, fast, high-coverage pass that had already declared this area clean. The reason is exact and is the whole lesson: the graph asked <em>"is there a capability check?"</em>, <code class="inline">user-new.php</code> has one, so the file passed. A presence-of-a-check model cannot represent a <em>missing sibling guard</em>, because every predicate it evaluates returns true.</p>
+  <p class="wide"><strong>And "just read everything" would not have caught it either.</strong> Three reasons, all specific to this bug. It does not fit: core is ~5,200,000 tokens and a 200k window holds about 4%, so you must chunk — and chunking is exactly where the interprocedural flow is lost, because the tainted store is in <code class="inline">wp-admin/user-new.php</code> while the sink that applies it lives in <code class="inline">wp-includes/ms-functions.php</code>, two files away. It cannot compare siblings without a map: the defect is only visible with all three role sinks side by side, and a windowed scan reads them in different chunks and never lines them up. And it re-reads the whole tree for every new hypothesis, paying the full token cost per question. The index is what returned "every <code class="inline">add_option</code> / <code class="inline">add_existing_user_to_blog</code> call carrying a role argument" as one result set — handing the reviewer the three siblings to compare — and what let the sweep target 883 security-relevant files instead of blindly chunking 1,492. To be plain about the division of labour: XERJ did not find this bug, and no index finds bugs. It narrowed the search and put the right neighbours next to each other; the per-file agent read and the adversarial verification did the rest.</p>
+  <p class="wide"><strong>The lesson, compiled.</strong> Structural coverage and per-file reading are complementary, not competing: the graph narrows the search and <em>proves</em> coverage, while the read catches the inconsistency and logic gaps no fact schema encodes — "a capability check exists" simply cannot express "a guard its siblings have is absent here". Neither technique alone found this one. The practical dial is to run the cheap structural passes as the daily driver, at ~26,000 tokens for the whole structured audit, and the exhaustive per-file sweep at ~10.8M tokens as the periodic backstop when you suspect misses. And when the backstop finds what the graph missed, the loop closes the way it is supposed to: compile the new invariant — <em>this guard must be applied to ALL sibling sinks of the same kind, not merely present somewhere in the file</em> — into a fingerprint, and the next audit gets it for free.</p>
 </section>
 
 
@@ -392,17 +445,15 @@
     <div class="law">
       <div class="t">THE STRUCTURAL PASS <span class="accent">MISSED ONE.</span></div>
       <div class="b">
-        An exhaustive per-file sweep — 222 agents, ~10.8M tokens, ~31 minutes over the 883
-        security-relevant files, producing 44 candidates that adversarial verification cut to 5 —
-        found a role-injection inconsistency in <code class="inline">wp-admin/user-new.php</code>: two of the
-        three sinks that assign a request-supplied role call <code class="inline">wp_ensure_editable_role()</code>,
-        and the email-invitation branch does not. The structural authz graph passed that file, because a
-        capability check <em>was</em> present and a presence-of-check model cannot see a missing sibling guard.
-        On a stock install no privilege boundary is crossed — <code class="inline">get_editable_roles()</code>
-        returns every role, so the guard is a no-op — and it bites only on multisite where an
-        <code class="inline">editable_roles</code> filter restricts the inviter below the injected role. A genuine
-        unconditional inconsistency worth a hardening fix, not a stock-install escalation. Neither pass alone
-        finds it: the deep sweep is the periodic backstop, the ~26,000-token structural passes are the daily driver.
+        The cheap, high-coverage authorization graph passed <code class="inline">wp-admin/user-new.php</code>
+        because a capability check <em>was</em> present, and a presence-of-check model cannot see a missing
+        sibling guard. The exhaustive per-file sweep — 222 agents, ~10.8M tokens, ~31 minutes over the 883
+        security-relevant files, 44 candidates cut to 5 by adversarial verification (36 of the 44 machine-verified;
+        8 dropped at a usage limit and hand-read by the lead) — caught what it missed.
+        The section above states that finding in full, including its ceiling: on a stock install
+        <code class="inline">get_editable_roles()</code> returns every role, so the guard is a no-op and no
+        privilege boundary is crossed. Neither pass alone finds it — the deep sweep is the periodic backstop,
+        the ~26,000-token structural passes are the daily driver.
       </div>
     </div>
   </div>
