@@ -20529,6 +20529,17 @@ fn postings_union_expand(
     (count, positions)
 }
 
+/// Coerce a `lat`/`lon` object member to `f64`. Real ES accepts numeric OR
+/// string-encoded lat/lon inside a `{"lat": .., "lon": ..}` geo_point object
+/// (normalised to numbers at index time) — Kibana's own flights sample data
+/// ships exactly this shape (`{"lat": "50.033333", ...}`), which `.as_f64()`
+/// alone silently rejects, turning every `geo_distance`/`geo_bounding_box`
+/// query against that field into an unconditional non-match.
+fn geo_coord(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 /// Evaluate a query against a single stored document source value.
 ///
 /// Returns true if the document matches the query.
@@ -21210,8 +21221,8 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                     // Accept {"lat": f64, "lon": f64} or [lon, lat] or "lat,lon".
                     let (doc_lat, doc_lon) = match &v {
                         Value::Object(obj) => {
-                            let dlat = obj.get("lat").and_then(|x| x.as_f64())?;
-                            let dlon = obj.get("lon").and_then(|x| x.as_f64())?;
+                            let dlat = geo_coord(obj.get("lat")?)?;
+                            let dlon = geo_coord(obj.get("lon")?)?;
                             (dlat, dlon)
                         }
                         Value::Array(arr) if arr.len() == 2 => {
@@ -21409,8 +21420,8 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                 .and_then(|v| {
                     let (doc_lat, doc_lon) = match &v {
                         Value::Object(obj) => {
-                            let dlat = obj.get("lat").and_then(|x| x.as_f64())?;
-                            let dlon = obj.get("lon").and_then(|x| x.as_f64())?;
+                            let dlat = geo_coord(obj.get("lat")?)?;
+                            let dlon = geo_coord(obj.get("lon")?)?;
                             (dlat, dlon)
                         }
                         Value::Array(arr) if arr.len() == 2 => {
