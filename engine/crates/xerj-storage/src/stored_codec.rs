@@ -55,7 +55,53 @@
 use crate::{Result, StorageError};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashMap;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
+
+mod row_hydration;
+pub use row_hydration::{
+    decode_stored_v2_rows, decode_stored_v2_rows_controlled, decode_stored_v2_rows_projected,
+    decode_stored_v2_rows_projected_controlled, StoredV2HydratedRow, StoredV2RowHydrationResult,
+    StoredV2RowHydrationStats,
+};
+
+pub const STORED_DECODE_CHECK_INTERVAL: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredDecodePhase {
+    BeforeColumn,
+    Rows,
+    AfterColumn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredDecodeCheckpoint {
+    pub phase: StoredDecodePhase,
+    pub column_index: usize,
+    pub rows_processed: usize,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StoredDecodeRun<T> {
+    Complete(T),
+    Cancelled,
+}
+
+pub(crate) fn decode_cancelled<F>(
+    checkpoint: &mut F,
+    phase: StoredDecodePhase,
+    column_index: usize,
+    rows_processed: usize,
+) -> bool
+where
+    F: FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()> + ?Sized,
+{
+    checkpoint(StoredDecodeCheckpoint {
+        phase,
+        column_index,
+        rows_processed,
+    })
+    .is_break()
+}
 
 // ── V1: flat LZ4 over JSON (legacy) ───────────────────────────────────────
 
@@ -535,6 +581,1035 @@ pub fn decode_stored(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Conservative retained-size bound for the canonical stored bytes plus the
+/// `(start, end)` row-offset table used by the engine's `StoredSlices`.
+///
+/// This reads only framing metadata. It never decompresses a column or
+/// materialises a `serde_json::Value`, so publish-time cache admission can
+/// fail closed *before* paying the full ZBS2 expansion. `Ok(None)` means a
+/// zstd frame omitted its content-size field and therefore has no trustworthy
+/// finite bound in the current format.
+pub fn stored_slices_retained_upper_bound(bytes: &[u8], expected_docs: u64) -> Result<Option<u64>> {
+    const STORED_SLICES_STRUCT_OVERHEAD: u64 = 64;
+    const OFFSET_BYTES: u64 = 8;
+
+    let expected_offsets = expected_docs
+        .checked_mul(OFFSET_BYTES)
+        .and_then(|size| size.checked_add(STORED_SLICES_STRUCT_OVERHEAD))
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("stored retained bound overflow")))?;
+
+    let (decoded_bound, offsets_bound) = if bytes.len() >= 4 && &bytes[..4] == STORED_LZ4_MAGIC {
+        let payload = bytes
+            .get(4..8)
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("LZ4 stored size truncated")))?;
+        let decoded = u32::from_le_bytes(payload.try_into().unwrap()) as u64;
+        let offsets = decoded
+            .checked_mul(OFFSET_BYTES)
+            .and_then(|size| size.checked_add(STORED_SLICES_STRUCT_OVERHEAD))
+            .ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!("LZ4 stored offset bound overflow"))
+            })?;
+        (decoded, offsets)
+    } else if bytes.len() >= 4 && &bytes[..4] == STORED_V2_MAGIC {
+        let directory = parse_v2_directory(&bytes[4..])?;
+        if directory.num_docs as u64 != expected_docs {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "v2 num_docs {} != expected {expected_docs}",
+                directory.num_docs
+            )));
+        }
+        let rows = expected_docs;
+        // Canonical wrapper punctuation, `_id`, `_seq_no`, `_source`, commas,
+        // colons and braces fit well below 64 bytes per row. This deliberately
+        // over-counts empty/null fields.
+        let mut bound = rows
+            .checked_mul(64)
+            .and_then(|size| size.checked_add(2))
+            .ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!("v2 decoded-size bound overflow"))
+            })?;
+        for column in &directory.columns {
+            let value_bound = match column.codec {
+                ColCodec::RawJson => {
+                    let Some(size) = zstd_frame_content_size(column.payload, "raw json")? else {
+                        return Ok(None);
+                    };
+                    size
+                }
+                ColCodec::Lz4Json => lz4_uncompressed_size(column.payload, "lz4 json")?,
+                ColCodec::Constant => {
+                    (column.payload.len() as u64)
+                        .checked_mul(rows)
+                        .ok_or_else(|| {
+                            StorageError::Other(anyhow::anyhow!(
+                                "constant decoded-size bound overflow"
+                            ))
+                        })?
+                }
+                ColCodec::DictBitpack => {
+                    let Some(dictionary_bytes) =
+                        dict_json_content_size(column.payload, directory.num_docs)?
+                    else {
+                        return Ok(None);
+                    };
+                    // Every row is either null (4 bytes) or one dictionary
+                    // entry. No entry can be longer than the complete
+                    // dictionary JSON payload.
+                    dictionary_bytes.max(4).checked_mul(rows).ok_or_else(|| {
+                        StorageError::Other(anyhow::anyhow!("dict decoded-size bound overflow"))
+                    })?
+                }
+                // CROSS_DEP materialises only JSON i64 or null cells. The
+                // longest i64 decimal representation is 20 bytes.
+                ColCodec::CrossDep => rows.checked_mul(20).ok_or_else(|| {
+                    StorageError::Other(anyhow::anyhow!("cross-dep decoded-size bound overflow"))
+                })?,
+            };
+            bound = bound.checked_add(value_bound).ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!("v2 decoded-size bound overflow"))
+            })?;
+            if column.name != "__id" && column.name != "__seq_no" {
+                let encoded_name_len = serde_json::to_vec(column.name)
+                    .map_err(|error| {
+                        StorageError::Other(anyhow::anyhow!(
+                            "v2 column-name size estimate: {error}"
+                        ))
+                    })?
+                    .len() as u64;
+                let key_overhead = rows
+                    .checked_mul(encoded_name_len.saturating_add(2))
+                    .ok_or_else(|| {
+                        StorageError::Other(anyhow::anyhow!("v2 key-size bound overflow"))
+                    })?;
+                bound = bound.checked_add(key_overhead).ok_or_else(|| {
+                    StorageError::Other(anyhow::anyhow!("v2 decoded-size bound overflow"))
+                })?;
+            }
+        }
+        (bound, expected_offsets)
+    } else {
+        let decoded = bytes.len() as u64;
+        let offsets = decoded
+            .checked_mul(OFFSET_BYTES)
+            .and_then(|size| size.checked_add(STORED_SLICES_STRUCT_OVERHEAD))
+            .ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!("plain stored offset bound overflow"))
+            })?;
+        (decoded, offsets)
+    };
+    decoded_bound
+        .checked_add(offsets_bound)
+        .map(Some)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("stored retained bound overflow")))
+}
+
+fn zstd_frame_content_size(payload: &[u8], context: &str) -> Result<Option<u64>> {
+    let frame_size = zstd::zstd_safe::find_frame_compressed_size(payload).map_err(|_| {
+        StorageError::Other(anyhow::anyhow!("{context} zstd frame header is invalid"))
+    })?;
+    if frame_size != payload.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "{context} contains concatenated/trailing zstd data"
+        )));
+    }
+    zstd::zstd_safe::get_frame_content_size(payload)
+        .map_err(|_| StorageError::Other(anyhow::anyhow!("{context} zstd frame header is invalid")))
+}
+
+fn decode_zstd_exact(payload: &[u8], expected: usize, context: &str) -> Result<Vec<u8>> {
+    if zstd_frame_content_size(payload, context)?.is_some_and(|size| size != expected as u64) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "{context} content size does not match expected length"
+        )));
+    }
+    let decoder = zstd::stream::read::Decoder::new(payload)
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("{context}: {error}")))?;
+    let mut bounded = decoder.take(expected as u64 + 1);
+    let mut decoded = Vec::with_capacity(expected);
+    bounded
+        .read_to_end(&mut decoded)
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("{context}: {error}")))?;
+    if decoded.len() != expected {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "{context} decoded length {} != expected {expected}",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
+
+fn lz4_uncompressed_size(payload: &[u8], context: &str) -> Result<u64> {
+    let size = payload
+        .get(..4)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("{context} size is truncated")))?;
+    Ok(u32::from_le_bytes(size.try_into().unwrap()) as u64)
+}
+
+fn dict_json_content_size(payload: &[u8], num_docs: usize) -> Result<Option<u64>> {
+    let mut cursor = Cursor::new(payload);
+    let _dict_count = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("dict_count: {error}")))?;
+    let bit_width = cursor
+        .read_u8()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("bit_width: {error}")))?;
+    if !(1..=32).contains(&bit_width) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict invalid bit_width {bit_width}"
+        )));
+    }
+    let dict_len = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("dict_zstd_len: {error}")))?
+        as usize;
+    let dict_start = cursor.position() as usize;
+    let dict_end = dict_start
+        .checked_add(dict_len)
+        .filter(|end| *end <= payload.len())
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("dict payload truncated")))?;
+    let content_size = zstd_frame_content_size(&payload[dict_start..dict_end], "dict json")?;
+    cursor.set_position(dict_end as u64);
+    let ids_len = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("ids_len: {error}")))?
+        as usize;
+    if ids_len != num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict ids_len {ids_len} != num_docs {num_docs}"
+        )));
+    }
+    let packed_len = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|error| StorageError::Other(anyhow::anyhow!("packed_zstd_len: {error}")))?
+        as usize;
+    let packed_start = cursor.position() as usize;
+    let packed_end = packed_start
+        .checked_add(packed_len)
+        .filter(|end| *end == payload.len())
+        .ok_or_else(|| {
+            StorageError::Other(anyhow::anyhow!("dict packed payload truncated/trailing"))
+        })?;
+    let packed_size = zstd_frame_content_size(&payload[packed_start..packed_end], "dict ids")?;
+    let expected_packed_size = num_docs
+        .checked_mul(bit_width as usize)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("dict packed-size overflow")))?
+        .div_ceil(8) as u64;
+    if packed_size.is_some_and(|size| size != expected_packed_size) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict packed content size does not match ids_len"
+        )));
+    }
+    if packed_size.is_none() {
+        return Ok(None);
+    }
+    Ok(content_size)
+}
+
+/// Values decoded from a requested subset of a ZBS2 stored section.
+///
+/// Column names use their on-disk names: `_id` and `_seq_no` are `__id` and
+/// `__seq_no`; source fields retain their original top-level names.
+#[derive(Debug, PartialEq)]
+pub struct StoredV2Projection {
+    pub num_docs: usize,
+    pub columns: HashMap<String, Vec<serde_json::Value>>,
+}
+
+/// Result of attempting a selective V2 decode.
+#[derive(Debug, PartialEq)]
+pub enum StoredV2ProjectionResult {
+    /// The section is a valid legacy/non-V2 shape. Callers may use the full
+    /// compatibility decoder.
+    NotV2,
+    /// The requested columns were decoded. Requested names absent from the
+    /// segment are absent from `columns`.
+    Projected(StoredV2Projection),
+}
+
+struct V2ColumnRef<'a> {
+    name: &'a str,
+    codec: ColCodec,
+    payload: &'a [u8],
+}
+
+struct V2Directory<'a> {
+    num_docs: usize,
+    columns: Vec<V2ColumnRef<'a>>,
+}
+
+/// Typed columns needed by an exact kNN scan.
+pub type StoredVectorRows = Vec<Option<Vec<f32>>>;
+pub type StoredVectorChunkRows = Vec<Option<Vec<Vec<f32>>>>;
+
+#[derive(Debug, PartialEq)]
+pub struct StoredV2KnnProjection {
+    pub num_docs: usize,
+    /// Invalid or missing identity cells are represented as `None`; the
+    /// engine's version/tombstone rules decide whether to skip those rows.
+    pub ids: Vec<Option<String>>,
+    pub seq_nos: Vec<Option<u64>>,
+    pub vectors: StoredVectorRows,
+    /// `None` means the optional chunks role was not requested or its named
+    /// column is absent. It is not a corruption signal.
+    pub vector_chunks: Option<StoredVectorChunkRows>,
+}
+
+/// Result of attempting the typed kNN projection.
+#[derive(Debug, PartialEq)]
+pub enum StoredV2KnnProjectionResult {
+    /// Legacy LZ4 or headerless JSON. The caller must use the compatibility
+    /// decoder.
+    NotV2,
+    /// A valid V2 section does not contain the requested vector column.
+    MissingVectorColumn,
+    /// The requested column exists but is not a finite numeric vector shape.
+    /// Callers may preserve compatibility by using the generic decoder.
+    UnsupportedVectorShape,
+    Projected(StoredV2KnnProjection),
+}
+
+/// Parse and validate the complete ZBS2 directory without decoding payloads.
+///
+/// Keeping framing validation separate from payload decoding allows callers
+/// to skip large unrelated columns while retaining the full decoder's
+/// truncation, UTF-8 and codec-id checks.
+fn parse_v2_directory(body: &[u8]) -> Result<V2Directory<'_>> {
+    let mut cur = Cursor::new(body);
+    let num_docs = cur
+        .read_u32::<LittleEndian>()
+        .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 num_docs: {e}")))?
+        as usize;
+    let num_cols = cur
+        .read_u32::<LittleEndian>()
+        .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 num_cols: {e}")))?
+        as usize;
+    const MIN_COLUMN_FRAMING_BYTES: usize =
+        std::mem::size_of::<u16>() + std::mem::size_of::<u8>() + std::mem::size_of::<u32>();
+    let remaining = body.len().saturating_sub(cur.position() as usize);
+    if num_cols > remaining / MIN_COLUMN_FRAMING_BYTES {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "v2 num_cols {num_cols} exceeds the remaining directory framing"
+        )));
+    }
+    let mut columns = Vec::new();
+    columns.try_reserve_exact(num_cols).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "v2 cannot reserve directory for {num_cols} columns: {error}"
+        ))
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    seen.try_reserve(num_cols).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "v2 cannot reserve duplicate-name set for {num_cols} columns: {error}"
+        ))
+    })?;
+    for _ in 0..num_cols {
+        let name_len = cur
+            .read_u16::<LittleEndian>()
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 name_len: {e}")))?
+            as usize;
+        let name_start = cur.position() as usize;
+        let name_end = name_start
+            .checked_add(name_len)
+            .filter(|end| *end <= body.len())
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 truncated name")))?;
+        let name = std::str::from_utf8(&body[name_start..name_end])
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 bad name utf8: {e}")))?;
+        if !seen.insert(name) {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "v2 duplicate column name: {name}"
+            )));
+        }
+        cur.set_position(name_end as u64);
+        let codec_id = cur
+            .read_u8()
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 codec_id: {e}")))?;
+        let codec = ColCodec::from_u8(codec_id)
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 unknown codec {codec_id}")))?;
+        let payload_len = cur
+            .read_u32::<LittleEndian>()
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 payload_len: {e}")))?
+            as usize;
+        let payload_start = cur.position() as usize;
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .filter(|end| *end <= body.len())
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v2 truncated payload")))?;
+        columns.push(V2ColumnRef {
+            name,
+            codec,
+            payload: &body[payload_start..payload_end],
+        });
+        cur.set_position(payload_end as u64);
+    }
+    if cur.position() as usize != body.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "v2 trailing bytes after column payloads"
+        )));
+    }
+    Ok(V2Directory { num_docs, columns })
+}
+
+/// Decode only named columns from a V2 stored section.
+///
+/// This API does not change `decode_stored` or any engine behavior. It is the
+/// storage primitive for consumers that can operate on selected columns
+/// without reconstructing every `_source` object.
+pub fn decode_stored_v2_projection(
+    bytes: &[u8],
+    requested: &[&str],
+) -> Result<StoredV2ProjectionResult> {
+    if bytes.len() < 4 || &bytes[..4] != STORED_V2_MAGIC {
+        return Ok(StoredV2ProjectionResult::NotV2);
+    }
+    let directory = parse_v2_directory(&bytes[4..])?;
+    let requested: std::collections::HashSet<&str> = requested.iter().copied().collect();
+    let mut decoded = vec![None; directory.columns.len()];
+    let mut visiting = vec![false; directory.columns.len()];
+    let mut columns = HashMap::with_capacity(requested.len());
+    for index in 0..directory.columns.len() {
+        let column = &directory.columns[index];
+        if requested.contains(column.name) {
+            let values =
+                decode_projected_column(index, &directory, &mut decoded, &mut visiting, 0)?.clone();
+            columns.insert(column.name.to_string(), values);
+        }
+    }
+    Ok(StoredV2ProjectionResult::Projected(StoredV2Projection {
+        num_docs: directory.num_docs,
+        columns,
+    }))
+}
+
+fn decode_cross_dep_body(payload: &[u8], num_docs: usize) -> Result<Vec<u8>> {
+    if payload.is_empty() {
+        return Err(StorageError::Other(anyhow::anyhow!("cross_dep empty")));
+    }
+    // A source dictionary cannot contain more entries than source rows.
+    // Each mode costs 8 bytes and each row contributes at most one
+    // (u32-delta, i64-zigzag) exception of at most 15 bytes.
+    let max_body = num_docs
+        .checked_mul(23)
+        .and_then(|row_bytes| 12usize.checked_add(row_bytes))
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("cross_dep size overflow")))?;
+    let body = if payload[0] == 1 {
+        if zstd_frame_content_size(&payload[1..], "cross_dep")?
+            .is_some_and(|size| size > max_body as u64)
+        {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep frame exceeds maximum decoded size"
+            )));
+        }
+        let decoder = zstd::stream::read::Decoder::new(&payload[1..])
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?;
+        let mut bounded = decoder.take(max_body as u64 + 1);
+        let mut body = Vec::new();
+        bounded
+            .read_to_end(&mut body)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?;
+        if body.len() > max_body {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep decoded body exceeds limit"
+            )));
+        }
+        body
+    } else if payload[0] == 0 {
+        if payload.len() - 1 > max_body {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep raw body exceeds limit"
+            )));
+        }
+        payload[1..].to_vec()
+    } else {
+        Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep invalid compression flag {}",
+            payload[0]
+        )))?
+    };
+    Ok(body)
+}
+
+fn cross_dep_source_index(payload: &[u8], num_docs: usize) -> Result<usize> {
+    let body = decode_cross_dep_body(payload, num_docs)?;
+    Cursor::new(body)
+        .read_u32::<LittleEndian>()
+        .map(|value| value as usize)
+        .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep src_ix: {e}")))
+}
+
+fn decode_projected_column<'a>(
+    index: usize,
+    directory: &'a V2Directory<'a>,
+    decoded: &'a mut [Option<Vec<serde_json::Value>>],
+    visiting: &mut [bool],
+    depth: usize,
+) -> Result<&'a Vec<serde_json::Value>> {
+    const MAX_CROSS_DEP_DEPTH: usize = 256;
+    if depth > MAX_CROSS_DEP_DEPTH {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep dependency depth exceeds {MAX_CROSS_DEP_DEPTH}"
+        )));
+    }
+    if decoded.get(index).and_then(Option::as_ref).is_some() {
+        return Ok(decoded[index].as_ref().unwrap());
+    }
+    if index >= directory.columns.len() || index >= visiting.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep source index {index} out of range"
+        )));
+    }
+    if visiting[index] {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep dependency cycle at column {index}"
+        )));
+    }
+    visiting[index] = true;
+    let column = &directory.columns[index];
+    let values = match column.codec {
+        ColCodec::RawJson => decode_raw_json(column.payload)?,
+        ColCodec::Lz4Json => decode_lz4_json(column.payload)?,
+        ColCodec::Constant => decode_constant(column.payload, directory.num_docs)?,
+        ColCodec::DictBitpack => decode_dict_bitpack(column.payload, directory.num_docs)?,
+        ColCodec::CrossDep => {
+            let source_index = cross_dep_source_index(column.payload, directory.num_docs)?;
+            let source =
+                decode_projected_column(source_index, directory, decoded, visiting, depth + 1)?
+                    .clone();
+            let mut dependencies = vec![Vec::new(); directory.columns.len()];
+            dependencies[source_index] = source;
+            decode_cross_dep(
+                column.payload,
+                directory.num_docs,
+                &dependencies,
+                &HashMap::new(),
+            )?
+            .ok_or_else(|| {
+                StorageError::Other(anyhow::anyhow!(
+                    "cross_dep source column {source_index} was not resolved"
+                ))
+            })?
+        }
+    };
+    visiting[index] = false;
+    if values.len() != directory.num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "v2 column {} row count {} != header {}",
+            column.name,
+            values.len(),
+            directory.num_docs
+        )));
+    }
+    decoded[index] = Some(values);
+    Ok(decoded[index].as_ref().unwrap())
+}
+
+fn finite_f32_vector(values: Vec<f64>) -> Option<Vec<f32>> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value as f32;
+        if !value.is_finite() {
+            return None;
+        }
+        out.push(value);
+    }
+    Some(out)
+}
+
+struct TypedVectorRowsVisitor<'a> {
+    expected_rows: usize,
+    column_index: usize,
+    checkpoint: &'a mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+    cancelled: &'a std::cell::Cell<bool>,
+}
+
+impl<'de> serde::de::Visitor<'de> for TypedVectorRowsVisitor<'_> {
+    type Value = Option<StoredVectorRows>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a vector column JSON array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut out = Vec::new();
+        out.try_reserve_exact(self.expected_rows)
+            .map_err(serde::de::Error::custom)?;
+        let mut supported = true;
+        for row in 0..self.expected_rows {
+            let Some(value) = seq.next_element::<serde_json::Value>()? else {
+                return Err(serde::de::Error::custom("vector column ended early"));
+            };
+            let typed = match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::Array(values) => {
+                    let values = values
+                        .into_iter()
+                        .map(|value| value.as_f64())
+                        .collect::<Option<Vec<_>>>()
+                        .and_then(finite_f32_vector);
+                    let Some(values) = values else {
+                        supported = false;
+                        out.push(None);
+                        if checkpoint_decoded_row(
+                            row,
+                            self.column_index,
+                            self.checkpoint,
+                            self.cancelled,
+                        ) {
+                            return Err(serde::de::Error::custom("stored decode cancelled"));
+                        }
+                        continue;
+                    };
+                    Some(values)
+                }
+                _ => {
+                    supported = false;
+                    None
+                }
+            };
+            out.push(typed);
+            if checkpoint_decoded_row(row, self.column_index, self.checkpoint, self.cancelled) {
+                return Err(serde::de::Error::custom("stored decode cancelled"));
+            }
+        }
+        if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom("vector column has extra rows"));
+        }
+        Ok(supported.then_some(out))
+    }
+}
+
+fn checkpoint_decoded_row(
+    zero_based_row: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+    cancelled: &std::cell::Cell<bool>,
+) -> bool {
+    let processed = zero_based_row + 1;
+    if processed.is_multiple_of(STORED_DECODE_CHECK_INTERVAL)
+        && checkpoint(StoredDecodeCheckpoint {
+            phase: StoredDecodePhase::Rows,
+            column_index,
+            rows_processed: processed,
+        })
+        .is_break()
+    {
+        cancelled.set(true);
+        return true;
+    }
+    false
+}
+
+fn repeat_constant_rows_controlled<T: Clone>(
+    row: T,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Vec<T>, ()>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(num_docs).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {num_docs} constant stored rows: {error}"
+        ))
+    })?;
+    for zero_based_row in 0..num_docs {
+        out.push(row.clone());
+        let processed = zero_based_row + 1;
+        if processed.is_multiple_of(STORED_DECODE_CHECK_INTERVAL)
+            && checkpoint(StoredDecodeCheckpoint {
+                phase: StoredDecodePhase::Rows,
+                column_index,
+                rows_processed: processed,
+            })
+            .is_break()
+        {
+            return Ok(Err(()));
+        }
+    }
+    Ok(Ok(out))
+}
+
+fn decode_typed_vector_rows_controlled(
+    column: &V2ColumnRef<'_>,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Option<StoredVectorRows>, ()>> {
+    if column.codec == ColCodec::Constant {
+        let row = match serde_json::from_slice::<serde_json::Value>(column.payload)
+            .map_err(|error| StorageError::Other(anyhow::anyhow!("constant decode: {error}")))?
+        {
+            serde_json::Value::Null => None,
+            serde_json::Value::Array(values) => {
+                let Some(values) = values
+                    .into_iter()
+                    .map(|value| value.as_f64())
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(finite_f32_vector)
+                else {
+                    return Ok(Ok(None));
+                };
+                Some(values)
+            }
+            _ => return Ok(Ok(None)),
+        };
+        return repeat_constant_rows_controlled(row, num_docs, column_index, checkpoint)
+            .map(|result| result.map(Some));
+    }
+    match column.codec {
+        ColCodec::RawJson => {
+            let decoder = zstd::stream::read::Decoder::new(column.payload).map_err(|error| {
+                StorageError::Other(anyhow::anyhow!("raw zstd decode: {error}"))
+            })?;
+            parse_typed_vector_reader(decoder, num_docs, column_index, checkpoint)
+        }
+        ColCodec::Lz4Json => {
+            let raw = lz4_flex::decompress_size_prepended(column.payload)
+                .map_err(|error| StorageError::Other(anyhow::anyhow!("lz4 decode: {error}")))?;
+            parse_typed_vector_reader(raw.as_slice(), num_docs, column_index, checkpoint)
+        }
+        _ => Ok(Ok(None)),
+    }
+}
+
+fn parse_typed_vector_reader<R: std::io::Read>(
+    reader: R,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Option<StoredVectorRows>, ()>> {
+    use serde::de::Deserializer as _;
+    let cancelled = std::cell::Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let value = match deserializer.deserialize_seq(TypedVectorRowsVisitor {
+        expected_rows: num_docs,
+        column_index,
+        checkpoint,
+        cancelled: &cancelled,
+    }) {
+        Ok(value) => value,
+        Err(_) if cancelled.get() => return Ok(Err(())),
+        Err(error) => {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "vector json decode: {error}"
+            )));
+        }
+    };
+    if value.is_some() {
+        deserializer
+            .end()
+            .map_err(|error| StorageError::Other(anyhow::anyhow!("vector json decode: {error}")))?;
+    }
+    Ok(Ok(value))
+}
+
+fn decode_typed_vector_chunk_rows_controlled(
+    column: &V2ColumnRef<'_>,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Option<StoredVectorChunkRows>, ()>> {
+    if column.codec == ColCodec::Constant {
+        let row = match serde_json::from_slice::<serde_json::Value>(column.payload)
+            .map_err(|error| StorageError::Other(anyhow::anyhow!("constant decode: {error}")))?
+        {
+            serde_json::Value::Null => None,
+            serde_json::Value::Array(chunks) => {
+                let mut typed = Vec::new();
+                typed.try_reserve_exact(chunks.len()).map_err(|error| {
+                    StorageError::Other(anyhow::anyhow!(
+                        "cannot reserve {} constant vector chunks: {error}",
+                        chunks.len()
+                    ))
+                })?;
+                for chunk in chunks {
+                    let serde_json::Value::Array(values) = chunk else {
+                        return Ok(Ok(None));
+                    };
+                    let Some(vector) = values
+                        .into_iter()
+                        .map(|value| value.as_f64())
+                        .collect::<Option<Vec<_>>>()
+                        .and_then(finite_f32_vector)
+                    else {
+                        return Ok(Ok(None));
+                    };
+                    typed.push(vector);
+                }
+                Some(typed)
+            }
+            _ => return Ok(Ok(None)),
+        };
+        return repeat_constant_rows_controlled(row, num_docs, column_index, checkpoint)
+            .map(|result| result.map(Some));
+    }
+    match column.codec {
+        ColCodec::RawJson => {
+            let decoder = zstd::stream::read::Decoder::new(column.payload).map_err(|error| {
+                StorageError::Other(anyhow::anyhow!("raw zstd decode: {error}"))
+            })?;
+            parse_typed_chunk_reader(decoder, num_docs, column_index, checkpoint)
+        }
+        ColCodec::Lz4Json => {
+            let raw = lz4_flex::decompress_size_prepended(column.payload)
+                .map_err(|error| StorageError::Other(anyhow::anyhow!("lz4 decode: {error}")))?;
+            parse_typed_chunk_reader(raw.as_slice(), num_docs, column_index, checkpoint)
+        }
+        _ => Ok(Ok(None)),
+    }
+}
+
+fn parse_typed_chunk_reader<R: std::io::Read>(
+    reader: R,
+    num_docs: usize,
+    column_index: usize,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<std::result::Result<Option<StoredVectorChunkRows>, ()>> {
+    use serde::de::Deserializer as _;
+    struct Visitor<'a> {
+        rows: usize,
+        column: usize,
+        checkpoint: &'a mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+        cancelled: &'a std::cell::Cell<bool>,
+    }
+    impl<'de> serde::de::Visitor<'de> for Visitor<'_> {
+        type Value = Option<StoredVectorChunkRows>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a vector chunks column JSON array")
+        }
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            out.try_reserve_exact(self.rows)
+                .map_err(serde::de::Error::custom)?;
+            let mut supported = true;
+            for row in 0..self.rows {
+                let Some(value) = seq.next_element::<serde_json::Value>()? else {
+                    return Err(serde::de::Error::custom("vector chunks ended early"));
+                };
+                let typed = match value {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::Array(chunks) => {
+                        let mut result = Vec::with_capacity(chunks.len());
+                        for chunk in chunks {
+                            let serde_json::Value::Array(values) = chunk else {
+                                supported = false;
+                                continue;
+                            };
+                            let vector = values
+                                .into_iter()
+                                .map(|value| value.as_f64())
+                                .collect::<Option<Vec<_>>>()
+                                .and_then(finite_f32_vector);
+                            let Some(vector) = vector else {
+                                supported = false;
+                                continue;
+                            };
+                            result.push(vector);
+                        }
+                        Some(result)
+                    }
+                    _ => {
+                        supported = false;
+                        None
+                    }
+                };
+                out.push(typed);
+                let processed = row + 1;
+                if processed.is_multiple_of(STORED_DECODE_CHECK_INTERVAL)
+                    && (self.checkpoint)(StoredDecodeCheckpoint {
+                        phase: StoredDecodePhase::Rows,
+                        column_index: self.column,
+                        rows_processed: processed,
+                    })
+                    .is_break()
+                {
+                    self.cancelled.set(true);
+                    return Err(serde::de::Error::custom("stored decode cancelled"));
+                }
+            }
+            if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("vector chunks has extra rows"));
+            }
+            Ok(supported.then_some(out))
+        }
+    }
+    let cancelled = std::cell::Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let value = match deserializer.deserialize_seq(Visitor {
+        rows: num_docs,
+        column: column_index,
+        checkpoint,
+        cancelled: &cancelled,
+    }) {
+        Ok(value) => value,
+        Err(_) if cancelled.get() => return Ok(Err(())),
+        Err(error) => {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "vector chunks json decode: {error}"
+            )));
+        }
+    };
+    if value.is_some() {
+        deserializer.end().map_err(|error| {
+            StorageError::Other(anyhow::anyhow!("vector chunks json decode: {error}"))
+        })?;
+    }
+    Ok(Ok(value))
+}
+
+/// Decode the identity and vector columns needed by exact kNN without
+/// reconstructing complete source documents.
+pub fn decode_stored_v2_knn_projection(
+    bytes: &[u8],
+    vector_field: &str,
+    vector_chunks_field: Option<&str>,
+) -> Result<StoredV2KnnProjectionResult> {
+    match decode_stored_v2_knn_projection_controlled(
+        bytes,
+        vector_field,
+        vector_chunks_field,
+        |_| std::ops::ControlFlow::Continue(()),
+    )? {
+        StoredDecodeRun::Complete(result) => Ok(result),
+        StoredDecodeRun::Cancelled => unreachable!("non-cancelling compatibility wrapper"),
+    }
+}
+
+pub fn decode_stored_v2_knn_projection_controlled<F>(
+    bytes: &[u8],
+    vector_field: &str,
+    vector_chunks_field: Option<&str>,
+    mut checkpoint: F,
+) -> Result<StoredDecodeRun<StoredV2KnnProjectionResult>>
+where
+    F: FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+{
+    if bytes.len() < 4 || &bytes[..4] != STORED_V2_MAGIC {
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::NotV2,
+        ));
+    }
+    if matches!(vector_field, "__id" | "__seq_no")
+        || vector_chunks_field
+            .is_some_and(|field| matches!(field, "__id" | "__seq_no") || field == vector_field)
+    {
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::UnsupportedVectorShape,
+        ));
+    }
+    let directory = parse_v2_directory(&bytes[4..])?;
+    let Some(vector_column) = directory
+        .columns
+        .iter()
+        .find(|column| column.name == vector_field)
+    else {
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::MissingVectorColumn,
+        ));
+    };
+    let vector_index = directory
+        .columns
+        .iter()
+        .position(|column| std::ptr::eq(column, vector_column))
+        .unwrap();
+    if decode_cancelled(
+        &mut checkpoint,
+        StoredDecodePhase::BeforeColumn,
+        vector_index,
+        0,
+    ) {
+        return Ok(StoredDecodeRun::Cancelled);
+    }
+    let Some(vectors) = (match decode_typed_vector_rows_controlled(
+        vector_column,
+        directory.num_docs,
+        vector_index,
+        &mut checkpoint,
+    )? {
+        Ok(value) => value,
+        Err(()) => return Ok(StoredDecodeRun::Cancelled),
+    }) else {
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::UnsupportedVectorShape,
+        ));
+    };
+    if decode_cancelled(
+        &mut checkpoint,
+        StoredDecodePhase::AfterColumn,
+        vector_index,
+        directory.num_docs,
+    ) {
+        return Ok(StoredDecodeRun::Cancelled);
+    }
+    let vector_chunks = match vector_chunks_field {
+        Some(field) => match directory.columns.iter().find(|column| column.name == field) {
+            Some(column) => {
+                let index = directory
+                    .columns
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, column))
+                    .unwrap();
+                if decode_cancelled(&mut checkpoint, StoredDecodePhase::BeforeColumn, index, 0) {
+                    return Ok(StoredDecodeRun::Cancelled);
+                }
+                let Some(chunks) = (match decode_typed_vector_chunk_rows_controlled(
+                    column,
+                    directory.num_docs,
+                    index,
+                    &mut checkpoint,
+                )? {
+                    Ok(value) => value,
+                    Err(()) => return Ok(StoredDecodeRun::Cancelled),
+                }) else {
+                    return Ok(StoredDecodeRun::Complete(
+                        StoredV2KnnProjectionResult::UnsupportedVectorShape,
+                    ));
+                };
+                if decode_cancelled(
+                    &mut checkpoint,
+                    StoredDecodePhase::AfterColumn,
+                    index,
+                    directory.num_docs,
+                ) {
+                    return Ok(StoredDecodeRun::Cancelled);
+                }
+                Some(chunks)
+            }
+            None => None,
+        },
+        None => None,
+    };
+    let (identity_num_docs, id_values, seq_values) =
+        match row_hydration::decode_v2_identity_columns_controlled(bytes, &mut checkpoint)? {
+            StoredDecodeRun::Complete(Some(values)) => values,
+            StoredDecodeRun::Complete(None) => {
+                return Ok(StoredDecodeRun::Complete(
+                    StoredV2KnnProjectionResult::UnsupportedVectorShape,
+                ));
+            }
+            StoredDecodeRun::Cancelled => return Ok(StoredDecodeRun::Cancelled),
+        };
+    let ids = id_values
+        .into_iter()
+        .map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect();
+    let seq_nos = seq_values.into_iter().map(|value| value.as_u64()).collect();
+    Ok(StoredDecodeRun::Complete(
+        StoredV2KnnProjectionResult::Projected(StoredV2KnnProjection {
+            num_docs: identity_num_docs,
+            ids,
+            seq_nos,
+            vectors,
+            vector_chunks,
+        }),
+    ))
+}
+
 fn decode_stored_v2(body: &[u8]) -> Result<Vec<u8>> {
     let mut cur = Cursor::new(body);
     let num_docs = cur
@@ -683,7 +1758,12 @@ fn decode_stored_v2(body: &[u8]) -> Result<Vec<u8>> {
     let id_col_ix = col_name_to_ix.get("__id").copied().unwrap_or(0);
     let seq_col_ix = col_name_to_ix.get("__seq_no").copied().unwrap_or(1);
 
-    let mut out_docs: Vec<serde_json::Value> = Vec::with_capacity(num_docs);
+    let mut out_docs: Vec<serde_json::Value> = Vec::new();
+    out_docs.try_reserve_exact(num_docs).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {num_docs} decoded stored rows: {error}"
+        ))
+    })?;
     for d in 0..num_docs {
         let mut source_map = serde_json::Map::new();
         for (cix, name) in col_names.iter().enumerate() {
@@ -951,7 +2031,14 @@ fn try_encode_constant<B: std::borrow::Borrow<serde_json::Value>>(col: &[B]) -> 
 fn decode_constant(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json::Value>> {
     let v: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| StorageError::Other(anyhow::anyhow!("constant decode: {e}")))?;
-    Ok(vec![v; num_docs])
+    let mut values = Vec::new();
+    values.try_reserve_exact(num_docs).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {num_docs} constant stored rows: {error}"
+        ))
+    })?;
+    values.resize(num_docs, v);
+    Ok(values)
 }
 
 fn encode_dict_bitpack(entries: &[serde_json::Value], ids: &[u32]) -> Vec<u8> {
@@ -996,9 +2083,19 @@ fn decode_dict_bitpack(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json
     let dict_count =
         cur.read_u32::<LittleEndian>()
             .map_err(|e| StorageError::Other(anyhow::anyhow!("dict_count: {e}")))? as usize;
+    if dict_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict_count {dict_count} exceeds num_docs {num_docs}"
+        )));
+    }
     let bit_width = cur
         .read_u8()
         .map_err(|e| StorageError::Other(anyhow::anyhow!("bit_width: {e}")))?;
+    if !(1..=32).contains(&bit_width) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "dict invalid bit_width {bit_width}"
+        )));
+    }
 
     let dict_zstd_len = cur
         .read_u32::<LittleEndian>()
@@ -1031,13 +2128,21 @@ fn decode_dict_bitpack(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json
         .map_err(|e| StorageError::Other(anyhow::anyhow!("packed_zstd_len: {e}")))?
         as usize;
     let pos = cur.position() as usize;
-    if payload.len() < pos + packed_zstd_len {
-        return Err(StorageError::Other(anyhow::anyhow!(
-            "dict bitpack packed truncated"
-        )));
-    }
-    let packed = zstd::decode_all(&payload[pos..pos + packed_zstd_len])
-        .map_err(|e| StorageError::Other(anyhow::anyhow!("packed zstd decode: {e}")))?;
+    let packed_end = pos
+        .checked_add(packed_zstd_len)
+        .filter(|end| *end == payload.len())
+        .ok_or_else(|| {
+            StorageError::Other(anyhow::anyhow!("dict bitpack packed truncated/trailing"))
+        })?;
+    let expected_packed_len = num_docs
+        .checked_mul(bit_width as usize)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("dict packed length overflow")))?
+        .div_ceil(8);
+    let packed = decode_zstd_exact(
+        &payload[pos..packed_end],
+        expected_packed_len,
+        "packed zstd decode",
+    )?;
 
     let ids = bitunpack_u32(&packed, bit_width, num_docs);
     let null_id = dict_count as u32;
@@ -1158,13 +2263,7 @@ fn decode_cross_dep(
     if payload.is_empty() {
         return Err(StorageError::Other(anyhow::anyhow!("cross_dep empty")));
     }
-    let flag = payload[0];
-    let body = if flag == 1 {
-        zstd::decode_all(&payload[1..])
-            .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep zstd decode: {e}")))?
-    } else {
-        payload[1..].to_vec()
-    };
+    let body = decode_cross_dep_body(payload, num_docs)?;
     let mut cur = Cursor::new(&body[..]);
     let src_ix = cur
         .read_u32::<LittleEndian>()
@@ -1175,6 +2274,11 @@ fn decode_cross_dep(
         .read_u32::<LittleEndian>()
         .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep dict_count: {e}")))?
         as usize;
+    if dict_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep dict_count {dict_count} exceeds num_docs {num_docs}"
+        )));
+    }
     let mut mode_values: Vec<i64> = Vec::with_capacity(dict_count);
     for _ in 0..dict_count {
         mode_values.push(
@@ -1186,6 +2290,11 @@ fn decode_cross_dep(
         .read_u32::<LittleEndian>()
         .map_err(|e| StorageError::Other(anyhow::anyhow!("cross_dep exc_count: {e}")))?
         as usize;
+    if exc_count > num_docs {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep exc_count {exc_count} exceeds num_docs {num_docs}"
+        )));
+    }
 
     // Rebuild the source column's dict ids by re-running `dict_encode_column`
     // on the already-decoded source column.
@@ -1201,19 +2310,42 @@ fn decode_cross_dep(
         .ok_or_else(|| StorageError::Other(anyhow::anyhow!("cross_dep re-dict src failed")))?;
 
     // Exceptions.
-    let mut exc: Vec<(u32, i64)> = Vec::with_capacity(exc_count);
+    let mut exc: Vec<(u32, i64)> = Vec::new();
+    exc.try_reserve_exact(exc_count).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {exc_count} cross-dependency exceptions: {error}"
+        ))
+    })?;
     let mut pos = cur.position() as usize;
     let mut prev_ord = 0u32;
     for _ in 0..exc_count {
-        let delta = read_varint(&body, &mut pos) as u32;
-        let val = read_zigzag_i64(&body, &mut pos);
-        let ord = prev_ord.wrapping_add(delta);
+        let delta = u32::try_from(read_varint(&body, &mut pos)?)
+            .map_err(|_| StorageError::Other(anyhow::anyhow!("cross_dep ordinal overflow")))?;
+        let val = read_zigzag_i64(&body, &mut pos)?;
+        let ord = prev_ord
+            .checked_add(delta)
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("cross_dep ordinal overflow")))?;
+        if ord as usize >= num_docs || (!exc.is_empty() && ord <= prev_ord) {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "cross_dep invalid exception ordinal {ord}"
+            )));
+        }
         exc.push((ord, val));
         prev_ord = ord;
     }
+    if pos != body.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "cross_dep trailing exception bytes"
+        )));
+    }
 
     // Materialise.
-    let mut result: Vec<serde_json::Value> = Vec::with_capacity(num_docs);
+    let mut result: Vec<serde_json::Value> = Vec::new();
+    result.try_reserve_exact(num_docs).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {num_docs} cross-dependency rows: {error}"
+        ))
+    })?;
     let mut exc_ix = 0;
     for row in 0..num_docs {
         if exc_ix < exc.len() && exc[exc_ix].0 as usize == row {
@@ -1317,19 +2449,24 @@ fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn read_varint(data: &[u8], pos: &mut usize) -> u64 {
+fn read_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
     let mut v = 0u64;
     let mut shift = 0u32;
-    while *pos < data.len() {
+    while *pos < data.len() && shift < 64 {
         let b = data[*pos];
         *pos += 1;
+        if shift == 63 && b & 0x7e != 0 {
+            return Err(StorageError::Other(anyhow::anyhow!("varint overflow")));
+        }
         v |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
-            return v;
+            return Ok(v);
         }
         shift += 7;
     }
-    v
+    Err(StorageError::Other(anyhow::anyhow!(
+        "truncated or overlong varint"
+    )))
 }
 
 fn write_zigzag_i64(out: &mut Vec<u8>, v: i64) {
@@ -1337,9 +2474,9 @@ fn write_zigzag_i64(out: &mut Vec<u8>, v: i64) {
     write_varint(out, z);
 }
 
-fn read_zigzag_i64(data: &[u8], pos: &mut usize) -> i64 {
-    let z = read_varint(data, pos);
-    ((z >> 1) as i64) ^ -((z & 1) as i64)
+fn read_zigzag_i64(data: &[u8], pos: &mut usize) -> Result<i64> {
+    let z = read_varint(data, pos)?;
+    Ok(((z >> 1) as i64) ^ -((z & 1) as i64))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1363,6 +2500,903 @@ mod tests {
         let raw = br#"[{"_id":"a"}]"#;
         let decoded = decode_stored(raw).unwrap();
         assert_eq!(&decoded, raw);
+    }
+
+    fn projection_fixture() -> (Vec<serde_json::Value>, Vec<u8>) {
+        let docs: Vec<_> = (0..256)
+            .map(|i| {
+                json!({
+                    "_id": format!("doc-{i}"),
+                    "_seq_no": i,
+                    "_source": {
+                        "category": if i % 2 == 0 { "even" } else { "odd" },
+                        "embedding": [i as f64 / 10.0, 0.25, -0.5],
+                        "embedding_chunks": [
+                            [i as f64 / 10.0, 0.25, -0.5],
+                            [-0.0, 1.25e-10, -2]
+                        ],
+                        "large_unrequested": "the same payload repeated to compress well"
+                    }
+                })
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        assert_eq!(&encoded[..4], STORED_V2_MAGIC);
+        (docs, encoded)
+    }
+
+    fn handcrafted_v2(num_docs: u32, columns: &[(&str, u8, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(STORED_V2_MAGIC);
+        out.write_u32::<LittleEndian>(num_docs).unwrap();
+        out.write_u32::<LittleEndian>(columns.len() as u32).unwrap();
+        for (name, codec, payload) in columns {
+            out.write_u16::<LittleEndian>(name.len() as u16).unwrap();
+            out.extend_from_slice(name.as_bytes());
+            out.push(*codec);
+            out.write_u32::<LittleEndian>(payload.len() as u32).unwrap();
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    fn raw_cross_dep(source_index: u32) -> Vec<u8> {
+        let mut payload = vec![0];
+        payload.write_u32::<LittleEndian>(source_index).unwrap();
+        payload
+    }
+
+    fn valid_cross_dep(source_index: u32, mode: i64) -> Vec<u8> {
+        let mut payload = raw_cross_dep(source_index);
+        payload.write_u32::<LittleEndian>(1).unwrap();
+        payload.write_i64::<LittleEndian>(mode).unwrap();
+        payload.write_u32::<LittleEndian>(0).unwrap();
+        payload
+    }
+
+    fn lz4_json(value: &serde_json::Value) -> Vec<u8> {
+        lz4_flex::compress_prepend_size(&serde_json::to_vec(value).unwrap())
+    }
+
+    fn dict_bitpack_with_content_sizes(entries: &[serde_json::Value], ids: &[u32]) -> Vec<u8> {
+        let bit_width = if entries.is_empty() {
+            1
+        } else {
+            32 - (entries.len() as u32).leading_zeros() as u8
+        };
+        let dict =
+            zstd::bulk::compress(&serde_json::to_vec(entries).unwrap(), STORED_ZSTD_LEVEL).unwrap();
+        let packed = zstd::bulk::compress(&bitpack_u32(ids, bit_width), STORED_ZSTD_LEVEL).unwrap();
+        let mut out = Vec::new();
+        out.write_u32::<LittleEndian>(entries.len() as u32).unwrap();
+        out.push(bit_width);
+        out.write_u32::<LittleEndian>(dict.len() as u32).unwrap();
+        out.extend_from_slice(&dict);
+        out.write_u32::<LittleEndian>(ids.len() as u32).unwrap();
+        out.write_u32::<LittleEndian>(packed.len() as u32).unwrap();
+        out.extend_from_slice(&packed);
+        out
+    }
+
+    fn typed_fixture_with_columns(
+        num_docs: usize,
+        vector_codec: ColCodec,
+        vector_payload: Vec<u8>,
+        chunks: Option<(ColCodec, Vec<u8>)>,
+    ) -> Vec<u8> {
+        let ids = json!((0..num_docs).map(|i| format!("id-{i}")).collect::<Vec<_>>());
+        let seq = json!((0..num_docs).collect::<Vec<_>>());
+        let mut columns = vec![
+            ("__id", ColCodec::Lz4Json as u8, lz4_json(&ids)),
+            ("__seq_no", ColCodec::Lz4Json as u8, lz4_json(&seq)),
+            ("embedding", vector_codec as u8, vector_payload),
+        ];
+        if let Some((codec, payload)) = chunks {
+            columns.push(("embedding_chunks", codec as u8, payload));
+        }
+        handcrafted_v2(num_docs as u32, &columns)
+    }
+
+    #[test]
+    fn retained_upper_bound_covers_real_decode_and_all_v2_codecs() {
+        let num_docs = 4usize;
+        let ids = json!(["a", "b", "a", "b"]);
+        let raw_values = json!([
+            {"nested": [1, 2]},
+            null,
+            {"nested": [3]},
+            {"text": "longer"}
+        ]);
+        let raw_payload =
+            zstd::bulk::compress(&serde_json::to_vec(&raw_values).unwrap(), STORED_ZSTD_LEVEL)
+                .unwrap();
+        let dict_payload =
+            dict_bitpack_with_content_sizes(&[json!("east"), json!("west")], &[0, 1, 0, 1]);
+        let encoded = handcrafted_v2(
+            num_docs as u32,
+            &[
+                ("__id", ColCodec::Lz4Json as u8, lz4_json(&ids)),
+                (
+                    "__seq_no",
+                    ColCodec::Constant as u8,
+                    serde_json::to_vec(&json!(7)).unwrap(),
+                ),
+                ("raw", ColCodec::RawJson as u8, raw_payload),
+                ("region", ColCodec::DictBitpack as u8, dict_payload),
+                (
+                    "amount",
+                    ColCodec::CrossDep as u8,
+                    valid_cross_dep(3, i64::MIN),
+                ),
+            ],
+        );
+        let decoded = decode_stored(&encoded).unwrap();
+        let bound = stored_slices_retained_upper_bound(&encoded, num_docs as u64)
+            .unwrap()
+            .unwrap();
+        let actual_retained = decoded.len() as u64 + num_docs as u64 * 8 + 64;
+        assert!(
+            bound >= actual_retained,
+            "bound {bound} < actual retained {actual_retained}"
+        );
+
+        let legacy = encode_stored_lz4(&decoded);
+        assert!(
+            stored_slices_retained_upper_bound(&legacy, num_docs as u64)
+                .unwrap()
+                .unwrap()
+                >= actual_retained
+        );
+        assert!(stored_slices_retained_upper_bound(&encoded, 5).is_err());
+    }
+
+    #[test]
+    fn retained_upper_bound_fails_closed_for_unknown_zstd_content_size() {
+        let values = serde_json::to_vec(&json!(["a", "b"])).unwrap();
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), STORED_ZSTD_LEVEL).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&values).unwrap();
+        let payload = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&payload).unwrap(),
+            None
+        );
+        let encoded = handcrafted_v2(
+            2,
+            &[
+                ("__id", ColCodec::RawJson as u8, payload),
+                (
+                    "__seq_no",
+                    ColCodec::Constant as u8,
+                    serde_json::to_vec(&json!(1)).unwrap(),
+                ),
+            ],
+        );
+        assert_eq!(
+            stored_slices_retained_upper_bound(&encoded, 2).unwrap(),
+            None
+        );
+
+        let first = zstd::bulk::compress(&values, STORED_ZSTD_LEVEL).unwrap();
+        let second = zstd::bulk::compress(b"[]", STORED_ZSTD_LEVEL).unwrap();
+        let concatenated = handcrafted_v2(
+            2,
+            &[
+                ("__id", ColCodec::RawJson as u8, [first, second].concat()),
+                (
+                    "__seq_no",
+                    ColCodec::Constant as u8,
+                    serde_json::to_vec(&json!(1)).unwrap(),
+                ),
+            ],
+        );
+        assert!(stored_slices_retained_upper_bound(&concatenated, 2).is_err());
+    }
+
+    #[test]
+    fn v2_projection_decodes_only_requested_columns_with_full_decode_parity() {
+        let (docs, encoded) = projection_fixture();
+        let StoredV2ProjectionResult::Projected(projected) =
+            decode_stored_v2_projection(&encoded, &["__id", "embedding"]).unwrap()
+        else {
+            panic!("fixture should support projection");
+        };
+        assert_eq!(projected.num_docs, docs.len());
+        assert_eq!(projected.columns.len(), 2);
+        assert!(!projected.columns.contains_key("large_unrequested"));
+        for (row, expected) in docs.iter().enumerate() {
+            assert_eq!(projected.columns["__id"][row], expected["_id"]);
+            assert_eq!(
+                projected.columns["embedding"][row],
+                expected["_source"]["embedding"]
+            );
+        }
+        let StoredV2ProjectionResult::Projected(seq_projection) =
+            decode_stored_v2_projection(&encoded, &["__seq_no"]).unwrap()
+        else {
+            panic!("CROSS_DEP sequence column should resolve");
+        };
+        for (row, expected) in docs.iter().enumerate() {
+            assert_eq!(seq_projection.columns["__seq_no"][row], expected["_seq_no"]);
+        }
+    }
+
+    #[test]
+    fn v2_projection_does_not_decode_unrequested_payload() {
+        let (_, mut encoded) = projection_fixture();
+        let (payload_offset, payload_len) = {
+            let directory = parse_v2_directory(&encoded[4..]).unwrap();
+            let column = directory
+                .columns
+                .iter()
+                .find(|column| column.name == "large_unrequested")
+                .unwrap();
+            (
+                column.payload.as_ptr() as usize - encoded.as_ptr() as usize,
+                column.payload.len(),
+            )
+        };
+        encoded[payload_offset + payload_len / 2] ^= 0xff;
+
+        let StoredV2ProjectionResult::Projected(projected) =
+            decode_stored_v2_projection(&encoded, &["__id"]).unwrap()
+        else {
+            panic!("an unrelated corrupt payload must not be decoded");
+        };
+        assert_eq!(projected.columns["__id"].len(), 256);
+        assert!(
+            decode_stored(&encoded).is_err(),
+            "the full decoder must still observe corrupt unrequested payloads"
+        );
+    }
+
+    #[test]
+    fn v2_knn_projection_resolves_identity_and_typed_vectors() {
+        let (docs, encoded) = projection_fixture();
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", Some("embedding_chunks"))
+                .unwrap()
+        else {
+            panic!("fixture should support typed projection");
+        };
+        assert_eq!(projected.num_docs, 256);
+        assert_eq!(projected.ids[42].as_deref(), Some("doc-42"));
+        assert_eq!(projected.seq_nos[42], Some(42));
+        for row in [0, 1, 42, 255] {
+            let expected = docs[row]["_source"]["embedding"].as_array().unwrap();
+            let actual = projected.vectors[row].as_ref().unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(
+                    actual.to_bits(),
+                    (expected.as_f64().unwrap() as f32).to_bits()
+                );
+            }
+        }
+        let chunks = projected.vector_chunks.as_ref().unwrap()[7]
+            .as_ref()
+            .unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1][0].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(chunks[1][1].to_bits(), (1.25e-10f32).to_bits());
+        assert_eq!(chunks[1][2], -2.0);
+    }
+
+    #[test]
+    fn controlled_knn_projection_cancels_without_changing_compatibility_outcomes() {
+        let (_, encoded) = projection_fixture();
+        let mut observed = Vec::new();
+        let run = decode_stored_v2_knn_projection_controlled(
+            &encoded,
+            "embedding",
+            Some("embedding_chunks"),
+            |point| {
+                observed.push(point);
+                if point.phase == StoredDecodePhase::Rows && point.rows_processed == 128 {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(run, StoredDecodeRun::Cancelled);
+        assert!(observed.iter().any(|point| {
+            point.phase == StoredDecodePhase::BeforeColumn && point.rows_processed == 0
+        }));
+
+        let controlled = decode_stored_v2_knn_projection_controlled(
+            &encoded,
+            "embedding",
+            Some("embedding_chunks"),
+            |_| std::ops::ControlFlow::Continue(()),
+        )
+        .unwrap();
+        assert_eq!(
+            controlled,
+            StoredDecodeRun::Complete(
+                decode_stored_v2_knn_projection(&encoded, "embedding", Some("embedding_chunks"))
+                    .unwrap()
+            )
+        );
+
+        assert_eq!(
+            decode_stored_v2_knn_projection_controlled(
+                &encode_stored_lz4(b"[]"),
+                "embedding",
+                None,
+                |_| std::ops::ControlFlow::Continue(())
+            )
+            .unwrap(),
+            StoredDecodeRun::Complete(StoredV2KnnProjectionResult::NotV2)
+        );
+    }
+
+    #[test]
+    fn controlled_knn_projection_stops_before_bad_row_129() {
+        let rows_with_bad_129 = |chunks: bool| {
+            let values: Vec<_> = (0..256)
+                .map(|row| {
+                    if row == 128 {
+                        json!("row-129-must-not-be-consumed")
+                    } else if chunks {
+                        json!([[1.0, 0.0]])
+                    } else {
+                        json!([1.0, 0.0])
+                    }
+                })
+                .collect();
+            zstd::encode_all(
+                Cursor::new(serde_json::to_vec(&values).unwrap()),
+                STORED_ZSTD_LEVEL,
+            )
+            .unwrap()
+        };
+        let constant_id = serde_json::to_vec(&json!("id")).unwrap();
+        let constant_seq = serde_json::to_vec(&json!(1)).unwrap();
+
+        for bad_column in ["embedding", "embedding_chunks"] {
+            let embedding = if bad_column == "embedding" {
+                rows_with_bad_129(false)
+            } else {
+                let values = vec![json!([1.0, 0.0]); 256];
+                zstd::encode_all(
+                    Cursor::new(serde_json::to_vec(&values).unwrap()),
+                    STORED_ZSTD_LEVEL,
+                )
+                .unwrap()
+            };
+            let chunks = if bad_column == "embedding_chunks" {
+                rows_with_bad_129(true)
+            } else {
+                let values = vec![json!([[1.0, 0.0]]); 256];
+                zstd::encode_all(
+                    Cursor::new(serde_json::to_vec(&values).unwrap()),
+                    STORED_ZSTD_LEVEL,
+                )
+                .unwrap()
+            };
+            let encoded = handcrafted_v2(
+                256,
+                &[
+                    ("__id", ColCodec::Constant as u8, constant_id.clone()),
+                    ("__seq_no", ColCodec::Constant as u8, constant_seq.clone()),
+                    ("embedding", ColCodec::RawJson as u8, embedding),
+                    ("embedding_chunks", ColCodec::RawJson as u8, chunks),
+                ],
+            );
+            let cancel_column = if bad_column == "embedding" { 2 } else { 3 };
+            assert_eq!(
+                decode_stored_v2_knn_projection_controlled(
+                    &encoded,
+                    "embedding",
+                    Some("embedding_chunks"),
+                    |point| {
+                        if point.column_index == cancel_column
+                            && point.phase == StoredDecodePhase::Rows
+                            && point.rows_processed == 128
+                        {
+                            std::ops::ControlFlow::Break(())
+                        } else {
+                            std::ops::ControlFlow::Continue(())
+                        }
+                    }
+                )
+                .unwrap(),
+                StoredDecodeRun::Cancelled,
+                "{bad_column} must cancel before consuming row 129"
+            );
+            assert_eq!(
+                decode_stored_v2_knn_projection_controlled(
+                    &encoded,
+                    "embedding",
+                    Some("embedding_chunks"),
+                    |_| std::ops::ControlFlow::Continue(())
+                )
+                .unwrap(),
+                StoredDecodeRun::Complete(StoredV2KnnProjectionResult::UnsupportedVectorShape),
+                "without cancellation {bad_column} must consume bad row 129"
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_vector_decode_checkpoints_after_invalid_row_for_raw_and_lz4() {
+        let values: Vec<_> = (0..256)
+            .map(|row| {
+                if row == 0 {
+                    json!([1.0, "invalid"])
+                } else {
+                    json!([1.0, 0.0])
+                }
+            })
+            .collect();
+        let json = serde_json::to_vec(&values).unwrap();
+        let payloads = [
+            (
+                ColCodec::RawJson,
+                zstd::encode_all(Cursor::new(&json), STORED_ZSTD_LEVEL).unwrap(),
+            ),
+            (ColCodec::Lz4Json, lz4_flex::compress_prepend_size(&json)),
+        ];
+        for (codec, embedding) in payloads {
+            let encoded = handcrafted_v2(
+                256,
+                &[
+                    (
+                        "__id",
+                        ColCodec::Constant as u8,
+                        serde_json::to_vec(&json!("id")).unwrap(),
+                    ),
+                    (
+                        "__seq_no",
+                        ColCodec::Constant as u8,
+                        serde_json::to_vec(&json!(1)).unwrap(),
+                    ),
+                    ("embedding", codec as u8, embedding),
+                ],
+            );
+            assert_eq!(
+                decode_stored_v2_knn_projection_controlled(&encoded, "embedding", None, |point| {
+                    if point.column_index == 2
+                        && point.phase == StoredDecodePhase::Rows
+                        && point.rows_processed == 128
+                    {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                })
+                .unwrap(),
+                StoredDecodeRun::Cancelled,
+                "{codec:?} must checkpoint even after an invalid first row"
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_constant_vector_and_chunk_decode_cancel_at_row_checkpoint() {
+        for cancel_column in [2, 3] {
+            let non_constant_embedding = zstd::encode_all(
+                Cursor::new(serde_json::to_vec(&vec![json!([1.0, 0.0]); 256]).unwrap()),
+                STORED_ZSTD_LEVEL,
+            )
+            .unwrap();
+            let encoded = handcrafted_v2(
+                256,
+                &[
+                    (
+                        "__id",
+                        ColCodec::Constant as u8,
+                        serde_json::to_vec(&json!("id")).unwrap(),
+                    ),
+                    (
+                        "__seq_no",
+                        ColCodec::Constant as u8,
+                        serde_json::to_vec(&json!(1)).unwrap(),
+                    ),
+                    (
+                        "embedding",
+                        if cancel_column == 2 {
+                            ColCodec::Constant as u8
+                        } else {
+                            ColCodec::RawJson as u8
+                        },
+                        if cancel_column == 2 {
+                            serde_json::to_vec(&json!([1.0, 0.0])).unwrap()
+                        } else {
+                            non_constant_embedding
+                        },
+                    ),
+                    (
+                        "embedding_chunks",
+                        ColCodec::Constant as u8,
+                        serde_json::to_vec(&json!([[1.0, 0.0], [0.0, 1.0]])).unwrap(),
+                    ),
+                ],
+            );
+            assert_eq!(
+                decode_stored_v2_knn_projection_controlled(
+                    &encoded,
+                    "embedding",
+                    Some("embedding_chunks"),
+                    |point| {
+                        if point.column_index == cancel_column
+                            && point.phase == StoredDecodePhase::Rows
+                            && point.rows_processed == 128
+                        {
+                            std::ops::ControlFlow::Break(())
+                        } else {
+                            std::ops::ControlFlow::Continue(())
+                        }
+                    }
+                )
+                .unwrap(),
+                StoredDecodeRun::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn v2_directory_rejects_impossible_column_count_before_allocation() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        let error = match parse_v2_directory(&body) {
+            Ok(_) => panic!("impossible column count must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("exceeds the remaining directory framing"));
+    }
+
+    #[test]
+    fn v2_knn_projection_has_explicit_legacy_missing_and_shape_outcomes() {
+        let legacy = encode_stored_lz4(br#"[{"_id":"legacy"}]"#);
+        assert_eq!(
+            decode_stored_v2_knn_projection(&legacy, "embedding", None).unwrap(),
+            StoredV2KnnProjectionResult::NotV2
+        );
+
+        let (_, encoded) = projection_fixture();
+        assert_eq!(
+            decode_stored_v2_knn_projection(&encoded, "missing", None).unwrap(),
+            StoredV2KnnProjectionResult::MissingVectorColumn
+        );
+
+        let malformed_docs: Vec<_> = (0..256)
+            .map(|i| {
+                json!({
+                    "_id": format!("bad-{i}"),
+                    "_seq_no": i,
+                    "_source": {
+                        "embedding": if i == 128 {
+                            json!([1.0, "not-a-number", 3.0])
+                        } else {
+                            json!([1.0, 2.0, 3.0])
+                        }
+                    }
+                })
+            })
+            .collect();
+        let malformed = encode_stored_v2(&serde_json::to_vec(&malformed_docs).unwrap());
+        assert_eq!(&malformed[..4], STORED_V2_MAGIC);
+        assert_eq!(
+            decode_stored_v2_knn_projection(&malformed, "embedding", None).unwrap(),
+            StoredV2KnnProjectionResult::UnsupportedVectorShape
+        );
+    }
+
+    #[test]
+    fn v2_projection_rejects_cross_dep_cycles_and_bad_source_indices() {
+        let cycle = handcrafted_v2(
+            1,
+            &[
+                ("a", ColCodec::CrossDep as u8, raw_cross_dep(1)),
+                ("b", ColCodec::CrossDep as u8, raw_cross_dep(0)),
+            ],
+        );
+        let error = decode_stored_v2_projection(&cycle, &["a"]).unwrap_err();
+        assert!(error.to_string().contains("dependency cycle"), "{error}");
+
+        let out_of_range = handcrafted_v2(1, &[("a", ColCodec::CrossDep as u8, raw_cross_dep(9))]);
+        let error = decode_stored_v2_projection(&out_of_range, &["a"]).unwrap_err();
+        assert!(error.to_string().contains("out of range"), "{error}");
+
+        let bad_flag = handcrafted_v2(1, &[("a", ColCodec::CrossDep as u8, vec![7, 0, 0, 0, 0])]);
+        let error = decode_stored_v2_projection(&bad_flag, &["a"]).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid compression flag"),
+            "{error}"
+        );
+        assert!(
+            decode_stored(&bad_flag).is_err(),
+            "full and selective decoders must reject the same bad flag"
+        );
+    }
+
+    #[test]
+    fn v2_projection_resolves_forward_multihop_and_shared_dependencies() {
+        let id_payload = serde_json::to_vec(&vec!["doc"; 4]).unwrap();
+        let seq_payload = serde_json::to_vec(&vec![0, 1, 2, 3]).unwrap();
+        let encoded = handcrafted_v2(
+            4,
+            &[
+                (
+                    "__id",
+                    ColCodec::Lz4Json as u8,
+                    lz4_flex::compress_prepend_size(&id_payload),
+                ),
+                (
+                    "__seq_no",
+                    ColCodec::Lz4Json as u8,
+                    lz4_flex::compress_prepend_size(&seq_payload),
+                ),
+                ("a", ColCodec::CrossDep as u8, valid_cross_dep(3, 10)),
+                ("b", ColCodec::CrossDep as u8, valid_cross_dep(4, 5)),
+                ("base", ColCodec::Constant as u8, br#""key""#.to_vec()),
+                ("d", ColCodec::CrossDep as u8, valid_cross_dep(4, 20)),
+            ],
+        );
+        let StoredV2ProjectionResult::Projected(projected) =
+            decode_stored_v2_projection(&encoded, &["a", "d"]).unwrap()
+        else {
+            panic!("valid recursive dependencies should project");
+        };
+        assert_eq!(
+            projected
+                .columns
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            ["a".to_string(), "d".to_string()].into_iter().collect()
+        );
+        assert_eq!(projected.columns["a"], vec![json!(10); 4]);
+        assert_eq!(projected.columns["d"], vec![json!(20); 4]);
+
+        let full: Vec<serde_json::Value> =
+            serde_json::from_slice(&decode_stored(&encoded).unwrap()).unwrap();
+        for row in full {
+            assert_eq!(row["_source"]["a"], 10);
+            assert_eq!(row["_source"]["d"], 20);
+        }
+    }
+
+    #[test]
+    fn cross_dep_checked_exceptions_reject_truncation_overflow_and_trailing_bytes() {
+        let dependencies = vec![Vec::new(), vec![json!("key"); 4]];
+        let make = |exception_bytes: &[u8]| {
+            let mut payload = valid_cross_dep(1, 7);
+            let len = payload.len();
+            payload[len - 4..].copy_from_slice(&1u32.to_le_bytes());
+            payload.extend_from_slice(exception_bytes);
+            payload
+        };
+
+        let truncated = make(&[0x80]);
+        assert!(decode_cross_dep(&truncated, 4, &dependencies, &HashMap::new()).is_err());
+
+        let overlong = make(&[0x80; 11]);
+        assert!(decode_cross_dep(&overlong, 4, &dependencies, &HashMap::new()).is_err());
+
+        let out_of_range = make(&[4, 0]);
+        assert!(decode_cross_dep(&out_of_range, 4, &dependencies, &HashMap::new()).is_err());
+
+        let mut trailing = valid_cross_dep(1, 7);
+        trailing.push(0);
+        assert!(decode_cross_dep(&trailing, 4, &dependencies, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn malformed_cardinality_and_cross_dep_expansion_are_bounded() {
+        let oversized_dict = ((DICT_MAX_CARDINALITY + 1) as u32).to_le_bytes().to_vec();
+        assert!(decode_dict_bitpack(&oversized_dict, 1).is_err());
+
+        let dependencies = vec![vec![json!("key")]];
+        let mut oversized_cross = vec![0];
+        oversized_cross.extend_from_slice(&0u32.to_le_bytes());
+        oversized_cross.extend_from_slice(&((DICT_MAX_CARDINALITY + 1) as u32).to_le_bytes());
+        assert!(decode_cross_dep(&oversized_cross, 1, &dependencies, &HashMap::new()).is_err());
+
+        let mut too_many_exceptions = valid_cross_dep(0, 7);
+        let count_offset = 1 + 4 + 4 + 8;
+        too_many_exceptions[count_offset..count_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_cross_dep(&too_many_exceptions, 1, &dependencies, &HashMap::new()).is_err());
+
+        let decoded_limit = 12 + 23;
+        let compressed =
+            zstd::bulk::compress(&vec![0; decoded_limit + 1], STORED_ZSTD_LEVEL).unwrap();
+        let mut bomb = vec![1];
+        bomb.extend_from_slice(&compressed);
+        assert!(decode_cross_dep(&bomb, 1, &dependencies, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn v2_knn_projection_preserves_384d_f32_bits_and_rejects_overflow() {
+        let docs: Vec<_> = (0..256)
+            .map(|row| {
+                let vector: Vec<f64> = (0..384)
+                    .map(|dim| (row as f64 - dim as f64) / 997.0)
+                    .collect();
+                json!({
+                    "_id": format!("wide-{row}"),
+                    "_seq_no": row,
+                    "_source": {"embedding": vector}
+                })
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        assert_eq!(&encoded[..4], STORED_V2_MAGIC);
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", None).unwrap()
+        else {
+            panic!("384d vectors should project");
+        };
+        for row in [0, 127, 255] {
+            let actual = projected.vectors[row].as_ref().unwrap();
+            assert_eq!(actual.len(), 384);
+            for dim in [0, 1, 191, 383] {
+                let expected = docs[row]["_source"]["embedding"][dim].as_f64().unwrap() as f32;
+                assert_eq!(actual[dim].to_bits(), expected.to_bits());
+            }
+        }
+
+        let overflow_docs: Vec<_> = (0..256)
+            .map(|row| {
+                json!({
+                    "_id": format!("overflow-{row}"),
+                    "_seq_no": row,
+                    "_source": {"embedding": [1e39, 0.0]}
+                })
+            })
+            .collect();
+        let overflow = encode_stored_v2(&serde_json::to_vec(&overflow_docs).unwrap());
+        assert_eq!(
+            decode_stored_v2_knn_projection(&overflow, "embedding", None).unwrap(),
+            StoredV2KnnProjectionResult::UnsupportedVectorShape
+        );
+    }
+
+    #[test]
+    fn v2_knn_projection_forced_lz4_nulls_and_optional_missing_chunks() {
+        let vectors = json!([[1.0, -0.0], null, [], [3, 4]]);
+        let chunks = json!([[[1.0, 2.0]], null, [], [[3.0], [4.0, 5.0]]]);
+        let encoded = typed_fixture_with_columns(
+            4,
+            ColCodec::Lz4Json,
+            lz4_json(&vectors),
+            Some((ColCodec::Lz4Json, lz4_json(&chunks))),
+        );
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", Some("embedding_chunks"))
+                .unwrap()
+        else {
+            panic!("forced LZ4 vectors should project");
+        };
+        assert_eq!(
+            projected.vectors[0].as_ref().unwrap()[1].to_bits(),
+            (-0.0f32).to_bits()
+        );
+        assert_eq!(projected.vectors[1], None);
+        assert_eq!(projected.vectors[2], Some(Vec::new()));
+        assert_eq!(projected.vector_chunks.as_ref().unwrap()[1], None);
+        assert_eq!(
+            projected.vector_chunks.as_ref().unwrap()[3],
+            Some(vec![vec![3.0], vec![4.0, 5.0]])
+        );
+
+        let StoredV2KnnProjectionResult::Projected(missing_chunks) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", Some("different_chunks"))
+                .unwrap()
+        else {
+            panic!("missing optional chunks must not block pooled vectors");
+        };
+        assert_eq!(missing_chunks.vector_chunks, None);
+    }
+
+    #[test]
+    fn v2_knn_projection_constant_vectors_and_identity_cell_semantics() {
+        let encoded = typed_fixture_with_columns(
+            4,
+            ColCodec::Constant,
+            br#"[1.5,-0.0]"#.to_vec(),
+            Some((ColCodec::Constant, b"null".to_vec())),
+        );
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&encoded, "embedding", Some("embedding_chunks"))
+                .unwrap()
+        else {
+            panic!("constant vectors should project");
+        };
+        assert_eq!(projected.vectors, vec![Some(vec![1.5, -0.0]); 4]);
+        assert_eq!(projected.vector_chunks, Some(vec![None; 4]));
+
+        let wrong_identity = handcrafted_v2(
+            2,
+            &[
+                ("__id", ColCodec::Lz4Json as u8, lz4_json(&json!(["ok", 7]))),
+                (
+                    "__seq_no",
+                    ColCodec::Lz4Json as u8,
+                    lz4_json(&json!([0, -1])),
+                ),
+                (
+                    "embedding",
+                    ColCodec::Lz4Json as u8,
+                    lz4_json(&json!([[1.0], [2.0]])),
+                ),
+            ],
+        );
+        let StoredV2KnnProjectionResult::Projected(projected) =
+            decode_stored_v2_knn_projection(&wrong_identity, "embedding", None).unwrap()
+        else {
+            panic!("wrong identity cells are explicit None rows");
+        };
+        assert_eq!(projected.ids, vec![Some("ok".into()), None]);
+        assert_eq!(projected.seq_nos, vec![Some(0), None]);
+    }
+
+    #[test]
+    fn v2_knn_projection_rejects_reserved_or_colliding_role_names() {
+        let (_, encoded) = projection_fixture();
+        for (vector, chunks) in [
+            ("__id", None),
+            ("__seq_no", None),
+            ("embedding", Some("__id")),
+            ("embedding", Some("__seq_no")),
+            ("embedding", Some("embedding")),
+        ] {
+            assert_eq!(
+                decode_stored_v2_knn_projection(&encoded, vector, chunks).unwrap(),
+                StoredV2KnnProjectionResult::UnsupportedVectorShape
+            );
+        }
+    }
+
+    #[test]
+    fn v2_projection_enforces_dependency_depth_boundary() {
+        let chain = |edges: usize| {
+            let mut owned: Vec<(String, u8, Vec<u8>)> = (0..edges)
+                .map(|index| {
+                    (
+                        format!("c{index}"),
+                        ColCodec::CrossDep as u8,
+                        valid_cross_dep((index + 1) as u32, index as i64),
+                    )
+                })
+                .collect();
+            owned.push((
+                format!("c{edges}"),
+                ColCodec::Constant as u8,
+                br#""base""#.to_vec(),
+            ));
+            let borrowed: Vec<_> = owned
+                .iter()
+                .map(|(name, codec, payload)| (name.as_str(), *codec, payload.clone()))
+                .collect();
+            handcrafted_v2(1, &borrowed)
+        };
+
+        let at_limit = chain(256);
+        assert!(
+            decode_stored_v2_projection(&at_limit, &["c0"]).is_ok(),
+            "256 dependency edges are supported"
+        );
+        let over_limit = chain(257);
+        let error = decode_stored_v2_projection(&over_limit, &["c0"]).unwrap_err();
+        assert!(error.to_string().contains("depth exceeds 256"), "{error}");
+    }
+
+    #[test]
+    fn v2_projection_validates_framing_and_preserves_legacy_fallback() {
+        let (_, encoded) = projection_fixture();
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_stored_v2_projection(&trailing, &["__id"]).is_err());
+
+        let legacy = encode_stored_lz4(br#"[{"_id":"legacy"}]"#);
+        assert_eq!(
+            decode_stored_v2_projection(&legacy, &["__id"]).unwrap(),
+            StoredV2ProjectionResult::NotV2
+        );
     }
 
     #[test]
