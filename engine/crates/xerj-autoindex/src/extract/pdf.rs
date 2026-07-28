@@ -19,6 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use xxhash_rust::xxh3::Xxh3;
 
 const PDF_CAP: u64 = 512 << 20;
 const MAX_PAGES: usize = 100_000;
@@ -116,6 +117,7 @@ fn spool_response(
             MAX_WORKER_OUTPUT >> 20
         ));
     }
+    let artifact_digest = artifact_digest(&mut file, bytes)?;
     reservation.shrink_to(bytes);
     file.rewind().context("rewind PDF extraction spool")?;
     Ok(ExtractionSpool {
@@ -123,8 +125,27 @@ fn spool_response(
         source_size,
         source_digest: source_digest.to_owned(),
         bytes,
+        artifact_digest,
         _reservation: reservation,
     })
+}
+
+fn artifact_digest(file: &mut File, bytes: u64) -> Result<u128> {
+    file.rewind().context("rewind PDF extraction spool")?;
+    let mut hash = Xxh3::new();
+    let mut remaining = bytes;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .context("size PDF extraction spool digest buffer")?;
+        let read = file
+            .read(&mut buffer[..limit])
+            .context("read PDF extraction spool for digest")?;
+        anyhow::ensure!(read > 0, "PDF extraction spool was truncated while hashing");
+        hash.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(hash.digest128())
 }
 
 pub(crate) struct ExtractionSpoolBudget {
@@ -210,6 +231,7 @@ pub(crate) struct ExtractionSpool {
     source_size: u64,
     source_digest: String,
     bytes: u64,
+    artifact_digest: u128,
     _reservation: ExtractionSpoolReservation,
 }
 
@@ -220,14 +242,43 @@ impl ExtractionSpool {
         source_digest: &str,
         sink: Sink,
     ) -> Result<ExtractStats> {
+        self.replay_with_gate(source_size, source_digest, sink, worker_gate())
+    }
+
+    fn replay_with_gate(
+        &self,
+        source_size: u64,
+        source_digest: &str,
+        sink: Sink,
+        gate: &WorkerGate,
+    ) -> Result<ExtractStats> {
         anyhow::ensure!(
             source_size == self.source_size && source_digest == self.source_digest,
             "PDF extraction spool belongs to a different source generation; retry extraction"
         );
+        // JSON decoding materializes a bounded WorkerResponse just like the
+        // parser protocol. Share the PDF gate so Phase B cannot multiply that
+        // 32 MiB response bound by the general autoindex worker count.
+        let _permit = gate.acquire();
         let mut file = self
             .file
             .lock()
             .map_err(|_| anyhow!("PDF extraction spool lock was poisoned"))?;
+        let actual_bytes = file
+            .metadata()
+            .context("measure PDF extraction spool before replay")?
+            .len();
+        anyhow::ensure!(
+            actual_bytes == self.bytes,
+            "PDF extraction spool length changed (expected {}, found {}); retry extraction",
+            self.bytes,
+            actual_bytes
+        );
+        let actual_digest = artifact_digest(&mut file, self.bytes)?;
+        anyhow::ensure!(
+            actual_digest == self.artifact_digest,
+            "PDF extraction spool content changed; retry extraction"
+        );
         file.rewind().context("rewind PDF extraction spool")?;
         let response: WorkerResponse = serde_json::from_reader(BufReader::new(&mut *file))
             .context("PDF extraction spool is malformed or truncated; retry extraction")?;
@@ -660,6 +711,13 @@ struct WorkerGate {
 }
 
 impl WorkerGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new((0, limit.clamp(1, 4))),
+            ready: Condvar::new(),
+        }
+    }
+
     fn set_limit(&self, limit: usize) {
         self.state.lock().expect("PDF worker gate poisoned").1 = limit;
         self.ready.notify_all();
@@ -687,15 +745,12 @@ impl Drop for WorkerPermit<'_> {
 
 fn worker_gate() -> &'static WorkerGate {
     static GATE: OnceLock<WorkerGate> = OnceLock::new();
-    GATE.get_or_init(|| WorkerGate {
-        state: Mutex::new((
-            0,
+    GATE.get_or_init(|| {
+        WorkerGate::new(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4)
-                .min(4),
-        )),
-        ready: Condvar::new(),
+                .unwrap_or(4),
+        )
     })
 }
 
@@ -761,7 +816,10 @@ mod tests {
     use crate::infer::{infer_fields, FieldAcc};
     use serde_json::Value;
     use std::collections::HashMap;
-    use std::io::{Seek, Write};
+    use std::io::{Read, Seek, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
     fn write_prose_pdf(path: &std::path::Path) {
         let prose = "Quarterly revenue increased because subscription demand remained strong. \
@@ -912,14 +970,14 @@ mod tests {
     }
 
     #[test]
-    fn spool_replay_fails_closed_on_truncation_and_wrong_worker_identity() {
+    fn spool_replay_verifies_exact_length_and_digest_before_decode() {
         let source = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let path = source.path().join("quarterly-report.pdf");
         write_prose_pdf(&path);
         let records = extract_in_process(&path).unwrap();
 
-        let budget = super::ExtractionSpoolBudget::new(2 * super::MAX_WORKER_OUTPUT as u64, 2);
+        let budget = super::ExtractionSpoolBudget::new(3 * super::MAX_WORKER_OUTPUT as u64, 3);
         let truncated = spool_response(
             state.path(),
             7,
@@ -930,9 +988,9 @@ mod tests {
         .unwrap();
         truncated.file.lock().unwrap().set_len(8).unwrap();
         let error = truncated.replay(7, "digest", &mut |_| true).unwrap_err();
-        assert!(format!("{error:#}").contains("malformed or truncated"));
+        assert!(format!("{error:#}").contains("length changed"));
 
-        let wrong_identity = spool_response(
+        let appended = spool_response(
             state.path(),
             7,
             "digest",
@@ -940,19 +998,100 @@ mod tests {
             budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
         )
         .unwrap();
-        let mut invalid = response(records);
-        invalid.parser = "pdf_oxide/not-the-pinned-parser".into();
         {
-            let mut file = wrong_identity.file.lock().unwrap();
-            file.rewind().unwrap();
-            file.set_len(0).unwrap();
-            serde_json::to_writer(&mut *file, &invalid).unwrap();
+            let mut file = appended.file.lock().unwrap();
+            file.seek(std::io::SeekFrom::End(0)).unwrap();
+            file.write_all(b" ").unwrap();
             file.flush().unwrap();
         }
-        let error = wrong_identity
-            .replay(7, "digest", &mut |_| true)
-            .unwrap_err();
-        assert!(error.to_string().contains("PDF parser version mismatch"));
+        let error = appended.replay(7, "digest", &mut |_| true).unwrap_err();
+        assert!(format!("{error:#}").contains("length changed"));
+
+        let mutated = spool_response(
+            state.path(),
+            7,
+            "digest",
+            &response(records.clone()),
+            budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
+        )
+        .unwrap();
+        {
+            let mut file = mutated.file.lock().unwrap();
+            file.rewind().unwrap();
+            let mut first = [0u8; 1];
+            file.read_exact(&mut first).unwrap();
+            file.rewind().unwrap();
+            file.write_all(if first == *b"{" { b"[" } else { b"{" })
+                .unwrap();
+            file.flush().unwrap();
+        }
+        assert_eq!(
+            mutated.file.lock().unwrap().metadata().unwrap().len(),
+            mutated.bytes
+        );
+        let error = mutated.replay(7, "digest", &mut |_| true).unwrap_err();
+        assert!(error.to_string().contains("content changed"));
+    }
+
+    #[test]
+    fn concurrent_spool_replay_never_exceeds_configured_pdf_gate() {
+        const REPLAYS: usize = 8;
+        const LIMIT: usize = 2;
+        let state = tempfile::tempdir().unwrap();
+        let budget = super::ExtractionSpoolBudget::new(
+            REPLAYS as u64 * super::MAX_WORKER_OUTPUT as u64,
+            REPLAYS as u64,
+        );
+        let records = vec![crate::extract::RawRecord {
+            fields: serde_json::Map::new(),
+            locator: "page:1".into(),
+            group: None,
+        }];
+        let spools: Vec<_> = (0..REPLAYS)
+            .map(|_| {
+                Arc::new(
+                    spool_response(
+                        state.path(),
+                        7,
+                        "digest",
+                        &response(records.clone()),
+                        budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let gate = Arc::new(super::WorkerGate::new(LIMIT));
+        let start = Arc::new(Barrier::new(REPLAYS));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for spool in spools {
+                let gate = Arc::clone(&gate);
+                let start = Arc::clone(&start);
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                scope.spawn(move || {
+                    start.wait();
+                    spool
+                        .replay_with_gate(
+                            7,
+                            "digest",
+                            &mut |_| {
+                                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                maximum.fetch_max(now, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_millis(20));
+                                active.fetch_sub(1, Ordering::SeqCst);
+                                true
+                            },
+                            &gate,
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(maximum.load(Ordering::SeqCst), LIMIT);
     }
 
     #[test]
