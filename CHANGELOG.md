@@ -7,6 +7,277 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.6] - 2026-07-28
+
+Sixth release candidate: the **semantic-analytics and bounded-memory
+release**. Headline for users: a `knn`/`semantic` query can now carry
+`aggs` in the same `_search` request — aggregations run over the
+retrieved top-k neighbour set, forced onto the exact path so bucket
+counts are exact — and a semantic hit can opt into a `_passage` field
+that returns the winning chunk's text with byte-exact provenance.
+Underneath, the seven immutable-segment hydration caches now share one
+process-wide, cgroup-aware memory budget, and the storage layer gains a
+bounded, cancellable selective-hydration primitive (deliberately not
+wired to any engine route yet). Two correctness holes are closed: kNN
+could return a superseded vector when a document ID was re-inserted
+while owning the HNSW entry point (fix arrived from the probelabs fork),
+and an oversized Painless expression could exhaust the native stack
+instead of returning a bounded error. One change arrived from outside
+the org: transparent gzip request-body decompression, contributed by
+Vinz2168, which unblocks Filebeat and the other ES clients that compress
+by default. ES-YAML conformance holds at 1360 passed / 0 failed / 3
+skipped. Each change states its own limits in place; the aggregation
+gaps left open are listed under Known limitations.
+
+### Added
+
+- **kNN + aggregations in a single request.** `POST /{index}/_search`
+  with a `knn`/`semantic` query plus `aggs` now returns aggregations;
+  previously the `aggs` field on kNN responses was hardcoded `null`. No
+  new API surface — the existing `aggs` request field is honored on the
+  kNN path, across all three executors (HNSW, exact brute-force,
+  multi-kNN). Semantics follow ES top-level-knn: aggregations run over
+  the retrieved top-k neighbour set after the `num_candidates` fan-out,
+  independent of `from`/`size` paging — `"size": 0` returns aggs only
+  with empty hits, and `hits.total.value` reports the neighbour pool
+  (`k`), not a match count, so bucket counts scale with `k`, never with
+  index size. To keep those counts exact, an aggs-bearing kNN request
+  always executes the exact brute-force path even when it would
+  otherwise qualify for HNSW — ANN recall is below 100% and approximate
+  bucket counts would be silently wrong — trading ANN speed for
+  exactness (no performance claims are made for this path). This
+  removes the previous two-step workaround (kNN → collect ids →
+  separate aggregation request). Limitation, stated up front:
+  `significant_terms` over a kNN slice returns empty — the vector path
+  does not yet supply a background corpus; use `terms` for raw in-slice
+  counts, or the two-step pattern when statistical significance is
+  needed (filed as a follow-up).
+- **Winning-passage provenance (`_passage`).** Requesting
+  `"fields": ["_passage"]` on a single `semantic` or kNN query adds
+  `fields._passage[0]` to each hit: the winning chunk's source `field`,
+  zero-based `ordinal`, UTF-8 byte `start_offset`/`end_offset`, the
+  `text` slice, and `page` (only when the source carries a numeric
+  `page`; omitted otherwise). The text is reconstructed by slicing the
+  authoritative `_source` at compact ingest-time offset metadata rather
+  than storing the chunk a second time — the committed measurement over
+  256 varied Unicode documents reports 80.26 B/doc of raw metadata,
+  3.98 B/doc after ZBS2 compression. All three ES `fields` wire shapes
+  (scalar, string array, object form) are accepted and normalized
+  identically, and scroll continuations keep the passage. Multi-kNN and
+  hybrid-fusion queries requesting `_passage` are a deliberate HTTP 400
+  with an actionable message — summed or fused contributions do not
+  define one winning passage, and rejecting is more honest than
+  guessing. Scope: provenance covers the exact per-chunk max-sim
+  scoring path; the HNSW-served and SQ8-quantized paths reconstruct a
+  passage only for single-chunk values, and a kNN clause on an
+  arbitrary `dense_vector` field has no passage metadata, so `_passage`
+  may be absent rather than erroring. The internal metadata (reserved
+  prefix `__xerj_passage_meta__`) is engine-owned: supplying it at
+  ingest is rejected per-document, and it is stripped from `_source`,
+  Painless, field discovery, full-text indexing, and aggregations. The
+  native `_search` endpoint accepts `_passage` (returned as a hit-level
+  key) and rejects any other `fields` entry. The default embedder
+  remains lexical feature hashing — neural semantics still require
+  opting into neural embedding mode or an embedding endpoint.
+- **Process-wide segment hydration cache budget.** The seven
+  immutable-segment hydration caches (stored slices, doc values, parsed
+  stored values, sort shadows, id positions, row sequences, decoded
+  stored bytes) — previously independent or unbounded — now share one
+  cgroup-aware retained-payload budget with CAS admission and
+  last-reader refunds. Configure with
+  `[limits] max_segment_hydration_cache_mb` (default `0` = automatic:
+  20% of the effective cgroup/system memory limit, no floor and no
+  fixed cap; an explicit value is clamped to 50% with a startup
+  warning) or the `XERJ_SEGMENT_HYDRATION_CACHE_MB` env override
+  (`auto`, `off`, or a MiB value; `off` refuses every admission — a
+  diagnostic switch). Refusal is invisible to queries: the request
+  keeps the value it already built and returns the same result,
+  uncached; publish-time warm-only values are simply dropped, and a
+  counter increments. `GET /_nodes/stats` gains
+  `indices.segment_hydration_cache` with limit/current/peak, refusal
+  and accounting-error counters, the budget source, and per-category
+  breakdowns. Automatic sizing now honors the *tightest* cgroup-v2
+  `memory.max` from leaf to root (previously the nearest finite value
+  won, overstating the ceiling when a parent limit was smaller). A
+  release-build accounting underflow that left counters unchanged is
+  also fixed — both counters now clamp atomically and record exactly
+  one accounting error. Honesty note, repeated in the docs: this is a
+  retained-payload/key ceiling computed from deliberately conservative
+  estimates, **not** an RSS bound — query-owned materialization, decode
+  scratch, mmaps, memtables, vectors, and allocator behavior stay
+  outside it, and a single highly compressed segment can still create a
+  transient decode peak before admission (bounded/streaming decode is a
+  named follow-up). The motivating profiles (~206 MiB of publish-warming
+  RSS on one 4,096-document diagnostic run; 226.35 MiB of cumulative
+  live allocations under a merge warm) are attributed measurements, not
+  a claimed end-to-end memory reduction.
+- **Bounded selective stored-field hydration (storage primitive).** The
+  `xerj-storage` crate can now hydrate selected rows and selected
+  top-level `_source` fields from a ZBS2 V2 stored section without
+  materializing the whole canonical JSON array, with cancellable entry
+  points (deterministic checkpoints every 128 rows), a retained-size
+  preflight computed from framing metadata alone (fails closed on
+  historical zstd frames that omit a content size), and
+  malformed-input hardening — checked arithmetic, fallible reserves,
+  and framing/varint/bit-width validation keep hostile headers on the
+  error path instead of aborting in the allocator. The on-disk stored
+  format is unchanged and historical segments remain fully readable.
+  This is deliberately **not** wired to any engine route or cache in
+  this release — no endpoint, no query change, and no end-to-end
+  speedup is claimed. The committed report measures the trade-off on
+  its deterministic 20,000-row fixture: one-row hydration at roughly
+  59× lower peak RSS (~335 MB full decode vs ~5.6–5.7 MB selective) but
+  roughly 4× slower wall time, because RAW/zstd JSON columns still
+  stream through all rows — a memory primitive with a CPU cost,
+  measured as a single-host storage microbenchmark, and LZ4 columns
+  still decompress whole before selective materialization.
+- **gzip request-body decompression (external contribution).** Both
+  HTTP routers now transparently decompress `Content-Encoding: gzip`
+  request bodies before parsing; previously the raw gzip bytes reached
+  handlers and failed JSON parsing (the commit reports
+  `PUT /_ilm/policy` returning 400 and `POST /_bulk` returning 500).
+  This unblocks the ES clients that compress by default — the
+  reproduced failure was Filebeat 8.13.4 with default config 400'ing on
+  its first ILM setup call, marking the output connection permanently
+  failed, and retrying forever with zero documents ingested; after the
+  fix the same default run completes and every test event lands and is
+  queryable. Semantics note: the decompression layer sits outside the
+  body-size limit, so the configured request-body limit now bounds the
+  *decompressed* size, not the on-wire size. Only gzip is handled
+  (deflate/br/zstd remain unsupported), response compression is
+  unchanged, and verification is the PR's own curl + Filebeat runs — no
+  automated test was added in the diff. Contributed by Vincenzo
+  Lombardo (`Vinz2168`).
+
+### Fixed
+
+- **kNN under document-ID reuse (HNSW entry point).** Re-inserting a
+  vector under the external ID that owned the HNSW graph entry point
+  could return the old, superseded vector as a hit for that ID, and the
+  v2 graph writer could persist a CRC-valid file whose entry header
+  paired the current slot's external ID with the orphaned slot's higher
+  layer. Both are fixed (arrived from the probelabs fork, PR #64,
+  landed via #66): a slot counts as live only when the reverse ID map
+  resolves its external ID back to that exact slot, the entry point is
+  re-selected as the highest-layer live slot, search excludes
+  superseded slots from results (they stay traversable for graph
+  connectivity — excluded, not reclaimed), and the writer derives the
+  entry header from live topology, repairing a stale in-memory header
+  on save. This is a write/search-time fix, not a retroactive file
+  repair: graph files written before the fix still load as-is and are
+  corrected the next time the fixed writer saves them. The on-disk
+  graph format and byte layout are unchanged, and no authoritative
+  documents or latest vectors are discarded.
+- **Painless: oversized expressions return a bounded 400 instead of
+  aborting the process.** Flat shapes the parser can build without
+  recursing (`1+1+…` binary chains, `.member` chains, `[index]` chains)
+  bypassed the parser's recursion guards, and the evaluator's depth
+  guard counted frames only after entering evaluation — so a 5,001-node
+  chain could exhaust the native stack before the intended error fired
+  (reproduced as a process abort on the default test-thread stack).
+  Expression depth is now computed exactly at parse time — 500 accepted
+  and evaluated, 501 rejected, covered for all three shapes — and flat
+  binary and member/index chains evaluate iteratively. Scripts found
+  under `script`/`*_script` keys in `_search` bodies that exceed the
+  limit get an up-front HTTP 400: "script evaluation exceeded maximum
+  depth; split the expression into smaller statements". The supported
+  depth contract itself is unchanged (still 500) — this enforces the
+  existing contract before evaluator recursion instead of during it —
+  and semantics of accepted expressions (precedence, associativity,
+  short-circuiting and error order, `doc`/`params`/`Math` dispatch)
+  are test-covered as unchanged. Statement nesting no longer consumes
+  the expression-depth budget; it stays bounded by the parser's
+  separate limit.
+
+### Changed — internal (no behavior change claimed)
+
+- **HNSW read path behind a storage-view seam.** Search, construction
+  traversal, diverse-neighbor selection, diagnostics, and graph
+  serialization in the vector index now run through a private read-only
+  storage trait with static dispatch, so a future immutable graph
+  backend can implement the same read contract without rewriting the
+  search path or adding runtime branching. Public API, mutation model,
+  distance behavior (cosine/L2/dot), filtered-search and tombstone
+  semantics, and graph format v2 are all unchanged — a checked-in
+  pre-seam format fixture loads, rewrites, and reopens correctly, and
+  parity tests compare exact result ordering and exact serialized
+  bytes. The commit's controlled A/B (one 10K × 64-d graph, 30K
+  deterministic queries, nine alternating CPU-pinned runs) reports
+  −0.31% median qps with identical checksums, stated to be within run
+  noise: explicitly not a speedup, and this refactor does not by itself
+  reduce ingest memory.
+
+### Docs
+
+- **calltree.ai case study**
+  (`docs/case-studies/calltree-analytics/`): three runnable scripts +
+  README showing one `POST /conversations/_search` combining
+  `query.knn` with `terms`/`percentiles`/`avg` aggregations for
+  deep-research questions, over a 130-conversation generated corpus,
+  with a primitives table mapping sub-questions to query shapes.
+- **RAG hybrid retrieval example**
+  (`docs/examples/rag-hybrid-retrieval/`): pure-cosine vs BM25 vs
+  `query.hybrid` (RRF) over an 18-chunk synthetic corpus with real
+  768-dim EmbeddingGemma vectors, documenting the pgvector-to-XERJ
+  drop-in migration (same chunks and embeddings, swap the cosine
+  `SELECT` for the hybrid `_search`). The honest result is included:
+  on the identifier query, equal-weight RRF ranks the right chunk #3,
+  not #1, and the README recommends weight tuning or a query router.
+- **daily.dev Postgres CDC case study**
+  (`docs/case-studies/daily-dev-postgres-cdc/`): logical-replication
+  sync from a pgvector-equipped `post` table into XERJ via `_bulk`,
+  with both a polled `test_decoding` consumer and a push-streaming
+  consumer with LSN checkpointing (live-verified resuming from
+  `confirmed_flush_lsn` after a stop/change/restart). A correction is
+  recorded in place: the first draft's "no fused RRF node" limitation
+  was the author's own request-syntax error, not an engine gap —
+  `query.hybrid` with `fusion: {type: rrf}` is the real syntax.
+- **Semantic-analytics use case** on xerj.org
+  (`landing/use-cases/semantic-analytics.html`, wired into the
+  use-case subnav, hub, solutions index, sitemap, and
+  `llms.txt`/`llms-full.txt`): documents the rc.6 kNN+aggregations
+  behavior, including every gap listed under Known limitations below.
+  All corpora in this Docs group are small and synthetic, and nothing
+  in them was timed at any corpus size; daily.dev and calltree.ai are
+  the parties whose questions motivated the case studies, not
+  customers.
+- **Production-deployment recipe** gains "Bound retained segment
+  hydration" (the budget knob, env override, clamping, refusal
+  semantics, and the stats fields); the passage-retrieval recipe gains
+  the `fields: ["_passage"]` example and response shape.
+
+### Known limitations
+
+Known-open items in this release's own features, stated here rather
+than left implied:
+
+- **`significant_terms` over a kNN slice returns empty buckets** — the
+  vector path does not yet supply a background corpus. Use `terms` for
+  raw in-slice counts, or the two-step kNN → ids → aggregation pattern
+  when statistical significance is needed. Filed as a follow-up.
+- **Aggregations on a kNN query are bounded by `k`:** buckets count the
+  retrieved neighbour set only, never the full matching corpus, and
+  `hits.total.value` echoes the neighbour-pool size, not a match count
+  — the documented top-level-knn semantics.
+- **An aggs-bearing kNN request always runs the exact brute-force
+  scan:** cost scales with corpus size × dims, `num_candidates` has no
+  effect there, and HNSW never serves it. A hybrid (RRF) query carrying
+  `aggs` is rejected with a 400, and a kNN clause inside `bool.filter`
+  is not peeled and returns no buckets — slice aggregation works for
+  pure kNN only.
+- **The hydration budget is not an RSS bound** — it caps conservatively
+  estimated retained payload and keys only, and a single highly
+  compressed segment can still create a transient decode peak before
+  admission; bounded/streaming decode is a separate follow-up.
+- **The selective-hydration primitive is not wired** into any engine
+  read path or the shared cache budget yet, and LZ4 columns still
+  require whole-column decompression before selective materialization.
+- **Request decompression handles gzip only** (deflate/br/zstd request
+  bodies remain unsupported); response compression is unchanged.
+- **HNSW graph files written before the entry-header fix** still load
+  with the inconsistent header retained; a file is only corrected the
+  next time the fixed writer saves it.
+
 ## [1.0.0-rc.5] - 2026-07-27
 
 Fifth release candidate: the **real-client compatibility release**. Much of
