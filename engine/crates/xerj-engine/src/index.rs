@@ -538,6 +538,7 @@ mod hnsw_identity_tests {
         boundary_case!("cancel-at-id-map", hnsw_id_map);
         boundary_case!("cancel-at-id-rev", hnsw_id_rev);
         boundary_case!("cancel-at-node-seq", hnsw_node_seq);
+        boundary_case!("cancel-at-vector-seq", hnsw_vector_seq);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
