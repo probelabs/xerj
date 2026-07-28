@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ.ai — Case study: semantic analytics in one request</title>
+<meta name="description" content="kNN + aggregations in a single request (rc.6): a deep-research question over 130 synthetic support conversations answered by one POST /_search. A correctness demo, not a benchmark.">
+<meta property="og:title" content="XERJ.ai — Case study: semantic analytics in one request">
+<meta property="og:description" content="One POST /_search returns the semantic slice, the breakdown, the metrics, and the evidence. Demonstrated live on a generated corpus — not a benchmark.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
+<link rel="stylesheet" href="/style.css?v=cs0728">
+<style>
+  /* page-local: comparison series uses the validated --z-cmp token, not gray */
+  .cmp-b .cmp-bar { background: var(--z-cmp); opacity: 1; }
+  .cmp-bars-head .cmp-b { color: var(--z-cmp); font-weight: 700; }
+  /* page-local: "one response carries" rows */
+  .carry { max-width: 720px; margin-top: var(--sp-8); }
+  .carry .c-row { display: flex; gap: var(--sp-4); align-items: baseline; padding: 10px 0; border-bottom: 1px solid var(--z-faint); font-family: var(--font-data); font-size: var(--fs-13); letter-spacing: var(--track-label); }
+  .carry .c-row:first-child { border-top: 1px solid var(--z-line); }
+  .carry .c-n { color: var(--z-accent); font-family: var(--font-mono); }
+  .carry .c-what { color: var(--z-ink); }
+  .carry .c-det { color: var(--z-mute); margin-left: auto; text-align: right; font-family: var(--font-mono); font-size: var(--fs-11); }
+</style>
+</head>
+<body>
+
+<!-- nav -->
+<nav class="nav" aria-label="Primary">
+  <a href="/index.html" class="brand">XERJ.AI</a>
+  <a href="/index.html">HOME</a>
+  <a href="/product.html">PRODUCT</a>
+  <span class="nav-drop">
+    <a href="/use-cases.html">USE CASES</a>
+  </span>
+  <a href="/case-studies.html" class="active">CASE STUDIES</a>
+  <span class="spacer"></span>
+  <a href="/for-agents.html">FOR AGENTS</a>
+  <a href="/docs/index.html">DOCS</a>
+  <a href="/docs/recipes/index.html">RECIPES</a>
+  <a href="/playground.html">DASHBOARDS</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="theme">
+    <button type="button" data-theme="day">DAY</button>
+    <span class="dash">·</span>
+    <button type="button" data-theme="night" class="active">NIGHT</button>
+  </span>
+</nav>
+
+
+<nav class="uc-subnav" aria-label="Case studies">
+  <a href="/case-studies.html">ALL CASE STUDIES</a>
+  <a href="/case-studies/wordpress-security-audit.html">WORDPRESS SECURITY AUDIT</a>
+  <a href="/case-studies/calltree-analytics.html" class="active">SEMANTIC ANALYTICS</a>
+  <a href="/case-studies/daily-dev-postgres-cdc.html">POSTGRES CDC + HYBRID</a>
+</nav>
+
+<div class="uc-hero">
+  <div class="uc-eyebrow">CASE STUDY · SEMANTIC ANALYTICS</div>
+  <h1>DEEP RESEARCH.<br><span class="accent">ONE REQUEST.</span></h1>
+  <p class="uc-lead">"Of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what are the key issues?" One question bundles retrieval, aggregation, labeling and evidence — normally an OLAP engine plus a vector store, with ETL between them. In XERJ it is one <code class="inline">POST /_search</code>: slice, breakdown, metrics and evidence come back together.</p>
+  <div class="kicker"><span>FOR</span><span class="dash">·</span><span>AI-OVER-SUPPORT TEAMS</span><span class="dash">·</span><span>DATA PLATFORM ENGINEERS</span></div>
+</div>
+
+<!-- Hero visual: the architecture collapse -->
+<section class="scene-section" style="border-top:0; padding-top:0;">
+  <div class="viz-block">
+    <div class="kicker"><span>GENERATED CORPUS · NOT A BENCHMARK · 130 SYNTHETIC CONVERSATIONS</span></div>
+    <div class="cmp-bars">
+      <div class="cmp-bars-head">
+        <span></span>
+        <span class="cmp-a">XERJ</span>
+        <span class="cmp-b">SPLIT STACK</span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Requests per question</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:45%;"></span>
+          <span class="cmp-num">1</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90%;"></span>
+          <span class="cmp-num">2</span>
+        </span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Stores to operate</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:45%;"></span>
+          <span class="cmp-num">1</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90%;"></span>
+          <span class="cmp-num">2</span>
+        </span>
+      </div>
+    </div>
+    <div class="kicker" style="margin-top:var(--sp-6);"><span>ONE RESPONSE CARRIES</span></div>
+    <div class="carry">
+      <div class="c-row"><span class="c-n">01</span><span class="c-what">SEMANTIC SLICE</span><span class="c-det">k=80 nearest conversations</span></div>
+      <div class="c-row"><span class="c-n">02</span><span class="c-what">BREAKDOWN</span><span class="c-det">terms buckets: band, key issues</span></div>
+      <div class="c-row"><span class="c-n">03</span><span class="c-what">METRICS</span><span class="c-det">csat p50 · handle-time avg, per bucket</span></div>
+      <div class="c-row"><span class="c-n">04</span><span class="c-what">EVIDENCE</span><span class="c-det">3 example hits → LLM narrative</span></div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">SPLIT STACK = OLAP + VECTOR STORE + ETL, OR TWO ROUND TRIPS IN ONE ENGINE · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics" rel="external">docs/case-studies/calltree-analytics &rarr;</a></p>
+  </div>
+</section>
+
+<div class="pain-solve">
+  <div class="pain">
+    <h3>THE SPLIT-STACK TAX</h3>
+    <ul><li><strong>Two systems before one answer.</strong> An OLAP engine for the columns, a vector store for the embeddings, ETL between them.</li><li><strong>No cross-system join.</strong> The semantic slice lives in one store, the metrics in the other.</li><li><strong>Two round trips even inside one engine.</strong> Run the kNN, ship the ids back to the client, aggregate with a filter.</li><li><strong>Evidence arrives separately.</strong> The example conversations the LLM narrative needs are yet another query.</li></ul>
+  </div>
+  <div class="solve">
+    <h3>THE XERJ ANSWER</h3>
+    <ul><li><strong>One index holds everything.</strong> Keyword columns, full text, and the 768-dim vector are fields of the same document.</li><li><strong>Aggregations run on the kNN slice.</strong> rc.6 computes the buckets over the retrieved top-k neighbour set, in-request.</li><li><strong>Exact buckets by design.</strong> An aggs-bearing kNN routes to the exact scan, so counts are never approximate.</li><li><strong>Evidence rides along.</strong> Example hits return in the same response; one LLM call turns them into the narrative.</li></ul>
+  </div>
+</div>
+
+<div class="proof-row">
+
+  <div class="stat">
+    <div class="num">1</div>
+    <div class="label">REQUEST PER QUESTION</div>
+    <div class="ctx">was 2: kNN, ship ids client-side, filtered aggregation</div>
+  </div>
+
+  <div class="stat">
+    <div class="num">768-D</div>
+    <div class="label">VECTORS BESIDE THE COLUMNS</div>
+    <div class="ctx">EmbeddingGemma via Ollama · same document as the columns you aggregate</div>
+  </div>
+
+  <div class="stat">
+    <div class="num">0</div>
+    <div class="label">ETL JOBS</div>
+    <div class="ctx">columns, text and vectors live in one store — nothing to sync</div>
+  </div>
+
+</div>
+
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">ONE REQUEST, <span class="accent">WHOLE ANSWER.</span></h2>
+  <p class="wide"><code class="inline">query.knn</code> retrieves the semantic slice; the <code class="inline">aggs</code> block computes the band split, key issues, CSAT percentile and handle-time average over that slice; <code class="inline">size: 3</code> returns the evidence hits. Demonstrated live with real 768-dim vectors — XERJ stores and searches them, it does not embed, so retrieval quality is your embedding model's job (EmbeddingGemma is a stand-in for yours).</p>
+
+  <pre class="code">curl -s localhost:9200/conversations/_search -H 'Content-Type: application/json' -d '{
+  "query": { "<span class="k">knn</span>": { "field": "vec", "query_vector": [<span class="comment">/* embed("wifi issues...") */</span>],
+                       "k": 80, "num_candidates": 130 } },
+  "size": 3, "_source": ["band","issue","body"],
+  "<span class="k">aggs</span>": { "by_band": { "terms": { "field": "band" }, "aggs": {
+      "key_issues": { "terms": { "field": "issue", "size": 4 } },
+      "csat": { "percentiles": { "field": "csat", "percents": [50] } },
+      "aht":  { "avg": { "field": "handle_time_s" } } } } }
+}'</pre>
+  <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">ONE POST /_search · RC.6</p>
+
+  <pre class="code">"of calls about wifi issues, how many 2.4 vs 5GHz, and what are the key issues?"
+
+retrieved 80 nearest wifi calls; aggregated in the same request:
+  2.4GHz  29 (54%)  csat_p50=4.0  aht=897s  issues: channel-overlap, congestion, disconnects, legacy-device
+  5GHz    25 (46%)  csat_p50=4.0  aht=924s  issues: range, disconnects, congestion
+
+deep-research narrative (LLM over the retrieved examples):
+  The key issue is that the 5GHz signal is weak in a nearby room, dropping to 2.4GHz
+  and resulting in slower speeds.</pre>
+  <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">RECORDED RUN · SEEDED-GENERATOR OUTPUT · 54 OF THE 80 CARRIED A WIFI BAND; THE 26 N/A ARE FILTERED CLIENT-SIDE · 03_deep_research.py</p>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">WHAT THIS <span class="accent">DOES NOT SHOW.</span></h2>
+  <div class="laws">
+    <div class="n">01</div>
+    <div class="law">
+      <div class="t">EXACT SCAN, <span class="accent">NO SPEED CLAIM.</span></div>
+      <div class="b">An aggs-bearing kNN always runs the exact brute-force scan: <code class="inline">num_candidates</code> is ignored, HNSW never serves it, and cost scales with corpus size × dims. Nothing here was timed.</div>
+    </div>
+    <div class="n">02</div>
+    <div class="law">
+      <div class="t">BUCKETS COUNT <span class="accent">THE SLICE.</span></div>
+      <div class="b">Aggregations count only the retrieved top-k neighbour set, and <code class="inline">hits.total.value</code> echoes k — the 80 is the request parameter coming back, not a corpus match count.</div>
+    </div>
+    <div class="n">03</div>
+    <div class="law">
+      <div class="t">KNOWN <span class="accent">GAPS.</span></div>
+      <div class="b"><code class="inline">significant_terms</code> over a kNN slice returns empty, hybrid (RRF) + aggs is rejected with a 400, and kNN inside <code class="inline">bool.filter</code> returns no buckets. Use <code class="inline">terms</code> in-slice, or the two-step pattern.</div>
+    </div>
+    <div class="n">04</div>
+    <div class="law">
+      <div class="t">SYNTHETIC, <span class="accent">NOT EXCLUSIVE.</span></div>
+      <div class="b">The numbers are artifacts, not findings. ES/OpenSearch or Postgres + pgvector can express this shape too — what differs is cost model and operational weight, not possibility.</div>
+    </div>
+  </div>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">READ THE <span class="accent">WALKTHROUGH.</span></h2>
+  <p class="wide">The question came from calltree.ai, who run AI over support interactions — a motivating party, not a customer. The walkthrough has the three runnable scripts, the recorded output and the scaling guide. XERJ on :9200 plus Ollama is the whole stack.</p>
+  <div style="display:flex; gap:var(--sp-6); margin-top:var(--sp-6); flex-wrap:wrap;">
+    <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics" rel="external" class="cta" style="font-size:var(--fs-20); padding:var(--sp-4) 0; border-bottom:0; flex:1; min-width:280px;">
+      <span>OPEN THE WALKTHROUGH</span>
+      <span class="arrow">→</span>
+    </a>
+    <a href="/case-studies.html" class="cta" style="font-size:var(--fs-20); padding:var(--sp-4) 0; border-bottom:0; flex:1; min-width:280px;">
+      <span>ALL CASE STUDIES</span>
+      <span class="arrow">→</span>
+    </a>
+  </div>
+</section>
+
+<section class="lead-capture" id="demo">
+  <div class="kicker"><span>READY?</span><span class="dash">·</span><span>REQUEST ACCESS</span></div>
+  <h3>RUN IT ON<br><span class="accent">YOUR CONVERSATIONS.</span></h3>
+  <p>Send us your mapping and one deep-research question. We'll send back the single-request version — kNN + aggs over your schema — with the scripts to reproduce it.</p>
+  <form class="lead-form" id="leadForm" action="#" method="post" novalidate>
+    <div class="lead-form-input">
+      <input type="email" name="email" placeholder="you@company.com" required aria-label="Work email" autocomplete="email" />
+    </div>
+    <button type="submit" class="demo">SEE THE DEMO <span class="arrow">→</span></button>
+    <span class="note">We only use this email to send you the binary. Ever.</span>
+    <span class="ok">✓ THANKS. CHECK YOUR INBOX WITHIN 24 HOURS.</span>
+  </form>
+</section>
+
+<footer class="footer">
+  <span>XERJ.AI · CASE STUDIES · V0.1</span>
+  <span>STORAGE FOR THE AGENT ERA</span>
+  <span><a href="/index.html">HOME</a> · <a href="/case-studies.html">ALL CASE STUDIES</a> · <a href="/docs/index.html">DOCS</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+</footer>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    for (const btn of document.querySelectorAll('[data-theme]')) {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-theme');
+        root.setAttribute('data-theme', t);
+        for (const b of document.querySelectorAll('[data-theme]')) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        }
+      });
+    }
+    const form = document.getElementById('leadForm');
+    if (form) {
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const email = form.querySelector('input[type=email]').value.trim();
+        if (!email || !email.includes('@')) return;
+        try { fetch('/lead', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, source: 'calltree-analytics' }), keepalive: true }).catch(function () {}); } catch (_) {}
+        form.classList.add('sent');
+      });
+    }
+  })();
+</script>
+
+</body>
+</html>

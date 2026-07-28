@@ -14,6 +14,7 @@
   --z-faint:  #2b2a28;
   --z-line:   #3a3836;
   --z-accent: #ffc400;  /* solid, not neon */
+  --z-cmp:    #7f93aa;  /* comparison series in charts — never XERJ */
 
   --font-display: 'Big Shoulders Display', 'Inter', system-ui, sans-serif;
   --font-prose:   'Inter', system-ui, sans-serif;
@@ -53,6 +54,7 @@ html[data-theme='day'] {
      #ffc400 on cream is 1.7:1 (unreadable). #a06800 is 5.7:1 (AA body).
      Still reads as "XERJ yellow", just at a different luminance. */
   --z-accent: #a06800;
+  --z-cmp: #6f8aa8;
 }
 
 /* ---------- base ---------- */

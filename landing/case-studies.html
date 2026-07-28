@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ.ai — Case studies</title>
+<meta name="description" content="Three engineering questions answered end to end: a measured WordPress-core security audit, plus two functional proofs on synthetic corpora — semantic analytics in one request and Postgres CDC + hybrid search.">
+<meta property="og:title" content="XERJ.ai — Case studies">
+<meta property="og:description" content="Real questions, runnable answers. One study measured on real code; two functional proofs on synthetic corpora. Every number traces to a published walkthrough.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
+<link rel="stylesheet" href="/style.css?v=cs0728">
+<style>
+  /* page-local: comparison series wears the validated --z-cmp token, never gray */
+  .cmp-b .cmp-bar { background: var(--z-cmp); opacity: 1; }
+  .cmp-bars-head .cmp-b { color: var(--z-cmp); font-weight: 700; }
+  /* page-local: "one response carries" rows (copied with the calltree hero chart) */
+  .carry { max-width: 720px; margin-top: var(--sp-8); }
+  .carry .c-row { display: flex; gap: var(--sp-4); align-items: baseline; padding: 10px 0; border-bottom: 1px solid var(--z-faint); font-family: var(--font-data); font-size: var(--fs-13); letter-spacing: var(--track-label); }
+  .carry .c-row:first-child { border-top: 1px solid var(--z-line); }
+  .carry .c-n { color: var(--z-accent); font-family: var(--font-mono); }
+  .carry .c-what { color: var(--z-ink); }
+  .carry .c-det { color: var(--z-mute); margin-left: auto; text-align: right; font-family: var(--font-mono); font-size: var(--fs-11); }
+  /* the CDC bar labels are words, not ms figures — let them wrap instead of clip */
+  @media (max-width: 720px) {
+    .cmp-num { white-space: normal; overflow-wrap: break-word; text-align: left; flex-shrink: 1; min-width: 0; }
+    .cmp-label { white-space: normal; }
+  }
+</style>
+</head>
+<body>
+
+<!-- nav -->
+<nav class="nav" aria-label="Primary">
+  <a href="/index.html" class="brand">XERJ.AI</a>
+  <a href="/index.html">HOME</a>
+  <a href="/product.html">PRODUCT</a>
+  <span class="nav-drop">
+    <a href="/use-cases.html">USE CASES</a>
+  </span>
+  <a href="/case-studies.html" class="active">CASE STUDIES</a>
+  <span class="spacer"></span>
+  <a href="/for-agents.html">FOR AGENTS</a>
+  <a href="/docs/index.html">DOCS</a>
+  <a href="/docs/recipes/index.html">RECIPES</a>
+  <a href="/playground.html">DASHBOARDS</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="theme">
+    <button type="button" data-theme="day">DAY</button>
+    <span class="dash">·</span>
+    <button type="button" data-theme="night" class="active">NIGHT</button>
+  </span>
+</nav>
+
+<nav class="uc-subnav" aria-label="Case studies">
+  <a href="/case-studies.html" class="active">ALL CASE STUDIES</a>
+  <a href="/case-studies/wordpress-security-audit.html">WORDPRESS SECURITY AUDIT</a>
+  <a href="/case-studies/calltree-analytics.html">SEMANTIC ANALYTICS</a>
+  <a href="/case-studies/daily-dev-postgres-cdc.html">POSTGRES CDC + HYBRID</a>
+</nav>
+
+<section class="scene-section" style="border-top:0; padding-top:0;">
+  <div class="kicker"><span>CASE STUDIES</span><span class="dash">·</span><span>REPRODUCIBLE WALKTHROUGHS</span></div>
+  <h1 class="hero">REAL QUESTIONS.<br><span class="accent">RUNNABLE ANSWERS.</span></h1>
+  <p class="lead" style="max-width:720px;">
+    WordPress core — ~619k lines — security-audited by an AI agent for ~26,000
+    tokens: that is the one study measured on real code. The other two are
+    functional proofs on small synthetic corpora — they show the shape works,
+    not how fast.
+    Three engineering questions, answered end to end with published code and
+    recorded output. The questions came from calltree.ai and daily.dev; neither
+    is a customer. Every number traces to a walkthrough in the repo.
+  </p>
+</section>
+
+<!-- 01 WORDPRESS SECURITY AUDIT -->
+<div class="uc-showcase">
+  <div class="uc-copy">
+    <span class="uc-num">01</span>
+    <div class="uc-title">WORDPRESS<br>SECURITY<br><span class="accent">AUDIT.</span></div>
+    <p class="uc-pitch">WordPress core is ~619k lines — ~26× a 200k-token context window. An agent indexed it as a queryable code graph and read only what queries surfaced. Yellow is the whole audit's token bill; blue is what it costs just to load the code once.</p>
+    <div class="uc-metric">~26K TOKENS INSTEAD OF ~5.2M</div>
+    <div class="uc-persona">SECURITY ENGINEERS · AI-AGENT BUILDERS · PLATFORM TEAMS</div>
+    <a href="/case-studies/wordpress-security-audit.html" class="uc-cta">FULL CASE STUDY →</a>
+  </div>
+  <div class="uc-viz">
+    <div class="kicker"><span>MEASURED · WORDPRESS CORE · 1,492 FILES / ~619K LINES</span></div>
+    <div class="cmp-bars">
+      <div class="cmp-bars-head">
+        <span></span>
+        <span class="cmp-a">XERJ-ASSISTED AUDIT</span>
+        <span class="cmp-b">READ EVERY FILE</span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Tokens, entire audit</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:0.45%;"></span>
+          <span class="cmp-num">~26,000</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90.0%;"></span>
+          <span class="cmp-num">~5,200,000 <span class="cmp-ratio">~199×</span></span>
+        </span>
+      </div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">TOKEN ACCOUNTING, NOT A LATENCY BENCHMARK · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/wordpress-security-audit" rel="external">docs/case-studies/wordpress-security-audit &rarr;</a></p>
+  </div>
+</div>
+
+<!-- 02 SEMANTIC ANALYTICS -->
+<div class="uc-showcase">
+  <div class="uc-copy">
+    <span class="uc-num">02</span>
+    <div class="uc-title">SEMANTIC<br>ANALYTICS IN<br><span class="accent">ONE REQUEST.</span></div>
+    <p class="uc-pitch">"Of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what are the key issues?" — asked by calltree.ai. Half retrieval, half analytics: normally two stores and an ETL. One XERJ <code class="inline">POST /_search</code> returns the slice, the breakdown, the metrics, and the evidence.</p>
+    <div class="uc-metric">1 REQUEST · 1 STORE — WAS 2 + ETL</div>
+    <div class="uc-persona">AI-OVER-SUPPORT TEAMS · DATA PLATFORM ENGINEERS</div>
+    <a href="/case-studies/calltree-analytics.html" class="uc-cta">FULL CASE STUDY →</a>
+  </div>
+  <div class="uc-viz">
+    <div class="kicker"><span>GENERATED CORPUS · NOT A BENCHMARK · 130 SYNTHETIC CONVERSATIONS</span></div>
+    <div class="cmp-bars">
+      <div class="cmp-bars-head">
+        <span></span>
+        <span class="cmp-a">XERJ</span>
+        <span class="cmp-b">SPLIT STACK</span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Requests per question</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:45%;"></span>
+          <span class="cmp-num">1</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90%;"></span>
+          <span class="cmp-num">2</span>
+        </span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Stores to operate</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:45%;"></span>
+          <span class="cmp-num">1</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90%;"></span>
+          <span class="cmp-num">2</span>
+        </span>
+      </div>
+    </div>
+    <div class="kicker" style="margin-top:var(--sp-6);"><span>ONE RESPONSE CARRIES</span></div>
+    <div class="carry">
+      <div class="c-row"><span class="c-n">01</span><span class="c-what">SEMANTIC SLICE</span><span class="c-det">k=80 nearest conversations</span></div>
+      <div class="c-row"><span class="c-n">02</span><span class="c-what">BREAKDOWN</span><span class="c-det">terms buckets: band, key issues</span></div>
+      <div class="c-row"><span class="c-n">03</span><span class="c-what">METRICS</span><span class="c-det">csat p50 · handle-time avg, per bucket</span></div>
+      <div class="c-row"><span class="c-n">04</span><span class="c-what">EVIDENCE</span><span class="c-det">3 example hits → LLM narrative</span></div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">SPLIT STACK = OLAP + VECTOR STORE + ETL, OR TWO ROUND TRIPS IN ONE ENGINE · AGGS-BEARING kNN RUNS THE EXACT SCAN, NO SPEED CLAIM · BUCKETS COUNT THE RETRIEVED SLICE · k=80 IS THE REQUEST PARAMETER, NOT A MATCH COUNT · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics" rel="external">docs/case-studies/calltree-analytics &rarr;</a></p>
+  </div>
+</div>
+
+<!-- 03 POSTGRES CDC + HYBRID SEARCH -->
+<div class="uc-showcase">
+  <div class="uc-copy">
+    <span class="uc-num">03</span>
+    <div class="uc-title">POSTGRES CDC +<br><span class="accent">HYBRID SEARCH.</span></div>
+    <p class="uc-pitch">daily.dev's founder asked: can XERJ replicate automatically from Postgres? A logical-replication slot streams every INSERT, UPDATE, and DELETE into XERJ — no reindex jobs — and one hybrid query fuses BM25 + vector rankings server-side, replacing the tsvector + pgvector two-query app merge.</p>
+    <div class="uc-metric">3/3 MUTATION TYPES REPLICATED · 0 CHANGES LOST</div>
+    <div class="uc-persona">POSTGRES TEAMS · SEARCH ENGINEERS · PLATFORM TEAMS</div>
+    <a href="/case-studies/daily-dev-postgres-cdc.html" class="uc-cta">FULL CASE STUDY →</a>
+  </div>
+  <div class="uc-viz">
+    <div class="kicker"><span>FUNCTIONAL PROOF</span><span class="dash">·</span><span>SYNTHETIC 8-ROW CORPUS</span><span class="dash">·</span><span>NOT A BENCHMARK</span></div>
+    <div class="cmp-bars">
+    <div class="cmp-bars-head">
+      <span></span>
+      <span class="cmp-a">XERJ</span>
+      <span class="cmp-b">POSTGRES TSVECTOR + PGVECTOR</span>
+    </div>
+    <div class="cmp-bars-row">
+        <span class="cmp-label">Queries per hybrid search</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:45%;"></span>
+          <span class="cmp-num">1 fused query</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90%;"></span>
+          <span class="cmp-num">2 queries + app-side merge</span>
+        </span>
+      </div>
+    <div class="cmp-bars-row">
+        <span class="cmp-label">App-side score merges</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:0; min-width:0;"></span>
+          <span class="cmp-num">0 · RRF fuses server-side</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:45%;"></span>
+          <span class="cmp-num">1 · across two score scales</span>
+        </span>
+      </div>
+  </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">ARCHITECTURAL COUNT FROM THE RECORDED RUN · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/daily-dev-postgres-cdc" rel="external">docs/case-studies/daily-dev-postgres-cdc &rarr;</a></p>
+  </div>
+</div>
+
+<section class="lead-capture" id="demo">
+  <div class="kicker"><span>READY?</span><span class="dash">·</span><span>REQUEST ACCESS</span></div>
+  <h3>RUN ONE ON<br><span class="accent">YOUR DATA.</span></h3>
+  <p>Every walkthrough reproduces from the repo. Want it run against your codebase, your conversations, or your Postgres? Leave a work email and we'll set it up with you.</p>
+  <form class="lead-form" id="leadForm" action="#" method="post" novalidate>
+    <div class="lead-form-input">
+      <input type="email" name="email" placeholder="you@company.com" required aria-label="Work email" autocomplete="email" />
+    </div>
+    <button type="submit" class="demo">SEE THE DEMO <span class="arrow">→</span></button>
+    <span class="note">We only use this email to send you the binary. Ever.</span>
+    <span class="ok">✓ THANKS. CHECK YOUR INBOX WITHIN 24 HOURS.</span>
+  </form>
+</section>
+
+<footer class="footer">
+  <span>XERJ.AI · CASE STUDIES · V0.1</span>
+  <span>STORAGE FOR THE AGENT ERA</span>
+  <span><a href="/index.html">HOME</a> · <a href="/case-studies.html">ALL CASE STUDIES</a> · <a href="/docs/index.html">DOCS</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+</footer>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    for (const btn of document.querySelectorAll('[data-theme]')) {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-theme');
+        root.setAttribute('data-theme', t);
+        for (const b of document.querySelectorAll('[data-theme]')) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        }
+      });
+    }
+    const form = document.getElementById('leadForm');
+    if (form) {
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const email = form.querySelector('input[type=email]').value.trim();
+        if (!email || !email.includes('@')) return;
+        console.log('[xerj lead]', email);
+        try { fetch('/lead', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, source: 'case-studies' }), keepalive: true }).catch(function () {}); } catch (_) {}
+        form.classList.add('sent');
+      });
+    }
+  })();
+</script>
+
+</body>
+</html>

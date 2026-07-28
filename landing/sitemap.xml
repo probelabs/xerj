@@ -71,6 +71,26 @@
     <priority>0.7</priority>
   </url>
   <url>
+    <loc>https://xerj.org/case-studies.html</loc>
+    <lastmod>2026-07-28</lastmod>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://xerj.org/case-studies/wordpress-security-audit.html</loc>
+    <lastmod>2026-07-28</lastmod>
+    <priority>0.7</priority>
+  </url>
+  <url>
+    <loc>https://xerj.org/case-studies/calltree-analytics.html</loc>
+    <lastmod>2026-07-28</lastmod>
+    <priority>0.7</priority>
+  </url>
+  <url>
+    <loc>https://xerj.org/case-studies/daily-dev-postgres-cdc.html</loc>
+    <lastmod>2026-07-28</lastmod>
+    <priority>0.7</priority>
+  </url>
+  <url>
     <loc>https://xerj.org/brand.html</loc>
     <lastmod>2026-04-14</lastmod>
     <priority>0.7</priority>

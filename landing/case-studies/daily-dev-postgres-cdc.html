@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ.ai — Case study: Postgres CDC + hybrid search</title>
+<meta name="description" content="Logical-replication CDC keeps XERJ in sync with Postgres — INSERT/UPDATE/DELETE flow in, and one hybrid RRF query replaces the tsvector+pgvector two-query app merge. Functional proof on a synthetic 8-row corpus, not a benchmark.">
+<meta property="og:title" content="XERJ.ai — Case study: Postgres CDC + hybrid search">
+<meta property="og:description" content="Point XERJ at Postgres: changes replicate in via a logical-replication slot, and one fused BM25+vector query replaces two queries plus an app-side merge. Functional end-to-end proof.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
+<link rel="stylesheet" href="/style.css?v=cs0728">
+<style>
+  /* page-local: comparison-series color + 4-up proof tiles */
+  .cmp-b .cmp-bar { background: var(--z-cmp); opacity: 1; }
+  .cmp-bars-head .cmp-b { color: var(--z-cmp); font-weight: 700; }
+  .proof-row.cdc { grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 960px) { .proof-row.cdc { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 620px) { .proof-row.cdc { grid-template-columns: 1fr; } }
+  /* the bar labels here are words, not ms figures — let them wrap instead of clip */
+  @media (max-width: 720px) {
+    .cmp-num { white-space: normal; overflow-wrap: break-word; text-align: left; flex-shrink: 1; min-width: 0; }
+    .cmp-label { white-space: normal; }
+  }
+</style>
+</head>
+<body>
+
+<!-- nav -->
+<nav class="nav" aria-label="Primary">
+  <a href="/index.html" class="brand">XERJ.AI</a>
+  <a href="/index.html">HOME</a>
+  <a href="/product.html">PRODUCT</a>
+  <span class="nav-drop">
+    <a href="/use-cases.html">USE CASES</a>
+  </span>
+  <a href="/case-studies.html" class="active">CASE STUDIES</a>
+  <span class="spacer"></span>
+  <a href="/for-agents.html">FOR AGENTS</a>
+  <a href="/docs/index.html">DOCS</a>
+  <a href="/docs/recipes/index.html">RECIPES</a>
+  <a href="/playground.html">DASHBOARDS</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="theme">
+    <button type="button" data-theme="day">DAY</button>
+    <span class="dash">·</span>
+    <button type="button" data-theme="night" class="active">NIGHT</button>
+  </span>
+</nav>
+
+
+<nav class="uc-subnav" aria-label="Case studies">
+  <a href="/case-studies.html">ALL CASE STUDIES</a>
+  <a href="/case-studies/wordpress-security-audit.html">WORDPRESS SECURITY AUDIT</a>
+  <a href="/case-studies/calltree-analytics.html">SEMANTIC ANALYTICS</a>
+  <a href="/case-studies/daily-dev-postgres-cdc.html" class="active">POSTGRES CDC + HYBRID</a>
+</nav>
+
+<div class="uc-hero">
+  <div class="uc-eyebrow">CASE STUDY · POSTGRES CDC + HYBRID SEARCH</div>
+  <h1>POINT IT AT POSTGRES.<br><span class="accent">SEARCH SYNCS ITSELF.</span></h1>
+  <p class="uc-lead">The founder of daily.dev asked a public question: can XERJ replicate automatically from Postgres? Yes. A small CDC consumer reads the WAL through a logical-replication slot, and every INSERT, UPDATE, and DELETE flows into XERJ by itself — no reindex jobs. One hybrid query then fuses BM25 and vector rankings server-side.</p>
+  <div class="kicker"><span>FOR</span><span class="dash">·</span><span>POSTGRES TEAMS</span><span class="dash">·</span><span>SEARCH ENGINEERS</span><span class="dash">·</span><span>PLATFORM TEAMS</span></div>
+</div>
+
+<!-- Hero chart -->
+<section class="scene-section" style="border-top:0; padding-top:0;">
+  <div class="viz-block">
+    <div class="kicker"><span>FUNCTIONAL PROOF</span><span class="dash">·</span><span>SYNTHETIC 8-ROW CORPUS</span><span class="dash">·</span><span>NOT A BENCHMARK</span></div>
+    <div class="cmp-bars">
+    <div class="cmp-bars-head">
+      <span></span>
+      <span class="cmp-a">XERJ</span>
+      <span class="cmp-b">POSTGRES TSVECTOR + PGVECTOR</span>
+    </div>
+    <div class="cmp-bars-row">
+        <span class="cmp-label">Queries per hybrid search</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:45%;"></span>
+          <span class="cmp-num">1 fused query</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90%;"></span>
+          <span class="cmp-num">2 queries + app-side merge</span>
+        </span>
+      </div>
+    <div class="cmp-bars-row">
+        <span class="cmp-label">App-side score merges</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:0; min-width:0;"></span>
+          <span class="cmp-num">0 · RRF fuses server-side</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:45%;"></span>
+          <span class="cmp-num">1 · across two score scales</span>
+        </span>
+      </div>
+  </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">ARCHITECTURAL COUNT FROM THE RECORDED RUN · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/daily-dev-postgres-cdc" rel="external">docs/case-studies/daily-dev-postgres-cdc &rarr;</a></p>
+  </div>
+</section>
+
+<div class="pain-solve">
+  <div class="pain">
+    <h3>SEARCH ON THE PRIMARY</h3>
+    <ul><li><strong>tsvector and pgvector don't fuse.</strong> two ranked lists, merged in app code across incompatible score scales.</li><li><strong>Search load hits OLTP.</strong> ranking queries and business writes fight for the same primary.</li><li><strong>A dedicated engine means a sync pipeline.</strong> you build it, run it, and babysit its reindex jobs.</li><li><strong>Deletes are the trap.</strong> miss one and search keeps serving rows Postgres removed.</li></ul>
+  </div>
+  <div class="solve">
+    <h3>THE XERJ ANSWER</h3>
+    <ul><li><strong>Replication is the pipeline.</strong> a logical-replication slot streams every INSERT/UPDATE/DELETE into XERJ.</li><li><strong>One fused query.</strong> first-class hybrid search — BM25 + kNN merged server-side by reciprocal-rank fusion.</li><li><strong>Crash-safe by LSN.</strong> a restarted consumer resumes from the confirmed LSN, replaying only what it missed.</li><li><strong>Zero manual reindexes.</strong> upsert and delete-by-id converge XERJ to Postgres state.</li></ul>
+  </div>
+</div>
+
+<section class="scene-section" style="border-top:0; padding-top:0;">
+  <div class="viz-block">
+    <div class="kicker"><span>RECORDED RUN</span><span class="dash">·</span><span>POSTGRES 16 + PGVECTOR 0.8.2</span><span class="dash">·</span><span>LOGICAL REPLICATION</span></div>
+    <div class="proof-row cdc" style="padding-top:var(--sp-4);">
+      <div class="stat">
+        <div class="num">3/3</div>
+        <div class="label">MUTATION TYPES REPLICATED</div>
+        <div class="ctx">INSERT + UPDATE + DELETE reflected in one slot drain</div>
+      </div>
+      <div class="stat">
+        <div class="num">0</div>
+        <div class="label">CHANGES LOST IN DOWNTIME</div>
+        <div class="ctx">consumer down while Postgres kept writing</div>
+      </div>
+      <div class="stat">
+        <div class="num">2</div>
+        <div class="label">CHANGES REPLAYED ON RESTART</div>
+        <div class="ctx">exactly the missed ones, from the confirmed LSN</div>
+      </div>
+      <div class="stat">
+        <div class="num">0</div>
+        <div class="label">MANUAL REINDEXES</div>
+        <div class="ctx">every mutation applied by upsert or delete-by-id</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">HOW IT <span class="accent">WORKS.</span></h2>
+  <p class="wide">A ~20-line SQL bootstrap turns on logical replication; a small Python consumer drains the slot, re-embeds changed rows (EmbeddingGemma via Ollama, 768-dim cosine), and bulk-writes XERJ. Search is one request: XERJ's hybrid query fuses the BM25 ranking and the kNN ranking with reciprocal-rank fusion — no score normalization, no merge code.</p>
+
+  <p style="font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data); margin-bottom:0;">THE ONE REQUEST — BM25 + VECTOR, FUSED SERVER-SIDE</p>
+  <pre class="code"><span class="prompt">$</span> curl -s localhost:9200/posts/_search -H <span class="s">'Content-Type: application/json'</span> -d <span class="s">'{
+  "query": { "<span class="k">hybrid</span>": {
+    "queries": [
+      { "query": { "match": { "summary": "ditching the JVM search stack for something cheaper" } } },
+      { "query": { "<span class="k">knn</span>": { "field": "vec", "query_vector": [<span class="comment">/* 768-dim */</span>], "num_candidates": 9 } } }
+    ],
+    "<span class="k">fusion</span>": { "type": "<span class="k">rrf</span>", "k": 60 }
+  } }
+}'</span></pre>
+
+  <p class="wide">Recorded top-3 for that query — RRF rank-fusion scores, shown as the fused order:</p>
+  <ol style="margin:0 0 var(--sp-6); padding-left:var(--sp-6); font-size:var(--fs-16); line-height:1.8;">
+    <li>Why we moved off Elasticsearch <span style="font-family:var(--font-mono); font-size:var(--fs-13); color:var(--z-mute);">RRF 0.03279</span></li>
+    <li>The cost of microservices <span style="font-family:var(--font-mono); font-size:var(--fs-13); color:var(--z-mute);">RRF 0.03175</span></li>
+    <li>Building a vector search engine from scratch <span style="font-family:var(--font-mono); font-size:var(--fs-13); color:var(--z-mute);">RRF 0.03151</span></li>
+  </ol>
+
+  <p style="font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data); margin-bottom:0;">CHANGE POSTGRES, WATCH XERJ FOLLOW — THEN A CRASH-RECOVERY REPLAY</p>
+  <pre class="code"><span class="comment">-- in Postgres:  UPDATE p7 · INSERT p9 · DELETE p5</span>
+<span class="prompt">$</span> python3 cdc_sync.py
+<span class="k">[cdc]</span> synced 2 upserts, 1 deletes to XERJ  <span class="s">[('p7','UPDATE'),('p9','INSERT'),('p5','DELETE')]</span>
+
+<span class="comment"># consumer killed; UPDATE p1 + INSERT p11 happen while it is down</span>
+<span class="prompt">$</span> python3 cdc_stream.py
+<span class="k">[stream]</span> consuming WAL from confirmed LSN (push, no polling)
+<span class="k">[stream]</span> UPDATE p1  -&gt; XERJ  <span class="s">LSN=27863424</span>  [checkpointing]
+<span class="k">[stream]</span> INSERT p11 -&gt; XERJ  <span class="s">LSN=27863976</span>  [checkpointing]</pre>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">WHAT THIS <span class="accent">DOES NOT SHOW.</span></h2>
+  <div class="laws">
+    <div class="n">01</div><div class="law"><div class="t">TINY <span class="accent">SYNTHETIC CORPUS.</span></div><div class="b">Eight seed posts (~11 after live changes), modeled on the open-source daily-api Post schema — not daily.dev's data. A functional proof: no latency, throughput, or cost numbers exist, and "within seconds" is qualitative.</div></div>
+    <div class="n">02</div><div class="law"><div class="t">DEMO SLOT, NOT <span class="accent">PRODUCTION SHAPE.</span></div><div class="b">The consumer reads Postgres' built-in test_decoding slot. The production shape is a pgoutput slot, wal2json, or Debezium in front of the same upsert/delete path.</div></div>
+    <div class="n">03</div><div class="law"><div class="t">AT-LEAST-ONCE, <span class="accent">CONVERGENT.</span></div><div class="b">Delivery is at-least-once, converging to Postgres state through idempotent upsert/delete-by-id plus LSN checkpointing — exactly-once-convergent, not bare exactly-once.</div></div>
+    <div class="n">04</div><div class="law"><div class="t">BRING YOUR OWN <span class="accent">EMBEDDINGS.</span></div><div class="b">XERJ stores and searches vectors; it does not embed. Quality is your model's job (EmbeddingGemma via Ollama here). RRF k and weights need per-corpus tuning; fusion:'learned' does not exist — only rrf and linear.</div></div>
+  </div>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">READ THE <span class="accent">WALKTHROUGH.</span></h2>
+  <p class="wide">daily.dev is a motivating party, not a customer. Every output above is recorded from the scripts in the walkthrough — setup.sql, cdc_sync.py, cdc_stream.py — against Postgres 16 + pgvector 0.8.2 in Docker. Four commands reproduce it end to end.</p>
+  <div style="display:flex; gap:var(--sp-6); margin-top:var(--sp-6); flex-wrap:wrap;">
+    <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/daily-dev-postgres-cdc" rel="external" class="cta" style="font-size:var(--fs-20); padding:var(--sp-4) 0; border-bottom:0; flex:1; min-width:280px;">
+      <span>OPEN THE WALKTHROUGH</span>
+      <span class="arrow">→</span>
+    </a>
+    <a href="/case-studies.html" class="cta" style="font-size:var(--fs-20); padding:var(--sp-4) 0; border-bottom:0; flex:1; min-width:280px;">
+      <span>ALL CASE STUDIES</span>
+      <span class="arrow">→</span>
+    </a>
+  </div>
+</section>
+
+<section class="lead-capture" id="demo">
+  <div class="kicker"><span>READY?</span><span class="dash">·</span><span>REQUEST ACCESS</span></div>
+  <h3>RUN IT ON<br><span class="accent">YOUR POSTGRES.</span></h3>
+  <p>Tell us your table shape and change rate. We'll wire the CDC consumer against a copy of your schema and send you the scripts and the binary.</p>
+  <form class="lead-form" id="leadForm" action="#" method="post" novalidate>
+    <div class="lead-form-input">
+      <input type="email" name="email" placeholder="you@company.com" required aria-label="Work email" autocomplete="email" />
+    </div>
+    <button type="submit" class="demo">SEE THE DEMO <span class="arrow">→</span></button>
+    <span class="note">We only use this email to send you the binary. Ever.</span>
+    <span class="ok">✓ THANKS. CHECK YOUR INBOX WITHIN 24 HOURS.</span>
+  </form>
+</section>
+
+<footer class="footer">
+  <span>XERJ.AI · CASE STUDIES · V0.1</span>
+  <span>STORAGE FOR THE AGENT ERA</span>
+  <span><a href="/index.html">HOME</a> · <a href="/case-studies.html">ALL CASE STUDIES</a> · <a href="/docs/index.html">DOCS</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+</footer>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    for (const btn of document.querySelectorAll('[data-theme]')) {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-theme');
+        root.setAttribute('data-theme', t);
+        for (const b of document.querySelectorAll('[data-theme]')) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        }
+      });
+    }
+    const form = document.getElementById('leadForm');
+    if (form) {
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const email = form.querySelector('input[type=email]').value.trim();
+        if (!email || !email.includes('@')) return;
+        console.log('[xerj lead]', email);
+        try { fetch('/lead', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, source: 'daily-dev-postgres-cdc' }), keepalive: true }).catch(function () {}); } catch (_) {}
+        form.classList.add('sent');
+      });
+    }
+  })();
+</script>
+
+</body>
+</html>

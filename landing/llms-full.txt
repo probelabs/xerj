@@ -306,6 +306,7 @@ Document-folder indexing (prior use case):
 
 AI security review of a codebase too big to read:
   https://github.com/xerj-org/xerj/tree/main/docs/case-studies/wordpress-security-audit
+  https://xerj.org/case-studies/wordpress-security-audit.html
   An agent audits real WordPress core — 1,492 PHP files, ~619k lines, ~26× a 200k
   context window — by indexing the tree as queryable facts (call graph + taint
   facts, cap/nonce shapes, hook registrations, sanitizer-order fingerprints —
@@ -327,6 +328,7 @@ AI security review of a codebase too big to read:
 Aggregate a semantic slice in one request (kNN + aggregations, rc.6):
   https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics
   https://xerj.org/use-cases/semantic-analytics.html
+  https://xerj.org/case-studies/calltree-analytics.html
   The deep-research shape, where one question is half retrieval and half
   analytics — "of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what
   are the key issues?" — answered in a single POST /_search, because the
@@ -365,6 +367,29 @@ Aggregate a semantic slice in one request (kNN + aggregations, rc.6):
   the vectors, not to XERJ. ES/OpenSearch and Postgres+pgvector can already
   express this question in one request — what differs is the cost model and the
   operational weight, not whether the shape is possible.
+
+Postgres CDC + hybrid search (daily.dev question):
+  https://github.com/xerj-org/xerj/tree/main/docs/case-studies/daily-dev-postgres-cdc
+  https://xerj.org/case-studies/daily-dev-postgres-cdc.html
+  Functional proof on a synthetic 8-row corpus modeled on the open-source
+  daily-api Post schema — NOT daily.dev's data; daily.dev's founder asked the
+  question publicly and daily.dev is not a customer. A small consumer drains a
+  Postgres logical-replication slot into XERJ: 3/3 mutation types
+  (INSERT/UPDATE/DELETE) reflected in one drain; a consumer killed mid-stream
+  lost 0 changes and replayed exactly the 2 missed ones from the confirmed LSN
+  (at-least-once delivery, converging via idempotent upsert/delete-by-id plus
+  LSN checkpointing — exactly-once-convergent, not bare exactly-once). One
+  hybrid rrf query replaces the tsvector+pgvector two-query app-side merge.
+  Caveats: the demo reads the built-in test_decoding slot (the production shape
+  is pgoutput, wal2json, or Debezium in front of the same upsert/delete path);
+  no latency, throughput, or cost numbers exist — "within seconds" is
+  qualitative; embeddings are external (EmbeddingGemma via Ollama — XERJ stores
+  and searches vectors, it does not embed them here); fusion is rrf or linear
+  only, fusion:"learned" does not exist.
+
+All three case studies are collected at https://xerj.org/case-studies.html —
+one measured on real code (WordPress), two functional proofs on synthetic
+corpora (semantic analytics, Postgres CDC); the named parties are not customers.
 
 Also validated end-to-end: semantic search & RAG, passage retrieval, vector search
 (kNN), vector quantization (SQ8), hybrid search, log analytics, anomaly detection,
@@ -546,4 +571,6 @@ POST /_memory/agent-42/_recall  { "query": "what did they ask about security", "
   Autoindex evaluation .... https://github.com/xerj-org/xerj/tree/main/demo/usecases/autoindex
   Security-audit study .... https://github.com/xerj-org/xerj/tree/main/docs/case-studies/wordpress-security-audit
   Semantic-analytics ...... https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics
+  Postgres CDC study ...... https://github.com/xerj-org/xerj/tree/main/docs/case-studies/daily-dev-postgres-cdc
+  Case-studies hub (web) .. https://xerj.org/case-studies.html
   Front door (short) ...... https://xerj.org/llms.txt
