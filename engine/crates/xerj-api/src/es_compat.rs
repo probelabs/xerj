@@ -15482,6 +15482,109 @@ mod passage_scroll_tests {
             );
         }
     }
+
+    async fn assert_ambiguous_passage_query_is_actionable_400(app: &axum::Router, body: Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/passage-composition/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "ambiguous passage ownership must be a caller-fixable 400, not a 500"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], 400, "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("one unambiguous winning passage"),
+            "error must explain why provenance is ambiguous: {body}"
+        );
+        assert!(
+            reason.contains("request `_passage` only with a single semantic/kNN clause")
+                && reason.contains("omit `_passage` for fusion"),
+            "error must tell the caller how to fix the request: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_multi_knn_passage_requests_are_http_400_in_both_orders() {
+        let state = test_state();
+        state
+            .engine
+            .create_index("passage-composition", Schema::empty())
+            .unwrap();
+        let app = crate::router::build_es_compat_router(state);
+        let knn_a = json!({
+            "field": "embedding_a",
+            "query_vector": [1.0, 0.0],
+            "k": 10
+        });
+        let knn_b = json!({
+            "field": "embedding_b",
+            "query_vector": [0.0, 1.0],
+            "k": 10
+        });
+
+        for knn in [
+            json!([knn_a.clone(), knn_b.clone()]),
+            json!([knn_b.clone(), knn_a.clone()]),
+        ] {
+            assert_ambiguous_passage_query_is_actionable_400(
+                &app,
+                json!({"fields": ["_passage"], "knn": knn}),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_hybrid_passage_requests_are_http_400_in_both_orders() {
+        let state = test_state();
+        state
+            .engine
+            .create_index("passage-composition", Schema::empty())
+            .unwrap();
+        let app = crate::router::build_es_compat_router(state);
+        let semantic = json!({
+            "query": {
+                "semantic": {
+                    "field": "content",
+                    "query": "quarterly evidence",
+                    "k": 10
+                }
+            }
+        });
+        let lexical = json!({"query": {"match_all": {}}});
+
+        for queries in [
+            json!([semantic.clone(), lexical.clone()]),
+            json!([lexical.clone(), semantic.clone()]),
+        ] {
+            assert_ambiguous_passage_query_is_actionable_400(
+                &app,
+                json!({
+                    "fields": ["_passage"],
+                    "query": {
+                        "hybrid": {
+                            "queries": queries,
+                            "fusion": "rrf"
+                        }
+                    }
+                }),
+            )
+            .await;
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
