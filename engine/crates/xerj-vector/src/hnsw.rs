@@ -146,7 +146,7 @@ impl HnswParams {
 /// Slot-indexed node storage. A `slot` is a dense `u32` handle assigned in
 /// insertion order; all hot-path state is `slot`-addressed so beam search
 /// runs on contiguous arrays with no per-node locks or hashing.
-struct Inner {
+struct SlabGraphStorage {
     dim: usize,
     metric: DistanceMetric,
     /// slot → external node id.
@@ -170,7 +170,149 @@ struct Inner {
     entry_layer: usize,
 }
 
-impl Inner {
+/// Read-only, slot-stable graph storage consumed by HNSW traversal and
+/// persistence.
+///
+/// Algorithms are generic over this private trait, so the current contiguous
+/// slab remains statically dispatched and fully inlineable. This is
+/// deliberately not a `dyn` facade: a future immutable backend can implement
+/// the same reads without adding a virtual call to every neighbor expansion.
+trait GraphStorageRead {
+    type TombstoneIds<'a>: Iterator<Item = u64>
+    where
+        Self: 'a;
+
+    fn dimension(&self) -> usize;
+    fn metric(&self) -> DistanceMetric;
+    fn node_count(&self) -> usize;
+    fn external_id(&self, slot: u32) -> u64;
+    fn current_slot(&self, id: u64) -> Option<u32>;
+    fn vector(&self, slot: u32) -> &[f32];
+    fn inverse_norm(&self, slot: u32) -> f32;
+    fn layer_count(&self, slot: u32) -> usize;
+    fn neighbors(&self, slot: u32, layer: usize) -> &[u32];
+    fn prefetch_vector(&self, slot: u32);
+    fn tombstoned(&self, slot: u32) -> bool;
+    fn contains_tombstone_id(&self, id: u64) -> bool;
+    fn tombstone_count(&self) -> usize;
+    fn tombstone_ids(&self) -> Self::TombstoneIds<'_>;
+    fn entry_slot(&self) -> Option<u32>;
+    fn entry_layer(&self) -> usize;
+}
+
+/// Borrowed view over the unchanged flat-slab representation.
+#[derive(Clone, Copy)]
+struct SlabGraphRead<'a> {
+    slab: &'a SlabGraphStorage,
+}
+
+impl GraphStorageRead for SlabGraphRead<'_> {
+    type TombstoneIds<'a>
+        = std::iter::Copied<std::collections::hash_set::Iter<'a, u64>>
+    where
+        Self: 'a;
+
+    #[inline(always)]
+    fn dimension(&self) -> usize {
+        self.slab.dim
+    }
+
+    #[inline(always)]
+    fn metric(&self) -> DistanceMetric {
+        self.slab.metric
+    }
+
+    #[inline(always)]
+    fn node_count(&self) -> usize {
+        self.slab.ids.len()
+    }
+
+    #[inline(always)]
+    fn external_id(&self, slot: u32) -> u64 {
+        self.slab.ids[slot as usize]
+    }
+
+    #[inline(always)]
+    fn current_slot(&self, id: u64) -> Option<u32> {
+        self.slab.slot_of.get(&id).copied()
+    }
+
+    #[inline(always)]
+    fn vector(&self, slot: u32) -> &[f32] {
+        let start = slot as usize * self.slab.dim;
+        &self.slab.vectors[start..start + self.slab.dim]
+    }
+
+    #[inline(always)]
+    fn inverse_norm(&self, slot: u32) -> f32 {
+        self.slab.inv_norms[slot as usize]
+    }
+
+    #[inline(always)]
+    fn layer_count(&self, slot: u32) -> usize {
+        self.slab.neighbors[slot as usize].len()
+    }
+
+    #[inline(always)]
+    fn neighbors(&self, slot: u32, layer: usize) -> &[u32] {
+        &self.slab.neighbors[slot as usize][layer]
+    }
+
+    #[inline(always)]
+    fn prefetch_vector(&self, slot: u32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // Preserve the slab hot path exactly: neighbor lists contain
+            // allocated slots, so this direct address calculation is valid.
+            let base = self
+                .slab
+                .vectors
+                .as_ptr()
+                .add(slot as usize * self.slab.dim) as *const i8;
+            _mm_prefetch(base, _MM_HINT_T0);
+            if self.slab.dim > 16 {
+                _mm_prefetch(base.add(64), _MM_HINT_T0);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = slot;
+        }
+    }
+
+    #[inline(always)]
+    fn tombstoned(&self, slot: u32) -> bool {
+        self.slab.tomb[slot as usize]
+    }
+
+    #[inline(always)]
+    fn contains_tombstone_id(&self, id: u64) -> bool {
+        self.slab.tomb_ids.contains(&id)
+    }
+
+    #[inline(always)]
+    fn tombstone_count(&self) -> usize {
+        self.slab.tomb_ids.len()
+    }
+
+    #[inline]
+    fn tombstone_ids(&self) -> Self::TombstoneIds<'_> {
+        self.slab.tomb_ids.iter().copied()
+    }
+
+    #[inline(always)]
+    fn entry_slot(&self) -> Option<u32> {
+        self.slab.entry_slot
+    }
+
+    #[inline(always)]
+    fn entry_layer(&self) -> usize {
+        self.slab.entry_layer
+    }
+}
+
+impl SlabGraphStorage {
     fn new(dim: usize, metric: DistanceMetric) -> Self {
         Self {
             dim,
@@ -187,106 +329,9 @@ impl Inner {
         }
     }
 
-    #[inline]
-    fn len(&self) -> usize {
-        self.ids.len()
-    }
-
-    #[inline]
-    fn is_live_slot(&self, slot: u32) -> bool {
-        self.ids
-            .get(slot as usize)
-            .is_some_and(|id| self.slot_of.get(id) == Some(&slot))
-    }
-
-    #[inline]
-    fn slot_layer(&self, slot: u32) -> usize {
-        self.neighbors[slot as usize].len().saturating_sub(1)
-    }
-
-    fn highest_live_entry(&self) -> Option<(u32, usize)> {
-        let mut best = self
-            .entry_slot
-            .filter(|slot| self.is_live_slot(*slot))
-            .map(|slot| (slot, self.slot_layer(slot)));
-        for slot in 0..self.len() as u32 {
-            if !self.is_live_slot(slot) {
-                continue;
-            }
-            let layer = self.slot_layer(slot);
-            if best.is_none_or(|(_, best_layer)| layer > best_layer) {
-                best = Some((slot, layer));
-            }
-        }
-        best
-    }
-
-    #[inline]
-    fn vec_of(&self, slot: u32) -> &[f32] {
-        let s = slot as usize * self.dim;
-        &self.vectors[s..s + self.dim]
-    }
-
-    /// The `1/‖q‖` scale a query needs for the cosine fast path
-    /// (1.0 for other metrics, 0.0 for a zero query).
-    #[inline]
-    fn query_inv(&self, q: &[f32]) -> f32 {
-        if self.metric == DistanceMetric::Cosine {
-            let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if n > 0.0 {
-                1.0 / n
-            } else {
-                0.0
-            }
-        } else {
-            1.0
-        }
-    }
-
-    /// Distance from an (external) query vector to a slot.
-    ///
-    /// Cosine uses cached per-slot inverse norms so the per-pair work is a
-    /// single dot product: `1 - dot(q,v)·(1/‖q‖)·(1/‖v‖)`. This matches
-    /// `compute_distance`'s `1 - cos` up to fp rounding — acceptable
-    /// because graph distances only decide beam ORDER; callers rescore
-    /// exact similarities downstream.
-    #[inline]
-    fn slot_dist(&self, q: &[f32], q_inv: f32, slot: u32) -> f32 {
-        let v = self.vec_of(slot);
-        match self.metric {
-            DistanceMetric::Cosine => {
-                1.0 - dot_unrolled(q, v) * q_inv * self.inv_norms[slot as usize]
-            }
-            _ => compute_distance(self.metric, q, v),
-        }
-    }
-
-    /// Hint the CPU to start pulling `slot`'s vector into cache. The
-    /// vector slab for a 50k × 128-d graph is ~25 MB (larger than L3), so
-    /// beam search reads are DRAM-latency-bound without this; prefetching
-    /// the next neighbor's lines while the current distance computes hides
-    /// most of that latency.
-    ///
-    /// Safety: `_mm_prefetch` is architecturally a hint — it cannot fault,
-    /// and the pointer is formed from an in-bounds slot (neighbor lists
-    /// only hold allocated slots). No-op on non-x86_64.
     #[inline(always)]
-    fn prefetch_slot(&self, slot: u32) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let base = self.vectors.as_ptr().add(slot as usize * self.dim) as *const i8;
-            // First two cache lines; the hardware streamer follows the
-            // sequential reads for the rest of the vector.
-            _mm_prefetch(base, _MM_HINT_T0);
-            if self.dim > 16 {
-                _mm_prefetch(base.add(64), _MM_HINT_T0);
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = slot;
-        }
+    fn read_view(&self) -> SlabGraphRead<'_> {
+        SlabGraphRead { slab: self }
     }
 
     /// Append a node to the slab. Returns its slot.
@@ -314,155 +359,303 @@ impl Inner {
         self.tomb.push(self.tomb_ids.contains(&id));
         slot
     }
+}
 
-    /// Greedy hill-climb to the locally-closest node at `layer`.
-    fn greedy_layer(&self, q: &[f32], q_inv: f32, start: u32, layer: usize) -> (u32, f32) {
-        let mut best = start;
-        let mut best_dist = self.slot_dist(q, q_inv, start);
-        loop {
-            let mut improved = false;
-            let nbrs = &self.neighbors[best as usize];
-            if layer >= nbrs.len() {
-                break;
-            }
-            for &nb in &nbrs[layer] {
-                let d = self.slot_dist(q, q_inv, nb);
-                if d < best_dist {
-                    best_dist = d;
-                    best = nb;
-                    improved = true;
-                }
-            }
-            if !improved {
-                break;
+#[inline(always)]
+fn query_inverse(graph: &impl GraphStorageRead, query: &[f32]) -> f32 {
+    if graph.metric() == DistanceMetric::Cosine {
+        let norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            1.0 / norm
+        } else {
+            0.0
+        }
+    } else {
+        1.0
+    }
+}
+
+#[inline(always)]
+fn slot_distance(
+    graph: &impl GraphStorageRead,
+    query: &[f32],
+    query_inverse_norm: f32,
+    slot: u32,
+) -> f32 {
+    let vector = graph.vector(slot);
+    match graph.metric() {
+        DistanceMetric::Cosine => {
+            1.0 - dot_unrolled(query, vector) * query_inverse_norm * graph.inverse_norm(slot)
+        }
+        metric => compute_distance(metric, query, vector),
+    }
+}
+
+fn greedy_layer(
+    graph: &impl GraphStorageRead,
+    query: &[f32],
+    query_inverse_norm: f32,
+    start: u32,
+    layer: usize,
+) -> (u32, f32) {
+    let mut best = start;
+    let mut best_distance = slot_distance(graph, query, query_inverse_norm, start);
+    loop {
+        let mut improved = false;
+        if layer >= graph.layer_count(best) {
+            break;
+        }
+        for &neighbor in graph.neighbors(best, layer) {
+            let distance = slot_distance(graph, query, query_inverse_norm, neighbor);
+            if distance < best_distance {
+                best_distance = distance;
+                best = neighbor;
+                improved = true;
             }
         }
-        (best, best_dist)
+        if !improved {
+            break;
+        }
+    }
+    (best, best_distance)
+}
+
+fn beam<G, A>(
+    graph: &G,
+    query: &[f32],
+    query_inverse_norm: f32,
+    entry: u32,
+    ef: usize,
+    layer: usize,
+    admit: &A,
+) -> Vec<(f32, u32)>
+where
+    G: GraphStorageRead,
+    A: Fn(u32) -> bool + ?Sized,
+{
+    let node_count = graph.node_count();
+    if entry as usize >= node_count {
+        return vec![];
+    }
+    let mut visited = vec![0u64; node_count.div_ceil(64)];
+    #[inline]
+    fn test_and_set(bits: &mut [u64], slot: u32) -> bool {
+        let (word, bit) = ((slot / 64) as usize, slot % 64);
+        let seen = bits[word] & (1 << bit) != 0;
+        bits[word] |= 1 << bit;
+        seen
     }
 
-    /// Beam search at `layer`, returning up to `ef` candidates sorted by
-    /// distance ascending. `admit` gates entry into the RESULT set only;
-    /// non-admitted nodes are still traversed (excluding them from
-    /// traversal would disconnect their neighbours and collapse recall).
-    fn beam(
-        &self,
-        q: &[f32],
-        q_inv: f32,
-        entry: u32,
-        ef: usize,
-        layer: usize,
-        admit: &dyn Fn(u32) -> bool,
-    ) -> Vec<(f32, u32)> {
-        let n = self.len();
-        if entry as usize >= n {
-            return vec![];
-        }
-        // Bitmap visited set: ~6 KB for a 50k graph, allocation-cheap and
-        // O(1) test-and-set (the old per-search HashSet<u64> hashed every
-        // neighbor expansion).
-        let mut visited = vec![0u64; n.div_ceil(64)];
-        #[inline]
-        fn test_and_set(bits: &mut [u64], i: u32) -> bool {
-            let (w, b) = ((i / 64) as usize, i % 64);
-            let seen = bits[w] & (1 << b) != 0;
-            bits[w] |= 1 << b;
-            seen
-        }
+    let entry_distance = slot_distance(graph, query, query_inverse_norm, entry);
+    let mut candidates: BinaryHeap<Reverse<(ordered_float::OrderedFloat, u32)>> =
+        BinaryHeap::with_capacity(ef * 4);
+    let mut results: BinaryHeap<(ordered_float::OrderedFloat, u32)> =
+        BinaryHeap::with_capacity(ef + 1);
 
-        let entry_dist = self.slot_dist(q, q_inv, entry);
-        // Min-heap of (dist, slot) candidates to explore.
-        let mut candidates: BinaryHeap<Reverse<(ordered_float::OrderedFloat, u32)>> =
-            BinaryHeap::with_capacity(ef * 4);
-        // Max-heap of (dist, slot) for the result set W.
-        let mut w: BinaryHeap<(ordered_float::OrderedFloat, u32)> =
-            BinaryHeap::with_capacity(ef + 1);
+    candidates.push(Reverse((
+        ordered_float::OrderedFloat(entry_distance),
+        entry,
+    )));
+    if admit(entry) {
+        results.push((ordered_float::OrderedFloat(entry_distance), entry));
+    }
+    test_and_set(&mut visited, entry);
 
-        candidates.push(Reverse((ordered_float::OrderedFloat(entry_dist), entry)));
-        if admit(entry) {
-            w.push((ordered_float::OrderedFloat(entry_dist), entry));
-        }
-        test_and_set(&mut visited, entry);
-
-        while let Some(Reverse((dist_c, c))) = candidates.pop() {
-            // Pruning: if the closest unexplored candidate is farther than
-            // the farthest kept result and W is full, stop.
-            if let Some(&(farthest, _)) = w.peek() {
-                if dist_c > farthest && w.len() >= ef {
-                    break;
-                }
+    while let Some(Reverse((candidate_distance, candidate))) = candidates.pop() {
+        if let Some(&(farthest, _)) = results.peek() {
+            if candidate_distance > farthest && results.len() >= ef {
+                break;
             }
-            let nbrs = &self.neighbors[c as usize];
-            if layer >= nbrs.len() {
+        }
+        if layer >= graph.layer_count(candidate) {
+            continue;
+        }
+        let neighbors = graph.neighbors(candidate, layer);
+        for &neighbor in neighbors.iter().take(2) {
+            graph.prefetch_vector(neighbor);
+        }
+        for (index, &neighbor) in neighbors.iter().enumerate() {
+            if index + 2 < neighbors.len() {
+                graph.prefetch_vector(neighbors[index + 2]);
+            }
+            if test_and_set(&mut visited, neighbor) {
                 continue;
             }
-            let list = &nbrs[layer];
-            // Start pulling the first vectors while the loop spins up.
-            for &nb in list.iter().take(2) {
-                self.prefetch_slot(nb);
-            }
-            for (i, &nb) in list.iter().enumerate() {
-                if i + 2 < list.len() {
-                    self.prefetch_slot(list[i + 2]);
-                }
-                if test_and_set(&mut visited, nb) {
-                    continue;
-                }
-                let d = self.slot_dist(q, q_inv, nb);
-                let farthest_w = w.peek().map(|&(f, _)| f.0).unwrap_or(f32::MAX);
-                if d < farthest_w || w.len() < ef {
-                    candidates.push(Reverse((ordered_float::OrderedFloat(d), nb)));
-                    if admit(nb) {
-                        w.push((ordered_float::OrderedFloat(d), nb));
-                        if w.len() > ef {
-                            w.pop();
-                        }
+            let distance = slot_distance(graph, query, query_inverse_norm, neighbor);
+            let farthest = results
+                .peek()
+                .map(|&(distance, _)| distance.0)
+                .unwrap_or(f32::MAX);
+            if distance < farthest || results.len() < ef {
+                candidates.push(Reverse((ordered_float::OrderedFloat(distance), neighbor)));
+                if admit(neighbor) {
+                    results.push((ordered_float::OrderedFloat(distance), neighbor));
+                    if results.len() > ef {
+                        results.pop();
                     }
                 }
             }
         }
-
-        let mut results: Vec<(f32, u32)> = w.into_iter().map(|(d, s)| (d.0, s)).collect();
-        results.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        results
     }
 
-    /// Neighbor selection — Malkov & Yashunin Algorithm 4 (the "heuristic"
-    /// variant used by hnswlib and Lucene): walk candidates in ascending
-    /// distance-to-base order and keep a candidate only if it is closer to
-    /// the base than to every already-kept neighbor. Enforces direction
-    /// diversity in each node's link list; plain closest-M packed all links
-    /// into one tight cluster (recall@10 0.565 @ ef=100 on 50k random
-    /// 128-d where the heuristic-built graph reaches ~0.95+).
-    fn select_diverse(&self, cands: &[(f32, u32)], m: usize) -> Vec<(f32, u32)> {
-        let mut sorted = cands.to_vec();
-        sorted.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let mut kept: Vec<(f32, u32)> = Vec::with_capacity(m);
-        for &(d_c, c) in &sorted {
-            if kept.len() >= m {
-                break;
-            }
-            let cv = self.vec_of(c);
-            let ci = self.inv_norms[c as usize];
-            // Diverse iff no already-kept neighbor is closer to the
-            // candidate than the base is.
-            let diverse = kept.iter().all(|&(_, r)| self.slot_dist(cv, ci, r) >= d_c);
-            if diverse {
-                kept.push((d_c, c));
+    let mut ordered: Vec<(f32, u32)> = results
+        .into_iter()
+        .map(|(distance, slot)| (distance.0, slot))
+        .collect();
+    ordered.sort_unstable_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
+    ordered
+}
+
+fn select_diverse(
+    graph: &impl GraphStorageRead,
+    candidates: &[(f32, u32)],
+    max_neighbors: usize,
+) -> Vec<(f32, u32)> {
+    let mut sorted = candidates.to_vec();
+    sorted.sort_unstable_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
+    let mut kept = Vec::with_capacity(max_neighbors);
+    for &(candidate_distance, candidate) in &sorted {
+        if kept.len() >= max_neighbors {
+            break;
+        }
+        let vector = graph.vector(candidate);
+        let inverse_norm = graph.inverse_norm(candidate);
+        let diverse = kept.iter().all(|&(_, retained)| {
+            slot_distance(graph, vector, inverse_norm, retained) >= candidate_distance
+        });
+        if diverse {
+            kept.push((candidate_distance, candidate));
+        }
+    }
+    kept
+}
+
+fn backlink_distances(graph: &impl GraphStorageRead, base: u32, layer: usize) -> Vec<(f32, u32)> {
+    let vector = graph.vector(base);
+    let inverse_norm = graph.inverse_norm(base);
+    graph
+        .neighbors(base, layer)
+        .iter()
+        .map(|&neighbor| {
+            (
+                slot_distance(graph, vector, inverse_norm, neighbor),
+                neighbor,
+            )
+        })
+        .collect()
+}
+
+/// True when `slot` is the current slot for its external ID. A reused
+/// external ID orphans its old slot: the orphan stays in the slab as
+/// traversal-only topology and must never surface as a hit or be
+/// persisted as graph metadata.
+#[inline]
+fn is_live_slot(graph: &impl GraphStorageRead, slot: u32) -> bool {
+    graph.current_slot(graph.external_id(slot)) == Some(slot)
+}
+
+/// The live slot with the highest layer, preferring the stored entry
+/// point when it is still live. This is the entry the graph should
+/// advertise: after an external-ID reuse the stored `entry_slot` /
+/// `entry_layer` pair can describe an orphan slot (or pair the current
+/// identity with the orphan's layer), which persisted as a corrupt
+/// header and resurfaced stale vectors.
+fn highest_live_entry(graph: &impl GraphStorageRead) -> Option<(u32, usize)> {
+    let slot_layer = |slot: u32| graph.layer_count(slot).saturating_sub(1);
+    let mut best = graph
+        .entry_slot()
+        .filter(|&slot| is_live_slot(graph, slot))
+        .map(|slot| (slot, slot_layer(slot)));
+    for slot in 0..graph.node_count() as u32 {
+        if !is_live_slot(graph, slot) {
+            continue;
+        }
+        let layer = slot_layer(slot);
+        if best.is_none_or(|(_, best_layer)| layer > best_layer) {
+            best = Some((slot, layer));
+        }
+    }
+    best
+}
+
+fn encode_graph_bytes(
+    params: &HnswParams,
+    graph: &impl GraphStorageRead,
+) -> Result<(Vec<u8>, usize)> {
+    let mut buffer = Vec::with_capacity(1024 * 1024);
+    buffer.write_all(HNSW_MAGIC).map_err(io_to_xerj)?;
+    buffer
+        .write_u32::<LittleEndian>(HNSW_FORMAT_VERSION)
+        .map_err(io_to_xerj)?;
+    buffer
+        .write_u32::<LittleEndian>(params.m as u32)
+        .map_err(io_to_xerj)?;
+    buffer
+        .write_u32::<LittleEndian>(params.ef_construction as u32)
+        .map_err(io_to_xerj)?;
+    buffer
+        .write_u8(metric_to_u8(params.metric))
+        .map_err(io_to_xerj)?;
+    buffer
+        .write_u32::<LittleEndian>(graph.dimension() as u32)
+        .map_err(io_to_xerj)?;
+
+    // Derive the entry header from live topology rather than trusting the
+    // stored entry metadata: after an external-ID reuse the stored pair can
+    // name an orphan slot or an inflated layer, and a reload would reject
+    // or mis-descend the graph.
+    let live_entry = highest_live_entry(graph);
+    let entry_id = live_entry.map(|(slot, _)| graph.external_id(slot));
+    buffer
+        .write_u64::<LittleEndian>(entry_id.unwrap_or(u64::MAX))
+        .map_err(io_to_xerj)?;
+    buffer
+        .write_u32::<LittleEndian>(live_entry.map_or(0, |(_, layer)| layer) as u32)
+        .map_err(io_to_xerj)?;
+
+    // Live slots only (a reused external ID orphans its old slot).
+    let live: Vec<u32> = (0..graph.node_count() as u32)
+        .filter(|&slot| is_live_slot(graph, slot))
+        .collect();
+    buffer
+        .write_u32::<LittleEndian>(live.len() as u32)
+        .map_err(io_to_xerj)?;
+    for &slot in &live {
+        buffer
+            .write_u64::<LittleEndian>(graph.external_id(slot))
+            .map_err(io_to_xerj)?;
+        buffer
+            .write_u32::<LittleEndian>(graph.layer_count(slot).saturating_sub(1) as u32)
+            .map_err(io_to_xerj)?;
+        for &value in graph.vector(slot) {
+            buffer
+                .write_f32::<LittleEndian>(value)
+                .map_err(io_to_xerj)?;
+        }
+        for layer in 0..graph.layer_count(slot) {
+            let neighbors = graph.neighbors(slot, layer);
+            buffer
+                .write_u32::<LittleEndian>(neighbors.len() as u32)
+                .map_err(io_to_xerj)?;
+            for &neighbor in neighbors {
+                buffer
+                    .write_u64::<LittleEndian>(graph.external_id(neighbor))
+                    .map_err(io_to_xerj)?;
             }
         }
-        kept
     }
 
-    /// Distances from `base` to each of its current neighbors at `layer`
-    /// (used when a saturated node re-selects after gaining a back-link).
-    fn backlink_dists(&self, base: u32, layer: usize) -> Vec<(f32, u32)> {
-        let bv = self.vec_of(base);
-        let bi = self.inv_norms[base as usize];
-        self.neighbors[base as usize][layer]
-            .iter()
-            .map(|&nb| (self.slot_dist(bv, bi, nb), nb))
-            .collect()
+    buffer
+        .write_u32::<LittleEndian>(graph.tombstone_count() as u32)
+        .map_err(io_to_xerj)?;
+    for tombstone in graph.tombstone_ids() {
+        buffer
+            .write_u64::<LittleEndian>(tombstone)
+            .map_err(io_to_xerj)?;
     }
+    let crc = crc32fast::hash(&buffer);
+    buffer.write_u32::<LittleEndian>(crc).map_err(io_to_xerj)?;
+    Ok((buffer, live.len()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -478,13 +671,13 @@ impl Inner {
 /// (format v2+).
 pub struct HnswIndex {
     params: HnswParams,
-    inner: RwLock<Inner>,
+    inner: RwLock<SlabGraphStorage>,
 }
 
 impl HnswIndex {
     /// Create a new empty index.
     pub fn new(params: HnswParams) -> Self {
-        let inner = Inner::new(params.dim, params.metric);
+        let inner = SlabGraphStorage::new(params.dim, params.metric);
         Self {
             params,
             inner: RwLock::new(inner),
@@ -514,13 +707,17 @@ impl HnswIndex {
 
     /// True if `id` has been tombstoned via `mark_deleted`.
     pub fn is_deleted(&self, id: u64) -> bool {
-        self.inner.read().unwrap().tomb_ids.contains(&id)
+        self.inner
+            .read()
+            .unwrap()
+            .read_view()
+            .contains_tombstone_id(id)
     }
 
     /// Number of tombstones currently held. Operators can monitor
     /// this to decide when to schedule a compaction.
     pub fn tombstone_count(&self) -> usize {
-        self.inner.read().unwrap().tomb_ids.len()
+        self.inner.read().unwrap().read_view().tombstone_count()
     }
 
     /// True when node `id` exists and stores exactly `v` (bit-exact f32
@@ -530,8 +727,9 @@ impl HnswIndex {
     /// inserts instead of a full O(N·log N) reconstruction.
     pub fn vector_matches(&self, id: u64, v: &[f32]) -> bool {
         let g = self.inner.read().unwrap();
-        match g.slot_of.get(&id) {
-            Some(&slot) => g.vec_of(slot) == v,
+        let graph = g.read_view();
+        match graph.current_slot(id) {
+            Some(slot) => graph.vector(slot) == v,
             None => false,
         }
     }
@@ -542,7 +740,7 @@ impl HnswIndex {
 
     /// Number of indexed vectors.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().unwrap().read_view().node_count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -588,7 +786,7 @@ impl HnswIndex {
         // Query view of the new vector for the construction beams (the
         // slab owns the canonical copy after alloc).
         let q = vector.clone();
-        let q_inv = g.query_inv(&q);
+        let q_inv = query_inverse(&g.read_view(), &q);
 
         // The new slot has no in-edges yet, so allocating it before the
         // beams run cannot perturb them — and it means the back-link
@@ -612,16 +810,16 @@ impl HnswIndex {
         // Greedy descent from the top layer down to node_level+1.
         let mut curr_ep = ep_slot;
         for layer in (node_level + 1..=ep_layer).rev() {
-            curr_ep = g.greedy_layer(&q, q_inv, curr_ep, layer).0;
+            curr_ep = greedy_layer(&g.read_view(), &q, q_inv, curr_ep, layer).0;
         }
 
         // Search and connect from min(node_level, ep_layer) down to 0.
         for layer in (0..=node_level.min(ep_layer)).rev() {
             let m_layer = if layer == 0 { 2 * m } else { m };
-            let candidates = g.beam(&q, q_inv, curr_ep, ef, layer, &|_| true);
+            let candidates = beam(&g.read_view(), &q, q_inv, curr_ep, ef, layer, &|_| true);
 
             // Select up to M diverse nearest (Algorithm 4 heuristic).
-            let selected = g.select_diverse(&candidates, m_layer);
+            let selected = select_diverse(&g.read_view(), &candidates, m_layer);
 
             // Connect new node → selected.
             g.neighbors[slot as usize][layer] = selected.iter().map(|&(_, s)| s).collect();
@@ -631,8 +829,8 @@ impl HnswIndex {
             for &(_, sel) in &selected {
                 g.neighbors[sel as usize][layer].push(slot);
                 if g.neighbors[sel as usize][layer].len() > m_layer {
-                    let dists = g.backlink_dists(sel, layer);
-                    let pruned = g.select_diverse(&dists, m_layer);
+                    let dists = backlink_distances(&g.read_view(), sel, layer);
+                    let pruned = select_diverse(&g.read_view(), &dists, m_layer);
                     g.neighbors[sel as usize][layer] = pruned.iter().map(|&(_, s)| s).collect();
                 }
             }
@@ -644,7 +842,7 @@ impl HnswIndex {
 
         // Update entry point if the new node reached a higher layer.
         if reuses_entry_identity {
-            let (entry, layer) = g.highest_live_entry().unwrap_or((slot, node_level));
+            let (entry, layer) = highest_live_entry(&g.read_view()).unwrap_or((slot, node_level));
             g.entry_slot = Some(entry);
             g.entry_layer = layer;
         } else if node_level > g.entry_layer {
@@ -684,16 +882,17 @@ impl HnswIndex {
         }
 
         let g = self.inner.read().unwrap();
-        let ep_slot = match g.entry_slot {
+        let graph = g.read_view();
+        let ep_slot = match graph.entry_slot() {
             Some(s) => s,
             None => return Ok(vec![]),
         };
-        let q_inv = g.query_inv(query);
+        let q_inv = query_inverse(&graph, query);
 
         // Greedy descent from the top layer to layer 1.
         let mut curr_ep = ep_slot;
-        for layer in (1..=g.entry_layer).rev() {
-            curr_ep = g.greedy_layer(query, q_inv, curr_ep, layer).0;
+        for layer in (1..=graph.entry_layer()).rev() {
+            curr_ep = greedy_layer(&graph, query, q_inv, curr_ep, layer).0;
         }
 
         // Beam search at layer 0. Tombstoned slots are kept as *traversal*
@@ -701,14 +900,16 @@ impl HnswIndex {
         // recall collapses) but excluded from the result set. The whole
         // search runs under one read guard, so it sees a consistent
         // tombstone set even if mark_deleted runs mid-query.
-        let admit = |s: u32| g.is_live_slot(s) && !g.tomb[s as usize] && filter(g.ids[s as usize]);
-        let candidates = g.beam(query, q_inv, curr_ep, ef.max(k), 0, &admit);
+        let admit = |slot: u32| {
+            is_live_slot(&graph, slot) && !graph.tombstoned(slot) && filter(graph.external_id(slot))
+        };
+        let candidates = beam(&graph, query, q_inv, curr_ep, ef.max(k), 0, &admit);
 
         Ok(candidates
             .into_iter()
             .filter(|&(_, s)| admit(s))
             .take(k)
-            .map(|(dist, s)| (g.ids[s as usize], dist))
+            .map(|(dist, slot)| (graph.external_id(slot), dist))
             .collect())
     }
 
@@ -771,68 +972,9 @@ impl HnswIndex {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io_to_xerj)?;
         }
-        let mut buf: Vec<u8> = Vec::with_capacity(1024 * 1024);
-
-        buf.write_all(HNSW_MAGIC).map_err(io_to_xerj)?;
-        buf.write_u32::<LittleEndian>(HNSW_FORMAT_VERSION)
-            .map_err(io_to_xerj)?;
-        buf.write_u32::<LittleEndian>(self.params.m as u32)
-            .map_err(io_to_xerj)?;
-        buf.write_u32::<LittleEndian>(self.params.ef_construction as u32)
-            .map_err(io_to_xerj)?;
-        buf.write_u8(metric_to_u8(self.params.metric))
-            .map_err(io_to_xerj)?;
-        buf.write_u32::<LittleEndian>(self.params.dim as u32)
-            .map_err(io_to_xerj)?;
-
         let g = self.inner.read().unwrap();
-        let live_entry = g.highest_live_entry();
-        let ep_id = live_entry.map(|(slot, _)| g.ids[slot as usize]);
-        buf.write_u64::<LittleEndian>(ep_id.unwrap_or(u64::MAX))
-            .map_err(io_to_xerj)?;
-        buf.write_u32::<LittleEndian>(live_entry.map_or(0, |(_, layer)| layer) as u32)
-            .map_err(io_to_xerj)?;
-
-        // Live slots only (a re-used external id orphans its old slot;
-        // the map wrote each external id once and so do we).
-        let live: Vec<u32> = (0..g.len() as u32)
-            .filter(|&s| g.slot_of.get(&g.ids[s as usize]) == Some(&s))
-            .collect();
-        buf.write_u32::<LittleEndian>(live.len() as u32)
-            .map_err(io_to_xerj)?;
-        for &s in &live {
-            buf.write_u64::<LittleEndian>(g.ids[s as usize])
-                .map_err(io_to_xerj)?;
-            let nbrs = &g.neighbors[s as usize];
-            let max_layer = nbrs.len().saturating_sub(1) as u32;
-            buf.write_u32::<LittleEndian>(max_layer)
-                .map_err(io_to_xerj)?;
-            for &v in g.vec_of(s) {
-                buf.write_f32::<LittleEndian>(v).map_err(io_to_xerj)?;
-            }
-            for layer_neighbors in nbrs {
-                buf.write_u32::<LittleEndian>(layer_neighbors.len() as u32)
-                    .map_err(io_to_xerj)?;
-                for &nb in layer_neighbors {
-                    buf.write_u64::<LittleEndian>(g.ids[nb as usize])
-                        .map_err(io_to_xerj)?;
-                }
-            }
-        }
-
-        // v2 — tombstone block. Empty for indices that have never had
-        // a delete; v1 readers don't know to skip past this, so the
-        // format version was bumped (loader checks).
-        buf.write_u32::<LittleEndian>(g.tomb_ids.len() as u32)
-            .map_err(io_to_xerj)?;
-        for &t in g.tomb_ids.iter() {
-            buf.write_u64::<LittleEndian>(t).map_err(io_to_xerj)?;
-        }
-        let node_count = live.len();
+        let (buf, node_count) = encode_graph_bytes(&self.params, &g.read_view())?;
         drop(g);
-
-        let crc = crc32fast::hash(&buf);
-        buf.write_u32::<LittleEndian>(crc).map_err(io_to_xerj)?;
 
         // Atomic + durable publish (RC4 W2 item 19). The previous
         // fs::write + rename left both the file bytes and the directory
@@ -904,7 +1046,7 @@ impl HnswIndex {
         };
 
         // Pass 1: read raw nodes (neighbors keyed by external id).
-        let mut g = Inner::new(dim, metric);
+        let mut g = SlabGraphStorage::new(dim, metric);
         let mut raw_neighbors: Vec<Vec<Vec<u64>>> = Vec::with_capacity(num_nodes);
         for _ in 0..num_nodes {
             let id = cur.read_u64::<LittleEndian>().map_err(io_to_xerj)?;
@@ -983,17 +1125,18 @@ impl HnswIndex {
         ef: usize,
     ) -> Vec<(u64, f32)> {
         let g = self.inner.read().unwrap();
-        let entry_slot = match g.slot_of.get(&entry) {
-            Some(&s) => s,
+        let graph = g.read_view();
+        let entry_slot = match graph.current_slot(entry) {
+            Some(slot) => slot,
             None => return vec![],
         };
-        let q_inv = g.query_inv(query);
-        let admit = |s: u32| !g.tomb[s as usize];
-        let candidates = g.beam(query, q_inv, entry_slot, ef.max(k), 0, &admit);
+        let q_inv = query_inverse(&graph, query);
+        let admit = |slot: u32| !graph.tombstoned(slot);
+        let candidates = beam(&graph, query, q_inv, entry_slot, ef.max(k), 0, &admit);
         candidates
             .into_iter()
             .take(k)
-            .map(|(dist, s)| (g.ids[s as usize], dist))
+            .map(|(dist, slot)| (graph.external_id(slot), dist))
             .collect()
     }
 
@@ -1001,16 +1144,17 @@ impl HnswIndex {
     /// plus its distance.
     pub fn debug_descent(&self, query: &[f32]) -> Option<(u64, f32)> {
         let g = self.inner.read().unwrap();
-        let ep = g.entry_slot?;
-        let q_inv = g.query_inv(query);
+        let graph = g.read_view();
+        let ep = graph.entry_slot()?;
+        let q_inv = query_inverse(&graph, query);
         let mut curr = ep;
-        let mut curr_dist = g.slot_dist(query, q_inv, curr);
-        for layer in (1..=g.entry_layer).rev() {
-            let (s, d) = g.greedy_layer(query, q_inv, curr, layer);
+        let mut curr_dist = slot_distance(&graph, query, q_inv, curr);
+        for layer in (1..=graph.entry_layer()).rev() {
+            let (s, d) = greedy_layer(&graph, query, q_inv, curr, layer);
             curr = s;
             curr_dist = d;
         }
-        Some((g.ids[curr as usize], curr_dist))
+        Some((graph.external_id(curr), curr_dist))
     }
 
     /// Graph structure summary: (entry_point, entry_layer, level histogram,
@@ -1027,21 +1171,22 @@ impl HnswIndex {
         usize,
     ) {
         let g = self.inner.read().unwrap();
-        let ep = g.entry_slot.map(|s| g.ids[s as usize]);
+        let graph = g.read_view();
+        let ep = graph.entry_slot().map(|slot| graph.external_id(slot));
         let mut level_hist: std::collections::BTreeMap<usize, usize> = Default::default();
         let mut deg0_hist: std::collections::BTreeMap<usize, usize> = Default::default();
-        for nbrs in &g.neighbors {
-            *level_hist.entry(nbrs.len() - 1).or_default() += 1;
-            *deg0_hist.entry(nbrs[0].len()).or_default() += 1;
+        for slot in 0..graph.node_count() as u32 {
+            *level_hist.entry(graph.layer_count(slot) - 1).or_default() += 1;
+            *deg0_hist.entry(graph.neighbors(slot, 0).len()).or_default() += 1;
         }
         let mut reach = 0usize;
-        if let Some(start) = g.entry_slot {
-            let mut seen = vec![false; g.len()];
+        if let Some(start) = graph.entry_slot() {
+            let mut seen = vec![false; graph.node_count()];
             let mut stack = vec![start];
             seen[start as usize] = true;
             while let Some(c) = stack.pop() {
                 reach += 1;
-                for &nb in &g.neighbors[c as usize][0] {
+                for &nb in graph.neighbors(c, 0) {
                     if !seen[nb as usize] {
                         seen[nb as usize] = true;
                         stack.push(nb);
@@ -1051,7 +1196,7 @@ impl HnswIndex {
         }
         (
             ep,
-            g.entry_layer,
+            graph.entry_layer(),
             level_hist.into_iter().collect(),
             deg0_hist.into_iter().collect(),
             reach,
@@ -1089,6 +1234,87 @@ mod ordered_float {
 mod tests {
     use super::*;
 
+    struct FragmentedTestGraph {
+        ids: Vec<u64>,
+        vectors: Vec<Vec<f32>>,
+        inverse_norms: Vec<f32>,
+        neighbors: Vec<Vec<Vec<u32>>>,
+        tombstones: Vec<u64>,
+        entry: Option<u32>,
+    }
+
+    impl GraphStorageRead for FragmentedTestGraph {
+        type TombstoneIds<'a>
+            = std::iter::Copied<std::slice::Iter<'a, u64>>
+        where
+            Self: 'a;
+
+        fn dimension(&self) -> usize {
+            self.vectors.first().map_or(0, Vec::len)
+        }
+
+        fn metric(&self) -> DistanceMetric {
+            DistanceMetric::Cosine
+        }
+
+        fn node_count(&self) -> usize {
+            self.ids.len()
+        }
+
+        fn external_id(&self, slot: u32) -> u64 {
+            self.ids[slot as usize]
+        }
+
+        fn current_slot(&self, id: u64) -> Option<u32> {
+            self.ids
+                .iter()
+                .rposition(|candidate| *candidate == id)
+                .map(|slot| slot as u32)
+        }
+
+        fn vector(&self, slot: u32) -> &[f32] {
+            &self.vectors[slot as usize]
+        }
+
+        fn inverse_norm(&self, slot: u32) -> f32 {
+            self.inverse_norms[slot as usize]
+        }
+
+        fn layer_count(&self, slot: u32) -> usize {
+            self.neighbors[slot as usize].len()
+        }
+
+        fn neighbors(&self, slot: u32, layer: usize) -> &[u32] {
+            &self.neighbors[slot as usize][layer]
+        }
+
+        fn prefetch_vector(&self, _slot: u32) {}
+
+        fn tombstoned(&self, slot: u32) -> bool {
+            self.tombstones.contains(&self.external_id(slot))
+        }
+
+        fn contains_tombstone_id(&self, id: u64) -> bool {
+            self.tombstones.contains(&id)
+        }
+
+        fn tombstone_count(&self) -> usize {
+            self.tombstones.len()
+        }
+
+        fn tombstone_ids(&self) -> Self::TombstoneIds<'_> {
+            self.tombstones.iter().copied()
+        }
+
+        fn entry_slot(&self) -> Option<u32> {
+            self.entry
+        }
+
+        fn entry_layer(&self) -> usize {
+            0
+        }
+    }
+
     fn unit_vec(dim: usize, hot: usize) -> Vec<f32> {
         let mut v = vec![0.0f32; dim];
         v[hot] = 1.0;
@@ -1097,6 +1323,200 @@ mod tests {
 
     fn make_index(dim: usize) -> HnswIndex {
         HnswIndex::new(HnswParams::new(dim, DistanceMetric::Cosine))
+    }
+
+    fn checked_in_pre_view_v2_fixture() -> Vec<u8> {
+        let hex = include_str!("../tests/fixtures/hnsw-v2-pre-storage-view.hex").trim();
+        assert_eq!(hex.len() % 2, 0);
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |byte: u8| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    b'A'..=b'F' => byte - b'A' + 10,
+                    _ => panic!("checked-in fixture contains non-hex byte"),
+                };
+                digit(pair[0]) << 4 | digit(pair[1])
+            })
+            .collect()
+    }
+
+    fn legacy_encode_graph_bytes(params: &HnswParams, graph: &SlabGraphStorage) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(1024 * 1024);
+        buffer.write_all(HNSW_MAGIC).unwrap();
+        buffer
+            .write_u32::<LittleEndian>(HNSW_FORMAT_VERSION)
+            .unwrap();
+        buffer.write_u32::<LittleEndian>(params.m as u32).unwrap();
+        buffer
+            .write_u32::<LittleEndian>(params.ef_construction as u32)
+            .unwrap();
+        buffer.write_u8(metric_to_u8(params.metric)).unwrap();
+        buffer.write_u32::<LittleEndian>(params.dim as u32).unwrap();
+        buffer
+            .write_u64::<LittleEndian>(
+                graph
+                    .entry_slot
+                    .map(|slot| graph.ids[slot as usize])
+                    .unwrap_or(u64::MAX),
+            )
+            .unwrap();
+        buffer
+            .write_u32::<LittleEndian>(graph.entry_layer as u32)
+            .unwrap();
+        let live: Vec<u32> = (0..graph.ids.len() as u32)
+            .filter(|&slot| graph.slot_of.get(&graph.ids[slot as usize]) == Some(&slot))
+            .collect();
+        buffer.write_u32::<LittleEndian>(live.len() as u32).unwrap();
+        for &slot in &live {
+            buffer
+                .write_u64::<LittleEndian>(graph.ids[slot as usize])
+                .unwrap();
+            let layers = &graph.neighbors[slot as usize];
+            buffer
+                .write_u32::<LittleEndian>(layers.len().saturating_sub(1) as u32)
+                .unwrap();
+            let start = slot as usize * graph.dim;
+            for &value in &graph.vectors[start..start + graph.dim] {
+                buffer.write_f32::<LittleEndian>(value).unwrap();
+            }
+            for neighbors in layers {
+                buffer
+                    .write_u32::<LittleEndian>(neighbors.len() as u32)
+                    .unwrap();
+                for &neighbor in neighbors {
+                    buffer
+                        .write_u64::<LittleEndian>(graph.ids[neighbor as usize])
+                        .unwrap();
+                }
+            }
+        }
+        buffer
+            .write_u32::<LittleEndian>(graph.tomb_ids.len() as u32)
+            .unwrap();
+        for &id in &graph.tomb_ids {
+            buffer.write_u64::<LittleEndian>(id).unwrap();
+        }
+        let crc = crc32fast::hash(&buffer);
+        buffer.write_u32::<LittleEndian>(crc).unwrap();
+        buffer
+    }
+
+    fn legacy_search(
+        graph: &SlabGraphStorage,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: &dyn Fn(u64) -> bool,
+    ) -> Vec<(u64, f32)> {
+        let Some(mut entry) = graph.entry_slot else {
+            return vec![];
+        };
+        let query_inverse_norm = if graph.metric == DistanceMetric::Cosine {
+            let norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                1.0 / norm
+            } else {
+                0.0
+            }
+        } else {
+            1.0
+        };
+        let distance = |slot: u32| {
+            let start = slot as usize * graph.dim;
+            let vector = &graph.vectors[start..start + graph.dim];
+            match graph.metric {
+                DistanceMetric::Cosine => {
+                    1.0 - dot_unrolled(query, vector)
+                        * query_inverse_norm
+                        * graph.inv_norms[slot as usize]
+                }
+                metric => compute_distance(metric, query, vector),
+            }
+        };
+        for layer in (1..=graph.entry_layer).rev() {
+            let mut best_distance = distance(entry);
+            while let Some(neighbors) = graph.neighbors[entry as usize].get(layer) {
+                let mut improved = false;
+                for &neighbor in neighbors {
+                    let candidate_distance = distance(neighbor);
+                    if candidate_distance < best_distance {
+                        entry = neighbor;
+                        best_distance = candidate_distance;
+                        improved = true;
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+        }
+
+        let mut visited = vec![0u64; graph.ids.len().div_ceil(64)];
+        let test_and_set = |bits: &mut [u64], slot: u32| {
+            let (word, bit) = ((slot / 64) as usize, slot % 64);
+            let seen = bits[word] & (1 << bit) != 0;
+            bits[word] |= 1 << bit;
+            seen
+        };
+        let admit = |slot: u32| !graph.tomb[slot as usize] && filter(graph.ids[slot as usize]);
+        let width = ef.max(k);
+        let mut candidates: BinaryHeap<Reverse<(ordered_float::OrderedFloat, u32)>> =
+            BinaryHeap::with_capacity(width * 4);
+        let mut results: BinaryHeap<(ordered_float::OrderedFloat, u32)> =
+            BinaryHeap::with_capacity(width + 1);
+        candidates.push(Reverse((
+            ordered_float::OrderedFloat(distance(entry)),
+            entry,
+        )));
+        if admit(entry) {
+            results.push((ordered_float::OrderedFloat(distance(entry)), entry));
+        }
+        test_and_set(&mut visited, entry);
+        while let Some(Reverse((candidate_distance, candidate))) = candidates.pop() {
+            if let Some(&(farthest, _)) = results.peek() {
+                if candidate_distance > farthest && results.len() >= width {
+                    break;
+                }
+            }
+            let Some(neighbors) = graph.neighbors[candidate as usize].first() else {
+                continue;
+            };
+            for &neighbor in neighbors {
+                if test_and_set(&mut visited, neighbor) {
+                    continue;
+                }
+                let neighbor_distance = distance(neighbor);
+                let farthest = results
+                    .peek()
+                    .map(|&(value, _)| value.0)
+                    .unwrap_or(f32::MAX);
+                if neighbor_distance < farthest || results.len() < width {
+                    candidates.push(Reverse((
+                        ordered_float::OrderedFloat(neighbor_distance),
+                        neighbor,
+                    )));
+                    if admit(neighbor) {
+                        results.push((ordered_float::OrderedFloat(neighbor_distance), neighbor));
+                        if results.len() > width {
+                            results.pop();
+                        }
+                    }
+                }
+            }
+        }
+        let mut ordered: Vec<_> = results
+            .into_iter()
+            .map(|(value, slot)| (value.0, slot))
+            .collect();
+        ordered.sort_unstable_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
+        ordered
+            .into_iter()
+            .filter(|&(_, slot)| admit(slot))
+            .take(k)
+            .map(|(value, slot)| (graph.ids[slot as usize], value))
+            .collect()
     }
 
     #[test]
@@ -1296,6 +1716,155 @@ mod tests {
         let structure = reopened.debug_structure();
         assert_eq!(structure.0, Some(7));
         assert_eq!(structure.1, 0);
+    }
+
+    #[test]
+    fn slab_read_view_preserves_search_and_graph_bytes() {
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::L2,
+            DistanceMetric::DotProduct,
+        ] {
+            let index = HnswIndex::new(HnswParams::new(3, metric));
+            let ids = [17, (1u64 << 48) + 9, 23, 41, 99];
+            let vectors = [
+                vec![1.0, 0.0, 0.0],
+                vec![1.0, 0.0, 0.0],
+                vec![0.5, 0.5, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ];
+            for (&id, vector) in ids.iter().zip(vectors) {
+                index.insert(id, vector).unwrap();
+            }
+            index.mark_deleted(ids[4]);
+            index.mark_deleted(999_999_999_999);
+
+            for query in [[1.0, 0.0, 0.0], [0.25, 0.75, 0.0]] {
+                let expected = {
+                    let slab = index.inner.read().unwrap();
+                    legacy_search(&slab, &query, 4, 32, &|id| id != ids[3])
+                };
+                let actual = index
+                    .search_filtered(&query, 4, 32, &|id| id != ids[3])
+                    .unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "metric, tie, or filter behavior changed for {metric:?}"
+                );
+            }
+
+            let slab = index.inner.read().unwrap();
+            let view = slab.read_view();
+            assert_eq!(view.node_count(), slab.ids.len());
+            assert_eq!(view.entry_slot(), slab.entry_slot);
+            assert_eq!(view.entry_layer(), slab.entry_layer);
+            for slot in 0..view.node_count() as u32 {
+                assert_eq!(view.external_id(slot), slab.ids[slot as usize]);
+                assert_eq!(
+                    view.current_slot(view.external_id(slot)),
+                    slab.slot_of.get(&slab.ids[slot as usize]).copied()
+                );
+                let start = slot as usize * slab.dim;
+                assert_eq!(view.vector(slot), &slab.vectors[start..start + slab.dim]);
+                assert_eq!(view.inverse_norm(slot), slab.inv_norms[slot as usize]);
+                assert_eq!(view.layer_count(slot), slab.neighbors[slot as usize].len());
+                assert_eq!(view.tombstoned(slot), slab.tomb[slot as usize]);
+                for layer in 0..view.layer_count(slot) {
+                    assert_eq!(
+                        view.neighbors(slot, layer),
+                        slab.neighbors[slot as usize][layer]
+                    );
+                }
+            }
+            assert_eq!(
+                encode_graph_bytes(&index.params, &view).unwrap().0,
+                legacy_encode_graph_bytes(&index.params, &slab),
+                "writer bytes changed for {metric:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_read_boundary_accepts_fragmented_backend() {
+        let graph = FragmentedTestGraph {
+            ids: vec![17, (1u64 << 48) + 5, 91],
+            vectors: vec![vec![1.0, 0.0], vec![0.8, 0.2], vec![0.0, 1.0]],
+            inverse_norms: vec![1.0, 1.0 / 0.68f32.sqrt(), 1.0],
+            neighbors: vec![vec![vec![1]], vec![vec![0, 2]], vec![vec![1]]],
+            tombstones: vec![91],
+            entry: Some(0),
+        };
+        let query = [1.0, 0.0];
+        let inverse = query_inverse(&graph, &query);
+        let candidates = beam(
+            &graph,
+            &query,
+            inverse,
+            graph.entry_slot().unwrap(),
+            8,
+            0,
+            &|slot| !graph.tombstoned(slot),
+        );
+        let hits: Vec<_> = candidates
+            .into_iter()
+            .map(|(distance, slot)| (graph.external_id(slot), distance))
+            .collect();
+        assert_eq!(hits[0], (17, 0.0));
+        assert_eq!(hits.len(), 2);
+
+        let params = HnswParams::new(2, DistanceMetric::Cosine);
+        let (bytes, nodes) = encode_graph_bytes(&params, &graph).unwrap();
+        assert_eq!(nodes, 3);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fragmented.bin");
+        std::fs::write(&path, bytes).unwrap();
+        let loaded = HnswIndex::load_from(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.is_deleted(91));
+        assert_eq!(loaded.search(&query, 3, 8).unwrap()[0], (17, 0.0));
+    }
+
+    #[test]
+    fn checked_in_pre_view_v2_fixture_reads_and_current_writer_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture_path = directory.path().join("pre-view.bin");
+        std::fs::write(&fixture_path, checked_in_pre_view_v2_fixture()).unwrap();
+        let old = HnswIndex::load_from(&fixture_path).unwrap();
+        let large_id = (1u64 << 48) + 3;
+        assert_eq!(old.len(), 2);
+        assert!(old.vector_matches(17, &[1.0, 0.0]));
+        assert!(old.is_deleted(large_id));
+        assert!(old.is_deleted(999_999_999_999));
+        assert_eq!(old.search(&[1.0, 0.0], 2, 16).unwrap(), vec![(17, 0.0)]);
+
+        let output_path = directory.path().join("current-writer.bin");
+        old.save_to(&output_path).unwrap();
+        let reopened = HnswIndex::load_from(&output_path).unwrap();
+        assert_eq!(
+            reopened.search(&[1.0, 0.0], 2, 16).unwrap(),
+            vec![(17, 0.0)]
+        );
+        assert!(reopened.is_deleted(large_id));
+        assert!(reopened.is_deleted(999_999_999_999));
+    }
+
+    #[test]
+    fn reused_external_id_writer_omits_orphaned_slot() {
+        let index = make_index(3);
+        index.insert(17, vec![1.0, 0.0, 0.0]).unwrap();
+        index.insert(23, vec![0.0, 1.0, 0.0]).unwrap();
+        index.insert(17, vec![0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(index.len(), 3, "old slot remains in the mutable slab");
+        assert!(index.vector_matches(17, &[0.0, 0.0, 1.0]));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reused-id.bin");
+        index.save_to(&path).unwrap();
+        let reopened = HnswIndex::load_from(&path).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert!(reopened.vector_matches(17, &[0.0, 0.0, 1.0]));
+        assert!(reopened.vector_matches(23, &[0.0, 1.0, 0.0]));
     }
 
     #[test]

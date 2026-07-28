@@ -25,7 +25,10 @@ use xerj_query::ast::{
     RandomScore, RescoreQuery, ScoreFunction, ScoreMode, SearchRequest, SourceFilter,
     TrackTotalHits,
 };
-use xerj_query::executor::{Hit, SearchResult, TotalHits, TotalHitsRelation};
+use xerj_query::executor::{
+    strip_internal_passage_metadata, Hit, PassageMatch, SearchResult, TotalHits, TotalHitsRelation,
+    PASSAGE_METADATA_PREFIX, PASSAGE_RESPONSE_FIELD,
+};
 use xerj_storage::index_store::{IndexStore, IndexStoreConfig};
 use xerj_storage::segment::SectionType;
 use xerj_storage::wal::{SyncMode, WalEntry};
@@ -6097,7 +6100,7 @@ impl Index {
         // fetch consults the version map first and returns None for
         // tombstoned ids.
         let chunk_field = format!("{field}_chunks");
-        let mut scored: Vec<(String, f32, Value)> = Vec::with_capacity(doc_ids.len());
+        let mut scored: Vec<(String, f32, Value, Option<u32>)> = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
             let src = match self.get_document_uncounted(&doc_id).await {
                 Ok(Some(s)) => s,
@@ -6119,7 +6122,7 @@ impl Index {
                 return None;
             }
             let score = compute_vector_similarity(similarity, query_vec, &doc_vec);
-            scored.push((doc_id, score, src));
+            scored.push((doc_id, score, src, None));
         }
 
         // Item 8: this line is only reached when the coverage gate admitted
@@ -6134,7 +6137,7 @@ impl Index {
             candidates = scored.len(),
             "knn served via HNSW (coverage gate passed)"
         );
-        Some(knn_result_from_scored(request, scored, k, started))
+        Some(knn_result_from_scored(request, field, scored, k, started))
     }
 
     /// Brute-force exact KNN against every doc's stored source.
@@ -6332,7 +6335,8 @@ impl Index {
         };
 
         // ── Score each candidate against the query vector ─────────────
-        let mut scored: Vec<(String, f32, Value)> = Vec::with_capacity(candidates.len());
+        let mut scored: Vec<(String, f32, Value, Option<u32>)> =
+            Vec::with_capacity(candidates.len());
         if use_sq8 {
             // Cosine fields are L2-normalised before quantising so SQ8 fits
             // over bounded [-1,1] per-dim ranges (much better recall); cosine
@@ -6426,7 +6430,7 @@ impl Index {
                     };
                     store.params.decode_into(codes, &mut decoded);
                     let score = compute_vector_similarity(similarity, query_vec, &decoded);
-                    scored.push((id, score, src));
+                    scored.push((id, score, src, None));
                 }
             }
         } else {
@@ -6454,52 +6458,58 @@ impl Index {
                         continue;
                     }
                 }
-                let score = if let Some(Value::Array(chunks)) = get_field_value(&src, &chunk_field)
-                {
-                    // Best-matching passage over the stored chunk vectors.
-                    let mut best: Option<f32> = None;
-                    for (chunk_position, cv) in chunks.iter().enumerate() {
-                        if chunk_position & 31 == 0
-                            && self.exact_scan_checkpoint(chunk_position, deadline).await
-                        {
-                            timed_out = true;
-                            break;
+                let (score, passage_ordinal) =
+                    if let Some(Value::Array(chunks)) = get_field_value(&src, &chunk_field) {
+                        // Best-matching passage over the stored chunk vectors.
+                        let mut best: Option<(f32, u32)> = None;
+                        for (chunk_position, cv) in chunks.iter().enumerate() {
+                            if chunk_position & 31 == 0
+                                && self.exact_scan_checkpoint(chunk_position, deadline).await
+                            {
+                                timed_out = true;
+                                break;
+                            }
+                            let dv: Vec<f32> = match cv {
+                                Value::Array(a) => a
+                                    .iter()
+                                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                    .collect(),
+                                _ => continue,
+                            };
+                            if dv.len() != query_vec.len() {
+                                continue;
+                            }
+                            let s = compute_vector_similarity(similarity, query_vec, &dv);
+                            let Some(ordinal) = u32::try_from(chunk_position).ok() else {
+                                continue;
+                            };
+                            choose_passage_winner(&mut best, s, ordinal);
                         }
-                        let dv: Vec<f32> = match cv {
-                            Value::Array(a) => a
+                        match best {
+                            Some((score, ordinal)) => (score, Some(ordinal)),
+                            None => continue,
+                        }
+                    } else {
+                        let vec_val = match get_field_value(&src, field) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let doc_vec: Vec<f32> = match &vec_val {
+                            Value::Array(arr) => arr
                                 .iter()
                                 .filter_map(|v| v.as_f64().map(|f| f as f32))
                                 .collect(),
                             _ => continue,
                         };
-                        if dv.len() != query_vec.len() {
+                        if doc_vec.len() != query_vec.len() {
                             continue;
                         }
-                        let s = compute_vector_similarity(similarity, query_vec, &dv);
-                        best = Some(best.map_or(s, |b| b.max(s)));
-                    }
-                    match best {
-                        Some(s) => s,
-                        None => continue,
-                    }
-                } else {
-                    let vec_val = match get_field_value(&src, field) {
-                        Some(v) => v,
-                        None => continue,
+                        (
+                            compute_vector_similarity(similarity, query_vec, &doc_vec),
+                            Some(0),
+                        )
                     };
-                    let doc_vec: Vec<f32> = match &vec_val {
-                        Value::Array(arr) => arr
-                            .iter()
-                            .filter_map(|v| v.as_f64().map(|f| f as f32))
-                            .collect(),
-                        _ => continue,
-                    };
-                    if doc_vec.len() != query_vec.len() {
-                        continue;
-                    }
-                    compute_vector_similarity(similarity, query_vec, &doc_vec)
-                };
-                scored.push((id, score, src));
+                scored.push((id, score, src, passage_ordinal));
             }
         }
         if trace_phases {
@@ -6515,15 +6525,15 @@ impl Index {
         // total (live-verified 2026-07-12).
         if let Some(raw) = min_similarity {
             let cut = raw_similarity_to_score(similarity, raw);
-            scored.retain(|(_, s, _)| *s >= cut);
+            scored.retain(|(_, score, _, _)| *score >= cut);
         }
         // ES applies `boost` to the final `_score` AFTER the similarity
         // cutoff (a boosted sub-threshold doc stays excluded; a boosted
         // passing doc scores `transform(sim) * boost`).
         if let Some(b) = boost {
             if (b - 1.0).abs() > f32::EPSILON {
-                for (_, s, _) in scored.iter_mut() {
-                    *s *= b;
+                for (_, score, _, _) in scored.iter_mut() {
+                    *score *= b;
                 }
             }
         }
@@ -6531,7 +6541,7 @@ impl Index {
         // ── Rank, cap the candidate pool at k, then paginate ──────────
         // (shared with the HNSW path so hits format / total semantics
         // cannot drift between the exact and approximate executors)
-        let mut result = knn_result_from_scored(request, scored, k, started);
+        let mut result = knn_result_from_scored(request, field, scored, k, started);
         result.timed_out = timed_out;
         if timed_out {
             result.total.relation = TotalHitsRelation::Gte;
@@ -6557,7 +6567,7 @@ impl Index {
         clauses: Vec<PeeledKnn>,
     ) -> Result<SearchResult> {
         let started = std::time::Instant::now();
-        let mut merged: Vec<(String, f32, Value)> = Vec::new();
+        let mut merged: Vec<(String, f32, Value, Option<u32>)> = Vec::new();
         let mut slot_by_id: HashMap<String, usize> = HashMap::new();
         let mut k_sum: usize = 0;
         let mut any_timed_out = false;
@@ -6597,7 +6607,12 @@ impl Index {
                     Some(&i) => merged[i].1 += hit.score,
                     None => {
                         slot_by_id.insert(hit.id.clone(), merged.len());
-                        merged.push((hit.id, hit.score, hit.source));
+                        merged.push((
+                            hit.id,
+                            hit.score,
+                            hit.source,
+                            hit.passage.map(|passage| passage.ordinal),
+                        ));
                     }
                 }
             }
@@ -6605,7 +6620,11 @@ impl Index {
                 break;
             }
         }
-        let mut result = knn_result_from_scored(request, merged, k_sum, started);
+        // Multi-field KNN has no single vector field with which to resolve
+        // passage metadata. Child clauses retain ordinary ranking semantics;
+        // provenance is intentionally omitted until per-clause ownership is
+        // represented in the merged winner.
+        let mut result = knn_result_from_scored(request, "", merged, k_sum, started);
         result.timed_out = any_timed_out;
         if any_timed_out {
             result.total.relation = TotalHitsRelation::Gte;
@@ -6836,15 +6855,37 @@ impl Index {
             dims: usize,
             original_text: String,
             texts: Vec<String>,
+            offsets: Vec<(usize, usize)>,
         }
 
         let mut jobs = Vec::<EmbedJob>::new();
         let mut pre_failures: Vec<Option<String>> = (0..sources.len()).map(|_| None).collect();
+        let allowed_metadata_fields: HashSet<String> = specs
+            .iter()
+            .map(|(_, target, _)| passage_metadata_field(target))
+            .collect();
+        for (source_idx, source) in sources.iter().enumerate() {
+            let Some(object) = source.as_object() else {
+                continue;
+            };
+            if let Some(name) = object.keys().find(|name| {
+                name.starts_with(PASSAGE_METADATA_PREFIX)
+                    && !allowed_metadata_fields.contains(*name)
+            }) {
+                pre_failures[source_idx] = Some(format!(
+                    "field [{name}] uses XERJ's reserved passage-metadata prefix; \
+                     remove it or rename the user field"
+                ));
+            }
+        }
         let onnx_pinned = self
             .embedding_config
             .mode
             .eq_ignore_ascii_case("onnx-experimental");
         for (source_idx, source) in sources.iter().enumerate() {
+            if pre_failures[source_idx].is_some() {
+                continue;
+            }
             #[cfg(test)]
             if crate::bulk::semantic_lifecycle_hook(
                 self.name.as_str(),
@@ -6864,6 +6905,15 @@ impl Index {
                     .get(&format!("{target}_chunks"))
                     .map(|v| !v.is_null())
                     .unwrap_or(false);
+                let supplied_metadata = obj.contains_key(&passage_metadata_field(target));
+                if supplied_metadata {
+                    pre_failures[source_idx] = Some(format!(
+                        "field [{}] is engine-owned passage metadata; submit semantic text \
+                         without derived vectors or reserved metadata",
+                        passage_metadata_field(target)
+                    ));
+                    continue;
+                }
                 if onnx_pinned && (supplied_vector || supplied_chunks) {
                     pre_failures[source_idx] = Some(format!(
                         "field [{field}]: caller-supplied derived vectors are not accepted for \
@@ -6879,10 +6929,16 @@ impl Index {
                     continue;
                 };
                 let chunks = semantic_chunker().chunk(text, None);
-                let texts = if chunks.len() <= 1 {
-                    vec![text.to_string()]
+                let (texts, offsets) = if chunks.len() <= 1 {
+                    (vec![text.to_string()], vec![(0, text.len())])
                 } else {
-                    chunks.iter().map(|c| c.text.clone()).collect()
+                    (
+                        chunks.iter().map(|c| c.text.clone()).collect(),
+                        chunks
+                            .iter()
+                            .map(|c| (c.start_offset, c.end_offset))
+                            .collect(),
+                    )
                 };
                 jobs.push(EmbedJob {
                     source_idx,
@@ -6891,6 +6947,7 @@ impl Index {
                     dims: *dims,
                     original_text: text.to_string(),
                     texts,
+                    offsets,
                 });
             }
         }
@@ -7005,11 +7062,16 @@ impl Index {
             if failures[job.source_idx].is_some() {
                 continue;
             }
-            let chunk_vecs: Vec<Vec<f32>> = outputs[job_idx]
+            let chunk_vecs_and_offsets: Vec<(Vec<f32>, (usize, usize))> = outputs[job_idx]
                 .take()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|v| !v.is_empty())
+                .zip(job.offsets.iter().copied())
+                .filter(|(vector, _)| !vector.is_empty())
+                .collect();
+            let chunk_vecs: Vec<Vec<f32>> = chunk_vecs_and_offsets
+                .iter()
+                .map(|(vector, _)| vector.clone())
                 .collect();
             let Some(obj) = sources[job.source_idx].as_object_mut() else {
                 continue;
@@ -7026,6 +7088,24 @@ impl Index {
             };
             let arr: Vec<Value> = pooled.into_iter().map(|f| Value::from(f as f64)).collect();
             obj.insert(job.target.clone(), Value::Array(arr));
+            // Compact, durable passage provenance. Text is deliberately NOT
+            // duplicated: the response reconstructs only the winning page
+            // slice from the original semantic field using these UTF-8 byte
+            // offsets. The field name is stored once per document/target and
+            // ordinals are implicit in array order.
+            let offsets_json: Vec<Value> = chunk_vecs_and_offsets
+                .iter()
+                .map(|(_, (start, end))| {
+                    Value::Array(vec![Value::from(*start as u64), Value::from(*end as u64)])
+                })
+                .collect();
+            obj.insert(
+                passage_metadata_field(&job.target),
+                serde_json::json!({
+                    "field": job.field,
+                    "chunks": offsets_json,
+                }),
+            );
             // Per-chunk passage vectors — persisted ONLY when the document
             // actually spans more than one chunk, under `<target>_chunks` as an
             // array of vectors. Semantic search prefers these and scores by the
@@ -7426,6 +7506,7 @@ impl Index {
                 explain: None,
                 highlight: None,
                 matched_queries: Vec::new(),
+                passage: None,
             })
             .collect();
 
@@ -7701,7 +7782,10 @@ impl Index {
     pub async fn get_document(&self, id: &str) -> Result<Option<Value>> {
         let get_started = std::time::Instant::now();
         self.metric_get_count.fetch_add(1, Ordering::Relaxed);
-        let res = self.get_document_uncounted(id).await;
+        let mut res = self.get_document_uncounted(id).await;
+        if let Ok(Some(source)) = &mut res {
+            strip_internal_passage_metadata(source);
+        }
         match &res {
             Ok(Some(_)) => {
                 self.metric_get_exists_count.fetch_add(1, Ordering::Relaxed);
@@ -8641,6 +8725,16 @@ impl Index {
         // exact brute-force scan below. Filtered knn stays exact brute
         // force with a pre-filter, where `num_candidates` (the ANN fan-out)
         // has no effect.
+        if passage_requested(request)
+            && (peel_multi_knn_query(query).is_some() || peel_hybrid_query(query).is_some())
+        {
+            return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                "`fields: [\"_passage\"]` requires one semantic or kNN clause; \
+                     multi-kNN and hybrid queries combine independent score contributions, \
+                     so they do not have one unambiguous winning passage; request `_passage` \
+                     only with a single semantic/kNN clause, or omit `_passage` for fusion",
+            )));
+        }
         if let Some(peeled) = peel_knn_query(query) {
             let PeeledKnn {
                 field,
@@ -9199,6 +9293,7 @@ impl Index {
                                         explain: None,
                                         highlight: None,
                                         matched_queries: Vec::new(),
+                                        passage: None,
                                     },
                                     seq,
                                 );
@@ -9216,6 +9311,7 @@ impl Index {
                                 explain: None,
                                 highlight: None,
                                 matched_queries: Vec::new(),
+                                passage: None,
                             });
                         }
                     }
@@ -9604,6 +9700,7 @@ impl Index {
                         explain: None,
                         highlight: None,
                         matched_queries: Vec::new(),
+                        passage: None,
                     });
                 }
                 // Beyond-cap remainder still counts toward hits.total
@@ -9706,6 +9803,7 @@ impl Index {
                                 explain: None,
                                 highlight: None,
                                 matched_queries: Vec::new(),
+                                passage: None,
                             });
                         } else {
                             total_count += 1;
@@ -10497,6 +10595,7 @@ impl Index {
                                                 explain: None,
                                                 highlight: None,
                                                 matched_queries: Vec::new(),
+                                                passage: None,
                                             };
                                             if let Some(topk) = sort_topk.as_mut() {
                                                 let seq =
@@ -12587,6 +12686,9 @@ impl Index {
                     continue;
                 };
                 for (key, val) in obj {
+                    if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                        continue;
+                    }
                     if !schema.schema.has_field(key) && !out.iter().any(|(k, _)| k == key) {
                         let ft = infer_field_type(val, date_detection);
                         out.push((key.clone(), FieldConfig::new(key.clone(), ft)));
@@ -12636,7 +12738,9 @@ impl Index {
             }
             let date_detection = self.date_detection_enabled();
             obj.iter()
-                .filter(|(key, _)| !schema.schema.has_field(key))
+                .filter(|(key, _)| {
+                    !key.starts_with(PASSAGE_METADATA_PREFIX) && !schema.schema.has_field(key)
+                })
                 .map(|(key, val)| {
                     let ft = infer_field_type(val, date_detection);
                     (key.clone(), FieldConfig::new(key.clone(), ft))
@@ -14187,6 +14291,7 @@ impl Index {
                         explain: None,
                         highlight: None,
                         matched_queries: Vec::new(),
+                        passage: None,
                     });
                 }
                 Cand::Seg(si, row) => {
@@ -14215,6 +14320,7 @@ impl Index {
                         explain: None,
                         highlight: None,
                         matched_queries: Vec::new(),
+                        passage: None,
                     });
                 }
             }
@@ -15661,6 +15767,7 @@ impl Index {
                 explain: None,
                 highlight: None,
                 matched_queries: Vec::new(),
+                passage: None,
             });
         }
         Some((hits, total, from_applied))
@@ -16875,6 +16982,7 @@ impl Index {
                     explain: None,
                     highlight: None,
                     matched_queries: Vec::new(),
+                    passage: None,
                 },
                 seq,
             );
@@ -17005,6 +17113,7 @@ impl Index {
                 explain: None,
                 highlight: None,
                 matched_queries: Vec::new(),
+                passage: None,
             });
         }
     }
@@ -17512,6 +17621,7 @@ impl Index {
                         explain: None,
                         highlight: None,
                         matched_queries: Vec::new(),
+                        passage: None,
                     },
                     seq,
                 );
@@ -17556,6 +17666,7 @@ impl Index {
                 explain: None,
                 highlight: None,
                 matched_queries: Vec::new(),
+                passage: None,
             });
         }
     }
@@ -18243,6 +18354,13 @@ fn es_format_to_epoch_ms(s: &str, fmt: &str) -> Option<i64> {
 }
 
 fn apply_source_filter(hits: Vec<Hit>, filter: &SourceFilter) -> Vec<Hit> {
+    let hits: Vec<Hit> = hits
+        .into_iter()
+        .map(|mut hit| {
+            strip_internal_passage_metadata(&mut hit.source);
+            hit
+        })
+        .collect();
     match filter {
         SourceFilter::Enabled(true) => hits,
         // `_source: false`: keep the raw source so the response layer can
@@ -19820,13 +19938,74 @@ const HNSW_MIN_DOCS: u64 = 1024;
 /// ~1.1 ms. A user-supplied num_candidates above the floor is honored.
 const HNSW_EF_FLOOR: usize = 800;
 
+fn passage_metadata_field(target: &str) -> String {
+    format!("{PASSAGE_METADATA_PREFIX}{target}")
+}
+
+fn choose_passage_winner(best: &mut Option<(f32, u32)>, score: f32, ordinal: u32) {
+    // Strictly greater preserves the lowest ordinal on an exact score tie.
+    if best.is_none_or(|(current, _)| score > current) {
+        *best = Some((score, ordinal));
+    }
+}
+
+fn passage_requested(request: &SearchRequest) -> bool {
+    request
+        .fields
+        .iter()
+        .any(|field| field == PASSAGE_RESPONSE_FIELD)
+}
+
+fn passage_match_from_source(
+    source: &Value,
+    vector_field: &str,
+    ordinal: Option<u32>,
+) -> Option<PassageMatch> {
+    let metadata = source
+        .get(passage_metadata_field(vector_field))?
+        .as_object()?;
+    let field = metadata.get("field")?.as_str()?;
+    let chunks = metadata.get("chunks")?.as_array()?;
+    let ordinal = ordinal.or_else(|| (chunks.len() == 1).then_some(0))?;
+    let offsets = chunks.get(ordinal as usize)?.as_array()?;
+    if offsets.len() != 2 {
+        return None;
+    }
+    let start = offsets[0].as_u64()?;
+    let end = offsets[1].as_u64()?;
+    let text_value = get_field_value(source, field)?;
+    let text = text_value.as_str()?;
+    let start_usize = usize::try_from(start).ok()?;
+    let end_usize = usize::try_from(end).ok()?;
+    if start_usize > end_usize
+        || end_usize > text.len()
+        || !text.is_char_boundary(start_usize)
+        || !text.is_char_boundary(end_usize)
+    {
+        return None;
+    }
+    let page = get_field_value(source, "page")
+        .or_else(|| get_field_value(source, "page_number"))
+        .or_else(|| get_field_value(source, "metadata.page"))
+        .and_then(|value| value.as_u64());
+    Some(PassageMatch {
+        field: field.to_string(),
+        ordinal,
+        start_offset: start,
+        end_offset: end,
+        text: text[start_usize..end_usize].to_string(),
+        page,
+    })
+}
+
 /// Shared tail of every top-level kNN executor (brute force and HNSW):
 /// rank by score desc, cap the candidate pool at `k`, window with
 /// `from`/`size`, and shape the response. Centralised so the exact and
 /// approximate paths cannot drift on hits format or total semantics.
 fn knn_result_from_scored(
     request: &SearchRequest,
-    mut scored: Vec<(String, f32, Value)>,
+    vector_field: &str,
+    mut scored: Vec<(String, f32, Value, Option<u32>)>,
     k: usize,
     started: std::time::Instant,
 ) -> SearchResult {
@@ -19854,7 +20033,10 @@ fn knn_result_from_scored(
     // sources (not the paginated page). Every knn executor (HNSW,
     // brute-force, multi-knn) funnels through here, so all of them gain it.
     let aggs = request.aggs.as_ref().map(|aggs_def| {
-        let sources: Vec<Value> = scored.iter().map(|(_, _, s)| s.clone()).collect();
+        let sources: Vec<Value> = scored
+            .iter()
+            .map(|(_, _, source, _)| source.clone())
+            .collect();
         crate::aggs::run_aggs(aggs_def, &sources)
     });
 
@@ -19868,16 +20050,24 @@ fn knn_result_from_scored(
             .collect::<Vec<_>>()
     }
     .into_iter()
-    .map(|(id, score, source)| Hit {
-        id,
-        score,
-        source,
-        sort: Vec::new(),
-        explain: None,
-        highlight: None,
-        matched_queries: Vec::new(),
+    .map(|(id, score, mut source, ordinal)| {
+        let passage = passage_requested(request)
+            .then(|| passage_match_from_source(&source, vector_field, ordinal))
+            .flatten();
+        strip_internal_passage_metadata(&mut source);
+        Hit {
+            id,
+            score,
+            source,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage,
+        }
     })
     .collect();
+    let hits = apply_source_filter(hits, &request.source);
 
     SearchResult {
         hits,
@@ -29257,6 +29447,170 @@ mod chunk_embed_tests {
         assert!(
             max_sim > pooled_score,
             "best-passage max-sim ({max_sim}) should beat pooled ({pooled_score})"
+        );
+    }
+
+    #[test]
+    fn passage_scoring_ties_choose_lowest_ordinal() {
+        let mut best = None;
+        choose_passage_winner(&mut best, 1.0, 0);
+        choose_passage_winner(&mut best, 1.0, 1);
+        assert_eq!(best, Some((1.0, 0)));
+    }
+
+    #[test]
+    fn passage_metadata_roundtrip_uses_valid_utf8_byte_boundaries() {
+        let text = "Préface αβ. Résumé 📄 quarterly evidence. 終了";
+        let start = text.find("Résumé").unwrap();
+        let end = text.find("終了").unwrap();
+        let source = serde_json::json!({
+            "content": text,
+            "page": 42,
+            "__xerj_passage_meta__embedding": {
+                "field": "content",
+                "chunks": [[0, start], [start, end], [end, text.len()]]
+            }
+        });
+        let roundtrip: Value =
+            serde_json::from_slice(&serde_json::to_vec(&source).unwrap()).unwrap();
+        let passage = passage_match_from_source(&roundtrip, "embedding", Some(1)).unwrap();
+        assert_eq!(passage.ordinal, 1);
+        assert_eq!(passage.page, Some(42));
+        assert_eq!(
+            passage.text,
+            &text[passage.start_offset as usize..passage.end_offset as usize]
+        );
+        assert!(text.is_char_boundary(passage.start_offset as usize));
+        assert!(text.is_char_boundary(passage.end_offset as usize));
+
+        let malformed = serde_json::json!({
+            "content": text,
+            "__xerj_passage_meta__embedding": {
+                "field": "content",
+                "chunks": [[3, text.len()]]
+            }
+        });
+        assert!(
+            passage_match_from_source(&malformed, "embedding", Some(0)).is_none(),
+            "offset inside the multibyte 'P/é' sequence must be refused"
+        );
+    }
+
+    #[test]
+    fn passage_metadata_has_bounded_stored_overhead_without_text_duplication() {
+        let content = "quarterly finance evidence with stable page-local wording. ".repeat(24);
+        let plain: Vec<Value> = (0..256)
+            .map(|id| {
+                serde_json::json!({
+                    "_id": id.to_string(),
+                    "_seq_no": id,
+                    "_source": {"content": content.as_str(), "page": id % 32}
+                })
+            })
+            .collect();
+        let with_metadata: Vec<Value> = plain
+            .iter()
+            .cloned()
+            .map(|mut doc| {
+                doc["_source"]["__xerj_passage_meta__embedding"] = serde_json::json!({
+                    "field": "content",
+                    "chunks": [[0, 384], [320, 704], [640, 1024], [960, content.len()]]
+                });
+                doc
+            })
+            .collect();
+        let plain_json = serde_json::to_vec(&plain).unwrap();
+        let metadata_json = serde_json::to_vec(&with_metadata).unwrap();
+        let plain_stored = xerj_storage::stored_codec::encode_stored_v2(&plain_json);
+        let metadata_stored = xerj_storage::stored_codec::encode_stored_v2(&metadata_json);
+        let delta = metadata_stored.len().saturating_sub(plain_stored.len());
+        assert!(
+            delta < 64 * plain.len(),
+            "compact offsets added {delta} bytes ({:.2} bytes/doc)",
+            delta as f64 / plain.len() as f64
+        );
+        assert_eq!(
+            metadata_json
+                .windows(content.len())
+                .filter(|window| *window == content.as_bytes())
+                .count(),
+            plain.len(),
+            "metadata must not duplicate passage text"
+        );
+        eprintln!(
+            "controlled passage metadata stored delta: {delta} bytes / {} docs = {:.2} bytes/doc",
+            plain.len(),
+            delta as f64 / plain.len() as f64
+        );
+    }
+
+    #[test]
+    fn varied_passage_metadata_reports_raw_and_stored_overhead() {
+        let mut plain = Vec::with_capacity(256);
+        let mut with_metadata = Vec::with_capacity(256);
+        let mut authoritative_texts = Vec::with_capacity(256);
+        for id in 0..256 {
+            let content = format!(
+                "Résumé 📄 page {id}. {} 終了 {}",
+                "finance covenant narrative. ".repeat(3 + id % 29),
+                "auditor footnote. ".repeat(1 + (id * 7) % 17)
+            );
+            let offsets: Vec<Value> = {
+                let chunks = semantic_chunker().chunk(&content, None);
+                if chunks.len() <= 1 {
+                    vec![serde_json::json!([0, content.len()])]
+                } else {
+                    chunks
+                        .iter()
+                        .map(|chunk| serde_json::json!([chunk.start_offset, chunk.end_offset]))
+                        .collect()
+                }
+            };
+            let doc = serde_json::json!({
+                "_id": format!("report-{id:04}"),
+                "_seq_no": id,
+                "_source": {
+                    "content": content,
+                    "page": 1 + id % 97,
+                    "company": format!("company-{}", id % 23)
+                }
+            });
+            let mut enriched = doc.clone();
+            enriched["_source"]["__xerj_passage_meta__embedding"] = serde_json::json!({
+                "field": "content",
+                "chunks": offsets
+            });
+            authoritative_texts.push(
+                doc["_source"]["content"]
+                    .as_str()
+                    .expect("fixture content")
+                    .to_string(),
+            );
+            plain.push(doc);
+            with_metadata.push(enriched);
+        }
+        let plain_json = serde_json::to_vec(&plain).unwrap();
+        let metadata_json = serde_json::to_vec(&with_metadata).unwrap();
+        let raw_delta = metadata_json.len() - plain_json.len();
+        let plain_stored = xerj_storage::stored_codec::encode_stored_v2(&plain_json);
+        let metadata_stored = xerj_storage::stored_codec::encode_stored_v2(&metadata_json);
+        let stored_delta = metadata_stored.len().saturating_sub(plain_stored.len());
+        for text in &authoritative_texts {
+            assert_eq!(
+                metadata_json
+                    .windows(text.len())
+                    .filter(|window| *window == text.as_bytes())
+                    .count(),
+                1,
+                "metadata must not duplicate authoritative content"
+            );
+        }
+        assert!(stored_delta < raw_delta);
+        eprintln!(
+            "varied passage metadata delta: raw={raw_delta} bytes ({:.2}/doc), \
+             stored={stored_delta} bytes ({:.2}/doc)",
+            raw_delta as f64 / plain.len() as f64,
+            stored_delta as f64 / plain.len() as f64
         );
     }
 }

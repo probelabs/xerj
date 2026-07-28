@@ -2265,6 +2265,9 @@ pub(crate) fn run_pipeline_agg(agg_type: &str, params: &Value) -> Value {
 /// Extract all scalar string representations of a field value from a document.
 /// Arrays are flattened — each element becomes a separate bucket key.
 pub(crate) fn extract_field_values(doc: &Value, field: &str) -> Vec<String> {
+    if field.starts_with(xerj_query::executor::PASSAGE_METADATA_PREFIX) {
+        return Vec::new();
+    }
     let val = get_nested_field(doc, field);
     let mut out = flatten_to_strings(val);
     if out.is_empty() {
@@ -12110,6 +12113,17 @@ fn run_ip_range(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn passage_metadata_is_not_an_aggregation_field() {
+        let doc = json!({
+            "content": "visible",
+            "__xerj_passage_meta__embedding": {"field": "content", "chunks": [[0, 7]]}
+        });
+        assert_eq!(extract_field_values(&doc, "content"), vec!["visible"]);
+        assert!(extract_field_values(&doc, "__xerj_passage_meta__embedding").is_empty());
+        assert!(extract_field_values(&doc, "__xerj_passage_meta__embedding.field").is_empty());
+    }
 
     // Regression: a deeply nested scripted-metric script must not overflow the
     // recursive-descent parser (which would abort the whole server). The guard
