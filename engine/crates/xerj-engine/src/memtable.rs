@@ -57,7 +57,8 @@ mod ingest_memory_drain_tests {
             );
 
             let ledger: &'static Ledger = Box::leak(Box::new(ledger));
-            let (_entries, guard) = mem.drain_shard_accounted_for_test(shard, false, ledger);
+            let (_entries, guard, _visibility) =
+                mem.drain_shard_accounted_for_test(shard, false, ledger);
             ledger.observe(Category::MemtableActive, mem.size_bytes());
             let entered = Arc::new(Barrier::new(2));
             let release = Arc::new(Barrier::new(2));
@@ -642,7 +643,50 @@ const DEFAULT_ENGINE_MEMTABLE_SHARDS: usize = 16;
 /// instants.
 pub struct ShardedFtsMemtable {
     shards: Vec<parking_lot::RwLock<FtsMemtable>>,
+    /// Rows atomically moved out of an active shard but not yet published in
+    /// a segment. Keys include the physical shard so an impossible duplicate
+    /// `(id, seq)` has a deterministic lowest-shard winner.
+    prepublication: Arc<dashmap::DashMap<(String, u64, usize), Arc<PrepublicationSource>>>,
     shard_mask: usize,
+}
+
+struct PrepublicationSource {
+    source: Arc<Value>,
+    source_bytes: Arc<[u8]>,
+    parsed: std::sync::OnceLock<Arc<Value>>,
+}
+
+impl PrepublicationSource {
+    fn resolve(&self) -> Arc<Value> {
+        if !self.source.is_null() || self.source_bytes.is_empty() {
+            return Arc::clone(&self.source);
+        }
+        Arc::clone(self.parsed.get_or_init(|| {
+            Arc::new(serde_json::from_slice(&self.source_bytes).unwrap_or(Value::Null))
+        }))
+    }
+}
+
+/// Keeps drained rows query-visible until their segment has been published.
+///
+/// Removal is value-identity guarded so a delayed lease can never erase a
+/// replacement registration for the same physical generation.
+pub(crate) struct DrainedVisibilityLease {
+    registry: Arc<dashmap::DashMap<(String, u64, usize), Arc<PrepublicationSource>>>,
+    entries: Vec<((String, u64, usize), Arc<PrepublicationSource>)>,
+}
+
+impl Drop for DrainedVisibilityLease {
+    fn drop(&mut self) {
+        for (key, expected) in &self.entries {
+            if let dashmap::mapref::entry::Entry::Occupied(entry) = self.registry.entry(key.clone())
+            {
+                if Arc::ptr_eq(entry.get(), expected) {
+                    entry.remove();
+                }
+            }
+        }
+    }
 }
 
 impl Default for ShardedFtsMemtable {
@@ -668,6 +712,7 @@ impl ShardedFtsMemtable {
             .collect();
         Self {
             shards,
+            prepublication: Arc::new(dashmap::DashMap::new()),
             shard_mask: n - 1,
         }
     }
@@ -712,7 +757,11 @@ impl ShardedFtsMemtable {
 
     /// Total document count across all shards.
     pub fn doc_count(&self) -> usize {
-        self.shards.iter().map(|s| s.read().doc_count()).sum()
+        self.shards
+            .iter()
+            .map(|s| s.read().doc_count())
+            .sum::<usize>()
+            .saturating_add(self.prepublication.len())
     }
 
     /// Total approximate byte size across all shards.
@@ -736,6 +785,77 @@ impl ShardedFtsMemtable {
     pub fn get_doc_source_as_value(&self, doc_id: &str) -> Option<Value> {
         let s = self.shard_for_dynamic(doc_id);
         self.shards[s].read().get_doc_source_as_value(doc_id)
+    }
+
+    /// Resolve one exact memtable generation without assuming physical shard
+    /// ownership from the id.
+    ///
+    /// Turbo batches place the whole request in the shard selected by the
+    /// first id. Point reads historically routed each id independently, so a
+    /// live VersionMap entry could be present while its source was invisible
+    /// to GET and HNSW exact rescoring. Check the canonical shard first, then
+    /// the bounded set of remaining ingest shards. Only the matching source
+    /// is cloned, and `seq_no` prevents an obsolete physical row from winning
+    /// over a concurrent update or delete.
+    pub fn get_doc_source_arc_for_seq(&self, doc_id: &str, seq_no: u64) -> Option<Arc<Value>> {
+        if let Some(source) = self.get_active_doc_source_arc_for_seq(doc_id, seq_no) {
+            return Some(source);
+        }
+
+        (0..self.shards.len()).find_map(|shard| {
+            self.prepublication
+                .get(&(doc_id.to_owned(), seq_no, shard))
+                .map(|entry| entry.resolve())
+        })
+    }
+
+    fn get_active_doc_source_arc_for_seq(&self, doc_id: &str, seq_no: u64) -> Option<Arc<Value>> {
+        let routed = self.shard_for_dynamic(doc_id);
+        if let Some(source) = self.shards[routed]
+            .read()
+            .get_doc_source_arc_for_seq(doc_id, seq_no)
+        {
+            return Some(source);
+        }
+        let active = self
+            .shards
+            .iter()
+            .enumerate()
+            .filter(|(shard, _)| *shard != routed)
+            .find_map(|(_, shard)| shard.read().get_doc_source_arc_for_seq(doc_id, seq_no));
+        if active.is_some() {
+            return active;
+        }
+        None
+    }
+
+    fn prepublication_snapshot(&self) -> Vec<(String, u64, usize, Arc<PrepublicationSource>)> {
+        let mut rows: Vec<_> = self
+            .prepublication
+            .iter()
+            .map(|entry| {
+                let (id, seq_no, shard) = entry.key();
+                (id.clone(), *seq_no, *shard, Arc::clone(entry.value()))
+            })
+            .collect();
+        rows.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        let mut previous: Option<(String, u64)> = None;
+        rows.retain(|row| {
+            if previous
+                .as_ref()
+                .is_some_and(|(id, seq_no)| id == &row.0 && *seq_no == row.1)
+            {
+                false
+            } else {
+                previous = Some((row.0.clone(), row.1));
+                true
+            }
+        });
+        rows
     }
 
     pub fn get_doc_source_arc(&self, doc_id: &str) -> Option<Arc<Value>> {
@@ -839,6 +959,16 @@ impl ShardedFtsMemtable {
                 out.extend(g.doc_ids_up_to(limit - out.len()));
             }
         }
+        let drained = self.prepublication_snapshot();
+        total = total.saturating_add(drained.len() as u64);
+        if out.len() < limit {
+            out.extend(
+                drained
+                    .into_iter()
+                    .take(limit - out.len())
+                    .map(|(id, _, _, _)| id),
+            );
+        }
         (out, total)
     }
 
@@ -850,6 +980,24 @@ impl ShardedFtsMemtable {
         let mut out = Vec::new();
         for s in &self.shards {
             out.extend(s.read().all_docs_with_sources());
+        }
+        out
+    }
+
+    /// Return each buffered row with the sequence that owns it, including a
+    /// generation currently between shard drain and durable publication.
+    pub fn all_docs_with_seq_sources_arc(&self) -> Vec<(String, u64, Arc<Value>)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.read().all_docs_with_seq_sources_arc());
+        }
+        for (id, seq_no, _, source) in self.prepublication_snapshot() {
+            if self
+                .get_active_doc_source_arc_for_seq(&id, seq_no)
+                .is_none()
+            {
+                out.push((id, seq_no, source.resolve()));
+            }
         }
         out
     }
@@ -876,7 +1024,12 @@ impl ShardedFtsMemtable {
     /// `all_docs_with_sources_arc` takes), so this both shrinks the work and the
     /// lock hold that the mixed read-under-write contention is bound on.
     pub fn filtered_docs_arc(&self, preds: &[MemBoolPred]) -> Option<Vec<(String, Arc<Value>)>> {
-        if preds.is_empty() {
+        // Drained rows remain query-visible through `prepublication` until the
+        // flush atomically repoints their version-map entries.  The columnar
+        // filter structures belong to active shards only, so they cannot prove
+        // a complete result while a drained generation is awaiting publication.
+        // Returning `None` makes the caller use the complete source walk.
+        if preds.is_empty() || !self.prepublication.is_empty() {
             return None;
         }
         let mut out: Vec<(String, Arc<Value>)> = Vec::new();
@@ -886,6 +1039,25 @@ impl ShardedFtsMemtable {
                 continue;
             }
             g.filtered_docs_arc_into(preds, &mut out)?;
+        }
+        Some(out)
+    }
+
+    /// Sequence-bearing twin used by logical-version filtering.
+    pub fn filtered_docs_with_seq_arc(
+        &self,
+        preds: &[MemBoolPred],
+    ) -> Option<Vec<(String, u64, Arc<Value>)>> {
+        if preds.is_empty() || !self.prepublication.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let guard = shard.read();
+            if guard.doc_count() == 0 {
+                continue;
+            }
+            guard.filtered_docs_with_seq_arc_into(preds, &mut out)?;
         }
         Some(out)
     }
@@ -1561,29 +1733,32 @@ impl ShardedFtsMemtable {
     /// tuples in WAL-sequence order.  Raw bytes are passed through to the
     /// segment writer so it can skip re-serializing the Value.
     pub fn drain_shard(&self, shard_idx: usize) -> Vec<(u64, String, Arc<Value>, Arc<[u8]>)> {
-        self.drain_shard_inner(shard_idx, false, None).0
+        self.drain_shard_inner(shard_idx, false, None, false).0
     }
 
     /// Drain without parsing raw-bytes entries. Returns Value::Null for
     /// entries that came from insert_raw_bytes_with_seq. Use when neither
     /// FTS nor DV sidecars will be built (turbo/CLI ingest path).
     pub fn drain_shard_raw(&self, shard_idx: usize) -> Vec<(u64, String, Arc<Value>, Arc<[u8]>)> {
-        self.drain_shard_inner(shard_idx, true, None).0
+        self.drain_shard_inner(shard_idx, true, None, false).0
     }
 
-    pub fn drain_shard_accounted(
+    pub(crate) fn drain_shard_accounted(
         &self,
         shard_idx: usize,
         skip_parse: bool,
     ) -> (
         Vec<(u64, String, Arc<Value>, Arc<[u8]>)>,
         crate::ingest_memory::Retained<'static>,
+        DrainedVisibilityLease,
     ) {
         let ledger = crate::ingest_memory::active_ledger();
-        let (entries, guard) = self.drain_shard_inner(shard_idx, skip_parse, ledger);
+        let (entries, guard, visibility) =
+            self.drain_shard_inner(shard_idx, skip_parse, ledger, true);
         (
             entries,
             guard.unwrap_or_else(crate::ingest_memory::Retained::disabled),
+            visibility.expect("visible drain creates a lease"),
         )
     }
 
@@ -1596,9 +1771,15 @@ impl ShardedFtsMemtable {
     ) -> (
         Vec<(u64, String, Arc<Value>, Arc<[u8]>)>,
         crate::ingest_memory::Retained<'static>,
+        DrainedVisibilityLease,
     ) {
-        let (entries, guard) = self.drain_shard_inner(shard_idx, skip_parse, Some(ledger));
-        (entries, guard.expect("test ledger always creates guard"))
+        let (entries, guard, visibility) =
+            self.drain_shard_inner(shard_idx, skip_parse, Some(ledger), true);
+        (
+            entries,
+            guard.expect("test ledger always creates guard"),
+            visibility.expect("visible test drain creates a lease"),
+        )
     }
 
     fn drain_shard_inner<'a>(
@@ -1606,9 +1787,11 @@ impl ShardedFtsMemtable {
         shard_idx: usize,
         skip_parse: bool,
         ledger: Option<&'a crate::ingest_memory::Ledger>,
+        publish_visible: bool,
     ) -> (
         Vec<(u64, String, Arc<Value>, Arc<[u8]>)>,
         Option<crate::ingest_memory::Retained<'a>>,
+        Option<DrainedVisibilityLease>,
     ) {
         // Swap the shard's maps out under the write lock (pointer moves,
         // O(1)) and deallocate them AFTER the lock is released, on a
@@ -1620,8 +1803,28 @@ impl ShardedFtsMemtable {
         // drain stalled every in-flight bulk request.  32 flushes per
         // 1 M docs × ~95 ms = a fixed ~3 s Amdahl serial term that
         // capped 8-client ingest at ~3.1× single-client throughput.
-        let (drained, dead, drain_guard) = {
+        let (drained, dead, drain_guard, visibility) = {
             let mut g = self.shards[shard_idx].write();
+            let visibility = publish_visible.then(|| {
+                let entries = g
+                    .docs
+                    .iter()
+                    .map(|entry| {
+                        let key = (entry.doc_id.clone(), entry.seq_no, shard_idx);
+                        let source = Arc::new(PrepublicationSource {
+                            source: Arc::clone(&entry.source),
+                            source_bytes: Arc::clone(&entry.source_bytes),
+                            parsed: std::sync::OnceLock::new(),
+                        });
+                        self.prepublication.insert(key.clone(), Arc::clone(&source));
+                        (key, source)
+                    })
+                    .collect();
+                DrainedVisibilityLease {
+                    registry: Arc::clone(&self.prepublication),
+                    entries,
+                }
+            });
             let removed_bytes = g.total_bytes;
             let d: Vec<MemEntry> = std::mem::take(&mut g.docs);
             let dead_index = std::mem::take(&mut g.index);
@@ -1651,6 +1854,7 @@ impl ShardedFtsMemtable {
                     dead_index, dead_dv, dead_fl, dead_afl, dead_dii, dead_gfl, dead_gdf,
                 ),
                 drain_guard,
+                visibility,
             )
         };
         // Free the dead maps off the flush critical path too — the
@@ -1680,7 +1884,7 @@ impl ShardedFtsMemtable {
             })
             .collect();
         out.sort_by_key(|(seq, _, _, _)| *seq);
-        (out, drain_guard)
+        (out, drain_guard, visibility)
     }
 
     /// Check if a shard's first entry was inserted via the raw-bytes
@@ -2505,6 +2709,19 @@ impl FtsMemtable {
             .collect()
     }
 
+    fn all_docs_with_seq_sources_arc(&self) -> Vec<(String, u64, Arc<Value>)> {
+        self.docs
+            .iter()
+            .map(|entry| {
+                (
+                    entry.doc_id.clone(),
+                    entry.seq_no,
+                    Self::resolve_source_arc(entry),
+                )
+            })
+            .collect()
+    }
+
     /// Return the full original source JSON for a document by ID.
     /// O(1) doc lookup via `doc_id_index` (maintained by every insert /
     /// remove path), with a linear-scan fallback in case an entry is ever
@@ -2534,6 +2751,12 @@ impl FtsMemtable {
     /// Return the Arc-wrapped source for a document by ID.
     pub fn get_doc_source_arc(&self, doc_id: &str) -> Option<Arc<Value>> {
         self.entry_for(doc_id).map(Self::resolve_source_arc)
+    }
+
+    fn get_doc_source_arc_for_seq(&self, doc_id: &str, seq_no: u64) -> Option<Arc<Value>> {
+        self.entry_for(doc_id)
+            .filter(|entry| entry.seq_no == seq_no)
+            .map(Self::resolve_source_arc)
     }
 
     /// Iterate all stored documents as (doc_id, original_source) pairs.
@@ -3010,6 +3233,21 @@ impl FtsMemtable {
             }
             let e = &self.docs[idx];
             out.push((e.doc_id.clone(), Self::resolve_source_arc(e)));
+        }
+        Some(())
+    }
+
+    fn filtered_docs_with_seq_arc_into(
+        &self,
+        preds: &[MemBoolPred],
+        out: &mut Vec<(String, u64, Arc<Value>)>,
+    ) -> Option<()> {
+        let mut matched = Vec::new();
+        self.filtered_docs_arc_into(preds, &mut matched)?;
+        out.reserve(matched.len());
+        for (id, source) in matched {
+            let seq_no = self.entry_for(&id)?.seq_no;
+            out.push((id, seq_no, source));
         }
         Some(())
     }

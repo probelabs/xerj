@@ -40,6 +40,12 @@ use crate::segment_cache_estimates as cache_estimates;
 pub(crate) type Resident<T> = Arc<CacheResident<T>>;
 pub(crate) type DocValueMap = std::collections::BTreeMap<String, xerj_storage::doc_values::Column>;
 
+#[cfg(test)]
+tokio::task_local! {
+    static POINT_READ_BEFORE_RETURN_HOOK:
+        Arc<dyn Fn(&str, u64, &str) + Send + Sync>;
+}
+
 fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudget> {
     if let Some(governor) = crate::governor::global() {
         return governor.segment_hydration_budget();
@@ -2705,8 +2711,7 @@ impl Index {
                 .version_map
                 .get(&doc_id)
                 .map(|entry| !entry.deleted)
-                .unwrap_or(false)
-                || self.memtable.contains(&doc_id);
+                .unwrap_or(false);
             if exists {
                 return Err(EngineError::Common(
                     xerj_common::XerjError::version_conflict(&doc_id, 0, 1),
@@ -5761,7 +5766,7 @@ impl Index {
             // flush completing mid-pass then presents the doc in both (the
             // `seen` set dedups) instead of in neither.
             let mut seen: HashSet<String> = HashSet::new();
-            let mem_docs = self.memtable.all_docs_with_sources();
+            let mem_docs = self.live_memtable_docs();
             for (doc_id, src) in &mem_docs {
                 seen.insert(doc_id.clone());
                 if let Some(vector) = extract_numeric_vector(src, &field) {
@@ -6222,10 +6227,7 @@ impl Index {
         // ── Collect all candidate (doc_id, source) pairs ──────────────
         let mut candidates: Vec<(String, Value)> = Vec::new();
         // Memtable first (newest writes).
-        {
-            let mem = &*self.memtable;
-            candidates.extend(mem.all_docs_with_sources());
-        }
+        candidates.extend(self.live_memtable_docs());
         // Then every flushed segment's stored section.
         let snap = self.store.snapshot();
         // Track seen IDs so later-segment copies don't duplicate memtable entries.
@@ -7263,10 +7265,7 @@ impl Index {
 
         // ── Collect candidate parent docs ─────────────────────────────
         let mut candidates: Vec<(String, Value)> = Vec::new();
-        {
-            let mem = &*self.memtable;
-            candidates.extend(mem.all_docs_with_sources());
-        }
+        candidates.extend(self.live_memtable_docs());
         let snap = self.store.snapshot();
         let mut seen: HashSet<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
         'segments: for meta in snap.segments.iter() {
@@ -7717,6 +7716,26 @@ impl Index {
         res
     }
 
+    /// Resolve the currently-owned in-memory generation, including a row
+    /// atomically drained into the prepublication registry.
+    fn resolve_live_memtable_source_arc(&self, id: &str) -> Option<Arc<Value>> {
+        let version = self.store.version_map.get(id)?;
+        if version.deleted
+            || version.segment_id.as_ref() != xerj_storage::version_map::IN_MEMORY_SEGMENT_ID
+        {
+            return None;
+        }
+        let seq_no = version.seq_no;
+        drop(version);
+        let source = self.memtable.get_doc_source_arc_for_seq(id, seq_no)?;
+        self.store.version_map.get(id).and_then(|current| {
+            (!current.deleted
+                && current.seq_no == seq_no
+                && current.segment_id.as_ref() == xerj_storage::version_map::IN_MEMORY_SEGMENT_ID)
+                .then_some(source)
+        })
+    }
+
     /// Metrics-free internal fetch: `get_document` minus the get.total /
     /// exists / missing counters. Used by the HNSW kNN hydration path —
     /// counting k internal fetches per kNN query would inflate
@@ -7727,21 +7746,51 @@ impl Index {
     /// (tombstoned ids → None), then memtable, then the B2 primary-key
     /// fast path, then the legacy full-segment scan.
     async fn get_document_uncounted(&self, id: &str) -> Result<Option<Value>> {
-        // Check version map — if the document was deleted, return None.
-        if let Some(entry) = self.store.version_map.get(id) {
-            if entry.deleted {
-                return Ok(None);
+        self.get_document_uncounted_once(id, true).await
+    }
+
+    async fn get_document_uncounted_once(
+        &self,
+        id: &str,
+        allow_visibility_retry: bool,
+    ) -> Result<Option<Value>> {
+        let owns_physical = |seq_no: u64, segment_id: &str| {
+            self.store.version_map.get(id).is_some_and(|current| {
+                !current.deleted
+                    && current.seq_no == seq_no
+                    && current.segment_id.as_ref() == segment_id
+            })
+        };
+        let before_physical_return = |seq_no: u64, segment_id: &str| {
+            #[cfg(test)]
+            {
+                let _ = POINT_READ_BEFORE_RETURN_HOOK.try_with(|hook| hook(id, seq_no, segment_id));
             }
-        } else {
+            #[cfg(not(test))]
+            let _ = (seq_no, segment_id);
+        };
+        // Pin the logical generation before touching a physical source. The
+        // source lookup below rechecks this tuple before returning so a
+        // concurrent update/delete cannot expose an obsolete memtable row.
+        let Some(initial_version) = self.store.version_map.get(id) else {
             // Document not in version map at all.
             return Ok(None);
+        };
+        if initial_version.deleted {
+            return Ok(None);
         }
+        let expected_segment = Arc::clone(&initial_version.segment_id);
 
-        // Check the memtable first — documents live here until a flush.
-        {
-            let mem = &*self.memtable;
-            if mem.contains(id) {
-                return Ok(mem.get_doc_source_as_value(id));
+        // A live `__memtable__` VersionMap entry must resolve by exact
+        // sequence across every bounded turbo-ingest shard. Historical turbo
+        // batches placed all request rows in the first id's shard, while the
+        // old point lookup checked only the id-derived shard. That made valid
+        // HNSW candidates appear missing and forced a healthy graph to
+        // decline. Clone only the one requested source, then validate that it
+        // is still the live generation.
+        if expected_segment.as_ref() == xerj_storage::version_map::IN_MEMORY_SEGMENT_ID {
+            if let Some(source) = self.resolve_live_memtable_source_arc(id) {
+                return Ok(Some(source.as_ref().clone()));
             }
         }
 
@@ -7794,8 +7843,14 @@ impl Index {
                                 // serde_json (not simd_json): same root cause
                                 // as the KNN cache — see ffd49ac.
                                 if let Ok(doc) = serde_json::from_slice::<Value>(slice) {
+                                    let row_seq = doc.get("_seq_no").and_then(Value::as_u64);
                                     if doc.get("_id").and_then(Value::as_str) == Some(id) {
-                                        return Ok(doc.get("_source").cloned());
+                                        if let Some(seq) = row_seq {
+                                            before_physical_return(seq, &seg_id);
+                                            if owns_physical(seq, &seg_id) {
+                                                return Ok(doc.get("_source").cloned());
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -7825,8 +7880,14 @@ impl Index {
                     // some stored payloads from the M7 raw-bytes flush path.
                     if let Ok(docs) = serde_json::from_slice::<Vec<Value>>(&stored_bytes) {
                         for doc in docs {
+                            let row_seq = doc.get("_seq_no").and_then(Value::as_u64);
                             if doc.get("_id").and_then(Value::as_str) == Some(id) {
-                                return Ok(doc.get("_source").cloned());
+                                if let Some(seq) = row_seq {
+                                    before_physical_return(seq, &meta.id);
+                                    if owns_physical(seq, &meta.id) {
+                                        return Ok(doc.get("_source").cloned());
+                                    }
+                                }
                             }
                         }
                     }
@@ -7853,8 +7914,14 @@ impl Index {
                         {
                             if let Ok(docs) = serde_json::from_slice::<Vec<Value>>(&stored_bytes) {
                                 for doc in docs {
+                                    let row_seq = doc.get("_seq_no").and_then(Value::as_u64);
                                     if doc.get("_id").and_then(Value::as_str) == Some(id) {
-                                        return Ok(doc.get("_source").cloned());
+                                        if let Some(seq) = row_seq {
+                                            before_physical_return(seq, &seg_id);
+                                            if owns_physical(seq, &seg_id) {
+                                                return Ok(doc.get("_source").cloned());
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -7864,6 +7931,15 @@ impl Index {
             }
         }
         drop(snap);
+
+        let generation_changed = self.store.version_map.get(id).is_none_or(|current| {
+            current.deleted
+                || current.seq_no != initial_version.seq_no
+                || current.segment_id != initial_version.segment_id
+        });
+        if allow_visibility_retry && generation_changed {
+            return Box::pin(self.get_document_uncounted_once(id, false)).await;
+        }
 
         Ok(None)
     }
@@ -7944,14 +8020,9 @@ impl Index {
             .map(|entry| !entry.deleted)
             .unwrap_or(false);
 
-        // Also check the memtable (newly indexed docs may not yet be in the
-        // version map or may have been put there after the version_map check).
-        let in_memtable = {
-            let mem = &*self.memtable;
-            mem.contains(id)
-        };
-
-        let should_delete = is_live || in_memtable;
+        // VersionMap is published before every engine-memtable insert and is
+        // the sole logical liveness authority.
+        let should_delete = is_live;
 
         if !should_delete {
             // ES `result: not_found` bookkeeping: a repeat delete of a
@@ -8027,7 +8098,7 @@ impl Index {
             self.doc_count.fetch_sub(1, Ordering::Relaxed);
         }
 
-        let found = existed || in_memtable;
+        let found = existed;
         if !found {
             // Raced away between the liveness check and store.delete —
             // report as not_found (same bookkeeping as the early return).
@@ -9147,8 +9218,8 @@ impl Index {
                         // the real key, not on a deferred/Null source.
                         if !seen_ids.contains(&hit.id) {
                             if hit.source.is_null() {
-                                if let Some(src) = self.memtable.get_doc_source_as_value(&hit.id) {
-                                    hit.source = src;
+                                if let Some(src) = self.resolve_live_memtable_source_arc(&hit.id) {
+                                    hit.source = src.as_ref().clone();
                                 }
                             }
                             seen_ids.insert(hit.id.clone());
@@ -9182,7 +9253,7 @@ impl Index {
                             // field-sorted walk (match_all/range under the
                             // implicit @timestamp index sort) that was
                             // ~1 s per query against a ~1 M-doc memtable.
-                            let src_arc = self.memtable.get_doc_source_arc(&id);
+                            let src_arc = self.resolve_live_memtable_source_arc(&id);
                             let rejected = src_arc
                                 .as_deref()
                                 .is_some_and(|s| memtable_primary_key_rejects(topk, s));
@@ -9354,7 +9425,7 @@ impl Index {
                         // the heap is full (NOT the id-only snapshot,
                         // whose per-doc deep clone cost ~1 s/query at a
                         // 1 M-doc memtable).
-                        None => MemSnapshot::DocsForScan(mem.all_docs_with_sources_arc()),
+                        None => MemSnapshot::DocsForScan(self.live_memtable_docs_arc()),
                     }
                 } else {
                     let (ids, total) = mem.doc_ids_bounded(materialisation_limit);
@@ -9438,7 +9509,7 @@ impl Index {
                     } else {
                         // Brute per-doc scan — same authority the size>0
                         // path falls back to; `doc_matches_query` semantics.
-                        MemSnapshot::DocsForScan(mem.all_docs_with_sources_arc())
+                        MemSnapshot::DocsForScan(self.live_memtable_docs_arc())
                     }
                 } else if let Some((hits, total)) = (|| {
                     // Fused columnar term/range/bool: ONE position walk
@@ -9492,7 +9563,7 @@ impl Index {
                     // query (plus a second per-doc clone for `_id`
                     // injection below) was the single hottest search-side
                     // cost in the read-under-write thread dumps.
-                    let docs: Vec<(String, Arc<Value>)> = mem.all_docs_with_sources_arc();
+                    let docs: Vec<(String, Arc<Value>)> = self.live_memtable_docs_arc();
                     MemSnapshot::DocsForScan(docs)
                 }
             } else {
@@ -11618,8 +11689,7 @@ impl Index {
             // load, where several panel queries serialize on the same
             // per-shard RwLock while each does a full O(doc) clone under it.
             let mut docs: Vec<Value> = self
-                .memtable
-                .all_docs_with_sources_arc()
+                .live_memtable_docs_arc()
                 .into_iter()
                 .map(|(id, v)| {
                     let mut v = (*v).clone();
@@ -12186,6 +12256,54 @@ impl Index {
         self.store.version_map.live_count() as u64
     }
 
+    /// Capture only physical buffered rows that still own their logical id.
+    pub(crate) fn live_memtable_docs_arc(&self) -> Vec<(String, Arc<Value>)> {
+        self.filter_live_memtable_docs_arc(self.memtable.all_docs_with_seq_sources_arc())
+    }
+
+    fn filter_live_memtable_docs_arc(
+        &self,
+        rows: Vec<(String, u64, Arc<Value>)>,
+    ) -> Vec<(String, Arc<Value>)> {
+        rows.into_iter()
+            .filter_map(|(id, seq_no, source)| {
+                let version = self.store.version_map.get(&id)?;
+                (!version.deleted
+                    && version.seq_no == seq_no
+                    && version.segment_id.as_ref()
+                        == xerj_storage::version_map::IN_MEMORY_SEGMENT_ID)
+                    .then_some((id, source))
+            })
+            .collect()
+    }
+
+    pub(crate) fn live_memtable_docs(&self) -> Vec<(String, Value)> {
+        self.live_memtable_docs_arc()
+            .into_iter()
+            .map(|(id, source)| (id, (*source).clone()))
+            .collect()
+    }
+
+    pub(crate) fn live_filtered_memtable_docs_arc(
+        &self,
+        predicates: &[crate::memtable::MemBoolPred],
+    ) -> Option<Vec<(String, Arc<Value>)>> {
+        Some(
+            self.memtable
+                .filtered_docs_with_seq_arc(predicates)?
+                .into_iter()
+                .filter_map(|(id, seq_no, source)| {
+                    let version = self.store.version_map.get(&id)?;
+                    (!version.deleted
+                        && version.seq_no == seq_no
+                        && version.segment_id.as_ref()
+                            == xerj_storage::version_map::IN_MEMORY_SEGMENT_ID)
+                        .then_some((id, source))
+                })
+                .collect(),
+        )
+    }
+
     pub async fn stats(&self) -> IndexStats {
         let snap = self.store.snapshot();
         let segment_count = snap.segments.len();
@@ -12681,12 +12799,11 @@ impl Index {
         // Look up sources from the active memtable for unflushed docs.
         // Flushed docs already have their sources filled by the segment reader
         // path in search_inner().
-        let mem = &*self.memtable;
         hits.into_iter()
             .map(|mut h| {
                 if h.source.is_null() {
-                    if let Some(source) = mem.get_doc_source_as_value(&h.id) {
-                        h.source = source;
+                    if let Some(source) = self.resolve_live_memtable_source_arc(&h.id) {
+                        h.source = source.as_ref().clone();
                     }
                     // If still null, try loading from disk segments.  This can
                     // happen for FTS hits from the active memtable that were
@@ -13449,7 +13566,7 @@ impl Index {
             {
                 total
             } else {
-                let docs = self.memtable.all_docs_with_sources_arc();
+                let docs = self.live_memtable_docs_arc();
                 docs.iter()
                     .filter(|(_, src)| doc_matches_query(query, src))
                     .count() as u64
@@ -13674,7 +13791,7 @@ impl Index {
             let mem_matches: u64 = if self.memtable.doc_count() == 0 {
                 0
             } else {
-                let docs = self.memtable.all_docs_with_sources();
+                let docs = self.live_memtable_docs();
                 docs.iter()
                     .filter(|(_, src)| doc_matches_query(query, src))
                     .count() as u64
@@ -14113,7 +14230,7 @@ impl Index {
         // ── Live memtable docs ────────────────────────────────────────────
         // Sources are already parsed Values in memory; score them through the
         // identical `compute_field_value_factor` for byte-for-byte parity.
-        let mem_docs = self.memtable.all_docs_with_sources_arc();
+        let mem_docs = self.live_memtable_docs_arc();
         for (i, (id, source)) in mem_docs.iter().enumerate() {
             if let Some(ver) = self.store.version_map.get(id) {
                 if ver.deleted {
@@ -17629,6 +17746,13 @@ async fn do_flush_shard(
     // correctness (each concurrent flush drains a disjoint set of docs
     // and writes an independent segment).
 
+    // Acquire finalization capacity before draining. Once a row leaves the
+    // active shard, every cancellation-safe owner needed to publish it must
+    // already be available; waiting on this gate after drain left an async
+    // cancellation window before the visibility lease reached the blocking
+    // worker.
+    let fin_permit = crate::flush_finalize_gate().acquire().await.ok();
+
     // ── Phase 1: atomic drain of BOTH memtables under the FTS write lock ──
     //
     // Ingest blocks only for the duration of this drain — which is fast
@@ -17675,6 +17799,7 @@ async fn do_flush_shard(
         )>,
         xerj_storage::index_store::DrainedMemtable,
         crate::ingest_memory::Retained<'static>,
+        crate::memtable::DrainedVisibilityLease,
     )> = {
         let t_drain = std::time::Instant::now();
         #[cfg(test)]
@@ -17683,13 +17808,14 @@ async fn do_flush_shard(
             .filter(|hook| hook.target_memtable == test_target)
             .map(|hook| hook.ledger);
         #[cfg(test)]
-        let (raw, _drained_memory) = if let Some(ledger) = test_ledger {
+        let (raw, _drained_memory, _drained_visibility) = if let Some(ledger) = test_ledger {
             memtable.drain_shard_accounted_for_test(shard_idx, is_raw_bytes_path, ledger)
         } else {
             memtable.drain_shard_accounted(shard_idx, is_raw_bytes_path)
         };
         #[cfg(not(test))]
-        let (raw, _drained_memory) = memtable.drain_shard_accounted(shard_idx, is_raw_bytes_path);
+        let (raw, _drained_memory, _drained_visibility) =
+            memtable.drain_shard_accounted(shard_idx, is_raw_bytes_path);
         prof_drain_us = t_drain.elapsed().as_micros();
         let t_prep = std::time::Instant::now();
         let _ = &t_prep;
@@ -17768,7 +17894,12 @@ async fn do_flush_shard(
                 entries: storage_entries,
             };
             prof_prep_us = t_prep.elapsed().as_micros();
-            Some((drained_fts, storage_drained, _drained_memory))
+            Some((
+                drained_fts,
+                storage_drained,
+                _drained_memory,
+                _drained_visibility,
+            ))
         }
     };
 
@@ -17785,7 +17916,7 @@ async fn do_flush_shard(
     // tmpfs.
     on_drained();
 
-    let (drained_fts, storage_drained, _drained_memory) = match drained_opt {
+    let (drained_fts, storage_drained, _drained_memory, _drained_visibility) = match drained_opt {
         Some(pair) => pair,
         None => return Ok(()),
     };
@@ -17931,8 +18062,14 @@ async fn do_flush_shard(
     //      concurrent bulk clients' HTTP handling and the reader's search
     //      dispatch.
     let t_finalize = std::time::Instant::now();
-    let _fin_permit = crate::flush_finalize_gate().acquire().await.ok();
+    // The visibility lease must live in the non-cancellable blocking worker.
+    // Aborting the async waiter cannot stop `spawn_blocking`; keeping the
+    // lease outside would make drained rows disappear while the worker was
+    // still preparing their segment.
+    let drained_visibility = _drained_visibility;
     let finalize_join = tokio::task::spawn_blocking(move || {
+        let _fin_permit = fin_permit;
+        let _drained_visibility = drained_visibility;
         // This lease lives in the blocking worker, not the async waiter:
         // aborting an async task cannot cancel `spawn_blocking`.
         let lease =
@@ -29992,6 +30129,109 @@ mod flush_memory_integration_tests {
     use super::*;
     use crate::ingest_memory::{Category, Ledger, Measurement};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn turbo_batch_every_id_is_point_fetchable_and_hnsw_rescorable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        config.storage.flush_size_mb = 4_096;
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut vector = FieldConfig::new("embedding", FieldType::Vector);
+        vector.options.dimensions = Some(2);
+        vector.options.similarity = Some("cosine".into());
+        schema.fields.push(vector);
+        engine.create_index("turbo-point-routing", schema).unwrap();
+        let index = engine.get_index("turbo-point-routing").unwrap();
+        let docs: Vec<(String, Value)> = (0..1_024)
+            .map(|row| {
+                let angle = row as f32 * 0.003;
+                (
+                    format!("mixed-{row:04}"),
+                    json!({"embedding": [angle.cos(), angle.sin()], "row": row}),
+                )
+            })
+            .collect();
+        assert!(docs.iter().skip(1).any(|(id, _)| {
+            index.memtable.shard_for_dynamic(id) != index.memtable.shard_for_dynamic(&docs[0].0)
+        }));
+        index.index_batch_turbo(docs, false, false).await.unwrap();
+
+        let started = std::time::Instant::now();
+        for row in 0..1_024 {
+            let id = format!("mixed-{row:04}");
+            assert_eq!(
+                index.get_document_uncounted(&id).await.unwrap().unwrap()["row"],
+                row
+            );
+        }
+        eprintln!(
+            "turbo point lookup: 1024 documents in {:?}",
+            started.elapsed()
+        );
+
+        let hnsw = index
+            .run_knn_hnsw(
+                &SearchRequest {
+                    size: 10,
+                    ..SearchRequest::default()
+                },
+                "embedding",
+                &[1.0, 0.0],
+                10,
+                Some(100),
+                "cosine",
+            )
+            .await
+            .expect("complete point-resolvable graph must remain HNSW eligible");
+        assert_eq!(hnsw.hits[0].id, "mixed-0000");
+    }
+
+    #[tokio::test]
+    async fn misplaced_turbo_generation_obeys_overwrite_and_tombstone_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("turbo-generation", Schema::empty())
+            .unwrap();
+        let index = engine.get_index("turbo-generation").unwrap();
+        let anchor = "batch-anchor";
+        let anchor_shard = index.memtable.shard_for_dynamic(anchor);
+        let sibling = (0..10_000)
+            .map(|candidate| format!("batch-sibling-{candidate}"))
+            .find(|id| index.memtable.shard_for_dynamic(id) != anchor_shard)
+            .unwrap();
+        index
+            .index_batch_turbo(
+                vec![
+                    (anchor.into(), json!({"revision": "anchor"})),
+                    (sibling.clone(), json!({"revision": "obsolete"})),
+                    (sibling.clone(), json!({"revision": "current"})),
+                ],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            index
+                .get_document_uncounted(&sibling)
+                .await
+                .unwrap()
+                .unwrap()["revision"],
+            "current"
+        );
+        assert!(index.delete_document(&sibling).await.unwrap());
+        assert!(index
+            .get_document_uncounted(&sibling)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     struct PublisherRelease(Option<std::sync::mpsc::SyncSender<()>>);
     impl PublisherRelease {
         fn release(&mut self) {
@@ -30152,5 +30392,115 @@ mod flush_memory_integration_tests {
     async fn real_flush_cleans_warmed_owners_on_post_warm_error_and_panic() {
         run_post_warm_failure_case("flush-post-warm-error", false).await;
         run_post_warm_failure_case("flush-post-warm-panic", true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drained_generation_stays_get_brute_and_hnsw_visible_until_publish() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.storage.flush_size_mb = 4_096;
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut vector = FieldConfig::new("embedding", FieldType::Vector);
+        vector.options.dimensions = Some(2);
+        vector.options.similarity = Some("cosine".into());
+        schema.fields.push(vector);
+        engine.create_index("drain-visible", schema).unwrap();
+        let idx = engine.get_index("drain-visible").unwrap();
+        let docs = (0..1_024)
+            .map(|row| {
+                let angle = row as f32 * 0.003;
+                (
+                    format!("drained-{row:04}"),
+                    serde_json::json!({
+                        "embedding": [angle.cos(), angle.sin()],
+                        "row": row,
+                    }),
+                )
+            })
+            .collect();
+        idx.index_batch_turbo(docs, false, false).await.unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                entered_tx.lock().take().unwrap().send(()).unwrap();
+                release_rx.lock().take().unwrap().recv().unwrap();
+                false
+            }),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+        };
+        let flush = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let point = idx
+            .get_document_uncounted("drained-0000")
+            .await
+            .unwrap()
+            .expect("drained point row must stay visible");
+        assert_eq!(point["row"], 0);
+        let filtered = [crate::memtable::MemBoolPred::Range {
+            field: "row".into(),
+            gte: Some(0.0),
+            gt: None,
+            lte: Some(0.0),
+            lt: None,
+        }];
+        assert!(
+            idx.live_filtered_memtable_docs_arc(&filtered).is_none(),
+            "active-shard-only filtering must fall back while drained rows await publication"
+        );
+        assert!(
+            idx.live_memtable_docs_arc()
+                .iter()
+                .any(|(id, source)| id == "drained-0000" && source["row"] == 0),
+            "the complete fallback walk must include the drained generation"
+        );
+
+        let request = SearchRequest {
+            size: 10,
+            ..SearchRequest::default()
+        };
+        let brute = idx
+            .run_knn_brute_force(
+                &request,
+                "embedding",
+                &[1.0, 0.0],
+                10,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(brute.hits[0].id, "drained-0000");
+        let hnsw = idx
+            .run_knn_hnsw(&request, "embedding", &[1.0, 0.0], 10, Some(100), "cosine")
+            .await
+            .expect("drained HNSW candidates must remain hydratable");
+        assert_eq!(hnsw.hits[0].id, "drained-0000");
+
+        release_tx.send(()).unwrap();
+        flush.await.unwrap().unwrap();
+        assert_eq!(
+            idx.get_document_uncounted("drained-0000")
+                .await
+                .unwrap()
+                .unwrap()["row"],
+            0
+        );
     }
 }

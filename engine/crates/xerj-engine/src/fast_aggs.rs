@@ -305,7 +305,7 @@ impl<'a> FastCtx<'a> {
                         .collect(),
                 )
             } else {
-                let pairs = self.idx.memtable.all_docs_with_sources_arc();
+                let pairs = self.idx.live_memtable_docs_arc();
                 let mut ids = Vec::with_capacity(pairs.len());
                 let mut srcs = Vec::with_capacity(pairs.len());
                 for (id, src) in pairs {
@@ -336,7 +336,7 @@ impl<'a> FastCtx<'a> {
         }
         let preds = self.top_filter_mem_preds.as_ref()?;
         self.mem_filtered
-            .get_or_init(|| self.idx.memtable.filtered_docs_arc(preds))
+            .get_or_init(|| self.idx.live_filtered_memtable_docs_arc(preds))
             .as_deref()
     }
 }
