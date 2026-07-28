@@ -6278,10 +6278,11 @@ impl Index {
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
-                    continue;
-                };
-                if !self.owns_exact_segment_row(&id, doc_seq, &meta.id) {
+                if !self.owns_segment_row_compat(
+                    &id,
+                    doc.get("_seq_no").and_then(Value::as_u64),
+                    &meta.id,
+                ) {
                     continue;
                 }
                 if !seen.insert(id.clone()) {
@@ -7288,10 +7289,11 @@ impl Index {
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
-                    continue;
-                };
-                if !self.owns_exact_segment_row(&id, doc_seq, &meta.id) {
+                if !self.owns_segment_row_compat(
+                    &id,
+                    doc.get("_seq_no").and_then(Value::as_u64),
+                    &meta.id,
+                ) {
                     continue;
                 }
                 if !seen.insert(id.clone()) {
@@ -7721,6 +7723,19 @@ impl Index {
                 && version.seq_no == seq_no
                 && version.segment_id.as_ref() == segment_id
         })
+    }
+
+    /// Admit historical stored envelopes which predate the embedded
+    /// `_seq_no` field without weakening exact admission for current data.
+    /// Reopen still reconstructs the owning segment in the version map, so
+    /// `(id, segment)` is the strongest evidence available for that format.
+    fn owns_segment_row_compat(&self, id: &str, seq_no: Option<u64>, segment_id: &str) -> bool {
+        match seq_no {
+            Some(seq_no) => self.owns_exact_segment_row(id, seq_no, segment_id),
+            None => self.store.version_map.get(id).is_some_and(|version| {
+                !version.deleted && version.segment_id.as_ref() == segment_id
+            }),
+        }
     }
 
     /// Metrics-free internal fetch: `get_document` minus the get.total /
@@ -8480,17 +8495,35 @@ impl Index {
             || peel_nested_knn_query(&request.query).is_some();
         let is_multi_thread = tokio::runtime::Handle::current().runtime_flavor()
             == tokio::runtime::RuntimeFlavor::MultiThread;
-        let search_fut = self.search_inner(request, request_deadline);
-        let search_result = if is_multi_thread && !cooperative_vector_query {
-            let fut = async move {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(search_fut)
-                })
-            };
-            tokio::time::timeout_at(tokio::time::Instant::from_std(request_deadline), fut).await
-        } else {
-            tokio::time::timeout_at(tokio::time::Instant::from_std(request_deadline), search_fut)
+        // A query may release the short publication latch after capturing its
+        // snapshot and memtable evidence, then spend substantial time scanning.
+        // Logical writes update `dataset_version`; if one lands before the
+        // result is complete, exact row admission would otherwise compare the
+        // captured physical view with a newer live version map and could
+        // transiently omit both generations. Retry until one complete attempt
+        // observes a stable logical dataset version (bounded by the request's
+        // existing absolute deadline).
+        let search_result = loop {
+            let captured_version = self.dataset_version.load(Ordering::Acquire);
+            let search_fut = self.search_inner(request, request_deadline);
+            let attempt = if is_multi_thread && !cooperative_vector_query {
+                let fut = async move {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(search_fut)
+                    })
+                };
+                tokio::time::timeout_at(tokio::time::Instant::from_std(request_deadline), fut).await
+            } else {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(request_deadline),
+                    search_fut,
+                )
                 .await
+            };
+            if attempt.is_err() || self.dataset_version.load(Ordering::Acquire) == captured_version
+            {
+                break attempt;
+            }
         };
         match search_result {
             Ok(result) => {
@@ -9353,12 +9386,13 @@ impl Index {
             let mem = &*self.memtable;
             if mem_doc_count == 0 {
                 MemSnapshot::Empty
-            } else if mem.has_prepublication_rows() || self.store.version_map.ghost_events() > 0 {
+            } else if mem.has_prepublication_rows() {
                 // Active-shard FTS/doc-values/sort structures cannot prove
-                // completeness while a drained generation is pending, and
-                // id-only shortcuts cannot distinguish a stale physical row
-                // after an overwrite/delete. Use the sequence-bearing source
-                // snapshot for every query shape in either state.
+                // completeness while a drained generation is pending. Use the
+                // sequence-bearing source snapshot until publication. A
+                // historical overwrite/delete alone does not require this:
+                // the normal FTS arm collects without a cap and validates
+                // every hit against the VersionMap when ghost_events > 0.
                 MemSnapshot::DocsForScan(self.live_memtable_docs_arc())
             } else if matches!(query, QueryNode::MatchAll) && size == 0 && request.aggs.is_none() {
                 // MatchAll + size=0 + NO aggs: pure count query.
@@ -9633,6 +9667,10 @@ impl Index {
             // Lock dropped here
         };
         drop(publication_capture);
+        #[cfg(test)]
+        SEARCH_CAPTURE_TEST_HOOK
+            .try_with(|hook| (hook.callback)())
+            .ok();
         phase_marks.push(("mem_snapshot", phase_t0.elapsed().as_millis() as u64));
         let skipped_match_all_mem_count = matches!(&mem_snapshot, MemSnapshot::Empty)
             && matches!(query, QueryNode::MatchAll)
@@ -9646,6 +9684,14 @@ impl Index {
             MemSnapshot::DocValuesHits(..) => "dv",
             MemSnapshot::DocsForScan(_) => "scan",
         };
+        #[cfg(test)]
+        SEARCH_CAPTURE_TEST_HOOK
+            .try_with(|hook| {
+                if let Some(callback) = &hook.mem_arm {
+                    callback(dbg_mem_arm);
+                }
+            })
+            .ok();
         match mem_snapshot {
             MemSnapshot::Empty => {}
             MemSnapshot::FtsHits(hits, uncollected) => {
@@ -11746,10 +11792,11 @@ impl Index {
                 };
                 for d in arr.iter() {
                     let id_ref = d.get("_id").and_then(Value::as_str).unwrap_or("");
-                    let Some(doc_seq) = d.get("_seq_no").and_then(Value::as_u64) else {
-                        continue;
-                    };
-                    if !self.owns_exact_segment_row(id_ref, doc_seq, &seg.id) {
+                    if !self.owns_segment_row_compat(
+                        id_ref,
+                        d.get("_seq_no").and_then(Value::as_u64),
+                        &seg.id,
+                    ) {
                         continue;
                     }
                     let id_owned = id_ref.to_string();
@@ -16954,10 +17001,11 @@ impl Index {
                 Err(_) => continue,
             };
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
-            let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
-                continue;
-            };
-            if !self.owns_exact_segment_row(id_ref, doc_seq, segment_id) {
+            if !self.owns_segment_row_compat(
+                id_ref,
+                doc.get("_seq_no").and_then(Value::as_u64),
+                segment_id,
+            ) {
                 continue;
             }
             *total_count += 1;
@@ -17059,10 +17107,11 @@ impl Index {
                 Err(_) => continue,
             };
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
-            let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
-                continue;
-            };
-            if !self.owns_exact_segment_row(id_ref, doc_seq, segment_id) {
+            if !self.owns_segment_row_compat(
+                id_ref,
+                doc.get("_seq_no").and_then(Value::as_u64),
+                segment_id,
+            ) {
                 continue;
             }
             // Re-test the full query — the pre-filter is only a superset.
@@ -17525,10 +17574,11 @@ impl Index {
             };
 
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
-            let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
-                continue;
-            };
-            if !self.owns_exact_segment_row(id_ref, doc_seq, segment_id) {
+            if !self.owns_segment_row_compat(
+                id_ref,
+                doc.get("_seq_no").and_then(Value::as_u64),
+                segment_id,
+            ) {
                 continue;
             }
 
@@ -17700,12 +17750,90 @@ struct FlushPublisherTestHook {
     callback: Arc<dyn Fn() -> bool + Send + Sync>,
     after_warm: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     after_repoint: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_finalize_spawn: Option<Arc<dyn Fn() + Send + Sync>>,
     ledger: &'static crate::ingest_memory::Ledger,
     target_memtable: usize,
+}
+
+/// Owns one drained generation until publication is committed.
+///
+/// The guard can move from the async caller, through the handoff channel, into
+/// the blocking finalizer without ever creating an ownerless interval. Any
+/// cancellation, channel close, unwind, or ordinary error before `disarm`
+/// returns the still-current rows to the active memtable before releasing the
+/// prepublication visibility lease.
+struct RetainedFlushGeneration {
+    drained: xerj_storage::index_store::DrainedMemtable,
+    visibility: Option<crate::memtable::DrainedVisibilityLease>,
+    memtable: Arc<crate::memtable::ShardedFtsMemtable>,
+    store: Arc<IndexStore>,
+    requeue_on_drop: bool,
+}
+
+impl RetainedFlushGeneration {
+    fn disarm(&mut self) {
+        self.requeue_on_drop = false;
+    }
+}
+
+impl Drop for RetainedFlushGeneration {
+    fn drop(&mut self) {
+        if !self.requeue_on_drop {
+            return;
+        }
+        for entry in &self.drained.entries {
+            let Some(version) = self.store.version_map.get(&entry.doc_id) else {
+                continue;
+            };
+            if version.deleted
+                || version.seq_no != entry.seq_no
+                || version.segment_id.as_ref() != xerj_storage::version_map::IN_MEMORY_SEGMENT_ID
+            {
+                continue;
+            }
+            let source_bytes = if !entry.source_bytes.is_empty() {
+                Arc::clone(&entry.source_bytes)
+            } else if let Some(source) = &entry.source {
+                match serde_json::to_vec(source.as_ref()) {
+                    Ok(bytes) => Arc::from(bytes),
+                    Err(error) => {
+                        tracing::error!(
+                            doc_id = entry.doc_id,
+                            seq_no = entry.seq_no,
+                            error = %error,
+                            "failed to requeue retained flush source"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                continue;
+            };
+            self.memtable.requeue_raw_if_not_newer(
+                entry.seq_no,
+                entry.doc_id.clone(),
+                source_bytes,
+            );
+        }
+        // Make the ordering explicit: active visibility is restored before
+        // the drained-generation registry and its budget owner are released.
+        self.visibility.take();
+    }
 }
 #[cfg(test)]
 tokio::task_local! {
     static FLUSH_PUBLISHER_TEST_HOOK: FlushPublisherTestHook;
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct SearchCaptureTestHook {
+    callback: Arc<dyn Fn() + Send + Sync>,
+    mem_arm: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+#[cfg(test)]
+tokio::task_local! {
+    static SEARCH_CAPTURE_TEST_HOOK: SearchCaptureTestHook;
 }
 
 // This deliberately remains a free function so background tasks can own every
@@ -17944,6 +18072,11 @@ async fn do_flush_shard(
         .and_then(|hook| hook.after_repoint.as_ref().map(Arc::clone));
     #[cfg(not(test))]
     let after_repoint_callback: Option<Arc<dyn Fn() + Send + Sync>> = None;
+    #[cfg(test)]
+    let after_finalize_spawn_callback = test_hook
+        .as_ref()
+        .filter(|hook| hook.target_memtable == test_target)
+        .and_then(|hook| hook.after_finalize_spawn.as_ref().map(Arc::clone));
     let build_fts = move |meta: &xerj_storage::segment::SegmentMeta| -> xerj_storage::Result<()> {
         *callback_warmed_segment_id.lock() = Some(meta.id.clone());
         #[cfg(test)]
@@ -18055,58 +18188,114 @@ async fn do_flush_shard(
     //      concurrent bulk clients' HTTP handling and the reader's search
     //      dispatch.
     let t_finalize = std::time::Instant::now();
-    // The visibility lease must live in the non-cancellable blocking worker.
-    // Aborting the async waiter cannot stop `spawn_blocking`; keeping the
-    // lease outside would make drained rows disappear while the worker was
-    // still preparing their segment.
-    let drained_visibility = _drained_visibility;
+    let generation = RetainedFlushGeneration {
+        drained: storage_drained,
+        visibility: Some(_drained_visibility),
+        memtable: Arc::clone(&memtable),
+        store: Arc::clone(&store),
+        requeue_on_drop: true,
+    };
+    // The async caller retains the recoverable generation until the blocking
+    // task proves it has started. The generation itself is the channel
+    // payload, so cancellation before/inside handoff still drops an armed RAII
+    // owner and restores active visibility.
+    let (handoff_tx, handoff_rx) = std::sync::mpsc::sync_channel::<RetainedFlushGeneration>(1);
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let finalize_join = tokio::task::spawn_blocking(move || {
         let _fin_permit = fin_permit;
-        let _drained_visibility = drained_visibility;
+        let _ = accepted_tx.send(());
+        let mut generation = handoff_rx.recv().map_err(|_| {
+            std::io::Error::other("flush finalizer handoff was cancelled before ownership transfer")
+        })?;
         // This lease lives in the blocking worker, not the async waiter:
         // aborting an async task cannot cancel `spawn_blocking`.
         let retry_caches = failed_warm_caches.clone();
         let lease =
             PrePublicationLease::tracked(failed_warm_caches, Arc::clone(&warmed_segment_id));
+        let published_meta = || {
+            let segment_id = warmed_segment_id.lock().clone()?;
+            store
+                .snapshot()
+                .segments
+                .iter()
+                .find(|meta| meta.id == segment_id)
+                .cloned()
+        };
         let mut attempt = 0_u8;
         let result = loop {
             let finalized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::background_pool().install(|| {
-                    store.finalize_borrowed_flush_with_publishers(
-                        &storage_drained,
-                        |meta| build_fts(meta),
-                        |_| {
-                            if let Some(callback) = &after_repoint_callback {
-                                callback();
+                    store
+                        .finalize_borrowed_flush_with_publishers(
+                            &generation.drained,
+                            |meta| build_fts(meta),
+                            |_| {
+                                if let Some(callback) = &after_repoint_callback {
+                                    callback();
+                                }
+                            },
+                        )
+                        .map(|publication| match publication {
+                            xerj_storage::index_store::FlushPublication::Empty => None,
+                            xerj_storage::index_store::FlushPublication::Published {
+                                meta,
+                                maintenance_error,
+                            } => {
+                                if let Some(error) = maintenance_error {
+                                    tracing::warn!(
+                                        segment_id = meta.id.as_str(),
+                                        error,
+                                        "flush published; maintenance will be retried later"
+                                    );
+                                }
+                                Some(meta)
                             }
-                        },
-                    )
+                        })
                 })
             }));
             match finalized {
                 Ok(Ok(meta)) => break Ok(meta),
-                Ok(Err(error)) if attempt == 0 => {
-                    if let Some(segment_id) = warmed_segment_id.lock().take() {
-                        retry_caches.remove_failed_output(&segment_id);
-                        store.remove_unpublished_segment_files(&segment_id);
+                Ok(Err(error)) => {
+                    if let Some(meta) = published_meta() {
+                        tracing::warn!(
+                            segment_id = meta.id.as_str(),
+                            error = %error,
+                            "flush reported an error after publication; retaining committed segment"
+                        );
+                        break Ok(Some(meta));
                     }
-                    tracing::warn!(error = %error, "flush finalization failed; retrying retained drained generation once");
-                }
-                Err(_) if attempt == 0 => {
-                    if let Some(segment_id) = warmed_segment_id.lock().take() {
-                        retry_caches.remove_failed_output(&segment_id);
-                        store.remove_unpublished_segment_files(&segment_id);
+                    if attempt == 0 {
+                        if let Some(segment_id) = warmed_segment_id.lock().take() {
+                            retry_caches.remove_failed_output(&segment_id);
+                            store.remove_unpublished_segment_files(&segment_id);
+                        }
+                        tracing::warn!(error = %error, "flush finalization failed; retrying retained drained generation once");
+                    } else {
+                        break Err(error);
                     }
-                    tracing::warn!(
-                        "flush finalization panicked; retrying retained drained generation once"
-                    );
                 }
-                Ok(Err(error)) => break Err(error),
                 Err(_) => {
-                    break Err(std::io::Error::other(
-                        "flush finalization panicked on both retained-payload attempts",
-                    )
-                    .into());
+                    if let Some(meta) = published_meta() {
+                        tracing::error!(
+                            segment_id = meta.id.as_str(),
+                            "flush panicked after publication; retaining committed segment"
+                        );
+                        break Ok(Some(meta));
+                    }
+                    if attempt == 0 {
+                        if let Some(segment_id) = warmed_segment_id.lock().take() {
+                            retry_caches.remove_failed_output(&segment_id);
+                            store.remove_unpublished_segment_files(&segment_id);
+                        }
+                        tracing::warn!(
+                            "flush finalization panicked; retrying retained drained generation once"
+                        );
+                    } else {
+                        break Err(std::io::Error::other(
+                            "flush finalization panicked on both retained-payload attempts",
+                        )
+                        .into());
+                    }
                 }
             }
             attempt += 1;
@@ -18116,66 +18305,48 @@ async fn do_flush_shard(
                 retry_caches.remove_failed_output(&segment_id);
                 store.remove_unpublished_segment_files(&segment_id);
             }
-            // Both bounded attempts failed. Hand the exact generation back to
-            // the active memtable before releasing its pending-visibility
-            // lease. Version-map sequence ownership decides which rows remain
-            // live; a concurrent newer update/delete is never requeued.
-            for entry in &storage_drained.entries {
-                let Some(version) = store.version_map.get(&entry.doc_id) else {
-                    continue;
-                };
-                if version.deleted
-                    || version.seq_no != entry.seq_no
-                    || version.segment_id.as_ref()
-                        != xerj_storage::version_map::IN_MEMORY_SEGMENT_ID
-                {
-                    continue;
-                }
-                let source_bytes = if !entry.source_bytes.is_empty() {
-                    Arc::clone(&entry.source_bytes)
-                } else if let Some(source) = &entry.source {
-                    match serde_json::to_vec(source.as_ref()) {
-                        Ok(bytes) => Arc::from(bytes),
-                        Err(error) => {
-                            tracing::error!(
-                                doc_id = entry.doc_id,
-                                seq_no = entry.seq_no,
-                                error = %error,
-                                "failed to requeue retained flush source"
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    continue;
-                };
-                memtable.requeue_raw_if_not_newer(
-                    entry.seq_no,
-                    entry.doc_id.clone(),
-                    source_bytes,
-                );
-            }
         }
         if matches!(result, Ok(Some(_))) {
             // finalize_flush_with_publisher publishes the snapshot before it
             // returns Some. Commit while still in the worker, with no await.
             lease.commit();
+            generation.disarm();
         }
         result
-    })
-    .await;
+    });
+    #[cfg(test)]
+    if let Some(callback) = after_finalize_spawn_callback {
+        callback();
+    }
+    match accepted_rx.await {
+        Ok(()) => {
+            if handoff_tx.send(generation).is_err() {
+                return Err(EngineError::Common(xerj_common::XerjError::internal(
+                    "flush finalizer exited before accepting retained generation",
+                )));
+            }
+        }
+        Err(_) => {
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                "flush finalizer stopped before accepting retained generation",
+            )));
+        }
+    }
+    let finalize_join = finalize_join.await;
     let meta = match finalize_join {
         Ok(Ok(Some(m))) => m,
         Ok(Ok(None)) => {
-            tracing::warn!("storage finalize returned None — unexpected");
-            return Ok(());
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                "flush finalizer returned no segment for a non-empty retained generation",
+            )));
         }
         Ok(Err(e)) => {
             return Err(e.into());
         }
         Err(join_e) => {
-            tracing::warn!("finalize spawn_blocking join failed: {join_e}");
-            return Ok(());
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                format!("flush finalizer join failed after ownership handoff: {join_e}"),
+            )));
         }
     };
     if prof {
@@ -30355,6 +30526,7 @@ mod flush_memory_integration_tests {
             }),
             after_warm: None,
             after_repoint: None,
+            after_finalize_spawn: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30476,6 +30648,7 @@ mod flush_memory_integration_tests {
                 true
             })),
             after_repoint: None,
+            after_finalize_spawn: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30555,6 +30728,7 @@ mod flush_memory_integration_tests {
             callback: Arc::new(move || hook_calls.fetch_add(1, Ordering::AcqRel) == 0),
             after_warm: None,
             after_repoint: None,
+            after_finalize_spawn: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30630,6 +30804,7 @@ mod flush_memory_integration_tests {
             }),
             after_warm: None,
             after_repoint: None,
+            after_finalize_spawn: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30677,6 +30852,145 @@ mod flush_memory_integration_tests {
         );
     }
 
+    #[test]
+    fn cancellation_before_blocking_worker_accepts_generation_requeues_exactly_once() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(config.clone()).unwrap();
+            engine
+                .create_index("flush-cancel-before-handoff", Schema::empty())
+                .unwrap();
+            let idx = engine.get_index("flush-cancel-before-handoff").unwrap();
+            idx.index_document(
+                Some("retained".into()),
+                json!({"body": "cancel-safe", "revision": 1}),
+            )
+            .await
+            .unwrap();
+            let shard = idx.memtable.shard_for_dynamic("retained");
+            let (field_configs, excluded_fts_fields) = {
+                let schema = idx.schema.read().await;
+                (
+                    build_fts_field_configs(&schema.schema),
+                    crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                )
+            };
+            let warm_caches = idx.publish_warm_caches();
+
+            // Occupy the runtime's only blocking thread so the finalizer
+            // closure cannot start and acknowledge ownership.
+            let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
+            let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(1);
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocker_started_tx.send(());
+                release_blocker_rx.recv().unwrap();
+            });
+            blocker_started_rx.await.unwrap();
+
+            let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+            let spawned_tx = parking_lot::Mutex::new(Some(spawned_tx));
+            let hook = FlushPublisherTestHook {
+                callback: Arc::new(|| false),
+                after_warm: None,
+                after_repoint: None,
+                after_finalize_spawn: Some(Arc::new(move || {
+                    spawned_tx.lock().take().unwrap().send(()).unwrap();
+                })),
+                ledger,
+                target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            };
+            let waiter = {
+                let store = Arc::clone(&idx.store);
+                let memtable = Arc::clone(&idx.memtable);
+                let registry = Arc::clone(&idx.registry);
+                let data_dir = idx.data_dir.clone();
+                tokio::spawn(async move {
+                    do_flush_shard(
+                        shard,
+                        store,
+                        memtable,
+                        registry,
+                        data_dir,
+                        field_configs,
+                        excluded_fts_fields,
+                        || {},
+                        warm_caches,
+                        Some(hook),
+                    )
+                    .await
+                })
+            };
+            spawned_rx.await.unwrap();
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+
+            assert_eq!(
+                idx.get_document_uncounted("retained")
+                    .await
+                    .unwrap()
+                    .unwrap()["revision"],
+                1
+            );
+            assert!(
+                !idx.memtable.has_prepublication_rows(),
+                "cancelled pre-handoff owner must restore active visibility before refund"
+            );
+            assert_eq!(
+                ledger
+                    .gauge(Category::PrepublicationRegistry, Measurement::Estimated)
+                    .current,
+                0
+            );
+            assert_eq!(
+                ledger
+                    .gauge(Category::FlushDrained, Measurement::Estimated)
+                    .current,
+                0
+            );
+
+            release_blocker_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            idx.flush().await.unwrap();
+            assert_eq!(
+                idx.search(&SearchRequest::default())
+                    .await
+                    .unwrap()
+                    .total
+                    .value,
+                1
+            );
+            drop(idx);
+            drop(engine);
+
+            let reopened = crate::Engine::new(config).unwrap();
+            let idx = reopened.get_index("flush-cancel-before-handoff").unwrap();
+            assert_eq!(
+                idx.get_document_uncounted("retained")
+                    .await
+                    .unwrap()
+                    .unwrap()["body"],
+                "cancel-safe"
+            );
+            assert_eq!(
+                idx.search(&SearchRequest::default())
+                    .await
+                    .unwrap()
+                    .total
+                    .value,
+                1
+            );
+        });
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readers_never_observe_repoint_before_snapshot_publication() {
         let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
@@ -30702,6 +31016,7 @@ mod flush_memory_integration_tests {
                 entered_tx.lock().take().unwrap().send(()).unwrap();
                 release_rx.lock().take().unwrap().recv().unwrap();
             })),
+            after_finalize_spawn: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30758,6 +31073,7 @@ mod flush_memory_integration_tests {
             }),
             after_warm: None,
             after_repoint: None,
+            after_finalize_spawn: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30861,6 +31177,7 @@ mod flush_memory_integration_tests {
             }),
             after_warm: None,
             after_repoint: None,
+            after_finalize_spawn: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30907,7 +31224,24 @@ mod flush_memory_integration_tests {
             boost: None,
         });
         assert!(doc_matches_query(&term.query, &point));
-        assert_eq!(idx.search(&term).await.unwrap().total.value, 1);
+        let selected_arm = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let selected_arm_hook = Arc::clone(&selected_arm);
+        let search_hook = SearchCaptureTestHook {
+            callback: Arc::new(|| {}),
+            mem_arm: Some(Arc::new(move |arm| {
+                *selected_arm_hook.lock() = Some(arm.to_owned());
+            })),
+        };
+        let term_result = SEARCH_CAPTURE_TEST_HOOK
+            .scope(search_hook, idx.search(&term))
+            .await
+            .unwrap();
+        assert_eq!(term_result.total.value, 1);
+        assert_eq!(
+            selected_arm.lock().as_deref(),
+            Some("scan"),
+            "a drained prepublication generation must use the complete sequence-bearing scan"
+        );
         let range = assert_one(QueryNode::Range {
             field: "row".into(),
             gte: Some(json!(0)),
@@ -31021,5 +31355,365 @@ mod flush_memory_integration_tests {
                 .unwrap()["row"],
             0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn historical_ghosts_keep_active_text_updates_on_fts_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("title", FieldType::Text))
+            .unwrap();
+        engine.create_index("ghost-fts-route", schema).unwrap();
+        let idx = engine.get_index("ghost-fts-route").unwrap();
+
+        idx.index_document(
+            Some("doc".into()),
+            json!({"title": "ethics of ambiguity", "revision": 1}),
+        )
+        .await
+        .unwrap();
+        idx.flush().await.unwrap();
+        idx.index_document(
+            Some("doc".into()),
+            json!({"title": "ethics of ambiguity", "revision": 2}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            idx.store.version_map.ghost_events() > 0,
+            "the overwrite must activate historical-ghost filtering"
+        );
+        assert!(
+            !idx.memtable.has_prepublication_rows(),
+            "the replacement is active, not a drained publication generation"
+        );
+
+        let request = SearchRequest {
+            query: QueryNode::Match {
+                field: "title".into(),
+                query: "ethics of ambiguity".into(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            ..SearchRequest::default()
+        };
+        let selected_arm = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let selected_arm_hook = Arc::clone(&selected_arm);
+        let hook = SearchCaptureTestHook {
+            callback: Arc::new(|| {}),
+            mem_arm: Some(Arc::new(move |arm| {
+                *selected_arm_hook.lock() = Some(arm.to_owned());
+            })),
+        };
+        let result = SEARCH_CAPTURE_TEST_HOOK
+            .scope(hook, idx.search(&request))
+            .await
+            .unwrap();
+        assert_eq!(selected_arm.lock().as_deref(), Some("fts"));
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].source["revision"], 2);
+        assert!(
+            (result.hits[0].score - 2.386_294_4).abs() > 0.01,
+            "the generic per-document heuristic must not replace active memtable BM25"
+        );
+    }
+
+    async fn captured_search_retries_after_logical_write(delete: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("stable-search-capture", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("stable-search-capture").unwrap();
+        idx.index_document(Some("doc".into()), json!({"revision": 1}))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook = SearchCaptureTestHook {
+            callback: Arc::new({
+                let first = Arc::clone(&first);
+                move || {
+                    if first.swap(false, Ordering::AcqRel) {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().take().unwrap().recv().unwrap();
+                    }
+                }
+            }),
+            mem_arm: None,
+        };
+        let search = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(SEARCH_CAPTURE_TEST_HOOK.scope(hook, async move {
+                idx.search(&SearchRequest::default()).await
+            }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        if delete {
+            assert!(idx.delete_document("doc").await.unwrap());
+        } else {
+            idx.index_document(Some("doc".into()), json!({"revision": 2}))
+                .await
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        let result = search.await.unwrap().unwrap();
+        if delete {
+            assert_eq!(result.total.value, 0);
+            assert!(result.hits.is_empty());
+        } else {
+            assert_eq!(result.total.value, 1);
+            assert_eq!(result.hits[0].source["revision"], 2);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn captured_search_retries_across_update_and_delete() {
+        captured_search_retries_after_logical_write(false).await;
+        captured_search_retries_after_logical_write(true).await;
+    }
+
+    /// Manual end-to-end reproduction:
+    ///
+    /// `cargo test -p xerj-engine flush_publication_e2e_survives_deferred_maintenance_and_reopen -- --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_publication_e2e_survives_deferred_maintenance_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        config.storage.flush_size_mb = 4_096;
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("flush-publication-e2e", Schema::empty())
+            .unwrap();
+        let index = engine.get_index("flush-publication-e2e").unwrap();
+        let documents: Vec<(String, Value)> = (0..64)
+            .map(|row| {
+                (
+                    format!("mixed-{row:03}"),
+                    json!({"revision": 1, "row": row}),
+                )
+            })
+            .collect();
+        assert!(documents.iter().skip(1).any(|(id, _)| {
+            index.memtable.shard_for_dynamic(id)
+                != index.memtable.shard_for_dynamic(&documents[0].0)
+        }));
+        index
+            .index_batch_turbo(documents, false, false)
+            .await
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                entered_tx.lock().take().unwrap().send(()).unwrap();
+                release_rx.lock().take().unwrap().recv().unwrap();
+                false
+            }),
+            after_warm: None,
+            after_repoint: None,
+            after_finalize_spawn: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&index.memtable) as usize,
+        };
+        index.store.fail_next_post_publish_snapshot_save_for_test();
+        let flush = {
+            let index = Arc::clone(&index);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { index.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index
+                .get_document_uncounted("mixed-063")
+                .await
+                .unwrap()
+                .unwrap()["row"],
+            63
+        );
+        assert_eq!(
+            index
+                .search(&SearchRequest {
+                    query: QueryNode::MatchAll,
+                    size: 64,
+                    ..SearchRequest::default()
+                })
+                .await
+                .unwrap()
+                .total
+                .value,
+            64
+        );
+        release_tx.send(()).unwrap();
+        flush.await.unwrap().unwrap();
+        assert_eq!(index.store.deferred_flush_maintenance_errors(), 1);
+        // The engine's explicit end-of-flush maintenance pass immediately
+        // consumes the storage retry marker; the counter proves the injected
+        // post-publication failure occurred without reclassifying the segment
+        // as unpublished.
+        assert!(!index.store.flush_maintenance_retry_pending());
+
+        index
+            .index_document(Some("mixed-063".into()), json!({"revision": 2, "row": 63}))
+            .await
+            .unwrap();
+        assert!(index.delete_document("mixed-000").await.unwrap());
+        index.flush().await.unwrap();
+        assert!(!index.store.flush_maintenance_retry_pending());
+        drop(index);
+        drop(engine);
+
+        let reopened = crate::Engine::new(config).unwrap();
+        let index = reopened.get_index("flush-publication-e2e").unwrap();
+        assert_eq!(
+            index
+                .get_document_uncounted("mixed-063")
+                .await
+                .unwrap()
+                .unwrap()["revision"],
+            2
+        );
+        assert!(index
+            .get_document_uncounted("mixed-000")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            index
+                .search(&SearchRequest {
+                    query: QueryNode::MatchAll,
+                    size: 64,
+                    ..SearchRequest::default()
+                })
+                .await
+                .unwrap()
+                .total
+                .value,
+            63
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_aggregations_ignore_stale_physical_memtable_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("stale-fast-agg", Schema::empty())
+            .unwrap();
+        let index = engine.get_index("stale-fast-agg").unwrap();
+        let id = "replaced";
+        let canonical = index.memtable.shard_for_dynamic(id);
+        let stale_shard = (canonical + 1) % index.memtable.shard_count();
+        index.memtable.with_shard_mut(stale_shard, |memtable| {
+            memtable.insert(
+                id.into(),
+                &json!({"revision": 1, "kind": "obsolete"}),
+                &Schema::empty(),
+                41,
+            );
+        });
+        index.store.version_map.set(
+            id,
+            41,
+            xerj_storage::version_map::IN_MEMORY_SEGMENT_ID,
+            false,
+        );
+        index.memtable.with_shard_mut(canonical, |memtable| {
+            memtable.insert(
+                id.into(),
+                &json!({"revision": 2, "kind": "current"}),
+                &Schema::empty(),
+                42,
+            );
+        });
+        index.store.version_map.set(
+            id,
+            42,
+            xerj_storage::version_map::IN_MEMORY_SEGMENT_ID,
+            false,
+        );
+        index
+            .index_document(
+                Some("other".into()),
+                json!({"revision": 3, "kind": "other"}),
+            )
+            .await
+            .unwrap();
+
+        let result = index
+            .search(&SearchRequest {
+                query: QueryNode::MatchAll,
+                size: 0,
+                aggs: Some(json!({
+                    "kinds": {"terms": {"field": "kind"}},
+                    "max_revision": {"max": {"field": "revision"}}
+                })),
+                ..SearchRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.total.value, 2);
+        let aggregations = result.aggs.unwrap();
+        let buckets = aggregations["kinds"]["buckets"].as_array().unwrap();
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|bucket| bucket["doc_count"].as_u64().unwrap())
+                .sum::<u64>(),
+            2
+        );
+        assert!(!buckets.iter().any(|bucket| bucket["key"] == "obsolete"));
+        assert_eq!(aggregations["max_revision"]["value"], 3.0);
+    }
+
+    #[tokio::test]
+    async fn legacy_row_without_embedded_sequence_uses_segment_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("legacy-row-admission", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("legacy-row-admission").unwrap();
+        idx.index_document(Some("legacy".into()), json!({"body": "old format"}))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        let owner = idx
+            .store
+            .version_map
+            .get("legacy")
+            .unwrap()
+            .segment_id
+            .to_string();
+        assert!(idx.owns_segment_row_compat("legacy", None, &owner));
+        idx.index_document(Some("legacy".into()), json!({"body": "new generation"}))
+            .await
+            .unwrap();
+        assert!(!idx.owns_segment_row_compat("legacy", None, &owner));
     }
 }

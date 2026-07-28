@@ -364,6 +364,11 @@ pub struct SegmentWriter {
 }
 
 impl SegmentWriter {
+    /// UUID prefix reserved for this writer's output files.
+    pub fn segment_id(&self) -> &str {
+        self.id.as_str()
+    }
+
     /// Create a new writer that will produce files in `dir`.
     pub fn new(
         dir: impl AsRef<Path>,

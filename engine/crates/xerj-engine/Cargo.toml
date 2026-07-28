@@ -57,6 +57,7 @@ onnx-experimental = ["xerj-ai/onnx-experimental"]
 tempfile  = { workspace = true }
 tokio     = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true }
+xerj-storage = { path = "../xerj-storage", features = ["test-hooks"] }
 
 [[bench]]
 name = "search_bench"

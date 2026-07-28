@@ -34,7 +34,9 @@ mod ingest_memory_drain_tests {
     #[test]
     fn prepublication_budget_refuses_before_partial_insert_and_refunds_on_drop() {
         let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
-        let mem = ShardedFtsMemtable::new();
+        let mem = ShardedFtsMemtable::with_prepublication_budget_for_test(Arc::new(
+            PrepublicationBudget::new(DEFAULT_PREPUBLICATION_BUDGET_BYTES),
+        ));
         let id = "budgeted-raw".to_string();
         let shard = mem.shard_for_dynamic(&id);
         mem.insert_raw_bytes_with_seq(
@@ -136,6 +138,128 @@ mod ingest_memory_drain_tests {
             budget.refusals.load(std::sync::atomic::Ordering::Acquire),
             1
         );
+    }
+
+    #[test]
+    fn sequential_indices_drop_registry_allocations_before_global_refund() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let budget = Arc::new(PrepublicationBudget::new(4 * 1024 * 1024));
+        for generation in 0..64_u64 {
+            let mem = ShardedFtsMemtable::with_prepublication_budget_for_test(Arc::clone(&budget));
+            let id = format!("sequential-{generation}");
+            let shard = mem.shard_for_dynamic(&id);
+            mem.insert_raw_bytes_with_seq(
+                generation + 1,
+                id,
+                Arc::from(br#"{"body":"pending"}"#.as_slice()),
+            );
+            let (rows, _guard, lease) = mem.drain_shard_accounted_for_test(shard, true, ledger);
+            assert_eq!(rows.len(), 1);
+            drop(lease);
+            assert!(mem.prepublication.read().is_empty());
+            assert_eq!(budget.used.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn lease_drops_every_charged_holder_before_global_refund() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let budget = Arc::new(PrepublicationBudget::new(4 * 1024 * 1024));
+        let mem = ShardedFtsMemtable::with_prepublication_budget_for_test(Arc::clone(&budget));
+        mem.insert_raw_bytes_with_seq(
+            1,
+            "release-order".to_string(),
+            Arc::from(br#"{"body":"pending"}"#.as_slice()),
+        );
+        let shard = mem.shard_for_dynamic("release-order");
+        let (rows, _guard, lease) = mem.drain_shard_accounted_for_test(shard, true, ledger);
+        assert_eq!(rows.len(), 1);
+        let weak_source = {
+            let registry = mem.prepublication.read();
+            Arc::downgrade(registry.values().next().unwrap())
+        };
+        let registry = Arc::clone(&mem.prepublication);
+        let sources_alive = Arc::clone(&mem.prepublication_sources_alive);
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *budget.before_release.lock() = Some(Arc::new({
+            let observed = Arc::clone(&observed);
+            move || {
+                assert!(registry.read().is_empty());
+                assert!(
+                    weak_source.upgrade().is_none(),
+                    "lease-owned source survived until global refund"
+                );
+                assert_eq!(sources_alive.load(std::sync::atomic::Ordering::Acquire), 0);
+                assert_eq!(
+                    ledger
+                        .gauge(Category::PrepublicationRegistry, Measurement::Estimated)
+                        .current,
+                    0,
+                    "logical retained holder survived until global refund"
+                );
+                observed.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }));
+        drop(lease);
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+        *budget.before_release.lock() = None;
+    }
+
+    #[test]
+    fn failure_after_generation_reserve_refunds_without_partial_publication() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let budget = Arc::new(PrepublicationBudget::new(4 * 1024 * 1024));
+        let mem = ShardedFtsMemtable::with_prepublication_budget_for_test(Arc::clone(&budget));
+        mem.insert_raw_bytes_with_seq(
+            1,
+            "reserve-failure".to_string(),
+            Arc::from(br#"{"body":"still active"}"#.as_slice()),
+        );
+        let shard = mem.shard_for_dynamic("reserve-failure");
+        mem.fail_prepublication_after_reserve_for_test();
+        let (rows, _guard, lease) = mem.drain_shard_accounted_for_test(shard, true, ledger);
+        assert!(rows.is_empty());
+        assert_eq!(mem.doc_count(), 1);
+        assert!(mem.prepublication.read().is_empty());
+        assert_eq!(budget.used.load(std::sync::atomic::Ordering::Acquire), 0);
+        drop(lease);
+    }
+
+    #[test]
+    fn failure_after_partially_building_pending_rows_drops_before_refund() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let budget = Arc::new(PrepublicationBudget::new(4 * 1024 * 1024));
+        let mem = ShardedFtsMemtable::with_prepublication_budget_for_test(Arc::clone(&budget));
+        let first = "partial-a".to_string();
+        let shard = mem.shard_for_dynamic(&first);
+        let second = (0..10_000)
+            .map(|n| format!("partial-{n}"))
+            .find(|id| id != &first && mem.shard_for_dynamic(id) == shard)
+            .unwrap();
+        mem.insert_raw_bytes_with_seq(1, first, Arc::from(br#"{"body":"one"}"#.as_slice()));
+        mem.insert_raw_bytes_with_seq(2, second, Arc::from(br#"{"body":"two"}"#.as_slice()));
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sources_alive = Arc::clone(&mem.prepublication_sources_alive);
+        *budget.before_release.lock() = Some(Arc::new({
+            let observed = Arc::clone(&observed);
+            move || {
+                assert_eq!(
+                    sources_alive.load(std::sync::atomic::Ordering::Acquire),
+                    0,
+                    "partially built pending source survived until global refund"
+                );
+                observed.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }));
+        mem.fail_prepublication_after_pending_rows_for_test(1);
+        let (rows, _guard, lease) = mem.drain_shard_accounted_for_test(shard, true, ledger);
+        assert!(rows.is_empty());
+        assert_eq!(mem.doc_count(), 2);
+        assert!(mem.prepublication.read().is_empty());
+        assert_eq!(budget.used.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+        drop(lease);
+        *budget.before_release.lock() = None;
     }
 
     #[test]
@@ -753,10 +877,19 @@ pub struct ShardedFtsMemtable {
     /// Rows atomically moved out of an active shard but not yet published in
     /// a segment. Keys include the physical shard so an impossible duplicate
     /// `(id, seq)` has a deterministic lowest-shard winner.
-    prepublication:
-        Arc<parking_lot::RwLock<HashMap<(String, u64, usize), Arc<PrepublicationSource>>>>,
+    prepublication: Arc<
+        parking_lot::RwLock<
+            std::collections::BTreeMap<(String, u64, usize), Arc<PrepublicationSource>>,
+        >,
+    >,
     prepublication_budget: Arc<PrepublicationBudget>,
     prepublication_budget_limit: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fail_prepublication_after_reserve: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_prepublication_after_pending_rows: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    prepublication_sources_alive: Arc<std::sync::atomic::AtomicUsize>,
     shard_mask: usize,
 }
 
@@ -773,14 +906,18 @@ struct PrepublicationBudget {
     used: std::sync::atomic::AtomicUsize,
     limit: usize,
     refusals: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    before_release: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl PrepublicationBudget {
-    const fn new(limit: usize) -> Self {
+    fn new(limit: usize) -> Self {
         Self {
             used: std::sync::atomic::AtomicUsize::new(0),
             limit,
             refusals: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            before_release: parking_lot::Mutex::new(None),
         }
     }
 
@@ -805,6 +942,10 @@ impl PrepublicationBudget {
     }
 
     fn release(&self, bytes: usize) {
+        #[cfg(test)]
+        if let Some(observer) = self.before_release.lock().as_ref() {
+            observer();
+        }
         self.used
             .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
     }
@@ -813,6 +954,8 @@ impl PrepublicationBudget {
 struct PrepublicationSource {
     source: Arc<Value>,
     source_bytes: Arc<[u8]>,
+    #[cfg(test)]
+    live_probe: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PrepublicationSource {
@@ -824,12 +967,24 @@ impl PrepublicationSource {
     }
 }
 
+#[cfg(test)]
+impl Drop for PrepublicationSource {
+    fn drop(&mut self) {
+        self.live_probe
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Keeps drained rows query-visible until their segment has been published.
 ///
 /// Removal is value-identity guarded so a delayed lease can never erase a
 /// replacement registration for the same physical generation.
 pub(crate) struct DrainedVisibilityLease {
-    registry: Arc<parking_lot::RwLock<HashMap<(String, u64, usize), Arc<PrepublicationSource>>>>,
+    registry: Arc<
+        parking_lot::RwLock<
+            std::collections::BTreeMap<(String, u64, usize), Arc<PrepublicationSource>>,
+        >,
+    >,
     entries: Vec<((String, u64, usize), Arc<PrepublicationSource>)>,
     budget: Arc<PrepublicationBudget>,
     budget_bytes: usize,
@@ -847,7 +1002,26 @@ impl Drop for DrainedVisibilityLease {
                 registry.remove(key);
             }
         }
+        if registry.is_empty() {
+            // Force the container root (and any allocator-retained tree
+            // structure) to be dropped before the authority is refunded.
+            // When other generations remain, their live leases continue to
+            // hold the corresponding global charge.
+            *registry = std::collections::BTreeMap::new();
+        }
+        drop(registry);
+        // `Drop::drop` runs before Rust drops struct fields. Explicitly take
+        // and destroy the lease-owned duplicate keys, Vec capacity, sources,
+        // and logical-memory guard before reopening the process-wide budget.
+        let entries = std::mem::take(&mut self.entries);
+        drop(entries);
+        let memory = std::mem::replace(
+            &mut self._memory,
+            crate::ingest_memory::Retained::disabled(),
+        );
+        drop(memory);
         self.budget.release(self.budget_bytes);
+        self.budget_bytes = 0;
     }
 }
 
@@ -874,11 +1048,21 @@ impl ShardedFtsMemtable {
             .collect();
         Self {
             shards,
-            prepublication: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            // BTreeMap nodes are generation-owned allocations: removing the
+            // last lease entry frees its node immediately. A HashMap retained
+            // its peak bucket array after refunding the process-wide budget,
+            // allowing sequential indices to accumulate unaccounted capacity.
+            prepublication: Arc::new(parking_lot::RwLock::new(std::collections::BTreeMap::new())),
             prepublication_budget: Arc::clone(&GLOBAL_PREPUBLICATION_BUDGET),
             prepublication_budget_limit: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_PREPUBLICATION_BUDGET_BYTES,
             ),
+            #[cfg(test)]
+            fail_prepublication_after_reserve: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_prepublication_after_pending_rows: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            prepublication_sources_alive: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shard_mask: n - 1,
         }
     }
@@ -944,7 +1128,17 @@ impl ShardedFtsMemtable {
     }
 
     fn prepublication_envelope_bytes(docs: &[MemEntry]) -> usize {
-        let fixed = std::mem::size_of::<((String, u64, usize), Arc<PrepublicationSource>)>()
+        // BTreeMap's node layout is private, so charge a deliberately
+        // conservative 1 KiB allocator envelope per row in addition to every
+        // owned payload. This is an admission estimate rather than allocator
+        // RSS (the process allocator may retain freed pages), but all
+        // container allocations are actually dropped before the lease refunds
+        // this authority.
+        let fixed = 1024usize
+            .saturating_add(std::mem::size_of::<(
+                (String, u64, usize),
+                Arc<PrepublicationSource>,
+            )>())
             .saturating_add(std::mem::size_of::<PrepublicationSource>())
             .saturating_add(std::mem::size_of::<Arc<PrepublicationSource>>())
             .saturating_add(3 * std::mem::size_of::<usize>());
@@ -964,6 +1158,18 @@ impl ShardedFtsMemtable {
     fn set_prepublication_budget_for_test(&self, bytes: usize) {
         self.prepublication_budget_limit
             .store(bytes, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn fail_prepublication_after_reserve_for_test(&self) {
+        self.fail_prepublication_after_reserve
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn fail_prepublication_after_pending_rows_for_test(&self, rows: usize) {
+        self.fail_prepublication_after_pending_rows
+            .store(rows, std::sync::atomic::Ordering::Release);
     }
 
     /// Total approximate byte size across all shards.
@@ -2046,7 +2252,8 @@ impl ShardedFtsMemtable {
                 // slot. A failed reservation therefore leaves the registry
                 // empty and the active shard untouched.
                 let mut registry = self.prepublication.write();
-                if registry.try_reserve(g.docs.len()).is_err() {
+                let mut pending = Vec::new();
+                if pending.try_reserve_exact(g.docs.len()).is_err() {
                     self.prepublication_budget.release(envelope_bytes);
                     return DrainedVisibilityLease {
                         registry: Arc::clone(&self.prepublication),
@@ -2056,8 +2263,11 @@ impl ShardedFtsMemtable {
                         _memory: crate::ingest_memory::Retained::disabled(),
                     };
                 }
-                let mut pending = Vec::new();
-                if pending.try_reserve_exact(g.docs.len()).is_err() {
+                #[cfg(test)]
+                if self
+                    .fail_prepublication_after_reserve
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
                     self.prepublication_budget.release(envelope_bytes);
                     return DrainedVisibilityLease {
                         registry: Arc::clone(&self.prepublication),
@@ -2070,6 +2280,7 @@ impl ShardedFtsMemtable {
                 for entry in &g.docs {
                     let mut registry_id = String::new();
                     if registry_id.try_reserve_exact(entry.doc_id.len()).is_err() {
+                        drop(pending);
                         self.prepublication_budget.release(envelope_bytes);
                         return DrainedVisibilityLease {
                             registry: Arc::clone(&self.prepublication),
@@ -2082,6 +2293,7 @@ impl ShardedFtsMemtable {
                     registry_id.push_str(&entry.doc_id);
                     let mut lease_id = String::new();
                     if lease_id.try_reserve_exact(entry.doc_id.len()).is_err() {
+                        drop(pending);
                         self.prepublication_budget.release(envelope_bytes);
                         return DrainedVisibilityLease {
                             registry: Arc::clone(&self.prepublication),
@@ -2092,15 +2304,38 @@ impl ShardedFtsMemtable {
                         };
                     }
                     lease_id.push_str(&entry.doc_id);
+                    #[cfg(test)]
+                    self.prepublication_sources_alive
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     let source = Arc::new(PrepublicationSource {
                         source: Arc::clone(&entry.source),
                         source_bytes: Arc::clone(&entry.source_bytes),
+                        #[cfg(test)]
+                        live_probe: Arc::clone(&self.prepublication_sources_alive),
                     });
                     pending.push((
                         (registry_id, entry.seq_no, shard_idx),
                         (lease_id, entry.seq_no, shard_idx),
                         source,
                     ));
+                    #[cfg(test)]
+                    if self
+                        .fail_prepublication_after_pending_rows
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == pending.len()
+                    {
+                        self.fail_prepublication_after_pending_rows
+                            .store(0, std::sync::atomic::Ordering::Release);
+                        drop(pending);
+                        self.prepublication_budget.release(envelope_bytes);
+                        return DrainedVisibilityLease {
+                            registry: Arc::clone(&self.prepublication),
+                            entries: Vec::new(),
+                            budget: Arc::clone(&self.prepublication_budget),
+                            budget_bytes: 0,
+                            _memory: crate::ingest_memory::Retained::disabled(),
+                        };
+                    }
                 }
                 let mut entries = Vec::with_capacity(pending.len());
                 for (registry_key, lease_key, source) in pending {

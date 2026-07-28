@@ -155,8 +155,99 @@ pub struct DrainedMemtable {
     pub entries: Vec<MemEntry>,
 }
 
+/// Result of the transactional flush finalizer. `Err` is reserved for work
+/// which failed before the RCU publication boundary. Once `Published` is
+/// returned, callers must retain the segment even when maintenance was
+/// deferred.
+pub enum FlushPublication {
+    Empty,
+    Published {
+        meta: SegmentMeta,
+        maintenance_error: Option<String>,
+    },
+}
+
 struct PublicationEpochGuard<'a> {
     epoch: &'a AtomicU64,
+}
+
+struct UnpublishedSegmentGuard<'a> {
+    store: &'a IndexStore,
+    segment_id: String,
+    rollback: PublicationRollback<'a>,
+    published: bool,
+}
+
+enum PublicationRollback<'a> {
+    Entries(&'a [MemEntry]),
+    Tombstones(&'a [(u64, String)]),
+}
+
+impl Drop for UnpublishedSegmentGuard<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.rollback_version_ownership();
+            self.store
+                .remove_unpublished_segment_files(&self.segment_id);
+        }
+    }
+}
+
+impl UnpublishedSegmentGuard<'_> {
+    fn rollback_version_ownership(&self) {
+        match self.rollback {
+            PublicationRollback::Entries(entries) => {
+                for entry in entries {
+                    if self
+                        .store
+                        .version_map
+                        .get(&entry.doc_id)
+                        .is_some_and(|version| {
+                            version.seq_no == entry.seq_no
+                                && version.segment_id.as_ref() == self.segment_id
+                        })
+                    {
+                        if entry.source.is_some() {
+                            self.store.version_map.repoint(
+                                &entry.doc_id,
+                                entry.seq_no,
+                                IN_MEMORY_SEGMENT_ID,
+                            );
+                        } else {
+                            self.store.version_map.set_if_latest(
+                                &entry.doc_id,
+                                entry.seq_no,
+                                IN_MEMORY_SEGMENT_ID,
+                                true,
+                            );
+                        }
+                    }
+                }
+            }
+            PublicationRollback::Tombstones(pairs) => {
+                for (seq_no, doc_id) in pairs {
+                    if self.store.version_map.get(doc_id).is_some_and(|version| {
+                        version.seq_no == *seq_no && version.segment_id.as_ref() == self.segment_id
+                    }) {
+                        self.store.version_map.set_if_latest(
+                            doc_id,
+                            *seq_no,
+                            IN_MEMORY_SEGMENT_ID,
+                            true,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Restore exact ownership while the publication latch is held, but defer
+    /// potentially slow local/object cleanup until after locks are released.
+    fn disarm_after_rollback(&mut self) -> String {
+        self.rollback_version_ownership();
+        self.published = true;
+        self.segment_id.clone()
+    }
 }
 
 impl Drop for PublicationEpochGuard<'_> {
@@ -448,6 +539,14 @@ pub struct IndexStore {
     publication_epoch: AtomicU64,
     publication_writer: Mutex<()>,
     publication_latch: RwLock<()>,
+    deferred_flush_maintenance_errors: AtomicU64,
+    flush_maintenance_retry_pending: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_post_publish_snapshot_save: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_post_publish_wal_maintenance: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    panic_next_immediately_after_publication: std::sync::atomic::AtomicBool,
     /// Sharded WAL writers — each shard has its own WAL file and mutex.
     /// Batches route to a shard by `xxh3(doc_id) & (num_shards - 1)`.
     /// When num_wal_shards=1, this is equivalent to the old single-WAL path.
@@ -624,6 +723,14 @@ impl IndexStore {
             publication_epoch: AtomicU64::new(0),
             publication_writer: Mutex::new(()),
             publication_latch: RwLock::new(()),
+            deferred_flush_maintenance_errors: AtomicU64::new(0),
+            flush_maintenance_retry_pending: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_post_publish_snapshot_save: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_post_publish_wal_maintenance: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            panic_next_immediately_after_publication: std::sync::atomic::AtomicBool::new(false),
             wal_shards,
             version_map: Arc::clone(&version_map),
             seq_counter,
@@ -1072,13 +1179,52 @@ impl IndexStore {
                 }
             }
         }
-        if let StorageMode::ObjectStore { cache_dir, .. } = &self.config.storage_mode {
+        if let StorageMode::ObjectStore { backend, cache_dir } = &self.config.storage_mode {
             if let Ok(entries) = std::fs::read_dir(cache_dir) {
                 for entry in entries.flatten() {
                     if entry.file_name().to_string_lossy().starts_with(segment_id) {
                         let _ = std::fs::remove_file(entry.path());
                     }
                 }
+            }
+            // Upload precedes the local publication boundary. A later sidecar,
+            // publisher, or midpoint failure must therefore remove the remote
+            // primary object as part of the same rollback. Run the async
+            // backend operation on a short dedicated runtime: this function is
+            // also called from Drop/unwind paths where entering the caller's
+            // Tokio runtime would panic or poison publication state.
+            let backend = Arc::clone(backend);
+            let object_key = format!("segments/{segment_id}.seg");
+            let cleanup = std::thread::Builder::new()
+                .name("xerj-unpublished-object-cleanup".into())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    match runtime {
+                        Ok(runtime) => runtime.block_on(backend.delete(&object_key)),
+                        Err(error) => Err(StorageError::Backend(format!(
+                            "cannot create rollback runtime: {error}"
+                        ))),
+                    }
+                })
+                .and_then(|thread| {
+                    thread
+                        .join()
+                        .map_err(|_| std::io::Error::other("object rollback thread panicked"))
+                });
+            match cleanup {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
+                    segment_id,
+                    error = %error,
+                    "failed to remove unpublished remote segment"
+                ),
+                Err(error) => warn!(
+                    segment_id,
+                    error = %error,
+                    "failed to run unpublished remote segment cleanup"
+                ),
             }
         }
     }
@@ -1491,7 +1637,10 @@ impl IndexStore {
     where
         F: FnOnce(&SegmentMeta) -> Result<()>,
     {
-        self.finalize_borrowed_flush_with_publishers(drained, post_finish, |_| {})
+        match self.finalize_borrowed_flush_with_publishers(drained, post_finish, |_| {})? {
+            FlushPublication::Empty => Ok(None),
+            FlushPublication::Published { meta, .. } => Ok(Some(meta)),
+        }
     }
 
     /// Borrowed finalizer with a hook at the exact publication midpoint:
@@ -1504,14 +1653,14 @@ impl IndexStore {
         drained: &DrainedMemtable,
         post_finish: F,
         before_snapshot: G,
-    ) -> Result<Option<SegmentMeta>>
+    ) -> Result<FlushPublication>
     where
         F: FnOnce(&SegmentMeta) -> Result<()>,
         G: FnOnce(&SegmentMeta),
     {
         let entries = &drained.entries;
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(FlushPublication::Empty);
         }
 
         // THROWAWAY prof (XERJ_PROF): finalize phase breakdown.
@@ -1526,6 +1675,12 @@ impl IndexStore {
 
         let segments_dir = self.data_dir.join("segments");
         let mut writer = SegmentWriter::new(&segments_dir, self.config.schema_version, 0, 0)?;
+        let mut unpublished_output = UnpublishedSegmentGuard {
+            store: self,
+            segment_id: writer.segment_id().to_string(),
+            rollback: PublicationRollback::Entries(entries),
+            published: false,
+        };
 
         // Build stored-fields bytes directly, streaming each source value
         // into the output buffer via `serde_json::to_writer`.  The previous
@@ -1732,12 +1887,7 @@ impl IndexStore {
                 .filter(|e| e.source.is_some())
                 .map(|e| (e.seq_no, e.doc_id.as_str()))
                 .collect();
-            if let Err(e) = self.write_ids_sidecar(meta.id.as_str(), &pairs) {
-                tracing::warn!(
-                    segment_id = meta.id.as_str(),
-                    "failed to write seg.ids sidecar: {e}"
-                );
-            }
+            self.write_ids_sidecar(meta.id.as_str(), &pairs)?;
         }
 
         // Run the caller-supplied "build side-car files" step.  This must
@@ -1766,7 +1916,10 @@ impl IndexStore {
             .publication_latch
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _publication_writer = self.publication_writer.lock().unwrap();
+        let _publication_writer = self
+            .publication_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prior_epoch = self.publication_epoch.fetch_add(1, Ordering::AcqRel);
         debug_assert_eq!(prior_epoch & 1, 0, "publication writers must serialize");
         let _publication_epoch = PublicationEpochGuard {
@@ -1799,7 +1952,43 @@ impl IndexStore {
                 );
             }
         }
-        before_snapshot(&meta);
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            before_snapshot(&meta);
+            self.snapshot
+                .rcu(|old| Arc::new(old.with_new_segment(meta.clone())));
+        }));
+        match publication {
+            Ok(()) => {
+                // This must be the literal first operation after successful
+                // RCU publication. From here onward unwind cleanup must retain
+                // the now-authoritative prefix.
+                unpublished_output.published = true;
+            }
+            Err(payload) => {
+                // Roll back exact version ownership and remove the prefix
+                // while the publication write latch is still held. Release
+                // every std lock before resuming the caller's panic so the
+                // writer is not poisoned and a retained retry can proceed.
+                let unpublished_segment = unpublished_output.disarm_after_rollback();
+                drop(_publication_epoch);
+                drop(_publication_writer);
+                drop(_publication_latch);
+                self.remove_unpublished_segment_files(&unpublished_segment);
+                std::panic::resume_unwind(payload);
+            }
+        }
+        // No potentially panicking diagnostics or maintenance may run while
+        // the std writer mutex is held after the irreversible boundary.
+        drop(_publication_epoch);
+        drop(_publication_writer);
+        drop(_publication_latch);
+        #[cfg(test)]
+        if self
+            .panic_next_immediately_after_publication
+            .swap(false, Ordering::AcqRel)
+        {
+            panic!("injected panic immediately after RCU publication and guard disarm");
+        }
         if prof {
             eprintln!(
                 "XERJ_PROF finalize docs={} ser_us={} encode_us={} writer_finish_us={} post_finish_us={} vm_us={} total_so_far_us={}",
@@ -1826,9 +2015,10 @@ impl IndexStore {
         // ~30 % of `_refresh` calls losing 1-2 docs after 6-doc
         // sequential PUTs in the YAML suite (110_field_collapsing
         // setup, et al.).
-        self.snapshot
-            .rcu(|old| Arc::new(old.with_new_segment(meta.clone())));
-
+        // This is the irreversible publication boundary. From this point the
+        // version map and the RCU snapshot both name `meta`, so no later
+        // maintenance failure may make the caller classify this output as
+        // unpublished and delete or requeue it.
         // V4 M4 — checkpoint + rotate + prune, NOW time-gated.
         //
         // Pre-gate: this loop ran for ALL 16 WAL shards on EVERY
@@ -1886,7 +2076,38 @@ impl IndexStore {
             if let Err(e) = self.persist_pending_tombstones() {
                 warn!(error = %e, "tombstone persistence failed — deletes stay WAL-pinned");
             }
-            self.save_snapshot()?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            let snapshot_save = if self
+                .fail_next_post_publish_snapshot_save
+                .swap(false, Ordering::AcqRel)
+            {
+                Err(StorageError::Io(std::io::Error::other(
+                    "injected post-publication snapshot save failure",
+                )))
+            } else {
+                self.save_snapshot()
+            };
+            #[cfg(not(any(test, feature = "test-hooks")))]
+            let snapshot_save = self.save_snapshot();
+            if let Err(error) = snapshot_save {
+                self.deferred_flush_maintenance_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                self.flush_maintenance_retry_pending
+                    .store(true, Ordering::Release);
+                // The failed CAS claimed this maintenance tick. Give the next
+                // flush an immediate retry rather than suppressing recovery
+                // for the normal one-second debounce interval.
+                self.last_wal_maintenance_ms.store(0, Ordering::Release);
+                warn!(
+                    segment_id = meta.id.as_str(),
+                    error = %error,
+                    "post-publication snapshot persistence deferred; ready-marker recovery and WAL retain the published generation"
+                );
+                return Ok(FlushPublication::Published {
+                    meta,
+                    maintenance_error: Some(error.to_string()),
+                });
+            }
             // RC4 W1 #8 — verified maintenance (see
             // `wal_maintain_all_verified`).  The pre-fix loop here
             // checkpointed EVERY shard with THIS segment's `max_seq` and
@@ -1904,11 +2125,44 @@ impl IndexStore {
             // holding unproven entries are retained (that retention IS the
             // fix) and reclaimed on a later tick once their docs flush.
             let durable_max = self.snapshot.load().max_seq_no;
-            self.wal_maintain_all_verified(durable_max)?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            let wal_maintenance = if self
+                .fail_next_post_publish_wal_maintenance
+                .swap(false, Ordering::AcqRel)
+            {
+                Err(StorageError::Io(std::io::Error::other(
+                    "injected post-publication WAL maintenance failure",
+                )))
+            } else {
+                self.wal_maintain_all_verified(durable_max)
+            };
+            #[cfg(not(any(test, feature = "test-hooks")))]
+            let wal_maintenance = self.wal_maintain_all_verified(durable_max);
+            if let Err(error) = wal_maintenance {
+                self.deferred_flush_maintenance_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                self.flush_maintenance_retry_pending
+                    .store(true, Ordering::Release);
+                self.last_wal_maintenance_ms.store(0, Ordering::Release);
+                warn!(
+                    segment_id = meta.id.as_str(),
+                    error = %error,
+                    "post-publication WAL maintenance deferred; published segment remains authoritative"
+                );
+                return Ok(FlushPublication::Published {
+                    meta,
+                    maintenance_error: Some(error.to_string()),
+                });
+            }
+            self.flush_maintenance_retry_pending
+                .store(false, Ordering::Release);
         }
 
         info!(segment_id, doc_count, min_seq, max_seq, "segment flushed");
-        Ok(Some(meta))
+        Ok(FlushPublication::Published {
+            meta,
+            maintenance_error: None,
+        })
     }
 
     /// Flush if the memtable is over the configured threshold.
@@ -1971,6 +2225,41 @@ impl IndexStore {
         self.publication_latch
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_post_publish_snapshot_save_for_test(&self) {
+        self.fail_next_post_publish_snapshot_save
+            .store(true, Ordering::Release);
+        self.last_wal_maintenance_ms.store(0, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_post_publish_wal_maintenance_for_test(&self) {
+        self.fail_next_post_publish_wal_maintenance
+            .store(true, Ordering::Release);
+        self.last_wal_maintenance_ms.store(0, Ordering::Release);
+    }
+
+    /// Number of post-publication snapshot/WAL maintenance failures observed
+    /// by this store. Publication remains committed; a zeroed maintenance
+    /// debounce makes the next flush retry immediately, while explicit
+    /// `force_wal_maintenance` remains available to callers.
+    pub fn deferred_flush_maintenance_errors(&self) -> u64 {
+        self.deferred_flush_maintenance_errors
+            .load(Ordering::Acquire)
+    }
+
+    /// True while a post-publication maintenance failure still needs a
+    /// successful snapshot + verified WAL maintenance pass.
+    pub fn flush_maintenance_retry_pending(&self) -> bool {
+        self.flush_maintenance_retry_pending.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn panic_next_immediately_after_publication_for_test(&self) {
+        self.panic_next_immediately_after_publication
+            .store(true, Ordering::Release);
     }
 
     /// Return the current WAL sequence number (the next value that
@@ -2046,6 +2335,13 @@ impl IndexStore {
     /// is covered by `recover_orphaned_segments`, which resurrects
     /// orphan tombstone-only segments from their (CRC-validated) header.
     fn persist_pending_tombstones(&self) -> Result<()> {
+        self.persist_pending_tombstones_with_hook(|| {})
+    }
+
+    fn persist_pending_tombstones_with_hook<F>(&self, after_repoint: F) -> Result<()>
+    where
+        F: FnOnce(),
+    {
         // Collect deletes whose tombstone is still memtable-resident.
         let pairs: Vec<(u64, String)> = {
             let pending = self.pending_deletes.lock().unwrap();
@@ -2072,6 +2368,12 @@ impl IndexStore {
 
         let segments_dir = self.data_dir.join("segments");
         let mut writer = SegmentWriter::new(&segments_dir, self.config.schema_version, 0, 0)?;
+        let mut unpublished_output = UnpublishedSegmentGuard {
+            store: self,
+            segment_id: writer.segment_id().to_string(),
+            rollback: PublicationRollback::Tombstones(&pairs),
+            published: false,
+        };
         writer.add_section(
             SectionType::Tombstones,
             crate::segment::encode_tombstones_v2(&pair_refs),
@@ -2082,6 +2384,19 @@ impl IndexStore {
 
         // Segment is durable — repoint the tombstones onto it (guarded:
         // a doc re-indexed since collection keeps its newer live entry).
+        let _publication_latch = self
+            .publication_latch
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _publication_writer = self
+            .publication_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior_epoch = self.publication_epoch.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(prior_epoch & 1, 0, "publication writers must serialize");
+        let _publication_epoch = PublicationEpochGuard {
+            epoch: &self.publication_epoch,
+        };
         let seg_arc: std::sync::Arc<str> = std::sync::Arc::from(meta.id.as_str());
         for (seq, doc_id) in &pairs {
             self.version_map.set_if_latest(
@@ -2091,10 +2406,30 @@ impl IndexStore {
                 true,
             );
         }
-
-        // Publish so the caller's save_snapshot() registers it on disk.
-        self.snapshot
-            .rcu(|old| Arc::new(old.with_new_segment(meta.clone())));
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            after_repoint();
+            // Publish so the caller's save_snapshot() registers it on disk.
+            self.snapshot
+                .rcu(|old| Arc::new(old.with_new_segment(meta.clone())));
+        }));
+        match publication {
+            Ok(()) => {
+                // As in the document finalizer, disarm before any other work
+                // can unwind after the snapshot has become authoritative.
+                unpublished_output.published = true;
+            }
+            Err(payload) => {
+                let unpublished_segment = unpublished_output.disarm_after_rollback();
+                drop(_publication_epoch);
+                drop(_publication_writer);
+                drop(_publication_latch);
+                self.remove_unpublished_segment_files(&unpublished_segment);
+                std::panic::resume_unwind(payload);
+            }
+        }
+        drop(_publication_epoch);
+        drop(_publication_writer);
+        drop(_publication_latch);
 
         info!(
             segment_id = meta.id.as_str(),
@@ -2339,6 +2674,8 @@ impl IndexStore {
         self.save_snapshot()?;
         let durable_max = self.snapshot.load().max_seq_no;
         self.wal_maintain_all_verified(durable_max)?;
+        self.flush_maintenance_retry_pending
+            .store(false, Ordering::Release);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -3984,6 +4321,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tombstone_repoint_and_snapshot_are_one_reader_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("deleted", serde_json::json!({"body": "old"}))
+            .unwrap();
+        store.flush().unwrap().unwrap();
+        store.delete("deleted").unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let maintenance = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store
+                    .persist_pending_tombstones_with_hook(|| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                    .unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (read_tx, read_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let publication = store.publication_capture();
+                let snapshot = store.snapshot();
+                let version = store.version_map.get("deleted").unwrap();
+                drop(publication);
+                read_tx
+                    .send((
+                        version,
+                        snapshot
+                            .segments
+                            .iter()
+                            .map(|meta| meta.id.clone())
+                            .collect::<Vec<_>>(),
+                    ))
+                    .unwrap();
+            })
+        };
+        assert!(
+            read_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "reader crossed tombstone repoint before snapshot publication"
+        );
+        release_tx.send(()).unwrap();
+        maintenance.join().unwrap();
+        let (version, segment_ids) = read_rx.recv().unwrap();
+        reader.join().unwrap();
+        assert!(version.deleted);
+        assert!(segment_ids
+            .iter()
+            .any(|id| id.as_str() == version.segment_id.as_ref()));
+    }
+
     fn walk_wal_files(root: &Path) -> Vec<u64> {
         let mut sizes = Vec::new();
         let mut dirs = vec![root.to_path_buf()];
@@ -4043,11 +4441,14 @@ mod tests {
         });
         assert!(result.is_err());
         let segments_dir = dir.path().join("segments");
-        assert!(std::fs::read_dir(&segments_dir).unwrap().any(|entry| entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".seg")));
+        assert!(
+            !std::fs::read_dir(&segments_dir).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".seg")),
+            "prepublication failure must remove its complete output prefix immediately"
+        );
         assert!(!std::fs::read_dir(&segments_dir).unwrap().any(|entry| entry
             .unwrap()
             .file_name()
@@ -4063,6 +4464,218 @@ mod tests {
             .to_string_lossy()
             .ends_with(".seg")));
         assert!(reopened.version_map.get("incomplete").is_some());
+    }
+
+    fn assert_post_publication_maintenance_failure_is_committed(fail_snapshot: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("committed", serde_json::json!({"body": "retained"}))
+            .unwrap();
+        let drained = store.take_memtable_for_flush().unwrap();
+        if fail_snapshot {
+            store.fail_next_post_publish_snapshot_save_for_test();
+        } else {
+            store.fail_next_post_publish_wal_maintenance_for_test();
+        }
+        let publication = store
+            .finalize_borrowed_flush_with_publishers(&drained, |_| Ok(()), |_| {})
+            .unwrap();
+        let (meta, maintenance_error) = match publication {
+            FlushPublication::Published {
+                meta,
+                maintenance_error,
+            } => (meta, maintenance_error),
+            FlushPublication::Empty => panic!("non-empty drain must publish"),
+        };
+        assert!(maintenance_error.is_some());
+        assert_eq!(store.deferred_flush_maintenance_errors(), 1);
+        assert!(store.flush_maintenance_retry_pending());
+        assert!(store
+            .snapshot()
+            .segments
+            .iter()
+            .any(|segment| segment.id == meta.id));
+        assert!(dir
+            .path()
+            .join("segments")
+            .join(format!("{}.seg", meta.id))
+            .exists());
+        assert_eq!(
+            store
+                .version_map
+                .get("committed")
+                .unwrap()
+                .segment_id
+                .as_ref(),
+            meta.id
+        );
+        // Resetting the debounce on failure makes the next ordinary flush run
+        // the complete snapshot + verified-WAL maintenance path immediately.
+        store
+            .index("maintenance-retry", serde_json::json!({"body": "next"}))
+            .unwrap();
+        let retry_drained = store.take_memtable_for_flush().unwrap();
+        let retry = store
+            .finalize_borrowed_flush_with_publishers(&retry_drained, |_| Ok(()), |_| {})
+            .unwrap();
+        assert!(matches!(
+            retry,
+            FlushPublication::Published {
+                maintenance_error: None,
+                ..
+            }
+        ));
+        assert!(!store.flush_maintenance_retry_pending());
+        assert_eq!(store.deferred_flush_maintenance_errors(), 1);
+        drop(store);
+
+        // Snapshot-save failure recovers through the exact ready marker and
+        // retained WAL; WAL-maintenance failure reopens from the saved
+        // snapshot. Both paths must preserve the committed generation.
+        let reopened = open_test_store(dir.path());
+        assert!(reopened
+            .snapshot()
+            .segments
+            .iter()
+            .any(|segment| segment.id == meta.id));
+        let version = reopened.version_map.get("committed").unwrap();
+        assert!(!version.deleted);
+        assert_eq!(version.segment_id.as_ref(), meta.id);
+        // A later maintenance pass must remain usable after the deferred one.
+        reopened.force_wal_maintenance().unwrap();
+    }
+
+    #[test]
+    fn post_rcu_snapshot_save_failure_retains_and_recovers_published_segment() {
+        assert_post_publication_maintenance_failure_is_committed(true);
+    }
+
+    #[test]
+    fn post_rcu_wal_maintenance_failure_retains_and_recovers_published_segment() {
+        assert_post_publication_maintenance_failure_is_committed(false);
+    }
+
+    #[test]
+    fn option_wrapper_preserves_observable_deferred_maintenance_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("wrapper-state", serde_json::json!({"body": "committed"}))
+            .unwrap();
+        store.fail_next_post_publish_snapshot_save_for_test();
+        assert!(store.flush().unwrap().is_some());
+        assert_eq!(store.deferred_flush_maintenance_errors(), 1);
+        assert!(store.flush_maintenance_retry_pending());
+        store.force_wal_maintenance().unwrap();
+        assert!(!store.flush_maintenance_retry_pending());
+    }
+
+    #[test]
+    fn panic_before_rcu_cleans_every_unpublished_output_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("before-rcu", serde_json::json!({"body": "pending"}))
+            .unwrap();
+        let drained = store.take_memtable_for_flush().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.finalize_borrowed_flush_with_publishers(
+                &drained,
+                |_| Ok(()),
+                |_| panic!("injected immediately before snapshot RCU"),
+            );
+        }));
+        assert!(result.is_err());
+        let names = std::fs::read_dir(dir.path().join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().all(|name| !name.ends_with(".seg")
+                && !name.ends_with(".ids")
+                && !name.ends_with(".ready")
+                && !name.ends_with(".sidx")),
+            "unpublished prefix survived pre-RCU panic: {names:?}"
+        );
+        assert!(store.snapshot().segments.is_empty());
+        assert_eq!(
+            store
+                .version_map
+                .get("before-rcu")
+                .unwrap()
+                .segment_id
+                .as_ref(),
+            IN_MEMORY_SEGMENT_ID
+        );
+    }
+
+    #[test]
+    fn panic_after_rcu_disarm_retains_complete_published_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("after-rcu", serde_json::json!({"body": "committed"}))
+            .unwrap();
+        let drained = store.take_memtable_for_flush().unwrap();
+        store.panic_next_immediately_after_publication_for_test();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.finalize_borrowed_flush_with_publishers(&drained, |_| Ok(()), |_| {});
+        }));
+        assert!(result.is_err());
+        let snapshot = store.snapshot();
+        let meta = snapshot.segments.last().expect("RCU must have published");
+        let segments = dir.path().join("segments");
+        for suffix in ["seg", "sidx", "ids", "ready"] {
+            assert!(
+                segments.join(format!("{}.{}", meta.id, suffix)).exists(),
+                "published {suffix} file was removed after guard disarm"
+            );
+        }
+        let version = store.version_map.get("after-rcu").unwrap();
+        assert_eq!(version.segment_id.as_ref(), meta.id);
+        // The injected unwind occurs only after disarm and lock release. A
+        // subsequent transaction proves no publication lock was poisoned.
+        drop(snapshot);
+        store
+            .index("after-rcu-next", serde_json::json!({"body": "next"}))
+            .unwrap();
+        assert!(store.flush().unwrap().is_some());
+    }
+
+    #[test]
+    fn tombstone_panic_before_rcu_rolls_back_owner_and_cleans_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("tombstone-panic", serde_json::json!({"body": "old"}))
+            .unwrap();
+        store.flush().unwrap().unwrap();
+        store.delete("tombstone-panic").unwrap();
+        let before = std::fs::read_dir(dir.path().join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::HashSet<_>>();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.persist_pending_tombstones_with_hook(|| {
+                panic!("injected tombstone midpoint panic")
+            });
+        }));
+        assert!(result.is_err());
+        let after = std::fs::read_dir(dir.path().join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(after, before, "tombstone panic leaked an output prefix");
+        let version = store.version_map.get("tombstone-panic").unwrap();
+        assert!(version.deleted);
+        assert_eq!(version.segment_id.as_ref(), IN_MEMORY_SEGMENT_ID);
+        // Rollback explicitly releases locks before resuming the panic.
+        // Retrying the same tombstone publication must therefore succeed.
+        store.persist_pending_tombstones().unwrap();
+        let version = store.version_map.get("tombstone-panic").unwrap();
+        assert!(version.deleted);
+        assert_ne!(version.segment_id.as_ref(), IN_MEMORY_SEGMENT_ID);
     }
 
     #[test]
@@ -4179,6 +4792,64 @@ mod tests {
         // Segment should also be in local cache.
         let cached = cache_dir.path().join(&meta.seg_path);
         assert!(cached.exists(), "segment not cached locally: {:?}", cached);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_prepublication_failure_removes_uploaded_object() {
+        use crate::backend::S3Backend;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let s3_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(S3Backend::new(s3_dir.path(), "test-bucket", "xerj/"));
+        let store = IndexStore::open(
+            data_dir.path(),
+            IndexStoreConfig {
+                sync_mode: SyncMode::Batched,
+                storage_mode: StorageMode::ObjectStore {
+                    backend: Arc::clone(&backend),
+                    cache_dir: cache_dir.path().to_path_buf(),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .index("rollback-remote", serde_json::json!({"body": "pending"}))
+            .unwrap();
+        let drained = store.take_memtable_for_flush().unwrap();
+        let warmed_id = Arc::new(std::sync::Mutex::new(None::<String>));
+        let result = store.finalize_borrowed_flush_with_publishers(
+            &drained,
+            {
+                let warmed_id = Arc::clone(&warmed_id);
+                move |meta| {
+                    *warmed_id.lock().unwrap() = Some(meta.id.clone());
+                    Err(StorageError::Io(std::io::Error::other(
+                        "injected publisher failure after upload",
+                    )))
+                }
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        let segment_id = warmed_id.lock().unwrap().clone().unwrap();
+        let object_key = format!("segments/{segment_id}.seg");
+        assert!(
+            !backend.exists(&object_key).await.unwrap(),
+            "prepublication failure leaked remote object {object_key}"
+        );
+        assert!(
+            std::fs::read_dir(data_dir.path().join("segments"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&segment_id)),
+            "prepublication failure leaked local output prefix"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
