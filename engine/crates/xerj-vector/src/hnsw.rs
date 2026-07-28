@@ -545,6 +545,39 @@ fn backlink_distances(graph: &impl GraphStorageRead, base: u32, layer: usize) ->
         .collect()
 }
 
+/// True when `slot` is the current slot for its external ID. A reused
+/// external ID orphans its old slot: the orphan stays in the slab as
+/// traversal-only topology and must never surface as a hit or be
+/// persisted as graph metadata.
+#[inline]
+fn is_live_slot(graph: &impl GraphStorageRead, slot: u32) -> bool {
+    graph.current_slot(graph.external_id(slot)) == Some(slot)
+}
+
+/// The live slot with the highest layer, preferring the stored entry
+/// point when it is still live. This is the entry the graph should
+/// advertise: after an external-ID reuse the stored `entry_slot` /
+/// `entry_layer` pair can describe an orphan slot (or pair the current
+/// identity with the orphan's layer), which persisted as a corrupt
+/// header and resurfaced stale vectors.
+fn highest_live_entry(graph: &impl GraphStorageRead) -> Option<(u32, usize)> {
+    let slot_layer = |slot: u32| graph.layer_count(slot).saturating_sub(1);
+    let mut best = graph
+        .entry_slot()
+        .filter(|&slot| is_live_slot(graph, slot))
+        .map(|slot| (slot, slot_layer(slot)));
+    for slot in 0..graph.node_count() as u32 {
+        if !is_live_slot(graph, slot) {
+            continue;
+        }
+        let layer = slot_layer(slot);
+        if best.is_none_or(|(_, best_layer)| layer > best_layer) {
+            best = Some((slot, layer));
+        }
+    }
+    best
+}
+
 fn encode_graph_bytes(
     params: &HnswParams,
     graph: &impl GraphStorageRead,
@@ -567,17 +600,22 @@ fn encode_graph_bytes(
         .write_u32::<LittleEndian>(graph.dimension() as u32)
         .map_err(io_to_xerj)?;
 
-    let entry_id = graph.entry_slot().map(|slot| graph.external_id(slot));
+    // Derive the entry header from live topology rather than trusting the
+    // stored entry metadata: after an external-ID reuse the stored pair can
+    // name an orphan slot or an inflated layer, and a reload would reject
+    // or mis-descend the graph.
+    let live_entry = highest_live_entry(graph);
+    let entry_id = live_entry.map(|(slot, _)| graph.external_id(slot));
     buffer
         .write_u64::<LittleEndian>(entry_id.unwrap_or(u64::MAX))
         .map_err(io_to_xerj)?;
     buffer
-        .write_u32::<LittleEndian>(graph.entry_layer() as u32)
+        .write_u32::<LittleEndian>(live_entry.map_or(0, |(_, layer)| layer) as u32)
         .map_err(io_to_xerj)?;
 
     // Live slots only (a reused external ID orphans its old slot).
     let live: Vec<u32> = (0..graph.node_count() as u32)
-        .filter(|&slot| graph.current_slot(graph.external_id(slot)) == Some(slot))
+        .filter(|&slot| is_live_slot(graph, slot))
         .collect();
     buffer
         .write_u32::<LittleEndian>(live.len() as u32)
@@ -725,6 +763,10 @@ impl HnswIndex {
     /// # Panics
     /// Does not panic — returns `Err` if the vector dimension doesn't match.
     pub fn insert(&self, id: u64, vector: Vec<f32>) -> Result<()> {
+        self.insert_at_level(id, vector, self.random_level())
+    }
+
+    fn insert_at_level(&self, id: u64, vector: Vec<f32>, node_level: usize) -> Result<()> {
         if vector.len() != self.params.dim {
             return Err(XerjError::invalid_mapping(format!(
                 "HNSW insert: vector dim {} != index dim {}",
@@ -733,11 +775,13 @@ impl HnswIndex {
             )));
         }
 
-        let node_level = self.random_level();
         let m = self.params.m;
         let ef = self.params.ef_construction;
 
         let mut g = self.inner.write().unwrap();
+        let reuses_entry_identity = g
+            .entry_slot
+            .is_some_and(|entry| g.ids[entry as usize] == id);
 
         // Query view of the new vector for the construction beams (the
         // slab owns the canonical copy after alloc).
@@ -797,7 +841,11 @@ impl HnswIndex {
         }
 
         // Update entry point if the new node reached a higher layer.
-        if node_level > g.entry_layer {
+        if reuses_entry_identity {
+            let (entry, layer) = highest_live_entry(&g.read_view()).unwrap_or((slot, node_level));
+            g.entry_slot = Some(entry);
+            g.entry_layer = layer;
+        } else if node_level > g.entry_layer {
             g.entry_slot = Some(slot);
             g.entry_layer = node_level;
         }
@@ -852,7 +900,9 @@ impl HnswIndex {
         // recall collapses) but excluded from the result set. The whole
         // search runs under one read guard, so it sees a consistent
         // tombstone set even if mark_deleted runs mid-query.
-        let admit = |slot: u32| !graph.tombstoned(slot) && filter(graph.external_id(slot));
+        let admit = |slot: u32| {
+            is_live_slot(&graph, slot) && !graph.tombstoned(slot) && filter(graph.external_id(slot))
+        };
         let candidates = beam(&graph, query, q_inv, curr_ep, ef.max(k), 0, &admit);
 
         Ok(candidates
@@ -1583,6 +1633,89 @@ mod tests {
         let aset: std::collections::HashSet<u64> = a.iter().map(|(id, _)| *id).collect();
         let bset: std::collections::HashSet<u64> = b.iter().map(|(id, _)| *id).collect();
         assert_eq!(aset, bset, "neighbour set differs after save/load");
+    }
+
+    #[test]
+    fn reused_entry_external_id_with_lower_layer_saves_a_reloadable_graph() {
+        let idx = HnswIndex::new(HnswParams::new(2, DistanceMetric::Cosine));
+        idx.insert_at_level(7, vec![1.0, 0.0], 3).unwrap();
+        idx.insert_at_level(7, vec![0.0, 1.0], 0).unwrap();
+
+        let structure = idx.debug_structure();
+        assert_eq!(structure.0, Some(7));
+        assert_eq!(structure.1, 0);
+        let runtime_hit = idx.search(&[1.0, 0.0], 1, 8).unwrap()[0];
+        assert_eq!(runtime_hit.0, 7);
+        assert!(
+            runtime_hit.1 > 0.9,
+            "the superseded slot must be traversal-only, not a stale hit"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.bin");
+        idx.save_to(&path).unwrap();
+        let reopened = HnswIndex::load_from(&path).unwrap();
+
+        assert_eq!(reopened.len(), 1);
+        assert!(reopened.vector_matches(7, &[0.0, 1.0]));
+        let structure = reopened.debug_structure();
+        assert_eq!(structure.0, Some(7));
+        assert_eq!(structure.1, 0);
+    }
+
+    #[test]
+    fn reused_entry_id_falls_back_to_the_highest_remaining_live_node() {
+        let idx = HnswIndex::new(HnswParams::new(2, DistanceMetric::L2));
+        for (id, vector, level) in [
+            (7, vec![1.0, 0.0], 3),
+            (8, vec![0.5, 0.5], 2),
+            (7, vec![0.0, 1.0], 0),
+        ] {
+            idx.insert_at_level(id, vector, level).unwrap();
+        }
+
+        let structure = idx.debug_structure();
+        assert_eq!(structure.0, Some(8));
+        assert_eq!(structure.1, 2);
+        assert_eq!(idx.search(&[0.0, 1.0], 1, 16).unwrap()[0].0, 7);
+        assert_eq!(idx.search(&[0.5, 0.5], 1, 16).unwrap()[0].0, 8);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.bin");
+        idx.save_to(&path).unwrap();
+        let reopened = HnswIndex::load_from(&path).unwrap();
+        assert_eq!(reopened.len(), 2);
+        let structure = reopened.debug_structure();
+        assert_eq!(structure.0, Some(8));
+        assert_eq!(structure.1, 2);
+        assert_eq!(reopened.search(&[0.0, 1.0], 1, 16).unwrap()[0].0, 7);
+        assert_eq!(reopened.search(&[0.5, 0.5], 1, 16).unwrap()[0].0, 8);
+    }
+
+    #[test]
+    fn writer_repairs_a_stale_reused_id_entry_header() {
+        let idx = HnswIndex::new(HnswParams::new(2, DistanceMetric::Cosine));
+        idx.insert_at_level(7, vec![1.0, 0.0], 3).unwrap();
+        idx.insert_at_level(7, vec![0.0, 1.0], 0).unwrap();
+
+        // Recreate the stale in-memory state produced before this fix.
+        // Persistence must derive its header from live topology rather than
+        // pairing the orphan slot's layer with the current slot's identity.
+        {
+            let mut graph = idx.inner.write().unwrap();
+            graph.entry_slot = Some(0);
+            graph.entry_layer = 3;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.bin");
+        idx.save_to(&path).unwrap();
+        let reopened = HnswIndex::load_from(&path).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert!(reopened.vector_matches(7, &[0.0, 1.0]));
+        let structure = reopened.debug_structure();
+        assert_eq!(structure.0, Some(7));
+        assert_eq!(structure.1, 0);
     }
 
     #[test]
