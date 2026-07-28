@@ -61,6 +61,7 @@ fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudge
 mod hnsw_identity_tests {
     use super::*;
     use crate::Engine;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
@@ -261,7 +262,7 @@ mod hnsw_identity_tests {
     }
 
     #[tokio::test]
-    async fn save_retries_delete_crossing_graph_identity_capture() {
+    async fn save_serializes_delete_across_graph_identity_capture() {
         let _serial = TEST_SERIAL.lock().await;
         let (directory, index) = fixture("hnsw-save-delete-race").await;
         index
@@ -287,11 +288,24 @@ mod hnsw_identity_tests {
         .await
         .expect("save did not reach graph/identity barrier");
 
-        assert!(index.delete_document("doc").await.unwrap());
+        let deleting_index = Arc::clone(&index);
+        let deleting =
+            tokio::spawn(async move { deleting_index.delete_document("doc").await.unwrap() });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !deleting.is_finished(),
+            "delete must not cross a graph/identity capture"
+        );
         index
             .test_hnsw_save_pause_after_graph
             .store(false, Ordering::Release);
         saving.await.unwrap().unwrap();
+        assert!(deleting.await.unwrap());
+        // Publish the post-delete generation; the first save is allowed to
+        // persist the coherent pre-delete generation it captured.
+        index.save_hnsw_to_disk().await.unwrap();
         index.abort_background_tasks();
         drop(index);
 
@@ -305,6 +319,347 @@ mod hnsw_identity_tests {
             .await
             .iter()
             .all(|(id, _)| id != "doc"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_id_bulk_keeps_vm_graph_and_vector_on_one_sequence() {
+        let (_directory, index) = fixture("hnsw-same-id-bulk").await;
+        for round in 0..32u64 {
+            let left = Arc::clone(&index);
+            let right = Arc::clone(&index);
+            let start = Arc::new(tokio::sync::Barrier::new(3));
+            let left_start = Arc::clone(&start);
+            let right_start = Arc::clone(&start);
+            let a = tokio::spawn(async move {
+                left_start.wait().await;
+                left.index_batch_turbo(
+                    vec![(
+                        "same".into(),
+                        serde_json::json!({"embedding": [1.0, round as f32, 0.0, 0.0]}),
+                    )],
+                    false,
+                    false,
+                )
+                .await
+                .unwrap()
+            });
+            let b = tokio::spawn(async move {
+                right_start.wait().await;
+                right
+                    .index_batch_turbo(
+                        vec![(
+                            "same".into(),
+                            serde_json::json!({"embedding": [0.0, round as f32, 1.0, 0.0]}),
+                        )],
+                        false,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            });
+            start.wait().await;
+            let (a, b) = tokio::join!(a, b);
+            let latest_response = [a.unwrap()[0].clone(), b.unwrap()[0].clone()]
+                .into_iter()
+                .max_by_key(|response| response.seq_no)
+                .unwrap();
+            let authoritative = index.store.version_map.get("same").unwrap();
+            assert_eq!(authoritative.seq_no, latest_response.seq_no);
+            let node = index.hnsw_id_map.read().await["same"];
+            assert_eq!(
+                index.hnsw_node_seq.read().await[&node],
+                authoritative.seq_no
+            );
+            let source = index.get_document("same").await.unwrap().unwrap();
+            let vector = extract_numeric_vector(&source, "embedding").unwrap();
+            assert!(
+                index
+                    .hnsw_vector_current("same", authoritative.seq_no, &vector)
+                    .await
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_wal_disables_ann_until_recovery() {
+        let (directory, index) = fixture("hnsw-cancel-after-wal").await;
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        index.save_hnsw_to_disk().await.unwrap();
+        assert!(!index.hnsw_stale.load(Ordering::Acquire));
+
+        let pause_once = Arc::new(AtomicBool::new(false));
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let paused_tx = parking_lot::Mutex::new(Some(paused_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        index.set_publication_test_hook(Some({
+            let pause_once = Arc::clone(&pause_once);
+            Arc::new(move |id, point| {
+                if id == "doc"
+                    && point == PublicationTestPoint::AfterWalVersionMap
+                    && !pause_once.swap(true, Ordering::SeqCst)
+                {
+                    paused_tx.lock().take().unwrap().send(()).unwrap();
+                    resume_rx.lock().take().unwrap().recv().unwrap();
+                }
+            })
+        }));
+        let updating = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                index
+                    .index_document(
+                        Some("doc".into()),
+                        serde_json::json!({"embedding": [0.0, 1.0, 0.0, 0.0]}),
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || paused_rx.recv().unwrap())
+            .await
+            .unwrap();
+        // Force a genuine cancellation boundary immediately after the hook:
+        // the publisher must wait for this schema writer before FTS.
+        let schema_writer = index.schema.write().await;
+        updating.abort();
+        resume_tx.send(()).unwrap();
+        assert!(updating.await.unwrap_err().is_cancelled());
+        drop(schema_writer);
+        index.set_publication_test_hook(None);
+
+        assert!(
+            index.hnsw_stale.load(Ordering::Acquire),
+            "post-WAL cancellation must make ANN ineligible"
+        );
+        assert!(index.write_publication.quiescent_generation().is_some());
+        let authoritative = index.store.version_map.get("doc").unwrap();
+        let node = index.hnsw_id_map.read().await["doc"];
+        assert_ne!(
+            index.hnsw_node_seq.read().await[&node],
+            authoritative.seq_no,
+            "fixture must retain an older graph publication"
+        );
+
+        index.abort_background_tasks();
+        drop(index);
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let reopened = Engine::new(config).unwrap();
+        let index = reopened.get_index("hnsw-cancel-after-wal").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !index.hnsw_stale.load(Ordering::Acquire)
+                    && !index.hnsw_rebuilding.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery did not converge");
+        let source = index.get_document("doc").await.unwrap().unwrap();
+        let vector = extract_numeric_vector(&source, "embedding").unwrap();
+        let authoritative = index.store.version_map.get("doc").unwrap();
+        assert!(
+            index
+                .hnsw_vector_current("doc", authoritative.seq_no, &vector)
+                .await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancellation_at_each_graph_identity_guard_leaves_old_tuple_intact() {
+        macro_rules! boundary_case {
+            ($name:literal, $field:ident) => {{
+                let (_directory, index) = fixture($name).await;
+                index
+                    .index_document(
+                        Some("doc".into()),
+                        serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+                    )
+                    .await
+                    .unwrap();
+                let old_seq = index.store.version_map.get("doc").unwrap().seq_no;
+                let old_node = index.hnsw_id_map.read().await["doc"];
+                let blocker = index.$field.write().await;
+                let updating = {
+                    let index = Arc::clone(&index);
+                    tokio::spawn(async move {
+                        index
+                            .index_document(
+                                Some("doc".into()),
+                                serde_json::json!({"embedding": [0.0, 1.0, 0.0, 0.0]}),
+                            )
+                            .await
+                    })
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while index
+                        .store
+                        .version_map
+                        .get("doc")
+                        .is_none_or(|version| version.seq_no == old_seq)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("update did not advance WAL/version map");
+                for _ in 0..32 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(!updating.is_finished(), "fixture did not block at boundary");
+                updating.abort();
+                assert!(updating.await.unwrap_err().is_cancelled());
+                drop(blocker);
+
+                assert!(index.hnsw_stale.load(Ordering::Acquire));
+                assert_eq!(index.hnsw_id_map.read().await["doc"], old_node);
+                assert_eq!(index.hnsw_id_rev.read().await[&old_node], "doc");
+                assert_eq!(index.hnsw_node_seq.read().await[&old_node], old_seq);
+                assert!(index
+                    .hnsw
+                    .read()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .vector_matches(old_node, &[1.0, 0.0, 0.0, 0.0]));
+            }};
+        }
+
+        boundary_case!("cancel-at-graph", hnsw);
+        boundary_case!("cancel-at-id-map", hnsw_id_map);
+        boundary_case!("cancel-at-id-rev", hnsw_id_rev);
+        boundary_case!("cancel-at-node-seq", hnsw_node_seq);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebuild_bulk_and_save_share_one_deadlock_free_publication_order() {
+        let (_directory, index) = fixture("hnsw-rebuild-bulk-save").await;
+        for id in 0..24u64 {
+            index
+                .index_document(
+                    Some(format!("doc-{id}")),
+                    serde_json::json!({"embedding": [1.0, id as f32, 0.0, 0.0]}),
+                )
+                .await
+                .unwrap();
+        }
+        index.hnsw_stale.store(true, Ordering::Release);
+
+        let rebuilding = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move { index.rebuild_hnsw_from_docs().await })
+        };
+        let saving = {
+            let index = Arc::clone(&index);
+            tokio::spawn(async move {
+                for _ in 0..8 {
+                    index.save_hnsw_to_disk().await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let mut writers = Vec::new();
+        for writer in 0..8u64 {
+            let index = Arc::clone(&index);
+            writers.push(tokio::spawn(async move {
+                for round in 0..16u64 {
+                    let id = format!("doc-{}", (writer + round) % 24);
+                    index
+                        .index_batch_turbo(
+                            vec![(
+                                id,
+                                serde_json::json!({
+                                    "embedding": [writer as f32, round as f32, 1.0, 0.0]
+                                }),
+                            )],
+                            false,
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let _ = rebuilding.await.unwrap().unwrap();
+            saving.await.unwrap();
+            for writer in writers {
+                writer.await.unwrap();
+            }
+        })
+        .await
+        .expect("rebuild/save/bulk lock ordering deadlocked");
+
+        index.hnsw_stale.store(true, Ordering::Release);
+        assert!(index.rebuild_hnsw_from_docs().await.unwrap());
+        for (doc_id, node_id) in index.hnsw_id_map.read().await.iter() {
+            let authoritative = index.store.version_map.get(doc_id).unwrap();
+            assert_eq!(
+                index.hnsw_node_seq.read().await[node_id],
+                authoritative.seq_no
+            );
+            let source = index.get_document(doc_id).await.unwrap().unwrap();
+            let vector = extract_numeric_vector(&source, "embedding").unwrap();
+            assert!(index
+                .hnsw
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .vector_matches(*node_id, &vector));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_reinsert_never_reuses_or_reanimates_the_deleted_node() {
+        let (directory, index) = fixture("hnsw-delete-reinsert").await;
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        let deleted_node = index.hnsw_id_map.read().await["doc"];
+        assert!(index.delete_document("doc").await.unwrap());
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": [0.0, 1.0, 0.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        let live_node = index.hnsw_id_map.read().await["doc"];
+        assert!(live_node > deleted_node);
+        assert!(!index.hnsw_id_rev.read().await.contains_key(&deleted_node));
+        assert!(!index.hnsw_node_seq.read().await.contains_key(&deleted_node));
+        assert_eq!(index.vector_doc_count.load(Ordering::Acquire), 1);
+        assert!(index
+            .hnsw
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .is_deleted(deleted_node));
+        index.save_hnsw_to_disk().await.unwrap();
+        index.abort_background_tasks();
+        drop(index);
+
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let reopened = Engine::new(config).unwrap();
+        let index = reopened.get_index("hnsw-delete-reinsert").unwrap();
+        assert_eq!(index.hnsw_id_map.read().await["doc"], live_node);
+        assert!(!index.hnsw_id_rev.read().await.contains_key(&deleted_node));
     }
 }
 
@@ -1812,6 +2167,33 @@ enum PublicationTestPoint {
 #[cfg(test)]
 type PublicationTestHook = Arc<dyn Fn(&str, PublicationTestPoint) + Send + Sync + 'static>;
 
+/// Fail-closed guard for the interval after an authoritative document
+/// sequence can advance but before its corresponding graph state is known to
+/// be complete. Async cancellation runs `Drop`; it cannot repair the graph,
+/// so it disables ANN until recovery rebuilds from authoritative documents.
+struct HnswPublicationEpoch {
+    stale: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl HnswPublicationEpoch {
+    fn new(stale: Arc<AtomicBool>) -> Self {
+        Self { stale, armed: true }
+    }
+
+    fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HnswPublicationEpoch {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stale.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Per-index coordinator.
 ///
 /// Owns the storage layer (`IndexStore`), the FTS memtable, and the schema.
@@ -1940,6 +2322,12 @@ pub struct Index {
     hnsw_rebuilding: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes graph/identity/manifest publication attempts.
     hnsw_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes one complete in-memory graph publication. Writers acquire
+    /// every fallible/awaiting guard before changing the graph or any of its
+    /// identity metadata, then perform the whole transition without an await.
+    /// Saves use the same lock so graph bytes and identity metadata are
+    /// captured from one state.
+    hnsw_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     /// JoinHandle of the in-flight stale rebuild, aborted by
     /// `abort_background_tasks` so an unfinished rebuild can't hold the
     /// runtime (or the index Arc) alive across shutdown.
@@ -2456,6 +2844,7 @@ impl Index {
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            hnsw_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
             sq8_stores: Arc::new(RwLock::new(HashMap::new())),
             metric_query_count: Arc::new(AtomicU64::new(0)),
@@ -2661,7 +3050,18 @@ impl Index {
                 // (spawned at the end of open — RC4 W2 item 17)
                 // re-derives the WAL-tail divergence and clears the
                 // flag. (The loader gate guarantees `field` is Some.)
-                let stale = l.stale || l.seq_no.is_none_or(|stamp| stamp != store.current_seq_no());
+                let node_sequences_match_authority = l.id_map.iter().all(|(doc_id, node_id)| {
+                    let Some(node_seq) = l.node_seq.get(node_id) else {
+                        return false;
+                    };
+                    store
+                        .version_map
+                        .get(doc_id)
+                        .is_some_and(|version| !version.deleted && version.seq_no == *node_seq)
+                });
+                let stale = l.stale
+                    || l.seq_no.is_none_or(|stamp| stamp != store.current_seq_no())
+                    || !node_sequences_match_authority;
                 (
                     Some(l.graph),
                     l.id_map,
@@ -2770,6 +3170,7 @@ impl Index {
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(hnsw_stale_init)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            hnsw_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
             sq8_stores: Arc::new(RwLock::new(HashMap::new())),
             metric_query_count: Arc::new(AtomicU64::new(0)),
@@ -3047,6 +3448,11 @@ impl Index {
             .map(|e| !e.deleted)
             .unwrap_or(false);
 
+        // From the first authoritative sequence advance until graph
+        // completion, cancellation must fail closed rather than leave ANN
+        // serving an older publication.
+        let hnsw_epoch = HnswPublicationEpoch::new(Arc::clone(&self.hnsw_stale));
+
         // Write to storage WAL.
         let seq_no = self.store.index(&doc_id, source.clone())?;
         // External-version admission becomes durable only after the WAL write
@@ -3134,6 +3540,7 @@ impl Index {
 
         // Index any vector fields into the HNSW index.
         self.index_vectors(&doc_id, seq_no, &source).await;
+        hnsw_epoch.complete();
         #[cfg(test)]
         self.publication_test_point(&doc_id, PublicationTestPoint::AfterHnsw);
 
@@ -3342,6 +3749,11 @@ impl Index {
             .map(|r| (r.id.clone(), Arc::clone(&r.source)))
             .collect();
 
+        let publication_guards = self
+            .write_publication
+            .lock_many(processed.iter().map(|doc| doc.id.clone()))
+            .await;
+        let hnsw_epoch = HnswPublicationEpoch::new(Arc::clone(&self.hnsw_stale));
         let wal_t = std::time::Instant::now();
         let seq_nos = self.store.wal_append_batch(&wal_refs)?;
         // RC4 W4 item 2: WAL durability-write latency.
@@ -3486,27 +3898,21 @@ impl Index {
             }
         }
 
-        // Vector indexing is only meaningful when at least one document
-        // in the batch carries an array of numbers.  Detecting that
-        // costs a single pass over the first doc's top-level object;
-        // for log workloads (no vector fields) this skips the async
-        // HNSW lock acquire entirely.
-        if processed
-            .first()
-            .and_then(|r| r.source.as_object())
-            .map(|obj| {
-                obj.values().any(|v| {
-                    v.as_array()
-                        .map(|arr| !arr.is_empty() && arr.iter().all(Value::is_number))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
-        {
+        // The first item is not representative of a heterogeneous bulk. Use
+        // the mapped graph field as the cheap batch-level gate; otherwise a
+        // vector appearing later in the request advances the VM without ever
+        // reaching HNSW.
+        let has_vector_mapping = {
+            let schema = self.schema.read().await;
+            !collect_dense_vector_fields(&schema.schema).is_empty()
+        };
+        if has_vector_mapping {
             for (ingest, &seq_no) in processed.iter().zip(&seq_nos) {
                 self.index_vectors(&ingest.id, seq_no, &ingest.source).await;
             }
         }
+        hnsw_epoch.complete();
+        drop(publication_guards);
 
         // ── Step 5: check flush threshold ─────────────────────────────────
         self.maybe_spawn_flush().await;
@@ -3541,6 +3947,7 @@ impl Index {
             return Ok(Vec::new());
         }
         let batch_len = docs.len();
+        let publication_ids: Vec<String> = docs.iter().map(|(id, _)| id.clone()).collect();
         if self.is_write_blocked().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
@@ -3625,6 +4032,8 @@ impl Index {
             let schema = self.schema.read().await;
             schema_has_copy_to(&schema.schema)
         };
+        let publication_guards = self.write_publication.lock_many(publication_ids).await;
+        let hnsw_epoch = HnswPublicationEpoch::new(Arc::clone(&self.hnsw_stale));
         let wal_t = std::time::Instant::now();
         let (docs, sources, seq_nos) = if has_copy_to {
             let (docs, parsed) = validated.into_parts();
@@ -3813,6 +4222,18 @@ impl Index {
             })
             .collect();
 
+        let has_vector_mapping = {
+            let schema = self.schema.read().await;
+            !collect_dense_vector_fields(&schema.schema).is_empty()
+        };
+        if has_vector_mapping {
+            for (((id, _), source), seq_no) in docs.iter().zip(&sources).zip(&seq_nos) {
+                self.index_vectors(id, *seq_no, source).await;
+            }
+        }
+        hnsw_epoch.complete();
+        drop(publication_guards);
+
         self.maybe_spawn_flush().await;
 
         let elapsed_ms = index_start.elapsed().as_millis() as u64;
@@ -3922,6 +4343,7 @@ impl Index {
             })?;
             schema_has_copy_to(&schema.schema)
         };
+        let _publication_activity = self.write_publication.begin_activity();
         let (docs, seq_nos, copy_schema) = if has_copy_to {
             let validated = crate::ingest_pool()
                 .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
@@ -3967,6 +4389,11 @@ impl Index {
                 None,
             )
         };
+        // The synchronous raw path cannot await per-ID graph publication and
+        // does not materialize vectors in the common path. Its authoritative
+        // WAL/VM generation is monotonic, but any pre-existing ANN snapshot
+        // must fail closed until rebuild derives these writes.
+        self.hnsw_stale.store(true, Ordering::Release);
         // RC4 W4 item 2: WAL durability-write latency.
         if let Some(m) = crate::engine_metrics() {
             m.observe_wal_write(wal_t.elapsed().as_secs_f64());
@@ -4206,11 +4633,20 @@ impl Index {
         drop(schema_guard);
 
         // Step 3: Update version map (lock-free atomic operations) — no WAL.
-        // Assign monotonically increasing seq_nos from the engine's counter.
+        let publication_guards = self
+            .write_publication
+            .lock_many(processed.iter().map(|doc| doc.id.clone()))
+            .await;
+        let hnsw_epoch = HnswPublicationEpoch::new(Arc::clone(&self.hnsw_stale));
+        // Reserve one monotonic range. The old fetch_add(0) assigned every
+        // item the same pseudo-sequence and then incremented doc_count later,
+        // so concurrent volatile bulks had no usable publication order.
         use std::sync::atomic::Ordering;
-        let seq_nos: Vec<u64> = processed
-            .iter()
-            .map(|_| self.doc_count.fetch_add(0, Ordering::Relaxed))
+        let sequence_base = self
+            .doc_count
+            .fetch_add(batch_len as u64, Ordering::Relaxed);
+        let seq_nos: Vec<u64> = (0..batch_len)
+            .map(|offset| sequence_base + offset as u64 + 1)
             .collect();
 
         // Step 4: FTS memtable insert — use standard insert() so the inverted
@@ -4228,7 +4664,7 @@ impl Index {
                 &schema_guard2.schema,
                 seq_no,
             );
-            let version = self.doc_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let version = sequence_base + i as u64 + 1;
             responses.push(IndexResponse {
                 id: ingest.id.clone(),
                 seq_no,
@@ -4238,11 +4674,16 @@ impl Index {
         }
         drop(schema_guard2);
 
-        // Step 5: schema evolution + vector indexing (post-lock).
-        for (ingest, &seq_no) in processed.iter().zip(&seq_nos) {
+        // Step 5: schema evolution. This path intentionally has no durable
+        // version-map publication, so it cannot safely stamp graph nodes.
+        // Keep ANN disabled; an eventual durable flush/reopen rebuilds from
+        // the authoritative stored sequence metadata.
+        for ingest in &processed {
             self.evolve_schema_from_doc(&ingest.source).await;
-            self.index_vectors(&ingest.id, seq_no, &ingest.source).await;
         }
+        self.hnsw_stale.store(true, Ordering::Release);
+        hnsw_epoch.complete();
+        drop(publication_guards);
 
         // Step 6: flush threshold check.
         self.maybe_spawn_flush().await;
@@ -5892,56 +6333,73 @@ impl Index {
             self.hnsw_remove_vector(doc_id).await;
             return false;
         }
-        // UPDATE staleness fix: a doc_id that already has a node must have
-        // that node tombstoned before the fresh vector goes in (fresh
-        // node_id; the old node is never unmarked).
-        let old_node: Option<u64> = self.hnsw_id_map.read().await.get(doc_id).copied();
-        if old_node.is_none() {
-            // Item 8: a new vector-bearing doc-id. Counted on ATTEMPT (here),
-            // not on success below: if the insert then fails (dim mismatch /
-            // graph error), `id_map.len()` stays behind `vector_doc_count`,
-            // which holds the coverage gate on brute force — the safe
-            // direction (a doc that isn't in the graph must not be answered
-            // from it). An update (old_node.is_some()) is already counted.
-            self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
-        }
-        let node_id = self.hnsw_next_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut hnsw_guard = self.hnsw.write().await;
-            if hnsw_guard.is_none() {
-                let params = HnswParams::new(dim, DistanceMetric::Cosine);
-                *hnsw_guard = Some(HnswIndex::new(params));
-            }
-            if let Some(ref hnsw) = *hnsw_guard {
-                if hnsw.params().dim != dim {
-                    // Mismatched dimension — skip (no id_map entry → the
-                    // coverage guard keeps queries on brute force).
-                    drop(hnsw_guard);
-                    if old_node.is_some() {
-                        self.hnsw_remove_vector(doc_id).await;
-                    } else {
-                        self.hnsw_remove_graph_identity(doc_id).await;
-                    }
-                    return false;
-                }
-                if let Some(old) = old_node {
-                    hnsw.mark_deleted(old);
-                }
-                if let Err(e) = hnsw.insert(node_id, vector) {
-                    warn!(doc_id, error = %e, "HNSW insert failed");
-                    drop(hnsw_guard);
-                    self.hnsw_remove_graph_identity(doc_id).await;
-                    return false;
-                }
-            }
-        }
-        // Update id maps.
+        let _mutation = self.hnsw_mutation_lock.lock().await;
+        // Acquire every async guard before the first mutation. Cancellation
+        // while waiting for any guard therefore leaves the old publication
+        // completely intact.
+        let mut hnsw_guard = self.hnsw.write().await;
         let mut id_map = self.hnsw_id_map.write().await;
         let mut id_rev = self.hnsw_id_rev.write().await;
         let mut node_seq = self.hnsw_node_seq.write().await;
+
+        // A rebuild or older bulk item may have computed this vector before a
+        // newer write advanced the authoritative version map. Never let that
+        // stale computation replace the current graph publication.
+        if !self
+            .store
+            .version_map
+            .get(doc_id)
+            .is_some_and(|version| !version.deleted && version.seq_no == seq_no)
+        {
+            return false;
+        }
+        if node_seq
+            .get(&id_map.get(doc_id).copied().unwrap_or_default())
+            .is_some_and(|published| *published > seq_no)
+        {
+            return false;
+        }
+
+        if hnsw_guard.is_none() {
+            let params = HnswParams::new(dim, DistanceMetric::Cosine);
+            *hnsw_guard = Some(HnswIndex::new(params));
+        }
+        let hnsw = hnsw_guard.as_ref().expect("HNSW initialized");
+        let old_node = id_map.get(doc_id).copied();
+        if hnsw.params().dim != dim {
+            // The authoritative document still carries a vector, but it
+            // cannot be represented by this graph. Remove its old binding and
+            // retain the denominator so ANN fails closed to exact search.
+            if let Some(old) = old_node {
+                hnsw.mark_deleted(old);
+                id_map.remove(doc_id);
+                id_rev.remove(&old);
+                node_seq.remove(&old);
+            } else {
+                self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
+            }
+            return false;
+        }
+
+        let node_id = self.hnsw_next_id.load(Ordering::Relaxed);
+        // Insert the replacement before tombstoning the old node. If the
+        // graph rejects the insert, all identity maps and the live old node
+        // remain unchanged.
+        if let Err(e) = hnsw.insert(node_id, vector) {
+            warn!(doc_id, error = %e, "HNSW insert failed");
+            if old_node.is_none() {
+                self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
+            }
+            return false;
+        }
+        self.hnsw_next_id
+            .store(node_id.saturating_add(1), Ordering::Relaxed);
         if let Some(old) = old_node {
+            hnsw.mark_deleted(old);
             id_rev.remove(&old);
             node_seq.remove(&old);
+        } else {
+            self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
         }
         id_map.insert(doc_id.to_string(), node_id);
         id_rev.insert(node_id, doc_id.to_string());
@@ -5953,14 +6411,18 @@ impl Index {
     /// denominator. Used when graph insertion cannot represent the current
     /// vector: coverage must fail closed to exact search.
     async fn hnsw_remove_graph_identity(&self, doc_id: &str) -> bool {
-        // Match save's graph → identity lock order.
+        let _mutation = self.hnsw_mutation_lock.lock().await;
+        // Acquire all guards before mutating, matching insert/save order.
         let hnsw = self.hnsw.read().await;
-        let node_id = match self.hnsw_id_map.write().await.remove(doc_id) {
+        let mut id_map = self.hnsw_id_map.write().await;
+        let mut id_rev = self.hnsw_id_rev.write().await;
+        let mut node_seq = self.hnsw_node_seq.write().await;
+        let node_id = match id_map.remove(doc_id) {
             Some(node_id) => node_id,
             None => return false,
         };
-        self.hnsw_id_rev.write().await.remove(&node_id);
-        self.hnsw_node_seq.write().await.remove(&node_id);
+        id_rev.remove(&node_id);
+        node_seq.remove(&node_id);
         if let Some(graph) = hnsw.as_ref() {
             graph.mark_deleted(node_id);
         }
@@ -6097,10 +6559,6 @@ impl Index {
             Some(f) => f,
             None => return Ok(false),
         };
-        if self.hnsw.read().await.is_none() {
-            return Ok(false);
-        }
-
         'passes: for pass in 1..=MAX_PASSES {
             let rebuild_activity = self.write_publication.begin_activity();
             let seq_start = self.store.current_seq_no();
@@ -6292,15 +6750,18 @@ impl Index {
     /// True when `doc_id` has a graph node whose stored vector bit-matches
     /// `vector` (rebuild fast path — no insert needed).
     async fn hnsw_vector_current(&self, doc_id: &str, seq_no: u64, vector: &[f32]) -> bool {
-        let node = match self.hnsw_id_map.read().await.get(doc_id) {
+        let _mutation = self.hnsw_mutation_lock.lock().await;
+        let id_map = self.hnsw_id_map.read().await;
+        let node_seq = self.hnsw_node_seq.read().await;
+        let graph = self.hnsw.read().await;
+        let node = match id_map.get(doc_id) {
             Some(n) => *n,
             None => return false,
         };
-        if self.hnsw_node_seq.read().await.get(&node) != Some(&seq_no) {
+        if node_seq.get(&node) != Some(&seq_no) {
             return false;
         }
-        let guard = self.hnsw.read().await;
-        guard
+        graph
             .as_ref()
             .map(|h| h.vector_matches(node, vector))
             .unwrap_or(false)
@@ -7877,6 +8338,7 @@ impl Index {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
 
         let _save_guard = self.hnsw_save_lock.lock().await;
+        let _mutation = self.hnsw_mutation_lock.lock().await;
         let hnsw_guard = self.hnsw.read().await;
         let hnsw = match &*hnsw_guard {
             Some(h) => h,
@@ -8433,6 +8895,7 @@ impl Index {
         // the delete will mutate publication state. A rejected conditional
         // delete must not make unrelated cached responses look stale.
         self.dataset_version.fetch_add(1, Ordering::Release);
+        let hnsw_epoch = HnswPublicationEpoch::new(Arc::clone(&self.hnsw_stale));
         let deleted_seq = self.store.delete(id)?;
         #[cfg(test)]
         self.publication_test_point(id, PublicationTestPoint::AfterWalVersionMap);
@@ -8453,6 +8916,7 @@ impl Index {
         // tombstones the node so kNN skips it; the edges remain
         // until a graph compaction (planned v0.7+).
         self.hnsw_remove_vector(id).await;
+        hnsw_epoch.complete();
         #[cfg(test)]
         self.publication_test_point(id, PublicationTestPoint::AfterHnsw);
 
