@@ -8725,6 +8725,16 @@ impl Index {
         // exact brute-force scan below. Filtered knn stays exact brute
         // force with a pre-filter, where `num_candidates` (the ANN fan-out)
         // has no effect.
+        if passage_requested(request)
+            && (peel_multi_knn_query(query).is_some() || peel_hybrid_query(query).is_some())
+        {
+            return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                "`fields: [\"_passage\"]` requires one semantic or kNN clause; \
+                     multi-kNN and hybrid queries combine independent score contributions, \
+                     so they do not have one unambiguous winning passage; request `_passage` \
+                     only with a single semantic/kNN clause, or omit `_passage` for fusion",
+            )));
+        }
         if let Some(peeled) = peel_knn_query(query) {
             let PeeledKnn {
                 field,

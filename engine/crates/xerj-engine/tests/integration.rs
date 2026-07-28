@@ -321,6 +321,82 @@ async fn reserved_passage_metadata_input_is_rejected() {
     assert!(idx.get_document("spoof").await.unwrap().is_none());
 }
 
+#[tokio::test]
+async fn passage_provenance_rejects_ambiguous_multi_vector_composition_in_any_order() {
+    use xerj_query::ast::{FusionStrategy, WeightedQuery};
+
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index("passage-composition", Schema::empty())
+        .unwrap();
+    let idx = engine.get_index("passage-composition").unwrap();
+
+    let knn_a = QueryNode::Knn {
+        field: "embedding_a".into(),
+        vector: vec![1.0, 0.0],
+        k: 10,
+        num_candidates: None,
+        filter: None,
+        boost: None,
+        similarity: None,
+    };
+    let knn_b = QueryNode::Knn {
+        field: "embedding_b".into(),
+        vector: vec![0.0, 1.0],
+        k: 10,
+        num_candidates: None,
+        filter: None,
+        boost: None,
+        similarity: None,
+    };
+
+    for should in [
+        vec![knn_a.clone(), knn_b.clone()],
+        vec![knn_b.clone(), knn_a.clone()],
+    ] {
+        let request = SearchRequest {
+            query: QueryNode::Bool {
+                must: Vec::new(),
+                should,
+                filter: Vec::new(),
+                must_not: Vec::new(),
+                minimum_should_match: None,
+            },
+            fields: vec!["_passage".into()],
+            ..SearchRequest::default()
+        };
+        let error = idx.search(&request).await.unwrap_err().to_string();
+        assert!(error.contains("one unambiguous winning passage"), "{error}");
+    }
+
+    let semantic = QueryNode::SemanticSearch {
+        field: "content".into(),
+        text: "quarterly evidence".into(),
+        k: 10,
+        filter: None,
+        boost: None,
+    };
+    for queries in [
+        vec![semantic.clone(), QueryNode::MatchAll],
+        vec![QueryNode::MatchAll, semantic.clone()],
+    ] {
+        let request = SearchRequest {
+            query: QueryNode::Hybrid {
+                queries: queries
+                    .into_iter()
+                    .map(|query| WeightedQuery { query, weight: 1.0 })
+                    .collect(),
+                fusion: FusionStrategy::Rrf { k: 60 },
+            },
+            fields: vec!["_passage".into()],
+            ..SearchRequest::default()
+        };
+        let error = idx.search(&request).await.unwrap_err().to_string();
+        assert!(error.contains("one unambiguous winning passage"), "{error}");
+    }
+}
+
 fn make_search(query_json: Value) -> SearchRequest {
     parse_request(&json!({ "query": query_json, "size": 100 })).expect("parse_request")
 }
