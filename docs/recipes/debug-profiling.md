@@ -30,13 +30,22 @@ python3 demo/playbooks/debug-profiling/capture.py \
   --cache-state cold \
   --build-features debug-profiling \
   --build-profile profiling \
-  --attach correctness=/tmp/correctness.json \
-  --attach telemetry=/tmp/memory.ndjson \
+  --attach correctness-baseline=/tmp/correctness-baseline.json \
+  --attach-after telemetry=/tmp/memory.ndjson \
+  --attach-after throughput=/tmp/throughput.json \
   -- \
   engine/target/profiling/xerj --insecure --data-dir /tmp/xerj-profile-data
 ```
 
 Start the workload from another terminal during the five-second delay. Repeat into fresh data and output directories with `--heap-seconds 30` instead of `--cpu-seconds 30`. Separate runs avoid CPU and heap profiler interference.
+
+`--attach` copies evidence that exists before launch. Use `--attach-after` for
+files produced by the workload or server; the controller waits for the server
+process to finish before copying and hashing them. Missing post-run evidence
+fails the bundle explicitly instead of producing a comparison-ready capture.
+Ensure the workload has closed those files before the server exits; the
+controller cannot wait for an unrelated producer that is not in the launched
+process group.
 
 Delay is relative to process start, not a readiness check. Delay zero includes configuration, TLS setup, engine replay, and router construction.
 

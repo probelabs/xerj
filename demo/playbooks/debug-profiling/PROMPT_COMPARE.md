@@ -6,7 +6,10 @@ Before analysis:
 
 1. Read both manifests and reject the comparison if corpus, workload, concurrency, cache state, host, capture interval, CPU Hz, build profile, or relevant feature set differs. Do not normalize across Cargo profiles.
    Treat source/profile/features as operator declarations while `source_build_binding` is `UNVERIFIED`; do not claim the binary came from that source revision without independent build attestation.
-2. Verify artifact hashes and benchmark correctness. Faster-but-wrong is a regression.
+2. Verify artifact hashes, reject either bundle when `attachment_failures` is
+   non-empty, and verify benchmark correctness. Confirm that same-run evidence
+   is marked `collection: post_process`; a pre-launch baseline is not proof of
+   the profiled run's correctness. Faster-but-wrong is a regression.
 3. Produce `pprof -base BEFORE AFTER` views for CPU and heap, plus absolute top/tree views for both sides.
 
 Report:

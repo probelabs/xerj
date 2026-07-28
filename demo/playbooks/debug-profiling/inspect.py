@@ -36,6 +36,11 @@ def main():
         path = bundle / metadata["file"]
         if not path.is_file() or sha256(path) != metadata["sha256"]:
             errors.append(f"invalid attachment: {label}")
+    for failure in manifest.get("attachment_failures", []):
+        errors.append(
+            f"attachment collection failed: {failure.get('label', 'unknown')}: "
+            f"{failure.get('reason', 'unknown reason')}"
+        )
     heap = bundle / "heap.pb.gz"
     if heap.exists():
         try:
@@ -65,7 +70,13 @@ def main():
         "experiment": manifest.get("experiment"),
         "source": manifest.get("source"),
         "attached_evidence": sorted(evidence),
-        "comparison_ready": any(
+        "attachment_failures": manifest.get("attachment_failures", []),
+        "post_run_attachment_requests": manifest.get(
+            "post_run_attachment_requests", {}
+        ),
+        "comparison_ready": manifest.get("status") == "complete"
+        and not manifest.get("attachment_failures")
+        and any(
             token in label.lower()
             for label in evidence
             for token in ("result", "correct", "bench", "telemetry")

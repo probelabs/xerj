@@ -43,15 +43,39 @@ python3 demo/playbooks/debug-profiling/capture.py \
   --cache-state cold \
   --build-features debug-profiling,onnx-experimental \
   --build-profile profiling \
-  --attach correctness=/tmp/fb20-correctness.json \
-  --attach telemetry=/tmp/fb20-memory.ndjson \
+  --attach correctness-baseline=/tmp/fb20-correctness-baseline.json \
+  --attach-after telemetry=/tmp/fb20-memory.ndjson \
+  --attach-after throughput=/tmp/fb20-throughput.json \
   -- \
   engine/target/profiling/xerj --data-dir /tmp/xerj-profile-data
 ```
 
 Run the workload from a second terminal. `--delay-seconds` is process-start-relative and gives the server and workload driver a bounded synchronization window; it does not probe readiness. With delay zero, profiling starts before config loading and engine replay and therefore includes initialization. The wrapper stops the whole server process group five seconds after the delay plus longest capture. An explicit `--stop-after` must preserve the same five-second dump/publication window; exact capture-boundary termination is rejected because conversion and atomic publication happen after sampling stops.
 
-The manifest records the exact binary hash, command, repository revision/dirty state, host shape, capture settings, exit status, and artifact hashes. The binary-to-source binding is explicitly `UNVERIFIED`: the wrapper cannot prove that the binary was built from the recorded checkout. Build profile/features and workload/corpus/concurrency/cache values are likewise **declared by the operator**, not extracted from the binary. Use repeatable `--attach LABEL=PATH` options to copy and hash correctness, throughput, RSS, jemalloc, and XERJ telemetry evidence. Without those, the supplied analysis prompts require an `INCONCLUSIVE` performance verdict.
+The manifest records the exact binary hash, command, repository revision/dirty state, host shape, capture settings, exit status, and artifact hashes. The binary-to-source binding is explicitly `UNVERIFIED`: the wrapper cannot prove that the binary was built from the recorded checkout. Build profile/features and workload/corpus/concurrency/cache values are likewise **declared by the operator**, not extracted from the binary.
+
+Use repeatable `--attach LABEL=PATH` for evidence that must already exist
+before server launch. Existing scripts retain this strict behavior. Use
+repeatable `--attach-after LABEL=PATH` for telemetry, RSS, throughput, and
+correctness files written during the run. Post-run sources are resolved before
+launch but are read only after the server process exits, including when that
+process fails. Every copied attachment records whether it was collected
+`pre_launch` or `post_process`; post-run entries also record the process exit
+code at collection.
+
+The controller waits for the launched server process group, not unrelated
+workload writers. The workload controller must stop and close every requested
+evidence file before the server exits; otherwise a producer can still race the
+post-run copy.
+
+Attachment publication is atomic and refuses to overwrite an existing bundle
+file. A missing, unreadable, or colliding post-run attachment is recorded in
+`attachment_failures`, makes the capture status `attachment_failed` when no
+profile/process failure takes precedence, and exits `4`. Profile and process
+failures retain their existing status/exit code while still preserving any
+post-run evidence that can be collected. The validator reports all attachment
+failures. Without attached correctness and benchmark/telemetry evidence, the
+supplied analysis prompts require an `INCONCLUSIVE` performance verdict.
 
 Server output is private `server.log`; when `pprof` is installed, agent-readable `*.top.txt` reports are generated too. Validate the entire bundle:
 

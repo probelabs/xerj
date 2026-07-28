@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 PUBLICATION_GRACE_SECONDS = 5
+ATTACHMENT_LABEL = re.compile(r"[a-zA-Z0-9_.-]+")
 
 
 def sha256(path):
@@ -31,6 +32,51 @@ def write_manifest(path, manifest):
     with os.fdopen(fd, "w") as target:
         target.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
+
+
+def parse_attachment(specification, option):
+    if "=" not in specification:
+        raise ValueError(f"{option} must be LABEL=PATH")
+    label, source_text = specification.split("=", 1)
+    if not ATTACHMENT_LABEL.fullmatch(label):
+        raise ValueError(f"unsafe attachment label: {label}")
+    return label, pathlib.Path(source_text).resolve()
+
+
+def copy_attachment_atomic(source, destination):
+    """Copy one attachment without exposing partial data or overwriting a file."""
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as target, source.open("rb") as attached:
+            shutil.copyfileobj(attached, target)
+            target.flush()
+            os.fsync(target.fileno())
+        # A same-directory hard link publishes atomically and refuses an
+        # existing destination on every supported platform.
+        os.link(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def collect_attachment(output, label, source, collection, process_exit_code=None):
+    if not source.is_file():
+        raise FileNotFoundError(f"attachment is not a file: {source}")
+    destination = output / f"attachment-{label}{source.suffix}"
+    copy_attachment_atomic(source, destination)
+    metadata = {
+        "file": destination.name,
+        "source": str(source),
+        "bytes": destination.stat().st_size,
+        "sha256": sha256(destination),
+        "collection": collection,
+    }
+    if process_exit_code is not None:
+        metadata["process_exit_code_at_collection"] = process_exit_code
+    return metadata
 
 
 def read_optional(path):
@@ -87,7 +133,14 @@ def main():
         action="append",
         default=[],
         metavar="LABEL=PATH",
-        help="copy and hash correctness, throughput, RSS, or telemetry evidence",
+        help="copy and hash evidence that already exists before server launch",
+    )
+    parser.add_argument(
+        "--attach-after",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help="copy and hash evidence after the server process exits",
     )
     parser.add_argument(
         "--stop-after",
@@ -117,6 +170,25 @@ def main():
             f"--stop-after must allow {PUBLICATION_GRACE_SECONDS}s after capture "
             "for profile dump and atomic publication"
         )
+    attachments_before = []
+    attachments_after = []
+    labels = set()
+    for option, specifications, target in (
+        ("--attach", args.attach, attachments_before),
+        ("--attach-after", args.attach_after, attachments_after),
+    ):
+        for specification in specifications:
+            try:
+                label, source = parse_attachment(specification, option)
+            except ValueError as error:
+                parser.error(str(error))
+            if label in labels:
+                parser.error(f"duplicate attachment label: {label}")
+            labels.add(label)
+            target.append((label, source))
+    for _, source in attachments_before:
+        if not source.is_file():
+            parser.error(f"attachment is not a file: {source}")
 
     args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
     output = args.output.resolve()
@@ -186,26 +258,15 @@ def main():
         manifest["rustc"] = None
     manifest["cgroup"] = read_optional("/proc/self/cgroup")
     attachments = {}
-    for specification in args.attach:
-        if "=" not in specification:
-            parser.error("--attach must be LABEL=PATH")
-        label, source_text = specification.split("=", 1)
-        if not re.fullmatch(r"[a-zA-Z0-9_.-]+", label):
-            parser.error(f"unsafe attachment label: {label}")
-        source = pathlib.Path(source_text)
-        if not source.is_file():
-            parser.error(f"attachment is not a file: {source}")
-        destination = output / f"attachment-{label}{source.suffix}"
-        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as target, source.open("rb") as attached:
-            shutil.copyfileobj(attached, target)
-        attachments[label] = {
-            "file": destination.name,
-            "source": str(source.resolve()),
-            "bytes": destination.stat().st_size,
-            "sha256": sha256(destination),
-        }
+    for label, source in attachments_before:
+        attachments[label] = collect_attachment(
+            output, label, source, collection="pre_launch"
+        )
     manifest["attachments"] = attachments
+    manifest["post_run_attachment_requests"] = {
+        label: {"source": str(source)} for label, source in attachments_after
+    }
+    manifest["attachment_failures"] = []
     write_manifest(manifest_path, manifest)
 
     environment = os.environ.copy()
@@ -255,6 +316,25 @@ def main():
     finally:
         log_file.close()
 
+    for label, source in attachments_after:
+        try:
+            attachments[label] = collect_attachment(
+                output,
+                label,
+                source,
+                collection="post_process",
+                process_exit_code=process.returncode,
+            )
+        except OSError as error:
+            manifest["attachment_failures"].append(
+                {
+                    "label": label,
+                    "source": str(source),
+                    "collection": "post_process",
+                    "reason": str(error),
+                }
+            )
+
     artifacts = {}
     requested = []
     if args.cpu_seconds:
@@ -294,6 +374,8 @@ def main():
         status = "profile_failed"
     elif process.returncode not in (0, None) and not expected_termination:
         status = "process_failed"
+    elif manifest["attachment_failures"]:
+        status = "attachment_failed"
     else:
         status = "complete"
     manifest.update(
@@ -313,6 +395,12 @@ def main():
         return 2
     if status == "process_failed":
         return 3
+    if status == "attachment_failed":
+        print(
+            "one or more post-run attachments could not be collected",
+            file=sys.stderr,
+        )
+        return 4
     return 0
 
 
