@@ -1583,6 +1583,11 @@ pub async fn put_mapping(
         }
     }
 
+    // Build and validate every target's complete candidate state before
+    // publishing any schema or raw mapping. This prevents deterministic
+    // wildcard/comma-list failures (for example, a later target's field
+    // collision) from leaving earlier targets changed.
+    let mut plans = Vec::with_capacity(targets.len());
     for idx_name in &targets {
         let idx = match state.engine.get_index(idx_name) {
             Ok(i) => i,
@@ -1635,9 +1640,10 @@ pub async fn put_mapping(
             }
         }
 
+        let mut additions = Vec::new();
         if let Some(properties) = body.get("properties") {
             let current = idx.schema().await;
-            let mut additions = Vec::new();
+            let mut candidate = current.clone();
             for field in es_properties_to_fields(properties) {
                 if let Some(existing_field) = current.field(&field.name) {
                     if existing_field.field_type != field.field_type {
@@ -1649,15 +1655,31 @@ pub async fn put_mapping(
                     }
                     continue;
                 }
+                if let Err(error) = candidate.add_field(field.clone()) {
+                    return ApiError::new(error).into_response();
+                }
                 additions.push(field);
             }
-            if let Err(error) = idx.add_fields(additions).await {
+        }
+        plans.push((idx_name.clone(), idx, existing, additions));
+    }
+
+    // Publication begins only after every deterministic candidate has passed.
+    // `add_fields` repeats engine-side validation defensively. Concurrent
+    // schema evolution and filesystem failures still require a broader
+    // engine-level multi-index transaction primitive; see the engineering
+    // report for that explicitly tracked limitation.
+    for (_, idx, _, additions) in &plans {
+        if !additions.is_empty() {
+            if let Err(error) = idx.add_fields(additions.clone()).await {
                 return ApiError::new(xerj_common::XerjError::from(error)).into_response();
             }
         }
+    }
+    for (idx_name, _, existing, _) in plans {
         // Persists es_mapping.json into the index dir (atomic) so the
         // merged mapping survives a restart.
-        state.engine.put_index_mapping(idx_name, existing);
+        state.engine.put_index_mapping(&idx_name, existing);
     }
 
     Json(json!({ "acknowledged": true })).into_response()
@@ -13432,6 +13454,112 @@ mod semantic_companion_hnsw_api_tests {
             .await;
             assert_eq!(mapping_after, mapping_before);
         }
+        state.engine.flush_all_force().await;
+    }
+
+    #[tokio::test]
+    async fn multi_index_put_mapping_validates_every_schema_before_publication() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = data_dir.path().to_string_lossy().into_owned();
+        let state = state(&config);
+        for name in ["a-first-clean", "z-late-collision"] {
+            let (status, response) = request_json(
+                state.clone(),
+                "PUT",
+                &format!("/{name}"),
+                Some("application/json"),
+                json!({"mappings": {"properties": {}}}).to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+        }
+
+        // Model an engine-side field that is absent from the raw mapping.
+        // Before two-phase planning, the first target published `body` and
+        // `body_vector` before this later target's add_fields collision
+        // returned an error.
+        state
+            .engine
+            .get_index("z-late-collision")
+            .unwrap()
+            .add_field(FieldConfig::new("body_vector", FieldType::Double))
+            .await
+            .unwrap();
+
+        let first_schema_before = state
+            .engine
+            .get_index("a-first-clean")
+            .unwrap()
+            .schema()
+            .await;
+        let late_schema_before = state
+            .engine
+            .get_index("z-late-collision")
+            .unwrap()
+            .schema()
+            .await;
+        let (_, mappings_before) = request_json(
+            state.clone(),
+            "GET",
+            "/a-first-clean,z-late-collision/_mapping",
+            None,
+            "",
+        )
+        .await;
+
+        let (status, error) = request_json(
+            state.clone(),
+            "PUT",
+            "/a-first-clean,z-late-collision/_mapping",
+            Some("application/json"),
+            json!({
+                "properties": {
+                    "body": { "type": "semantic_text", "dimensions": 32 }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("body_vector"),
+            "{error}"
+        );
+        assert_eq!(
+            state
+                .engine
+                .get_index("a-first-clean")
+                .unwrap()
+                .schema()
+                .await,
+            first_schema_before,
+            "an earlier target schema changed before a later validation failure"
+        );
+        assert_eq!(
+            state
+                .engine
+                .get_index("z-late-collision")
+                .unwrap()
+                .schema()
+                .await,
+            late_schema_before
+        );
+        let (_, mappings_after) = request_json(
+            state.clone(),
+            "GET",
+            "/a-first-clean,z-late-collision/_mapping",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(
+            mappings_after, mappings_before,
+            "raw mappings changed despite a rejected multi-index update"
+        );
         state.engine.flush_all_force().await;
     }
 
