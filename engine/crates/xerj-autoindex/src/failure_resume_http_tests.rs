@@ -16,6 +16,17 @@ use std::thread;
 
 static FAILPOINT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(unix)]
+struct PdfWorkerEnvGuard;
+
+#[cfg(unix)]
+impl Drop for PdfWorkerEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("XERJ_PDF_WORKER_BIN");
+        std::env::remove_var("XERJ_TEST_PDF_COUNT");
+    }
+}
+
 #[derive(Default)]
 struct MockState {
     docs: HashMap<String, Value>,
@@ -836,4 +847,57 @@ fn partial_file_done_is_rolled_back_before_another_worker_commits() {
             .as_str()
             .is_some_and(|value| value.ends_with("-new"))
     }));
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_pdf_is_parsed_once_and_failed_publication_retry_reparses_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("quarterly-report.pdf");
+    fs::write(
+        &pdf,
+        b"%PDF-1.4\nfake bytes consumed by the isolated test worker\n",
+    )
+    .unwrap();
+    fs::copy(&pdf, corpus.path().join("quarterly-report-copy.pdf")).unwrap();
+
+    let count = tools.path().join("worker-count");
+    let worker = tools.path().join("pdf-worker");
+    fs::write(
+        &worker,
+        br#"#!/bin/sh
+printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/1.0.0-rc.5","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let endpoint = MockEndpoint::start(1);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
+    let _env = PdfWorkerEnvGuard;
+
+    let first = run_index(config.clone()).unwrap_err();
+    assert!(format!("{first:#}").contains("bulk backend failed"));
+    assert_eq!(
+        fs::read_to_string(&count).unwrap().lines().count(),
+        1,
+        "Phase A's extraction must be replayed in Phase B, not parsed again"
+    );
+    assert_eq!(file_done_count(state_dir.path()), 0);
+
+    // The process-local spool is intentionally not journal state. A retry has
+    // a frozen plan, performs exactly one fresh extraction in Phase B, and
+    // commits only after the backend accepts it.
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
+    assert_eq!(file_done_count(state_dir.path()), 1);
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
 }
