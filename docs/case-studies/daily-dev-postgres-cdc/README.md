@@ -66,22 +66,36 @@ The WAL slot captured every mutation; XERJ reflects the update, the insert, and 
 delete — no manual reindex. Run the consumer on a loop (`--loops N`) or as a daemon
 for continuous, near-real-time sync.
 
-### 2. Hybrid search — the thing pg can't do cleanly
+### 2. Hybrid search with **RRF fusion** — the thing pg can't do cleanly
 
-Query *"ditching the JVM search stack for something cheaper"* (semantic; little
-literal overlap with any post). Real output:
+XERJ has a first-class `hybrid` query with **reciprocal-rank fusion** built in — no
+app-side merge. Query *"ditching the JVM search stack for something cheaper"*
+(semantic; little literal overlap):
 
+```json
+POST /posts/_search
+{ "query": { "hybrid": {
+    "queries": [
+      { "query": { "match": { "summary": "ditching the JVM search stack for something cheaper" } }, "weight": 1.0 },
+      { "query": { "knn": { "field": "vec", "query_vector": [...], "num_candidates": 9 } }, "weight": 1.0 }
+    ],
+    "fusion": { "type": "rrf", "k": 60 } } } }
 ```
-LEXICAL only (BM25 ≈ pg tsvector):     4.00  Why we moved off Elasticsearch
-VECTOR only (≈ pgvector):              0.859 Why we moved off Elasticsearch
-                                       0.845 The cost of microservices   ← semantically near but off-topic
-HYBRID (BM25 + vector, one query):     2.386 Why we moved off Elasticsearch  (upvotes 1203)
-                                       2.099 Building a vector search engine from scratch
+Real output:
 ```
-Vector-alone drifts to "cost of microservices"; lexical-alone can't see synonyms;
-**hybrid fuses both in one request** and you can layer engagement (`upvotes`,
-`trending`) into ranking — exactly what a developer feed needs. In Postgres this is
-two separate queries (`tsvector` and `pgvector`) merged in application code.
+LEXICAL only (BM25 ≈ pg tsvector):   Why we moved off Elasticsearch
+VECTOR only (≈ pgvector):            Why we moved off Elasticsearch
+                                     The cost of microservices   ← semantically near but off-topic
+RRF HYBRID (fused, one request):     0.03279 Why we moved off Elasticsearch
+                                     0.03175 The cost of microservices
+                                     0.03151 Building a vector search engine from scratch
+```
+`fusion: rrf` fuses the two ranked lists by `Σ weight/(k + rank)` — no manual score
+normalization (BM25 and cosine live on different scales; RRF is rank-based, so it
+sidesteps that). `linear` fusion and per-query `weight`s are also supported. In
+Postgres this is two separate queries (`tsvector` + `pgvector`) merged in app code;
+here it's one query with principled fusion, and you can still layer engagement
+(`upvotes`, `trending`) via function-score.
 
 ### 3. Bonus (rc.6): semantic slice + engagement analytics in one request
 *"of posts about AI/ML, which sources, and avg upvotes?"* — one `knn`+`aggs` call
@@ -113,6 +127,36 @@ python3 cdc_sync.py --loops 100       # near-real-time: drain the slot every 2s
 `cdc_sync.py` uses the slot as a **change signal** (which ids changed + op), then
 reads the *current* row from Postgres and upserts to XERJ — a robust CDC pattern
 that avoids brittle decoder-format parsing and always converges to Postgres state.
+
+### Push-streaming + LSN checkpointing (`cdc_stream.py`) — production shape
+
+`cdc_sync.py` polls (`get_changes`). `cdc_stream.py` is the **true push-streaming**
+consumer: psycopg2's `LogicalReplicationConnection.consume_stream()` **blocks on the
+WAL** (no polling), and after each change is durably applied to XERJ it calls
+`send_feedback(flush_lsn=…)` so Postgres advances the slot's `confirmed_flush_lsn`.
+
+```bash
+python3 cdc_stream.py     # blocks; applies changes the instant they commit
+```
+
+**Proven live** — an INSERT in Postgres appears in XERJ within seconds, no poll:
+```
+[stream] INSERT p10 -> XERJ (errors=False)  LSN=27860016  [checkpointing]
+```
+
+**Exactly-once-convergent (LSN checkpointing), proven:** stop the consumer → change
+data while it's *down* (`UPDATE p1 upvotes=9999`, `INSERT p11`) → XERJ goes stale
+(the WAL is retained by the slot) → **restart:**
+```
+[stream] consuming WAL from confirmed LSN ...
+[stream] UPDATE p1 -> XERJ  LSN=27863424  [checkpointing]
+[stream] INSERT p11 -> XERJ  LSN=27863976  [checkpointing]
+  p1 upvotes: 9999   p11: Offline change test
+```
+It resumed from the last checkpoint and applied **exactly** the missed changes — no
+re-sync, no loss. Combined with upsert/delete-by-id (idempotent replays), this gives
+**at-least-once delivery that converges to Postgres state**; the LSN feedback means
+a crash never loses a change and never forces a full rebuild.
 
 ---
 
@@ -163,17 +207,27 @@ the primary, kept in sync automatically.
 
 ## Honest limitations
 
-1. **No fused RRF hybrid node** — `bool.should[match, knn]` with boosts approximates
-   it; principled RRF is a follow-up. (Score scales differ between BM25 and cosine;
-   tune boosts or normalize.)
-2. **`test_decoding` is polled** via `get_changes` — for true push-streaming use
-   `pgoutput`/Debezium; the consumer logic is identical.
-3. **Embedding model is yours** — retrieval quality is the model's job; XERJ stores
+1. **Embedding model is yours** — retrieval quality is the model's job; XERJ stores
    and searches the vectors.
-4. **Exactly-once** needs care — the demo consumer is idempotent (upsert by id,
-   delete by id), which gives at-least-once → convergent state; add slot-LSN
-   checkpointing for strict delivery guarantees.
+2. **RRF `k` and weights need tuning** per corpus — RRF removes the BM25-vs-cosine
+   scale problem, but the fusion constant `k` and per-query `weight`s still shape
+   ranking; A/B them against click/upvote signals.
+3. **`learned` fusion is not implemented** — `rrf` and `linear` are; a learned
+   fuser (train weights on engagement) is a future item.
+4. **Backfill embeds cost** — a model change means re-embedding the corpus (a
+   backfill job); steady-state CDC only re-embeds changed rows (and can skip
+   re-embed on stats-only updates).
+
+## Resolved (previously listed as gaps)
+- ~~No fused RRF node~~ → **RRF exists and is first-class** (`hybrid` + `fusion:rrf`);
+  the earlier note was a request-syntax error. `weight`s and `linear` also supported.
+- ~~`test_decoding` only polled~~ → **`cdc_stream.py` is true push-streaming** via
+  `consume_stream()` (no polling).
+- ~~Exactly-once needs care~~ → **LSN checkpointing implemented** (`send_feedback`);
+  proven to resume from the last confirmed LSN and catch offline changes with no loss.
 
 ## Files
 - [`setup.sql`](setup.sql) — daily.dev-modeled schema + trigger + logical slot.
-- [`cdc_sync.py`](cdc_sync.py) — the CDC consumer (slot → embed → XERJ bulk).
+- [`cdc_sync.py`](cdc_sync.py) — polled CDC consumer (slot → embed → XERJ bulk).
+- [`cdc_stream.py`](cdc_stream.py) — **push-streaming** consumer + **LSN checkpointing**
+  (the production shape).
