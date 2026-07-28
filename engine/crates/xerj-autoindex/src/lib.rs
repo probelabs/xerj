@@ -68,6 +68,8 @@ pub fn run_cli() -> i32 {
 const GB: u64 = 1 << 30;
 const SAMPLE_LIMIT_BYTES: u64 = 4 << 20;
 const SQLDUMP_SAMPLE_LIMIT: u64 = 64 << 20;
+const PDF_EXTRACTION_SPOOL_BUDGET: u64 = 2 << 30;
+const PDF_EXTRACTION_SPOOL_COUNT: u64 = 512;
 
 #[cfg(test)]
 static REPLACEMENT_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -180,13 +182,27 @@ struct FileScan {
     /// group → (field accs, sampled record count)
     sketches: Vec<(Option<String>, HashMap<String, infer::FieldAcc>, u64)>,
     junk: Option<(String, String)>, // (status, reason)
+    /// Run-local PDF extraction produced during sampling. This is consumed by
+    /// Phase B only when it is bound to the same full-content generation.
+    pdf_spool: Option<extract::pdf::ExtractionSpool>,
+    pdf_spool_fallback: Option<String>,
 }
 
-fn scan_file(path: &Path, size: u64, sample: usize, max_file_gb: u64) -> FileScan {
+fn scan_file(
+    path: &Path,
+    size: u64,
+    digest: &str,
+    state_dir: &Path,
+    pdf_spool_budget: &std::sync::Arc<extract::pdf::ExtractionSpoolBudget>,
+    sample: usize,
+    max_file_gb: u64,
+) -> FileScan {
     let mut out = FileScan {
         sniffed: None,
         sketches: Vec::new(),
         junk: None,
+        pdf_spool: None,
+        pdf_spool_fallback: None,
     };
     let sn = match sniff::sniff(path) {
         Ok(s) => s,
@@ -245,7 +261,38 @@ fn scan_file(path: &Path, size: u64, sample: usize, max_file_gb: u64) -> FileSca
             (entry.1 as usize) < sample
         }
     };
-    match extract::extract(path, &sn, limit, &mut sink) {
+    let extraction = if sn.family == Family::Pdf {
+        match extract::pdf::extract_and_spool(
+            path,
+            state_dir,
+            size,
+            digest,
+            pdf_spool_budget,
+            &mut sink,
+        ) {
+            Ok((stats, spool, fallback)) => {
+                // The inventory digest was computed before Phase A. Only hand
+                // bytes to Phase B when the source still matches that exact
+                // generation after the parser has finished reading it.
+                match content::verify(path, size, digest) {
+                    Ok(()) => {
+                        out.pdf_spool = spool;
+                        out.pdf_spool_fallback = fallback;
+                    }
+                    Err(error) => {
+                        out.pdf_spool_fallback = Some(format!(
+                            "source generation changed after extraction: {error:#}"
+                        ));
+                    }
+                }
+                Ok(stats)
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        extract::extract(path, &sn, limit, &mut sink)
+    };
+    match extraction {
         Ok(stats) => {
             if groups.is_empty() {
                 out.junk = Some((
@@ -657,6 +704,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     // ── Phase A: inference (skipped when a frozen plan exists) ──────────
     let mut clusters_rt: Option<Vec<dataset::Cluster>> = None;
+    let mut pdf_spools: Vec<Option<extract::pdf::ExtractionSpool>> =
+        (0..files.len()).map(|_| None).collect();
+    let pdf_spool_budget = extract::pdf::ExtractionSpoolBudget::new(
+        PDF_EXTRACTION_SPOOL_BUDGET,
+        PDF_EXTRACTION_SPOOL_COUNT,
+    );
     let plan: Plan = if let Some(p) = journal.plan.clone() {
         p
     } else {
@@ -665,13 +718,46 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
         let scans: Vec<FileScan> = files
             .par_iter()
-            .map(|f| scan_file(&f.path, f.size, cfg.sample, cfg.max_file_gb))
+            .zip(digests.par_iter())
+            .map(|(f, digest)| {
+                scan_file(
+                    &f.path,
+                    f.size,
+                    digest,
+                    &state_dir,
+                    &pdf_spool_budget,
+                    cfg.sample,
+                    cfg.max_file_gb,
+                )
+            })
             .collect();
+
+        let pdf_reparse_reasons: Vec<&str> = scans
+            .iter()
+            .filter_map(|scan| scan.pdf_spool_fallback.as_deref())
+            .collect();
+        if !pdf_reparse_reasons.is_empty() && !cfg.quiet {
+            eprintln!(
+                "phase A: {} PDF extraction(s) could not retain a bounded run-local artifact; \
+                 phase B will parse them again safely",
+                pdf_reparse_reasons.len()
+            );
+            for reason in pdf_reparse_reasons.iter().take(3) {
+                eprintln!("  PDF reuse fallback: {reason}");
+            }
+            if pdf_reparse_reasons.len() > 3 {
+                eprintln!(
+                    "  … and {} more PDF reuse fallback(s)",
+                    pdf_reparse_reasons.len() - 3
+                );
+            }
+        }
 
         let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
         let mut sketches = Vec::new();
         let mut junk_files = Vec::new();
-        for (i, sc) in scans.into_iter().enumerate() {
+        for (i, mut sc) in scans.into_iter().enumerate() {
+            pdf_spools[i] = sc.pdf_spool.take();
             let family = sc
                 .sniffed
                 .as_ref()
@@ -1051,11 +1137,21 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // start first and can't serialize the end of the run.
     todo.sort_by_key(|&i| files[i].size);
     let n_todo = todo.len();
+    let n_pdf_spools = todo
+        .iter()
+        .filter(|&&index| pdf_spools[index].is_some())
+        .count();
     if !cfg.quiet {
         eprintln!(
             "phase B: indexing {} files with {} workers → {}",
             n_todo, cfg.workers, cfg.url
         );
+        if n_pdf_spools > 0 {
+            eprintln!(
+                "phase B: reusing {n_pdf_spools} run-local PDF extraction(s); these PDFs will not \
+                 be parsed a second time"
+            );
+        }
     }
 
     let queue = Mutex::new(todo);
@@ -1275,7 +1371,14 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             }
                             true
                         };
-                        let res = extract::extract(&f.path, &sn, None, &mut sink);
+                        let res = if sn.family == Family::Pdf {
+                            match pdf_spools[i].as_ref() {
+                                Some(spool) => spool.replay(f.size, expected_digest, &mut sink),
+                                None => extract::extract(&f.path, &sn, None, &mut sink),
+                            }
+                        } else {
+                            extract::extract(&f.path, &sn, None, &mut sink)
+                        };
                         match res {
                             Ok(stats) => {
                                 file_junk += stats.junk;
