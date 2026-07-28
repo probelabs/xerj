@@ -113,6 +113,33 @@ mod hnsw_identity_tests {
         assert!(!index.hnsw_id_map.read().await.contains_key("doc"));
         assert!(!index.hnsw_node_seq.read().await.contains_key(&second_node));
     }
+
+    #[tokio::test]
+    async fn coherent_identity_round_trips_with_the_graph() {
+        let (directory, index) = fixture("hnsw-identity-roundtrip").await;
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        let node = index.hnsw_id_map.read().await["doc"];
+        let seq_no = index.hnsw_node_seq.read().await[&node];
+        index.save_hnsw_to_disk().await.unwrap();
+        assert!(index.hnsw_manifest_path().exists());
+        index.abort_background_tasks();
+        drop(index);
+
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let reopened = Engine::new(config).unwrap();
+        let index = reopened.get_index("hnsw-identity-roundtrip").unwrap();
+        assert_eq!(index.hnsw_id_map.read().await["doc"], node);
+        assert_eq!(index.hnsw_node_seq.read().await[&node], seq_no);
+        assert!(index.hnsw.read().await.is_some());
+        assert!(!index.hnsw_stale.load(Ordering::Acquire));
+    }
 }
 
 /// Clears an index's `merge_in_progress` flag on every exit path of the
@@ -1741,6 +1768,8 @@ pub struct Index {
     /// guards against double-spawn and is surfaced in stats so operators
     /// can distinguish "healing" from "permanently degraded".
     hnsw_rebuilding: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes graph/identity/manifest publication attempts.
+    hnsw_save_lock: Arc<tokio::sync::Mutex<()>>,
     /// JoinHandle of the in-flight stale rebuild, aborted by
     /// `abort_background_tasks` so an unfinished rebuild can't hold the
     /// runtime (or the index Arc) alive across shutdown.
@@ -2252,6 +2281,7 @@ impl Index {
             hnsw_field: Arc::new(std::sync::RwLock::new(None)),
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hnsw_save_lock: Arc::new(tokio::sync::Mutex::new(())),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
             sq8_stores: Arc::new(RwLock::new(HashMap::new())),
             metric_query_count: Arc::new(AtomicU64::new(0)),
@@ -2427,31 +2457,59 @@ impl Index {
         // refused at load), we skip the O(N log N) rebuild and load the
         // byte-identical graph that was running pre-restart.
         let dv_fields_at_open = collect_dense_vector_fields(&schema.schema);
-        let loaded_hnsw = load_hnsw_artifacts_sync(&index_dir.join("hnsw"), &|f: &str| {
+        let hnsw_dir_at_open = index_dir.join("hnsw");
+        let rejected_hnsw_artifacts = hnsw_dir_at_open.join("graph.bin").exists()
+            || hnsw_dir_at_open.join("ids.json").exists()
+            || hnsw_dir_at_open.join("manifest.json").exists();
+        let loaded_hnsw = load_hnsw_artifacts_sync(&hnsw_dir_at_open, &|f: &str| {
             dv_fields_at_open.iter().any(|df| df == f)
         });
         let initial_hnsw = loaded_hnsw.as_ref().map(|_| ()).is_some();
-        let (hnsw_init, id_map_init, id_rev_init, next_id_init, hnsw_field_init, hnsw_stale_init) =
-            match loaded_hnsw {
-                Some(l) => {
-                    // Freshness stamp check: the snapshot is flush-time, but
-                    // WAL replay never calls index_vectors — so a WAL-tail
-                    // UPDATE of an already-graphed doc leaves the graph
-                    // holding the pre-update vector while the
-                    // `id_map.len() == doc_count` coverage guard still
-                    // passes (len and count both unchanged). A stamp
-                    // mismatch therefore marks the graph stale: ingest keeps
-                    // maintaining it and the kNN query path stays on exact
-                    // brute force until the background stale rebuild
-                    // (spawned at the end of open — RC4 W2 item 17)
-                    // re-derives the WAL-tail divergence and clears the
-                    // flag. (The loader gate guarantees `field` is Some.)
-                    let stale =
-                        l.stale || l.seq_no.is_none_or(|stamp| stamp != store.current_seq_no());
-                    (Some(l.graph), l.id_map, l.id_rev, l.next_id, l.field, stale)
-                }
-                None => (None, HashMap::new(), HashMap::new(), 1, None, false),
-            };
+        let (
+            hnsw_init,
+            id_map_init,
+            id_rev_init,
+            node_seq_init,
+            next_id_init,
+            hnsw_field_init,
+            hnsw_stale_init,
+        ) = match loaded_hnsw {
+            Some(l) => {
+                // Freshness stamp check: the snapshot is flush-time, but
+                // WAL replay never calls index_vectors — so a WAL-tail
+                // UPDATE of an already-graphed doc leaves the graph
+                // holding the pre-update vector while the
+                // `id_map.len() == doc_count` coverage guard still
+                // passes (len and count both unchanged). A stamp
+                // mismatch therefore marks the graph stale: ingest keeps
+                // maintaining it and the kNN query path stays on exact
+                // brute force until the background stale rebuild
+                // (spawned at the end of open — RC4 W2 item 17)
+                // re-derives the WAL-tail divergence and clears the
+                // flag. (The loader gate guarantees `field` is Some.)
+                let stale = l.stale || l.seq_no.is_none_or(|stamp| stamp != store.current_seq_no());
+                (
+                    Some(l.graph),
+                    l.id_map,
+                    l.id_rev,
+                    l.node_seq,
+                    l.next_id,
+                    l.field,
+                    stale,
+                )
+            }
+            None => (
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                1,
+                rejected_hnsw_artifacts
+                    .then(|| dv_fields_at_open.first().cloned())
+                    .flatten(),
+                rejected_hnsw_artifacts,
+            ),
+        };
         // Item 8: seed the coverage-gate denominator from the persisted graph.
         // At flush time the graph covered every vector-bearing doc, so the
         // reloaded `id_map.len()` IS the vector-doc count. If the snapshot is
@@ -2527,12 +2585,13 @@ impl Index {
             hnsw: Arc::new(RwLock::new(hnsw_init)),
             hnsw_id_map: Arc::new(RwLock::new(id_map_init)),
             hnsw_id_rev: Arc::new(RwLock::new(id_rev_init)),
-            hnsw_node_seq: Arc::new(RwLock::new(HashMap::new())),
+            hnsw_node_seq: Arc::new(RwLock::new(node_seq_init)),
             hnsw_next_id: Arc::new(AtomicU64::new(next_id_init)),
             vector_doc_count: Arc::new(AtomicU64::new(vector_doc_count_init)),
             hnsw_field: Arc::new(std::sync::RwLock::new(hnsw_field_init)),
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(hnsw_stale_init)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hnsw_save_lock: Arc::new(tokio::sync::Mutex::new(())),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
             sq8_stores: Arc::new(RwLock::new(HashMap::new())),
             metric_query_count: Arc::new(AtomicU64::new(0)),
@@ -7570,10 +7629,17 @@ impl Index {
         self.hnsw_dir().join("ids.json")
     }
 
+    fn hnsw_manifest_path(&self) -> std::path::PathBuf {
+        self.hnsw_dir().join("manifest.json")
+    }
+
     /// Persist the in-memory HNSW graph + id-map to disk. No-op when
     /// `self.hnsw` is None (no vector field has been indexed yet).
     /// Called on flush completion and graceful shutdown.
     pub async fn save_hnsw_to_disk(&self) -> Result<()> {
+        const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
+
+        let _save_guard = self.hnsw_save_lock.lock().await;
         let hnsw_guard = self.hnsw.read().await;
         let hnsw = match &*hnsw_guard {
             Some(h) => h,
@@ -7584,55 +7650,106 @@ impl Index {
             warn!(error = %e, "HNSW save: cannot create dir");
             return Ok(());
         }
-        if let Err(e) = hnsw.save_to(&self.hnsw_graph_path()) {
-            warn!(error = %e, "HNSW save: graph serialization failed");
+        for attempt in 1..=MAX_SNAPSHOT_ATTEMPTS {
+            let Some(publication_generation) = self.write_publication.quiescent_generation() else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            let generation = Uuid::new_v4().simple().to_string();
+            let graph_candidate = dir.join(format!("graph.bin.candidate.{generation}"));
+            let ids_candidate = dir.join(format!("ids.json.candidate.{generation}"));
+            if let Err(error) = hnsw.save_to(&graph_candidate) {
+                warn!(%error, "HNSW save: graph serialization failed");
+                return Ok(());
+            }
+            let graph_sha256 = match hnsw_sha256_file(&graph_candidate) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&graph_candidate);
+                    warn!(%error, "HNSW save: graph fingerprint failed");
+                    return Ok(());
+                }
+            };
+
+            let id_map = self.hnsw_id_map.read().await;
+            let node_seq = self.hnsw_node_seq.read().await;
+            let hnsw_field = self.hnsw_field.read().unwrap().clone();
+            let identity = serde_json::json!({
+                "next_id": self.hnsw_next_id.load(Ordering::Relaxed),
+                "map": *id_map,
+                "node_seq": *node_seq,
+                "generation": generation,
+                "field": hnsw_field,
+                "seq_no": self.store.current_seq_no(),
+                "stale": self.hnsw_stale.load(Ordering::Acquire),
+            });
+            let ids_bytes = match serde_json::to_vec(&identity) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&graph_candidate);
+                    warn!(%error, "HNSW save: identity serialization failed");
+                    return Ok(());
+                }
+            };
+            if let Err(error) = xerj_common::fsio::write_file_durable(&ids_candidate, &ids_bytes) {
+                let _ = std::fs::remove_file(&graph_candidate);
+                warn!(%error, "HNSW save: identity write failed");
+                return Ok(());
+            }
+            drop(node_seq);
+            drop(id_map);
+
+            if self.write_publication.quiescent_generation() != Some(publication_generation) {
+                let _ = std::fs::remove_file(&graph_candidate);
+                let _ = std::fs::remove_file(&ids_candidate);
+                debug!(
+                    attempt,
+                    "HNSW save: publication crossed graph/identity capture; retrying"
+                );
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            if let Err(error) = std::fs::rename(&graph_candidate, self.hnsw_graph_path())
+                .and_then(|()| xerj_common::fsio::fsync_dir(&dir))
+            {
+                let _ = std::fs::remove_file(&graph_candidate);
+                warn!(%error, "HNSW save: graph generation publish failed");
+                return Ok(());
+            }
+            if let Err(error) = std::fs::rename(&ids_candidate, self.hnsw_ids_path())
+                .and_then(|()| xerj_common::fsio::fsync_dir(&dir))
+            {
+                let _ = std::fs::remove_file(&ids_candidate);
+                warn!(%error, "HNSW save: identity generation publish failed");
+                return Ok(());
+            }
+            let manifest = serde_json::json!({
+                "generation": generation,
+                "graph_sha256": graph_sha256,
+                "ids_sha256": hnsw_sha256_bytes(&ids_bytes),
+            });
+            let manifest_bytes = match serde_json::to_vec(&manifest) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(%error, "HNSW save: manifest serialization failed");
+                    return Ok(());
+                }
+            };
+            if let Err(error) =
+                xerj_common::fsio::write_file_durable(&self.hnsw_manifest_path(), &manifest_bytes)
+            {
+                warn!(%error, "HNSW save: manifest publish failed");
+                return Ok(());
+            }
+            debug!(
+                graph = %self.hnsw_graph_path().display(),
+                nodes = hnsw.len(),
+                "HNSW persisted"
+            );
             return Ok(());
         }
-        // Save the id map alongside. JSON is fine — the map is at most
-        // a few hundred MB even for the largest indices and writes
-        // infrequently (once per flush). The shape is fixed so a v0.7
-        // codec swap (e.g. to a binary keyed by doc_id length) won't
-        // break loaders that read both fields.
-        //
-        // Integrity stamp (2026-07): `field` records the graph's pinned
-        // field identity and `seq_no` the store's WAL position at save
-        // time. At load, a fielded snapshot whose stamp differs from the
-        // replayed `current_seq_no()` is flush-time stale relative to a WAL
-        // tail (which may contain updates of already-graphed docs that the
-        // coverage guard cannot detect) → the HNSW query path is disabled.
-        // `stale` persists an already-detected staleness so a later flush
-        // of the still-stale graph cannot re-stamp it as fresh. Loaders are
-        // duck-typed in both directions: old binaries ignore the extra
-        // keys, and this loader treats a missing `field` as legacy.
-        let id_map = self.hnsw_id_map.read().await;
-        let hnsw_field = self.hnsw_field.read().unwrap().clone();
-        let snapshot = serde_json::json!({
-            "next_id": self.hnsw_next_id.load(Ordering::Relaxed),
-            "map": *id_map,
-            "field": hnsw_field,
-            "seq_no": self.store.current_seq_no(),
-            "stale": self.hnsw_stale.load(Ordering::Acquire),
-        });
-        // Durable atomic publish (RC4 W2 item 19 — same treatment as
-        // graph.bin in HnswIndex::save_to): fsync file + rename + fsync
-        // parent dir, so power loss can't leave a torn/evaporating
-        // ids.json. Write order is graph.bin THEN ids.json: a crash
-        // between the two renames leaves new-graph/old-ids, whose seq_no
-        // stamp then mismatches the replayed WAL position → the loader
-        // marks the pair stale and the rebuild path re-derives it (never
-        // serves a mixed pair).
-        if let Err(e) = xerj_common::fsio::write_file_durable(
-            &self.hnsw_ids_path(),
-            &serde_json::to_vec(&snapshot).unwrap_or_default(),
-        ) {
-            warn!(error = %e, "HNSW save: ids.json write failed");
-            return Ok(());
-        }
-        debug!(
-            graph = %self.hnsw_graph_path().display(),
-            nodes = hnsw.len(),
-            "HNSW persisted"
-        );
+        warn!("HNSW save: publication did not quiesce; keeping the prior manifest");
         Ok(())
     }
 
@@ -7651,10 +7768,13 @@ impl Index {
             Some(l) => l,
             None => return Ok(false),
         };
+        self.hnsw_stale.store(true, Ordering::Release);
         let mut id_map = self.hnsw_id_map.write().await;
         let mut id_rev = self.hnsw_id_rev.write().await;
+        let mut node_seq = self.hnsw_node_seq.write().await;
         *id_map = loaded.id_map;
         *id_rev = loaded.id_rev;
+        *node_seq = loaded.node_seq;
         // Item 8: re-seed the coverage-gate denominator from the reloaded
         // graph (every graphed doc is a vector doc). Staleness is handled
         // separately by `hnsw_stale`.
@@ -7662,6 +7782,7 @@ impl Index {
             .store(id_map.len() as u64, Ordering::Relaxed);
         drop(id_map);
         drop(id_rev);
+        drop(node_seq);
         self.hnsw_next_id.store(loaded.next_id, Ordering::Relaxed);
         // Same freshness-stamp handling as Index::open (the loader gate
         // guarantees `field` is Some).
@@ -7670,10 +7791,9 @@ impl Index {
                 .seq_no
                 .is_none_or(|stamp| stamp != self.store.current_seq_no());
         *self.hnsw_field.write().unwrap() = loaded.field;
-        self.hnsw_stale
-            .store(stale, std::sync::atomic::Ordering::Release);
         let nodes = loaded.graph.len();
         *self.hnsw.write().await = Some(loaded.graph);
+        self.hnsw_stale.store(stale, Ordering::Release);
         info!(
             nodes,
             stale, "HNSW reloaded from disk — skipping WAL replay rebuild"
@@ -19475,6 +19595,7 @@ struct LoadedHnsw {
     graph: xerj_vector::HnswIndex,
     id_map: HashMap<String, u64>,
     id_rev: HashMap<u64, String>,
+    node_seq: HashMap<u64, u64>,
     next_id: u64,
     /// Pinned field identity stamped into ids.json at save time.
     /// `None` = legacy snapshot (pre-field-stamp): the HNSW query path
@@ -19487,13 +19608,36 @@ struct LoadedHnsw {
     stale: bool,
 }
 
+fn hnsw_sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn hnsw_sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(format!("{:x}", hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
 fn load_hnsw_artifacts_sync(
     hnsw_dir: &Path,
     field_is_dense_vector: &dyn Fn(&str) -> bool,
 ) -> Option<LoadedHnsw> {
     let graph_path = hnsw_dir.join("graph.bin");
     let ids_path = hnsw_dir.join("ids.json");
-    if !graph_path.exists() || !ids_path.exists() {
+    let manifest_path = hnsw_dir.join("manifest.json");
+    if !graph_path.exists() || !ids_path.exists() || !manifest_path.exists() {
         return None;
     }
     // ids.json FIRST (cheap): the mapping gate below must run before the
@@ -19513,6 +19657,30 @@ fn load_hnsw_artifacts_sync(
             return None;
         }
     };
+    let manifest_bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, "HNSW load: manifest missing — graph dropped");
+            return None;
+        }
+    };
+    let manifest: Value = match serde_json::from_slice(&manifest_bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, "HNSW load: manifest corrupt — graph dropped");
+            return None;
+        }
+    };
+    let generation = manifest.get("generation").and_then(Value::as_str)?;
+    let graph_hash = manifest.get("graph_sha256").and_then(Value::as_str)?;
+    let ids_hash = manifest.get("ids_sha256").and_then(Value::as_str)?;
+    if ids.get("generation").and_then(Value::as_str) != Some(generation)
+        || hnsw_sha256_bytes(&ids_bytes) != ids_hash
+        || hnsw_sha256_file(&graph_path).ok().as_deref() != Some(graph_hash)
+    {
+        warn!("HNSW load: graph and identity sidecar generations differ — graph dropped");
+        return None;
+    }
     // Mapping gate (RC4 W2 item 16): a graph is only legitimate for an
     // explicit dense_vector-mapped field. Snapshots pinned to anything
     // else — heuristic-3 graphs from pre-fix builds (e.g. `ports`) and
@@ -19559,6 +19727,35 @@ fn load_hnsw_artifacts_sync(
             id_rev.insert(nid, doc_id.clone());
         }
     }
+    if id_map.len() != map_obj.len() {
+        warn!("HNSW load: identity sidecar contains an invalid node ID — graph dropped");
+        return None;
+    }
+    if id_rev.len() != id_map.len() {
+        warn!("HNSW load: multiple document identities reference one node — graph dropped");
+        return None;
+    }
+    let seq_obj = match ids.get("node_seq").and_then(Value::as_object) {
+        Some(seq_obj) => seq_obj,
+        None => {
+            warn!("HNSW load: identity sidecar has no per-node sequence stamps — graph dropped");
+            return None;
+        }
+    };
+    let mut node_seq = HashMap::with_capacity(id_map.len());
+    for (node_id, seq_no) in seq_obj {
+        if let (Ok(node_id), Some(seq_no)) = (node_id.parse::<u64>(), seq_no.as_u64()) {
+            node_seq.insert(node_id, seq_no);
+        }
+    }
+    if node_seq.len() != id_map.len()
+        || id_map
+            .values()
+            .any(|node_id| !node_seq.contains_key(node_id))
+    {
+        warn!("HNSW load: per-node sequence stamps do not cover the identity map — graph dropped");
+        return None;
+    }
     let graph = match xerj_vector::HnswIndex::load_from(&graph_path) {
         Ok(g) => g,
         Err(e) => {
@@ -19566,6 +19763,20 @@ fn load_hnsw_artifacts_sync(
             return None;
         }
     };
+    if id_map
+        .values()
+        .any(|node_id| !graph.contains_live_id(*node_id))
+    {
+        warn!("HNSW load: identity sidecar references an absent graph node — graph dropped");
+        return None;
+    }
+    if graph
+        .max_known_id()
+        .is_some_and(|max_node_id| next_id <= max_node_id)
+    {
+        warn!("HNSW load: next node identity would reuse a persisted graph node — graph dropped");
+        return None;
+    }
     // Integrity stamp (see save_hnsw_to_disk): `seq_no` records the WAL
     // position at save time, `stale` persists an already-detected
     // staleness so a later flush of a still-stale graph cannot re-stamp
@@ -19576,11 +19787,137 @@ fn load_hnsw_artifacts_sync(
         graph,
         id_map,
         id_rev,
+        node_seq,
         next_id,
         field,
         seq_no,
         stale,
     })
+}
+
+#[cfg(test)]
+mod hnsw_identity_sidecar_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn graph(id: u64, value: f32) -> HnswIndex {
+        let graph = HnswIndex::new(HnswParams::new(2, DistanceMetric::Cosine));
+        graph.insert(id, vec![value, 1.0 - value]).unwrap();
+        graph
+    }
+
+    fn write_pair(
+        dir: &Path,
+        saved_graph: &HnswIndex,
+        graph_override: Option<&HnswIndex>,
+        include_node_seq: bool,
+    ) {
+        let generation = "generation-a";
+        saved_graph.save_to(&dir.join("graph.bin")).unwrap();
+        let ids = json!({
+            "next_id": 2,
+            "map": {"doc": 1},
+            "node_seq": include_node_seq.then_some(json!({"1": 7})),
+            "field": "v",
+            "seq_no": 7,
+            "stale": false,
+            "generation": generation,
+        });
+        let ids_bytes = serde_json::to_vec(&ids).unwrap();
+        std::fs::write(dir.join("ids.json"), &ids_bytes).unwrap();
+        let manifest = json!({
+            "generation": generation,
+            "graph_sha256": hnsw_sha256_file(&dir.join("graph.bin")).unwrap(),
+            "ids_sha256": hnsw_sha256_bytes(&ids_bytes),
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        if let Some(other) = graph_override {
+            other.save_to(&dir.join("graph.bin")).unwrap();
+        }
+    }
+
+    fn rewrite_ids(dir: &Path, mutate: impl FnOnce(&mut Value)) {
+        let ids_path = dir.join("ids.json");
+        let mut ids: Value = serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+        mutate(&mut ids);
+        let ids_bytes = serde_json::to_vec(&ids).unwrap();
+        std::fs::write(&ids_path, &ids_bytes).unwrap();
+        let manifest_path = dir.join("manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["ids_sha256"] = json!(hnsw_sha256_bytes(&ids_bytes));
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    fn load(dir: &Path) -> Option<LoadedHnsw> {
+        load_hnsw_artifacts_sync(dir, &|field| field == "v")
+    }
+
+    #[test]
+    fn loader_accepts_generation_coupled_node_sequences() {
+        let temp = tempfile::tempdir().unwrap();
+        write_pair(temp.path(), &graph(1, 1.0), None, true);
+        let loaded = load(temp.path()).unwrap();
+        assert_eq!(loaded.node_seq.get(&1), Some(&7));
+    }
+
+    #[test]
+    fn loader_rejects_mixed_graph_and_identity_generations() {
+        let temp = tempfile::tempdir().unwrap();
+        write_pair(temp.path(), &graph(1, 1.0), Some(&graph(2, 0.25)), true);
+        assert!(load(temp.path()).is_none());
+
+        write_pair(temp.path(), &graph(1, 1.0), None, true);
+        let mut ids: Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("ids.json")).unwrap()).unwrap();
+        ids["node_seq"] = json!({"1": 8});
+        std::fs::write(
+            temp.path().join("ids.json"),
+            serde_json::to_vec(&ids).unwrap(),
+        )
+        .unwrap();
+        assert!(load(temp.path()).is_none());
+    }
+
+    #[test]
+    fn loader_rejects_legacy_or_torn_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        write_pair(temp.path(), &graph(1, 1.0), None, false);
+        assert!(load(temp.path()).is_none());
+
+        write_pair(temp.path(), &graph(1, 1.0), None, true);
+        std::fs::write(temp.path().join("manifest.json"), b"{").unwrap();
+        assert!(load(temp.path()).is_none());
+        std::fs::remove_file(temp.path().join("manifest.json")).unwrap();
+        assert!(load(temp.path()).is_none());
+    }
+
+    #[test]
+    fn loader_rejects_duplicate_absent_or_reused_node_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        write_pair(temp.path(), &graph(1, 1.0), None, true);
+        rewrite_ids(temp.path(), |ids| {
+            ids["map"] = json!({"doc-a": 1, "doc-b": 1});
+            ids["node_seq"] = json!({"1": 7});
+        });
+        assert!(load(temp.path()).is_none());
+
+        write_pair(temp.path(), &graph(1, 1.0), None, true);
+        rewrite_ids(temp.path(), |ids| {
+            ids["next_id"] = json!(100);
+            ids["map"] = json!({"doc": 99});
+            ids["node_seq"] = json!({"99": 7});
+        });
+        assert!(load(temp.path()).is_none());
+
+        write_pair(temp.path(), &graph(1, 1.0), None, true);
+        rewrite_ids(temp.path(), |ids| ids["next_id"] = json!(1));
+        assert!(load(temp.path()).is_none());
+    }
 }
 
 fn store_config_from(config: &Config) -> IndexStoreConfig {

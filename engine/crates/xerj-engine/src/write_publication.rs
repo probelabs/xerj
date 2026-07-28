@@ -4,6 +4,7 @@
 //! reference to its mutex. The registry keeps a `Weak`, so idle document IDs
 //! do not accumulate forever.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use dashmap::mapref::entry::Entry;
@@ -13,6 +14,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 #[derive(Default)]
 pub(crate) struct WritePublicationCoordinator {
     locks: DashMap<String, Weak<Mutex<()>>>,
+    /// Low 16 bits count active publishers; high 48 bits count completed
+    /// publications. A single sample is a complete optimistic-read stamp.
+    visibility_state: AtomicU64,
     #[cfg(test)]
     before_mutex_await: parking_lot::RwLock<Option<Arc<dyn Fn(&str) + Send + Sync + 'static>>>,
 }
@@ -22,6 +26,11 @@ pub(crate) struct WritePublicationGuard {
     key: String,
     lock: Arc<Mutex<()>>,
     guard: Option<OwnedMutexGuard<()>>,
+    activity: Option<PublicationActivityGuard>,
+}
+
+pub(crate) struct PublicationActivityGuard {
+    coordinator: Arc<WritePublicationCoordinator>,
 }
 
 /// Owns the registry's strong reference while `lock_owned()` is pending.
@@ -91,7 +100,28 @@ impl WritePublicationCoordinator {
             key,
             lock,
             guard: Some(guard),
+            activity: Some(self.begin_activity()),
         }
+    }
+
+    pub(crate) fn begin_activity(self: &Arc<Self>) -> PublicationActivityGuard {
+        const ACTIVE_MASK: u64 = (1 << 16) - 1;
+        self.visibility_state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                ((state & ACTIVE_MASK) != ACTIVE_MASK).then_some(state + 1)
+            })
+            .expect("concurrent publication activity exceeds 65,535");
+        PublicationActivityGuard {
+            coordinator: Arc::clone(self),
+        }
+    }
+
+    /// Return a stable optimistic-read stamp, or `None` while a publication
+    /// is active.
+    pub(crate) fn quiescent_generation(&self) -> Option<u64> {
+        const ACTIVE_MASK: u64 = (1 << 16) - 1;
+        let state = self.visibility_state.load(Ordering::SeqCst);
+        (state & ACTIVE_MASK == 0).then_some(state)
     }
 
     #[cfg(test)]
@@ -166,8 +196,18 @@ impl Drop for WritePublicationGuard {
         // waiter already owns another strong Arc and therefore prevents
         // removal below.
         self.guard.take();
+        self.activity.take();
 
         remove_if_idle(&self.coordinator, &self.key, &self.lock);
+    }
+}
+
+impl Drop for PublicationActivityGuard {
+    fn drop(&mut self) {
+        const COMPLETION: u64 = 1 << 16;
+        self.coordinator
+            .visibility_state
+            .fetch_add(COMPLETION - 1, Ordering::SeqCst);
     }
 }
 
@@ -175,6 +215,39 @@ impl Drop for WritePublicationGuard {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn optimistic_stamp_changes_only_after_quiescent_publication() {
+        let coordinator = WritePublicationCoordinator::new();
+        let before = coordinator.quiescent_generation().unwrap();
+        let first = coordinator.begin_activity();
+        assert!(coordinator.quiescent_generation().is_none());
+        let second = coordinator.begin_activity();
+        assert!(coordinator.quiescent_generation().is_none());
+        drop(first);
+        assert!(coordinator.quiescent_generation().is_none());
+        drop(second);
+        let after = coordinator.quiescent_generation().unwrap();
+        assert_ne!(after, before);
+        assert_eq!(after >> 16, (before >> 16) + 2);
+    }
+
+    #[test]
+    fn optimistic_stamp_rejects_active_counter_overflow_without_wrapping() {
+        let coordinator = WritePublicationCoordinator::new();
+        coordinator
+            .visibility_state
+            .store((1 << 16) - 1, Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = coordinator.begin_activity();
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            coordinator.visibility_state.load(Ordering::SeqCst),
+            (1 << 16) - 1
+        );
+        assert!(coordinator.quiescent_generation().is_none());
+    }
 
     #[tokio::test]
     async fn same_key_is_strictly_ordered_and_cleans_up() {

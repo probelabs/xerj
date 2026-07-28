@@ -507,6 +507,22 @@ impl HnswIndex {
         }
     }
 
+    /// True when a live (non-tombstoned) node with this external ID exists.
+    pub fn contains_live_id(&self, id: u64) -> bool {
+        let g = self.inner.read().unwrap();
+        g.slot_of.contains_key(&id) && !g.tomb_ids.contains(&id)
+    }
+
+    /// Highest external node ID represented by a live slot or tombstone.
+    pub fn max_known_id(&self) -> Option<u64> {
+        let g = self.inner.read().unwrap();
+        g.ids
+            .iter()
+            .copied()
+            .chain(g.tomb_ids.iter().copied())
+            .max()
+    }
+
     pub fn params(&self) -> &HnswParams {
         &self.params
     }
