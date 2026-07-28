@@ -24,6 +24,7 @@ impl Drop for PdfWorkerEnvGuard {
     fn drop(&mut self) {
         std::env::remove_var("XERJ_PDF_WORKER_BIN");
         std::env::remove_var("XERJ_TEST_PDF_COUNT");
+        crate::extract::pdf::reset_replay_concurrency_observation(0);
     }
 }
 
@@ -900,4 +901,57 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/1.0.0-rc.5","parser":"pdf_o
     assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
     assert_eq!(file_done_count(state_dir.path()), 1);
     assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_pdf_run_index_bounds_phase_b_replay_by_pdf_workers_not_general_workers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    const PDFS: usize = 6;
+    for index in 0..PDFS {
+        fs::write(
+            corpus.path().join(format!("quarterly-report-{index}.pdf")),
+            format!("%PDF-1.4\nunique isolated worker input {index}\n"),
+        )
+        .unwrap();
+    }
+
+    let count = tools.path().join("worker-count");
+    let worker = tools.path().join("pdf-worker");
+    fs::write(
+        &worker,
+        br#"#!/bin/sh
+printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/1.0.0-rc.5","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let endpoint = MockEndpoint::start(0);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    config.workers = 8;
+    config.pdf_workers = 2;
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
+    let _env = PdfWorkerEnvGuard;
+    crate::extract::pdf::reset_replay_concurrency_observation(40);
+
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(
+        fs::read_to_string(&count).unwrap().lines().count(),
+        PDFS,
+        "each unique PDF must be parsed once in Phase A and replayed in Phase B"
+    );
+    assert_eq!(
+        crate::extract::pdf::replay_concurrency_maximum(),
+        2,
+        "eight general workers must not widen the two-worker PDF replay gate"
+    );
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), PDFS);
 }

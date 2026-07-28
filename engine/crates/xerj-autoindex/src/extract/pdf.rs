@@ -29,6 +29,65 @@ const MAX_WORKER_OUTPUT: usize = 32 << 20;
 const MAX_WORKER_STDERR: u64 = 64 << 10;
 const WORKER_ADDRESS_SPACE: u64 = 1536 << 20;
 
+#[cfg(test)]
+static REPLAY_OBSERVATION_ACTIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static REPLAY_OBSERVATION_MAXIMUM: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static REPLAY_OBSERVATION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static REPLAY_OBSERVATION_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn reset_replay_concurrency_observation(delay_ms: u64) {
+    REPLAY_OBSERVATION_ENABLED.store(false, Ordering::SeqCst);
+    REPLAY_OBSERVATION_DELAY_MS.store(delay_ms, Ordering::SeqCst);
+    if delay_ms == 0 {
+        return;
+    }
+    assert_eq!(
+        REPLAY_OBSERVATION_ACTIVE.load(Ordering::SeqCst),
+        0,
+        "a previous PDF replay observation is still active"
+    );
+    REPLAY_OBSERVATION_MAXIMUM.store(0, Ordering::SeqCst);
+    REPLAY_OBSERVATION_ENABLED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn replay_concurrency_maximum() -> usize {
+    REPLAY_OBSERVATION_MAXIMUM.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+struct ReplayObservation;
+
+#[cfg(test)]
+impl ReplayObservation {
+    fn begin() -> Option<Self> {
+        if !REPLAY_OBSERVATION_ENABLED.load(Ordering::SeqCst) {
+            return None;
+        }
+        let active = REPLAY_OBSERVATION_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        REPLAY_OBSERVATION_MAXIMUM.fetch_max(active, Ordering::SeqCst);
+        let delay_ms = REPLAY_OBSERVATION_DELAY_MS.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        Some(Self)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReplayObservation {
+    fn drop(&mut self) {
+        REPLAY_OBSERVATION_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub fn extract(path: &Path, sink: Sink) -> Result<ExtractStats> {
     let _permit = worker_gate().acquire();
     let response = spawn_worker(path)?;
@@ -242,7 +301,7 @@ impl ExtractionSpool {
         source_digest: &str,
         sink: Sink,
     ) -> Result<ExtractStats> {
-        self.replay_with_gate(source_size, source_digest, sink, worker_gate())
+        self.replay_with_gate(source_size, source_digest, sink, worker_gate(), true)
     }
 
     fn replay_with_gate(
@@ -251,6 +310,7 @@ impl ExtractionSpool {
         source_digest: &str,
         sink: Sink,
         gate: &WorkerGate,
+        observe_global_replay: bool,
     ) -> Result<ExtractStats> {
         anyhow::ensure!(
             source_size == self.source_size && source_digest == self.source_digest,
@@ -260,6 +320,12 @@ impl ExtractionSpool {
         // parser protocol. Share the PDF gate so Phase B cannot multiply that
         // 32 MiB response bound by the general autoindex worker count.
         let _permit = gate.acquire();
+        #[cfg(test)]
+        let _observation = observe_global_replay
+            .then(ReplayObservation::begin)
+            .flatten();
+        #[cfg(not(test))]
+        let _ = observe_global_replay;
         let mut file = self
             .file
             .lock()
@@ -1086,6 +1152,7 @@ mod tests {
                                 true
                             },
                             &gate,
+                            false,
                         )
                         .unwrap();
                 });
