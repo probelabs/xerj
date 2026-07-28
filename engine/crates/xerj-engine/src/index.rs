@@ -63,6 +63,9 @@ mod hnsw_identity_tests {
     use crate::Engine;
     use tempfile::TempDir;
 
+    static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     async fn fixture(name: &str) -> (TempDir, Arc<Index>) {
         let directory = TempDir::new().unwrap();
         let mut config = xerj_common::config::Config::default();
@@ -76,8 +79,26 @@ mod hnsw_identity_tests {
         (directory, engine.get_index(name).unwrap())
     }
 
+    async fn wait_for_rebuild(index: &Index) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let stats = index.hnsw_stats().await;
+                if stats["present"] == serde_json::json!(true)
+                    && stats["stale"] == serde_json::json!(false)
+                    && stats["rebuilding"] == serde_json::json!(false)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HNSW rebuild did not converge");
+    }
+
     #[tokio::test]
     async fn graph_identity_tracks_the_exact_publication_sequence() {
+        let _serial = TEST_SERIAL.lock().await;
         let (_directory, index) = fixture("hnsw-node-sequence").await;
         let vector = vec![1.0, 0.0, 0.0, 0.0];
         index
@@ -116,6 +137,7 @@ mod hnsw_identity_tests {
 
     #[tokio::test]
     async fn coherent_identity_round_trips_with_the_graph() {
+        let _serial = TEST_SERIAL.lock().await;
         let (directory, index) = fixture("hnsw-identity-roundtrip").await;
         index
             .index_document(
@@ -139,6 +161,150 @@ mod hnsw_identity_tests {
         assert_eq!(index.hnsw_node_seq.read().await[&node], seq_no);
         assert!(index.hnsw.read().await.is_some());
         assert!(!index.hnsw_stale.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn rebuild_advances_sequence_when_vector_bits_are_unchanged() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (directory, index) = fixture("hnsw-same-vector-tail").await;
+        let vector = serde_json::json!([1.0, 0.0, 0.0, 0.0]);
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": vector.clone(), "payload": "old"}),
+            )
+            .await
+            .unwrap();
+        index.save_hnsw_to_disk().await.unwrap();
+        let old_node = index.hnsw_id_map.read().await["doc"];
+        let old_seq = index.hnsw_node_seq.read().await[&old_node];
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": vector, "payload": "new"}),
+            )
+            .await
+            .unwrap();
+        let authoritative_seq = index.store.version_map.get("doc").unwrap().seq_no;
+        assert!(authoritative_seq > old_seq);
+        index.abort_background_tasks();
+        drop(index);
+
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let reopened = Engine::new(config).unwrap();
+        let index = reopened.get_index("hnsw-same-vector-tail").unwrap();
+        wait_for_rebuild(&index).await;
+        let node = index.hnsw_id_map.read().await["doc"];
+        assert_ne!(node, old_node);
+        assert_eq!(index.hnsw_node_seq.read().await[&node], authoritative_seq);
+    }
+
+    #[tokio::test]
+    async fn replacing_vector_with_non_vector_removes_ann_identity() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_directory, index) = fixture("hnsw-remove-vector").await;
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        let node = index.hnsw_id_map.read().await["doc"];
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"payload": "vector removed"}),
+            )
+            .await
+            .unwrap();
+        assert!(!index.hnsw_id_map.read().await.contains_key("doc"));
+        assert!(!index.hnsw_id_rev.read().await.contains_key(&node));
+        assert!(!index.hnsw_node_seq.read().await.contains_key(&node));
+        assert_eq!(index.vector_doc_count.load(Ordering::Relaxed), 0);
+        assert!(index
+            .knn_search(&[1.0, 0.0, 0.0, 0.0], 8)
+            .await
+            .iter()
+            .all(|(id, _)| id != "doc"));
+    }
+
+    #[tokio::test]
+    async fn legacy_two_file_snapshot_is_refused_without_deleting_it() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (directory, index) = fixture("hnsw-legacy-refusal").await;
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        index.save_hnsw_to_disk().await.unwrap();
+        let manifest = index.hnsw_manifest_path();
+        std::fs::remove_file(&manifest).unwrap();
+        let graph = index.hnsw_graph_path();
+        let ids = index.hnsw_ids_path();
+        index.abort_background_tasks();
+        drop(index);
+
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let reopened = Engine::new(config).unwrap();
+        let index = reopened.get_index("hnsw-legacy-refusal").unwrap();
+        assert!(index.hnsw.read().await.is_none());
+        assert!(index.hnsw_stale.load(Ordering::Acquire));
+        assert!(graph.exists());
+        assert!(ids.exists());
+        assert!(!manifest.exists());
+    }
+
+    #[tokio::test]
+    async fn save_retries_delete_crossing_graph_identity_capture() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (directory, index) = fixture("hnsw-save-delete-race").await;
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        index
+            .test_hnsw_save_pause_after_graph
+            .store(true, Ordering::Release);
+        let saving_index = Arc::clone(&index);
+        let saving = tokio::spawn(async move { saving_index.save_hnsw_to_disk().await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !index
+                .test_hnsw_save_ready_after_graph
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("save did not reach graph/identity barrier");
+
+        assert!(index.delete_document("doc").await.unwrap());
+        index
+            .test_hnsw_save_pause_after_graph
+            .store(false, Ordering::Release);
+        saving.await.unwrap().unwrap();
+        index.abort_background_tasks();
+        drop(index);
+
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let reopened = Engine::new(config).unwrap();
+        let index = reopened.get_index("hnsw-save-delete-race").unwrap();
+        assert!(!index.hnsw_id_map.read().await.contains_key("doc"));
+        assert!(index
+            .knn_search(&[1.0, 0.0, 0.0, 0.0], 8)
+            .await
+            .iter()
+            .all(|(id, _)| id != "doc"));
     }
 }
 
@@ -1684,6 +1850,10 @@ pub struct Index {
     write_publication: Arc<crate::write_publication::WritePublicationCoordinator>,
     #[cfg(test)]
     publication_test_hook: Arc<parking_lot::RwLock<Option<PublicationTestHook>>>,
+    #[cfg(test)]
+    test_hnsw_save_pause_after_graph: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_hnsw_save_ready_after_graph: Arc<AtomicBool>,
     doc_count: Arc<AtomicU64>,
     /// Counter for `update` operations that detected no change to the
     /// existing source — surfaced via `indices.stats` as
@@ -2235,6 +2405,10 @@ impl Index {
             write_publication: crate::write_publication::WritePublicationCoordinator::new(),
             #[cfg(test)]
             publication_test_hook: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(test)]
+            test_hnsw_save_pause_after_graph: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_hnsw_save_ready_after_graph: Arc::new(AtomicBool::new(false)),
             doc_count: Arc::new(AtomicU64::new(0)),
             noop_update_count: Arc::new(AtomicU64::new(0)),
             request_cache_seen: Arc::new(RwLock::new(RequestCacheSeen::with_capacity(65_536))),
@@ -2567,6 +2741,10 @@ impl Index {
             write_publication: crate::write_publication::WritePublicationCoordinator::new(),
             #[cfg(test)]
             publication_test_hook: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(test)]
+            test_hnsw_save_pause_after_graph: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_hnsw_save_ready_after_graph: Arc::new(AtomicBool::new(false)),
             doc_count: Arc::new(AtomicU64::new(total_doc_count)),
             noop_update_count: Arc::new(AtomicU64::new(0)),
             request_cache_seen: Arc::new(RwLock::new(RequestCacheSeen::with_capacity(65_536))),
@@ -5613,15 +5791,22 @@ impl Index {
     /// node before inserting the fresh vector — otherwise the graph would
     /// keep serving the pre-update vector forever.
     async fn index_vectors(&self, doc_id: &str, seq_no: u64, source: &Value) {
+        let pinned: Option<String> = self.hnsw_field.read().unwrap().clone();
         let obj = match source.as_object() {
             Some(o) => o,
-            None => return,
+            None => {
+                if pinned.is_some() {
+                    self.hnsw_remove_vector(doc_id).await;
+                }
+                return;
+            }
         };
-        let pinned: Option<String> = self.hnsw_field.read().unwrap().clone();
         if let Some(field) = pinned {
             // Enforced path: only the pinned field ever enters the graph.
             if let Some(vector) = extract_numeric_vector(source, &field) {
                 self.hnsw_insert_vector(doc_id, seq_no, vector).await;
+            } else {
+                self.hnsw_remove_vector(doc_id).await;
             }
             return;
         }
@@ -5704,6 +5889,7 @@ impl Index {
     async fn hnsw_insert_vector(&self, doc_id: &str, seq_no: u64, vector: Vec<f32>) -> bool {
         let dim = vector.len();
         if dim == 0 {
+            self.hnsw_remove_vector(doc_id).await;
             return false;
         }
         // UPDATE staleness fix: a doc_id that already has a node must have
@@ -5730,6 +5916,12 @@ impl Index {
                 if hnsw.params().dim != dim {
                     // Mismatched dimension — skip (no id_map entry → the
                     // coverage guard keeps queries on brute force).
+                    drop(hnsw_guard);
+                    if old_node.is_some() {
+                        self.hnsw_remove_vector(doc_id).await;
+                    } else {
+                        self.hnsw_remove_graph_identity(doc_id).await;
+                    }
                     return false;
                 }
                 if let Some(old) = old_node {
@@ -5737,6 +5929,8 @@ impl Index {
                 }
                 if let Err(e) = hnsw.insert(node_id, vector) {
                     warn!(doc_id, error = %e, "HNSW insert failed");
+                    drop(hnsw_guard);
+                    self.hnsw_remove_graph_identity(doc_id).await;
                     return false;
                 }
             }
@@ -5752,6 +5946,37 @@ impl Index {
         id_map.insert(doc_id.to_string(), node_id);
         id_rev.insert(node_id, doc_id.to_string());
         node_seq.insert(node_id, seq_no);
+        true
+    }
+
+    /// Remove a document's graph binding while retaining the vector-document
+    /// denominator. Used when graph insertion cannot represent the current
+    /// vector: coverage must fail closed to exact search.
+    async fn hnsw_remove_graph_identity(&self, doc_id: &str) -> bool {
+        // Match save's graph → identity lock order.
+        let hnsw = self.hnsw.read().await;
+        let node_id = match self.hnsw_id_map.write().await.remove(doc_id) {
+            Some(node_id) => node_id,
+            None => return false,
+        };
+        self.hnsw_id_rev.write().await.remove(&node_id);
+        self.hnsw_node_seq.write().await.remove(&node_id);
+        if let Some(graph) = hnsw.as_ref() {
+            graph.mark_deleted(node_id);
+        }
+        true
+    }
+
+    /// Remove a document that no longer carries the pinned vector field.
+    async fn hnsw_remove_vector(&self, doc_id: &str) -> bool {
+        if !self.hnsw_remove_graph_identity(doc_id).await {
+            return false;
+        }
+        self.vector_doc_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .ok();
         true
     }
 
@@ -5877,6 +6102,7 @@ impl Index {
         }
 
         'passes: for pass in 1..=MAX_PASSES {
+            let rebuild_activity = self.write_publication.begin_activity();
             let seq_start = self.store.current_seq_no();
             let mut walked = 0u64;
             let mut compared = 0u64;
@@ -5889,6 +6115,15 @@ impl Index {
             let mem_docs = self.memtable.all_docs_with_sources_and_seq_arc();
             for (doc_id, src, seq_no) in &mem_docs {
                 seen.insert(doc_id.clone());
+                let _publication_guard = self.write_publication.lock(doc_id.clone()).await;
+                let current = self
+                    .store
+                    .version_map
+                    .get(doc_id)
+                    .is_some_and(|version| !version.deleted && version.seq_no == *seq_no);
+                if !current {
+                    continue;
+                }
                 if let Some(vector) = extract_numeric_vector(src, &field) {
                     compared += 1;
                     if !self.hnsw_vector_current(doc_id, *seq_no, &vector).await
@@ -5896,6 +6131,8 @@ impl Index {
                     {
                         reinserted += 1;
                     }
+                } else {
+                    self.hnsw_remove_vector(doc_id).await;
                 }
                 walked += 1;
                 if walked & 1023 == 0 {
@@ -5969,6 +6206,15 @@ impl Index {
                             &src_owned
                         }
                     };
+                    let _publication_guard = self.write_publication.lock(id.to_string()).await;
+                    let current = self
+                        .store
+                        .version_map
+                        .get(id)
+                        .is_some_and(|version| !version.deleted && version.seq_no == doc_seq);
+                    if !current {
+                        continue 'passes;
+                    }
                     if let Some(vector) = extract_numeric_vector(src, &field) {
                         compared += 1;
                         if !self.hnsw_vector_current(id, doc_seq, &vector).await
@@ -5976,6 +6222,8 @@ impl Index {
                         {
                             reinserted += 1;
                         }
+                    } else {
+                        self.hnsw_remove_vector(id).await;
                     }
                     walked += 1;
                     if walked & 1023 == 0 {
@@ -5996,6 +6244,7 @@ impl Index {
             };
             let mut pruned = 0u64;
             for (doc_id, node_id) in prune_candidates {
+                let _publication_guard = self.write_publication.lock(doc_id.clone()).await;
                 // Version-map confirm: prune only genuinely-gone docs. A doc
                 // the walk missed because it flushed mid-pass keeps a live
                 // version entry and therefore its node.
@@ -6006,28 +6255,11 @@ impl Index {
                 if !gone {
                     continue;
                 }
+                if self.hnsw_id_map.read().await.get(&doc_id) == Some(&node_id)
+                    && self.hnsw_remove_vector(&doc_id).await
                 {
-                    // Re-check the mapping still points at the node we saw —
-                    // a concurrent re-index replaces the mapping and must
-                    // keep its fresh node.
-                    let mut id_map = self.hnsw_id_map.write().await;
-                    if id_map.get(&doc_id) != Some(&node_id) {
-                        continue;
-                    }
-                    id_map.remove(&doc_id);
+                    pruned += 1;
                 }
-                self.hnsw_id_rev.write().await.remove(&node_id);
-                self.hnsw_node_seq.write().await.remove(&node_id);
-                if let Some(h) = self.hnsw.read().await.as_ref() {
-                    h.mark_deleted(node_id);
-                }
-                // Item 8: pruned doc leaves the coverage-gate denominator.
-                self.vector_doc_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    })
-                    .ok();
-                pruned += 1;
             }
 
             let seq_end = self.store.current_seq_no();
@@ -6038,6 +6270,7 @@ impl Index {
                     index = self.name.as_str(),
                     pass, compared, reinserted, pruned, "HNSW rebuild pass converged"
                 );
+                drop(rebuild_activity);
                 // Persist the healed graph + fresh stamp so the next
                 // restart doesn't redo the work.
                 let _ = self.save_hnsw_to_disk().await;
@@ -6156,6 +6389,7 @@ impl Index {
         similarity: &str,
     ) -> Option<SearchResult> {
         let started = std::time::Instant::now();
+        let publication_generation = self.write_publication.quiescent_generation()?;
         if similarity != "cosine" {
             return None;
         }
@@ -6276,6 +6510,9 @@ impl Index {
             candidates = scored.len(),
             "knn served via HNSW (coverage gate passed)"
         );
+        if self.write_publication.quiescent_generation() != Some(publication_generation) {
+            return None;
+        }
         Some(knn_result_from_scored(request, scored, k, started))
     }
 
@@ -7670,6 +7907,19 @@ impl Index {
                     return Ok(());
                 }
             };
+            #[cfg(test)]
+            {
+                self.test_hnsw_save_ready_after_graph
+                    .store(true, Ordering::Release);
+                while self
+                    .test_hnsw_save_pause_after_graph
+                    .load(Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+                self.test_hnsw_save_ready_after_graph
+                    .store(false, Ordering::Release);
+            }
 
             let id_map = self.hnsw_id_map.read().await;
             let node_seq = self.hnsw_node_seq.read().await;
@@ -8202,28 +8452,7 @@ impl Index {
         // and its neighbour edges stayed in the graph). mark_deleted
         // tombstones the node so kNN skips it; the edges remain
         // until a graph compaction (planned v0.7+).
-        let node_id_to_tomb = {
-            let id_map = self.hnsw_id_map.read().await;
-            id_map.get(id).copied()
-        };
-        if let Some(node_id) = node_id_to_tomb {
-            let hnsw_guard = self.hnsw.read().await;
-            if let Some(ref h) = *hnsw_guard {
-                h.mark_deleted(node_id);
-            }
-            drop(hnsw_guard);
-            // Remove from id maps so a re-index of the same doc_id
-            // gets a fresh node_id (the old one stays tombstoned).
-            self.hnsw_id_map.write().await.remove(id);
-            self.hnsw_id_rev.write().await.remove(&node_id);
-            self.hnsw_node_seq.write().await.remove(&node_id);
-            // Item 8: this doc leaves the coverage-gate denominator.
-            self.vector_doc_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                })
-                .ok();
-        }
+        self.hnsw_remove_vector(id).await;
         #[cfg(test)]
         self.publication_test_point(id, PublicationTestPoint::AfterHnsw);
 
