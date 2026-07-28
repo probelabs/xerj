@@ -661,6 +661,52 @@ mod hnsw_identity_tests {
         assert_eq!(index.hnsw_id_map.read().await["doc"], live_node);
         assert!(!index.hnsw_id_rev.read().await.contains_key(&deleted_node));
     }
+
+    #[tokio::test]
+    async fn failed_graph_insert_persists_denominator_until_authoritative_removal() {
+        let (directory, index) = fixture("hnsw-failed-insert-denominator").await;
+        index
+            .index_document(
+                Some("valid".into()),
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        index
+            .index_document(
+                Some("wrong-dim".into()),
+                serde_json::json!({"embedding": [0.0, 1.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        let before = index.hnsw_stats().await;
+        assert_eq!(before["doc_coverage"], 1);
+        assert_eq!(before["vector_doc_count"], 2);
+        assert_eq!(before["covered"], false);
+        assert!(index.hnsw_vector_seq.read().await.contains_key("wrong-dim"));
+        assert!(!index.hnsw_id_map.read().await.contains_key("wrong-dim"));
+        index.save_hnsw_to_disk().await.unwrap();
+        index.abort_background_tasks();
+        drop(index);
+
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let reopened = Engine::new(config).unwrap();
+        let index = reopened
+            .get_index("hnsw-failed-insert-denominator")
+            .unwrap();
+        let after = index.hnsw_stats().await;
+        assert_eq!(after["doc_coverage"], 1);
+        assert_eq!(after["vector_doc_count"], 2);
+        assert_eq!(after["covered"], false);
+
+        assert!(index.delete_document("wrong-dim").await.unwrap());
+        let removed = index.hnsw_stats().await;
+        assert_eq!(removed["doc_coverage"], 1);
+        assert_eq!(removed["vector_doc_count"], 1);
+        assert_eq!(removed["covered"], true);
+        assert!(!index.hnsw_vector_seq.read().await.contains_key("wrong-dim"));
+    }
 }
 
 /// Clears an index's `merge_in_progress` flag on every exit path of the
@@ -2278,6 +2324,11 @@ pub struct Index {
     /// Exact authoritative sequence that produced each graph node. A node
     /// without a matching stamp is never considered current by recovery.
     hnsw_node_seq: Arc<RwLock<HashMap<u64, u64>>>,
+    /// Every live document carrying the pinned vector field, including
+    /// documents whose vector cannot be represented by the current graph.
+    /// This is the authoritative ANN coverage denominator and carries the
+    /// document sequence needed to make removal monotonic and idempotent.
+    hnsw_vector_seq: Arc<RwLock<HashMap<String, u64>>>,
     /// Monotonic counter for HNSW node IDs.
     hnsw_next_id: Arc<AtomicU64>,
     /// Number of distinct live docs that CARRY the pinned vector field (item
@@ -2838,6 +2889,7 @@ impl Index {
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
             hnsw_id_rev: Arc::new(RwLock::new(HashMap::new())),
             hnsw_node_seq: Arc::new(RwLock::new(HashMap::new())),
+            hnsw_vector_seq: Arc::new(RwLock::new(HashMap::new())),
             hnsw_next_id: Arc::new(AtomicU64::new(1)),
             vector_doc_count: Arc::new(AtomicU64::new(0)),
             hnsw_field: Arc::new(std::sync::RwLock::new(None)),
@@ -3033,6 +3085,7 @@ impl Index {
             id_map_init,
             id_rev_init,
             node_seq_init,
+            vector_seq_init,
             next_id_init,
             hnsw_field_init,
             hnsw_stale_init,
@@ -3059,14 +3112,25 @@ impl Index {
                         .get(doc_id)
                         .is_some_and(|version| !version.deleted && version.seq_no == *node_seq)
                 });
+                let vector_denominator_matches_authority =
+                    l.vector_seq.iter().all(|(doc_id, vector_seq)| {
+                        store.version_map.get(doc_id).is_some_and(|version| {
+                            !version.deleted && version.seq_no == *vector_seq
+                        })
+                    }) && l
+                        .id_map
+                        .keys()
+                        .all(|doc_id| l.vector_seq.contains_key(doc_id));
                 let stale = l.stale
                     || l.seq_no.is_none_or(|stamp| stamp != store.current_seq_no())
-                    || !node_sequences_match_authority;
+                    || !node_sequences_match_authority
+                    || !vector_denominator_matches_authority;
                 (
                     Some(l.graph),
                     l.id_map,
                     l.id_rev,
                     l.node_seq,
+                    l.vector_seq,
                     l.next_id,
                     l.field,
                     stale,
@@ -3074,6 +3138,7 @@ impl Index {
             }
             None => (
                 None,
+                HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -3088,7 +3153,7 @@ impl Index {
         // At flush time the graph covered every vector-bearing doc, so the
         // reloaded `id_map.len()` IS the vector-doc count. If the snapshot is
         // stale, `hnsw_stale` already forces brute regardless of this value.
-        let vector_doc_count_init = id_map_init.len() as u64;
+        let vector_doc_count_init = vector_seq_init.len() as u64;
         if initial_hnsw {
             info!(
                 name = name.as_str(),
@@ -3164,6 +3229,7 @@ impl Index {
             hnsw_id_map: Arc::new(RwLock::new(id_map_init)),
             hnsw_id_rev: Arc::new(RwLock::new(id_rev_init)),
             hnsw_node_seq: Arc::new(RwLock::new(node_seq_init)),
+            hnsw_vector_seq: Arc::new(RwLock::new(vector_seq_init)),
             hnsw_next_id: Arc::new(AtomicU64::new(next_id_init)),
             vector_doc_count: Arc::new(AtomicU64::new(vector_doc_count_init)),
             hnsw_field: Arc::new(std::sync::RwLock::new(hnsw_field_init)),
@@ -6237,7 +6303,7 @@ impl Index {
             Some(o) => o,
             None => {
                 if pinned.is_some() {
-                    self.hnsw_remove_vector(doc_id).await;
+                    self.hnsw_remove_vector(doc_id, seq_no).await;
                 }
                 return;
             }
@@ -6247,7 +6313,7 @@ impl Index {
             if let Some(vector) = extract_numeric_vector(source, &field) {
                 self.hnsw_insert_vector(doc_id, seq_no, vector).await;
             } else {
-                self.hnsw_remove_vector(doc_id).await;
+                self.hnsw_remove_vector(doc_id, seq_no).await;
             }
             return;
         }
@@ -6330,7 +6396,7 @@ impl Index {
     async fn hnsw_insert_vector(&self, doc_id: &str, seq_no: u64, vector: Vec<f32>) -> bool {
         let dim = vector.len();
         if dim == 0 {
-            self.hnsw_remove_vector(doc_id).await;
+            self.hnsw_remove_vector(doc_id, seq_no).await;
             return false;
         }
         let _mutation = self.hnsw_mutation_lock.lock().await;
@@ -6341,6 +6407,7 @@ impl Index {
         let mut id_map = self.hnsw_id_map.write().await;
         let mut id_rev = self.hnsw_id_rev.write().await;
         let mut node_seq = self.hnsw_node_seq.write().await;
+        let mut vector_seq = self.hnsw_vector_seq.write().await;
 
         // A rebuild or older bulk item may have computed this vector before a
         // newer write advanced the authoritative version map. Never let that
@@ -6359,6 +6426,15 @@ impl Index {
         {
             return false;
         }
+        if vector_seq
+            .get(doc_id)
+            .is_some_and(|published| *published > seq_no)
+        {
+            return false;
+        }
+        vector_seq.insert(doc_id.to_string(), seq_no);
+        self.vector_doc_count
+            .store(vector_seq.len() as u64, Ordering::Relaxed);
 
         if hnsw_guard.is_none() {
             let params = HnswParams::new(dim, DistanceMetric::Cosine);
@@ -6375,8 +6451,6 @@ impl Index {
                 id_map.remove(doc_id);
                 id_rev.remove(&old);
                 node_seq.remove(&old);
-            } else {
-                self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
             }
             return false;
         }
@@ -6387,9 +6461,6 @@ impl Index {
         // remain unchanged.
         if let Err(e) = hnsw.insert(node_id, vector) {
             warn!(doc_id, error = %e, "HNSW insert failed");
-            if old_node.is_none() {
-                self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
-            }
             return false;
         }
         self.hnsw_next_id
@@ -6398,8 +6469,6 @@ impl Index {
             hnsw.mark_deleted(old);
             id_rev.remove(&old);
             node_seq.remove(&old);
-        } else {
-            self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
         }
         id_map.insert(doc_id.to_string(), node_id);
         id_rev.insert(node_id, doc_id.to_string());
@@ -6407,39 +6476,44 @@ impl Index {
         true
     }
 
-    /// Remove a document's graph binding while retaining the vector-document
-    /// denominator. Used when graph insertion cannot represent the current
-    /// vector: coverage must fail closed to exact search.
-    async fn hnsw_remove_graph_identity(&self, doc_id: &str) -> bool {
+    /// Remove a document from both graph identity and the authoritative
+    /// vector-eligibility denominator. The expected sequence must still be
+    /// current in the version map, so an older rebuild/delete cannot remove a
+    /// newer reinsert. A denominator entry is removed even when graph
+    /// insertion previously failed and therefore produced no identity.
+    async fn hnsw_remove_vector(&self, doc_id: &str, seq_no: u64) -> bool {
         let _mutation = self.hnsw_mutation_lock.lock().await;
-        // Acquire all guards before mutating, matching insert/save order.
         let hnsw = self.hnsw.read().await;
         let mut id_map = self.hnsw_id_map.write().await;
         let mut id_rev = self.hnsw_id_rev.write().await;
         let mut node_seq = self.hnsw_node_seq.write().await;
-        let node_id = match id_map.remove(doc_id) {
-            Some(node_id) => node_id,
-            None => return false,
+        let mut vector_seq = self.hnsw_vector_seq.write().await;
+        let authority_matches = match self.store.version_map.get(doc_id) {
+            Some(version) => version.seq_no == seq_no,
+            None => vector_seq.get(doc_id) == Some(&seq_no),
         };
-        id_rev.remove(&node_id);
-        node_seq.remove(&node_id);
-        if let Some(graph) = hnsw.as_ref() {
-            graph.mark_deleted(node_id);
-        }
-        true
-    }
-
-    /// Remove a document that no longer carries the pinned vector field.
-    async fn hnsw_remove_vector(&self, doc_id: &str) -> bool {
-        if !self.hnsw_remove_graph_identity(doc_id).await {
+        if !authority_matches {
             return false;
         }
+        let mut changed = false;
+        if let Some(node_id) = id_map.remove(doc_id) {
+            id_rev.remove(&node_id);
+            node_seq.remove(&node_id);
+            if let Some(graph) = hnsw.as_ref() {
+                graph.mark_deleted(node_id);
+            }
+            changed = true;
+        }
+        if vector_seq
+            .get(doc_id)
+            .is_some_and(|published| *published <= seq_no)
+        {
+            vector_seq.remove(doc_id);
+            changed = true;
+        }
         self.vector_doc_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_sub(1))
-            })
-            .ok();
-        true
+            .store(vector_seq.len() as u64, Ordering::Relaxed);
+        changed
     }
 
     /// Perform KNN search over the HNSW index.
@@ -6590,7 +6664,7 @@ impl Index {
                         reinserted += 1;
                     }
                 } else {
-                    self.hnsw_remove_vector(doc_id).await;
+                    self.hnsw_remove_vector(doc_id, *seq_no).await;
                 }
                 walked += 1;
                 if walked & 1023 == 0 {
@@ -6681,7 +6755,7 @@ impl Index {
                             reinserted += 1;
                         }
                     } else {
-                        self.hnsw_remove_vector(id).await;
+                        self.hnsw_remove_vector(id, doc_seq).await;
                     }
                     walked += 1;
                     if walked & 1023 == 0 {
@@ -6690,18 +6764,19 @@ impl Index {
                 }
             }
 
-            // Prune graphed docs that are no longer live — WAL-tail deletes
-            // the flush-time id_map still carries.
+            // Prune every denominator entry that is no longer live, including
+            // vector docs whose graph insertion failed and have no id_map
+            // binding.
             let prune_candidates: Vec<(String, u64)> = {
-                let id_map = self.hnsw_id_map.read().await;
-                id_map
+                let vector_seq = self.hnsw_vector_seq.read().await;
+                vector_seq
                     .iter()
                     .filter(|(doc_id, _)| !seen.contains(*doc_id))
-                    .map(|(doc_id, node)| (doc_id.clone(), *node))
+                    .map(|(doc_id, seq_no)| (doc_id.clone(), *seq_no))
                     .collect()
             };
             let mut pruned = 0u64;
-            for (doc_id, node_id) in prune_candidates {
+            for (doc_id, vector_seq) in prune_candidates {
                 let _publication_guard = self.write_publication.lock(doc_id.clone()).await;
                 // Version-map confirm: prune only genuinely-gone docs. A doc
                 // the walk missed because it flushed mid-pass keeps a live
@@ -6713,9 +6788,13 @@ impl Index {
                 if !gone {
                     continue;
                 }
-                if self.hnsw_id_map.read().await.get(&doc_id) == Some(&node_id)
-                    && self.hnsw_remove_vector(&doc_id).await
-                {
+                let removal_seq = self
+                    .store
+                    .version_map
+                    .get(&doc_id)
+                    .map(|version| version.seq_no)
+                    .unwrap_or(vector_seq);
+                if self.hnsw_remove_vector(&doc_id, removal_seq).await {
                     pruned += 1;
                 }
             }
@@ -8307,13 +8386,12 @@ impl Index {
     //   graph.bin    HNSW graph (xerj-vector format, CRC32C-validated)
     //   ids.json     { next_id, map: { "doc_id": node_id, ... } }
     //
-    // Caller invariants:
+    // Persistence invariants:
     //   * `save_hnsw_to_disk` writes both files atomically (via .tmp +
     //     rename). A crash leaves either both old files or no files;
     //     in the latter case startup falls back to WAL replay.
-    //   * `load_hnsw_from_disk` is best-effort. Any error returns Ok(())
-    //     and leaves `self.hnsw = None`; the next vector ingest re-
-    //     creates the graph.
+    //   * Open-time loading is the only install path. Any rejected artifact
+    //     leaves ANN stale/exact and schedules an authoritative rebuild.
 
     fn hnsw_dir(&self) -> std::path::PathBuf {
         self.data_dir.join("hnsw")
@@ -8385,11 +8463,13 @@ impl Index {
 
             let id_map = self.hnsw_id_map.read().await;
             let node_seq = self.hnsw_node_seq.read().await;
+            let vector_seq = self.hnsw_vector_seq.read().await;
             let hnsw_field = self.hnsw_field.read().unwrap().clone();
             let identity = serde_json::json!({
                 "next_id": self.hnsw_next_id.load(Ordering::Relaxed),
                 "map": *id_map,
                 "node_seq": *node_seq,
+                "vector_seq": *vector_seq,
                 "generation": generation,
                 "field": hnsw_field,
                 "seq_no": self.store.current_seq_no(),
@@ -8408,6 +8488,7 @@ impl Index {
                 warn!(%error, "HNSW save: identity write failed");
                 return Ok(());
             }
+            drop(vector_seq);
             drop(node_seq);
             drop(id_map);
 
@@ -8463,54 +8544,6 @@ impl Index {
         }
         warn!("HNSW save: publication did not quiesce; keeping the prior manifest");
         Ok(())
-    }
-
-    /// Try to load a previously-persisted HNSW graph + id-map.
-    /// Returns `Ok(true)` on a successful load (graph and ids both
-    /// present and self-consistent), `Ok(false)` if no snapshot
-    /// exists or load failed (caller falls back to WAL replay).
-    pub async fn load_hnsw_from_disk(&self) -> Result<bool> {
-        let dv_fields = {
-            let schema = self.schema.read().await;
-            collect_dense_vector_fields(&schema.schema)
-        };
-        let loaded = match load_hnsw_artifacts_sync(&self.hnsw_dir(), &|f: &str| {
-            dv_fields.iter().any(|df| df == f)
-        }) {
-            Some(l) => l,
-            None => return Ok(false),
-        };
-        self.hnsw_stale.store(true, Ordering::Release);
-        let mut id_map = self.hnsw_id_map.write().await;
-        let mut id_rev = self.hnsw_id_rev.write().await;
-        let mut node_seq = self.hnsw_node_seq.write().await;
-        *id_map = loaded.id_map;
-        *id_rev = loaded.id_rev;
-        *node_seq = loaded.node_seq;
-        // Item 8: re-seed the coverage-gate denominator from the reloaded
-        // graph (every graphed doc is a vector doc). Staleness is handled
-        // separately by `hnsw_stale`.
-        self.vector_doc_count
-            .store(id_map.len() as u64, Ordering::Relaxed);
-        drop(id_map);
-        drop(id_rev);
-        drop(node_seq);
-        self.hnsw_next_id.store(loaded.next_id, Ordering::Relaxed);
-        // Same freshness-stamp handling as Index::open (the loader gate
-        // guarantees `field` is Some).
-        let stale = loaded.stale
-            || loaded
-                .seq_no
-                .is_none_or(|stamp| stamp != self.store.current_seq_no());
-        *self.hnsw_field.write().unwrap() = loaded.field;
-        let nodes = loaded.graph.len();
-        *self.hnsw.write().await = Some(loaded.graph);
-        self.hnsw_stale.store(stale, Ordering::Release);
-        info!(
-            nodes,
-            stale, "HNSW reloaded from disk — skipping WAL replay rebuild"
-        );
-        Ok(true)
     }
 
     /// Re-validate every section's CRC32C across every segment in
@@ -8915,7 +8948,11 @@ impl Index {
         // and its neighbour edges stayed in the graph). mark_deleted
         // tombstones the node so kNN skips it; the edges remain
         // until a graph compaction (planned v0.7+).
-        self.hnsw_remove_vector(id).await;
+        self.hnsw_remove_vector(
+            id,
+            deleted_seq.unwrap_or_else(|| self.store.current_seq_no().saturating_sub(1)),
+        )
+        .await;
         hnsw_epoch.complete();
         #[cfg(test)]
         self.publication_test_point(id, PublicationTestPoint::AfterHnsw);
@@ -20289,6 +20326,7 @@ struct LoadedHnsw {
     id_map: HashMap<String, u64>,
     id_rev: HashMap<u64, String>,
     node_seq: HashMap<u64, u64>,
+    vector_seq: HashMap<String, u64>,
     next_id: u64,
     /// Pinned field identity stamped into ids.json at save time.
     /// `None` = legacy snapshot (pre-field-stamp): the HNSW query path
@@ -20449,6 +20487,29 @@ fn load_hnsw_artifacts_sync(
         warn!("HNSW load: per-node sequence stamps do not cover the identity map — graph dropped");
         return None;
     }
+    let vector_seq_obj = match ids.get("vector_seq").and_then(Value::as_object) {
+        Some(vector_seq) => vector_seq,
+        None => {
+            warn!(
+                "HNSW load: identity sidecar has no authoritative vector denominator — graph dropped"
+            );
+            return None;
+        }
+    };
+    let mut vector_seq = HashMap::with_capacity(vector_seq_obj.len());
+    for (doc_id, seq_no) in vector_seq_obj {
+        if let Some(seq_no) = seq_no.as_u64() {
+            vector_seq.insert(doc_id.clone(), seq_no);
+        }
+    }
+    if vector_seq.len() != vector_seq_obj.len()
+        || id_map.keys().any(|doc_id| !vector_seq.contains_key(doc_id))
+    {
+        warn!(
+            "HNSW load: authoritative vector denominator is invalid or misses graphed docs — graph dropped"
+        );
+        return None;
+    }
     let graph = match xerj_vector::HnswIndex::load_from(&graph_path) {
         Ok(g) => g,
         Err(e) => {
@@ -20481,6 +20542,7 @@ fn load_hnsw_artifacts_sync(
         id_map,
         id_rev,
         node_seq,
+        vector_seq,
         next_id,
         field,
         seq_no,
@@ -20511,6 +20573,7 @@ mod hnsw_identity_sidecar_tests {
             "next_id": 2,
             "map": {"doc": 1},
             "node_seq": include_node_seq.then_some(json!({"1": 7})),
+            "vector_seq": {"doc": 7},
             "field": "v",
             "seq_no": 7,
             "stale": false,
@@ -20580,6 +20643,12 @@ mod hnsw_identity_sidecar_tests {
     fn loader_rejects_legacy_or_torn_metadata() {
         let temp = tempfile::tempdir().unwrap();
         write_pair(temp.path(), &graph(1, 1.0), None, false);
+        assert!(load(temp.path()).is_none());
+
+        write_pair(temp.path(), &graph(1, 1.0), None, true);
+        rewrite_ids(temp.path(), |ids| {
+            ids.as_object_mut().unwrap().remove("vector_seq");
+        });
         assert!(load(temp.path()).is_none());
 
         write_pair(temp.path(), &graph(1, 1.0), None, true);
