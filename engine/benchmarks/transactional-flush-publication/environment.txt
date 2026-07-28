@@ -1,0 +1,12 @@
+benchmark_version=1
+base_git=761b47dfcb5f8fcc57bc929385c422bcffbe130b
+head_git=e601555b0eb8a371ba7d9e2eb3edc0066d63e503
+base_binary_sha256=43499d15693ba5e2c7485ab96777bf1cadb84cf98078e47a874a0f77d0fa06f4
+head_binary_sha256=cfa22aa5861ed387c35c5e69a50e41df0eaf9b9dda1951fa730db0caf0124bac
+kernel=Linux 6.12.95+deb13-amd64 x86_64
+rustc=1.97.1 (8bab26f4f 2026-07-14)
+cargo=1.97.1 (c980f4866 2026-06-30)
+memory_total=62Gi
+swap=0B
+python=3.13.5
+logical_cpu_count=16
