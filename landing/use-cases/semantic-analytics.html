@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ.ai — Semantic analytics: aggregate a semantic slice in one request</title>
+<meta name="description" content="Deep-research questions bundle retrieval, aggregation and evidence in one breath. XERJ answers them in a single POST /_search: the rc.6 engine change runs aggregations over the retrieved top-k neighbour set, so columns, full text and vectors are queried together in one index. Includes the deliberate trade — an aggs-bearing kNN routes to the exact brute-force path so bucket counts cannot be approximate — and an honest limitations list. Demonstrated on a generated 130-conversation corpus, not real data and not a benchmark.">
+<meta property="og:title" content="XERJ.ai — Semantic analytics: aggregate a semantic slice in one request">
+<meta property="og:description" content="&quot;Of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what are the key issues?&quot; — one clause is vector retrieval, the rest is aggregation over exactly what that clause selected. One index, one request, exact buckets. Demonstrated on a generated 130-conversation corpus — not real data, not a benchmark, nothing timed.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
+<link rel="stylesheet" href="/style.css?v=sc0706">
+</head>
+<body>
+
+<!-- nav -->
+<nav class="nav" aria-label="Primary">
+  <a href="/index.html" class="brand">XERJ.AI</a>
+  <a href="/index.html">HOME</a>
+  <a href="/product.html">PRODUCT</a>
+  <span class="nav-drop active">
+    <a href="/use-cases.html" class="active">USE CASES</a>
+  </span>
+  <span class="spacer"></span>
+  <a href="/for-agents.html">FOR AGENTS</a>
+  <a href="/docs/index.html">DOCS</a>
+  <a href="/docs/recipes/index.html">RECIPES</a>
+  <a href="/playground.html">DASHBOARDS</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="theme">
+    <button type="button" data-theme="day">DAY</button>
+    <span class="dash">·</span>
+    <button type="button" data-theme="night" class="active">NIGHT</button>
+  </span>
+</nav>
+
+
+<nav class="uc-subnav" aria-label="Use cases">
+  <a href="/use-cases.html">ALL USE CASES</a>
+  <a href="/use-cases/security-analytics.html">SECURITY ANALYTICS</a>
+  <a href="/use-cases/operational-intelligence.html">OPERATIONAL INTELLIGENCE</a>
+  <a href="/use-cases/ai-search-retrieval.html">AI SEARCH</a>
+  <a href="/use-cases/semantic-analytics.html" class="active">SEMANTIC ANALYTICS</a>
+  <a href="/use-cases/code-security-audit.html">AI SECURITY REVIEW</a>
+  <a href="/use-cases/elasticsearch-replacement.html">ES REPLACEMENT</a>
+  <a href="/use-cases/unified-observability.html">OBSERVABILITY</a>
+</nav>
+
+<div class="uc-hero">
+  <div class="uc-eyebrow">USE CASE · SEMANTIC ANALYTICS</div>
+  <h1>AGGREGATE THE<br>SEMANTIC SLICE.<br><span class="accent">ONE REQUEST.</span></h1>
+  <p class="uc-lead">A deep-research question bundles two workloads in one breath: <em>of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what are the key issues?</em> The first clause is vector retrieval. Everything after it is aggregation over exactly the documents that clause selected — plus a handful of example records to ground the answer. Answering it has meant two systems, an OLAP engine for the aggregation and a vector store for the neighbours, with ETL between them and no join across them; or a two-step round trip, run the kNN, ship the ids back to the client, aggregate with a filter. XERJ answers it in one <code class="inline">POST /_search</code>, because the structured columns, the full text and the vector live in the same index — and because the rc.6 engine change runs the aggregations over the <em>retrieved top-k neighbour set</em>, before any <code class="inline">from</code>/<code class="inline">size</code> windowing. What follows is that feature, its deliberate cost, and its gaps. Every run shown below used a <strong>generated</strong> 130-conversation corpus, built by a seeded script from about 21 hand-written sentence templates: a correctness demo of a query shape, not real support data, not production scale, and nothing on this page was timed.</p>
+  <div class="kicker"><span>FOR</span><span class="dash">·</span><span>DATA / ML ENGINEER</span><span class="dash">·</span><span>ANALYTICS ENGINEER</span><span class="dash">·</span><span>AI PRODUCT</span></div>
+</div>
+
+<!-- Hero chart -->
+<section class="scene-section" style="border-top:0; padding-top:0;">
+  <div class="viz-block">
+    <div class="kicker"><span>WHAT CAME BACK FROM ONE REQUEST · TERMS BUCKETS OVER THE RETRIEVED NEIGHBOUR SET · GENERATED 130-CONVERSATION CORPUS · NOT REAL DATA · NOT A BENCHMARK</span></div>
+    <div class="topn-list">
+    <div class="row">
+      <div class="row__label">band 2.4GHz</div>
+      <div class="row__val">29</div>
+      <div class="row__bar">
+        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
+          <line x1="0" y1="5" x2="200.0" y2="5" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      </div>
+      <div class="row__pct">36%</div>
+    </div>
+    <div class="row">
+      <div class="row__label">band n/a · non-wifi (derived: 80 − 54)</div>
+      <div class="row__val">26</div>
+      <div class="row__bar">
+        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
+          <line x1="0" y1="5" x2="179.3" y2="5" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      </div>
+      <div class="row__pct">33%</div>
+    </div>
+    <div class="row">
+      <div class="row__label">band 5GHz</div>
+      <div class="row__val">25</div>
+      <div class="row__bar">
+        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
+          <line x1="0" y1="5" x2="172.4" y2="5" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      </div>
+      <div class="row__pct">31%</div>
+    </div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">THE 80 IS THE <code class="inline">k</code> PARAMETER OF THE REQUEST, ECHOED BACK AS <code class="inline">hits.total.value</code> — IT IS THE SIZE OF THE RETRIEVED NEIGHBOUR POOL, NOT A COUNT OF MATCHING DOCUMENTS AND NOT A RETRIEVAL-QUALITY FIGURE. 54 OF THE 80 CARRIED A WIFI BAND. THE <code class="inline">n/a</code> ROW IS NOT IN THE PUBLISHED OUTPUT — THE DEMO SCRIPT FILTERS THAT BUCKET CLIENT-SIDE BEFORE PRINTING, AND 26 IS THE REMAINDER (80 − 54). THE SPLIT ITSELF IS OUTPUT OF A SEEDED GENERATOR (<code class="inline">random.seed(7)</code>, ~21 HAND-WRITTEN TEMPLATES), NOT A FINDING ABOUT SUPPORT CALLS — WHAT THE CHART DEMONSTRATES IS THAT THE BUCKETS WERE COMPUTED OVER THE SEMANTIC SLICE IN THE SAME RESPONSE AS THE HITS · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics" rel="external">docs/case-studies/calltree-analytics &rarr;</a></p>
+  </div>
+</section>
+
+<div class="pain-solve">
+  <div class="pain">
+    <h3>THE TWO-SYSTEM PROBLEM</h3>
+    <ul><li><strong>One question, two workloads.</strong> "Calls about X" is vector retrieval; "how many, split by what, with which percentiles" is analytics — and the second has to run over exactly the set the first selected.</li><li><strong>OLAP plus a vector store means ETL.</strong> Two systems to operate, a pipeline between them, and no join across them: the ids that come out of one are the only thing the other can consume.</li><li><strong>The two-step round trip carries the join by hand.</strong> Run the kNN, collect the ids, send them back as a filter on the aggregation. The client becomes the join engine, and the id list grows with the slice.</li><li><strong>Aggregations used to skip the vector path entirely.</strong> Before rc.6, <code class="inline">knn</code>+<code class="inline">aggs</code> and <code class="inline">query.knn</code>+<code class="inline">aggs</code> both came back with no buckets. (A <code class="inline">knn</code> placed inside <code class="inline">bool.filter</code> still does — see the limits below.)</li><li><strong>The evidence lives somewhere else again.</strong> A research report needs the counts <em>and</em> the example records behind them, which is another query against another store.</li></ul>
+  </div>
+  <div class="solve">
+    <h3>THE XERJ ANSWER</h3>
+    <ul><li><strong>One index holds all three.</strong> The demo mapping declares <code class="inline">keyword</code> and <code class="inline">integer</code> columns, a <code class="inline">text</code> body and a <code class="inline">dense_vector</code> with cosine similarity — structured, full-text and vector in a single mapping.</li><li><strong>kNN and aggs in one POST.</strong> rc.6: the aggregation sees the retrieved top-<code class="inline">k</code> neighbour set — for both the top-level <code class="inline">knn</code> section and the <code class="inline">query.knn</code> form — computed before the <code class="inline">from</code>/<code class="inline">size</code> hit page is cut.</li><li><strong>Exact buckets by construction.</strong> An <code class="inline">aggs</code>-bearing kNN is deliberately gated out of the ANN path and routed to the exact brute-force scan, because ANN recall is under 100% and a bucket count must not be approximate.</li><li><strong>Implemented once, in the shared assembler.</strong> The change lives in the single kNN result assembler, so there is no second implementation to drift. The two executors that can actually serve an <code class="inline">aggs</code>-bearing kNN are both exact — the brute-force scan and the multi-kNN array form, which is brute force per clause; the ANN executor is gated out by the same exactness rule.</li><li><strong>Counts and evidence in the same response.</strong> <code class="inline">size:3</code> returns example documents alongside the buckets; <code class="inline">size:0</code> is a legitimate analytics-only shape that returns aggregations and totals with no hits — use the <code class="inline">query.knn</code> form for it, since the top-level <code class="inline">knn</code> section widens <code class="inline">size</code> to <code class="inline">k</code>.</li></ul>
+  </div>
+</div>
+
+<div class="proof-row">
+
+  <div class="stat">
+    <div class="num">1</div>
+    <div class="label">REQUEST FOR THE WHOLE ANSWER</div>
+    <div class="ctx">semantic slice · band split · per-band issue terms · csat percentile · handle-time average · example hits — one POST</div>
+  </div>
+
+  <div class="stat">
+    <div class="num">1</div>
+    <div class="label">SHARED RESULT ASSEMBLER</div>
+    <div class="ctx">exact brute force and multi-knn both funnel through it; the HNSW executor is excluded from aggs-bearing kNN by the same exactness gate</div>
+  </div>
+
+  <div class="stat">
+    <div class="num">130</div>
+    <div class="label">GENERATED CONVERSATIONS IN THE DEMO</div>
+    <div class="ctx">seeded script · ~21 hand-written templates · a correctness demo of the query shape, not a benchmark</div>
+  </div>
+
+</div>
+
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">ONE QUESTION, <span class="accent">ONE ROUND TRIP.</span></h2>
+  <p class="wide">Read the question again and mark the clauses. <em>"Of calls about wifi issues"</em> is a kNN over a topic vector. <em>"How many are 2.4GHz vs 5GHz"</em> is a <code class="inline">terms</code> aggregation on a keyword column — but only over the documents the first clause returned. <em>"What are the key issues"</em> is a nested <code class="inline">terms</code> inside each band bucket. CSAT and handle time are <code class="inline">percentiles</code> and <code class="inline">avg</code> on integer columns in the same breath, and the report body needs a few real conversations to quote. Five primitives, one document set, one request.</p>
+  <pre class="code">$ curl -s "$XERJ/conversations/_search" -H 'Content-Type: application/json' \
+  -d '{"query":{"knn":{"field":"vec","query_vector":[ ...768 floats... ],
+                       "k":80,"num_candidates":130}},
+       "size":3,"_source":["band","issue","body"],
+       "aggs":{"by_band":{"terms":{"field":"band"},"aggs":{
+          "key_issues":{"terms":{"field":"issue","size":4}},
+          "csat":{"percentiles":{"field":"csat","percents":[50]}},
+          "aht":{"avg":{"field":"handle_time_s"}}}}}}'
+<span class="comment"># the knn clause selects the slice · the aggs run over that slice · size:3 returns evidence</span></pre>
+  <p class="wide">That is the actual request the demo script issues — a <code class="inline">knn</code> clause nested under <code class="inline">query</code>, with a sibling <code class="inline">aggs</code> block carrying nested <code class="inline">terms</code>, <code class="inline">percentiles</code> and <code class="inline">avg</code>. And here is what came back, with the provenance of every number written next to it rather than in a footnote, because most of them are properties of the generator and not of anything real.</p>
+  <pre class="code"><span class="comment"># run against the GENERATED 130-doc corpus — a seeded script, ~21 hand-written sentences</span>
+"of calls about wifi issues, how many 2.4 vs 5GHz, and what are the key issues?"
+
+hits.total.value = 80    <span class="comment"># this is the k parameter echoed back, NOT a match count</span>
+
+  2.4GHz  29   csat_p50=4.0   aht=897s   issues: channel-overlap, congestion, disconnects, legacy-device
+  5GHz    25   csat_p50=4.0   aht=924s   issues: range, disconnects, congestion
+  n/a     26   <span class="comment"># DERIVED, not printed: the script drops this bucket client-side, 26 is the remainder (80 - 54)</span>
+
+<span class="comment"># csat_p50 = 4.0 in both bands is the generator's median: csat is drawn from the</span>
+<span class="comment">#   hand-written list [1,2,3,4,5,4,5,5,3], whose population median is 4 — so any</span>
+<span class="comment">#   reasonably sized slice of this corpus lands on 4.0.</span>
+<span class="comment"># 897s vs 924s is uniform noise: handle_time_s = randint(120,1800), drawn independently</span>
+<span class="comment">#   of band, issue and text. The 27-second gap means nothing. It is not an insight.</span>
+<span class="comment"># the per-band issue labels sit in the SAME template tuple as the sentence, so band and</span>
+<span class="comment">#   issue are correlated by construction — the agg recovers what the script inserted.</span></pre>
+  <p class="wide">The repository's own output block prints those two bands as 54% and 46%. Those are shares of the 54 band-carrying documents, computed client-side after the <code class="inline">n/a</code> bucket is filtered out — not shares of the 80 that were retrieved. And the demo's closing sentence, the one-line "deep-research narrative", came from an external LLM run over three example hits and truncated at 300 characters; it is non-deterministic, it will not reproduce verbatim, and it is not a XERJ output. XERJ's contribution to that loop is narrower and more defensible: the slice, the exact buckets, and the grounded example documents, in one response, so the model that writes the sentence is reading evidence rather than recalling.</p>
+</section>
+
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">WHAT THE ENGINE DOES, <span class="accent">AND WHAT IT COSTS.</span></h2>
+  <p class="wide">The rc.6 change is small and its placement is the whole point. The shared kNN result assembler ranks the candidates, truncates the pool to <code class="inline">k</code>, and — if the request carries <code class="inline">aggs</code> — runs the aggregation over those top-<code class="inline">k</code> sources <em>before</em> the hit page is cut with <code class="inline">from</code>/<code class="inline">size</code>. Because every kNN executor funnels through that one assembler, there is no second implementation to drift — but the ANN executor is gated out of <code class="inline">aggs</code>-bearing requests by design, so the two paths that can actually serve one are both exact: the brute-force scan and the multi-kNN array form, which is itself brute force per clause. The slice aggregation is computed from the retrieved documents' <code class="inline">_source</code>, not from doc-values; the columnar path is the no-kNN recurring-report shape in the next section. <code class="inline">hits.total.value</code> for such a query is the size of the retrieved neighbour pool, <code class="inline">min(k, matches)</code>, computed after the truncate — not the number of documents that carry a vector, and not a count of documents "about" the topic.</p>
+  <pre class="code">POST /conversations/_search
+{ "query": { "knn": { "field":"vec", "query_vector":[ ... ], "k":200, "num_candidates":400 } },
+  "size": 0,
+  "aggs": { "by_band":  { "terms": { "field": "band" } },
+            "csat_p50": { "percentiles": { "field":"csat", "percents":[50] } } } }
+
+<span class="comment"># size:0 is the analytics-only shape — aggregations and totals, no hits at all</span>
+<span class="comment"># num_candidates is accepted but has NO effect here: an aggs-bearing knn runs the</span>
+<span class="comment">#   exact scan, and the brute-force executor does not take a fan-out parameter</span></pre>
+  <p class="wide"><strong>The trade is deliberate, and it is a cost.</strong> An <code class="inline">aggs</code>-bearing kNN is explicitly excluded from the ANN eligibility condition and sent down the exact brute-force path. The reasoning in the engine is stated plainly: ANN recall is under 100%, so the retrieved neighbour set can differ slightly from exact — tolerable for ranked hits, not tolerable for analytics counts, and approximation must not leak into bucket counts. The consequence is that this path scans, so its cost grows with corpus size times dimensions on every request, it pays a per-document source clone on top of that scan, and the ANN fan-out knob does nothing for it. That is worth stating rather than hiding, and it is the reason this page carries no speed claim of any kind: <em>no query in this demo was timed, at any corpus size.</em></p>
+  <p class="wide">What is verified, and exactly how far it goes: an integration test indexes five documents — four clustered near a topic vector and split two-and-two across two bands, plus one deliberately distant document — issues a <code class="inline">k:4</code>, <code class="inline">size:0</code> kNN with a <code class="inline">terms</code> aggregation, and asserts that both band buckets hold two, that the far document's bucket is <em>absent</em>, that <code class="inline">hits.total.value</code> is 4, and that no hits come back. That is a proof the aggregation ran over the semantic slice rather than the whole index. It is not a proof of anything about scale, recall or speed, and this page does not present it as one. Two honest caveats about the scan gate. The engine only admits the HNSW path at 1,024 or more live vector documents, so at 130 documents in the demo — and at five in the test — every kNN was already running exact; neither run exercised the rule as an actual switch away from HNSW. And the exclusion is not a corpus-size effect: because the gate tests <code class="inline">aggs.is_none()</code>, the HNSW executor can never serve an aggregation-bearing kNN at <em>any</em> corpus size. That is the right design — approximation must not leak into bucket counts — but it means the ANN path is excluded by construction rather than merely unexercised.</p>
+</section>
+
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">WHY THE SHAPE IS AWKWARD <span class="accent">EVERYWHERE ELSE.</span></h2>
+  <p class="wide">The table below is reasoned architecture, not measurement. <strong>Nothing in it was benchmarked and no competing system was run</strong> — it is a map of where the friction sits in each arrangement when one question needs columnar aggregation and vector retrieval over the same document set. XERJ speaks the Elasticsearch wire so existing clients and tooling connect without a rewrite, but that compatibility is an adoption bridge, not the identity: the store is built for the workload where retrieval and analytics are the same query.</p>
+  <div class="bench">
+    <div class="head">ARRANGEMENT · REASONED, NOT BENCHMARKED</div>
+    <div class="head num">COLUMNAR</div>
+    <div class="head num">VECTORS</div>
+    <div class="head num">ONE STORE</div>
+
+    <div class="cell test">OLAP engine + separate vector store</div>
+    <div class="cell num es">yes</div>
+    <div class="cell num xy">yes</div>
+    <div class="cell num delta">no</div>
+    <div class="cell source">ETL between the two · no join across them · two systems to operate · the id list is the only thing that crosses the boundary</div>
+
+    <div class="cell test">Postgres + <code class="inline">pgvector</code></div>
+    <div class="cell num es">yes</div>
+    <div class="cell num xy">yes</div>
+    <div class="cell num delta">yes</div>
+    <div class="cell source">kNN + <code class="inline">GROUP BY</code> works in one query, but scales poorly on large corpora · full SQL and one store · vector search and large analytical scans compete for the same OLTP engine · no object-store columnar tier</div>
+
+    <div class="cell test">Elasticsearch / OpenSearch</div>
+    <div class="cell num es">yes</div>
+    <div class="cell num xy">yes</div>
+    <div class="cell num delta">yes</div>
+    <div class="cell source">the closest analogue on this axis — kNN + aggregations already supported in one request · heavier operations, JVM memory, and a hot-storage cost model</div>
+
+    <div class="cell test">Warehouse + vector add-on</div>
+    <div class="cell num es">yes</div>
+    <div class="cell num xy">bolt-on</div>
+    <div class="cell num delta">partial</div>
+    <div class="cell source">best-in-class SQL for the analytics half · embedding retrieval is a second-class citizen in an interactive report loop</div>
+
+    <div class="cell test">Dedicated vector database</div>
+    <div class="cell num es">limited</div>
+    <div class="cell num xy">yes</div>
+    <div class="cell num delta">vectors</div>
+    <div class="cell source">strong retrieval, thin columnar analytics · the SQL half still has to live somewhere else, which puts the ETL back</div>
+
+    <div class="cell test">XERJ</div>
+    <div class="cell num es">yes</div>
+    <div class="cell num xy">yes</div>
+    <div class="cell num delta">yes</div>
+    <div class="cell source">one index holds the columns, the text and the vector · knn + aggs in a single request (rc.6) · open gaps, stated below: aggs over an RRF-fused slice rejected (400), thin SQL surface, significant_terms over a kNN slice pending</div>
+  </div>
+  <p class="wide">Read that as a description of shapes, not a scoreboard. Every row on it is a defensible choice for some workload, and none of them was measured here. The narrow claim this page makes is bounded accordingly: Elasticsearch/OpenSearch and <code class="inline">pgvector</code> can already express this in one request, and what differs there is the cost model and the operational weight, not whether the shape is possible. The pipeline-or-two-step framing applies to the OLAP-plus-vector-store and warehouse arrangements only — and until rc.6, it applied to XERJ too.</p>
+</section>
+
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">DO THE SEMANTIC WORK ONCE, <span class="accent">AT INGEST.</span></h2>
+  <p class="wide">The recommended architecture is the part that survives contact with scale, and it argues <em>against</em> reaching for kNN as often as you might. The expensive semantic work — embedding, clustering, issue labelling, distance to the nearest canonical record — is done once, by your model, when the document arrives, and materialized as ordinary columns on the document. Recurring reports then become plain columnar aggregations over those columns with no vector search in the request at all. kNN plus aggregations is kept for the ad-hoc question, the one nobody pre-computed a column for.</p>
+  <pre class="code"><span class="comment"># ONCE, AT INGEST — your embedding model does the expensive part</span>
+conversation --&gt; embed(body)                     --&gt; vec          (dense_vector)
+             --&gt; cluster / issue label           --&gt; issue        (keyword)
+             --&gt; distance to nearest canonical   --&gt; kb_distance  (float)
+             --&gt; band, device, csat, handle_time --&gt; columns      (keyword / integer)
+
+<span class="comment"># THEN, AT QUERY TIME — one index, three shapes of question</span>
+recurring report        --&gt; terms / avg / percentiles on the label columns   <span class="comment">(no kNN)</span>
+ad-hoc "calls about X"  --&gt; knn + aggs in a single request                   <span class="comment">(rc.6)</span>
+report body             --&gt; the hits returned beside the buckets --&gt; your LLM</pre>
+  <p class="wide">Under that arrangement, a question like "how far are we drifting from the canonical guidance" stops being a retrieval problem and becomes <code class="inline">avg(kb_distance)</code> grouped by issue, with the high-distance outliers reading as novel or uncovered topics — a straight aggregation over a column. <strong>Stated plainly, because the page will not claim what it did not run:</strong> that distance-to-canonical column is a design recommendation only. The demo builds a small knowledgebase index, and then no script ever queries it, so nothing about that half of the picture is measured. The same applies to the deployment guidance around it — sharding, one index per tenant versus a shared index with a customer filter, object-store-backed segments — which was reasoned, not exercised. The demo was a single node with two indices — <code class="inline">conversations</code>, and the <code class="inline">kb</code> index that no script ever queries — no shards, no replicas, no multi-tenancy.</p>
+  <p class="wide">The sizing intuition is worth keeping, though, because it follows from the engine behaviour above rather than from any measurement. <code class="inline">k</code> is the neighbour pool your aggregation runs over, so it is a product decision — how many conversations belong in the slice — rather than a tuning knob. <code class="inline">num_candidates</code> is the ANN fan-out for the plain retrieval path and is ignored once <code class="inline">aggs</code> are present. And because that path scans, the cheapest large-corpus move is to narrow before the vector step with an ordinary keyword or date filter, or to skip kNN entirely and aggregate the materialized labels.</p>
+</section>
+
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">WHAT THIS <span class="accent">DOES NOT SHOW.</span></h2>
+  <p class="wide">A capability page is only worth reading if it marks its own edges. These are the limits of the evidence above and the gaps in the feature, in the order they would bite you.</p>
+  <div class="laws">
+    <div class="n">01</div>
+    <div class="law">
+      <div class="t">THE CORPUS IS <span class="accent">GENERATED.</span></div>
+      <div class="b">
+        130 conversations produced by a script with <code class="inline">random.seed(7)</code> from
+        roughly 21 hand-written sentence templates, so every document body is a verbatim duplicate of
+        one of a handful of sentences and retrieval is easier than on real data. It is a correctness
+        demo of a query shape — not a dataset study, not real support conversations, not production
+        scale. Treat the band split, the CSAT median and both handle-time averages as generator
+        artifacts, which is exactly what they are: the CSAT list has a median of 4 by construction, and
+        handle time is a uniform draw unrelated to band, issue or text.
+      </div>
+    </div>
+
+    <div class="n">02</div>
+    <div class="law">
+      <div class="t">NOTHING HERE <span class="accent">WAS TIMED.</span></div>
+      <div class="b">
+        There are no latency, throughput, memory, concurrency or cost numbers on this page because the only
+        wall-clock number in the source is the embed-and-index elapsed print in
+        <code class="inline">02_embed_index.py</code>, which is one embedding round trip per document and
+        measures the embedding model, not XERJ. No query was ever timed, at any corpus size.
+        And the shape of the cost is known even though it was
+        not measured: the aggs path is an exact scan, so it grows with corpus size times dimensions on
+        every request, and the ANN fan-out parameter does nothing for it. The engine admits its HNSW path
+        only at 1,024 or more live vector documents, so at 130 documents in the demo — and five in the
+        integration test — every kNN already ran exact. The aggs-force-exact rule is real in code and is
+        the right call; neither run demonstrated it as an actual switch away from ANN. Nor could a larger
+        corpus: the gate excludes the ANN executor from every aggregation-bearing kNN at any size, so that
+        path is closed by construction, not by the demo being small.
+      </div>
+    </div>
+
+    <div class="n">03</div>
+    <div class="law">
+      <div class="t">SIGNIFICANT_TERMS OVER A SLICE <span class="accent">RETURNS EMPTY.</span></div>
+      <div class="b">
+        Not a mystery, a traceable gap: the kNN path calls the two-argument aggregation entry point,
+        which forwards the same document set as both foreground and background — so there is no
+        background corpus for a term to be over-represented against, and the result is empty. Use raw
+        <code class="inline">terms</code> counts inside the slice, or the two-step pattern (kNN, collect
+        ids, aggregate with the full index as background) when you need statistical significance.
+      </div>
+    </div>
+
+    <div class="n">04</div>
+    <div class="law">
+      <div class="t"><span class="accent">hits.total</span> IS <span class="accent">k</span>, NOT A MATCH COUNT.</div>
+      <div class="b">
+        For a kNN query the total is the size of the retrieved neighbour pool, <code class="inline">min(k, matches)</code>.
+        The demo asked for 80 and got 80 back — that number describes the request, not the corpus. Of those
+        80 neighbours, 54 carried a wifi band and 26 did not, which is the honest way to read the slice:
+        a nearest-neighbour pool always fills to <code class="inline">k</code>, whether or not there are
+        <code class="inline">k</code> good matches. That 54-of-80 wifi share is the only retrieval-quality
+        number here — a precision figure in all but name, and on 21 duplicated sentences it measures the
+        generator, not the model. The source also reports 74 wifi in the nearest 100 from a separate run;
+        neither is a benchmark, and no recall figure exists at all.
+      </div>
+    </div>
+
+    <div class="n">05</div>
+    <div class="law">
+      <div class="t">NO AGGS OVER A <span class="accent">FUSED SLICE</span>, AND THE <span class="accent">SQL SURFACE IS THIN.</span></div>
+      <div class="b">
+        Reciprocal-rank fusion <em>is</em> exposed — <code class="inline">query.hybrid</code> with
+        <code class="inline">queries:[…]</code> and <code class="inline">fusion:"rrf"</code> (default
+        <code class="inline">k=60</code>, overridable) — but a hybrid query that carries
+        <code class="inline">aggs</code> is rejected with a 400
+        (<em>aggregations are not supported with hybrid/fusion queries</em>), because a bounded aggregation
+        over a fused top-N would silently under-count. So the one-request "aggregate the slice" shape on
+        this page works for a pure <code class="inline">knn</code> slice only, not for a lexical-plus-vector
+        fused one; for hybrid you still run the aggregation as a second, non-hybrid search. The SQL layer is a
+        thin convenience mapping — roughly <code class="inline">SELECT</code>/<code class="inline">WHERE</code>/<code class="inline">GROUP BY</code>
+        onto <code class="inline">terms</code> and counts — so do not plan on porting warehouse SQL one to
+        one. The aggregation API is the real interface; generate its JSON.
+      </div>
+    </div>
+
+    <div class="n">06</div>
+    <div class="law">
+      <div class="t">ONE QUERY SHAPE IS <span class="accent">STILL NOT COVERED.</span></div>
+      <div class="b">
+        rc.6 covers the shapes that funnel through the shared assembler: a top-level
+        <code class="inline">knn</code> section, a <code class="inline">query.knn</code>, a
+        <code class="inline">bool</code> whose single <code class="inline">must</code>/<code class="inline">should</code>
+        clause is the kNN (extra <code class="inline">filter</code> clauses are ANDed in), and the
+        multi-<code class="inline">knn</code> array form. A kNN placed inside
+        <code class="inline">bool.filter</code> is <em>not</em> peeled — the peeler collects candidates from
+        <code class="inline">must</code> and <code class="inline">should</code> only — so it never reaches
+        the kNN executor and still returns no buckets. Move the clause to
+        <code class="inline">must</code> and put the ordinary predicates in
+        <code class="inline">filter</code>.
+      </div>
+    </div>
+
+    <div class="n">07</div>
+    <div class="law">
+      <div class="t">THE MODEL DOES THE <span class="accent">SEMANTICS.</span></div>
+      <div class="b">
+        Retrieval quality is a property of whatever produced the vectors — here an external 768-dimension
+        embedding model served locally — not of XERJ, which stores and searches them. Clustering and
+        labelling quality is yours to own, and it is where the leverage is. Likewise the narrative
+        sentence in the demo output: it came from a separate general-purpose model reading three
+        retrieved examples, it is non-deterministic, and it is not a XERJ capability. The claim that
+        belongs to the store is retrieval plus aggregation plus grounded evidence in one response.
+      </div>
+    </div>
+
+    <div class="n">08</div>
+    <div class="law">
+      <div class="t">THE ARCHITECTURE SECTIONS ARE <span class="accent">GUIDANCE.</span></div>
+      <div class="b">
+        The comparison table is reasoned analysis and no competing system was run for it. The
+        distance-to-canonical column is a recommendation: the knowledgebase index is created and
+        populated by the demo and then never queried, so nothing about it is measured. Scaling,
+        sharding and multi-tenant notes were not exercised — one node, two indices, no shards and no
+        replicas. Reproducing the run needs the engine on its port plus a local embedding model and
+        an LLM.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">READ THE <span class="accent">WALKTHROUGH.</span></h2>
+  <p class="wide">The full write-up is published with the three scripts that produced everything above — the dataset generator, the embed-and-index step, and the single-request deep-research query — plus the mapping, the request shapes, the recommended ingest architecture, and the same generated-corpus provenance and limitations restated in the source's own words. The engine change ships with its changelog entry and its integration test. Read both before deciding what this is worth for your workload; the point of stating the gaps this plainly is that the parts that <em>do</em> hold should be usable without a second opinion.</p>
+  <div style="display:flex; gap:var(--sp-6); margin-top:var(--sp-6); flex-wrap:wrap;">
+    <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics" rel="external" class="cta" style="font-size:var(--fs-20); padding:var(--sp-4) 0; border-bottom:0; flex:1; min-width:280px;">
+      <span>OPEN THE WALKTHROUGH</span>
+      <span class="arrow">→</span>
+    </a>
+    <a href="https://github.com/xerj-org/xerj/blob/main/engine/CHANGELOG-rc6.md" rel="external" class="cta" style="font-size:var(--fs-20); padding:var(--sp-4) 0; border-bottom:0; flex:1; min-width:280px;">
+      <span>OPEN THE RC.6 CHANGELOG</span>
+      <span class="arrow">→</span>
+    </a>
+  </div>
+</section>
+
+<section class="lead-capture" id="demo">
+  <div class="kicker"><span>READY?</span><span class="dash">·</span><span>REQUEST ACCESS</span></div>
+  <h3>RUN IT ON<br><span class="accent">YOUR DATA.</span></h3>
+  <p>Send us the deep-research question you actually get asked and the columns you already have — the labels, the scores, the timestamps, the embedding model you use. We'll come back with the mapping, the single-request query shape that answers it, and a straight account of which parts of it we have measured.</p>
+  <form class="lead-form" id="leadForm" action="#" method="post" novalidate>
+    <input type="email" name="email" placeholder="you@company.com" required aria-label="Work email" autocomplete="email" />
+    <button type="submit" class="demo">SEE THE DEMO <span class="arrow">→</span></button>
+    <span class="note">We only use this email to follow up about XERJ — nothing else. No spam, no reselling.</span>
+    <span class="ok">✓ THANKS. WE'LL FOLLOW UP WITHIN ONE BUSINESS DAY.</span>
+  </form>
+</section>
+
+<footer class="footer">
+  <span>XERJ.AI · USE CASES · V0.1</span>
+  <span>STORAGE FOR THE AGENT ERA</span>
+  <span><a href="/index.html">HOME</a> · <a href="/use-cases.html">ALL USE CASES</a> · <a href="/docs/index.html">DOCS</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+</footer>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    for (const btn of document.querySelectorAll('[data-theme]')) {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-theme');
+        root.setAttribute('data-theme', t);
+        for (const b of document.querySelectorAll('[data-theme]')) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        }
+      });
+    }
+    const form = document.getElementById('leadForm');
+    if (form) {
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const email = form.querySelector('input[type=email]').value.trim();
+        if (!email || !email.includes('@')) return;
+        console.log('[xerj lead]', email);
+        try { fetch('/lead', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, source: 'semantic-analytics' }), keepalive: true }).catch(function () {}); } catch (_) {}
+        form.classList.add('sent');
+      });
+    }
+  })();
+</script>
+
+</body>
+</html>

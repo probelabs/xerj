@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XERJ.ai — Enterprise use cases</title>
-<meta name="description" content="Six enterprise workloads. One binary. Measured benchmarks vs ES 8.13.">
+<meta name="description" content="Seven enterprise workloads. One binary. Measured benchmarks vs ES 8.13.">
 <meta property="og:title" content="XERJ.ai — storage for the agent era">
 <meta property="og:description" content="An AI-native, Elasticsearch-wire-compatible search + vector + log engine in Rust. Apache-2.0, no lock-in. Live playground + reproducible head-to-head benchmarks.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -42,6 +42,7 @@
   <a href="/use-cases/security-analytics.html">SECURITY ANALYTICS</a>
   <a href="/use-cases/operational-intelligence.html">OPERATIONAL INTELLIGENCE</a>
   <a href="/use-cases/ai-search-retrieval.html">AI SEARCH</a>
+  <a href="/use-cases/semantic-analytics.html">SEMANTIC ANALYTICS</a>
   <a href="/use-cases/code-security-audit.html">AI SECURITY REVIEW</a>
   <a href="/use-cases/elasticsearch-replacement.html">ES REPLACEMENT</a>
   <a href="/use-cases/unified-observability.html">OBSERVABILITY</a>
@@ -51,11 +52,13 @@
   <div class="kicker"><span>USE CASES</span><span class="dash">·</span><span>ENTERPRISE</span></div>
   <h1 class="hero" style="font-size: var(--fs-96);">REPLACE THE<br>STACK.<br><span class="accent">KEEP THE DATA.</span></h1>
   <p class="lead" style="max-width:720px;">
-    Six enterprise workloads. One binary. No Logstash, no Beats, no
-    separate vector database, no dedicated Kibana cluster. Each section
-    below is a real deployment pattern with measured numbers — benchmarks
-    against Elasticsearch 8.13, or token costs measured on a real audit —
-    and a live chart.
+    Seven enterprise workloads. One binary. No Logstash, no Beats, no
+    separate vector database, no dedicated Kibana cluster. Six of the
+    sections below are real deployment patterns with measured numbers —
+    benchmarks against Elasticsearch 8.13, or token costs measured on a
+    real audit — and the seventh is a query-shape demonstration on a
+    generated corpus, not a deployment and not a benchmark. Each has a
+    live chart that says which it is.
   </p>
 </section>
 
@@ -482,6 +485,54 @@
       </div>
   </div>
     <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">TOKEN COST TO THE ANSWER · NOT LATENCY · LAST TWO ROWS: THE PUBLISHED COUNTER-EXAMPLES WHERE GREP WINS — REACHABILITY IS THE AUDIT-TIME MEASUREMENT UNDER THE KEYWORD-ARRAY TERM BUG THE AUDIT ITSELF SURFACED · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/wordpress-security-audit" rel="external">docs/case-studies/wordpress-security-audit →</a></p>
+  </div>
+</div>
+
+<!-- 07 SEMANTIC ANALYTICS — buckets over the retrieved neighbour set -->
+<div class="uc-showcase">
+  <div class="uc-copy">
+    <span class="uc-num">07</span>
+    <div class="uc-title">AGGREGATE THE<br>SEMANTIC<br><span class="accent">SLICE.</span></div>
+    <p class="uc-pitch">A deep-research question bundles two workloads in one breath: <em>of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what are the key issues?</em> The first clause is vector retrieval; everything after it is aggregation over exactly the documents that clause selected. XERJ answers it in a single search request — the columns, the full text and the vector live in one index, and the aggregations run over the retrieved top-k neighbour set. An aggregation-bearing kNN is routed to the exact scan deliberately, because bucket counts must not be approximate. The chart is that query shape working on a <em>generated</em> corpus: a correctness demo, not a benchmark, and nothing in it was timed.</p>
+    <div class="uc-metric">1 REQUEST · RETRIEVAL + EXACT BUCKETS + EVIDENCE · DEMO, NOT A DEPLOYMENT</div>
+    <div class="uc-persona">DATA / ML ENGINEER · ANALYTICS ENGINEER · AI PRODUCT</div>
+    <a href="/use-cases/semantic-analytics.html" class="uc-cta">FULL USE CASE →</a>
+  </div>
+  <div class="uc-viz">
+    <div class="kicker"><span>GENERATED 130-CONVERSATION CORPUS · NOT REAL DATA · NOT A DEPLOYMENT · NOT A BENCHMARK</span></div>
+    <div class="topn-list">
+    <div class="row">
+      <div class="row__label">band 2.4GHz</div>
+      <div class="row__val">29</div>
+      <div class="row__bar">
+        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
+          <line x1="0" y1="5" x2="200.0" y2="5" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      </div>
+      <div class="row__pct">36%</div>
+    </div>
+    <div class="row">
+      <div class="row__label">band n/a · non-wifi (derived: 80 − 54)</div>
+      <div class="row__val">26</div>
+      <div class="row__bar">
+        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
+          <line x1="0" y1="5" x2="179.3" y2="5" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      </div>
+      <div class="row__pct">33%</div>
+    </div>
+    <div class="row">
+      <div class="row__label">band 5GHz</div>
+      <div class="row__val">25</div>
+      <div class="row__bar">
+        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
+          <line x1="0" y1="5" x2="172.4" y2="5" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      </div>
+      <div class="row__pct">31%</div>
+    </div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">TERMS BUCKETS RETURNED IN THE SAME RESPONSE AS THE HITS · NOT LATENCY, NOTHING HERE WAS TIMED · THE POOL WAS THE k=80 NEAREST NEIGHBOURS, WHICH IS THE REQUEST PARAMETER ECHOED BACK AND NOT A MATCH COUNT — 54 OF THE 80 CARRIED A BAND; THE <code class="inline">n/a</code> ROW IS NOT IN THE PUBLISHED OUTPUT, THE DEMO SCRIPT FILTERS IT BEFORE PRINTING AND 26 IS THE REMAINDER · THE SPLIT IS OUTPUT OF A SEEDED GENERATOR (<code class="inline">random.seed(7)</code>, ~21 HAND-WRITTEN TEMPLATES), NOT A FINDING ABOUT SUPPORT CALLS · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics" rel="external">docs/case-studies/calltree-analytics →</a></p>
   </div>
 </div>
 
