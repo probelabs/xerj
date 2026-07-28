@@ -43,6 +43,12 @@ async fn test_semantic_vectors_stay_stored_but_not_fts_indexed_after_merge_and_r
         assert!(semantic.hits.iter().all(|hit| {
             hit.source.get("custom_embedding").is_some()
                 && hit.source.get("custom_embedding_chunks").is_some()
+                && hit.passage.is_none()
+                && hit.source.as_object().is_some_and(|source| {
+                    source
+                        .keys()
+                        .all(|name| !name.starts_with("__xerj_passage_meta__"))
+                })
         }));
 
         let lexical = idx
@@ -109,10 +115,286 @@ async fn test_semantic_vectors_stay_stored_but_not_fts_indexed_after_merge_and_r
     assert!(!names
         .iter()
         .any(|name| name.ends_with(".custom_embedding_chunks.fst")));
+    assert!(!names
+        .iter()
+        .any(|name| name.contains("__xerj_passage_meta__")));
 
     let reopened = make_engine(&dir);
     let idx = reopened.get_index("sem-fts-exclusion").unwrap();
     assert_queries(&idx).await;
+}
+
+#[tokio::test]
+async fn semantic_passage_provenance_survives_update_merge_restart_and_source_filter() {
+    let dir = TempDir::new().unwrap();
+    let mut schema = Schema::empty();
+    let mut content = FieldConfig::new("content", FieldType::Text);
+    content.options.dimensions = Some(64);
+    content.options.similarity = Some("cosine".to_string());
+    content.embedding = Some(xerj_common::types::EmbeddingConfig {
+        endpoint: None,
+        model: None,
+        target_field: Some("custom_embedding".to_string()),
+    });
+    schema.fields.push(content);
+    schema
+        .fields
+        .push(FieldConfig::new("page", FieldType::Long));
+
+    let initial = format!(
+        "{} Résumé 📄 quarterly zephyr liquidity evidence. {}",
+        "unrelated operating narrative. ".repeat(40),
+        "unrelated tax footnote. ".repeat(40)
+    );
+    {
+        let engine = make_engine(&dir);
+        engine.create_index("passage-provenance", schema).unwrap();
+        let idx = engine.get_index("passage-provenance").unwrap();
+        idx.index_document(
+            Some("report-page".into()),
+            json!({"content": initial, "page": 17, "company": "ACME"}),
+        )
+        .await
+        .unwrap();
+        idx.refresh().await.unwrap();
+        idx.force_merge(1).await.unwrap();
+
+        let request = parse_request(&json!({
+            "query": {"semantic": {
+                "field": "content",
+                "query": "Résumé 📄 quarterly zephyr liquidity evidence",
+                "k": 10
+            }},
+            "fields": ["_passage"],
+            "_source": {"includes": ["company"]},
+            "size": 1
+        }))
+        .unwrap();
+        let result = idx.search(&request).await.unwrap();
+        let hit = &result.hits[0];
+        assert_eq!(hit.source, json!({"company": "ACME"}));
+        let passage = hit.passage.as_ref().expect("opt-in passage");
+        assert_eq!(passage.field, "content");
+        assert_eq!(passage.page, Some(17));
+        assert!(passage.text.contains("Résumé 📄 quarterly zephyr"));
+        assert!(initial.is_char_boundary(passage.start_offset as usize));
+        assert!(initial.is_char_boundary(passage.end_offset as usize));
+        assert_eq!(
+            &initial[passage.start_offset as usize..passage.end_offset as usize],
+            passage.text
+        );
+
+        let ordinary = idx
+            .search(
+                &parse_request(&json!({
+                    "query": {"semantic": {
+                        "field": "content",
+                        "query": "quarterly zephyr liquidity",
+                        "k": 10
+                    }},
+                    "size": 1
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(ordinary.hits[0].passage.is_none());
+        assert!(ordinary.hits[0]
+            .source
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|name| !name.starts_with("__xerj_passage_meta__")));
+
+        // Re-indexing regenerates offsets from the new authoritative text.
+        let updated = format!(
+            "{} deferred tax aurora covenant disclosure. {}",
+            "replacement narrative. ".repeat(36),
+            "replacement appendix. ".repeat(36)
+        );
+        idx.index_document(
+            Some("report-page".into()),
+            json!({"content": updated, "page": 18, "company": "ACME"}),
+        )
+        .await
+        .unwrap();
+        idx.refresh().await.unwrap();
+        idx.force_merge(1).await.unwrap();
+        let updated_result = idx
+            .search(
+                &parse_request(&json!({
+                    "query": {"semantic": {
+                        "field": "content",
+                        "query": "deferred tax aurora covenant disclosure",
+                        "k": 10
+                    }},
+                    "fields": ["_passage"],
+                    "size": 1
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let updated_passage = updated_result.hits[0].passage.as_ref().unwrap();
+        assert_eq!(updated_passage.page, Some(18));
+        assert!(updated_passage.text.contains("aurora covenant"));
+        assert_eq!(
+            &updated[updated_passage.start_offset as usize..updated_passage.end_offset as usize],
+            updated_passage.text
+        );
+    }
+
+    let reopened = make_engine(&dir);
+    let idx = reopened.get_index("passage-provenance").unwrap();
+    let reopened_result = idx
+        .search(
+            &parse_request(&json!({
+                "query": {"semantic": {
+                    "field": "content",
+                    "query": "deferred tax aurora covenant disclosure",
+                    "k": 10
+                }},
+                "fields": ["_passage"],
+                "size": 1
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(reopened_result.hits[0]
+        .passage
+        .as_ref()
+        .unwrap()
+        .text
+        .contains("aurora covenant"));
+
+    idx.delete_document("report-page").await.unwrap();
+    let after_delete = idx
+        .search(
+            &parse_request(&json!({
+                "query": {"semantic": {
+                    "field": "content",
+                    "query": "deferred tax aurora covenant disclosure",
+                    "k": 10
+                }},
+                "fields": ["_passage"]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(after_delete.hits.is_empty());
+}
+
+#[tokio::test]
+async fn reserved_passage_metadata_input_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let mut schema = Schema::empty();
+    let mut content = FieldConfig::new("content", FieldType::Text);
+    content.options.dimensions = Some(16);
+    content.embedding = Some(xerj_common::types::EmbeddingConfig {
+        endpoint: None,
+        model: None,
+        target_field: Some("custom_embedding".to_string()),
+    });
+    schema.fields.push(content);
+    engine
+        .create_index("reserved-passage-field", schema)
+        .unwrap();
+    let idx = engine.get_index("reserved-passage-field").unwrap();
+    let error = idx
+        .index_document(
+            Some("spoof".into()),
+            json!({
+                "content": "user text",
+                "__xerj_passage_meta__custom_embedding": {
+                    "field": "content",
+                    "chunks": [[0, 9]]
+                }
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("engine-owned passage metadata"), "{error}");
+    assert!(idx.get_document("spoof").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn passage_provenance_rejects_ambiguous_multi_vector_composition_in_any_order() {
+    use xerj_query::ast::{FusionStrategy, WeightedQuery};
+
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index("passage-composition", Schema::empty())
+        .unwrap();
+    let idx = engine.get_index("passage-composition").unwrap();
+
+    let knn_a = QueryNode::Knn {
+        field: "embedding_a".into(),
+        vector: vec![1.0, 0.0],
+        k: 10,
+        num_candidates: None,
+        filter: None,
+        boost: None,
+        similarity: None,
+    };
+    let knn_b = QueryNode::Knn {
+        field: "embedding_b".into(),
+        vector: vec![0.0, 1.0],
+        k: 10,
+        num_candidates: None,
+        filter: None,
+        boost: None,
+        similarity: None,
+    };
+
+    for should in [
+        vec![knn_a.clone(), knn_b.clone()],
+        vec![knn_b.clone(), knn_a.clone()],
+    ] {
+        let request = SearchRequest {
+            query: QueryNode::Bool {
+                must: Vec::new(),
+                should,
+                filter: Vec::new(),
+                must_not: Vec::new(),
+                minimum_should_match: None,
+            },
+            fields: vec!["_passage".into()],
+            ..SearchRequest::default()
+        };
+        let error = idx.search(&request).await.unwrap_err().to_string();
+        assert!(error.contains("one unambiguous winning passage"), "{error}");
+    }
+
+    let semantic = QueryNode::SemanticSearch {
+        field: "content".into(),
+        text: "quarterly evidence".into(),
+        k: 10,
+        filter: None,
+        boost: None,
+    };
+    for queries in [
+        vec![semantic.clone(), QueryNode::MatchAll],
+        vec![QueryNode::MatchAll, semantic.clone()],
+    ] {
+        let request = SearchRequest {
+            query: QueryNode::Hybrid {
+                queries: queries
+                    .into_iter()
+                    .map(|query| WeightedQuery { query, weight: 1.0 })
+                    .collect(),
+                fusion: FusionStrategy::Rrf { k: 60 },
+            },
+            fields: vec!["_passage".into()],
+            ..SearchRequest::default()
+        };
+        let error = idx.search(&request).await.unwrap_err().to_string();
+        assert!(error.contains("one unambiguous winning passage"), "{error}");
+    }
 }
 
 fn make_search(query_json: Value) -> SearchRequest {

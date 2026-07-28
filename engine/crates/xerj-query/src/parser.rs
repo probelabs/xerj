@@ -210,12 +210,19 @@ pub fn parse_request(body: &Value) -> Result<SearchRequest> {
     let script_fields = obj.get("script_fields").cloned();
 
     // fields — stored/doc-value fields to return alongside _source.
+    let parse_field = |value: &Value| {
+        value.as_str().map(String::from).or_else(|| {
+            value
+                .as_object()
+                .and_then(|object| object.get("field"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+    };
     let fields: Vec<String> = match obj.get("fields") {
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect(),
-        _ => Vec::new(),
+        Some(Value::Array(arr)) => arr.iter().filter_map(parse_field).collect(),
+        Some(value) => parse_field(value).into_iter().collect(),
+        None => Vec::new(),
     };
 
     // profile — include timing breakdown
@@ -5049,5 +5056,22 @@ mod tests {
             "rank_feature": { "field": "pr", "log": {} }
         }))
         .is_err());
+    }
+
+    #[test]
+    fn fields_accept_scalar_array_and_object_forms() {
+        for (body, expected) in [
+            (json!({"fields": "_passage"}), vec!["_passage"]),
+            (
+                json!({"fields": ["company", "_passage"]}),
+                vec!["company", "_passage"],
+            ),
+            (
+                json!({"fields": [{"field": "_passage", "format": "ignored"}]}),
+                vec!["_passage"],
+            ),
+        ] {
+            assert_eq!(parse_request(&body).unwrap().fields, expected);
+        }
     }
 }

@@ -3427,6 +3427,11 @@ pub fn semantic_derived_vector_fields(schema: &Schema) -> std::collections::Hash
             .unwrap_or_else(|| format!("{}_vector", field.name));
         excluded.insert(target.clone());
         excluded.insert(format!("{target}_chunks"));
+        excluded.insert(format!(
+            "{}{}",
+            xerj_query::executor::PASSAGE_METADATA_PREFIX,
+            target
+        ));
     }
     excluded
 }
@@ -3468,8 +3473,10 @@ mod semantic_derived_vector_exclusion_tests {
             std::collections::HashSet::from([
                 "body_vector".to_string(),
                 "body_vector_chunks".to_string(),
+                "__xerj_passage_meta__body_vector".to_string(),
                 "summary_model_output".to_string(),
                 "summary_model_output_chunks".to_string(),
+                "__xerj_passage_meta__summary_model_output".to_string(),
             ])
         );
 
@@ -3480,8 +3487,13 @@ mod semantic_derived_vector_exclusion_tests {
             "body_vector_backup": [3.0, 4.0],
             "body_vector": [0.1, 0.2],
             "body_vector_chunks": [[0.1, 0.2], [0.3, 0.4]],
+            "__xerj_passage_meta__body_vector": {"field": "body", "chunks": [[0, 20]]},
             "summary_model_output": [0.5, 0.6],
-            "summary_model_output_chunks": [[0.5, 0.6], [0.7, 0.8]]
+            "summary_model_output_chunks": [[0.5, 0.6], [0.7, 0.8]],
+            "__xerj_passage_meta__summary_model_output": {
+                "field": "summary",
+                "chunks": [[0, 7]]
+            }
         });
         let fields = extract_text_fields_from_excluding(&source, &excluded);
         assert_eq!(fields.get("page").map(String::as_str), Some("7"));

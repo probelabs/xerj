@@ -29,6 +29,15 @@ use crate::{
     state::AppState,
 };
 
+fn passage_fields(hit: &xerj_query::executor::Hit) -> Option<HashMap<String, Value>> {
+    let passage = hit.passage.as_ref()?;
+    let value = serde_json::to_value(passage).ok()?;
+    Some(HashMap::from([(
+        xerj_query::executor::PASSAGE_RESPONSE_FIELD.to_string(),
+        Value::Array(vec![value]),
+    )]))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET / — cluster info
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2087,7 +2096,8 @@ pub async fn get_doc(
     };
 
     match idx.get_document(&id).await {
-        Ok(Some(source)) => {
+        Ok(Some(mut source)) => {
+            xerj_query::executor::strip_internal_passage_metadata(&mut source);
             // Apply _source filtering based on query params.
             let filtered = apply_get_doc_source_filter(source, &params);
             // Real per-doc metadata (was hardcoded `_version: 1` /
@@ -4632,6 +4642,12 @@ fn build_search_request(
     if let Some(ref tth) = body.track_total_hits {
         query_body["track_total_hits"] = tth.clone();
     }
+    // Preserve every accepted ES `fields` wire shape. The query parser
+    // normalizes scalar, string-array, and `{field: ...}` entries into names
+    // used by engine-owned pseudo-fields such as `_passage`.
+    if let Some(ref fields) = body.fields {
+        query_body["fields"] = fields.clone();
+    }
 
     let mut req = parse_request(&query_body)
         .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))?;
@@ -4737,22 +4753,6 @@ fn build_search_request(
     // script is evaluated per hit against the hit's source in the search
     // handler's fields-building closure and merged into the hit's `fields`.
     req.script_fields = body.script_fields.clone();
-
-    // Forward fields request.
-    if let Some(fields_val) = &body.fields {
-        match fields_val {
-            Value::Array(arr) => {
-                req.fields = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
-            Value::String(s) => {
-                req.fields = vec![s.clone()];
-            }
-            _ => {}
-        }
-    }
 
     // track_total_hits is already forwarded via the JSON blob above.
 
@@ -8620,6 +8620,9 @@ pub async fn search(
                     obj.remove("__xy_collapse_group__");
                     obj.remove("__xy_collapse_spec__");
                     obj.remove("_matched_queries");
+                    obj.retain(|name, _| {
+                        !name.starts_with(xerj_query::executor::PASSAGE_METADATA_PREFIX)
+                    });
                 }
                 // Non-synthetic mode: strip the internal copy-to
                 // tracking marker; keep the copied values in the source
@@ -10169,6 +10172,17 @@ pub async fn search(
                                 other => Value::Array(vec![other]),
                             };
                             fmap.insert(fname.clone(), arr);
+                        }
+                    }
+                }
+                // XERJ's opt-in semantic provenance pseudo-field. Keeping it
+                // under the standard ES `fields` envelope preserves the
+                // default hit wire shape and lets ES clients request it
+                // without a separate response dialect.
+                if field_specs.iter().any(|(name, _, _)| name == "_passage") {
+                    if let Some(passage) = &h.passage {
+                        if let Ok(value) = serde_json::to_value(passage) {
+                            fmap.insert("_passage".to_string(), Value::Array(vec![value]));
                         }
                     }
                 }
@@ -15021,7 +15035,7 @@ pub async fn search_with_scroll(
                 } else {
                     Some(h.source.clone())
                 },
-                fields: None,
+                fields: passage_fields(h),
                 sort: if h.sort.is_empty() {
                     None
                 } else {
@@ -15075,12 +15089,18 @@ pub async fn search_with_scroll(
             "hits": {
                 "total": { "value": total_count, "relation": "eq" },
                 "max_score": first_page.first().and_then(|h| h.score),
-                "hits": first_page.iter().map(|h| json!({
-                    "_index": h.index,
-                    "_id": h.id,
-                    "_score": h.score,
-                    "_source": h.source,
-                })).collect::<Vec<_>>()
+                "hits": first_page.iter().map(|h| {
+                    let mut hit = json!({
+                        "_index": h.index,
+                        "_id": h.id,
+                        "_score": h.score,
+                        "_source": h.source,
+                    });
+                    if let Some(fields) = &h.fields {
+                        hit["fields"] = serde_json::to_value(fields).unwrap_or(Value::Null);
+                    }
+                    hit
+                }).collect::<Vec<_>>()
             }
         });
         return Json(resp).into_response();
@@ -15105,7 +15125,7 @@ pub async fn search_with_scroll(
             } else {
                 Some(h.source.clone())
             },
-            fields: None,
+            fields: passage_fields(h),
             sort: if h.sort.is_empty() {
                 None
             } else {
@@ -15242,7 +15262,7 @@ pub async fn next_scroll(
                     } else {
                         Some(h.source.clone())
                     },
-                    fields: None,
+                    fields: passage_fields(h),
                     sort: if h.sort.is_empty() {
                         None
                     } else {
@@ -15296,6 +15316,12 @@ pub async fn next_scroll(
                         if let Some(sort) = &h.sort {
                             o.insert("sort".to_string(), Value::Array(sort.clone()));
                         }
+                        if let Some(fields) = &h.fields {
+                            o.insert(
+                                "fields".to_string(),
+                                serde_json::to_value(fields).unwrap_or(Value::Null),
+                            );
+                        }
                         Value::Object(o)
                     }).collect::<Vec<_>>()
                 }
@@ -15308,6 +15334,256 @@ pub async fn next_scroll(
             Json(resp).into_response()
         }
         None => search_context_missing(&scroll_id),
+    }
+}
+
+#[cfg(test)]
+mod passage_scroll_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use std::time::{Duration, Instant};
+    use tower::ServiceExt;
+    use xerj_query::executor::{Hit, PassageMatch};
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    fn passage_hit(id: &str, ordinal: u32) -> Hit {
+        Hit {
+            id: id.to_string(),
+            score: 1.0,
+            source: json!({"company": "ACME"}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: Some(PassageMatch {
+                field: "content".into(),
+                ordinal,
+                start_offset: 0,
+                end_offset: 8,
+                text: "evidence".into(),
+                page: Some(u64::from(ordinal) + 1),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn scroll_continuation_preserves_opted_in_passage_fields() {
+        let state = test_state();
+        let scroll_id = Uuid::new_v4().to_string();
+        let now = Instant::now();
+        state.engine.scrolls.insert(
+            scroll_id.clone(),
+            xerj_engine::engine::ScrollContext {
+                index: "reports".into(),
+                hits: vec![passage_hit("page-1", 0), passage_hit("page-2", 1)],
+                position: 1,
+                page_size: 1,
+                created: now,
+                keep_alive: Duration::from_secs(60),
+                expires_at: now + Duration::from_secs(60),
+            },
+        );
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::post("/_search/scroll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"scroll_id": scroll_id}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["hits"]["hits"][0]["_id"], "page-2");
+        assert_eq!(
+            body["hits"]["hits"][0]["fields"]["_passage"][0]["ordinal"],
+            1
+        );
+        assert_eq!(body["hits"]["hits"][0]["fields"]["_passage"][0]["page"], 2);
+    }
+
+    #[tokio::test]
+    async fn passage_field_scalar_array_and_object_forms_reach_the_engine() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        let mut content = FieldConfig::new("content", FieldType::Text);
+        content.options.dimensions = Some(32);
+        content.embedding = Some(xerj_common::types::EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("embedding".into()),
+        });
+        schema.fields.push(content);
+        state.engine.create_index("passage-fields", schema).unwrap();
+        let index = state.engine.get_index("passage-fields").unwrap();
+        index
+            .index_document(
+                Some("report-page".into()),
+                json!({
+                    "content": format!(
+                        "{} quarterly zephyr liquidity evidence {}",
+                        "operating narrative ".repeat(50),
+                        "tax footnote ".repeat(50)
+                    ),
+                    "page": 7
+                }),
+            )
+            .await
+            .unwrap();
+        index.refresh().await.unwrap();
+        let app = crate::router::build_es_compat_router(state);
+
+        for fields in [
+            json!("_passage"),
+            json!(["_passage"]),
+            json!([{"field": "_passage"}]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/passage-fields/_search")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "fields": fields,
+                                "query": {"semantic": {
+                                    "field": "content",
+                                    "query": "quarterly zephyr liquidity evidence",
+                                    "k": 1
+                                }}
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["hits"]["hits"][0]["fields"]["_passage"][0]["page"], 7,
+                "fields form {fields} did not propagate: {body}"
+            );
+        }
+    }
+
+    async fn assert_ambiguous_passage_query_is_actionable_400(app: &axum::Router, body: Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/passage-composition/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "ambiguous passage ownership must be a caller-fixable 400, not a 500"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], 400, "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("one unambiguous winning passage"),
+            "error must explain why provenance is ambiguous: {body}"
+        );
+        assert!(
+            reason.contains("request `_passage` only with a single semantic/kNN clause")
+                && reason.contains("omit `_passage` for fusion"),
+            "error must tell the caller how to fix the request: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_multi_knn_passage_requests_are_http_400_in_both_orders() {
+        let state = test_state();
+        state
+            .engine
+            .create_index("passage-composition", Schema::empty())
+            .unwrap();
+        let app = crate::router::build_es_compat_router(state);
+        let knn_a = json!({
+            "field": "embedding_a",
+            "query_vector": [1.0, 0.0],
+            "k": 10
+        });
+        let knn_b = json!({
+            "field": "embedding_b",
+            "query_vector": [0.0, 1.0],
+            "k": 10
+        });
+
+        for knn in [
+            json!([knn_a.clone(), knn_b.clone()]),
+            json!([knn_b.clone(), knn_a.clone()]),
+        ] {
+            assert_ambiguous_passage_query_is_actionable_400(
+                &app,
+                json!({"fields": ["_passage"], "knn": knn}),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_hybrid_passage_requests_are_http_400_in_both_orders() {
+        let state = test_state();
+        state
+            .engine
+            .create_index("passage-composition", Schema::empty())
+            .unwrap();
+        let app = crate::router::build_es_compat_router(state);
+        let semantic = json!({
+            "query": {
+                "semantic": {
+                    "field": "content",
+                    "query": "quarterly evidence",
+                    "k": 10
+                }
+            }
+        });
+        let lexical = json!({"query": {"match_all": {}}});
+
+        for queries in [
+            json!([semantic.clone(), lexical.clone()]),
+            json!([lexical.clone(), semantic.clone()]),
+        ] {
+            assert_ambiguous_passage_query_is_actionable_400(
+                &app,
+                json!({
+                    "fields": ["_passage"],
+                    "query": {
+                        "hybrid": {
+                            "queries": queries,
+                            "fusion": "rrf"
+                        }
+                    }
+                }),
+            )
+            .await;
+        }
     }
 }
 
