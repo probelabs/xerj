@@ -863,6 +863,17 @@ impl ShardedFtsMemtable {
         out
     }
 
+    /// Return each live buffered source together with the exact sequence
+    /// captured in the same memtable entry. Rebuild callers must not attach a
+    /// later VersionMap sequence to a source captured earlier.
+    pub fn all_docs_with_sources_and_seq_arc(&self) -> Vec<(String, Arc<Value>, u64)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.read().all_docs_with_sources_and_seq_arc());
+        }
+        out
+    }
+
     /// Columnar-filtered twin of `all_docs_with_sources_arc`: materialise ONLY
     /// the `(doc_id, source_arc)` pairs matching `preds` (a pure conjunction of
     /// Term/Range predicates), so a filtered `size:0` aggregation folds
@@ -2505,6 +2516,21 @@ impl FtsMemtable {
             .collect()
     }
 
+    /// Sequence-bearing source iterator used by HNSW recovery. Raw deferred
+    /// entries share the memoized parsed `Arc<Value>` via `resolve_source_arc`.
+    pub fn all_docs_with_sources_and_seq_arc(&self) -> Vec<(String, Arc<Value>, u64)> {
+        self.docs
+            .iter()
+            .map(|entry| {
+                (
+                    entry.doc_id.clone(),
+                    Self::resolve_source_arc(entry),
+                    entry.seq_no,
+                )
+            })
+            .collect()
+    }
+
     /// Return the full original source JSON for a document by ID.
     /// O(1) doc lookup via `doc_id_index` (maintained by every insert /
     /// remove path), with a linear-scan fallback in case an entry is ever
@@ -3766,6 +3792,41 @@ mod filtered_docs_arc_tests {
         assert!(
             mem.filtered_docs_arc(&preds).is_none(),
             "array-valued predicate field must force the full-corpus fallback"
+        );
+    }
+
+    #[test]
+    fn sequence_bearing_iterator_returns_source_entry_sequence() {
+        let mem = ShardedFtsMemtable::new();
+        let schema = Schema::default();
+        mem.insert("A".into(), &json!({"value": "old"}), &schema, 11);
+        mem.insert("B".into(), &json!({"value": "b"}), &schema, 12);
+        mem.insert_raw_bytes_with_seq(
+            14,
+            "R".into(),
+            Arc::<[u8]>::from(br#"{"value":"raw"}"#.as_slice()),
+        );
+        mem.remove("A");
+        mem.insert("A".into(), &json!({"value": "new"}), &schema, 13);
+
+        let mut docs = mem.all_docs_with_sources_and_seq_arc();
+        docs.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(docs.len(), 3);
+        assert_eq!((docs[0].0.as_str(), docs[0].2), ("A", 13));
+        assert_eq!(docs[0].1["value"], "new");
+        assert_eq!((docs[1].0.as_str(), docs[1].2), ("B", 12));
+        assert_eq!(docs[1].1["value"], "b");
+        assert_eq!((docs[2].0.as_str(), docs[2].2), ("R", 14));
+        assert_eq!(docs[2].1["value"], "raw");
+
+        let again = mem
+            .all_docs_with_sources_and_seq_arc()
+            .into_iter()
+            .find(|(id, _, _)| id == "R")
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&docs[2].1, &again.1),
+            "the deferred raw source must be parsed once and memoized"
         );
     }
 }

@@ -57,6 +57,64 @@ fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudge
     panic!("Index construction requires the process ResourceGovernor to be initialised");
 }
 
+#[cfg(test)]
+mod hnsw_identity_tests {
+    use super::*;
+    use crate::Engine;
+    use tempfile::TempDir;
+
+    async fn fixture(name: &str) -> (TempDir, Arc<Index>) {
+        let directory = TempDir::new().unwrap();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = directory.path().to_string_lossy().into_owned();
+        let engine = Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut vector = FieldConfig::new("embedding", FieldType::Vector);
+        vector.options.dimensions = Some(4);
+        schema.fields.push(vector);
+        engine.create_index(name, schema).unwrap();
+        (directory, engine.get_index(name).unwrap())
+    }
+
+    #[tokio::test]
+    async fn graph_identity_tracks_the_exact_publication_sequence() {
+        let (_directory, index) = fixture("hnsw-node-sequence").await;
+        let vector = vec![1.0, 0.0, 0.0, 0.0];
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": vector.clone(), "payload": "first"}),
+            )
+            .await
+            .unwrap();
+
+        let first_node = index.hnsw_id_map.read().await["doc"];
+        let first_seq = index.store.version_map.get("doc").unwrap().seq_no;
+        assert_eq!(index.hnsw_node_seq.read().await[&first_node], first_seq);
+        assert!(index.hnsw_vector_current("doc", first_seq, &vector).await);
+
+        index
+            .index_document(
+                Some("doc".into()),
+                serde_json::json!({"embedding": vector.clone(), "payload": "second"}),
+            )
+            .await
+            .unwrap();
+        let second_node = index.hnsw_id_map.read().await["doc"];
+        let second_seq = index.store.version_map.get("doc").unwrap().seq_no;
+        assert_ne!(second_node, first_node);
+        assert!(second_seq > first_seq);
+        assert!(!index.hnsw_node_seq.read().await.contains_key(&first_node));
+        assert_eq!(index.hnsw_node_seq.read().await[&second_node], second_seq);
+        assert!(!index.hnsw_vector_current("doc", first_seq, &vector).await);
+        assert!(index.hnsw_vector_current("doc", second_seq, &vector).await);
+
+        assert!(index.delete_document("doc").await.unwrap());
+        assert!(!index.hnsw_id_map.read().await.contains_key("doc"));
+        assert!(!index.hnsw_node_seq.read().await.contains_key(&second_node));
+    }
+}
+
 /// Clears an index's `merge_in_progress` flag on every exit path of the
 /// merge holder (background pass or forcemerge), including panics.
 struct MergeFlagClear<'a>(&'a std::sync::atomic::AtomicBool);
@@ -1638,6 +1696,9 @@ pub struct Index {
     hnsw_id_map: Arc<RwLock<HashMap<String, u64>>>,
     /// Maps u64 node-id → string doc-id (reverse of hnsw_id_map).
     hnsw_id_rev: Arc<RwLock<HashMap<u64, String>>>,
+    /// Exact authoritative sequence that produced each graph node. A node
+    /// without a matching stamp is never considered current by recovery.
+    hnsw_node_seq: Arc<RwLock<HashMap<u64, u64>>>,
     /// Monotonic counter for HNSW node IDs.
     hnsw_next_id: Arc<AtomicU64>,
     /// Number of distinct live docs that CARRY the pinned vector field (item
@@ -2185,6 +2246,7 @@ impl Index {
             hnsw: Arc::new(RwLock::new(None)),
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
             hnsw_id_rev: Arc::new(RwLock::new(HashMap::new())),
+            hnsw_node_seq: Arc::new(RwLock::new(HashMap::new())),
             hnsw_next_id: Arc::new(AtomicU64::new(1)),
             vector_doc_count: Arc::new(AtomicU64::new(0)),
             hnsw_field: Arc::new(std::sync::RwLock::new(None)),
@@ -2465,6 +2527,7 @@ impl Index {
             hnsw: Arc::new(RwLock::new(hnsw_init)),
             hnsw_id_map: Arc::new(RwLock::new(id_map_init)),
             hnsw_id_rev: Arc::new(RwLock::new(id_rev_init)),
+            hnsw_node_seq: Arc::new(RwLock::new(HashMap::new())),
             hnsw_next_id: Arc::new(AtomicU64::new(next_id_init)),
             vector_doc_count: Arc::new(AtomicU64::new(vector_doc_count_init)),
             hnsw_field: Arc::new(std::sync::RwLock::new(hnsw_field_init)),
@@ -2833,7 +2896,7 @@ impl Index {
         }
 
         // Index any vector fields into the HNSW index.
-        self.index_vectors(&doc_id, &source).await;
+        self.index_vectors(&doc_id, seq_no, &source).await;
         #[cfg(test)]
         self.publication_test_point(&doc_id, PublicationTestPoint::AfterHnsw);
 
@@ -3203,8 +3266,8 @@ impl Index {
             })
             .unwrap_or(false)
         {
-            for ingest in &processed {
-                self.index_vectors(&ingest.id, &ingest.source).await;
+            for (ingest, &seq_no) in processed.iter().zip(&seq_nos) {
+                self.index_vectors(&ingest.id, seq_no, &ingest.source).await;
             }
         }
 
@@ -3939,9 +4002,9 @@ impl Index {
         drop(schema_guard2);
 
         // Step 5: schema evolution + vector indexing (post-lock).
-        for ingest in &processed {
+        for (ingest, &seq_no) in processed.iter().zip(&seq_nos) {
             self.evolve_schema_from_doc(&ingest.source).await;
-            self.index_vectors(&ingest.id, &ingest.source).await;
+            self.index_vectors(&ingest.id, seq_no, &ingest.source).await;
         }
 
         // Step 6: flush threshold check.
@@ -5490,7 +5553,7 @@ impl Index {
     /// UPDATES: re-indexing an existing doc_id tombstones the doc's previous
     /// node before inserting the fresh vector — otherwise the graph would
     /// keep serving the pre-update vector forever.
-    async fn index_vectors(&self, doc_id: &str, source: &Value) {
+    async fn index_vectors(&self, doc_id: &str, seq_no: u64, source: &Value) {
         let obj = match source.as_object() {
             Some(o) => o,
             None => return,
@@ -5499,7 +5562,7 @@ impl Index {
         if let Some(field) = pinned {
             // Enforced path: only the pinned field ever enters the graph.
             if let Some(vector) = extract_numeric_vector(source, &field) {
-                self.hnsw_insert_vector(doc_id, vector).await;
+                self.hnsw_insert_vector(doc_id, seq_no, vector).await;
             }
             return;
         }
@@ -5540,7 +5603,7 @@ impl Index {
             }
         };
         if let Some(vector) = extract_numeric_vector(source, &field) {
-            self.hnsw_insert_vector(doc_id, vector).await;
+            self.hnsw_insert_vector(doc_id, seq_no, vector).await;
         }
     }
 
@@ -5579,7 +5642,7 @@ impl Index {
     /// Returns false when the vector was skipped (empty / dim mismatch /
     /// insert error) — the doc then has no `hnsw_id_map` entry, so the
     /// coverage guard keeps the kNN query path on brute force.
-    async fn hnsw_insert_vector(&self, doc_id: &str, vector: Vec<f32>) -> bool {
+    async fn hnsw_insert_vector(&self, doc_id: &str, seq_no: u64, vector: Vec<f32>) -> bool {
         let dim = vector.len();
         if dim == 0 {
             return false;
@@ -5622,11 +5685,14 @@ impl Index {
         // Update id maps.
         let mut id_map = self.hnsw_id_map.write().await;
         let mut id_rev = self.hnsw_id_rev.write().await;
+        let mut node_seq = self.hnsw_node_seq.write().await;
         if let Some(old) = old_node {
             id_rev.remove(&old);
+            node_seq.remove(&old);
         }
         id_map.insert(doc_id.to_string(), node_id);
         id_rev.insert(node_id, doc_id.to_string());
+        node_seq.insert(node_id, seq_no);
         true
     }
 
@@ -5761,13 +5827,13 @@ impl Index {
             // flush completing mid-pass then presents the doc in both (the
             // `seen` set dedups) instead of in neither.
             let mut seen: HashSet<String> = HashSet::new();
-            let mem_docs = self.memtable.all_docs_with_sources();
-            for (doc_id, src) in &mem_docs {
+            let mem_docs = self.memtable.all_docs_with_sources_and_seq_arc();
+            for (doc_id, src, seq_no) in &mem_docs {
                 seen.insert(doc_id.clone());
                 if let Some(vector) = extract_numeric_vector(src, &field) {
                     compared += 1;
-                    if !self.hnsw_vector_current(doc_id, &vector).await
-                        && self.hnsw_insert_vector(doc_id, vector).await
+                    if !self.hnsw_vector_current(doc_id, *seq_no, &vector).await
+                        && self.hnsw_insert_vector(doc_id, *seq_no, vector).await
                     {
                         reinserted += 1;
                     }
@@ -5819,6 +5885,19 @@ impl Index {
                     if !seen.insert(id.to_string()) {
                         continue;
                     }
+                    let doc_seq = match doc.get("_seq_no").and_then(Value::as_u64) {
+                        Some(seq_no) => seq_no,
+                        None => {
+                            warn!(
+                                index = self.name.as_str(),
+                                segment = meta.id.as_str(),
+                                doc_id = id,
+                                pass,
+                                "HNSW rebuild: live document has no sequence — retrying pass"
+                            );
+                            continue 'passes;
+                        }
+                    };
                     let src_owned;
                     let src: &Value = match doc.get("_source") {
                         Some(s) => s,
@@ -5833,8 +5912,8 @@ impl Index {
                     };
                     if let Some(vector) = extract_numeric_vector(src, &field) {
                         compared += 1;
-                        if !self.hnsw_vector_current(id, &vector).await
-                            && self.hnsw_insert_vector(id, vector).await
+                        if !self.hnsw_vector_current(id, doc_seq, &vector).await
+                            && self.hnsw_insert_vector(id, doc_seq, vector).await
                         {
                             reinserted += 1;
                         }
@@ -5879,6 +5958,7 @@ impl Index {
                     id_map.remove(&doc_id);
                 }
                 self.hnsw_id_rev.write().await.remove(&node_id);
+                self.hnsw_node_seq.write().await.remove(&node_id);
                 if let Some(h) = self.hnsw.read().await.as_ref() {
                     h.mark_deleted(node_id);
                 }
@@ -5919,11 +5999,14 @@ impl Index {
 
     /// True when `doc_id` has a graph node whose stored vector bit-matches
     /// `vector` (rebuild fast path — no insert needed).
-    async fn hnsw_vector_current(&self, doc_id: &str, vector: &[f32]) -> bool {
+    async fn hnsw_vector_current(&self, doc_id: &str, seq_no: u64, vector: &[f32]) -> bool {
         let node = match self.hnsw_id_map.read().await.get(doc_id) {
             Some(n) => *n,
             None => return false,
         };
+        if self.hnsw_node_seq.read().await.get(&node) != Some(&seq_no) {
+            return false;
+        }
         let guard = self.hnsw.read().await;
         guard
             .as_ref()
@@ -8013,6 +8096,7 @@ impl Index {
             // gets a fresh node_id (the old one stays tombstoned).
             self.hnsw_id_map.write().await.remove(id);
             self.hnsw_id_rev.write().await.remove(&node_id);
+            self.hnsw_node_seq.write().await.remove(&node_id);
             // Item 8: this doc leaves the coverage-gate denominator.
             self.vector_doc_count
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
