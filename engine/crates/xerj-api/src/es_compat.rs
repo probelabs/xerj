@@ -683,6 +683,10 @@ pub async fn create_index(
             let e = xerj_common::XerjError::invalid_mapping(reason);
             return ApiError::new(e).into_response();
         }
+        if let Err(reason) = validate_semantic_companion_targets(props) {
+            let e = xerj_common::XerjError::invalid_mapping(reason);
+            return ApiError::new(e).into_response();
+        }
     }
     // Runtime mapping type validation too.
     if let Some(rt_obj) = mappings_val.get("runtime").and_then(Value::as_object) {
@@ -837,6 +841,135 @@ fn validate_properties(props: &serde_json::Map<String, Value>) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+fn validate_semantic_companion_targets(
+    props: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    fn walk(props: &serde_json::Map<String, Value>, parent: Option<&str>) -> Result<(), String> {
+        let mut producer_by_target: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (name, spec) in props {
+            let Some(definition) = spec.as_object() else {
+                continue;
+            };
+            if definition.get("type").and_then(Value::as_str) == Some("semantic_text") {
+                if let Some(parent) = parent {
+                    return Err(format!(
+                        "nested semantic_text field [{parent}.{name}] is not supported; \
+                         map semantic_text as a top-level field"
+                    ));
+                }
+                let target = definition
+                    .get("target_field")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{name}_vector"));
+                if let Some(first) = producer_by_target.insert(target.clone(), name.clone()) {
+                    return Err(format!(
+                        "semantic_text fields [{first}] and [{name}] both target [{target}]; \
+                     each semantic field must use a distinct target_field"
+                    ));
+                }
+                let explicit_targets = mapping_definitions_for_logical_path(props, &target);
+                if explicit_targets.len() > 1 {
+                    return Err(format!(
+                        "semantic_text field [{name}] target [{target}] is ambiguous because both \
+                    literal and nested mapping paths resolve to that name; keep only one"
+                    ));
+                }
+                if props.get(&target).is_none() && !explicit_targets.is_empty() {
+                    return Err(format!(
+                    "semantic_text field [{name}] target [{target}] resolves to a nested mapping; \
+                     custom dotted target_field values must be declared as a literal top-level \
+                     property key"
+                ));
+                }
+                if let Some(explicit) = explicit_targets.first() {
+                    let explicit_type = explicit
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("object");
+                    if explicit_type != "dense_vector" {
+                        return Err(format!(
+                            "semantic_text field [{name}] targets [{target}], but that field is \
+                         explicitly mapped as [{explicit_type}]; map it as [dense_vector] or \
+                         choose another target_field"
+                        ));
+                    }
+                    let semantic_dims = definition
+                        .get("dimensions")
+                        .or_else(|| definition.get("dims"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(384);
+                    if let Some(target_dims) = explicit.get("dims").and_then(Value::as_u64) {
+                        if target_dims != semantic_dims {
+                            return Err(format!(
+                            "semantic_text field [{name}] produces {semantic_dims} dimensions, \
+                             but target field [{target}] declares {target_dims}"
+                        ));
+                        }
+                    }
+                    let semantic_similarity = definition
+                        .get("similarity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("cosine");
+                    let target_similarity = explicit
+                        .get("similarity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("cosine");
+                    if semantic_similarity != target_similarity {
+                        return Err(format!(
+                        "semantic_text field [{name}] uses similarity [{semantic_similarity}], \
+                         but target field [{target}] declares [{target_similarity}]"
+                    ));
+                    }
+                }
+            }
+            if let Some(sub) = definition.get("properties").and_then(Value::as_object) {
+                let path = parent
+                    .map(|prefix| format!("{prefix}.{name}"))
+                    .unwrap_or_else(|| name.clone());
+                walk(sub, Some(&path))?;
+            }
+        }
+        Ok(())
+    }
+    walk(props, None)
+}
+
+fn mapping_definitions_for_logical_path<'a>(
+    props: &'a serde_json::Map<String, Value>,
+    path: &str,
+) -> Vec<&'a serde_json::Map<String, Value>> {
+    let mut matches = Vec::new();
+    if let Some(definition) = props.get(path).and_then(Value::as_object) {
+        matches.push(definition);
+    }
+    if path.contains('.') {
+        let segments: Vec<&str> = path.split('.').collect();
+        let mut current = props;
+        let mut found = None;
+        for (position, segment) in segments.iter().enumerate() {
+            let Some(definition) = current.get(*segment).and_then(Value::as_object) else {
+                found = None;
+                break;
+            };
+            if position + 1 == segments.len() {
+                found = Some(definition);
+                break;
+            }
+            let Some(children) = definition.get("properties").and_then(Value::as_object) else {
+                found = None;
+                break;
+            };
+            current = children;
+        }
+        if let Some(definition) = found {
+            matches.push(definition);
+        }
+    }
+    matches
 }
 
 fn validate_runtime_fields(rt: &serde_json::Map<String, Value>) -> Result<(), String> {
@@ -1363,6 +1496,10 @@ pub async fn put_mapping(
             let e = xerj_common::XerjError::invalid_mapping(reason);
             return ApiError::new(e).into_response();
         }
+        if let Err(reason) = validate_semantic_companion_targets(props) {
+            let e = xerj_common::XerjError::invalid_mapping(reason);
+            return ApiError::new(e).into_response();
+        }
     }
 
     // Reject type changes on existing fields. ES disallows mutating a
@@ -1405,6 +1542,42 @@ pub async fn put_mapping(
                         )
                             .into_response();
                     }
+                    if new_type == "semantic_text" {
+                        let old_definition = mapping
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .and_then(|properties| properties.get(key))
+                            .and_then(Value::as_object);
+                        let new_definition = val.as_object();
+                        if let (Some(old_definition), Some(new_definition)) =
+                            (old_definition, new_definition)
+                        {
+                            let old_contract = semantic_mapping_contract(key, old_definition);
+                            let new_contract = semantic_mapping_contract(key, new_definition);
+                            if old_contract != new_contract {
+                                let reason = format!(
+                                    "semantic_text field [{key}] embedding contract cannot be \
+                                     changed in place (target_field, dimensions, and similarity \
+                                     are immutable); create a new field or reindex"
+                                );
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(json!({
+                                        "error": {
+                                            "root_cause": [{
+                                                "type": "illegal_argument_exception",
+                                                "reason": reason,
+                                            }],
+                                            "type": "illegal_argument_exception",
+                                            "reason": reason,
+                                        },
+                                        "status": 400,
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1415,12 +1588,6 @@ pub async fn put_mapping(
             Ok(i) => i,
             Err(_) => continue,
         };
-        if let Some(properties) = body.get("properties") {
-            let fields = es_properties_to_fields(properties);
-            for field in fields {
-                let _ = idx.add_field(field).await;
-            }
-        }
         // Merge the new properties into the stored mappings blob so
         // round-trip GET /_mapping reflects both create-time and
         // put_mapping-time field definitions. Dotted keys in the request
@@ -1457,12 +1624,65 @@ pub async fn put_mapping(
         } else {
             existing = body.clone();
         }
+
+        // Semantic companion validation must see the complete post-update
+        // mapping, not only this request. Otherwise a target declared by an
+        // earlier request can collide with a newly added semantic source.
+        if let Some(merged_props) = existing.get("properties").and_then(Value::as_object) {
+            if let Err(reason) = validate_semantic_companion_targets(merged_props) {
+                let e = xerj_common::XerjError::invalid_mapping(reason);
+                return ApiError::new(e).into_response();
+            }
+        }
+
+        if let Some(properties) = body.get("properties") {
+            let current = idx.schema().await;
+            let mut additions = Vec::new();
+            for field in es_properties_to_fields(properties) {
+                if let Some(existing_field) = current.field(&field.name) {
+                    if existing_field.field_type != field.field_type {
+                        let e = xerj_common::XerjError::invalid_mapping(format!(
+                            "field [{}] already exists as [{}], cannot add [{}]",
+                            field.name, existing_field.field_type, field.field_type
+                        ));
+                        return ApiError::new(e).into_response();
+                    }
+                    continue;
+                }
+                additions.push(field);
+            }
+            if let Err(error) = idx.add_fields(additions).await {
+                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+            }
+        }
         // Persists es_mapping.json into the index dir (atomic) so the
         // merged mapping survives a restart.
         state.engine.put_index_mapping(idx_name, existing);
     }
 
     Json(json!({ "acknowledged": true })).into_response()
+}
+
+fn semantic_mapping_contract(
+    field_name: &str,
+    definition: &serde_json::Map<String, Value>,
+) -> (String, u64, String) {
+    let target = definition
+        .get("target_field")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{field_name}_vector"));
+    let dimensions = definition
+        .get("dimensions")
+        .or_else(|| definition.get("dims"))
+        .and_then(Value::as_u64)
+        .unwrap_or(384);
+    let similarity = definition
+        .get("similarity")
+        .and_then(Value::as_str)
+        .unwrap_or("cosine")
+        .to_string();
+    (target, dimensions, similarity)
 }
 
 /// Walk a mapping blob's `properties` tree and build a flat map of
@@ -12572,9 +12792,20 @@ fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
                 .map(|d| d as usize)
                 .unwrap_or(384);
             fc.options.dimensions = Some(dims);
-            // Built-in embeddings are L2-normalised → cosine similarity.
-            fc.options.similarity = Some("cosine".to_string());
-            let target_field = format!("{field_name}_vector");
+            // Built-in embeddings are L2-normalised, so cosine is the
+            // default. Honour an explicit similarity for proxy/custom
+            // embedders and carry it onto the internal vector companion.
+            let similarity = field_def
+                .get("similarity")
+                .and_then(Value::as_str)
+                .unwrap_or("cosine")
+                .to_string();
+            fc.options.similarity = Some(similarity);
+            let target_field = field_def
+                .get("target_field")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{field_name}_vector"));
             // Allow a mapping to point at an external inference endpoint/model
             // (`inference_id` mirrors ES 8.x semantic_text wiring); when absent
             // the engine falls back to the zero-config built-in embedder.
@@ -12638,7 +12869,46 @@ fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
 
         fields.push(fc);
     }
+
+    // A semantic_text field writes its embedding to a companion field. That
+    // companion is internal when the caller did not declare it explicitly,
+    // but it still has to be a native Vector in the engine schema: HNSW pins
+    // only mapped vector fields and deliberately ignores arbitrary numeric
+    // arrays. Add companions after parsing all public fields so declaration
+    // order cannot overwrite an explicit target.
+    let semantic_companions: Vec<FieldConfig> = fields
+        .iter()
+        .filter_map(|field| {
+            let embedding = field.embedding.as_ref()?;
+            let target = embedding
+                .target_field
+                .clone()
+                .unwrap_or_else(|| format!("{}_vector", field.name));
+            if field_configs_contain_logical_path(&fields, &target) {
+                return None;
+            }
+            let mut companion = FieldConfig::new(target, FieldType::Vector);
+            companion.options.dimensions = field.options.dimensions;
+            companion.options.similarity = field.options.similarity.clone();
+            Some(companion)
+        })
+        .collect();
+    fields.extend(semantic_companions);
     fields
+}
+
+fn field_configs_contain_logical_path(fields: &[FieldConfig], target: &str) -> bool {
+    fn walk(fields: &[FieldConfig], prefix: &str, target: &str) -> bool {
+        fields.iter().any(|field| {
+            let path = if prefix.is_empty() {
+                field.name.clone()
+            } else {
+                format!("{prefix}.{}", field.name)
+            };
+            path == target || (!field.fields.is_empty() && walk(&field.fields, &path, target))
+        })
+    }
+    walk(fields, "", target)
 }
 
 fn es_type_to_native(es_type: &str) -> FieldType {
@@ -12664,6 +12934,713 @@ fn es_type_to_native(es_type: &str) -> FieldType {
         "binary" => FieldType::Binary,
         "nested" => FieldType::Nested,
         _ => FieldType::Object,
+    }
+}
+
+#[cfg(test)]
+mod semantic_companion_schema_tests {
+    use super::*;
+
+    #[test]
+    fn implicit_companion_is_a_native_vector_with_semantic_options() {
+        let fields = es_properties_to_fields(&json!({
+            "body": {
+                "type": "semantic_text",
+                "dimensions": 96,
+                "similarity": "dot_product"
+            },
+            "ports": { "type": "object" }
+        }));
+
+        let body = fields.iter().find(|field| field.name == "body").unwrap();
+        assert_eq!(
+            body.embedding.as_ref().unwrap().target_field.as_deref(),
+            Some("body_vector")
+        );
+        let companion = fields
+            .iter()
+            .find(|field| field.name == "body_vector")
+            .unwrap();
+        assert_eq!(companion.field_type, FieldType::Vector);
+        assert_eq!(companion.options.dimensions, Some(96));
+        assert_eq!(companion.options.similarity.as_deref(), Some("dot_product"));
+        assert!(
+            fields.iter().all(|field| field.name != "ports_vector"),
+            "ordinary fields and numeric arrays must not acquire vector mappings"
+        );
+    }
+
+    #[test]
+    fn custom_target_is_registered_without_overwriting_an_explicit_companion() {
+        let fields = es_properties_to_fields(&json!({
+            "body": {
+                "type": "semantic_text",
+                "target_field": "model_output",
+                "dimensions": 7,
+                "similarity": "l2_norm"
+            },
+            "model_output": {
+                "type": "dense_vector",
+                "dims": 7,
+                "similarity": "l2_norm"
+            }
+        }));
+
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|field| field.name == "model_output")
+                .count(),
+            1,
+            "the explicit target must not be replaced or duplicated"
+        );
+        let companion = fields
+            .iter()
+            .find(|field| field.name == "model_output")
+            .unwrap();
+        assert_eq!(companion.field_type, FieldType::Vector);
+        assert_eq!(companion.options.dimensions, Some(7));
+        assert_eq!(companion.options.similarity.as_deref(), Some("l2_norm"));
+    }
+
+    #[test]
+    fn explicit_companion_collisions_report_actionable_mismatches() {
+        let wrong_type = json!({
+            "body": { "type": "semantic_text", "target_field": "model_output" },
+            "model_output": { "type": "double" }
+        });
+        let error =
+            validate_semantic_companion_targets(wrong_type.as_object().unwrap()).unwrap_err();
+        assert!(error.contains("explicitly mapped as [double]"), "{error}");
+        assert!(error.contains("map it as [dense_vector]"), "{error}");
+
+        let wrong_dims = json!({
+            "body": {
+                "type": "semantic_text",
+                "target_field": "model_output",
+                "dimensions": 384
+            },
+            "model_output": { "type": "dense_vector", "dims": 768 }
+        });
+        let error =
+            validate_semantic_companion_targets(wrong_dims.as_object().unwrap()).unwrap_err();
+        assert!(error.contains("produces 384 dimensions"), "{error}");
+        assert!(error.contains("declares 768"), "{error}");
+
+        let wrong_similarity = json!({
+            "body": {
+                "type": "semantic_text",
+                "target_field": "model_output",
+                "similarity": "dot_product"
+            },
+            "model_output": {
+                "type": "dense_vector",
+                "dims": 384,
+                "similarity": "cosine"
+            }
+        });
+        let error =
+            validate_semantic_companion_targets(wrong_similarity.as_object().unwrap()).unwrap_err();
+        assert!(error.contains("uses similarity [dot_product]"), "{error}");
+        assert!(error.contains("declares [cosine]"), "{error}");
+
+        let nested = json!({
+            "document": {
+                "type": "object",
+                "properties": {
+                    "body": { "type": "semantic_text" }
+                }
+            }
+        });
+        let error = validate_semantic_companion_targets(nested.as_object().unwrap()).unwrap_err();
+        assert!(
+            error.contains("nested semantic_text field [document.body] is not supported"),
+            "{error}"
+        );
+
+        let nested_target = json!({
+            "body": {
+                "type": "semantic_text",
+                "target_field": "semantic.embedding",
+                "dimensions": 32
+            },
+            "semantic": {
+                "properties": {
+                    "embedding": { "type": "dense_vector", "dims": 32 }
+                }
+            }
+        });
+        let error =
+            validate_semantic_companion_targets(nested_target.as_object().unwrap()).unwrap_err();
+        assert!(
+            error.contains("must be declared as a literal top-level property key"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn multiple_semantic_fields_pin_only_declared_companions() {
+        let fields = es_properties_to_fields(&json!({
+            "body": { "type": "semantic_text", "dimensions": 8 },
+            "summary": {
+                "type": "semantic_text",
+                "target_field": "summary_embedding",
+                "dimensions": 16
+            },
+            "measurements": { "type": "object" }
+        }));
+
+        let vectors: Vec<_> = fields
+            .iter()
+            .filter(|field| field.field_type == FieldType::Vector)
+            .map(|field| (field.name.as_str(), field.options.dimensions))
+            .collect();
+        assert_eq!(
+            vectors,
+            vec![("body_vector", Some(8)), ("summary_embedding", Some(16))]
+        );
+    }
+}
+
+#[cfg(test)]
+mod semantic_companion_hnsw_api_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    async fn request_json(
+        state: AppState,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: impl Into<Body>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(content_type) = content_type {
+            builder = builder.header("content-type", content_type);
+        }
+        let response = crate::router::build_es_compat_router(state)
+            .oneshot(builder.body(body.into()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "{method} {path} returned non-JSON ({error}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, json)
+    }
+
+    fn state(config: &Config) -> AppState {
+        let engine = Engine::new(config.clone()).unwrap();
+        let metrics = Metrics::new().unwrap();
+        AppState::new(config.clone(), engine, metrics)
+    }
+
+    async fn assert_complete_semantic_graph(state: &AppState) {
+        let index = state.engine.get_index("semantic-api").unwrap();
+        let stats = index.hnsw_stats().await;
+        assert_eq!(stats["present"], true, "{stats}");
+        assert_eq!(stats["field"], "body_vector", "{stats}");
+        assert_eq!(stats["nodes"], 1024, "{stats}");
+        assert_eq!(stats["doc_coverage"], 1024, "{stats}");
+        assert_eq!(stats["vector_doc_count"], 1024, "{stats}");
+        assert_eq!(stats["covered"], true, "{stats}");
+    }
+
+    #[tokio::test]
+    async fn api_semantic_bulk_builds_complete_hnsw_and_survives_restart() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = data_dir.path().to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+
+        {
+            let state = state(&config);
+            let (status, _) = request_json(
+                state.clone(),
+                "PUT",
+                "/semantic-api",
+                Some("application/json"),
+                json!({
+                    "mappings": {
+                        "properties": {
+                            "body": { "type": "semantic_text", "dimensions": 32 },
+                            "measurements": { "type": "object" }
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+
+            // Public mapping round-trips exactly what the caller declared:
+            // the engine-only companion is not exposed as another field.
+            let (status, mapping) =
+                request_json(state.clone(), "GET", "/semantic-api/_mapping", None, "").await;
+            assert_eq!(status, StatusCode::OK);
+            let properties = mapping["semantic-api"]["mappings"]["properties"]
+                .as_object()
+                .unwrap();
+            assert_eq!(properties.len(), 2, "{mapping}");
+            assert!(!properties.contains_key("body_vector"), "{mapping}");
+
+            let mut bulk = String::new();
+            for id in 0..1024 {
+                bulk.push_str(&format!(
+                    "{{\"index\":{{\"_index\":\"semantic-api\",\"_id\":\"{id}\"}}}}\n"
+                ));
+                bulk.push_str(&format!(
+                    "{{\"body\":\"quarterly finance report revenue item {id}\",\
+                     \"measurements\":[{id},{}]}}\n",
+                    id + 1
+                ));
+            }
+            let (status, response) = request_json(
+                state.clone(),
+                "POST",
+                "/_bulk",
+                Some("application/x-ndjson"),
+                bulk,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(response["errors"], false, "{response}");
+            assert_eq!(response["items"].as_array().unwrap().len(), 1024);
+            assert_complete_semantic_graph(&state).await;
+
+            let (status, response) = request_json(
+                state.clone(),
+                "POST",
+                "/semantic-api/_search",
+                Some("application/json"),
+                json!({
+                    "size": 5,
+                    "query": {
+                        "semantic": {
+                            "field": "body",
+                            "query": "quarterly revenue",
+                            "k": 5
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(response["hits"]["hits"].as_array().unwrap().len(), 5);
+
+            state.engine.flush_all_force().await;
+        }
+
+        let restarted = state(&config);
+        assert_complete_semantic_graph(&restarted).await;
+        let (status, response) = request_json(
+            restarted.clone(),
+            "POST",
+            "/semantic-api/_search",
+            Some("application/json"),
+            json!({
+                "size": 5,
+                "query": {
+                    "semantic": {
+                        "field": "body",
+                        "query": "quarterly revenue",
+                        "k": 5
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["hits"]["hits"].as_array().unwrap().len(), 5);
+        restarted.engine.flush_all_force().await;
+    }
+
+    #[tokio::test]
+    async fn put_mapping_rejects_existing_companion_collision_atomically() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = data_dir.path().to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let state = state(&config);
+
+        let (status, _) = request_json(
+            state.clone(),
+            "PUT",
+            "/semantic-collision",
+            Some("application/json"),
+            json!({
+                "mappings": {
+                    "properties": {
+                        "body_vector": { "type": "double" }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let schema_before = state
+            .engine
+            .get_index("semantic-collision")
+            .unwrap()
+            .schema()
+            .await;
+
+        let (status, error) = request_json(
+            state.clone(),
+            "PUT",
+            "/semantic-collision/_mapping",
+            Some("application/json"),
+            json!({
+                "properties": {
+                    "body": { "type": "semantic_text" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("explicitly mapped as [double]"),
+            "{error}"
+        );
+        let schema_after = state
+            .engine
+            .get_index("semantic-collision")
+            .unwrap()
+            .schema()
+            .await;
+        assert_eq!(schema_after, schema_before, "schema update must be atomic");
+
+        let (_, mapping) = request_json(
+            state.clone(),
+            "GET",
+            "/semantic-collision/_mapping",
+            None,
+            "",
+        )
+        .await;
+        assert!(
+            mapping["semantic-collision"]["mappings"]["properties"]
+                .get("body")
+                .is_none(),
+            "{mapping}"
+        );
+        state.engine.flush_all_force().await;
+    }
+
+    #[tokio::test]
+    async fn put_mapping_rejects_semantic_contract_mutation_atomically() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = data_dir.path().to_string_lossy().into_owned();
+        let state = state(&config);
+        let (status, _) = request_json(
+            state.clone(),
+            "PUT",
+            "/semantic-contract",
+            Some("application/json"),
+            json!({
+                "mappings": {
+                    "properties": {
+                        "body": { "type": "semantic_text", "dimensions": 32 }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let schema_before = state
+            .engine
+            .get_index("semantic-contract")
+            .unwrap()
+            .schema()
+            .await;
+        let (_, mapping_before) = request_json(
+            state.clone(),
+            "GET",
+            "/semantic-contract/_mapping",
+            None,
+            "",
+        )
+        .await;
+
+        for mutation in [
+            json!({"type": "semantic_text", "dimensions": 64}),
+            json!({
+                "type": "semantic_text",
+                "dimensions": 32,
+                "target_field": "replacement_vector"
+            }),
+            json!({
+                "type": "semantic_text",
+                "dimensions": 32,
+                "similarity": "dot_product"
+            }),
+        ] {
+            let (status, error) = request_json(
+                state.clone(),
+                "PUT",
+                "/semantic-contract/_mapping",
+                Some("application/json"),
+                json!({"properties": {"body": mutation}}).to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("embedding contract cannot be changed in place"),
+                "{error}"
+            );
+            assert_eq!(
+                state
+                    .engine
+                    .get_index("semantic-contract")
+                    .unwrap()
+                    .schema()
+                    .await,
+                schema_before
+            );
+            let (_, mapping_after) = request_json(
+                state.clone(),
+                "GET",
+                "/semantic-contract/_mapping",
+                None,
+                "",
+            )
+            .await;
+            assert_eq!(mapping_after, mapping_before);
+        }
+        state.engine.flush_all_force().await;
+    }
+
+    #[tokio::test]
+    async fn shared_semantic_target_is_rejected_before_index_creation() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = data_dir.path().to_string_lossy().into_owned();
+        let state = state(&config);
+        let (status, error) = request_json(
+            state.clone(),
+            "PUT",
+            "/shared-target",
+            Some("application/json"),
+            json!({
+                "mappings": {
+                    "properties": {
+                        "body": {
+                            "type": "semantic_text",
+                            "target_field": "shared_vector"
+                        },
+                        "summary": {
+                            "type": "semantic_text",
+                            "target_field": "shared_vector"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("each semantic field must use a distinct target_field"),
+            "{error}"
+        );
+        assert!(state.engine.get_index("shared-target").is_err());
+
+        let (status, error) = request_json(
+            state.clone(),
+            "PUT",
+            "/nested-custom-target",
+            Some("application/json"),
+            json!({
+                "mappings": {
+                    "properties": {
+                        "body": {
+                            "type": "semantic_text",
+                            "target_field": "semantic.embedding",
+                            "dimensions": 32
+                        },
+                        "semantic": {
+                            "properties": {
+                                "embedding": { "type": "dense_vector", "dims": 32 }
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("literal top-level property key"),
+            "{error}"
+        );
+        assert!(state.engine.get_index("nested-custom-target").is_err());
+
+        let (status, _) = request_json(
+            state.clone(),
+            "PUT",
+            "/nested-put-target",
+            Some("application/json"),
+            json!({
+                "mappings": {
+                    "properties": {
+                        "semantic": {
+                            "properties": {
+                                "embedding": { "type": "dense_vector", "dims": 32 }
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let before = state
+            .engine
+            .get_index("nested-put-target")
+            .unwrap()
+            .schema()
+            .await;
+        let (status, error) = request_json(
+            state.clone(),
+            "PUT",
+            "/nested-put-target/_mapping",
+            Some("application/json"),
+            json!({
+                "properties": {
+                    "body": {
+                        "type": "semantic_text",
+                        "target_field": "semantic.embedding",
+                        "dimensions": 32
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(
+            state
+                .engine
+                .get_index("nested-put-target")
+                .unwrap()
+                .schema()
+                .await,
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_dotted_custom_target_builds_and_queries_hnsw() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = data_dir.path().to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let state = state(&config);
+        let (status, _) = request_json(
+            state.clone(),
+            "PUT",
+            "/dotted-target",
+            Some("application/json"),
+            json!({
+                "mappings": {
+                    "properties": {
+                        "body": {
+                            "type": "semantic_text",
+                            "target_field": "semantic.embedding",
+                            "dimensions": 32
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut bulk = String::new();
+        for id in 0..1024 {
+            bulk.push_str(&format!(
+                "{{\"index\":{{\"_index\":\"dotted-target\",\"_id\":\"{id}\"}}}}\n"
+            ));
+            bulk.push_str(&format!(
+                "{{\"body\":\"dotted semantic revenue item {id}\"}}\n"
+            ));
+        }
+        let (status, response) = request_json(
+            state.clone(),
+            "POST",
+            "/_bulk",
+            Some("application/x-ndjson"),
+            bulk,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["errors"], false, "{response}");
+        let stats = state
+            .engine
+            .get_index("dotted-target")
+            .unwrap()
+            .hnsw_stats()
+            .await;
+        assert_eq!(stats["field"], "semantic.embedding", "{stats}");
+        assert_eq!(stats["doc_coverage"], 1024, "{stats}");
+        assert_eq!(stats["covered"], true, "{stats}");
+
+        let (status, response) = request_json(
+            state.clone(),
+            "POST",
+            "/dotted-target/_search",
+            Some("application/json"),
+            json!({
+                "size": 5,
+                "query": {
+                    "semantic": {
+                        "field": "body",
+                        "query": "semantic revenue",
+                        "k": 5
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["hits"]["total"]["value"], 5);
+        assert_eq!(response["hits"]["hits"].as_array().unwrap().len(), 5);
+        state.engine.flush_all_force().await;
     }
 }
 

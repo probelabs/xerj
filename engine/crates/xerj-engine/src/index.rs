@@ -547,6 +547,255 @@ mod semantic_deadline_regression_tests {
     }
 
     #[tokio::test]
+    async fn fully_covered_semantic_companion_uses_ann_with_exact_rescore() {
+        let dir = TempDir::new().unwrap();
+        let engine_instance = engine(&dir);
+        let mut schema = Schema::empty();
+        let mut body = FieldConfig::new("body", FieldType::Text);
+        body.options.dimensions = Some(32);
+        body.options.similarity = Some("cosine".into());
+        body.embedding = Some(xerj_common::types::EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("body_vector".into()),
+        });
+        schema.add_field(body).unwrap();
+        let mut companion = FieldConfig::new("body_vector", FieldType::Vector);
+        companion.options.dimensions = Some(32);
+        companion.options.similarity = Some("cosine".into());
+        schema.add_field(companion).unwrap();
+        let mut summary = FieldConfig::new("summary", FieldType::Text);
+        summary.options.dimensions = Some(32);
+        summary.options.similarity = Some("cosine".into());
+        summary.embedding = Some(xerj_common::types::EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("summary_vector".into()),
+        });
+        schema.add_field(summary).unwrap();
+        let mut summary_companion = FieldConfig::new("summary_vector", FieldType::Vector);
+        summary_companion.options.dimensions = Some(32);
+        summary_companion.options.similarity = Some("cosine".into());
+        schema.add_field(summary_companion).unwrap();
+        engine_instance
+            .create_index("semantic-ann", schema)
+            .unwrap();
+        let idx = engine_instance.get_index("semantic-ann").unwrap();
+
+        for n in 0..1024 {
+            idx.index_document(
+                Some(format!("s{n}")),
+                serde_json::json!({
+                    "body": format!("quarterly revenue item {n}"),
+                    "summary": format!("cash flow note {n}")
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let stats = idx.hnsw_stats().await;
+        assert_eq!(stats["field"], "body_vector", "{stats}");
+        assert_eq!(stats["doc_coverage"], 1024, "{stats}");
+        assert_eq!(stats["vector_doc_count"], 1024, "{stats}");
+        assert_eq!(stats["covered"], true, "{stats}");
+
+        let semantic_request = SearchRequest {
+            query: QueryNode::SemanticSearch {
+                field: "body".into(),
+                text: "quarterly revenue item 777".into(),
+                k: 5,
+                filter: None,
+                boost: None,
+            },
+            size: 5,
+            ..SearchRequest::default()
+        };
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        let body_ann = idx.search(&semantic_request).await.unwrap();
+        assert_eq!(body_ann.hits.len(), 5);
+        assert_eq!(body_ann.total.value, 5);
+        assert_eq!(body_ann.hits[0].id, "s777");
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            0,
+            "an eligible semantic query must use HNSW candidates plus exact rescore, \
+             not the brute-force document scan"
+        );
+
+        let exact = idx
+            .run_knn_brute_force(
+                &semantic_request,
+                "body_vector",
+                &xerj_ai::local::local_embed("quarterly revenue item 777", 32),
+                5,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.hits[0].id, "s777");
+        assert_eq!(exact.hits[0].score, body_ann.hits[0].score);
+        let exact_ids: HashSet<_> = exact.hits.iter().map(|hit| hit.id.as_str()).collect();
+        let recalled = body_ann
+            .hits
+            .iter()
+            .filter(|hit| exact_ids.contains(hit.id.as_str()))
+            .count();
+        assert!(
+            recalled >= 4,
+            "fixed-oracle recall@5 fell below 0.8: ANN={:?}, exact={:?}",
+            body_ann
+                .hits
+                .iter()
+                .map(|hit| (&hit.id, hit.score))
+                .collect::<Vec<_>>(),
+            exact
+                .hits
+                .iter()
+                .map(|hit| (&hit.id, hit.score))
+                .collect::<Vec<_>>()
+        );
+        // Only the unique exact match has a stable order. Remaining documents
+        // tie under this deliberately repetitive corpus; graph-return order is
+        // the documented ANN tie contract, while total remains exactly k.
+        let cached = idx.search(&semantic_request).await.unwrap();
+        assert_eq!(
+            cached
+                .hits
+                .iter()
+                .map(|hit| (&hit.id, hit.score))
+                .collect::<Vec<_>>(),
+            body_ann
+                .hits
+                .iter()
+                .map(|hit| (&hit.id, hit.score))
+                .collect::<Vec<_>>(),
+            "cached semantic ANN must preserve IDs and exact-rescored scores"
+        );
+
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        let expired = idx
+            .search(&SearchRequest {
+                query: QueryNode::SemanticSearch {
+                    field: "body".into(),
+                    text: "a distinct already-expired semantic request".into(),
+                    k: 5,
+                    filter: None,
+                    boost: None,
+                },
+                timeout_ms: Some(0),
+                size: 5,
+                ..SearchRequest::default()
+            })
+            .await
+            .unwrap();
+        assert!(expired.timed_out);
+        assert_eq!(expired.total.relation, TotalHitsRelation::Gte);
+        assert!(
+            expired.hits.is_empty(),
+            "an expired request must not publish ANN candidates"
+        );
+        assert!(
+            idx.query_cache.iter().all(|entry| !entry.value().timed_out),
+            "timed-out semantic results must never enter the query cache"
+        );
+
+        let mut filtered_request = semantic_request.clone();
+        filtered_request.query = QueryNode::SemanticSearch {
+            field: "body".into(),
+            text: "quarterly revenue item 777".into(),
+            k: 5,
+            filter: Some(Box::new(QueryNode::MatchAll)),
+            boost: None,
+        };
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        let filtered = idx.search(&filtered_request).await.unwrap();
+        assert_eq!(filtered.hits.len(), 5);
+        assert!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed) > 0,
+            "filtered semantic queries must keep the exact scan"
+        );
+
+        let mut aggregate_request = semantic_request.clone();
+        aggregate_request.aggs = Some(serde_json::json!({
+            "ids": { "terms": { "field": "summary" } }
+        }));
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        let aggregated = idx.search(&aggregate_request).await.unwrap();
+        assert!(aggregated.aggs.is_some());
+        assert!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed) > 0,
+            "semantic aggregations must keep the exact scan"
+        );
+
+        // One graph has one pinned field. A second semantic companion must
+        // never be mixed into that graph; its query safely stays exact.
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        let summary_exact = idx
+            .search(&SearchRequest {
+                query: QueryNode::SemanticSearch {
+                    field: "summary".into(),
+                    text: "cash flow".into(),
+                    k: 5,
+                    filter: None,
+                    boost: None,
+                },
+                size: 5,
+                ..SearchRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(summary_exact.hits.len(), 5);
+        assert!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed) > 0,
+            "the non-pinned semantic companion must use the safe exact fallback"
+        );
+
+        idx.index_document(
+            Some("s777".into()),
+            serde_json::json!({
+                "body": "unrelated replacement",
+                "summary": "cash flow note 777"
+            }),
+        )
+        .await
+        .unwrap();
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        let after_update = idx.search(&semantic_request).await.unwrap();
+        assert_ne!(
+            after_update.hits[0].id, "s777",
+            "a write must invalidate the cached semantic result"
+        );
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            0,
+            "cache invalidation must recompute through ANN, not force brute"
+        );
+
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(engine_instance);
+        let restarted_engine = engine(&dir);
+        let restarted = restarted_engine.get_index("semantic-ann").unwrap();
+        let stats = restarted.hnsw_stats().await;
+        assert_eq!(stats["field"], "body_vector", "{stats}");
+        assert_eq!(stats["covered"], true, "{stats}");
+        restarted
+            .test_scan_checkpoint_count
+            .store(0, Ordering::Relaxed);
+        let restarted_result = restarted.search(&semantic_request).await.unwrap();
+        assert_eq!(restarted_result.hits[0].id, after_update.hits[0].id);
+        assert_eq!(restarted_result.hits[0].score, after_update.hits[0].score);
+        assert_eq!(
+            restarted.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            0,
+            "the restored graph must serve semantic ANN after restart"
+        );
+    }
+
+    #[tokio::test]
     async fn timed_out_leader_is_not_cached() {
         let dir = TempDir::new().unwrap();
         let engine = engine(&dir);
@@ -6545,9 +6794,11 @@ impl Index {
     /// paths. Accepted divergences from brute (commit body documents them):
     /// tie order is graph-return order, and `total.value` may be < k when
     /// the graph returns fewer candidates (ES ANN behavior class; no pad).
+    #[allow(clippy::too_many_arguments)] // query contract plus cooperative deadline
     async fn run_knn_hnsw(
         &self,
         request: &SearchRequest,
+        deadline: std::time::Instant,
         field: &str,
         query_vec: &[f32],
         k: usize,
@@ -6555,6 +6806,9 @@ impl Index {
         similarity: &str,
     ) -> Option<SearchResult> {
         let started = std::time::Instant::now();
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         if similarity != "cosine" {
             return None;
         }
@@ -6623,6 +6877,9 @@ impl Index {
         };
         #[cfg(test)]
         self.publication_test_point("", PublicationTestPoint::AnnAfterGraphSearch);
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
 
         // node_id → doc_id under a short id_rev read. Nodes without a rev
         // entry were deleted between search and mapping — skip them (brute
@@ -6646,10 +6903,15 @@ impl Index {
         let chunk_field = format!("{field}_chunks");
         let mut scored: Vec<(String, f32, Value, Option<u32>)> = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
-            let src = match self.get_document_uncounted(&doc_id).await {
-                Ok(Some(s)) => s,
-                _ => return None,
-            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let src =
+                match tokio::time::timeout(remaining, self.get_document_uncounted(&doc_id)).await {
+                    Ok(Ok(Some(source))) => source,
+                    _ => return None,
+                };
             // Multi-chunk semantic docs score by best passage in brute —
             // single-vector rescore would diverge, so hand the request back.
             if get_field_value(&src, &chunk_field).is_some() {
@@ -6667,6 +6929,9 @@ impl Index {
             }
             let score = compute_vector_similarity(similarity, query_vec, &doc_vec);
             scored.push((doc_id, score, src, None));
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
         }
 
         // A writer may start after the pre-check and finish while ANN searches
@@ -7312,8 +7577,41 @@ impl Index {
             tracing::info!(index=%self.name, elapsed_ms=semantic_started.elapsed().as_millis() as u64, "semantic_phase=embed_complete");
         }
 
-        let result = self
-            .run_knn_brute_force_with_deadline(
+        // Match the top-level kNN serving policy: plain, unfiltered semantic
+        // queries may use the fully covered HNSW graph and are exact-rescored
+        // against stored vectors. Filters and aggregations remain exact scans
+        // so approximation cannot change filter/analytics membership.
+        let result = if filter.is_none() && request.aggs.is_none() {
+            match self
+                .run_knn_hnsw(
+                    request,
+                    deadline,
+                    &knn_field,
+                    &query_vec,
+                    k,
+                    None,
+                    &similarity,
+                )
+                .await
+            {
+                Some(result) => Ok(result),
+                None => {
+                    self.run_knn_brute_force_with_deadline(
+                        request,
+                        deadline,
+                        &knn_field,
+                        &query_vec,
+                        k,
+                        filter,
+                        &similarity,
+                        None,
+                        None,
+                    )
+                    .await
+                }
+            }
+        } else {
+            self.run_knn_brute_force_with_deadline(
                 request,
                 deadline,
                 &knn_field,
@@ -7324,7 +7622,8 @@ impl Index {
                 None,
                 None,
             )
-            .await;
+            .await
+        };
         if trace_phases {
             tracing::info!(index=%self.name, elapsed_ms=semantic_started.elapsed().as_millis() as u64, ok=result.is_ok(), "semantic_phase=request_complete");
         }
@@ -9335,7 +9634,15 @@ impl Index {
                 && request.aggs.is_none()
             {
                 if let Some(result) = self
-                    .run_knn_hnsw(request, &field, &query_vec, k, num_candidates, &similarity)
+                    .run_knn_hnsw(
+                        request,
+                        search_deadline,
+                        &field,
+                        &query_vec,
+                        k,
+                        num_candidates,
+                        &similarity,
+                    )
                     .await
                 {
                     return Ok(result);
@@ -13078,29 +13385,47 @@ impl Index {
 
     /// Add a field to the schema.
     pub async fn add_field(&self, field: FieldConfig) -> Result<()> {
-        let activates_embedder = schema_needs_embedder(std::slice::from_ref(&field))
-            && !schema_needs_embedder(&self.schema.read().await.schema.fields);
+        self.add_fields(vec![field]).await
+    }
+
+    /// Atomically add several fields to the schema.
+    ///
+    /// Mapping updates can introduce a semantic source and its derived vector
+    /// companion together. Validate and persist the complete candidate schema
+    /// before publishing it so a later-field failure cannot leave half of that
+    /// contract visible.
+    pub async fn add_fields(&self, fields: Vec<FieldConfig>) -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let mut schema = self.schema.write().await;
+        let current = schema.clone();
+        let activates_embedder =
+            schema_needs_embedder(&fields) && !schema_needs_embedder(&current.schema.fields);
         let activated = if activates_embedder {
             Some(make_embedder(&self.embedding_config)?)
         } else {
             None
         };
-        if schema_has_embeddings(std::slice::from_ref(&field)) {
+        if schema_has_embeddings(&fields) {
             if self
                 .embedding_config
                 .mode
                 .eq_ignore_ascii_case("onnx-experimental")
             {
-                validate_onnx_dimensions(std::slice::from_ref(&field))?;
+                validate_onnx_dimensions(&fields)?;
             }
             ensure_embedding_identity_for_new_field(&self.data_dir, &self.embedding_config)?;
         }
+        let mut candidate = current;
+        for field in fields {
+            candidate.add_field(field)?;
+        }
+        self.save_schema(&candidate).await?;
         if let Some(embedder) = activated {
             *self.embedder.write().await = embedder;
         }
-        let mut schema = self.schema.write().await;
-        schema.add_field(field)?;
-        self.save_schema(&schema).await?;
+        *schema = candidate;
         Ok(())
     }
 
