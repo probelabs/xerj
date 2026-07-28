@@ -25,6 +25,17 @@ use crate::error::Result;
 use crate::planner::ExecutionPlan;
 use crate::sort::{compare_sort_keys, SortField};
 
+pub const PASSAGE_METADATA_PREFIX: &str = "__xerj_passage_meta__";
+pub const PASSAGE_RESPONSE_FIELD: &str = "_passage";
+
+/// Remove engine-owned passage-offset companions before `_source` reaches a
+/// client. The metadata remains in stored source for restart/merge correctness.
+pub fn strip_internal_passage_metadata(source: &mut serde_json::Value) {
+    if let Some(object) = source.as_object_mut() {
+        object.retain(|name, _| !name.starts_with(PASSAGE_METADATA_PREFIX));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Result types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,6 +62,30 @@ pub struct Hit {
     /// Names of named queries that matched this document (only present when `_name` was used).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub matched_queries: Vec<String>,
+    /// Winning semantic passage, populated only when the caller explicitly
+    /// requests the `_passage` pseudo-field.
+    ///
+    /// This is derived from compact ingest-time byte offsets. It is not
+    /// persisted as a second text copy and is absent from ordinary responses.
+    #[serde(rename = "_passage", skip_serializing_if = "Option::is_none", default)]
+    pub passage: Option<PassageMatch>,
+}
+
+/// Provenance for the passage that supplied a semantic hit's max score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PassageMatch {
+    /// Original `semantic_text` field, rather than its derived vector field.
+    pub field: String,
+    /// Zero-based ordinal in the deterministic ingest-time chunk sequence.
+    pub ordinal: u32,
+    /// UTF-8 byte offsets into `field`.
+    pub start_offset: u64,
+    pub end_offset: u64,
+    /// Winning text slice materialized only for the returned page.
+    pub text: String,
+    /// Autoindex PDF page identity when the source carries a numeric `page`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u64>,
 }
 
 /// Total hits information (mirrors ES semantics exactly).
@@ -351,6 +386,7 @@ mod tests {
             explain: None,
             highlight: None,
             matched_queries: vec![],
+            passage: None,
         }
     }
 

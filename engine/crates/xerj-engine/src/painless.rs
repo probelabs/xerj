@@ -1080,7 +1080,9 @@ fn eval_access_chain(
                 (Some("params"), Step::Index(index)) => {
                     let key = access_key(eval_expr(index, ctx, env)?)?;
                     value = Some(if key == "_source" {
-                        PainlessValue::from_json(ctx.doc)
+                        let mut source = ctx.doc.clone();
+                        xerj_query::executor::strip_internal_passage_metadata(&mut source);
+                        PainlessValue::from_json(&source)
                     } else {
                         PainlessValue::from_json(
                             &ctx.params.get(&key).cloned().unwrap_or(Value::Null),
@@ -1393,6 +1395,9 @@ fn date_component(ms: i64, member: &str) -> Result<PainlessValue, String> {
 }
 
 fn get_doc_value(doc: &Value, field: &str) -> Value {
+    if field.starts_with(xerj_query::executor::PASSAGE_METADATA_PREFIX) {
+        return Value::Null;
+    }
     let parts: Vec<&str> = field.split('.').collect();
     let mut cur = doc.clone();
     for part in &parts {
@@ -1613,6 +1618,28 @@ mod tests {
         )
         .unwrap();
         assert!((v.as_f64().unwrap() - 1500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn passage_metadata_is_hidden_from_doc_and_source_scripts() {
+        let doc = json!({
+            "content": "visible",
+            "__xerj_passage_meta__embedding": {"field": "content", "chunks": [[0, 7]]}
+        });
+        let params = json!({});
+        let size = eval_painless(
+            "doc['__xerj_passage_meta__embedding'].size()",
+            &ctx(&doc, &params, 0.0),
+        )
+        .unwrap();
+        assert_eq!(size.as_f64(), Some(0.0));
+        let rendered =
+            eval_painless("params['_source'].toString()", &ctx(&doc, &params, 0.0)).unwrap();
+        let PainlessValue::String(rendered) = rendered else {
+            panic!("expected rendered source string");
+        };
+        assert!(rendered.contains("content=visible"));
+        assert!(!rendered.contains("__xerj_passage_meta__"));
     }
 
     #[test]

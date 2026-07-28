@@ -67,6 +67,72 @@ fn default_size() -> usize {
     10
 }
 
+fn native_fields_supported(fields: Option<&[String]>) -> bool {
+    fields.is_none_or(|fields| {
+        fields
+            .iter()
+            .all(|field| field == xerj_query::executor::PASSAGE_RESPONSE_FIELD)
+    })
+}
+
+fn native_hit_value(hit: &xerj_query::executor::Hit) -> Value {
+    let mut value = serde_json::json!({
+        "_id": hit.id,
+        "_score": hit.score,
+        "_source": hit.source,
+    });
+    if let Some(passage) = &hit.passage {
+        value["_passage"] = serde_json::to_value(passage).unwrap_or(Value::Null);
+    }
+    value
+}
+
+#[cfg(test)]
+mod passage_wire_tests {
+    use super::*;
+    use xerj_query::executor::{Hit, PassageMatch};
+
+    fn hit(passage: Option<PassageMatch>) -> Hit {
+        Hit {
+            id: "report-page".to_string(),
+            score: 0.91,
+            source: serde_json::json!({"company": "ACME"}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage,
+        }
+    }
+
+    #[test]
+    fn native_fields_accept_only_passage_pseudo_field() {
+        assert!(native_fields_supported(None));
+        assert!(native_fields_supported(Some(&[])));
+        assert!(native_fields_supported(Some(&["_passage".to_string()])));
+        assert!(!native_fields_supported(Some(&["company".to_string()])));
+    }
+
+    #[test]
+    fn native_passage_wire_is_opt_in_and_structured() {
+        let ordinary = native_hit_value(&hit(None));
+        assert!(ordinary.get("_passage").is_none());
+
+        let passage = PassageMatch {
+            field: "content".to_string(),
+            ordinal: 2,
+            start_offset: 320,
+            end_offset: 704,
+            text: "quarterly evidence".to_string(),
+            page: Some(17),
+        };
+        let enriched = native_hit_value(&hit(Some(passage)));
+        assert_eq!(enriched["_passage"]["ordinal"], 2);
+        assert_eq!(enriched["_passage"]["page"], 17);
+        assert_eq!(enriched["_source"], serde_json::json!({"company": "ACME"}));
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct EvolveSchemaRequest {
     pub fields: Vec<FieldConfig>,
@@ -424,8 +490,22 @@ pub async fn search(
     // recorded once at completion via `record_query`.
     let _search_guard = state.metrics.active_search_guard();
 
+    if !native_fields_supported(req.fields.as_deref()) {
+        let error = xerj_common::XerjError::invalid_query(
+            "native search only supports the `_passage` pseudo-field; remove `fields` and read \
+             values from `_source`, request only `_passage`, or use the \
+             Elasticsearch-compatible `_search` endpoint",
+        );
+        return native_error(
+            error,
+            Some(&request_id),
+            started.elapsed().as_millis() as u64,
+        )
+        .into_response();
+    }
+
     // Build a query body for the parser.
-    let query_body = if let Some(q_str) = &req.q {
+    let mut query_body = if let Some(q_str) = &req.q {
         serde_json::json!({
             "query": {
                 "multi_match": {
@@ -449,6 +529,9 @@ pub async fn search(
             "size": req.size
         })
     };
+    if let Some(fields) = &req.fields {
+        query_body["fields"] = serde_json::json!(fields);
+    }
 
     let search_req = match parse_request(&query_body) {
         Ok(r) => r,
@@ -490,17 +573,7 @@ pub async fn search(
                     .unwrap_or_default(),
             );
 
-            let hits: Vec<Value> = result
-                .hits
-                .iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "_id": h.id,
-                        "_score": h.score,
-                        "_source": h.source,
-                    })
-                })
-                .collect();
+            let hits: Vec<Value> = result.hits.iter().map(native_hit_value).collect();
 
             let resp = NativeResponse::new(
                 serde_json::json!({

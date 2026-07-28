@@ -54,6 +54,24 @@ curl -sX POST "$XERJ_URL/docs/_search" -H 'content-type: application/json' -d '{
 }'
 ```
 
+Ask for the winning passage through the standard `fields` mechanism:
+
+```bash
+curl -sX POST "$XERJ_URL/docs/_search" -H 'content-type: application/json' -d '{
+  "fields": ["_passage"],
+  "_source": {"includes": ["file", "page"]},
+  "query": { "semantic": { "field": "body",
+                           "query": "how does chlorophyll drive photosynthesis",
+                           "k": 10 } }
+}'
+```
+
+Each hit then carries `fields._passage[0]` with the original semantic field,
+zero-based passage ordinal, UTF-8 byte offsets, winning text, and numeric PDF
+`page` when the source has one. `_passage` is opt-in: ordinary responses are
+unchanged. XERJ stores only compact offsets alongside the derived vectors; it
+does not store a second copy of the passage text.
+
 The document is retrieved on the strength of the one passage that matches —
 even if the rest of it is about something else entirely.
 

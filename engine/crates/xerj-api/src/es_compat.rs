@@ -2087,7 +2087,8 @@ pub async fn get_doc(
     };
 
     match idx.get_document(&id).await {
-        Ok(Some(source)) => {
+        Ok(Some(mut source)) => {
+            xerj_query::executor::strip_internal_passage_metadata(&mut source);
             // Apply _source filtering based on query params.
             let filtered = apply_get_doc_source_filter(source, &params);
             // Real per-doc metadata (was hardcoded `_version: 1` /
@@ -8620,6 +8621,9 @@ pub async fn search(
                     obj.remove("__xy_collapse_group__");
                     obj.remove("__xy_collapse_spec__");
                     obj.remove("_matched_queries");
+                    obj.retain(|name, _| {
+                        !name.starts_with(xerj_query::executor::PASSAGE_METADATA_PREFIX)
+                    });
                 }
                 // Non-synthetic mode: strip the internal copy-to
                 // tracking marker; keep the copied values in the source
@@ -10169,6 +10173,17 @@ pub async fn search(
                                 other => Value::Array(vec![other]),
                             };
                             fmap.insert(fname.clone(), arr);
+                        }
+                    }
+                }
+                // XERJ's opt-in semantic provenance pseudo-field. Keeping it
+                // under the standard ES `fields` envelope preserves the
+                // default hit wire shape and lets ES clients request it
+                // without a separate response dialect.
+                if field_specs.iter().any(|(name, _, _)| name == "_passage") {
+                    if let Some(passage) = &h.passage {
+                        if let Ok(value) = serde_json::to_value(passage) {
+                            fmap.insert("_passage".to_string(), Value::Array(vec![value]));
                         }
                     }
                 }
