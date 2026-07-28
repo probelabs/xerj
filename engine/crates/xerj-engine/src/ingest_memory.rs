@@ -120,10 +120,11 @@ pub enum Category {
     CacheIdPositions,
     CacheRowSequences,
     CacheDecodedStored,
+    PrepublicationRegistry,
 }
 
 impl Category {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::HttpBody,
         Self::HttpRewriteBuffer,
         Self::RawSource,
@@ -145,6 +146,7 @@ impl Category {
         Self::CacheIdPositions,
         Self::CacheRowSequences,
         Self::CacheDecodedStored,
+        Self::PrepublicationRegistry,
     ];
 
     const COUNT: usize = Self::ALL.len();

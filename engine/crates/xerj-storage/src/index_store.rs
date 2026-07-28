@@ -25,7 +25,7 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -153,6 +153,16 @@ pub struct MemEntry {
 /// expensive segment + side-car I/O — unblocking ingest during the flush.
 pub struct DrainedMemtable {
     pub entries: Vec<MemEntry>,
+}
+
+struct PublicationEpochGuard<'a> {
+    epoch: &'a AtomicU64,
+}
+
+impl Drop for PublicationEpochGuard<'_> {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
 }
 
 // ── Fsck report types ─────────────────────────────────────────────────────────
@@ -433,6 +443,11 @@ pub struct IndexStore {
     num_shards: usize,
     /// Current active segment snapshot.
     snapshot: ArcSwap<IndexSnapshot>,
+    /// Even when readers may capture `(snapshot, version_map)`; odd while a
+    /// publisher is repointing exact versions and installing that segment.
+    publication_epoch: AtomicU64,
+    publication_writer: Mutex<()>,
+    publication_latch: RwLock<()>,
     /// Sharded WAL writers — each shard has its own WAL file and mutex.
     /// Batches route to a shard by `xxh3(doc_id) & (num_shards - 1)`.
     /// When num_wal_shards=1, this is equivalent to the old single-WAL path.
@@ -606,6 +621,9 @@ impl IndexStore {
             config,
             num_shards,
             snapshot: ArcSwap::from_pointee(snapshot),
+            publication_epoch: AtomicU64::new(0),
+            publication_writer: Mutex::new(()),
+            publication_latch: RwLock::new(()),
             wal_shards,
             version_map: Arc::clone(&version_map),
             seq_counter,
@@ -794,6 +812,10 @@ impl IndexStore {
             let seg_filename = format!("{prefix}.seg");
             let seg_path = segments_dir.join(&seg_filename);
             let ids_path = segments_dir.join(format!("{prefix}.ids"));
+            let ready_path = segments_dir.join(format!("{prefix}.ready"));
+            if !std::fs::read(&ready_path).is_ok_and(|bytes| bytes == b"XERJ-SEGMENT-READY-V1\n") {
+                continue;
+            }
 
             // RC4 W2 #14 — TOMBSTONE-ONLY orphan (doc_count 0, ZTB2
             // section, no `.ids` — written by `persist_pending_tombstones`
@@ -1026,6 +1048,41 @@ impl IndexStore {
         xerj_common::fsio::write_file_durable(&ids_path, &buf)
     }
 
+    /// Durably mark a segment as having completed every required sidecar and
+    /// publisher callback. Orphan recovery accepts only this marker; `.seg` or
+    /// `.ids` alone can describe an output that failed halfway through.
+    fn write_ready_marker(&self, segment_id: &str) -> std::io::Result<()> {
+        let path = self
+            .data_dir
+            .join("segments")
+            .join(format!("{segment_id}.ready"));
+        xerj_common::fsio::write_file_durable(&path, b"XERJ-SEGMENT-READY-V1\n")
+    }
+
+    /// Best-effort cleanup for an output that never reached authoritative
+    /// publication. Removes the primary file, every sidecar sharing the UUID
+    /// prefix, the hold-open reader, and the object-store local cache copy.
+    pub fn remove_unpublished_segment_files(&self, segment_id: &str) {
+        self.seg_reader_cache.remove(segment_id);
+        let segments_dir = self.data_dir.join("segments");
+        if let Ok(entries) = std::fs::read_dir(&segments_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(segment_id) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        if let StorageMode::ObjectStore { cache_dir, .. } = &self.config.storage_mode {
+            if let Ok(entries) = std::fs::read_dir(cache_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with(segment_id) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
+
     /// Unlink every on-disk file belonging to the given segment ids — the
     /// primary `.seg` plus all side-cars (`.sidx`, `.ids`, `.dv`,
     /// `.<field>.post` / `.fst` / `.meta` / `.norms`).
@@ -1110,6 +1167,7 @@ impl IndexStore {
         let segments_dir = self.data_dir.join("segments");
         for id in segment_ids {
             let _ = std::fs::remove_file(segments_dir.join(format!("{}.ids", id.as_str())));
+            let _ = std::fs::remove_file(segments_dir.join(format!("{}.ready", id.as_str())));
         }
         {
             let mut graveyard = self.retired_segments.lock().unwrap();
@@ -1417,7 +1475,41 @@ impl IndexStore {
     where
         F: FnOnce(&SegmentMeta) -> Result<()>,
     {
-        let entries = drained.entries;
+        self.finalize_borrowed_flush_with_publisher(&drained, post_finish)
+    }
+
+    /// Recoverable twin of [`Self::finalize_flush_with_publisher`].
+    ///
+    /// The caller retains ownership of `drained`, allowing it to retry the
+    /// identical immutable generation or return it to an active memtable when
+    /// segment construction or the prepublication callback fails.
+    pub fn finalize_borrowed_flush_with_publisher<F>(
+        &self,
+        drained: &DrainedMemtable,
+        post_finish: F,
+    ) -> Result<Option<SegmentMeta>>
+    where
+        F: FnOnce(&SegmentMeta) -> Result<()>,
+    {
+        self.finalize_borrowed_flush_with_publishers(drained, post_finish, |_| {})
+    }
+
+    /// Borrowed finalizer with a hook at the exact publication midpoint:
+    /// version-map entries have been repointed, but the snapshot has not yet
+    /// exposed the segment. Primarily useful for deterministic correctness
+    /// tests; normal callers should use
+    /// [`Self::finalize_borrowed_flush_with_publisher`].
+    pub fn finalize_borrowed_flush_with_publishers<F, G>(
+        &self,
+        drained: &DrainedMemtable,
+        post_finish: F,
+        before_snapshot: G,
+    ) -> Result<Option<SegmentMeta>>
+    where
+        F: FnOnce(&SegmentMeta) -> Result<()>,
+        G: FnOnce(&SegmentMeta),
+    {
+        let entries = &drained.entries;
         if entries.is_empty() {
             return Ok(None);
         }
@@ -1654,6 +1746,7 @@ impl IndexStore {
         // (e.g. FTS index) missing, returning wrong results.
         let t_pf = std::time::Instant::now();
         post_finish(&meta)?;
+        self.write_ready_marker(meta.id.as_str())?;
         let prof_pf_us = t_pf.elapsed().as_micros();
 
         // Update version map: point live docs at the new segment.
@@ -1669,8 +1762,18 @@ impl IndexStore {
         // this seq_no — same-generation duplicates and post-drain
         // updates/deletes are left untouched.
         let t_vm = std::time::Instant::now();
+        let _publication_latch = self
+            .publication_latch
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _publication_writer = self.publication_writer.lock().unwrap();
+        let prior_epoch = self.publication_epoch.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(prior_epoch & 1, 0, "publication writers must serialize");
+        let _publication_epoch = PublicationEpochGuard {
+            epoch: &self.publication_epoch,
+        };
         let segment_id_arc: std::sync::Arc<str> = std::sync::Arc::from(segment_id.as_str());
-        for entry in &entries {
+        for entry in entries {
             if entry.source.is_some() {
                 self.version_map.repoint(
                     &entry.doc_id,
@@ -1696,6 +1799,7 @@ impl IndexStore {
                 );
             }
         }
+        before_snapshot(&meta);
         if prof {
             eprintln!(
                 "XERJ_PROF finalize docs={} ser_us={} encode_us={} writer_finish_us={} post_finish_us={} vm_us={} total_so_far_us={}",
@@ -1845,6 +1949,30 @@ impl IndexStore {
         }
     }
 
+    /// Begin a stable publication capture. Odd epochs are transient and are
+    /// never returned; callers copy the version/snapshot/memtable evidence they
+    /// need and then validate it with [`Self::publication_capture_is_stable`].
+    pub fn publication_capture_epoch(&self) -> u64 {
+        loop {
+            let epoch = self.publication_epoch.load(Ordering::Acquire);
+            if epoch & 1 == 0 {
+                return epoch;
+            }
+            std::hint::spin_loop();
+            std::thread::yield_now();
+        }
+    }
+
+    pub fn publication_capture_is_stable(&self, epoch: u64) -> bool {
+        epoch & 1 == 0 && self.publication_epoch.load(Ordering::Acquire) == epoch
+    }
+
+    pub fn publication_capture(&self) -> RwLockReadGuard<'_, ()> {
+        self.publication_latch
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Return the current WAL sequence number (the next value that
     /// `wal_append_batch` would assign).  Used by `Index::flush` to
     /// write a global checkpoint covering ALL shards after a
@@ -1950,6 +2078,7 @@ impl IndexStore {
         )?;
         // doc_count 0: tombstone-only.  finish() fsyncs file + dir.
         let meta = writer.finish(0, min_seq, max_seq)?;
+        self.write_ready_marker(meta.id.as_str())?;
 
         // Segment is durable — repoint the tombstones onto it (guarded:
         // a doc re-indexed since collection keeps its newer live entry).
@@ -3899,6 +4028,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = open_test_store(dir.path());
         assert!(store.flush().unwrap().is_none());
+    }
+
+    #[test]
+    fn incomplete_sidecar_stage_has_no_ready_marker_and_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("incomplete", serde_json::json!({"body": "wal retained"}))
+            .unwrap();
+        let drained = store.take_memtable_for_flush().unwrap();
+        let result = store.finalize_borrowed_flush_with_publisher(&drained, |_| {
+            Err(std::io::Error::other("injected sidecar-stage failure").into())
+        });
+        assert!(result.is_err());
+        let segments_dir = dir.path().join("segments");
+        assert!(std::fs::read_dir(&segments_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".seg")));
+        assert!(!std::fs::read_dir(&segments_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".ready")));
+        drop(store);
+
+        let reopened = open_test_store(dir.path());
+        assert!(reopened.snapshot().segments.is_empty());
+        assert!(!std::fs::read_dir(&segments_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".seg")));
+        assert!(reopened.version_map.get("incomplete").is_some());
     }
 
     #[test]

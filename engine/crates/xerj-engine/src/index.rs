@@ -6278,25 +6278,11 @@ impl Index {
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                if let Some(ver) = self.store.version_map.get(&id) {
-                    // Skip tombstoned (deleted) docs.
-                    if ver.deleted {
-                        continue;
-                    }
-                    // Superseded stale copy (same predicate as the b8 T2
-                    // fix in the count path): an updated doc appears in
-                    // both its old and new segments, and first-seen dedup
-                    // over oldest-first segment order would resurrect the
-                    // PRE-update vector (live-verified 2026-07-12: update
-                    // + flush + kNN returned the old vector as if the
-                    // update never happened). Skip BEFORE `seen` so the
-                    // stale copy can't shadow the live one. Legacy docs
-                    // without `_seq_no` keep the first-seen dedup.
-                    if let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) {
-                        if doc_seq < ver.seq_no {
-                            continue;
-                        }
-                    }
+                let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if !self.owns_exact_segment_row(&id, doc_seq, &meta.id) {
+                    continue;
                 }
                 if !seen.insert(id.clone()) {
                     continue;
@@ -7302,18 +7288,11 @@ impl Index {
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                if let Some(ver) = self.store.version_map.get(&id) {
-                    if ver.deleted {
-                        continue;
-                    }
-                    // Superseded stale copy — same guard as the top-level
-                    // kNN collector (see run_knn_brute_force): never let an
-                    // old segment's pre-update copy shadow the live one.
-                    if let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) {
-                        if doc_seq < ver.seq_no {
-                            continue;
-                        }
-                    }
+                let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if !self.owns_exact_segment_row(&id, doc_seq, &meta.id) {
+                    continue;
                 }
                 if !seen.insert(id.clone()) {
                     continue;
@@ -7736,6 +7715,14 @@ impl Index {
         })
     }
 
+    fn owns_exact_segment_row(&self, id: &str, seq_no: u64, segment_id: &str) -> bool {
+        self.store.version_map.get(id).is_some_and(|version| {
+            !version.deleted
+                && version.seq_no == seq_no
+                && version.segment_id.as_ref() == segment_id
+        })
+    }
+
     /// Metrics-free internal fetch: `get_document` minus the get.total /
     /// exists / missing counters. Used by the HNSW kNN hydration path —
     /// counting k internal fetches per kNN query would inflate
@@ -7772,6 +7759,7 @@ impl Index {
         // Pin the logical generation before touching a physical source. The
         // source lookup below rechecks this tuple before returning so a
         // concurrent update/delete cannot expose an obsolete memtable row.
+        let publication_capture = self.store.publication_capture();
         let Some(initial_version) = self.store.version_map.get(id) else {
             // Document not in version map at all.
             return Ok(None);
@@ -7796,6 +7784,7 @@ impl Index {
 
         // Search segments for the stored document.
         let snap = self.store.snapshot();
+        drop(publication_capture);
 
         // ── Primary-key fast path (B2, 2026-07-10 scorecard) ─────────────
         // Resolve the id to its stored position via the same per-segment
@@ -9345,6 +9334,7 @@ impl Index {
         // writes.  The remaining race (drained before snap, installed after)
         // is a transient undercount during an in-flight flush — the
         // pre-existing, self-healing behaviour.
+        let publication_capture = self.store.publication_capture();
         let snap = self.store.snapshot();
         // Exact memtable match total captured by the fused DV walk below and
         // threaded into `try_shortcut_count`, whose bool-conjunction arm
@@ -9363,6 +9353,13 @@ impl Index {
             let mem = &*self.memtable;
             if mem_doc_count == 0 {
                 MemSnapshot::Empty
+            } else if mem.has_prepublication_rows() || self.store.version_map.ghost_events() > 0 {
+                // Active-shard FTS/doc-values/sort structures cannot prove
+                // completeness while a drained generation is pending, and
+                // id-only shortcuts cannot distinguish a stale physical row
+                // after an overwrite/delete. Use the sequence-bearing source
+                // snapshot for every query shape in either state.
+                MemSnapshot::DocsForScan(self.live_memtable_docs_arc())
             } else if matches!(query, QueryNode::MatchAll) && size == 0 && request.aggs.is_none() {
                 // MatchAll + size=0 + NO aggs: pure count query.
                 // Everything is served by try_shortcut_count via the
@@ -9635,7 +9632,12 @@ impl Index {
             }
             // Lock dropped here
         };
+        drop(publication_capture);
         phase_marks.push(("mem_snapshot", phase_t0.elapsed().as_millis() as u64));
+        let skipped_match_all_mem_count = matches!(&mem_snapshot, MemSnapshot::Empty)
+            && matches!(query, QueryNode::MatchAll)
+            && size == 0
+            && request.aggs.is_none();
 
         let dbg_mem_arm: &'static str = match &mem_snapshot {
             MemSnapshot::Empty => "empty",
@@ -9837,7 +9839,7 @@ impl Index {
         // memtable doc via `admit_hit!(count ...)` — if we add
         // `mem_count` again we double-count (visible as the 40 vs 20
         // failure on `test_terms_agg_bucket_counts` under M5.1).
-        if is_match_all && size == 0 && request.aggs.is_none() {
+        if skipped_match_all_mem_count {
             let mem_count = mem_doc_count as u64;
             total_count = total_count.saturating_add(mem_count);
         }
@@ -10408,6 +10410,7 @@ impl Index {
                                             let mut discard = 0u64;
                                             self.hydrate_sorted_candidates(
                                                 &slices,
+                                                seg_id.as_str(),
                                                 &cand,
                                                 query,
                                                 false,
@@ -10871,6 +10874,7 @@ impl Index {
                                 let t_scan = std::time::Instant::now();
                                 self.hydrate_sorted_candidates(
                                     &slices,
+                                    seg_id.as_str(),
                                     sort_cand.as_ref().expect("gated on is_some"),
                                     query,
                                     is_match_all,
@@ -10901,6 +10905,7 @@ impl Index {
                         let t_scan = std::time::Instant::now();
                         self.scan_stored_section_into(
                             &cached_bytes,
+                            seg_id.as_str(),
                             query,
                             is_match_all,
                             count_only,
@@ -10952,6 +10957,7 @@ impl Index {
                             Some(pf) if sort_topk.is_none() => {
                                 self.hydrate_prefiltered_unsorted(
                                     &warm_slices,
+                                    seg_id.as_str(),
                                     pf,
                                     query,
                                     is_match_all,
@@ -10967,6 +10973,7 @@ impl Index {
                             _ => {
                                 self.scan_stored_section_into(
                                     &warm_slices.bytes,
+                                    seg_id.as_str(),
                                     query,
                                     is_match_all,
                                     count_only,
@@ -11050,6 +11057,7 @@ impl Index {
                                     && !self.stored_slices_cache.contains_key(seg_id.as_str());
                                 self.scan_stored_section_into(
                                     &stored_bytes,
+                                    seg_id.as_str(),
                                     query,
                                     is_match_all,
                                     count_only,
@@ -11737,19 +11745,12 @@ impl Index {
                     }
                 };
                 for d in arr.iter() {
-                    // Skip tombstoned docs.
                     let id_ref = d.get("_id").and_then(Value::as_str).unwrap_or("");
-                    if let Some(ver) = self.store.version_map.get(id_ref) {
-                        if ver.deleted {
-                            continue;
-                        }
-                        // Superseded stale copy (b8 DEFECT T2) —
-                        // merge.rs stale-copy predicate.
-                        if let Some(doc_seq) = d.get("_seq_no").and_then(Value::as_u64) {
-                            if doc_seq < ver.seq_no {
-                                continue;
-                            }
-                        }
+                    let Some(doc_seq) = d.get("_seq_no").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    if !self.owns_exact_segment_row(id_ref, doc_seq, &seg.id) {
+                        continue;
                     }
                     let id_owned = id_ref.to_string();
                     let mut src = d.get("_source").cloned().unwrap_or_else(|| d.clone());
@@ -16917,6 +16918,7 @@ impl Index {
     fn hydrate_sorted_candidates(
         &self,
         slices: &StoredSlices,
+        segment_id: &str,
         candidates: &SortCandidates,
         // Retained for signature parity with the sibling scan loops; the
         // score now comes from `scorer` (which closes over the query).
@@ -16952,16 +16954,11 @@ impl Index {
                 Err(_) => continue,
             };
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
-            if let Some(ver) = self.store.version_map.get(id_ref) {
-                if ver.deleted {
-                    continue;
-                }
-                // Superseded stale copy (b8 DEFECT T2) — merge.rs predicate.
-                if let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) {
-                    if doc_seq < ver.seq_no {
-                        continue;
-                    }
-                }
+            let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
+                continue;
+            };
+            if !self.owns_exact_segment_row(id_ref, doc_seq, segment_id) {
+                continue;
             }
             *total_count += 1;
             if seen_ids.contains(id_ref) {
@@ -17022,6 +17019,7 @@ impl Index {
     fn hydrate_prefiltered_unsorted(
         &self,
         slices: &StoredSlices,
+        segment_id: &str,
         pre_filter: &PrefilterSet,
         query: &QueryNode,
         is_match_all: bool,
@@ -17061,16 +17059,11 @@ impl Index {
                 Err(_) => continue,
             };
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
-            if let Some(ver) = self.store.version_map.get(id_ref) {
-                if ver.deleted {
-                    continue;
-                }
-                // Superseded stale copy (b8 DEFECT T2) — merge.rs predicate.
-                if let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) {
-                    if doc_seq < ver.seq_no {
-                        continue;
-                    }
-                }
+            let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
+                continue;
+            };
+            if !self.owns_exact_segment_row(id_ref, doc_seq, segment_id) {
+                continue;
             }
             // Re-test the full query — the pre-filter is only a superset.
             let matched = if is_match_all {
@@ -17363,6 +17356,7 @@ impl Index {
     fn scan_stored_section_into(
         &self,
         stored_bytes: &[u8],
+        segment_id: &str,
         query: &QueryNode,
         is_match_all: bool,
         count_only: bool,
@@ -17531,20 +17525,11 @@ impl Index {
             };
 
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
-            if let Some(ver) = self.store.version_map.get(id_ref) {
-                if ver.deleted {
-                    continue;
-                }
-                // Superseded stale copy (b8 DEFECT T2): the live version
-                // per the version map has a strictly newer seq than this
-                // stored envelope's `_seq_no` (same predicate the merge
-                // purge uses, merge.rs stale-copy skip).  Raw-source docs
-                // without `_seq_no` keep the pre-fix behavior.
-                if let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) {
-                    if doc_seq < ver.seq_no {
-                        continue;
-                    }
-                }
+            let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) else {
+                continue;
+            };
+            if !self.owns_exact_segment_row(id_ref, doc_seq, segment_id) {
+                continue;
             }
 
             let matched = if is_match_all {
@@ -17714,6 +17699,7 @@ impl Drop for FlushDurationTimer {
 struct FlushPublisherTestHook {
     callback: Arc<dyn Fn() -> bool + Send + Sync>,
     after_warm: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    after_repoint: Option<Arc<dyn Fn() + Send + Sync>>,
     ledger: &'static crate::ingest_memory::Ledger,
     target_memtable: usize,
 }
@@ -17951,7 +17937,15 @@ async fn do_flush_shard(
     let failed_warm_caches = warm_caches.clone();
     let warmed_segment_id = Arc::new(parking_lot::Mutex::new(None::<String>));
     let callback_warmed_segment_id = Arc::clone(&warmed_segment_id);
+    #[cfg(test)]
+    let after_repoint_callback = test_hook
+        .as_ref()
+        .filter(|hook| hook.target_memtable == test_target)
+        .and_then(|hook| hook.after_repoint.as_ref().map(Arc::clone));
+    #[cfg(not(test))]
+    let after_repoint_callback: Option<Arc<dyn Fn() + Send + Sync>> = None;
     let build_fts = move |meta: &xerj_storage::segment::SegmentMeta| -> xerj_storage::Result<()> {
+        *callback_warmed_segment_id.lock() = Some(meta.id.clone());
         #[cfg(test)]
         let test_callback = test_hook
             .as_ref()
@@ -18024,7 +18018,6 @@ async fn do_flush_shard(
             // warm left a ~250 ms visible-but-cold window per flush storm;
             // 64 racing queries each decompressed all 16 fresh segments
             // inside it — the dec≈900 ms stall episodes.)
-            *callback_warmed_segment_id.lock() = Some(meta.id.clone());
             warm_segment_at_publish(
                 &store_for_warm,
                 &segments_dir_for_dv,
@@ -18072,10 +18065,97 @@ async fn do_flush_shard(
         let _drained_visibility = drained_visibility;
         // This lease lives in the blocking worker, not the async waiter:
         // aborting an async task cannot cancel `spawn_blocking`.
+        let retry_caches = failed_warm_caches.clone();
         let lease =
             PrePublicationLease::tracked(failed_warm_caches, Arc::clone(&warmed_segment_id));
-        let result = crate::background_pool()
-            .install(|| store.finalize_flush_with_publisher(storage_drained, build_fts));
+        let mut attempt = 0_u8;
+        let result = loop {
+            let finalized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::background_pool().install(|| {
+                    store.finalize_borrowed_flush_with_publishers(
+                        &storage_drained,
+                        |meta| build_fts(meta),
+                        |_| {
+                            if let Some(callback) = &after_repoint_callback {
+                                callback();
+                            }
+                        },
+                    )
+                })
+            }));
+            match finalized {
+                Ok(Ok(meta)) => break Ok(meta),
+                Ok(Err(error)) if attempt == 0 => {
+                    if let Some(segment_id) = warmed_segment_id.lock().take() {
+                        retry_caches.remove_failed_output(&segment_id);
+                        store.remove_unpublished_segment_files(&segment_id);
+                    }
+                    tracing::warn!(error = %error, "flush finalization failed; retrying retained drained generation once");
+                }
+                Err(_) if attempt == 0 => {
+                    if let Some(segment_id) = warmed_segment_id.lock().take() {
+                        retry_caches.remove_failed_output(&segment_id);
+                        store.remove_unpublished_segment_files(&segment_id);
+                    }
+                    tracing::warn!(
+                        "flush finalization panicked; retrying retained drained generation once"
+                    );
+                }
+                Ok(Err(error)) => break Err(error),
+                Err(_) => {
+                    break Err(std::io::Error::other(
+                        "flush finalization panicked on both retained-payload attempts",
+                    )
+                    .into());
+                }
+            }
+            attempt += 1;
+        };
+        if result.is_err() {
+            if let Some(segment_id) = warmed_segment_id.lock().take() {
+                retry_caches.remove_failed_output(&segment_id);
+                store.remove_unpublished_segment_files(&segment_id);
+            }
+            // Both bounded attempts failed. Hand the exact generation back to
+            // the active memtable before releasing its pending-visibility
+            // lease. Version-map sequence ownership decides which rows remain
+            // live; a concurrent newer update/delete is never requeued.
+            for entry in &storage_drained.entries {
+                let Some(version) = store.version_map.get(&entry.doc_id) else {
+                    continue;
+                };
+                if version.deleted
+                    || version.seq_no != entry.seq_no
+                    || version.segment_id.as_ref()
+                        != xerj_storage::version_map::IN_MEMORY_SEGMENT_ID
+                {
+                    continue;
+                }
+                let source_bytes = if !entry.source_bytes.is_empty() {
+                    Arc::clone(&entry.source_bytes)
+                } else if let Some(source) = &entry.source {
+                    match serde_json::to_vec(source.as_ref()) {
+                        Ok(bytes) => Arc::from(bytes),
+                        Err(error) => {
+                            tracing::error!(
+                                doc_id = entry.doc_id,
+                                seq_no = entry.seq_no,
+                                error = %error,
+                                "failed to requeue retained flush source"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    continue;
+                };
+                memtable.requeue_raw_if_not_newer(
+                    entry.seq_no,
+                    entry.doc_id.clone(),
+                    source_bytes,
+                );
+            }
+        }
         if matches!(result, Ok(Some(_))) {
             // finalize_flush_with_publisher publishes the snapshot before it
             // returns Some. Commit while still in the worker, with no await.
@@ -30264,13 +30344,17 @@ mod flush_memory_integration_tests {
         let mut publisher_release = PublisherRelease(Some(release_tx));
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let first_attempt = AtomicBool::new(true);
         let hook = FlushPublisherTestHook {
             callback: Arc::new(move || {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
-                let _ = release_rx.lock().take().unwrap().recv();
+                if first_attempt.swap(false, Ordering::AcqRel) {
+                    entered_tx.lock().take().unwrap().send(()).unwrap();
+                    let _ = release_rx.lock().take().unwrap().recv();
+                }
                 inject_error
             }),
             after_warm: None,
+            after_repoint: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30293,11 +30377,61 @@ mod flush_memory_integration_tests {
         let result = flush.await.unwrap();
         assert_eq!(result.is_err(), inject_error);
         assert_eq!(
+            idx.get_document_uncounted("doc")
+                .await
+                .unwrap()
+                .expect("failed flush must requeue its exact source")["body"],
+            "retained"
+        );
+        if inject_error {
+            assert!(
+                std::fs::read_dir(dir.path().join(name).join("segments"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .all(|entry| !entry.file_name().to_string_lossy().contains(".seg")),
+                "both failed output prefixes must be removed before requeue"
+            );
+            idx.flush().await.unwrap();
+            assert_eq!(
+                idx.search(&SearchRequest::default())
+                    .await
+                    .unwrap()
+                    .total
+                    .value,
+                1,
+                "one later flush must publish the requeued row exactly once"
+            );
+        }
+        assert_eq!(
             ledger
                 .gauge(Category::FlushDrained, Measurement::Estimated)
                 .current,
             0
         );
+        if inject_error {
+            drop(idx);
+            drop(engine);
+            let reopened = crate::Engine::new({
+                let mut config = Config::default();
+                config.server.data_dir = dir.path().to_string_lossy().into_owned();
+                config
+            })
+            .unwrap();
+            let idx = reopened.get_index(name).unwrap();
+            assert_eq!(
+                idx.search(&SearchRequest::default())
+                    .await
+                    .unwrap()
+                    .total
+                    .value,
+                1
+            );
+            assert_eq!(
+                idx.get_document_uncounted("doc").await.unwrap().unwrap()["body"],
+                "retained"
+            );
+        }
     }
 
     async fn run_post_warm_failure_case(name: &'static str, panic_after_warm: bool) {
@@ -30341,6 +30475,7 @@ mod flush_memory_integration_tests {
                 }
                 true
             })),
+            after_repoint: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30358,11 +30493,7 @@ mod flush_memory_integration_tests {
             Some(hook),
         )
         .await;
-        if panic_after_warm {
-            assert!(result.is_ok(), "join panic is logged and kept non-fatal");
-        } else {
-            assert!(result.is_err());
-        }
+        assert!(result.is_err());
         let segment_id = warmed_id.lock().clone().expect("warm hook did not run");
         assert!(!idx.stored_slices_cache.contains_key(&segment_id));
         assert!(!idx.dv_cache.contains_key(&segment_id));
@@ -30377,6 +30508,19 @@ mod flush_memory_integration_tests {
             .any(|entry| entry.key().starts_with(&prefix)));
         assert_eq!(budget.snapshot().current, 0);
         assert_eq!(budget.snapshot().accounting_errors, 0);
+        assert!(
+            idx.get_document_uncounted(&doc_id).await.unwrap().is_some(),
+            "post-warm failure must return the exact row to the active memtable"
+        );
+        idx.flush().await.unwrap();
+        assert_eq!(
+            idx.search(&SearchRequest::default())
+                .await
+                .unwrap()
+                .total
+                .value,
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -30386,6 +30530,283 @@ mod flush_memory_integration_tests {
             run_flush_memory_case("flush-memory-failure", true),
         );
         assert_eq!((success, failure), ((), ()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transient_publisher_failure_retries_retained_payload_once_without_duplicates() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("flush-retry-once", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("flush-retry-once").unwrap();
+        idx.index_document(
+            Some("retry-doc".into()),
+            json!({"body": "retry retained", "rank": 7}),
+        )
+        .await
+        .unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let hook_calls = Arc::clone(&calls);
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || hook_calls.fetch_add(1, Ordering::AcqRel) == 0),
+            after_warm: None,
+            after_repoint: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+        };
+        FLUSH_PUBLISHER_TEST_HOOK
+            .scope(hook, idx.flush())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert_eq!(
+            idx.get_document_uncounted("retry-doc")
+                .await
+                .unwrap()
+                .unwrap()["body"],
+            "retry retained"
+        );
+        assert_eq!(
+            idx.search(&SearchRequest::default())
+                .await
+                .unwrap()
+                .total
+                .value,
+            1
+        );
+        drop(idx);
+        drop(engine);
+
+        let reopened = crate::Engine::new({
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            config
+        })
+        .unwrap();
+        let idx = reopened.get_index("flush-retry-once").unwrap();
+        assert_eq!(
+            idx.search(&SearchRequest::default())
+                .await
+                .unwrap()
+                .total
+                .value,
+            1
+        );
+        assert_eq!(
+            idx.get_document_uncounted("retry-doc")
+                .await
+                .unwrap()
+                .unwrap()["rank"],
+            7
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborting_flush_waiter_does_not_drop_blocking_publish_visibility() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("flush-abort", Schema::empty()).unwrap();
+        let idx = engine.get_index("flush-abort").unwrap();
+        idx.index_document(Some("abort-doc".into()), json!({"body": "still visible"}))
+            .await
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                let _ = entered_tx.lock().take().unwrap().send(());
+                let _ = release_rx.lock().take().unwrap().recv();
+                false
+            }),
+            after_warm: None,
+            after_repoint: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+        };
+        let waiter = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        waiter.abort();
+        assert_eq!(
+            idx.get_document_uncounted("abort-doc")
+                .await
+                .unwrap()
+                .unwrap()["body"],
+            "still visible"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let version = idx.store.version_map.get("abort-doc").unwrap();
+                if version.segment_id.as_ref() != xerj_storage::version_map::IN_MEMORY_SEGMENT_ID {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached blocking finalizer did not publish");
+        assert_eq!(
+            idx.get_document_uncounted("abort-doc")
+                .await
+                .unwrap()
+                .unwrap()["body"],
+            "still visible"
+        );
+        assert_eq!(
+            idx.search(&SearchRequest::default())
+                .await
+                .unwrap()
+                .total
+                .value,
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn readers_never_observe_repoint_before_snapshot_publication() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("flush-midpoint", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("flush-midpoint").unwrap();
+        idx.index_document(Some("midpoint-doc".into()), json!({"body": "stable"}))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(|| false),
+            after_warm: None,
+            after_repoint: Some(Arc::new(move || {
+                entered_tx.lock().take().unwrap().send(()).unwrap();
+                release_rx.lock().take().unwrap().recv().unwrap();
+            })),
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+        };
+        let flush = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let read = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move { idx.get_document_uncounted("midpoint-doc").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !read.is_finished(),
+            "reader crossed the VM-repoint/snapshot midpoint"
+        );
+        release_tx.send(()).unwrap();
+        flush.await.unwrap().unwrap();
+        assert_eq!(read.await.unwrap().unwrap().unwrap()["body"], "stable");
+    }
+
+    async fn failed_flush_cannot_requeue_over_newer_version(delete_newer: bool) {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let name = if delete_newer {
+            "flush-newer-delete"
+        } else {
+            "flush-newer-update"
+        };
+        engine.create_index(name, Schema::empty()).unwrap();
+        let idx = engine.get_index(name).unwrap();
+        idx.index_document(Some("same-id".into()), json!({"revision": 1}))
+            .await
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let first = AtomicBool::new(true);
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                if first.swap(false, Ordering::AcqRel) {
+                    entered_tx.lock().take().unwrap().send(()).unwrap();
+                    release_rx.lock().take().unwrap().recv().unwrap();
+                }
+                true
+            }),
+            after_warm: None,
+            after_repoint: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+        };
+        let flush = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        if delete_newer {
+            idx.delete_document("same-id").await.unwrap();
+        } else {
+            idx.index_document(Some("same-id".into()), json!({"revision": 2}))
+                .await
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        assert!(flush.await.unwrap().is_err());
+        if delete_newer {
+            assert!(idx
+                .get_document_uncounted("same-id")
+                .await
+                .unwrap()
+                .is_none());
+        } else {
+            assert_eq!(
+                idx.get_document_uncounted("same-id")
+                    .await
+                    .unwrap()
+                    .unwrap()["revision"],
+                2
+            );
+        }
+        idx.flush().await.unwrap();
+        assert_eq!(
+            idx.search(&SearchRequest::default())
+                .await
+                .unwrap()
+                .total
+                .value,
+            u64::from(!delete_newer)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_flush_requeue_respects_newer_update_and_delete() {
+        failed_flush_cannot_requeue_over_newer_version(false).await;
+        failed_flush_cannot_requeue_over_newer_version(true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -30417,6 +30838,8 @@ mod flush_memory_integration_tests {
                     serde_json::json!({
                         "embedding": [angle.cos(), angle.sin()],
                         "row": row,
+                        "category": if row == 0 { "target" } else { "other" },
+                        "body": if row == 0 { "pending needle" } else { "ordinary text" },
                     }),
                 )
             })
@@ -30427,13 +30850,17 @@ mod flush_memory_integration_tests {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let first_callback = AtomicBool::new(true);
         let hook = FlushPublisherTestHook {
             callback: Arc::new(move || {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
-                release_rx.lock().take().unwrap().recv().unwrap();
+                if first_callback.swap(false, Ordering::AcqRel) {
+                    let _ = entered_tx.lock().take().unwrap().send(());
+                    let _ = release_rx.lock().take().unwrap().recv();
+                }
                 false
             }),
             after_warm: None,
+            after_repoint: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
         };
@@ -30451,6 +30878,7 @@ mod flush_memory_integration_tests {
             .unwrap()
             .expect("drained point row must stay visible");
         assert_eq!(point["row"], 0);
+        assert_eq!(point["category"], "target", "point source: {point}");
         let filtered = [crate::memtable::MemBoolPred::Range {
             field: "row".into(),
             gte: Some(0.0),
@@ -30467,6 +30895,97 @@ mod flush_memory_integration_tests {
                 .iter()
                 .any(|(id, source)| id == "drained-0000" && source["row"] == 0),
             "the complete fallback walk must include the drained generation"
+        );
+        let assert_one = |query| SearchRequest {
+            query,
+            size: 10,
+            ..SearchRequest::default()
+        };
+        let term = assert_one(QueryNode::Term {
+            field: "category".into(),
+            value: json!("target"),
+            boost: None,
+        });
+        assert!(doc_matches_query(&term.query, &point));
+        assert_eq!(idx.search(&term).await.unwrap().total.value, 1);
+        let range = assert_one(QueryNode::Range {
+            field: "row".into(),
+            gte: Some(json!(0)),
+            gt: None,
+            lte: Some(json!(0)),
+            lt: None,
+            boost: None,
+        });
+        assert_eq!(idx.search(&range).await.unwrap().total.value, 1);
+        let bool_query = assert_one(QueryNode::Bool {
+            must: vec![term.query.clone()],
+            should: Vec::new(),
+            must_not: Vec::new(),
+            filter: vec![range.query.clone()],
+            minimum_should_match: None,
+        });
+        assert_eq!(idx.search(&bool_query).await.unwrap().total.value, 1);
+        let text = assert_one(QueryNode::Match {
+            field: "body".into(),
+            query: "pending needle".into(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+        });
+        assert_eq!(idx.search(&text).await.unwrap().total.value, 1);
+        let sorted = idx
+            .search(&SearchRequest {
+                query: QueryNode::MatchAll,
+                size: 1,
+                sort: vec![xerj_query::sort::SortField {
+                    field: "row".into(),
+                    order: xerj_query::sort::SortOrder::Asc,
+                    mode: Default::default(),
+                    missing: Default::default(),
+                    format: None,
+                }],
+                ..SearchRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(sorted.total.value, 1_024);
+        assert_eq!(sorted.hits[0].id, "drained-0000");
+        assert_eq!(
+            idx.search(&SearchRequest {
+                query: QueryNode::MatchAll,
+                size: 0,
+                ..SearchRequest::default()
+            })
+            .await
+            .unwrap()
+            .total
+            .value,
+            1_024
+        );
+        let aggregate = idx
+            .search(&SearchRequest {
+                query: QueryNode::MatchAll,
+                size: 0,
+                aggs: Some(json!({
+                    "max_row": {"max": {"field": "row"}},
+                    "categories": {"terms": {"field": "category"}}
+                })),
+                ..SearchRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(aggregate.total.value, 1_024);
+        let aggs = aggregate.aggs.unwrap();
+        assert_eq!(aggs["max_row"]["value"], 1_023.0);
+        assert_eq!(
+            aggs["categories"]["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket["doc_count"].as_u64().unwrap())
+                .sum::<u64>(),
+            1_024
         );
 
         let request = SearchRequest {

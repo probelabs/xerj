@@ -32,6 +32,113 @@ mod ingest_memory_drain_tests {
     use std::sync::{Arc, Barrier};
 
     #[test]
+    fn prepublication_budget_refuses_before_partial_insert_and_refunds_on_drop() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let mem = ShardedFtsMemtable::new();
+        let id = "budgeted-raw".to_string();
+        let shard = mem.shard_for_dynamic(&id);
+        mem.insert_raw_bytes_with_seq(
+            7,
+            id.clone(),
+            Arc::from(br#"{"body":"raw pending"}"#.as_slice()),
+        );
+        mem.set_prepublication_budget_for_test(1);
+        let (refused, _guard, lease) = mem.drain_shard_accounted_for_test(shard, true, ledger);
+        assert!(refused.is_empty());
+        assert_eq!(mem.doc_count(), 1);
+        assert!(mem.prepublication.read().is_empty());
+        assert_eq!(
+            mem.prepublication_budget
+                .used
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        drop(lease);
+
+        mem.set_prepublication_budget_for_test(usize::MAX);
+        let (drained, _guard, lease) = mem.drain_shard_accounted_for_test(shard, true, ledger);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            mem.get_doc_source_arc_for_seq(&id, 7).unwrap()["body"],
+            "raw pending"
+        );
+        assert!(
+            mem.prepublication_budget
+                .used
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        );
+        drop(lease);
+        assert!(mem.prepublication.read().is_empty());
+        assert_eq!(
+            mem.prepublication_budget
+                .used
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            ledger
+                .gauge(Category::PrepublicationRegistry, Measurement::Estimated)
+                .current,
+            0
+        );
+    }
+
+    #[test]
+    fn prepublication_budget_is_process_wide_across_indices() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        let provisional_budget = Arc::new(PrepublicationBudget::new(usize::MAX));
+        let first = ShardedFtsMemtable::with_prepublication_budget_for_test(Arc::clone(
+            &provisional_budget,
+        ));
+        let second = ShardedFtsMemtable::with_prepublication_budget_for_test(Arc::clone(
+            &provisional_budget,
+        ));
+        for (mem, id, seq) in [(&first, "first", 1), (&second, "second", 2)] {
+            mem.insert_raw_bytes_with_seq(
+                seq,
+                id.to_string(),
+                Arc::from(br#"{"body":"pending"}"#.as_slice()),
+            );
+            mem.set_prepublication_budget_for_test(usize::MAX);
+        }
+
+        let first_shard = first.shard_for_dynamic("first");
+        let exact_one_index = ShardedFtsMemtable::prepublication_envelope_bytes(
+            &first.shards[first_shard].read().docs,
+        );
+        let budget = Arc::new(PrepublicationBudget::new(exact_one_index));
+        let mut first = first;
+        let mut second = second;
+        first.prepublication_budget = Arc::clone(&budget);
+        second.prepublication_budget = Arc::clone(&budget);
+
+        let (first_rows, _guard, first_lease) =
+            first.drain_shard_accounted_for_test(first_shard, true, ledger);
+        assert_eq!(first_rows.len(), 1);
+        assert_eq!(
+            budget.used.load(std::sync::atomic::Ordering::Acquire),
+            exact_one_index
+        );
+
+        // A second index cannot admit another independently valid envelope
+        // while the first index owns the process-wide capacity.
+        let second_shard = second.shard_for_dynamic("second");
+        let (second_rows, _guard, second_lease) =
+            second.drain_shard_accounted_for_test(second_shard, true, ledger);
+        assert!(second_rows.is_empty());
+        assert_eq!(second.doc_count(), 1);
+        assert!(second.prepublication.read().is_empty());
+        drop(second_lease);
+        drop(first_lease);
+        assert_eq!(budget.used.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(
+            budget.refusals.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+    }
+
+    #[test]
     fn authoritative_active_moves_to_drained_through_blocked_finalize_success_and_error() {
         for inject_error in [false, true] {
             let mem = ShardedFtsMemtable::new();
@@ -646,14 +753,66 @@ pub struct ShardedFtsMemtable {
     /// Rows atomically moved out of an active shard but not yet published in
     /// a segment. Keys include the physical shard so an impossible duplicate
     /// `(id, seq)` has a deterministic lowest-shard winner.
-    prepublication: Arc<dashmap::DashMap<(String, u64, usize), Arc<PrepublicationSource>>>,
+    prepublication:
+        Arc<parking_lot::RwLock<HashMap<(String, u64, usize), Arc<PrepublicationSource>>>>,
+    prepublication_budget: Arc<PrepublicationBudget>,
+    prepublication_budget_limit: std::sync::atomic::AtomicUsize,
     shard_mask: usize,
+}
+
+const DEFAULT_PREPUBLICATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+static GLOBAL_PREPUBLICATION_BUDGET: std::sync::LazyLock<Arc<PrepublicationBudget>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(PrepublicationBudget::new(
+            DEFAULT_PREPUBLICATION_BUDGET_BYTES,
+        ))
+    });
+
+struct PrepublicationBudget {
+    used: std::sync::atomic::AtomicUsize,
+    limit: usize,
+    refusals: std::sync::atomic::AtomicU64,
+}
+
+impl PrepublicationBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+            refusals: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn try_admit(&self, bytes: usize) -> bool {
+        let admitted = self
+            .used
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| {
+                    current
+                        .checked_add(bytes)
+                        .filter(|next| *next <= self.limit)
+                },
+            )
+            .is_ok();
+        if !admitted {
+            self.refusals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        admitted
+    }
+
+    fn release(&self, bytes: usize) {
+        self.used
+            .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 struct PrepublicationSource {
     source: Arc<Value>,
     source_bytes: Arc<[u8]>,
-    parsed: std::sync::OnceLock<Arc<Value>>,
 }
 
 impl PrepublicationSource {
@@ -661,9 +820,7 @@ impl PrepublicationSource {
         if !self.source.is_null() || self.source_bytes.is_empty() {
             return Arc::clone(&self.source);
         }
-        Arc::clone(self.parsed.get_or_init(|| {
-            Arc::new(serde_json::from_slice(&self.source_bytes).unwrap_or(Value::Null))
-        }))
+        Arc::new(serde_json::from_slice(&self.source_bytes).unwrap_or(Value::Null))
     }
 }
 
@@ -672,20 +829,25 @@ impl PrepublicationSource {
 /// Removal is value-identity guarded so a delayed lease can never erase a
 /// replacement registration for the same physical generation.
 pub(crate) struct DrainedVisibilityLease {
-    registry: Arc<dashmap::DashMap<(String, u64, usize), Arc<PrepublicationSource>>>,
+    registry: Arc<parking_lot::RwLock<HashMap<(String, u64, usize), Arc<PrepublicationSource>>>>,
     entries: Vec<((String, u64, usize), Arc<PrepublicationSource>)>,
+    budget: Arc<PrepublicationBudget>,
+    budget_bytes: usize,
+    _memory: crate::ingest_memory::Retained<'static>,
 }
 
 impl Drop for DrainedVisibilityLease {
     fn drop(&mut self) {
+        let mut registry = self.registry.write();
         for (key, expected) in &self.entries {
-            if let dashmap::mapref::entry::Entry::Occupied(entry) = self.registry.entry(key.clone())
+            if registry
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
             {
-                if Arc::ptr_eq(entry.get(), expected) {
-                    entry.remove();
-                }
+                registry.remove(key);
             }
         }
+        self.budget.release(self.budget_bytes);
     }
 }
 
@@ -712,9 +874,20 @@ impl ShardedFtsMemtable {
             .collect();
         Self {
             shards,
-            prepublication: Arc::new(dashmap::DashMap::new()),
+            prepublication: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            prepublication_budget: Arc::clone(&GLOBAL_PREPUBLICATION_BUDGET),
+            prepublication_budget_limit: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_PREPUBLICATION_BUDGET_BYTES,
+            ),
             shard_mask: n - 1,
         }
+    }
+
+    #[cfg(test)]
+    fn with_prepublication_budget_for_test(budget: Arc<PrepublicationBudget>) -> Self {
+        let mut mem = Self::new();
+        mem.prepublication_budget = budget;
+        mem
     }
 
     #[inline]
@@ -761,7 +934,36 @@ impl ShardedFtsMemtable {
             .iter()
             .map(|s| s.read().doc_count())
             .sum::<usize>()
-            .saturating_add(self.prepublication.len())
+            .saturating_add(self.prepublication.read().len())
+    }
+
+    /// True while a flush owns rows that have left an active shard but whose
+    /// authoritative segment publication has not completed.
+    pub(crate) fn has_prepublication_rows(&self) -> bool {
+        !self.prepublication.read().is_empty()
+    }
+
+    fn prepublication_envelope_bytes(docs: &[MemEntry]) -> usize {
+        let fixed = std::mem::size_of::<((String, u64, usize), Arc<PrepublicationSource>)>()
+            .saturating_add(std::mem::size_of::<PrepublicationSource>())
+            .saturating_add(std::mem::size_of::<Arc<PrepublicationSource>>())
+            .saturating_add(3 * std::mem::size_of::<usize>());
+        docs.iter().fold(0usize, |total, entry| {
+            total.saturating_add(fixed.saturating_add(entry.doc_id.len().saturating_mul(2)))
+        })
+    }
+
+    fn try_admit_prepublication(&self, bytes: usize) -> bool {
+        let local_limit = self
+            .prepublication_budget_limit
+            .load(std::sync::atomic::Ordering::Acquire);
+        bytes <= local_limit && self.prepublication_budget.try_admit(bytes)
+    }
+
+    #[cfg(test)]
+    fn set_prepublication_budget_for_test(&self, bytes: usize) {
+        self.prepublication_budget_limit
+            .store(bytes, std::sync::atomic::Ordering::Release);
     }
 
     /// Total approximate byte size across all shards.
@@ -802,8 +1004,9 @@ impl ShardedFtsMemtable {
             return Some(source);
         }
 
+        let registry = self.prepublication.read();
         (0..self.shards.len()).find_map(|shard| {
-            self.prepublication
+            registry
                 .get(&(doc_id.to_owned(), seq_no, shard))
                 .map(|entry| entry.resolve())
         })
@@ -830,31 +1033,17 @@ impl ShardedFtsMemtable {
     }
 
     fn prepublication_snapshot(&self) -> Vec<(String, u64, usize, Arc<PrepublicationSource>)> {
-        let mut rows: Vec<_> = self
-            .prepublication
+        let registry = self.prepublication.read();
+        let mut rows: Vec<_> = registry
             .iter()
-            .map(|entry| {
-                let (id, seq_no, shard) = entry.key();
-                (id.clone(), *seq_no, *shard, Arc::clone(entry.value()))
-            })
+            .map(|((id, seq_no, shard), source)| (id.clone(), *seq_no, *shard, Arc::clone(source)))
             .collect();
         rows.sort_unstable_by(|a, b| {
             a.0.cmp(&b.0)
                 .then_with(|| a.1.cmp(&b.1))
                 .then_with(|| a.2.cmp(&b.2))
         });
-        let mut previous: Option<(String, u64)> = None;
-        rows.retain(|row| {
-            if previous
-                .as_ref()
-                .is_some_and(|(id, seq_no)| id == &row.0 && *seq_no == row.1)
-            {
-                false
-            } else {
-                previous = Some((row.0.clone(), row.1));
-                true
-            }
-        });
+        rows.dedup_by(|next, previous| next.0 == previous.0 && next.1 == previous.1);
         rows
     }
 
@@ -1029,7 +1218,7 @@ impl ShardedFtsMemtable {
         // filter structures belong to active shards only, so they cannot prove
         // a complete result while a drained generation is awaiting publication.
         // Returning `None` makes the caller use the complete source walk.
-        if preds.is_empty() || !self.prepublication.is_empty() {
+        if preds.is_empty() || !self.prepublication.read().is_empty() {
             return None;
         }
         let mut out: Vec<(String, Arc<Value>)> = Vec::new();
@@ -1048,7 +1237,7 @@ impl ShardedFtsMemtable {
         &self,
         preds: &[MemBoolPred],
     ) -> Option<Vec<(String, u64, Arc<Value>)>> {
-        if preds.is_empty() || !self.prepublication.is_empty() {
+        if preds.is_empty() || !self.prepublication.read().is_empty() {
             return None;
         }
         let mut out = Vec::new();
@@ -1361,6 +1550,27 @@ impl ShardedFtsMemtable {
         self.shards[s]
             .write()
             .insert_raw_bytes_with_seq(seq_no, doc_id, source_bytes);
+    }
+
+    /// Return a failed flush generation to an active shard without replacing a
+    /// newer physical write for the same id. The drained-visibility lease stays
+    /// alive across this call, so readers see either the pending owner or this
+    /// active owner throughout the hand-back.
+    pub(crate) fn requeue_raw_if_not_newer(
+        &self,
+        seq_no: u64,
+        doc_id: String,
+        source_bytes: Arc<[u8]>,
+    ) {
+        let shard = self.shard_for_dynamic(&doc_id);
+        let mut active = self.shards[shard].write();
+        if active
+            .entry_for(&doc_id)
+            .is_some_and(|entry| entry.seq_no >= seq_no)
+        {
+            return;
+        }
+        active.insert_raw_bytes_with_seq(seq_no, doc_id, source_bytes);
     }
 
     /// Iterate every document in every shard as `(doc_id, Value)`.
@@ -1782,15 +1992,15 @@ impl ShardedFtsMemtable {
         )
     }
 
-    fn drain_shard_inner<'a>(
+    fn drain_shard_inner(
         &self,
         shard_idx: usize,
         skip_parse: bool,
-        ledger: Option<&'a crate::ingest_memory::Ledger>,
+        ledger: Option<&'static crate::ingest_memory::Ledger>,
         publish_visible: bool,
     ) -> (
         Vec<(u64, String, Arc<Value>, Arc<[u8]>)>,
-        Option<crate::ingest_memory::Retained<'a>>,
+        Option<crate::ingest_memory::Retained<'static>>,
         Option<DrainedVisibilityLease>,
     ) {
         // Swap the shard's maps out under the write lock (pointer moves,
@@ -1805,26 +2015,131 @@ impl ShardedFtsMemtable {
         // capped 8-client ingest at ~3.1× single-client throughput.
         let (drained, dead, drain_guard, visibility) = {
             let mut g = self.shards[shard_idx].write();
+            let envelope_bytes = if publish_visible {
+                Self::prepublication_envelope_bytes(&g.docs)
+            } else {
+                0
+            };
+            if publish_visible && !self.try_admit_prepublication(envelope_bytes) {
+                return (
+                    Vec::new(),
+                    ledger.map(|ledger| {
+                        crate::ingest_memory::Retained::for_ledger(
+                            ledger,
+                            crate::ingest_memory::Category::FlushDrained,
+                            0,
+                        )
+                    }),
+                    Some(DrainedVisibilityLease {
+                        registry: Arc::clone(&self.prepublication),
+                        entries: Vec::new(),
+                        budget: Arc::clone(&self.prepublication_budget),
+                        budget_bytes: 0,
+                        _memory: crate::ingest_memory::Retained::disabled(),
+                    }),
+                );
+            }
             let visibility = publish_visible.then(|| {
-                let entries = g
-                    .docs
-                    .iter()
-                    .map(|entry| {
-                        let key = (entry.doc_id.clone(), entry.seq_no, shard_idx);
-                        let source = Arc::new(PrepublicationSource {
-                            source: Arc::clone(&entry.source),
-                            source_bytes: Arc::clone(&entry.source_bytes),
-                            parsed: std::sync::OnceLock::new(),
-                        });
-                        self.prepublication.insert(key.clone(), Arc::clone(&source));
-                        (key, source)
-                    })
-                    .collect();
+                // Reserve the complete envelope before publishing a single
+                // registry entry. Each row needs two owned key strings (map +
+                // lease), one map node, one Arc control block, and one vector
+                // slot. A failed reservation therefore leaves the registry
+                // empty and the active shard untouched.
+                let mut registry = self.prepublication.write();
+                if registry.try_reserve(g.docs.len()).is_err() {
+                    self.prepublication_budget.release(envelope_bytes);
+                    return DrainedVisibilityLease {
+                        registry: Arc::clone(&self.prepublication),
+                        entries: Vec::new(),
+                        budget: Arc::clone(&self.prepublication_budget),
+                        budget_bytes: 0,
+                        _memory: crate::ingest_memory::Retained::disabled(),
+                    };
+                }
+                let mut pending = Vec::new();
+                if pending.try_reserve_exact(g.docs.len()).is_err() {
+                    self.prepublication_budget.release(envelope_bytes);
+                    return DrainedVisibilityLease {
+                        registry: Arc::clone(&self.prepublication),
+                        entries: Vec::new(),
+                        budget: Arc::clone(&self.prepublication_budget),
+                        budget_bytes: 0,
+                        _memory: crate::ingest_memory::Retained::disabled(),
+                    };
+                }
+                for entry in &g.docs {
+                    let mut registry_id = String::new();
+                    if registry_id.try_reserve_exact(entry.doc_id.len()).is_err() {
+                        self.prepublication_budget.release(envelope_bytes);
+                        return DrainedVisibilityLease {
+                            registry: Arc::clone(&self.prepublication),
+                            entries: Vec::new(),
+                            budget: Arc::clone(&self.prepublication_budget),
+                            budget_bytes: 0,
+                            _memory: crate::ingest_memory::Retained::disabled(),
+                        };
+                    }
+                    registry_id.push_str(&entry.doc_id);
+                    let mut lease_id = String::new();
+                    if lease_id.try_reserve_exact(entry.doc_id.len()).is_err() {
+                        self.prepublication_budget.release(envelope_bytes);
+                        return DrainedVisibilityLease {
+                            registry: Arc::clone(&self.prepublication),
+                            entries: Vec::new(),
+                            budget: Arc::clone(&self.prepublication_budget),
+                            budget_bytes: 0,
+                            _memory: crate::ingest_memory::Retained::disabled(),
+                        };
+                    }
+                    lease_id.push_str(&entry.doc_id);
+                    let source = Arc::new(PrepublicationSource {
+                        source: Arc::clone(&entry.source),
+                        source_bytes: Arc::clone(&entry.source_bytes),
+                    });
+                    pending.push((
+                        (registry_id, entry.seq_no, shard_idx),
+                        (lease_id, entry.seq_no, shard_idx),
+                        source,
+                    ));
+                }
+                let mut entries = Vec::with_capacity(pending.len());
+                for (registry_key, lease_key, source) in pending {
+                    registry.insert(registry_key, Arc::clone(&source));
+                    entries.push((lease_key, source));
+                }
                 DrainedVisibilityLease {
                     registry: Arc::clone(&self.prepublication),
                     entries,
+                    budget: Arc::clone(&self.prepublication_budget),
+                    budget_bytes: envelope_bytes,
+                    _memory: ledger
+                        .map(|ledger| {
+                            crate::ingest_memory::Retained::for_ledger(
+                                ledger,
+                                crate::ingest_memory::Category::PrepublicationRegistry,
+                                envelope_bytes,
+                            )
+                        })
+                        .unwrap_or_else(crate::ingest_memory::Retained::disabled),
                 }
             });
+            if publish_visible
+                && visibility
+                    .as_ref()
+                    .is_some_and(|lease| lease.budget_bytes == 0 && !g.docs.is_empty())
+            {
+                return (
+                    Vec::new(),
+                    ledger.map(|ledger| {
+                        crate::ingest_memory::Retained::for_ledger(
+                            ledger,
+                            crate::ingest_memory::Category::FlushDrained,
+                            0,
+                        )
+                    }),
+                    visibility,
+                );
+            }
             let removed_bytes = g.total_bytes;
             let d: Vec<MemEntry> = std::mem::take(&mut g.docs);
             let dead_index = std::mem::take(&mut g.index);
