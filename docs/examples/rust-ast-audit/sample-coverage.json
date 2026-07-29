@@ -1,0 +1,1794 @@
+{
+  "root": "/home/claude/ai/xerj-rust-audit-wt/engine",
+  "files_total": 197,
+  "files_parsed": 197,
+  "files_with_error_nodes": 0,
+  "error_files": [],
+  "error_nodes_total": 0,
+  "ast_function_nodes": 5095,
+  "emitted_function_records": 5095,
+  "function_coverage_pct": 100.0,
+  "call_edges": 87137,
+  "routes": 477,
+  "unsafe_block_sites": 23,
+  "unsafe_fn_declarations": 2,
+  "functions_with_unsafe": 21,
+  "handler_shaped_functions": 299,
+  "functions_with_narrowing_casts": 433,
+  "functions_with_alloc_from_param": 149,
+  "per_file": [
+    {
+      "file": "crates/xerj-ai/examples/onnx_experimental.rs",
+      "crate": "xerj-ai",
+      "bytes": 2106,
+      "lines": 56,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-ai/src/chunker.rs",
+      "crate": "xerj-ai",
+      "bytes": 14198,
+      "lines": 361,
+      "ast_functions": 15,
+      "emitted_functions": 15,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-ai/src/embed.rs",
+      "crate": "xerj-ai",
+      "bytes": 14611,
+      "lines": 387,
+      "ast_functions": 19,
+      "emitted_functions": 19,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-ai/src/embedder.rs",
+      "crate": "xerj-ai",
+      "bytes": 33562,
+      "lines": 861,
+      "ast_functions": 34,
+      "emitted_functions": 34,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-ai/src/lib.rs",
+      "crate": "xerj-ai",
+      "bytes": 1219,
+      "lines": 33,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-ai/src/local.rs",
+      "crate": "xerj-ai",
+      "bytes": 6036,
+      "lines": 165,
+      "ast_functions": 9,
+      "emitted_functions": 9,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-ai/src/memory.rs",
+      "crate": "xerj-ai",
+      "bytes": 11611,
+      "lines": 328,
+      "ast_functions": 20,
+      "emitted_functions": 20,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-ai/src/neural.rs",
+      "crate": "xerj-ai",
+      "bytes": 12856,
+      "lines": 321,
+      "ast_functions": 9,
+      "emitted_functions": 9,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-ai/src/onnx.rs",
+      "crate": "xerj-ai",
+      "bytes": 18392,
+      "lines": 521,
+      "ast_functions": 20,
+      "emitted_functions": 20,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/auth.rs",
+      "crate": "xerj-api",
+      "bytes": 24965,
+      "lines": 622,
+      "ast_functions": 17,
+      "emitted_functions": 17,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/binary_protocol.rs",
+      "crate": "xerj-api",
+      "bytes": 16916,
+      "lines": 460,
+      "ast_functions": 14,
+      "emitted_functions": 14,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/error.rs",
+      "crate": "xerj-api",
+      "bytes": 19718,
+      "lines": 398,
+      "ast_functions": 11,
+      "emitted_functions": 11,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/es_compat.rs",
+      "crate": "xerj-api",
+      "bytes": 1298735,
+      "lines": 31222,
+      "ast_functions": 603,
+      "emitted_functions": 603,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/extract.rs",
+      "crate": "xerj-api",
+      "bytes": 6416,
+      "lines": 177,
+      "ast_functions": 5,
+      "emitted_functions": 5,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/lib.rs",
+      "crate": "xerj-api",
+      "bytes": 2984,
+      "lines": 76,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/main.rs",
+      "crate": "xerj-api",
+      "bytes": 1907,
+      "lines": 49,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/memory_api.rs",
+      "crate": "xerj-api",
+      "bytes": 49370,
+      "lines": 1268,
+      "ast_functions": 26,
+      "emitted_functions": 26,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/native.rs",
+      "crate": "xerj-api",
+      "bytes": 92051,
+      "lines": 2471,
+      "ast_functions": 52,
+      "emitted_functions": 52,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/responses.rs",
+      "crate": "xerj-api",
+      "bytes": 24967,
+      "lines": 695,
+      "ast_functions": 18,
+      "emitted_functions": 18,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/router.rs",
+      "crate": "xerj-api",
+      "bytes": 52652,
+      "lines": 998,
+      "ast_functions": 11,
+      "emitted_functions": 11,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/state.rs",
+      "crate": "xerj-api",
+      "bytes": 22816,
+      "lines": 527,
+      "ast_functions": 32,
+      "emitted_functions": 32,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-api/src/stub.rs",
+      "crate": "xerj-api",
+      "bytes": 2547,
+      "lines": 69,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/catalog.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 23008,
+      "lines": 567,
+      "ast_functions": 11,
+      "emitted_functions": 11,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/cli.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 12255,
+      "lines": 315,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/coerce.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 4412,
+      "lines": 135,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/content.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 10397,
+      "lines": 286,
+      "ast_functions": 15,
+      "emitted_functions": 15,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/correlate.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 11908,
+      "lines": 344,
+      "ast_functions": 8,
+      "emitted_functions": 8,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/dataset.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 7129,
+      "lines": 223,
+      "ast_functions": 6,
+      "emitted_functions": 6,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/esclient.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 24097,
+      "lines": 635,
+      "ast_functions": 26,
+      "emitted_functions": 26,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/csv_x.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 2383,
+      "lines": 82,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/docx.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 3445,
+      "lines": 98,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/html.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 11540,
+      "lines": 343,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/json.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 3438,
+      "lines": 99,
+      "ast_functions": 2,
+      "emitted_functions": 2,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/jsonl.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 2811,
+      "lines": 98,
+      "ast_functions": 3,
+      "emitted_functions": 3,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/logs.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 10040,
+      "lines": 279,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/mod.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 12113,
+      "lines": 377,
+      "ast_functions": 16,
+      "emitted_functions": 16,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/pdf.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 23001,
+      "lines": 644,
+      "ast_functions": 27,
+      "emitted_functions": 27,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/sqldump.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 21654,
+      "lines": 592,
+      "ast_functions": 13,
+      "emitted_functions": 13,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/sqlite_x.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 4175,
+      "lines": 116,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/txt.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 9977,
+      "lines": 284,
+      "ast_functions": 10,
+      "emitted_functions": 10,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/xml_x.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 9374,
+      "lines": 281,
+      "ast_functions": 5,
+      "emitted_functions": 5,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/yaml_x.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 3785,
+      "lines": 112,
+      "ast_functions": 2,
+      "emitted_functions": 2,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/failure_resume_http_tests.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 28865,
+      "lines": 795,
+      "ast_functions": 17,
+      "emitted_functions": 17,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/ids.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 2017,
+      "lines": 62,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/infer/dates.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 6916,
+      "lines": 185,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/infer/entities.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 2083,
+      "lines": 84,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/infer/mod.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 21190,
+      "lines": 577,
+      "ast_functions": 16,
+      "emitted_functions": 16,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/lib.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 76296,
+      "lines": 1908,
+      "ast_functions": 18,
+      "emitted_functions": 18,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/sniff.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 19296,
+      "lines": 586,
+      "ast_functions": 24,
+      "emitted_functions": 24,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/state.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 33074,
+      "lines": 832,
+      "ast_functions": 22,
+      "emitted_functions": 22,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-autoindex/src/walk.rs",
+      "crate": "xerj-autoindex",
+      "bytes": 2832,
+      "lines": 92,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/coordinator.rs",
+      "crate": "xerj-cluster",
+      "bytes": 22289,
+      "lines": 583,
+      "ast_functions": 15,
+      "emitted_functions": 15,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/lib.rs",
+      "crate": "xerj-cluster",
+      "bytes": 3518,
+      "lines": 78,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/metadata.rs",
+      "crate": "xerj-cluster",
+      "bytes": 12932,
+      "lines": 392,
+      "ast_functions": 17,
+      "emitted_functions": 17,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/node.rs",
+      "crate": "xerj-cluster",
+      "bytes": 14454,
+      "lines": 397,
+      "ast_functions": 22,
+      "emitted_functions": 22,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/raft.rs",
+      "crate": "xerj-cluster",
+      "bytes": 38381,
+      "lines": 1093,
+      "ast_functions": 41,
+      "emitted_functions": 41,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/raft_log.rs",
+      "crate": "xerj-cluster",
+      "bytes": 15749,
+      "lines": 428,
+      "ast_functions": 17,
+      "emitted_functions": 17,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/regions.rs",
+      "crate": "xerj-cluster",
+      "bytes": 30974,
+      "lines": 822,
+      "ast_functions": 29,
+      "emitted_functions": 29,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/replication.rs",
+      "crate": "xerj-cluster",
+      "bytes": 18190,
+      "lines": 479,
+      "ast_functions": 16,
+      "emitted_functions": 16,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/router.rs",
+      "crate": "xerj-cluster",
+      "bytes": 13659,
+      "lines": 360,
+      "ast_functions": 16,
+      "emitted_functions": 16,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/runner.rs",
+      "crate": "xerj-cluster",
+      "bytes": 6114,
+      "lines": 171,
+      "ast_functions": 8,
+      "emitted_functions": 8,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/search.rs",
+      "crate": "xerj-cluster",
+      "bytes": 10286,
+      "lines": 288,
+      "ast_functions": 10,
+      "emitted_functions": 10,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/src/transport.rs",
+      "crate": "xerj-cluster",
+      "bytes": 7974,
+      "lines": 220,
+      "ast_functions": 8,
+      "emitted_functions": 8,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/tests/persistent_raft_test.rs",
+      "crate": "xerj-cluster",
+      "bytes": 2697,
+      "lines": 77,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/tests/region_tests.rs",
+      "crate": "xerj-cluster",
+      "bytes": 14534,
+      "lines": 418,
+      "ast_functions": 16,
+      "emitted_functions": 16,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/tests/replication_tests.rs",
+      "crate": "xerj-cluster",
+      "bytes": 11214,
+      "lines": 323,
+      "ast_functions": 13,
+      "emitted_functions": 13,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-cluster/tests/transport_tests.rs",
+      "crate": "xerj-cluster",
+      "bytes": 9369,
+      "lines": 279,
+      "ast_functions": 6,
+      "emitted_functions": 6,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-common/src/config.rs",
+      "crate": "xerj-common",
+      "bytes": 61734,
+      "lines": 1446,
+      "ast_functions": 38,
+      "emitted_functions": 38,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-common/src/error.rs",
+      "crate": "xerj-common",
+      "bytes": 12958,
+      "lines": 332,
+      "ast_functions": 27,
+      "emitted_functions": 27,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-common/src/fsio.rs",
+      "crate": "xerj-common",
+      "bytes": 3464,
+      "lines": 92,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-common/src/lib.rs",
+      "crate": "xerj-common",
+      "bytes": 1267,
+      "lines": 36,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-common/src/metrics.rs",
+      "crate": "xerj-common",
+      "bytes": 20945,
+      "lines": 506,
+      "ast_functions": 21,
+      "emitted_functions": 21,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-common/src/schema.rs",
+      "crate": "xerj-common",
+      "bytes": 17231,
+      "lines": 432,
+      "ast_functions": 21,
+      "emitted_functions": 21,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-common/src/types.rs",
+      "crate": "xerj-common",
+      "bytes": 23746,
+      "lines": 606,
+      "ast_functions": 36,
+      "emitted_functions": 36,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-compress/src/block.rs",
+      "crate": "xerj-compress",
+      "bytes": 11499,
+      "lines": 311,
+      "ast_functions": 17,
+      "emitted_functions": 17,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-compress/src/codec.rs",
+      "crate": "xerj-compress",
+      "bytes": 9834,
+      "lines": 245,
+      "ast_functions": 21,
+      "emitted_functions": 21,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-compress/src/dictionary.rs",
+      "crate": "xerj-compress",
+      "bytes": 9818,
+      "lines": 273,
+      "ast_functions": 19,
+      "emitted_functions": 19,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-compress/src/field_codec.rs",
+      "crate": "xerj-compress",
+      "bytes": 63551,
+      "lines": 1650,
+      "ast_functions": 62,
+      "emitted_functions": 62,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-compress/src/lib.rs",
+      "crate": "xerj-compress",
+      "bytes": 746,
+      "lines": 22,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/build.rs",
+      "crate": "xerj-console-api",
+      "bytes": 6120,
+      "lines": 167,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/audit.rs",
+      "crate": "xerj-console-api",
+      "bytes": 1466,
+      "lines": 50,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/login.rs",
+      "crate": "xerj-console-api",
+      "bytes": 10610,
+      "lines": 291,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/magic.rs",
+      "crate": "xerj-console-api",
+      "bytes": 14140,
+      "lines": 374,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/me.rs",
+      "crate": "xerj-console-api",
+      "bytes": 2946,
+      "lines": 94,
+      "ast_functions": 3,
+      "emitted_functions": 3,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/mod.rs",
+      "crate": "xerj-console-api",
+      "bytes": 557,
+      "lines": 20,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/passkey.rs",
+      "crate": "xerj-console-api",
+      "bytes": 11628,
+      "lines": 334,
+      "ast_functions": 5,
+      "emitted_functions": 5,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/rate_limit.rs",
+      "crate": "xerj-console-api",
+      "bytes": 5260,
+      "lines": 171,
+      "ast_functions": 8,
+      "emitted_functions": 8,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/sessions.rs",
+      "crate": "xerj-console-api",
+      "bytes": 13358,
+      "lines": 333,
+      "ast_functions": 15,
+      "emitted_functions": 15,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/store.rs",
+      "crate": "xerj-console-api",
+      "bytes": 13691,
+      "lines": 361,
+      "ast_functions": 22,
+      "emitted_functions": 22,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/tokens.rs",
+      "crate": "xerj-console-api",
+      "bytes": 6924,
+      "lines": 181,
+      "ast_functions": 3,
+      "emitted_functions": 3,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/auth/webauthn_setup.rs",
+      "crate": "xerj-console-api",
+      "bytes": 821,
+      "lines": 22,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/bootstrap.rs",
+      "crate": "xerj-console-api",
+      "bytes": 13219,
+      "lines": 358,
+      "ast_functions": 16,
+      "emitted_functions": 16,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/cluster.rs",
+      "crate": "xerj-console-api",
+      "bytes": 1393,
+      "lines": 40,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/dashboards.rs",
+      "crate": "xerj-console-api",
+      "bytes": 24712,
+      "lines": 613,
+      "ast_functions": 19,
+      "emitted_functions": 19,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/data_sources.rs",
+      "crate": "xerj-console-api",
+      "bytes": 8840,
+      "lines": 224,
+      "ast_functions": 5,
+      "emitted_functions": 5,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/error.rs",
+      "crate": "xerj-console-api",
+      "bytes": 4519,
+      "lines": 142,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/indices.rs",
+      "crate": "xerj-console-api",
+      "bytes": 11145,
+      "lines": 248,
+      "ast_functions": 5,
+      "emitted_functions": 5,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/lib.rs",
+      "crate": "xerj-console-api",
+      "bytes": 2212,
+      "lines": 63,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/prefs.rs",
+      "crate": "xerj-console-api",
+      "bytes": 2113,
+      "lines": 63,
+      "ast_functions": 2,
+      "emitted_functions": 2,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/response.rs",
+      "crate": "xerj-console-api",
+      "bytes": 2855,
+      "lines": 82,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/router.rs",
+      "crate": "xerj-console-api",
+      "bytes": 7213,
+      "lines": 178,
+      "ast_functions": 2,
+      "emitted_functions": 2,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/seed.rs",
+      "crate": "xerj-console-api",
+      "bytes": 36440,
+      "lines": 909,
+      "ast_functions": 17,
+      "emitted_functions": 17,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/spa.rs",
+      "crate": "xerj-console-api",
+      "bytes": 4180,
+      "lines": 116,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/state.rs",
+      "crate": "xerj-console-api",
+      "bytes": 5895,
+      "lines": 176,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/time.rs",
+      "crate": "xerj-console-api",
+      "bytes": 1375,
+      "lines": 38,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/src/views.rs",
+      "crate": "xerj-console-api",
+      "bytes": 4157,
+      "lines": 143,
+      "ast_functions": 6,
+      "emitted_functions": 6,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/tests/api_tokens_flow.rs",
+      "crate": "xerj-console-api",
+      "bytes": 8303,
+      "lines": 224,
+      "ast_functions": 6,
+      "emitted_functions": 6,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/tests/dashboards_seed_and_schema.rs",
+      "crate": "xerj-console-api",
+      "bytes": 19519,
+      "lines": 539,
+      "ast_functions": 17,
+      "emitted_functions": 17,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/tests/phase1_boot_and_cluster_info.rs",
+      "crate": "xerj-console-api",
+      "bytes": 6238,
+      "lines": 198,
+      "ast_functions": 10,
+      "emitted_functions": 10,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/tests/phase2_auth_flow.rs",
+      "crate": "xerj-console-api",
+      "bytes": 17913,
+      "lines": 539,
+      "ast_functions": 20,
+      "emitted_functions": 20,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/tests/phase3_user_state.rs",
+      "crate": "xerj-console-api",
+      "bytes": 16296,
+      "lines": 503,
+      "ast_functions": 15,
+      "emitted_functions": 15,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/tests/router_precedence.rs",
+      "crate": "xerj-console-api",
+      "bytes": 2746,
+      "lines": 82,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-console-api/tests/spa_assets.rs",
+      "crate": "xerj-console-api",
+      "bytes": 4356,
+      "lines": 133,
+      "ast_functions": 8,
+      "emitted_functions": 8,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/benches/search_bench.rs",
+      "crate": "xerj-engine",
+      "bytes": 12567,
+      "lines": 322,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/examples/alloc_count.rs",
+      "crate": "xerj-engine",
+      "bytes": 3467,
+      "lines": 91,
+      "ast_functions": 3,
+      "emitted_functions": 3,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/aggs.rs",
+      "crate": "xerj-engine",
+      "bytes": 503632,
+      "lines": 12508,
+      "ast_functions": 246,
+      "emitted_functions": 246,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/audit.rs",
+      "crate": "xerj-engine",
+      "bytes": 7191,
+      "lines": 198,
+      "ast_functions": 9,
+      "emitted_functions": 9,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/bounded_ingest_resources_tests.rs",
+      "crate": "xerj-engine",
+      "bytes": 9022,
+      "lines": 240,
+      "ast_functions": 7,
+      "emitted_functions": 7,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/bulk.rs",
+      "crate": "xerj-engine",
+      "bytes": 142914,
+      "lines": 3262,
+      "ast_functions": 38,
+      "emitted_functions": 38,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/engine.rs",
+      "crate": "xerj-engine",
+      "bytes": 85887,
+      "lines": 1973,
+      "ast_functions": 58,
+      "emitted_functions": 58,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/fast_aggs.rs",
+      "crate": "xerj-engine",
+      "bytes": 228590,
+      "lines": 5499,
+      "ast_functions": 89,
+      "emitted_functions": 89,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/governor.rs",
+      "crate": "xerj-engine",
+      "bytes": 39762,
+      "lines": 934,
+      "ast_functions": 44,
+      "emitted_functions": 44,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/index.rs",
+      "crate": "xerj-engine",
+      "bytes": 1449876,
+      "lines": 32426,
+      "ast_functions": 524,
+      "emitted_functions": 524,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/ingest_memory.rs",
+      "crate": "xerj-engine",
+      "bytes": 31974,
+      "lines": 1002,
+      "ast_functions": 51,
+      "emitted_functions": 51,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/lib.rs",
+      "crate": "xerj-engine",
+      "bytes": 15173,
+      "lines": 345,
+      "ast_functions": 10,
+      "emitted_functions": 10,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/memtable.rs",
+      "crate": "xerj-engine",
+      "bytes": 161777,
+      "lines": 3784,
+      "ast_functions": 139,
+      "emitted_functions": 139,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/painless.rs",
+      "crate": "xerj-engine",
+      "bytes": 74755,
+      "lines": 2010,
+      "ast_functions": 83,
+      "emitted_functions": 83,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/rbac.rs",
+      "crate": "xerj-engine",
+      "bytes": 6222,
+      "lines": 205,
+      "ast_functions": 13,
+      "emitted_functions": 13,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/segment_cache_budget.rs",
+      "crate": "xerj-engine",
+      "bytes": 13490,
+      "lines": 404,
+      "ast_functions": 20,
+      "emitted_functions": 20,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/segment_cache_estimates.rs",
+      "crate": "xerj-engine",
+      "bytes": 9086,
+      "lines": 239,
+      "ast_functions": 14,
+      "emitted_functions": 14,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/slow_query.rs",
+      "crate": "xerj-engine",
+      "bytes": 9674,
+      "lines": 259,
+      "ast_functions": 13,
+      "emitted_functions": 13,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/sql.rs",
+      "crate": "xerj-engine",
+      "bytes": 22557,
+      "lines": 725,
+      "ast_functions": 12,
+      "emitted_functions": 12,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/turbo_ingest.rs",
+      "crate": "xerj-engine",
+      "bytes": 25235,
+      "lines": 665,
+      "ast_functions": 27,
+      "emitted_functions": 27,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/src/write_publication.rs",
+      "crate": "xerj-engine",
+      "bytes": 10717,
+      "lines": 322,
+      "ast_functions": 18,
+      "emitted_functions": 18,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/battle_test.rs",
+      "crate": "xerj-engine",
+      "bytes": 59651,
+      "lines": 1734,
+      "ast_functions": 19,
+      "emitted_functions": 19,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/chaos_tests.rs",
+      "crate": "xerj-engine",
+      "bytes": 51251,
+      "lines": 1495,
+      "ast_functions": 26,
+      "emitted_functions": 26,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/es_compat_tests.rs",
+      "crate": "xerj-engine",
+      "bytes": 91021,
+      "lines": 2443,
+      "ast_functions": 67,
+      "emitted_functions": 67,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/integration.rs",
+      "crate": "xerj-engine",
+      "bytes": 208156,
+      "lines": 6238,
+      "ast_functions": 111,
+      "emitted_functions": 111,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/multi_match_scoring.rs",
+      "crate": "xerj-engine",
+      "bytes": 5480,
+      "lines": 163,
+      "ast_functions": 3,
+      "emitted_functions": 3,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/node_lock.rs",
+      "crate": "xerj-engine",
+      "bytes": 1930,
+      "lines": 51,
+      "ast_functions": 2,
+      "emitted_functions": 2,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/perf_benchmark.rs",
+      "crate": "xerj-engine",
+      "bytes": 25431,
+      "lines": 675,
+      "ast_functions": 14,
+      "emitted_functions": 14,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/product_experience.rs",
+      "crate": "xerj-engine",
+      "bytes": 36780,
+      "lines": 1032,
+      "ast_functions": 13,
+      "emitted_functions": 13,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/rc4_w2_storage_hardening.rs",
+      "crate": "xerj-engine",
+      "bytes": 6394,
+      "lines": 173,
+      "ast_functions": 3,
+      "emitted_functions": 3,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/search_context_ttl.rs",
+      "crate": "xerj-engine",
+      "bytes": 3288,
+      "lines": 90,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-engine/tests/shard_router_write_path.rs",
+      "crate": "xerj-engine",
+      "bytes": 4080,
+      "lines": 105,
+      "ast_functions": 2,
+      "emitted_functions": 2,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-fts/src/analyzer.rs",
+      "crate": "xerj-fts",
+      "bytes": 65798,
+      "lines": 2001,
+      "ast_functions": 59,
+      "emitted_functions": 59,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-fts/src/bm25.rs",
+      "crate": "xerj-fts",
+      "bytes": 10559,
+      "lines": 314,
+      "ast_functions": 18,
+      "emitted_functions": 18,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-fts/src/index.rs",
+      "crate": "xerj-fts",
+      "bytes": 61950,
+      "lines": 1492,
+      "ast_functions": 31,
+      "emitted_functions": 31,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-fts/src/lib.rs",
+      "crate": "xerj-fts",
+      "bytes": 3564,
+      "lines": 84,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-fts/src/postings.rs",
+      "crate": "xerj-fts",
+      "bytes": 32001,
+      "lines": 828,
+      "ast_functions": 31,
+      "emitted_functions": 31,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-fts/src/search.rs",
+      "crate": "xerj-fts",
+      "bytes": 76797,
+      "lines": 1982,
+      "ast_functions": 73,
+      "emitted_functions": 73,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-logs/src/columnar.rs",
+      "crate": "xerj-logs",
+      "bytes": 22674,
+      "lines": 616,
+      "ast_functions": 28,
+      "emitted_functions": 28,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-logs/src/ingest.rs",
+      "crate": "xerj-logs",
+      "bytes": 14930,
+      "lines": 424,
+      "ast_functions": 25,
+      "emitted_functions": 25,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-logs/src/lib.rs",
+      "crate": "xerj-logs",
+      "bytes": 698,
+      "lines": 22,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-logs/src/query.rs",
+      "crate": "xerj-logs",
+      "bytes": 17251,
+      "lines": 475,
+      "ast_functions": 16,
+      "emitted_functions": 16,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-logs/src/retention.rs",
+      "crate": "xerj-logs",
+      "bytes": 7193,
+      "lines": 205,
+      "ast_functions": 15,
+      "emitted_functions": 15,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-mcp/src/main.rs",
+      "crate": "xerj-mcp",
+      "bytes": 29508,
+      "lines": 721,
+      "ast_functions": 29,
+      "emitted_functions": 29,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/ast.rs",
+      "crate": "xerj-query",
+      "bytes": 44151,
+      "lines": 1120,
+      "ast_functions": 16,
+      "emitted_functions": 16,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/dates.rs",
+      "crate": "xerj-query",
+      "bytes": 39090,
+      "lines": 1012,
+      "ast_functions": 41,
+      "emitted_functions": 41,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/error.rs",
+      "crate": "xerj-query",
+      "bytes": 2409,
+      "lines": 71,
+      "ast_functions": 4,
+      "emitted_functions": 4,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/executor.rs",
+      "crate": "xerj-query",
+      "bytes": 19377,
+      "lines": 505,
+      "ast_functions": 23,
+      "emitted_functions": 23,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/lib.rs",
+      "crate": "xerj-query",
+      "bytes": 3922,
+      "lines": 113,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/parser.rs",
+      "crate": "xerj-query",
+      "bytes": 187082,
+      "lines": 5230,
+      "ast_functions": 171,
+      "emitted_functions": 171,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/planner.rs",
+      "crate": "xerj-query",
+      "bytes": 29029,
+      "lines": 825,
+      "ast_functions": 14,
+      "emitted_functions": 14,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/rewriter.rs",
+      "crate": "xerj-query",
+      "bytes": 21186,
+      "lines": 606,
+      "ast_functions": 22,
+      "emitted_functions": 22,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-query/src/sort.rs",
+      "crate": "xerj-query",
+      "bytes": 13645,
+      "lines": 357,
+      "ast_functions": 14,
+      "emitted_functions": 14,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-server/build.rs",
+      "crate": "xerj-server",
+      "bytes": 1293,
+      "lines": 34,
+      "ast_functions": 1,
+      "emitted_functions": 1,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-server/src/debug_profiling.rs",
+      "crate": "xerj-server",
+      "bytes": 13656,
+      "lines": 388,
+      "ast_functions": 17,
+      "emitted_functions": 17,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-server/src/grpc.rs",
+      "crate": "xerj-server",
+      "bytes": 21030,
+      "lines": 588,
+      "ast_functions": 15,
+      "emitted_functions": 15,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-server/src/ingest_memory_trace.rs",
+      "crate": "xerj-server",
+      "bytes": 12644,
+      "lines": 404,
+      "ast_functions": 21,
+      "emitted_functions": 21,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-server/src/main.rs",
+      "crate": "xerj-server",
+      "bytes": 81705,
+      "lines": 1781,
+      "ast_functions": 25,
+      "emitted_functions": 25,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-server/tests/pdf_worker.rs",
+      "crate": "xerj-server",
+      "bytes": 8919,
+      "lines": 240,
+      "ast_functions": 8,
+      "emitted_functions": 8,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/examples/stored_projection_probe.rs",
+      "crate": "xerj-storage",
+      "bytes": 6658,
+      "lines": 191,
+      "ast_functions": 9,
+      "emitted_functions": 9,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/backend.rs",
+      "crate": "xerj-storage",
+      "bytes": 21255,
+      "lines": 599,
+      "ast_functions": 32,
+      "emitted_functions": 32,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/cache.rs",
+      "crate": "xerj-storage",
+      "bytes": 11825,
+      "lines": 312,
+      "ast_functions": 11,
+      "emitted_functions": 11,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/doc_values.rs",
+      "crate": "xerj-storage",
+      "bytes": 34649,
+      "lines": 866,
+      "ast_functions": 29,
+      "emitted_functions": 29,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/index_store.rs",
+      "crate": "xerj-storage",
+      "bytes": 198858,
+      "lines": 4416,
+      "ast_functions": 97,
+      "emitted_functions": 97,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/lib.rs",
+      "crate": "xerj-storage",
+      "bytes": 5423,
+      "lines": 130,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/merge.rs",
+      "crate": "xerj-storage",
+      "bytes": 22159,
+      "lines": 580,
+      "ast_functions": 15,
+      "emitted_functions": 15,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/segment.rs",
+      "crate": "xerj-storage",
+      "bytes": 33481,
+      "lines": 819,
+      "ast_functions": 24,
+      "emitted_functions": 24,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/stored_codec.rs",
+      "crate": "xerj-storage",
+      "bytes": 146427,
+      "lines": 3679,
+      "ast_functions": 92,
+      "emitted_functions": 92,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/stored_codec/row_hydration.rs",
+      "crate": "xerj-storage",
+      "bytes": 50250,
+      "lines": 1345,
+      "ast_functions": 27,
+      "emitted_functions": 27,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/version_map.rs",
+      "crate": "xerj-storage",
+      "bytes": 29393,
+      "lines": 736,
+      "ast_functions": 32,
+      "emitted_functions": 32,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-storage/src/wal.rs",
+      "crate": "xerj-storage",
+      "bytes": 92964,
+      "lines": 2319,
+      "ast_functions": 62,
+      "emitted_functions": 62,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-vector/examples/recall_probe.rs",
+      "crate": "xerj-vector",
+      "bytes": 5154,
+      "lines": 125,
+      "ast_functions": 3,
+      "emitted_functions": 3,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-vector/examples/storage_view_search_bench.rs",
+      "crate": "xerj-vector",
+      "bytes": 3413,
+      "lines": 103,
+      "ast_functions": 6,
+      "emitted_functions": 6,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-vector/src/distance.rs",
+      "crate": "xerj-vector",
+      "bytes": 6100,
+      "lines": 186,
+      "ast_functions": 13,
+      "emitted_functions": 13,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-vector/src/hnsw.rs",
+      "crate": "xerj-vector",
+      "bytes": 74277,
+      "lines": 1989,
+      "ast_functions": 98,
+      "emitted_functions": 98,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-vector/src/lib.rs",
+      "crate": "xerj-vector",
+      "bytes": 744,
+      "lines": 24,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-vector/src/quantizer.rs",
+      "crate": "xerj-vector",
+      "bytes": 30151,
+      "lines": 836,
+      "ast_functions": 34,
+      "emitted_functions": 34,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-vector/src/search.rs",
+      "crate": "xerj-vector",
+      "bytes": 7638,
+      "lines": 236,
+      "ast_functions": 19,
+      "emitted_functions": 19,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-wasm/examples/example_custom_plugin.rs",
+      "crate": "xerj-wasm",
+      "bytes": 2496,
+      "lines": 80,
+      "ast_functions": 3,
+      "emitted_functions": 3,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-wasm/src/builtins.rs",
+      "crate": "xerj-wasm",
+      "bytes": 44795,
+      "lines": 1197,
+      "ast_functions": 77,
+      "emitted_functions": 77,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-wasm/src/lib.rs",
+      "crate": "xerj-wasm",
+      "bytes": 2583,
+      "lines": 66,
+      "ast_functions": 0,
+      "emitted_functions": 0,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-wasm/src/pipeline.rs",
+      "crate": "xerj-wasm",
+      "bytes": 15828,
+      "lines": 443,
+      "ast_functions": 13,
+      "emitted_functions": 13,
+      "error_nodes": 0
+    },
+    {
+      "file": "crates/xerj-wasm/tests/integration.rs",
+      "crate": "xerj-wasm",
+      "bytes": 16410,
+      "lines": 434,
+      "ast_functions": 13,
+      "emitted_functions": 13,
+      "error_nodes": 0
+    },
+    {
+      "file": "tests/es-compat-yaml/src/main.rs",
+      "crate": "tests",
+      "bytes": 64411,
+      "lines": 1661,
+      "ast_functions": 20,
+      "emitted_functions": 20,
+      "error_nodes": 0
+    }
+  ]
+}

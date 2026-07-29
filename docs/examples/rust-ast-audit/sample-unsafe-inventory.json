@@ -1,0 +1,253 @@
+{
+  "unsafe_blocks": [
+    {
+      "file": "crates/xerj-ai/src/neural.rs",
+      "fn": "load",
+      "line": 105,
+      "ops": [],
+      "is_unsafe_fn": false,
+      "crate": "xerj-ai"
+    },
+    {
+      "file": "crates/xerj-api/src/es_compat.rs",
+      "fn": "read_disk_stats",
+      "line": 21687,
+      "ops": [
+        "ffi_call",
+        "uninit"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-api"
+    },
+    {
+      "file": "crates/xerj-api/src/es_compat.rs",
+      "fn": "read_disk_stats",
+      "line": 21688,
+      "ops": [
+        "ffi_call",
+        "uninit"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-api"
+    },
+    {
+      "file": "crates/xerj-api/src/es_compat.rs",
+      "fn": "remove_dotted_path",
+      "line": 25020,
+      "ops": [
+        "ptr_reborrow"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-api"
+    },
+    {
+      "file": "crates/xerj-api/src/es_compat.rs",
+      "fn": "remove_dotted_path",
+      "line": 25029,
+      "ops": [
+        "ptr_reborrow"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-api"
+    },
+    {
+      "file": "crates/xerj-api/src/es_compat.rs",
+      "fn": "remove_dotted_path",
+      "line": 25033,
+      "ops": [
+        "ptr_reborrow"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-api"
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/pdf.rs",
+      "fn": "set_worker_memory_limit",
+      "line": 242,
+      "ops": [
+        "ffi_call"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-autoindex"
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/pdf.rs",
+      "fn": "terminate_worker_tree",
+      "line": 264,
+      "ops": [
+        "ffi_call"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-autoindex"
+    },
+    {
+      "file": "crates/xerj-autoindex/src/extract/pdf.rs",
+      "fn": "terminate_worker_descendants",
+      "line": 273,
+      "ops": [
+        "ffi_call"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-autoindex"
+    },
+    {
+      "file": "crates/xerj-engine/src/governor.rs",
+      "fn": "page_size_bytes",
+      "line": 586,
+      "ops": [
+        "ffi_call"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-engine/src/governor.rs",
+      "fn": "disk_stats",
+      "line": 699,
+      "ops": [
+        "ffi_call",
+        "uninit"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-engine/src/governor.rs",
+      "fn": "disk_stats",
+      "line": 700,
+      "ops": [
+        "ffi_call",
+        "uninit"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-engine/src/lib.rs",
+      "fn": "ingest_pool",
+      "line": 119,
+      "ops": [
+        "ffi_call"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-engine/src/lib.rs",
+      "fn": "background_pool",
+      "line": 150,
+      "ops": [
+        "ffi_call"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-engine/src/lib.rs",
+      "fn": "merge_pool",
+      "line": 190,
+      "ops": [
+        "ffi_call"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-engine/src/turbo_ingest.rs",
+      "fn": "tokenize_fast",
+      "line": 199,
+      "ops": [
+        "utf8_unchecked"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-engine/tests/perf_benchmark.rs",
+      "fn": "page_size_bytes",
+      "line": 513,
+      "ops": [],
+      "is_unsafe_fn": false,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-fts/src/index.rs",
+      "fn": "mmap_file",
+      "line": 1148,
+      "ops": [
+        "mmap"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-fts"
+    },
+    {
+      "file": "crates/xerj-server/src/ingest_memory_trace.rs",
+      "fn": "process_cpu_time_ns",
+      "line": 181,
+      "ops": [
+        "ffi_call"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-server"
+    },
+    {
+      "file": "crates/xerj-server/src/main.rs",
+      "fn": "run_cli_index",
+      "line": 979,
+      "ops": [
+        "from_raw",
+        "mmap",
+        "slice_raw_parts"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-server"
+    },
+    {
+      "file": "crates/xerj-server/src/main.rs",
+      "fn": "run_cli_index",
+      "line": 988,
+      "ops": [
+        "from_raw",
+        "mmap",
+        "slice_raw_parts"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-server"
+    },
+    {
+      "file": "crates/xerj-storage/src/segment.rs",
+      "fn": "open",
+      "line": 553,
+      "ops": [
+        "mmap"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-storage"
+    },
+    {
+      "file": "crates/xerj-vector/src/hnsw.rs",
+      "fn": "prefetch_vector",
+      "line": 264,
+      "ops": [
+        "ptr_arith",
+        "raw_deref"
+      ],
+      "is_unsafe_fn": false,
+      "crate": "xerj-vector"
+    }
+  ],
+  "unsafe_fns": [
+    {
+      "file": "crates/xerj-engine/examples/alloc_count.rs",
+      "fn": "alloc",
+      "line": 24,
+      "crate": "xerj-engine"
+    },
+    {
+      "file": "crates/xerj-engine/examples/alloc_count.rs",
+      "fn": "dealloc",
+      "line": 29,
+      "crate": "xerj-engine"
+    }
+  ]
+}
