@@ -9,6 +9,7 @@ pub mod coerce;
 mod content;
 pub mod correlate;
 pub mod dataset;
+pub mod detect;
 pub mod esclient;
 pub mod extract;
 pub mod ids;
@@ -122,6 +123,43 @@ fn record_bulk_outcome(
             true
         }
     }
+}
+
+// ─── second-brain graph runtime ──────────────────────────────────────────
+
+/// Per-run graph state, shared read-only with the Phase B workers
+/// (SECOND_BRAIN_SPEC §6.6). Built after the plan is final because the
+/// detectors resolve links against the FULL corpus — a per-file view could
+/// not tell "dangling" from "not walked yet".
+struct GraphRt {
+    corpus: detect::CorpusIndex,
+    detectors: Vec<Box<dyn detect::EdgeDetector>>,
+    /// Raw-source href pass handle. Lives outside the registry because the
+    /// HTML extractor strips markup before sectioning, so anchors only exist
+    /// in the raw bytes — a source the `EdgeDetector` trait deliberately
+    /// never sees (see `detect::href` module docs).
+    href_raw: detect::href::Href,
+    edges_index: String,
+    brain: String,
+    /// ONE wall-clock stamp per run: `created_at` is the single
+    /// non-deterministic edge field (§6.4); per-worker clocks would make two
+    /// halves of one run disagree about when it happened.
+    created_at_ms: i64,
+    /// detector tag → edges written this run (run-summary honesty §6.6.4).
+    written: Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    self_dropped: AtomicU64,
+    /// Prior-generation edges soft-invalidated before this run's writes.
+    invalidated: u64,
+}
+
+/// `emit_document` section locators are `s{i}`; everything else (row/line/
+/// table locators) is not a text section and must not reach `detect_text`.
+fn section_ordinal(locator: &str) -> Option<u32> {
+    let rest = locator.strip_prefix('s')?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
 }
 
 // ─── Phase A: per-file scan (sniff + bounded sampling) ───────────────────
@@ -824,6 +862,162 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
             journal.file_replace_start(key, generation)?;
         }
     }
+    // ── second-brain graph: corpus table, structural edges, invalidation ──
+    // (SECOND_BRAIN_SPEC §6.6.1/§6.6.3.) Runs after plan finalization so the
+    // detectors see the whole corpus, and BEFORE any Phase B publication so
+    // replacement invalidation can only ever see prior-generation edges —
+    // running it later would invalidate this run's own fresh edges.
+    let bulk_cut = cfg.bulk_mb << 20;
+    let junk_records = AtomicU64::new(0);
+    let bulk_errors = Mutex::new(Vec::<String>::new());
+    let graph: Option<GraphRt> = if cfg.no_graph {
+        None
+    } else {
+        let brain = match &cfg.brain {
+            Some(b) => b.clone(),
+            None => {
+                let base = cfg
+                    .root
+                    .canonicalize()
+                    .unwrap_or_else(|_| cfg.root.clone());
+                let name = base
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let slug = dataset::sanitize_slug(&name);
+                if slug.is_empty() {
+                    "brain".into()
+                } else {
+                    slug
+                }
+            }
+        };
+        if let Err(reason) = detect::validate_brain(&brain) {
+            anyhow::bail!(
+                "brain name '{brain}' is invalid: {reason}. Pass an explicit --brain <name> \
+                 or disable relationship detection with --no-graph"
+            );
+        }
+        // Corpus resolution table: every planned file's rel → identity +
+        // anchor node. valid_at comes from the file mtime (§6.4) so an
+        // unchanged corpus re-emits byte-identical edge_ids and re-runs
+        // converge by overwrite, exactly like ids::doc_id does for nodes.
+        let mut corpus_files = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let key = &keys[i];
+            if key.is_empty() {
+                continue;
+            }
+            let Some(fa) = plan.files.get(key) else {
+                continue; // junk or post-freeze files carry no node docs
+            };
+            let slug = fa
+                .assignments
+                .iter()
+                .find(|(g, _)| g.is_none())
+                .map(|(_, s)| s.clone())
+                .or_else(|| fa.assignments.iter().map(|(_, s)| s.clone()).min());
+            let Some(slug) = slug else { continue };
+            let mtime_ms = std::fs::metadata(&f.path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            corpus_files.push(detect::corpus_file(&f.rel, key, &slug, &fa.family, mtime_ms));
+        }
+        let corpus = detect::CorpusIndex::build(corpus_files);
+        let detectors = detect::default_detectors();
+        let edges_index = detect::edges_index_name(&brain);
+        let created_at_ms = chrono::Utc::now().timestamp_millis();
+
+        es.ensure_index(&edges_index, &detect::edge_index_mapping())
+            .with_context(|| format!("create edges index {edges_index}"))?;
+        let mut nodes_indices: Vec<&str> = plan.datasets.iter().map(|d| d.index.as_str()).collect();
+        nodes_indices.sort_unstable();
+        nodes_indices.dedup();
+        detect::ensure_brain_meta(
+            &es,
+            &edges_index,
+            &brain,
+            &nodes_indices.join(","),
+            created_at_ms,
+        )?;
+
+        // Replacement invalidation FIRST: soft-invalidate every live edge a
+        // replaced file taught in earlier runs. The bi-temporal record stays
+        // queryable (`as_of` time travel); nothing is deleted.
+        let mut invalidated = 0u64;
+        {
+            let mut replaced_rels: Vec<&str> = todo
+                .iter()
+                .filter(|&&i| cleanup_required.contains(&keys[i]))
+                .map(|&i| files[i].rel.as_str())
+                .collect();
+            replaced_rels.sort_unstable();
+            replaced_rels.dedup();
+            for rel in replaced_rels {
+                invalidated += detect::invalidate_prior_edges(&es, &edges_index, rel, created_at_ms)
+                    .with_context(|| format!("invalidate prior edges taught by {rel}"))?;
+            }
+        }
+
+        // Structural detection (samedir chains) + bulk write, cut at the same
+        // --bulk-mb threshold as node bulks.
+        let mut structural = Vec::new();
+        for det in &detectors {
+            det.detect_structure(&corpus, &mut structural);
+        }
+        let assembled = detect::assemble(&structural, &edges_index, created_at_ms);
+        let mut written: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
+        {
+            let mut send_err: Option<String> = None;
+            let mut buf: Vec<u8> = Vec::new();
+            for edge in &assembled.edges {
+                buf.extend_from_slice(&edge.ndjson);
+                *written.entry(edge.detector).or_default() += 1;
+                if buf.len() >= bulk_cut
+                    && record_bulk_outcome(
+                        &es,
+                        std::mem::take(&mut buf),
+                        &junk_records,
+                        &bulk_errors,
+                        &mut send_err,
+                    )
+                {
+                    break;
+                }
+            }
+            if send_err.is_none() && !buf.is_empty() {
+                record_bulk_outcome(&es, buf, &junk_records, &bulk_errors, &mut send_err);
+            }
+            if let Some(e) = send_err {
+                anyhow::bail!("write structural graph edges to {edges_index}: {e}");
+            }
+        }
+        if !cfg.quiet {
+            eprintln!(
+                "graph: brain '{brain}' → {edges_index}; {} structural edges, {} prior edges \
+                 invalidated ({} detectors live)",
+                assembled.edges.len(),
+                invalidated,
+                detectors.len()
+            );
+        }
+        Some(GraphRt {
+            corpus,
+            detectors,
+            href_raw: detect::href::Href::default(),
+            edges_index,
+            brain,
+            created_at_ms,
+            written: Mutex::new(written),
+            self_dropped: AtomicU64::new(assembled.self_dropped),
+            invalidated,
+        })
+    };
+
     // ascending by size — workers pop() from the tail, so the BIGGEST files
     // start first and can't serialize the end of the run.
     todo.sort_by_key(|&i| files[i].size);
@@ -854,10 +1048,7 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
     let journal_mx = Mutex::new(&mut journal);
     let files_done = AtomicU64::new(0);
     let records_total = AtomicU64::new(0);
-    let junk_records = AtomicU64::new(0);
-    let bulk_errors = Mutex::new(Vec::<String>::new());
     let extra_junk = Mutex::new(Vec::<JunkFile>::new());
-    let bulk_cut = cfg.bulk_mb << 20;
 
     std::thread::scope(|scope| {
         for _ in 0..cfg.workers.min(n_todo.max(1)) {
@@ -890,6 +1081,10 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                     let mut file_records = 0u64;
                     let mut file_junk = 0u64;
                     let mut send_err: Option<String> = None;
+                    // Edges this file teaches — buffered apart from the node
+                    // staging file (different target index) and sent only
+                    // after the node bulks are accepted (§6.7).
+                    let mut edge_drafts: Vec<detect::EdgeDraft> = Vec::new();
                     let mut staged = match tempfile::Builder::new()
                         .prefix(".autoindex-stage-")
                         .tempfile_in(&state_dir)
@@ -948,12 +1143,12 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                             fields.insert("ax_format".into(), Value::String(format_str(Some(&sn))));
                             let id = ids::doc_id(slug, key, &rec.locator);
                             let action = json!({"index": {"_index": rt.index, "_id": id}});
+                            let doc = Value::Object(fields);
                             if let Err(error) = writeln!(
                                 staged.as_file_mut(),
                                 "{}\n{}",
                                 action,
-                                serde_json::to_string(&Value::Object(fields))
-                                    .unwrap_or_else(|_| "{}".into())
+                                serde_json::to_string(&doc).unwrap_or_else(|_| "{}".into())
                             ) {
                                 send_err =
                                     Some(format!("stage extracted records for {}: {error}", f.rel));
@@ -961,6 +1156,29 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                             }
                             rt.records.fetch_add(1, Ordering::Relaxed);
                             file_records += 1;
+                            // Textual edge detection (§6.6.2), after the node
+                            // action is staged: `body` is the exact section
+                            // string the node doc carries, and `id` is the
+                            // section node the evidence lives in.
+                            if let Some(gr) = graph.as_ref() {
+                                if let Some(ordinal) = section_ordinal(&rec.locator) {
+                                    if let (Some(cf), Some(body)) = (
+                                        gr.corpus.files.get(&f.rel),
+                                        doc.get("body").and_then(Value::as_str),
+                                    ) {
+                                        let ctx = detect::SectionCtx {
+                                            corpus: &gr.corpus,
+                                            file: cf,
+                                            section_ordinal: ordinal,
+                                            section_doc_id: &id,
+                                            text: body,
+                                        };
+                                        for det in &gr.detectors {
+                                            det.detect_text(&ctx, &mut edge_drafts);
+                                        }
+                                    }
+                                }
+                            }
                             true
                         };
                         let res = extract::extract(&f.path, &sn, None, &mut sink);
@@ -978,6 +1196,32 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                                     reason: format!("extract failed at index time: {e}"),
                                     bytes: f.size,
                                 });
+                            }
+                        }
+                    }
+                    // Raw-source href pass: the HTML extractor strips markup
+                    // before sectioning, so `<a href>` evidence exists only in
+                    // the raw bytes (detect::href module docs). The second
+                    // content::verify below still covers this re-read.
+                    if send_err.is_none() {
+                        if let Some(gr) = graph.as_ref() {
+                            if let Some(cf) = gr
+                                .corpus
+                                .files
+                                .get(&f.rel)
+                                .filter(|cf| cf.family == "html")
+                            {
+                                if let Ok(Some(bytes)) =
+                                    extract::read_whole(&f.path, sn.gzip, extract::MAX_WHOLE_FILE)
+                                {
+                                    let (raw, _) = sniff::decode_text(&bytes);
+                                    gr.href_raw.detect_raw_html(
+                                        &gr.corpus,
+                                        cf,
+                                        &raw,
+                                        &mut edge_drafts,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1084,6 +1328,49 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                             );
                         }
                     }
+                    // Second-brain edges for this file (§6.7): only after the
+                    // node bulks were accepted, so an edge never precedes its
+                    // own src doc. A failed edge send leaves the file
+                    // un-journaled — the whole file (nodes AND edges) is
+                    // republished on the next run, which converges because
+                    // both sides overwrite by deterministic _id.
+                    if send_err.is_none() && !edge_drafts.is_empty() {
+                        if let Some(gr) = graph.as_ref() {
+                            let out =
+                                detect::assemble(&edge_drafts, &gr.edges_index, gr.created_at_ms);
+                            gr.self_dropped.fetch_add(out.self_dropped, Ordering::Relaxed);
+                            let mut ebuf: Vec<u8> = Vec::new();
+                            for edge in &out.edges {
+                                ebuf.extend_from_slice(&edge.ndjson);
+                                if ebuf.len() >= bulk_cut
+                                    && record_bulk_outcome(
+                                        &es,
+                                        std::mem::take(&mut ebuf),
+                                        &junk_records,
+                                        &bulk_errors,
+                                        &mut send_err,
+                                    )
+                                {
+                                    break;
+                                }
+                            }
+                            if send_err.is_none() && !ebuf.is_empty() {
+                                record_bulk_outcome(
+                                    &es,
+                                    ebuf,
+                                    &junk_records,
+                                    &bulk_errors,
+                                    &mut send_err,
+                                );
+                            }
+                            if send_err.is_none() {
+                                let mut written = gr.written.lock().unwrap();
+                                for edge in &out.edges {
+                                    *written.entry(edge.detector).or_default() += 1;
+                                }
+                            }
+                        }
+                    }
                     if let Some(e) = send_err {
                         // endpoint trouble: record, do NOT journal file_done
                         let mut be = bulk_errors.lock().unwrap();
@@ -1159,6 +1446,10 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
 
     // ── finalize: refresh, verify, correlate, catalog ────────────────────
     es.refresh(&format!("{}-*", cfg.prefix)).ok();
+    // The dot-prefixed edges index is outside the {prefix}-* pattern.
+    if let Some(gr) = &graph {
+        es.refresh(&gr.edges_index).ok();
+    }
 
     // live per-dataset counts + time ranges (every claim traces to a run)
     let mut ds_counts: HashMap<String, u64> = HashMap::new();
@@ -1404,7 +1695,36 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
 
     let wall = t0.elapsed().as_secs_f64();
     let total_records: u64 = ds_counts.values().sum();
-    let run_doc = json!({
+    // Run-summary honesty (§6.6.4): what the detectors wrote AND what they
+    // could not resolve — a dangling [[link]] is a fact about the corpus, not
+    // something to swallow.
+    let graph_summary = graph.as_ref().map(|gr| {
+        let written = gr.written.lock().unwrap();
+        let mut counters = detect::DetectorCounters::default();
+        for det in &gr.detectors {
+            let c = det.counters();
+            counters.unresolved += c.unresolved;
+            counters.ambiguous += c.ambiguous;
+        }
+        let raw = gr.href_raw.counters();
+        counters.unresolved += raw.unresolved;
+        counters.ambiguous += raw.ambiguous;
+        let by_detector: Map<String, Value> = written
+            .iter()
+            .map(|(tag, n)| ((*tag).to_string(), json!(n)))
+            .collect();
+        json!({
+            "brain": gr.brain,
+            "edges_index": gr.edges_index,
+            "edges_written": written.values().sum::<u64>(),
+            "by_detector": by_detector,
+            "edges_unresolved": counters.unresolved,
+            "edges_ambiguous": counters.ambiguous,
+            "edges_self_dropped": gr.self_dropped.load(Ordering::Relaxed),
+            "edges_invalidated": gr.invalidated,
+        })
+    });
+    let mut run_doc = json!({
         "doc_kind": "run",
         "run_id": run_id,
         "root": root_str,
@@ -1422,6 +1742,9 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
         "workers": cfg.workers,
         "semantic": !cfg.no_semantic,
     });
+    if let Some(g) = &graph_summary {
+        run_doc["graph"] = g.clone();
+    }
     push_doc(&format!("run:{run_id}"), &run_doc, &mut cat_buf);
 
     if !cat_buf.is_empty() {
@@ -1445,6 +1768,26 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
         rows.sort_by_key(|r| std::cmp::Reverse(r.1));
         for (idx, cnt) in rows {
             println!("  {idx:<40} {cnt:>10} docs");
+        }
+        if let Some(g) = &graph_summary {
+            let by: Vec<String> = g["by_detector"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(tag, n)| format!("{tag} {n}"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            println!(
+                "graph: {} edges → {} ({}); {} unresolved, {} ambiguous, {} self-dropped, {} invalidated",
+                g["edges_written"],
+                g["edges_index"].as_str().unwrap_or(""),
+                if by.is_empty() { "no detections".to_string() } else { by.join(", ") },
+                g["edges_unresolved"],
+                g["edges_ambiguous"],
+                g["edges_self_dropped"],
+                g["edges_invalidated"],
+            );
         }
         println!(
             "\nnext: `xerj autoindex map --url {}` for the data map; search via GET /{}-*/_search",
@@ -1583,6 +1926,33 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
                 junk_files.len() as u64
             )
         );
+        // Second-brain summary (§6.1): live edge count straight from the
+        // edges index, scoped by `exists src` so the meta doc never counts.
+        if let Some(g) = runs.first().and_then(|r| r.get("graph")) {
+            if let (Some(brain), Some(edges_index)) = (
+                g.get("brain").and_then(Value::as_str),
+                g.get("edges_index").and_then(Value::as_str),
+            ) {
+                let live = es
+                    .search(
+                        edges_index,
+                        &json!({
+                            "size": 0,
+                            "track_total_hits": true,
+                            "query": {"bool": {
+                                "filter": [{"exists": {"field": "src"}}],
+                                "must_not": [{"exists": {"field": "invalid_at"}}]
+                            }}
+                        }),
+                    )
+                    .ok()
+                    .and_then(|v| v.pointer("/hits/total/value").and_then(Value::as_u64));
+                match live {
+                    Some(n) => println!("\ngraph: {n} live edges in {edges_index} (brain {brain})"),
+                    None => println!("\ngraph: brain {brain} — edges index {edges_index} unreachable"),
+                }
+            }
+        }
     }
     Ok(0)
 }
@@ -1610,6 +1980,7 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
         let mut done = 0u64;
         let mut records = 0u64;
         let mut finished = false;
+        let mut graph_line: Option<String> = None;
         if let Ok(f) = std::fs::File::open(&jp) {
             use std::io::BufRead;
             for line in std::io::BufReader::new(f).lines().map_while(|l| l.ok()) {
@@ -1622,7 +1993,20 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
                             done += 1;
                             records += v.get("records").and_then(|r| r.as_u64()).unwrap_or(0);
                         }
-                        Some("finish") => finished = true,
+                        Some("finish") => {
+                            finished = true;
+                            // Latest finish wins — the summary embeds the run
+                            // doc, whose `graph` block is the edge count of
+                            // record for this journal.
+                            if let Some(g) = v.pointer("/summary/graph") {
+                                graph_line = Some(format!(
+                                    "graph: {} edges written to {} (brain {})",
+                                    g.get("edges_written").and_then(Value::as_u64).unwrap_or(0),
+                                    g.get("edges_index").and_then(Value::as_str).unwrap_or("?"),
+                                    g.get("brain").and_then(Value::as_str).unwrap_or("?"),
+                                ));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1636,6 +2020,9 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
             records,
             if finished { "FINISHED" } else { "in progress" }
         );
+        if let Some(line) = graph_line {
+            println!("  {line}");
+        }
     }
     // live indices
     if let Ok(es) = Es::new(&cfg.url, cfg.api_key.clone()) {
