@@ -187,6 +187,11 @@ impl Config {
                 "embedding.onnx_session_pool_size must be in 1..=2",
             ));
         }
+        if self.embedding.onnx_scheduling_window > self.embedding.onnx_max_pending {
+            return Err(XerjError::config(
+                "embedding.onnx_scheduling_window must be <= embedding.onnx_max_pending",
+            ));
+        }
 
         // ── Config honesty guards ────────────────────────────────────────────
         // Some config knobs exist in the schema but are not wired into any code
@@ -1415,6 +1420,19 @@ mod tests {
                     .expect_err(&format!("{key}={value} must be rejected"));
             }
         }
+    }
+
+    #[test]
+    fn onnx_scheduling_window_cannot_exceed_backend_pending_limit() {
+        Config::from_toml_str("[embedding]\nonnx_scheduling_window = 64\nonnx_max_pending = 64\n")
+            .expect("equal scheduling and backend limits are valid");
+        let error = Config::from_toml_str(
+            "[embedding]\nonnx_scheduling_window = 65\nonnx_max_pending = 64\n",
+        )
+        .expect_err("a scheduling window above max_pending must fail at startup");
+        assert!(error
+            .to_string()
+            .contains("onnx_scheduling_window must be <= embedding.onnx_max_pending"));
     }
 
     #[test]

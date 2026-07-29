@@ -86,8 +86,8 @@ impl OnnxPool {
         intra_threads: usize,
         pool_size: usize,
     ) -> Result<Self> {
-        if pool_size == 0 {
-            return Err(anyhow!("ONNX session pool size must be non-zero"));
+        if !(1..=2).contains(&pool_size) {
+            return Err(anyhow!("ONNX session pool size must be in 1..=2"));
         }
         let sessions = build_exact_pool(pool_size, |ordinal| {
             OnnxEmbedder::load_bytes(model_bytes, tokenizer_bytes, intra_threads).with_context(
@@ -467,6 +467,17 @@ mod tests {
                     .collect::<Vec<_>>(),
                 expected_bits
             );
+        }
+    }
+
+    #[test]
+    fn pool_loader_defensively_rejects_sizes_outside_supported_bound() {
+        for pool_size in [0, 3, usize::MAX] {
+            let error = match OnnxPool::load_bytes(&[], &[], 1, pool_size) {
+                Ok(_) => panic!("pool size {pool_size} must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("must be in 1..=2"));
         }
     }
 

@@ -8411,16 +8411,6 @@ impl Index {
             return sources.into_iter().map(Ok).collect();
         }
 
-        struct EmbedJob {
-            source_idx: usize,
-            field: String,
-            target: String,
-            dims: usize,
-            original_text: String,
-            texts: Vec<String>,
-            offsets: Vec<(usize, usize)>,
-        }
-
         let mut jobs = Vec::<EmbedJob>::new();
         let mut pre_failures: Vec<Option<String>> = (0..sources.len()).map(|_| None).collect();
         let allowed_metadata_fields: HashSet<String> = specs
@@ -8524,18 +8514,20 @@ impl Index {
             // Bound caller-side windows as well as backend-internal batches.
             // This avoids an arbitrarily large proxy payload and gives ONNX a
             // useful cross-document scheduling window without giant padding.
-            let max_passages_per_window = self.embedding_config.onnx_scheduling_window;
+            // The ONNX scheduling knob must not silently resize requests to
+            // remote/proxy backends. Before ONNX throughput controls those
+            // backends used the fixed 64-passage window.
+            let max_passages_per_window = semantic_embedding_window_limit(
+                onnx_pinned,
+                self.embedding_config.onnx_scheduling_window,
+            );
             let passage_counts = jobs.iter().map(|job| job.texts.len()).collect::<Vec<_>>();
             let mut windows = Vec::new();
             let mut start = 0;
             while start < jobs.len() {
                 let (end, passages) =
                     semantic_embedding_window_end(&passage_counts, start, max_passages_per_window);
-                let texts: Vec<String> = jobs[start..end]
-                    .iter()
-                    .flat_map(|job| job.texts.iter().cloned())
-                    .collect();
-                windows.push((start, end, passages, texts));
+                windows.push((start, end, passages));
                 start = end;
             }
 
@@ -8549,7 +8541,9 @@ impl Index {
                 self.embedding_config.onnx_session_pool_size,
             ) {
                 let results = collect_ordinal_buffered_two(windows.len(), |ordinal| {
-                    embedder.embed_batch(windows[ordinal].3.clone())
+                    let (start, end, _) = windows[ordinal];
+                    let texts = semantic_embedding_window_texts(&jobs, start, end);
+                    embedder.embed_batch(texts)
                 })
                 .await;
                 window_results.extend(
@@ -8559,13 +8553,9 @@ impl Index {
                         .map(|(window, result)| (window.0, window.1, window.2, result)),
                 );
             } else {
-                for (start, end, passages, texts) in &windows {
-                    window_results.push((
-                        *start,
-                        *end,
-                        *passages,
-                        embedder.embed_batch(texts.clone()).await,
-                    ));
+                for &(start, end, passages) in &windows {
+                    let texts = semantic_embedding_window_texts(&jobs, start, end);
+                    window_results.push((start, end, passages, embedder.embed_batch(texts).await));
                 }
             }
 
@@ -29705,6 +29695,25 @@ const SEMANTIC_CHUNK_SIZE: usize = 512;
 /// Default overlap (characters) between consecutive chunks.
 const SEMANTIC_CHUNK_OVERLAP: usize = 64;
 
+struct EmbedJob {
+    source_idx: usize,
+    field: String,
+    target: String,
+    dims: usize,
+    original_text: String,
+    texts: Vec<String>,
+    offsets: Vec<(usize, usize)>,
+}
+
+fn semantic_embedding_window_limit(onnx_pinned: bool, configured: usize) -> usize {
+    const PROXY_PASSAGES_PER_WINDOW: usize = 64;
+    if onnx_pinned {
+        configured
+    } else {
+        PROXY_PASSAGES_PER_WINDOW
+    }
+}
+
 /// Select one order-preserving caller-side embedding window. One oversized
 /// document-field job remains whole so the planner always makes progress.
 fn semantic_embedding_window_end(
@@ -29722,6 +29731,13 @@ fn semantic_embedding_window_end(
         end += 1;
     }
     (end, passages)
+}
+
+fn semantic_embedding_window_texts(jobs: &[EmbedJob], start: usize, end: usize) -> Vec<String> {
+    jobs[start..end]
+        .iter()
+        .flat_map(|job| job.texts.iter().cloned())
+        .collect()
 }
 
 /// Run no more than two futures concurrently and return every result in input
@@ -29754,7 +29770,9 @@ fn dual_session_scheduler_enabled(onnx_pinned: bool, pool_size: usize) -> bool {
 #[cfg(test)]
 mod semantic_embedding_window_tests {
     use super::{
-        collect_ordinal_buffered_two, dual_session_scheduler_enabled, semantic_embedding_window_end,
+        collect_ordinal_buffered_two, dual_session_scheduler_enabled,
+        semantic_embedding_window_end, semantic_embedding_window_limit,
+        semantic_embedding_window_texts, EmbedJob,
     };
 
     fn windows(counts: &[usize], limit: usize) -> Vec<(std::ops::Range<usize>, usize)> {
@@ -29766,6 +29784,18 @@ mod semantic_embedding_window_tests {
             start = end;
         }
         result
+    }
+
+    fn job(ordinal: usize, texts: &[&str]) -> EmbedJob {
+        EmbedJob {
+            source_idx: ordinal,
+            field: format!("field-{ordinal}"),
+            target: format!("target-{ordinal}"),
+            dims: 384,
+            original_text: texts.join(" "),
+            texts: texts.iter().map(|text| (*text).to_string()).collect(),
+            offsets: Vec::new(),
+        }
     }
 
     #[test]
@@ -29786,14 +29816,62 @@ mod semantic_embedding_window_tests {
         assert!(dual_session_scheduler_enabled(true, 2));
     }
 
+    #[test]
+    fn onnx_uses_configured_window_while_proxy_remains_fixed_at_64() {
+        assert_eq!(semantic_embedding_window_limit(true, 1), 1);
+        assert_eq!(semantic_embedding_window_limit(true, 512), 512);
+        assert_eq!(semantic_embedding_window_limit(false, 1), 64);
+        assert_eq!(semantic_embedding_window_limit(false, 4096), 64);
+    }
+
+    #[test]
+    fn materializes_only_the_requested_text_window() {
+        let jobs = vec![
+            job(0, &["first-a", "first-b"]),
+            job(1, &["second"]),
+            job(2, &["must-not-be-retained"]),
+        ];
+        assert_eq!(
+            semantic_embedding_window_texts(&jobs, 0, 2),
+            vec!["first-a", "first-b", "second"]
+        );
+        assert_eq!(
+            semantic_embedding_window_texts(&jobs, 2, 3),
+            vec!["must-not-be-retained"]
+        );
+    }
+
     #[tokio::test]
     async fn buffered_pair_drains_reversed_completion_in_ordinal_order() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        struct OwnedWindow {
+            count: Arc<AtomicUsize>,
+            texts: Vec<String>,
+        }
+        impl Drop for OwnedWindow {
+            fn drop(&mut self) {
+                self.count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let jobs = vec![job(0, &["zero"]), job(1, &["one"]), job(2, &["two"])];
+        // Boundary planning itself owns only integer ranges/counts. Texts are
+        // first cloned by the launch callback below.
+        let boundaries = windows(&[1, 1, 1], 1);
         let completed = Arc::new(AtomicUsize::new(0));
+        let owned = Arc::new(AtomicUsize::new(0));
+        let peak_owned = Arc::new(AtomicUsize::new(0));
         let second_finished = Arc::new(tokio::sync::Notify::new());
-        let results = collect_ordinal_buffered_two(3, |ordinal| {
+        let results = collect_ordinal_buffered_two(boundaries.len(), |ordinal| {
             let completed = Arc::clone(&completed);
+            let range = boundaries[ordinal].0.clone();
+            let texts = semantic_embedding_window_texts(&jobs, range.start, range.end);
+            let owned_count = owned.fetch_add(1, Ordering::SeqCst) + 1;
+            peak_owned.fetch_max(owned_count, Ordering::SeqCst);
+            let owned_window = OwnedWindow {
+                count: Arc::clone(&owned),
+                texts,
+            };
             let second_finished = Arc::clone(&second_finished);
             async move {
                 if ordinal == 0 {
@@ -29805,13 +29883,22 @@ mod semantic_embedding_window_tests {
                 if ordinal == 0 {
                     Err("first failed")
                 } else {
-                    Ok(ordinal)
+                    Ok((ordinal, owned_window.texts[0].clone()))
                 }
             }
         })
         .await;
         assert_eq!(completed.load(Ordering::SeqCst), 3);
-        assert_eq!(results, vec![Err("first failed"), Ok(1), Ok(2)]);
+        assert_eq!(peak_owned.load(Ordering::SeqCst), 2);
+        assert_eq!(owned.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            results,
+            vec![
+                Err("first failed"),
+                Ok((1, "one".into())),
+                Ok((2, "two".into()))
+            ]
+        );
     }
 }
 
