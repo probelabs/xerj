@@ -869,14 +869,16 @@ fn fresh_pdf_is_parsed_once_and_failed_publication_retry_reparses_once() {
 
     let count = tools.path().join("worker-count");
     let worker = tools.path().join("pdf-worker");
-    fs::write(
-        &worker,
+    let worker_script = String::from_utf8(
         br#"#!/bin/sh
 printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
-printf '%s' '{"schema":1,"extractor":"xerj-autoindex/1.0.0-rc.5","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
-"#,
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
+"#
+        .to_vec(),
     )
-    .unwrap();
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
 
     let endpoint = MockEndpoint::start(1);
@@ -923,14 +925,16 @@ fn multi_pdf_run_index_bounds_phase_b_replay_by_pdf_workers_not_general_workers(
 
     let count = tools.path().join("worker-count");
     let worker = tools.path().join("pdf-worker");
-    fs::write(
-        &worker,
+    let worker_script = String::from_utf8(
         br#"#!/bin/sh
 printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
-printf '%s' '{"schema":1,"extractor":"xerj-autoindex/1.0.0-rc.5","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
-"#,
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
+"#
+        .to_vec(),
     )
-    .unwrap();
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
 
     let endpoint = MockEndpoint::start(0);
