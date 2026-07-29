@@ -263,6 +263,41 @@ pub async fn process_bulk_with_opts(
     use rayon::prelude::*;
 
     let started = std::time::Instant::now();
+
+    // ── F8: bulk DoS protections ──────────────────────────────────────────
+    //
+    // 1. Acquire a global bulk-concurrency permit. Caps the number of
+    //    concurrent `_bulk` requests in the parse phase to
+    //    `max_concurrent_bulks` (default 8), preventing N concurrent bulks
+    //    from each materializing ~300 B/action of parse-phase heap before the
+    //    memtable admission check fires.
+    // 2. Enforce `max_actions_per_bulk` (default 50 000). An unbounded bulk
+    //    body of one-byte lines produces ~50 M lines → ~25 M action pairs ×
+    //    ~300 B ≈ 7.5 GiB of heap per request. The cap rejects oversized
+    //    bulks with a single 413-style error item before allocating the
+    //    parse-phase Vecs.
+    let _bulk_permit = match crate::governor::global() {
+        Some(g) => match g.acquire_bulk().await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return BulkResult {
+                    took_ms: started.elapsed().as_millis() as u64,
+                    errors: true,
+                    items: vec![BulkItemResult {
+                        action: "bulk".to_string(),
+                        index: default_index.unwrap_or("").to_string(),
+                        id: String::new(),
+                        status: 503,
+                        result: None,
+                        error: Some(e.to_string()),
+                        get_source: None,
+                    }],
+                };
+            }
+        },
+        None => None,
+    };
+
     let t_lines = std::time::Instant::now();
     let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
     let lines_ms = t_lines.elapsed().as_millis() as u64;
@@ -270,6 +305,32 @@ pub async fn process_bulk_with_opts(
     // Pre-allocate output slots — filled in after execution.
     let mut items: Vec<Option<BulkItemResult>> = Vec::new();
     let mut errors = false;
+
+    // F8: enforce `max_actions_per_bulk`. Each action is an action+doc line
+    // pair (or a single delete line), so the action count is at most
+    // `lines.len()`. Reject before building `pairs` / `parse_results` /
+    // `parsed` (the ~300 B/action amplifiers).
+    let max_actions = engine.config().limits.max_actions_per_bulk;
+    if max_actions > 0 && lines.len() > max_actions * 2 {
+        return BulkResult {
+            took_ms: started.elapsed().as_millis() as u64,
+            errors: true,
+            items: vec![BulkItemResult {
+                action: "bulk".to_string(),
+                index: default_index.unwrap_or("").to_string(),
+                id: String::new(),
+                status: 413,
+                result: None,
+                error: Some(format!(
+                    "bulk request contains {} lines (~{} actions); exceeds max_actions_per_bulk of {}",
+                    lines.len(),
+                    lines.len() / 2,
+                    max_actions,
+                )),
+                get_source: None,
+            }],
+        };
+    }
 
     // M5.3 — PARALLEL NDJSON PARSE.
     //

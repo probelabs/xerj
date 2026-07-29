@@ -2942,6 +2942,13 @@ pub struct Index {
     /// same embedding identity before its first document is accepted.
     embedding_config: xerj_common::config::EmbeddingConfig,
 
+    /// Snapshot of `config.limits.max_fields_per_index`, enforced on the
+    /// dynamic-mapping ingest path (`evolve_schema_from_doc(s)`) to prevent
+    /// mapping-explosion DoS. Mirrors `ManagedSchema::apply_document`'s check
+    /// but on the production path the engine uses `evolve_schema_from_doc(s)`
+    /// directly, which previously bypassed the limit.
+    max_fields_per_index: u32,
+
     /// Embedding backend for `semantic` / `semantic_text` (v0.7-P2).
     /// One of lexical (built-in, default), an external proxy, the built-in
     /// Candle neural BERT embedder, or the experimental ONNX Runtime backend
@@ -3267,6 +3274,13 @@ impl Index {
         data_dir: &Path,
     ) -> Result<Arc<Self>> {
         let index_dir = data_dir.join(name.as_str());
+        // Defense-in-depth: IndexName::validate rejects '.', '..', separators,
+        // and '..' substrings, so join cannot escape data_dir. The debug_assert
+        // catches a regression in the validator during development.
+        debug_assert!(
+            index_dir.starts_with(data_dir),
+            "IndexName validation regression: {index_dir:?} escaped {data_dir:?}"
+        );
         std::fs::create_dir_all(&index_dir)?;
 
         let store_config = store_config_from(config);
@@ -3418,6 +3432,7 @@ impl Index {
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
             embedding_config: config.embedding.clone(),
+            max_fields_per_index: config.limits.max_fields_per_index,
             embedder: Arc::new(RwLock::new(effective_embedder)),
             dv_cache: Arc::new(dashmap::DashMap::new()),
             sort_shadow_cache: Arc::new(dashmap::DashMap::new()),
@@ -3744,6 +3759,7 @@ impl Index {
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
             embedding_config: config.embedding.clone(),
+            max_fields_per_index: config.limits.max_fields_per_index,
             embedder: Arc::new(RwLock::new(effective_embedder)),
             dv_cache: Arc::new(dashmap::DashMap::new()),
             sort_shadow_cache: Arc::new(dashmap::DashMap::new()),
@@ -14345,13 +14361,45 @@ impl Index {
             return;
         }
 
+        // Mapping-explosion guard: enforce `max_fields_per_index` on the
+        // production ingest path. `ManagedSchema::apply_document` checks the
+        // same limit, but the engine's dynamic-mapping path calls
+        // `Schema::add_field` directly, which previously bypassed the cap.
+        // An authenticated client could ingest documents with arbitrarily many
+        // distinct field names, bloating the schema unbounded.
+        {
+            let schema = self.schema.read().await;
+            let current = schema.schema.field_count() as u32;
+            let projected = current.saturating_add(new_fields.len() as u32);
+            if projected > self.max_fields_per_index {
+                tracing::warn!(
+                    current_fields = current,
+                    new_fields = new_fields.len(),
+                    limit = self.max_fields_per_index,
+                    "rejecting schema evolution: field limit exceeded"
+                );
+                return;
+            }
+        }
+
         let mut schema = self.schema.write().await;
         if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
             return;
         }
+        // Re-check under the write lock: another concurrent ingest may have
+        // already added fields up to the limit between the read-lock check
+        // above and this write lock.
         let mut schema_changed = false;
         for (_, fc) in new_fields {
             if !schema.schema.has_field(&fc.name) {
+                if schema.schema.field_count() as u32 >= self.max_fields_per_index {
+                    tracing::warn!(
+                        field = %fc.name,
+                        limit = self.max_fields_per_index,
+                        "rejecting new field: field limit reached"
+                    );
+                    break;
+                }
                 if matches!(fc.field_type, FieldType::Date) {
                     self.has_date_fields.store(true, Ordering::Relaxed);
                 }
@@ -14396,6 +14444,22 @@ impl Index {
             return;
         }
 
+        // Mapping-explosion guard (see evolve_schema_from_docs for rationale).
+        {
+            let schema = self.schema.read().await;
+            let current = schema.schema.field_count() as u32;
+            let projected = current.saturating_add(new_fields.len() as u32);
+            if projected > self.max_fields_per_index {
+                tracing::warn!(
+                    current_fields = current,
+                    new_fields = new_fields.len(),
+                    limit = self.max_fields_per_index,
+                    "rejecting schema evolution: field limit exceeded"
+                );
+                return;
+            }
+        }
+
         // Slow path: at least one new field found.  Upgrade to write lock and
         // persist the updated schema.
         let mut schema = self.schema.write().await;
@@ -14405,6 +14469,14 @@ impl Index {
         let mut schema_changed = false;
         for (_, fc) in new_fields {
             if !schema.schema.has_field(&fc.name) {
+                if schema.schema.field_count() as u32 >= self.max_fields_per_index {
+                    tracing::warn!(
+                        field = %fc.name,
+                        limit = self.max_fields_per_index,
+                        "rejecting new field: field limit reached"
+                    );
+                    break;
+                }
                 if matches!(fc.field_type, FieldType::Date) {
                     self.has_date_fields.store(true, Ordering::Relaxed);
                 }

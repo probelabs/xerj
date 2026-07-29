@@ -21978,11 +21978,62 @@ pub async fn get_index_alias(
 // GET    /_snapshot/{repo}/{snapshot}
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Validate a snapshot repository name. The `repo` is used as a key in the
+/// in-memory `snapshot_repos` map, but it is also echoed in API responses and
+/// surfaced in logs, and a future change could path-join it. Reject anything
+/// that could traverse (`..`) or contain a path separator.
+fn validate_snapshot_repo_name(repo: &str) -> Result<(), xerj_common::XerjError> {
+    if repo.is_empty() {
+        return Err(xerj_common::XerjError::invalid_mapping(
+            "snapshot repository name must not be empty",
+        ));
+    }
+    if repo.contains("..") || repo.contains('/') || repo.contains('\\') || repo.contains('\0') {
+        return Err(xerj_common::XerjError::invalid_mapping(format!(
+            "invalid snapshot repository name [{repo}]: must not contain '..', '/', '\\', or NUL"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a snapshot name. The snapshot name is path-joined onto the repo's
+/// `settings.location` inside the engine (`Path::new(repo_path).join(name)`),
+/// so `..` or a separator would let a write escape the repo. ES restricts
+/// snapshot names to `[a-zA-Z0-9._-]`; we apply the same traversal-blocking
+/// rule as `IndexName::validate` (no `..`, no separators, no NUL).
+fn validate_snapshot_name(name: &str) -> Result<(), xerj_common::XerjError> {
+    if name.is_empty() {
+        return Err(xerj_common::XerjError::invalid_mapping(
+            "snapshot name must not be empty",
+        ));
+    }
+    if name == "."
+        || name == ".."
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(xerj_common::XerjError::invalid_mapping(format!(
+            "invalid snapshot name [{name}]: must not be '.' or '..' and must not contain '..', '/', '\\', or NUL"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn put_snapshot_repo(
     State(state): State<AppState>,
     Path(repo): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Reject repository names that would let a later create/restore escape
+    // the configured filesystem location via `..` or separators. The snapshot
+    // name is path-joined onto `repo_path` inside the engine; a `repo` of
+    // `..` is a path-traversal vector even before the repo's `settings.location`
+    // is consulted.
+    if let Err(e) = validate_snapshot_repo_name(&repo) {
+        return ApiError::new(e).into_response();
+    }
     state.engine.snapshot_repos.insert(repo, body);
     Json(json!({ "acknowledged": true })).into_response()
 }
@@ -22024,6 +22075,15 @@ pub async fn create_snapshot(
     Path((repo, snapshot)): Path<(String, String)>,
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
+    // Validate both path params before any lookup. The snapshot name is
+    // path-joined onto the repo's `settings.location`; a name containing `..`
+    // or a separator would let the engine write outside the repo.
+    if let Err(e) = validate_snapshot_repo_name(&repo) {
+        return ApiError::new(e).into_response();
+    }
+    if let Err(e) = validate_snapshot_name(&snapshot) {
+        return ApiError::new(e).into_response();
+    }
     // Look up the repository config to get the filesystem location.
     let repo_config = match state.engine.snapshot_repos.get(&repo) {
         Some(cfg) => cfg.clone(),
@@ -22093,6 +22153,12 @@ pub async fn restore_snapshot(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Option<Json<Value>>,
 ) -> impl IntoResponse {
+    if let Err(e) = validate_snapshot_repo_name(&repo) {
+        return ApiError::new(e).into_response();
+    }
+    if let Err(e) = validate_snapshot_name(&snapshot) {
+        return ApiError::new(e).into_response();
+    }
     let repo_config = match state.engine.snapshot_repos.get(&repo) {
         Some(cfg) => cfg.clone(),
         None => {

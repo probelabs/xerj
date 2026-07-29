@@ -889,6 +889,14 @@ pub struct LimitsConfig {
     ///
     /// Elasticsearch's mapping explosion protection. Keep this low.
     pub max_fields_per_index: u32,
+    /// Maximum number of actions in a single `_bulk` request (default:
+    /// `50_000`). Each action materializes several intermediate Vecs
+    /// (line pairs, parse outcomes, parsed actions) totalling ~300 B/entry,
+    /// so an unbounded bulk body of one-byte lines can amplify to ~7.5 GiB
+    /// of heap before any memtable admission check fires. This cap rejects
+    /// oversized bulks at the top of the parse phase with a 413-style per-item
+    /// error instead of letting jemalloc abort the process on OOM.
+    pub max_actions_per_bulk: usize,
     /// Maximum HTTP request body size in bytes (default: `100 * 1024 * 1024`,
     /// i.e. 100 MiB). Caps NDJSON bulk payloads, large mget bodies, etc.
     /// Raise this only if your client routinely sends bigger requests; the
@@ -954,6 +962,7 @@ impl Default for LimitsConfig {
             max_query_memory_mb: 512,
             max_concurrent_searches: 64,
             max_fields_per_index: 500,
+            max_actions_per_bulk: 50_000,
             max_body_bytes: 100 * 1024 * 1024,
             max_result_window: 10_000,
             max_mget_docs: 10_000,

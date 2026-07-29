@@ -1099,6 +1099,20 @@ fn parse_query_string(params: &Value) -> Result<QueryNode> {
         .ok_or_else(|| qerr("`query_string` must be an object"))?;
 
     let query = string_field(obj, "query")?;
+    // Defense-in-depth: bound the raw query string length before tokenizing.
+    // The depth guard in `parse_qs_unary`'s `LParen` arm caps paren nesting to
+    // `MAX_QUERY_DEPTH`, but a pathological non-paren query (e.g. millions of
+    // juxtaposed terms) can still blow up the token stream. 64 KiB is far
+    // above any realistic Lucene query string (ES effectively limits this too)
+    // and well within the 100 MiB request body cap.
+    const MAX_QUERY_STRING_LEN: usize = 65_536;
+    if query.len() > MAX_QUERY_STRING_LEN {
+        return Err(qerr(format!(
+            "query_string.query length {} exceeds max of {} characters",
+            query.len(),
+            MAX_QUERY_STRING_LEN
+        )));
+    }
     let default_field = obj
         .get("default_field")
         .and_then(|v| v.as_str())
@@ -1631,6 +1645,17 @@ fn parse_qs_unary(
     match toks[*pos].clone() {
         QsTok::LParen => {
             *pos += 1;
+            // Bound paren-nesting depth. The shared thread-local `QUERY_DEPTH`
+            // is already at 1 from the outer `parse_query` call that dispatched
+            // to `parse_query_string` → `try_lower_query_string`. Each `LParen`
+            // recurses `parse_qs_or → parse_qs_and → parse_qs_unary`, so without
+            // this guard a ~100 k-paren query string overflows the tokio worker
+            // stack (default 2 MiB) and aborts the process with SIGSEGV — not
+            // catchable by `catch_unwind`. On overflow we return `None`, which
+            // `try_lower_query_string` turns into a graceful fallback to the
+            // opaque `QueryNode::QueryString` path (iterative tokenizer, no
+            // recursion). The guard decrements on drop when this arm returns.
+            let _depth_guard = DepthGuard::enter().ok()?;
             let n = parse_qs_or(toks, pos, default_field, None)?;
             if *pos >= toks.len() || !matches!(toks[*pos], QsTok::RParen) {
                 return None;
@@ -3040,7 +3065,40 @@ fn parse_more_like_this(params: &Value) -> Result<QueryNode> {
     // build the disjunction, so we fall back to the legacy MoreLikeThis node
     // (which scans all string fields on the brute path).
     if !fields.is_empty() {
-        let mut should: Vec<QueryNode> = Vec::with_capacity(fields.len() * like.len());
+        // Bound the cross-product. `fields.len() × like.len()` QueryNode entries
+        // are pre-allocated below; without a cap a ~200 KB body with 10 000
+        // fields × 10 000 like-texts forces a 10^8-entry Vec (~10 GiB) and
+        // aborts the process on OOM. ES effectively bounds MLT `fields` to a
+        // handful; we enforce hard limits and reject oversized requests
+        // with a 400-style parse error instead of allocating.
+        const MAX_MLT_FIELDS: usize = 64;
+        const MAX_MLT_LIKE: usize = 1_024;
+        const MAX_MLT_CROSS_PRODUCT: usize = 4_096;
+        if fields.len() > MAX_MLT_FIELDS {
+            return invalid(format!(
+                "`more_like_this.fields` has {} entries; max is {}",
+                fields.len(),
+                MAX_MLT_FIELDS
+            ));
+        }
+        if like.len() > MAX_MLT_LIKE {
+            return invalid(format!(
+                "`more_like_this.like` has {} entries; max is {}",
+                like.len(),
+                MAX_MLT_LIKE
+            ));
+        }
+        let cross = fields.len().saturating_mul(like.len());
+        if cross > MAX_MLT_CROSS_PRODUCT {
+            return invalid(format!(
+                "`more_like_this` cross-product ({} fields × {} like = {}) exceeds max of {}",
+                fields.len(),
+                like.len(),
+                cross,
+                MAX_MLT_CROSS_PRODUCT
+            ));
+        }
+        let mut should: Vec<QueryNode> = Vec::with_capacity(cross);
         for field in &fields {
             for text in &like {
                 should.push(QueryNode::Match {
@@ -5073,5 +5131,99 @@ mod tests {
         ] {
             assert_eq!(parse_request(&body).unwrap().fields, expected);
         }
+    }
+
+    // ── Security regression tests ───────────────────────────────────────────
+
+    /// F1: deeply nested parens in `query_string` must not overflow the stack.
+    /// Pre-fix, ~100 k nested `(` caused a SIGSEGV process abort. The depth
+    /// guard in `parse_qs_unary`'s `LParen` arm caps nesting to
+    /// `MAX_QUERY_DEPTH` (64) and falls back to the opaque `QueryString` path.
+    #[test]
+    fn test_query_string_deep_paren_nesting_does_not_overflow() {
+        // 5000 nested parens is well above the 64-depth cap but well below
+        // the stack-overflow threshold (~100 k). Pre-fix this would have
+        // recursed 5000 deep; post-fix the depth guard trips at 64 and the
+        // parser falls back to QueryString without crashing.
+        let deep = "(".repeat(5000) + "a" + &")".repeat(5000);
+        let node = q(json!({"query_string": {"query": &deep}}));
+        // The fallback is opaque QueryString (the depth guard returns None
+        // from parse_qs_unary, try_lower_query_string returns Ok(None), and
+        // parse_query_string wraps the raw query in QueryNode::QueryString).
+        // It must NOT panic / abort.
+        match &node {
+            QueryNode::QueryString { query, .. } => assert_eq!(query, &deep),
+            other => panic!("expected QueryString fallback, got {other:?}"),
+        }
+    }
+
+    /// F1: a `query_string.query` longer than 64 KiB is rejected with a parse
+    /// error (defense-in-depth before tokenizing).
+    #[test]
+    fn test_query_string_over_length_cap_rejected() {
+        let too_long = "a ".repeat(40_000); // 80_000 chars > 65_536
+        let res = parse_query(&json!({
+            "query_string": { "query": too_long }
+        }));
+        assert!(res.is_err(), "oversized query_string should be rejected");
+    }
+
+    /// F1: a legitimate moderately-nested query still lowers into a Bool tree.
+    /// Ensures the depth guard doesn't trip on reasonable nesting (10 levels).
+    #[test]
+    fn test_query_string_moderate_paren_nesting_still_parses() {
+        let mut qs = String::new();
+        for _ in 0..10 {
+            qs.push_str("(title:foo OR ");
+        }
+        qs.push_str("title:bar");
+        for _ in 0..10 {
+            qs.push(')');
+        }
+        let node = q(json!({"query_string": {"query": &qs}}));
+        // 10 levels of nesting is well within the 64-depth cap, so it should
+        // lower into a Bool tree (not fall back to opaque QueryString).
+        assert!(
+            matches!(node, QueryNode::Bool { .. }),
+            "moderate nesting should parse to Bool, got {node:?}"
+        );
+    }
+
+    /// F6: `more_like_this` with an oversized `fields × like` cross-product
+    /// is rejected with a parse error instead of pre-allocating a huge Vec.
+    /// Pre-fix, 10 000 × 10 000 would try to allocate ~10 GiB and abort.
+    #[test]
+    fn test_more_like_this_cross_product_capped() {
+        let fields: Vec<String> = (0..200).map(|i| format!("f{i}")).collect();
+        let like: Vec<String> = (0..200).map(|i| format!("text{i}")).collect();
+        let res = parse_query(&json!({
+            "more_like_this": { "fields": fields, "like": like }
+        }));
+        assert!(
+            res.is_err(),
+            "200×200=40000 cross-product exceeds 4096 cap and must be rejected"
+        );
+    }
+
+    /// F6: `more_like_this` with too many fields is rejected.
+    #[test]
+    fn test_more_like_this_fields_cap() {
+        let fields: Vec<String> = (0..65).map(|i| format!("f{i}")).collect();
+        let res = parse_query(&json!({
+            "more_like_this": { "fields": fields, "like": ["text"] }
+        }));
+        assert!(res.is_err(), "65 fields exceeds the 64-field cap");
+    }
+
+    /// F6: `more_like_this` within the caps still parses successfully.
+    #[test]
+    fn test_more_like_this_within_caps_parses() {
+        let fields = vec!["title".to_string(), "body".to_string()];
+        let like = vec!["interesting text".to_string(), "more text".to_string()];
+        // 2 fields × 2 like = 4 cross-product, well within 4096.
+        let res = parse_query(&json!({
+            "more_like_this": { "fields": fields, "like": like }
+        }));
+        assert!(res.is_ok(), "2×2 cross-product should parse fine");
     }
 }
