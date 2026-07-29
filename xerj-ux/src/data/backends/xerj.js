@@ -9,6 +9,8 @@
 // `probe()` is intentionally GET / so it costs ~0 on the engine.
 // ============================================================
 
+import { liveSecondBrain } from '../second-brain-api.js';
+
 // Aggregation materialisation bypass.
 //
 // Xerj v1.0.0-rc.1 has a known bug at
@@ -95,6 +97,11 @@ export async function search(baseUrl, dashId, ctx, signal) {
     case 'rag-quality':           return liveRagQuality(baseUrl, ctx, signal);
     case 'vector-index':          return liveVectorIndex(baseUrl, ctx, signal);
     case 'agent-memory':          return liveAgentMemory(baseUrl, ctx, signal);
+    // Second brain NEVER returns null: its adapter shapes every failure
+    // (engine down, no brains, 404 brain) into an honest state object,
+    // so the mock fallback in data/query.js can never fire for it —
+    // a fabricated brain would be worse than an empty one.
+    case 'second-brain':          return liveSecondBrain(baseUrl, ctx, signal);
     case 'anomaly-detect':        return liveAnomalyDetect(baseUrl, ctx, signal);
     case 'ingest-pipeline':       return liveIngestPipeline(baseUrl, ctx, signal);
     default:                      return null; // signals "fall back to mock"

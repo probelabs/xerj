@@ -16,6 +16,7 @@ import { aiOverview }     from './ai-overview.js';
 import { ragQuality }     from './rag-quality.js';
 import { vectorIndex }    from './vector-index.js';
 import { agentMemory }    from './agent-memory.js';
+import { secondBrain }    from './second-brain.js';
 import { anomalyDetect }  from './anomaly-detect.js';
 import { ingestPipeline } from './ingest-pipeline.js';
 import { logsOverview }   from './logs-overview.js';
@@ -38,12 +39,13 @@ const DEFAULT_GROUP = {
   'rag-quality':    'ai',
   'vector-index':   'ai',
   'agent-memory':   'ai',
+  'second-brain':   'ai',
   'logs-overview':  'logs',
   'anomaly-detect': 'logs',
   'ingest-pipeline':'logs',
   'system':         'infra',
 };
-for (const d of [aiOverview, ragQuality, vectorIndex, agentMemory, anomalyDetect, ingestPipeline, logsOverview, system]) {
+for (const d of [aiOverview, ragQuality, vectorIndex, agentMemory, secondBrain, anomalyDetect, ingestPipeline, logsOverview, system]) {
   d.section = 'dashboards';
   d.group = DEFAULT_GROUP[d.id] || 'other';
 }
@@ -53,10 +55,10 @@ searchDiscover.section = 'discover';
 const all = [
   // Dashboards section, ordered by group so the first member of each
   // group is the one the group tab lands on when clicked.
-  //   AI:    ai-overview, rag-quality, vector-index, agent-memory
+  //   AI:    ai-overview, rag-quality, vector-index, agent-memory, second-brain
   //   Logs:  logs-overview, anomaly-detect, ingest-pipeline
   //   Infra: system
-  aiOverview, ragQuality, vectorIndex, agentMemory,
+  aiOverview, ragQuality, vectorIndex, agentMemory, secondBrain,
   logsOverview, anomalyDetect, ingestPipeline,
   system,
   // Top-level sections (one view each)
