@@ -177,6 +177,17 @@ impl Config {
             return Err(XerjError::config("vector.max_dimensions must be > 0"));
         }
 
+        if !(1..=4096).contains(&self.embedding.onnx_scheduling_window) {
+            return Err(XerjError::config(
+                "embedding.onnx_scheduling_window must be in 1..=4096",
+            ));
+        }
+        if !(1..=2).contains(&self.embedding.onnx_session_pool_size) {
+            return Err(XerjError::config(
+                "embedding.onnx_session_pool_size must be in 1..=2",
+            ));
+        }
+
         // ── Config honesty guards ────────────────────────────────────────────
         // Some config knobs exist in the schema but are not wired into any code
         // path in this build. Silently ignoring them is worse than failing: an
@@ -831,8 +842,16 @@ pub struct EmbeddingConfig {
     pub onnx_model_path: String,
     /// Experimental ONNX backend: tokenizer.json from the same model/export.
     pub onnx_tokenizer_path: String,
+    /// Maximum passages collected before one ONNX scheduling call
+    /// (default: `64`, range: `1..=4096`). This is independent of the
+    /// backend's internal `onnx_max_batch` microbatch cap.
+    pub onnx_scheduling_window: usize,
     /// Experimental ONNX Runtime intra-op threads (default: available CPUs).
     pub onnx_intra_threads: usize,
+    /// Number of independent ONNX Runtime sessions (default: `1`, range:
+    /// `1..=2`). Two sessions permit two scheduling windows to run in
+    /// parallel, at the cost of another model session's memory.
+    pub onnx_session_pool_size: usize,
     /// Maximum texts accepted by one ONNX scheduling window.
     pub onnx_max_pending: usize,
     /// Maximum documents in one ONNX inference microbatch.
@@ -860,9 +879,11 @@ impl Default for EmbeddingConfig {
             local_model_dir: String::new(),
             onnx_model_path: String::new(),
             onnx_tokenizer_path: String::new(),
+            onnx_scheduling_window: 64,
             onnx_intra_threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
+            onnx_session_pool_size: 1,
             onnx_max_pending: 4096,
             onnx_max_batch: 64,
             onnx_padded_token_budget: 4096,
@@ -1356,6 +1377,35 @@ mod tests {
             .expect("shipped xerj.default.toml must parse against the current Config schema");
         cfg.validate()
             .expect("shipped xerj.default.toml must pass Config::validate");
+    }
+
+    #[test]
+    fn onnx_throughput_controls_preserve_single_session_defaults() {
+        let cfg = Config::from_toml_str("[embedding]\n").unwrap();
+        assert_eq!(cfg.embedding.onnx_scheduling_window, 64);
+        assert_eq!(cfg.embedding.onnx_session_pool_size, 1);
+    }
+
+    #[test]
+    fn onnx_throughput_controls_accept_only_bounded_values() {
+        for (key, valid) in [
+            ("onnx_scheduling_window", [1, 64, 4096].as_slice()),
+            ("onnx_session_pool_size", [1, 2].as_slice()),
+        ] {
+            for value in valid {
+                Config::from_toml_str(&format!("[embedding]\n{key} = {value}\n"))
+                    .unwrap_or_else(|error| panic!("{key}={value} must be valid: {error}"));
+            }
+        }
+        for (key, invalid) in [
+            ("onnx_scheduling_window", [0, 4097].as_slice()),
+            ("onnx_session_pool_size", [0, 3].as_slice()),
+        ] {
+            for value in invalid {
+                Config::from_toml_str(&format!("[embedding]\n{key} = {value}\n"))
+                    .expect_err(&format!("{key}={value} must be rejected"));
+            }
+        }
     }
 
     #[test]

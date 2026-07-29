@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 pub const MAX_TOKENS: usize = 512;
@@ -62,6 +62,113 @@ impl MicrobatchConfig {
 pub struct OnnxEmbedder {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
+}
+
+/// A fixed-width pool of independent ONNX Runtime sessions.
+///
+/// Construction is atomic: callers either receive the requested number of
+/// sessions or an error, never a partially initialized pool.
+pub(crate) struct OnnxPool {
+    size: usize,
+    sessions: Mutex<Vec<Arc<OnnxEmbedder>>>,
+    available: Condvar,
+}
+
+struct SessionLease<'a> {
+    pool: &'a OnnxPool,
+    session: Option<Arc<OnnxEmbedder>>,
+}
+
+impl OnnxPool {
+    pub(crate) fn load_bytes(
+        model_bytes: &[u8],
+        tokenizer_bytes: &[u8],
+        intra_threads: usize,
+        pool_size: usize,
+    ) -> Result<Self> {
+        if pool_size == 0 {
+            return Err(anyhow!("ONNX session pool size must be non-zero"));
+        }
+        let sessions = build_exact_pool(pool_size, |ordinal| {
+            OnnxEmbedder::load_bytes(model_bytes, tokenizer_bytes, intra_threads).with_context(
+                || {
+                    format!(
+                        "construct ONNX session {} of {}; no partial pool was published",
+                        ordinal + 1,
+                        pool_size
+                    )
+                },
+            )
+        })?
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+        Ok(Self {
+            size: pool_size,
+            sessions: Mutex::new(sessions),
+            available: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.size
+    }
+
+    fn lease(&self) -> Result<SessionLease<'_>> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("ONNX session pool mutex poisoned"))?;
+        while sessions.is_empty() {
+            sessions = self
+                .available
+                .wait(sessions)
+                .map_err(|_| anyhow!("ONNX session pool mutex poisoned"))?;
+        }
+        let session = sessions.pop().expect("non-empty pool checked");
+        Ok(SessionLease {
+            pool: self,
+            session: Some(session),
+        })
+    }
+
+    pub(crate) fn embed_scheduled_blocking(
+        &self,
+        texts: &[String],
+        config: MicrobatchConfig,
+    ) -> Result<Vec<Vec<f32>>> {
+        let lease = self.lease()?;
+        lease
+            .session
+            .as_ref()
+            .expect("leased session present")
+            .embed_scheduled_blocking(texts, config)
+    }
+}
+
+fn build_exact_pool<T>(
+    pool_size: usize,
+    mut construct: impl FnMut(usize) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut values = Vec::with_capacity(pool_size);
+    for ordinal in 0..pool_size {
+        values.push(construct(ordinal)?);
+    }
+    Ok(values)
+}
+
+impl Drop for SessionLease<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            let mut sessions = self
+                .pool
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sessions.push(session);
+            self.pool.available.notify_one();
+        }
+    }
 }
 
 impl OnnxEmbedder {
@@ -289,6 +396,79 @@ pub fn plan_microbatches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_initialization_discards_partial_members_on_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Member<'a>(&'a AtomicUsize);
+        impl Drop for Member<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dropped = AtomicUsize::new(0);
+        let error = build_exact_pool(3, |ordinal| {
+            if ordinal == 1 {
+                Err(anyhow!("synthetic second-session failure"))
+            } else {
+                Ok(Member(&dropped))
+            }
+        })
+        .expect_err("a member failure must reject the whole pool")
+        .to_string();
+        assert!(error.contains("second-session failure"), "{error}");
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    /// Run with explicit matching assets:
+    ///
+    /// `XERJ_ONNX_TEST_MODEL=/abs/model.onnx
+    ///  XERJ_ONNX_TEST_TOKENIZER=/abs/tokenizer.json
+    ///  cargo test -p xerj-ai --features onnx-experimental
+    ///  independent_pool_sessions_are_bit_identical -- --ignored`
+    #[test]
+    #[ignore = "requires explicit matching ONNX model and tokenizer assets"]
+    fn independent_pool_sessions_are_bit_identical() {
+        let model = std::fs::read(
+            std::env::var_os("XERJ_ONNX_TEST_MODEL").expect("XERJ_ONNX_TEST_MODEL is required"),
+        )
+        .unwrap();
+        let tokenizer = std::fs::read(
+            std::env::var_os("XERJ_ONNX_TEST_TOKENIZER")
+                .expect("XERJ_ONNX_TEST_TOKENIZER is required"),
+        )
+        .unwrap();
+        let texts = vec![
+            "quarterly revenue increased year over year".to_string(),
+            "operating margin declined in the fourth quarter".to_string(),
+        ];
+        let config = MicrobatchConfig::default();
+        let expected = OnnxEmbedder::load_bytes(&model, &tokenizer, 2)
+            .unwrap()
+            .embed_scheduled_blocking(&texts, config)
+            .unwrap();
+        let expected_bits = expected
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let pool = OnnxPool::load_bytes(&model, &tokenizer, 2, 2).unwrap();
+        let sessions = pool.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 2);
+        for session in sessions.iter() {
+            let actual = session.embed_scheduled_blocking(&texts, config).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .flatten()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected_bits
+            );
+        }
+    }
 
     #[test]
     fn planner_bounds_every_batch_and_preserves_all_positions() {

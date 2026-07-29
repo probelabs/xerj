@@ -6961,22 +6961,53 @@ impl Index {
             // Bound caller-side windows as well as backend-internal batches.
             // This avoids an arbitrarily large proxy payload and gives ONNX a
             // useful cross-document scheduling window without giant padding.
-            const MAX_PASSAGES_PER_WINDOW: usize = 64;
+            let max_passages_per_window = self.embedding_config.onnx_scheduling_window;
+            let passage_counts = jobs.iter().map(|job| job.texts.len()).collect::<Vec<_>>();
+            let mut windows = Vec::new();
             let mut start = 0;
             while start < jobs.len() {
-                let mut end = start;
-                let mut passages = 0;
-                while end < jobs.len()
-                    && (end == start || passages + jobs[end].texts.len() <= MAX_PASSAGES_PER_WINDOW)
-                {
-                    passages += jobs[end].texts.len();
-                    end += 1;
-                }
+                let (end, passages) =
+                    semantic_embedding_window_end(&passage_counts, start, max_passages_per_window);
                 let texts: Vec<String> = jobs[start..end]
                     .iter()
                     .flat_map(|job| job.texts.iter().cloned())
                     .collect();
-                match embedder.embed_batch(texts).await {
+                windows.push((start, end, passages, texts));
+                start = end;
+            }
+
+            // Two sessions are an explicit opt-in. Launch at most two complete
+            // windows together, drain both, then consume results in input
+            // order. This bounds native work and keeps retry/publication
+            // behavior deterministic when one sibling fails.
+            let mut window_results = Vec::with_capacity(windows.len());
+            if dual_session_scheduler_enabled(
+                onnx_pinned,
+                self.embedding_config.onnx_session_pool_size,
+            ) {
+                let results = collect_ordinal_buffered_two(windows.len(), |ordinal| {
+                    embedder.embed_batch(windows[ordinal].3.clone())
+                })
+                .await;
+                window_results.extend(
+                    windows
+                        .iter()
+                        .zip(results)
+                        .map(|(window, result)| (window.0, window.1, window.2, result)),
+                );
+            } else {
+                for (start, end, passages, texts) in &windows {
+                    window_results.push((
+                        *start,
+                        *end,
+                        *passages,
+                        embedder.embed_batch(texts.clone()).await,
+                    ));
+                }
+            }
+
+            for (start, end, passages, batch_result) in window_results {
+                match batch_result {
                     Ok(vectors) if vectors.len() == passages => {
                         let mut offset = 0;
                         for job_idx in start..end {
@@ -7048,7 +7079,6 @@ impl Index {
                         }
                     }
                 }
-                start = end;
             }
         } else {
             for (job_idx, job) in jobs.iter().enumerate() {
@@ -19443,6 +19473,7 @@ fn make_onnx_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xerj
         model_path,
         tokenizer_path,
         intra_threads: cfg.onnx_intra_threads.max(1),
+        session_pool_size: cfg.onnx_session_pool_size,
         microbatch: xerj_ai::onnx::MicrobatchConfig {
             max_pending: cfg.onnx_max_pending,
             max_batch: cfg.onnx_max_batch,
@@ -19455,6 +19486,8 @@ fn make_onnx_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xerj
     info!(
         model = %onnx_cfg.model_path.display(),
         tokenizer = %onnx_cfg.tokenizer_path.display(),
+        scheduling_window = cfg.onnx_scheduling_window,
+        session_pool_size = onnx_cfg.session_pool_size,
         "embedding backend: experimental ONNX Runtime (loads on first use)"
     );
     Ok(xerj_ai::Embedder::onnx(onnx_cfg))
@@ -27899,6 +27932,116 @@ fn scored_fast_plan(
 const SEMANTIC_CHUNK_SIZE: usize = 512;
 /// Default overlap (characters) between consecutive chunks.
 const SEMANTIC_CHUNK_OVERLAP: usize = 64;
+
+/// Select one order-preserving caller-side embedding window. One oversized
+/// document-field job remains whole so the planner always makes progress.
+fn semantic_embedding_window_end(
+    passage_counts: &[usize],
+    start: usize,
+    max_passages: usize,
+) -> (usize, usize) {
+    debug_assert!(max_passages > 0);
+    let mut end = start;
+    let mut passages = 0usize;
+    while end < passage_counts.len()
+        && (end == start || passages.saturating_add(passage_counts[end]) <= max_passages)
+    {
+        passages = passages.saturating_add(passage_counts[end]);
+        end += 1;
+    }
+    (end, passages)
+}
+
+/// Run no more than two futures concurrently and return every result in input
+/// order. `join!` waits for both siblings even when one fails.
+async fn collect_ordinal_buffered_two<T, F, Fut>(count: usize, launch: F) -> Vec<T>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut results = Vec::with_capacity(count);
+    let mut ordinal = 0;
+    while ordinal < count {
+        if ordinal + 1 < count {
+            let (first, second) = tokio::join!(launch(ordinal), launch(ordinal + 1));
+            results.push(first);
+            results.push(second);
+            ordinal += 2;
+        } else {
+            results.push(launch(ordinal).await);
+            ordinal += 1;
+        }
+    }
+    results
+}
+
+fn dual_session_scheduler_enabled(onnx_pinned: bool, pool_size: usize) -> bool {
+    onnx_pinned && pool_size == 2
+}
+
+#[cfg(test)]
+mod semantic_embedding_window_tests {
+    use super::{
+        collect_ordinal_buffered_two, dual_session_scheduler_enabled, semantic_embedding_window_end,
+    };
+
+    fn windows(counts: &[usize], limit: usize) -> Vec<(std::ops::Range<usize>, usize)> {
+        let mut result = Vec::new();
+        let mut start = 0;
+        while start < counts.len() {
+            let (end, passages) = semantic_embedding_window_end(counts, start, limit);
+            result.push((start..end, passages));
+            start = end;
+        }
+        result
+    }
+
+    #[test]
+    fn preserves_order_and_keeps_oversized_jobs_whole() {
+        let counts = [20, 44, 1, 70, 32, 32];
+        assert_eq!(
+            windows(&counts, 64),
+            vec![(0..2, 64), (2..3, 1), (3..4, 70), (4..6, 64)]
+        );
+        assert_eq!(windows(&[64, 64, 128, 256], 512), vec![(0..4, 512)]);
+    }
+
+    #[test]
+    fn dual_scheduler_is_unreachable_for_defaults_and_non_onnx_backends() {
+        assert!(!dual_session_scheduler_enabled(true, 1));
+        assert!(!dual_session_scheduler_enabled(false, 1));
+        assert!(!dual_session_scheduler_enabled(false, 2));
+        assert!(dual_session_scheduler_enabled(true, 2));
+    }
+
+    #[tokio::test]
+    async fn buffered_pair_drains_reversed_completion_in_ordinal_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let completed = Arc::new(AtomicUsize::new(0));
+        let second_finished = Arc::new(tokio::sync::Notify::new());
+        let results = collect_ordinal_buffered_two(3, |ordinal| {
+            let completed = Arc::clone(&completed);
+            let second_finished = Arc::clone(&second_finished);
+            async move {
+                if ordinal == 0 {
+                    second_finished.notified().await;
+                } else if ordinal == 1 {
+                    second_finished.notify_one();
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                if ordinal == 0 {
+                    Err("first failed")
+                } else {
+                    Ok(ordinal)
+                }
+            }
+        })
+        .await;
+        assert_eq!(completed.load(Ordering::SeqCst), 3);
+        assert_eq!(results, vec![Err("first failed"), Ok(1), Ok(2)]);
+    }
+}
 
 /// The chunker used by the auto-embed-on-ingest path.
 fn semantic_chunker() -> xerj_ai::TextChunker {
