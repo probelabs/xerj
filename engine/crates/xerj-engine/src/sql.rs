@@ -314,7 +314,7 @@ pub fn parse_sql(sql: &str) -> Result<SqlQuery, String> {
     // Optional WHERE.
     let query: QueryNode = if peek_word(pos).as_deref() == Some("WHERE") {
         pos += 1;
-        parse_or_expr(&tokens, &mut pos)?
+        parse_or_expr(&tokens, &mut pos, 0)?
     } else {
         QueryNode::MatchAll
     };
@@ -411,14 +411,28 @@ pub fn parse_sql(sql: &str) -> Result<SqlQuery, String> {
 
 // ── Condition parser (recursive descent) ─────────────────────────────────────
 
-fn parse_or_expr(tokens: &[Token], pos: &mut usize) -> Result<QueryNode, String> {
-    let left = parse_and_expr(tokens, pos)?;
+/// Cap on WHERE-clause nesting depth. `parse_or_expr → parse_and_expr →
+/// parse_condition → parse_or_expr` is a recursion cycle driven one turn per
+/// `(` (and `parse_condition` self-recurses on `NOT`), so without a bound a
+/// `WHERE ((((…))))` with tens of thousands of parens overflows the thread
+/// stack and aborts the whole process (SIGABRT — not a catchable panic). 64
+/// mirrors `xerj-query`'s `MAX_QUERY_DEPTH` for the query_string parser; no
+/// legitimate SQL nests that deep.
+const MAX_SQL_DEPTH: usize = 64;
+
+fn parse_or_expr(tokens: &[Token], pos: &mut usize, depth: usize) -> Result<QueryNode, String> {
+    if depth > MAX_SQL_DEPTH {
+        return Err(format!(
+            "WHERE clause nesting exceeds max depth of {MAX_SQL_DEPTH}"
+        ));
+    }
+    let left = parse_and_expr(tokens, pos, depth)?;
     let mut clauses = vec![left];
 
     while let Some(w) = peek_word_at(tokens, *pos) {
         if w == "OR" {
             *pos += 1;
-            clauses.push(parse_and_expr(tokens, pos)?);
+            clauses.push(parse_and_expr(tokens, pos, depth)?);
         } else {
             break;
         }
@@ -437,14 +451,14 @@ fn parse_or_expr(tokens: &[Token], pos: &mut usize) -> Result<QueryNode, String>
     }
 }
 
-fn parse_and_expr(tokens: &[Token], pos: &mut usize) -> Result<QueryNode, String> {
-    let left = parse_condition(tokens, pos)?;
+fn parse_and_expr(tokens: &[Token], pos: &mut usize, depth: usize) -> Result<QueryNode, String> {
+    let left = parse_condition(tokens, pos, depth)?;
     let mut musts = vec![left];
 
     while let Some(w) = peek_word_at(tokens, *pos) {
         if w == "AND" {
             *pos += 1;
-            musts.push(parse_condition(tokens, pos)?);
+            musts.push(parse_condition(tokens, pos, depth)?);
         } else {
             break;
         }
@@ -463,12 +477,17 @@ fn parse_and_expr(tokens: &[Token], pos: &mut usize) -> Result<QueryNode, String
     }
 }
 
-fn parse_condition(tokens: &[Token], pos: &mut usize) -> Result<QueryNode, String> {
+fn parse_condition(tokens: &[Token], pos: &mut usize, depth: usize) -> Result<QueryNode, String> {
+    if depth > MAX_SQL_DEPTH {
+        return Err(format!(
+            "WHERE clause nesting exceeds max depth of {MAX_SQL_DEPTH}"
+        ));
+    }
     // Handle NOT / parenthesised groups.
     if let Some(Token::Word(w)) = tokens.get(*pos) {
         if w.to_uppercase() == "NOT" {
             *pos += 1;
-            let inner = parse_condition(tokens, pos)?;
+            let inner = parse_condition(tokens, pos, depth + 1)?;
             return Ok(QueryNode::Bool {
                 must: vec![],
                 filter: vec![],
@@ -480,7 +499,7 @@ fn parse_condition(tokens: &[Token], pos: &mut usize) -> Result<QueryNode, Strin
     }
     if let Some(Token::LParen) = tokens.get(*pos) {
         *pos += 1;
-        let inner = parse_or_expr(tokens, pos)?;
+        let inner = parse_or_expr(tokens, pos, depth + 1)?;
         if let Some(Token::RParen) = tokens.get(*pos) {
             *pos += 1;
         }
@@ -720,5 +739,40 @@ mod tests {
         let q = parse_sql("SELECT category, COUNT(*) FROM products GROUP BY category").unwrap();
         assert_eq!(q.index, "products");
         assert_eq!(q.group_by, vec!["category"]);
+    }
+
+    #[test]
+    fn test_deeply_nested_where_parens_do_not_overflow_stack() {
+        // Regression: `parse_or_expr → parse_and_expr → parse_condition →
+        // parse_or_expr` is a recursion cycle driven one turn per `(`. Before
+        // the depth guard, ~50k nested parens overflowed the thread stack and
+        // aborted the process. Now it returns a bounded parse error, no crash.
+        let sql = format!(
+            "SELECT * FROM t WHERE {}a = 1{}",
+            "(".repeat(5_000),
+            ")".repeat(5_000)
+        );
+        match parse_sql(&sql) {
+            Err(e) => assert!(
+                e.contains("depth"),
+                "rejection should cite the depth cap: {e}"
+            ),
+            Ok(_) => panic!("deeply nested WHERE must be rejected, not parsed"),
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_not_does_not_overflow_stack() {
+        // `NOT NOT NOT …` is the other arm of the same cycle (self-recursion
+        // in parse_condition).
+        let sql = format!("SELECT * FROM t WHERE {}a = 1", "NOT ".repeat(5_000));
+        assert!(parse_sql(&sql).is_err());
+    }
+
+    #[test]
+    fn test_moderate_where_nesting_still_parses() {
+        // A realistic nesting depth (well under the 64 cap) must be unaffected.
+        let q = parse_sql("SELECT * FROM t WHERE ((a = 1 OR b = 2) AND c = 3)").unwrap();
+        assert_eq!(q.index, "t");
     }
 }
