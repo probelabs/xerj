@@ -11,13 +11,17 @@
 //! - `onnx`      — Experimental MiniLM-compatible FP32 ONNX backend
 //!   (feature `onnx-experimental`; server feature + explicit runtime selection required)
 //! - [`chunker`] — Text chunking with sentence-aware splitting and overlap
-//! - [`memory`]  — Agent memory: semantic dedup + recency-blended recall
+//!
+//! Agent memory does NOT live here. The real memory store is index-backed
+//! (`/_memory/*` in xerj-api over ordinary XERJ indices — durable, WAL-replayed,
+//! kNN/BM25-searchable). An earlier in-RAM `AgentMemory` (O(N²) dedup scan, no
+//! durability, process-lifetime only) was deleted once it reached zero callers:
+//! keeping it around shadowed the real API and invited accidental use.
 
 pub mod chunker;
 pub mod embed;
 pub mod embedder;
 pub mod local;
-pub mod memory;
 #[cfg(feature = "neural")]
 pub mod neural;
 #[cfg(feature = "onnx-experimental")]
@@ -27,6 +31,5 @@ pub use chunker::{Chunk, TextChunker};
 pub use embed::{EmbeddingProxy, EmbeddingProxyConfig};
 pub use embedder::Embedder;
 pub use local::{local_embed, DEFAULT_DIMS};
-pub use memory::{AgentMemory, MemoryEntry};
 
 pub use xerj_common::Result;
