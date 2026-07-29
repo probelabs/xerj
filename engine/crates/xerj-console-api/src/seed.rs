@@ -294,7 +294,12 @@ fn seed_specs() -> Vec<DashboardSpec> {
                 p("detectors", "metric", "WHAT TAUGHT THIS BRAIN", 3),
                 p("typeDist", "dist", "HOW NOTES CONNECT", 6),
                 p("edgeTimeline", "series", "NEW LINKS PER DAY", 6),
-                p("ego", "ego", "THE LEDGER · ONE NOTE, EVERYTHING IT TOUCHES", 12),
+                p(
+                    "ego",
+                    "ego",
+                    "THE LEDGER · ONE NOTE, EVERYTHING IT TOUCHES",
+                    12,
+                ),
                 p("hubs", "topn", "CENTERS OF GRAVITY", 6),
                 p("notShown", "honesty", "WHAT THIS VIEW DID NOT SHOW", 6),
             ],
