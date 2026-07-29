@@ -267,14 +267,45 @@ fn run(cfg: BrainCfg) -> Result<i32> {
     }
 
     // ── index: the autoindex pipeline, graph detection on ────────────────
-    let (code, run_doc) = xerj_autoindex::run_index_report(index_cfg(&cfg, &brain, api_key))?;
+    let (mut code, mut run_doc) =
+        xerj_autoindex::run_index_report(index_cfg(&cfg, &brain, api_key.clone()))?;
 
-    let records_total = run_doc
-        .as_ref()
-        .and_then(|d| d.get("records_total"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if records_total == 0 {
+    let run_u64 = |doc: &Option<Value>, key: &str| {
+        doc.as_ref()
+            .and_then(|d| d.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    // `records_total` is run-scoped: a resumed re-run over an already-indexed
+    // folder legitimately reports 0. Server truth decides what that means.
+    if run_u64(&run_doc, "records_total") == 0 {
+        let live_nodes = live_node_docs(&es, &brain);
+        if live_nodes == 0 && run_u64(&run_doc, "files_indexed") > 0 && !cfg.fresh {
+            // The resume journal says this folder is done, but the server has
+            // none of it (wiped data dir, or a different --url than the run
+            // that wrote the journal). Trusting the journal here would leave a
+            // silent, permanently-empty brain — with only structural edges,
+            // since text detectors ride the per-file indexing pass. Re-index
+            // from scratch once; ids are idempotent, so this converges.
+            eprintln!(
+                "\nresume journal says {} is already indexed, but the server at {} has none \
+                 of it — re-indexing from scratch",
+                cfg.root.display(),
+                cfg.url
+            );
+            let mut fresh_cfg = index_cfg(&cfg, &brain, api_key);
+            fresh_cfg.fresh = true;
+            (code, run_doc) = xerj_autoindex::run_index_report(fresh_cfg)?;
+        }
+    }
+
+    // Server truth for every surface below: run-scoped counters read 0 on a
+    // converged re-run, but the brain is live on the server all the same.
+    let records_live = match run_u64(&run_doc, "records_total") {
+        0 => live_node_docs(&es, &brain),
+        n => n,
+    };
+    if records_live == 0 {
         eprintln!(
             "\nxerj brain: nothing indexable under {} — {} files seen, 0 records live.\n\
              autoindex reads text, markdown, html, pdf, docx, csv, json/ndjson, xml,\n\
@@ -316,7 +347,7 @@ fn run(cfg: BrainCfg) -> Result<i32> {
         println!(
             "\nyour second brain indexed, but no links were found — {} files, {} records, 0 links",
             files.len(),
-            records_total
+            records_live
         );
         println!(
             "  notes connect through [[wikilinks]], relative markdown/html links, and\n\
@@ -355,6 +386,32 @@ fn run(cfg: BrainCfg) -> Result<i32> {
         }
     }
     Ok(code)
+}
+
+/// Count the node documents live on the server behind `brain`, via the brain
+/// meta doc's `nodes_index` (SECOND_BRAIN_SPEC §2.5 — autoindex writes the
+/// comma-list of its dataset indices there). 0 on any miss: an unreadable
+/// meta doc and an empty brain call for the same honest answer.
+fn live_node_docs(es: &Es, brain: &str) -> u64 {
+    let edges_index = detect::edges_index_name(brain);
+    let Ok(Some(meta)) = es.get_doc(&edges_index, detect::BRAIN_META_ID) else {
+        return 0;
+    };
+    // `Es::get_doc` returns the document `_source` itself.
+    let Some(nodes_index) = meta
+        .get("nodes_index")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return 0;
+    };
+    es.search(
+        nodes_index,
+        &json!({"size": 0, "track_total_hits": true, "query": {"match_all": {}}}),
+    )
+    .ok()
+    .and_then(|v| v.pointer("/hits/total/value").and_then(Value::as_u64))
+    .unwrap_or(0)
 }
 
 fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
