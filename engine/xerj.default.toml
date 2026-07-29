@@ -306,6 +306,13 @@ max_concurrent_searches = 64
 # Elasticsearch uses 1000 as its default; 500 is intentionally stricter.
 max_fields_per_index = 500
 
+# Maximum number of actions in a single _bulk request (DoS protection).
+# Each action materializes ~300 B of parse-phase heap; an unbounded bulk
+# can amplify a 100 MiB body to ~7.5 GiB of heap before admission checks
+# fire. 50 000 actions × ~300 B ≈ 15 MiB — well bounded. Set to 0 to
+# disable the cap (not recommended in production).
+max_actions_per_bulk = 50000
+
 # Process-wide retained-payload budget for the seven immutable segment
 # hydration caches (MiB). 0 derives 20% of the effective cgroup/system memory
 # limit with no minimum floor. This is not an RSS limit: query-owned results,

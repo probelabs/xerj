@@ -82,6 +82,15 @@ pub struct ResourceGovernor {
     /// High-water mark of concurrent searches observed (proof of the cap).
     search_inflight_peak: Arc<AtomicU64>,
 
+    // ── item 2b: global bulk pool (concurrent bulk parse cap) ─────────
+    /// Global bulk-concurrency permits. Caps the number of concurrent
+    /// `_bulk` requests in the parse phase, preventing memory amplification
+    /// from N concurrent bulks each materializing ~300 B/action before the
+    /// memtable admission check fires.
+    bulk_pool: Arc<Semaphore>,
+    /// Configured bulk permit count (for observability / stats).
+    max_concurrent_bulks: usize,
+
     // ── item 3: disk flood-stage write block ────────────────────────────
     /// Used-percentage watermark that engages the write block. `0` = off.
     disk_flood_pct: u8,
@@ -199,6 +208,25 @@ impl ResourceGovernor {
         self.max_concurrent_searches
     }
 
+    // ── item 2b: global bulk pool ──────────────────────────────────────
+
+    /// Acquire one global bulk permit. Bounds process-wide bulk-parse
+    /// concurrency to `max_concurrent_bulks` (default 8), preventing N
+    /// concurrent bulks from each materializing ~300 B/action of parse-phase
+    /// heap before the memtable admission check fires.
+    pub async fn acquire_bulk(&self) -> Result<tokio::sync::OwnedSemaphorePermit, XerjError> {
+        self.bulk_pool
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| XerjError::internal("global bulk pool closed — shutting down"))
+    }
+
+    /// Configured global bulk-concurrency cap.
+    pub fn max_concurrent_bulks(&self) -> usize {
+        self.max_concurrent_bulks
+    }
+
     // ── Sampler surface (called by the background task) ─────────────────
 
     /// Refresh every sampled atomic in one call (memtable, RSS, disk).
@@ -308,6 +336,7 @@ impl ResourceGovernor {
             max_concurrent_searches: self.max_concurrent_searches,
             search_inflight: self.search_inflight.load(Ordering::Relaxed),
             search_inflight_peak: self.search_inflight_peak.load(Ordering::Relaxed),
+            max_concurrent_bulks: self.max_concurrent_bulks,
         }
     }
 
@@ -347,6 +376,7 @@ pub struct GovernorSnapshot {
     pub max_concurrent_searches: usize,
     pub search_inflight: u64,
     pub search_inflight_peak: u64,
+    pub max_concurrent_bulks: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -482,6 +512,12 @@ fn build(config: &Config) -> ResourceGovernor {
 
     let max_concurrent_searches = (limits.max_concurrent_searches.max(1)) as usize;
 
+    // Bulk concurrency cap: default 8. Bounds the number of concurrent
+    // `_bulk` requests in the parse phase. Each bulk materializes ~300 B
+    // per action before the memtable admission check fires, so N concurrent
+    // 50 k-action bulks would allocate ~N × 15 MiB of parse-phase heap.
+    let max_concurrent_bulks = 8usize;
+
     tracing::info!(
         memtable_budget_mb = memtable_budget_bytes / (1024 * 1024),
         memory_limit_mb = memory_limit_bytes / (1024 * 1024),
@@ -489,6 +525,7 @@ fn build(config: &Config) -> ResourceGovernor {
         memory_watermark_pct = limits.memory_watermark_percent,
         max_query_memory_mb = limits.max_query_memory_mb,
         max_concurrent_searches,
+        max_concurrent_bulks,
         disk_flood_pct = limits.disk_flood_stage_percent,
         segment_hydration_cache_mb = resolved_segment_hydration.bytes / (1024 * 1024),
         segment_hydration_cache_source = ?resolved_segment_hydration.source,
@@ -510,6 +547,8 @@ fn build(config: &Config) -> ResourceGovernor {
         max_concurrent_searches,
         search_inflight: Arc::new(AtomicU64::new(0)),
         search_inflight_peak: Arc::new(AtomicU64::new(0)),
+        bulk_pool: Arc::new(Semaphore::new(max_concurrent_bulks)),
+        max_concurrent_bulks,
         disk_flood_pct: limits.disk_flood_stage_percent.min(100),
         disk_blocked: AtomicBool::new(false),
         disk_used_pct: AtomicU64::new(0),

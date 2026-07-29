@@ -1560,6 +1560,7 @@ impl Engine {
         indices: Option<Vec<String>>,
     ) -> Result<Value> {
         let snap_dir = std::path::Path::new(repo_path).join(name);
+        let snap_dir = validate_snapshot_path(repo_path, name, &snap_dir)?;
         std::fs::create_dir_all(&snap_dir).map_err(EngineError::Io)?;
 
         // Wall-clock start, captured BEFORE the flush+copy work so
@@ -1651,6 +1652,7 @@ impl Engine {
         indices: Option<Vec<String>>,
     ) -> Result<Vec<String>> {
         let snap_dir = std::path::Path::new(repo_path).join(name);
+        let snap_dir = validate_snapshot_path(repo_path, name, &snap_dir)?;
         let manifest_path = snap_dir.join("manifest.json");
 
         let manifest_bytes = std::fs::read(&manifest_path).map_err(EngineError::Io)?;
@@ -1716,7 +1718,30 @@ impl Engine {
             selected
         };
 
+        // Canonicalize the data_dir once for the per-index containment check
+        // below. `self.data_dir` always exists at this point (the engine opens
+        // indices under it), but canonicalize defensively in case a test mounts
+        // a relative path that hasn't been created yet.
+        let data_dir_canon = self
+            .data_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.data_dir.clone());
+
         for idx_name in &index_names {
+            // Validate the index name BEFORE any filesystem op. Previously the
+            // `IndexName::new` check ran AFTER `remove_dir_all`, so a manifest
+            // carrying `..` as an index name deleted the parent of `data_dir`.
+            // `IndexName::validate` now rejects `.`/`..`/separators/`..`
+            // substrings, so this is belt-and-suspenders against a future
+            // regression in the validator.
+            let index_name = match IndexName::new(idx_name) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(index = idx_name, error = %e, "skipping restore of invalid index name");
+                    continue;
+                }
+            };
+
             let src_dir = snap_dir.join(idx_name.as_str());
             if !src_dir.exists() {
                 warn!(index = idx_name, "snapshot directory missing, skipping");
@@ -1724,6 +1749,19 @@ impl Engine {
             }
 
             let dst_dir = self.data_dir.join(idx_name);
+
+            // Containment: lexical check BEFORE any filesystem op. `IndexName`
+            // validation already rejects `.`/`..`/separators/`..` substrings,
+            // so this is a cheap belt-and-suspenders guard against a future
+            // regression in the validator that would let `dst_dir` escape the
+            // data_dir.
+            if !dst_dir.starts_with(&self.data_dir) {
+                return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
+                    format!(
+                        "refusing to restore index [{idx_name}] outside data_dir"
+                    ),
+                )));
+            }
 
             // Remove existing index data (if any) and close it.
             if self.indices.contains_key(idx_name.as_str()) {
@@ -1734,12 +1772,24 @@ impl Engine {
             }
             std::fs::create_dir_all(&dst_dir).map_err(EngineError::Io)?;
 
+            // After create_dir_all, re-verify the canonicalized path is still
+            // inside the canonicalized data_dir (catches symlink-based escapes
+            // that the lexical check misses).
+            if let Ok(dst_canon) = dst_dir.canonicalize() {
+                if !dst_canon.starts_with(&data_dir_canon) {
+                    return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
+                        format!(
+                            "refusing to restore index [{idx_name}] outside data_dir (canonical)"
+                        ),
+                    )));
+                }
+            }
+
             // Copy snapshot files back.
             let mut _files: Vec<String> = Vec::new();
             copy_dir_recursive(&src_dir, &dst_dir, &mut _files).map_err(EngineError::Io)?;
 
             // Reopen the index.
-            let index_name = IndexName::new(idx_name).map_err(EngineError::Common)?;
             match Index::open(index_name, &self.config, &self.data_dir) {
                 Ok(idx) => {
                     // Snapshot dirs carry es_mapping.json — reload it so the
@@ -1783,6 +1833,74 @@ fn now_millis() -> i64 {
 /// we do the same for ours so `_snapshot`/`_restore` operate on user data.
 pub(crate) fn is_system_index(name: &str) -> bool {
     name.starts_with(".xerj_")
+}
+
+/// Validate a snapshot repo path and snapshot name before any filesystem op.
+///
+/// Returns the canonicalized `snap_dir` (creating it is the caller's job) or
+/// an error. This is the chokepoint for the snapshot path-traversal surface:
+///   - the snapshot `name` must not contain `..`, `/`, `\`, or NUL, so
+///     `Path::new(repo).join(name)` cannot escape the repo;
+///   - the canonicalized `snap_dir` must remain inside the canonicalized
+///     `repo_path`, so a `repo_path` like `/tmp/repo/../..` is rejected;
+///   - the `repo_path` itself must not be empty (defensive).
+///
+/// Pre-fix, `PUT /_snapshot/evil` with `location: "/etc"` plus a snapshot
+/// `name = ".."` made `snap_dir = "/etc/.."`, so `create_dir_all` and
+/// `manifest.json` landed in the parent of `/etc`. The snapshot name was
+/// otherwise unvalidated.
+fn validate_snapshot_path(
+    repo_path: &str,
+    name: &str,
+    snap_dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    if repo_path.is_empty() {
+        return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
+            "snapshot repository location must not be empty",
+        )));
+    }
+    if name.is_empty()
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
+            format!("invalid snapshot name [{name}]: must not be empty or contain '..', '/', '\\', or NUL"),
+        )));
+    }
+    // Canonicalize repo_path. The repo may not yet exist (create_snapshot
+    // creates it on the next line), so fall back to the lexically-cleaned
+    // path. `Path::canonicalize` requires the path to exist.
+    let repo_canon = std::path::Path::new(repo_path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
+    // If snap_dir already exists, canonicalize it and verify containment;
+    // if it does not yet exist (the create_snapshot case), verify lexically
+    // that it starts with the repo.
+    if let Ok(snap_canon) = snap_dir.canonicalize() {
+        if !snap_canon.starts_with(&repo_canon) {
+            return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
+                format!(
+                    "snapshot [{name}] resolves outside its repository; refusing"
+                ),
+            )));
+        }
+        Ok(snap_canon)
+    } else {
+        // Not yet on disk: lexical containment check. This catches `..` in
+        // repo_path that canonicalize couldn't resolve because the parent
+        // exists but the repo dir does not.
+        let snap_lex = snap_dir.to_path_buf();
+        if !snap_lex.starts_with(&repo_canon) {
+            return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
+                format!(
+                    "snapshot [{name}] resolves outside its repository; refusing"
+                ),
+            )));
+        }
+        Ok(snap_lex)
+    }
 }
 
 /// Recursively copy all files from `src` to `dst`, recording relative paths in `files`.

@@ -106,6 +106,21 @@ impl IndexName {
         let Some(first) = name.chars().next() else {
             return Err(XerjError::invalid_mapping("index name cannot be empty"));
         };
+        // Reject the literal names "." and ".." and any name containing a
+        // path separator. Previously a leading '.' was carved out for system
+        // indices (`.kibana`) and '.' was allowed in the body of the name,
+        // which let `..` through — `IndexName::new("..")` succeeded and
+        // `data_dir.join("..")` traversed out of the data directory.
+        if name == "." || name == ".." {
+            return Err(XerjError::invalid_mapping(format!(
+                "index name must not be '.' or '..' (got '{name}')"
+            )));
+        }
+        if name.contains('/') || name.contains('\\') || name.contains('\0') {
+            return Err(XerjError::invalid_mapping(format!(
+                "index name must not contain a path separator (got '{name}')"
+            )));
+        }
         // Allow leading '.' for system indices like .kibana, .security-* etc.
         if !first.is_ascii_lowercase() && first != '.' {
             return Err(XerjError::invalid_mapping(format!(
@@ -121,6 +136,14 @@ impl IndexName {
                      (only lowercase letters, digits, '-', '_', '.' allowed)"
                 )));
             }
+        }
+        // A leading dot is permitted (system indices), but a doubled ".."
+        // anywhere in the name is a path-traversal vector — reject it the
+        // same way the /_memory/{ns} validator does.
+        if name.contains("..") {
+            return Err(XerjError::invalid_mapping(format!(
+                "index name must not contain '..' (got '{name}')"
+            )));
         }
         Ok(())
     }
@@ -525,6 +548,16 @@ mod tests {
         assert!(IndexName::new("_private").is_err()); // starts with _
         assert!(IndexName::new("bad name").is_err()); // space
         assert!(IndexName::new("1bad").is_err()); // starts with digit
+        // Path-traversal vectors (regression: leading-dot carve-out plus '.'
+        // in the body previously let "."/".."/"a/../b" through).
+        assert!(IndexName::new(".").is_err()); // literal dot
+        assert!(IndexName::new("..").is_err()); // literal double-dot
+        assert!(IndexName::new("...").is_err()); // triple
+        assert!(IndexName::new("a..b").is_err()); // embedded ..
+        assert!(IndexName::new(".kibana..").is_err()); // trailing .. on system index
+        assert!(IndexName::new("a/b").is_err()); // forward slash
+        assert!(IndexName::new("a\\b").is_err()); // backslash
+        assert!(IndexName::new("a\0b").is_err()); // NUL
     }
 
     #[test]
