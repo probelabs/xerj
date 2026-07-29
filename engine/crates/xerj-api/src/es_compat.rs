@@ -20900,7 +20900,8 @@ fn validate_snapshot_name(name: &str) -> Result<(), xerj_common::XerjError> {
             "snapshot name must not be empty",
         ));
     }
-    if name == "." || name == ".."
+    if name == "."
+        || name == ".."
         || name.contains("..")
         || name.contains('/')
         || name.contains('\\')

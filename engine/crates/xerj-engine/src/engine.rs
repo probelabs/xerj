@@ -1756,11 +1756,11 @@ impl Engine {
             // regression in the validator that would let `dst_dir` escape the
             // data_dir.
             if !dst_dir.starts_with(&self.data_dir) {
-                return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
-                    format!(
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::invalid_mapping(format!(
                         "refusing to restore index [{idx_name}] outside data_dir"
-                    ),
-                )));
+                    )),
+                ));
             }
 
             // Remove existing index data (if any) and close it.
@@ -1777,11 +1777,11 @@ impl Engine {
             // that the lexical check misses).
             if let Ok(dst_canon) = dst_dir.canonicalize() {
                 if !dst_canon.starts_with(&data_dir_canon) {
-                    return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
-                        format!(
+                    return Err(EngineError::Common(
+                        xerj_common::XerjError::invalid_mapping(format!(
                             "refusing to restore index [{idx_name}] outside data_dir (canonical)"
-                        ),
-                    )));
+                        )),
+                    ));
                 }
             }
 
@@ -1855,9 +1855,11 @@ fn validate_snapshot_path(
     snap_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
     if repo_path.is_empty() {
-        return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
-            "snapshot repository location must not be empty",
-        )));
+        return Err(EngineError::Common(
+            xerj_common::XerjError::invalid_mapping(
+                "snapshot repository location must not be empty",
+            ),
+        ));
     }
     if name.is_empty()
         || name.contains("..")
@@ -1880,11 +1882,11 @@ fn validate_snapshot_path(
     // that it starts with the repo.
     if let Ok(snap_canon) = snap_dir.canonicalize() {
         if !snap_canon.starts_with(&repo_canon) {
-            return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
-                format!(
+            return Err(EngineError::Common(
+                xerj_common::XerjError::invalid_mapping(format!(
                     "snapshot [{name}] resolves outside its repository; refusing"
-                ),
-            )));
+                )),
+            ));
         }
         Ok(snap_canon)
     } else {
@@ -1893,11 +1895,11 @@ fn validate_snapshot_path(
         // exists but the repo dir does not.
         let snap_lex = snap_dir.to_path_buf();
         if !snap_lex.starts_with(&repo_canon) {
-            return Err(EngineError::Common(xerj_common::XerjError::invalid_mapping(
-                format!(
+            return Err(EngineError::Common(
+                xerj_common::XerjError::invalid_mapping(format!(
                     "snapshot [{name}] resolves outside its repository; refusing"
-                ),
-            )));
+                )),
+            ));
         }
         Ok(snap_lex)
     }

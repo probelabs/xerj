@@ -548,8 +548,8 @@ mod tests {
         assert!(IndexName::new("_private").is_err()); // starts with _
         assert!(IndexName::new("bad name").is_err()); // space
         assert!(IndexName::new("1bad").is_err()); // starts with digit
-        // Path-traversal vectors (regression: leading-dot carve-out plus '.'
-        // in the body previously let "."/".."/"a/../b" through).
+                                                  // Path-traversal vectors (regression: leading-dot carve-out plus '.'
+                                                  // in the body previously let "."/".."/"a/../b" through).
         assert!(IndexName::new(".").is_err()); // literal dot
         assert!(IndexName::new("..").is_err()); // literal double-dot
         assert!(IndexName::new("...").is_err()); // triple
