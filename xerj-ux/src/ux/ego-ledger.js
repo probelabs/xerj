@@ -38,9 +38,12 @@ import { Spark, Series, Dist } from './charts.js';
 
 // Rows shown per link-kind group before the in-band "TOP n OF m" cap.
 export const LEDGER_GROUP_CAP = 12;
-// Lifetime rows drawn in the belief-time strip (top by strength, then
-// believed-since, then id — deterministic), cap labelled in the legend.
-export const SCRUB_ROW_CAP = 64;
+// Belief-strip form switch: up to this many links the strip draws one
+// lifetime row per link; beyond it, individual 1px rows become an
+// unreadable hatch, so the strip switches to a belief-count curve over
+// the same time axis (same caret, same drag). Both forms count every
+// fetched link — the switch changes the drawing, never the truth.
+export const SCRUB_LIFETIME_MAX = 24;
 
 // ----- user-word vocabulary ----------------------------------------
 
@@ -56,6 +59,25 @@ const TYPE_WORDS = {
 };
 export const typeName = (t) =>
   TYPE_WORDS[t] || String(t || 'links').replace(/[_-]+/g, ' ').toUpperCase();
+
+/** Detector tags ("wikilink@1") → the same user vocabulary as the link
+ *  kinds, with the version kept — versioning IS part of the promise
+ *  (same folder in, same links out, bump on any behavior change). The
+ *  raw tag stays available on hover and in the evidence paper-trail. */
+const DETECTOR_WORDS = {
+  wikilink: 'WIKI-LINKS',
+  mdlink: 'MARKDOWN LINKS',
+  href: 'HTML LINKS',
+  sequence: 'READING ORDER',
+  samedir: 'FOLDER NEIGHBORS',
+  manual: 'HAND-ASSERTED',
+};
+export const detectorName = (tag) => {
+  const [base, v] = String(tag || '').split('@');
+  const w = DETECTOR_WORDS[base];
+  if (!w) return String(tag || 'unknown').toUpperCase();
+  return v ? `${w} · v${v}` : w;
+};
 
 /** Ids are opaque doc ids — autoindex ones are long hashes. Never make
  *  a human read 32 hex chars as a name. */
@@ -172,7 +194,7 @@ const EvidenceBlock = (e) => {
     ${quote}
     <div class="sb-evmeta mono faint">
       ${src}
-      <span>taught by ${esc(e.detector || 'unknown detector')} · ${esc(fmt(conf * 100, { decimals: 0 }))}% confident · strength ${esc(fmt(e.weight ?? 1, { decimals: 2 }))}</span>
+      <span>taught by ${esc(detectorName(e.detector).toLowerCase())} (${esc(e.detector || 'unknown detector')}) · ${esc(fmt(conf * 100, { decimals: 0 }))}% confident · strength ${esc(fmt(e.weight ?? 1, { decimals: 2 }))}</span>
       <span>believed since ${esc(fmtTs(e.valid_at))}${invalid}${expired}</span>
       <span>link id ${esc(e.edge_id)} · this is the handle the API takes</span>
     </div>
@@ -225,12 +247,17 @@ const groupBlock = (g, side, ctx) => {
 
 // ----- focus card ---------------------------------------------------
 
-const FocusCard = ({ ego, nodes, names, brain }) => {
+const FocusCard = ({ ego, nodes, names, brain, asOf }) => {
   const id = ego.node;
   const hop1 = (ego.edges || []).filter((e) => e.hop === 1);
-  const nIn = hop1.filter((e) => e.direction === 'in').length;
-  const nOut = hop1.length - nIn;
-  const kinds = new Set(hop1.map((e) => e.type)).size;
+  // Degrees speak the page's tense — BELIEVED AT THIS MOMENT — so they
+  // count only links live at the caret; retired ones are counted apart
+  // (they are drawn struck-through in the columns either way).
+  const live = hop1.filter((e) => edgeStateAt(e, asOf) === 'live');
+  const nRetired = hop1.filter((e) => edgeStateAt(e, asOf) === 'expired').length;
+  const nIn = live.filter((e) => e.direction === 'in').length;
+  const nOut = live.length - nIn;
+  const kinds = new Set(live.map((e) => e.type)).size;
   const earliest = hop1.length
     ? Math.min(...hop1.map((e) => Number(e.valid_at)))
     : null;
@@ -247,9 +274,10 @@ const FocusCard = ({ ego, nodes, names, brain }) => {
     <div class="sb-ftitle">${esc(nodeName(id, { nodes, names }))}</div>
     ${preview}
     <div class="sb-fdeg mono">
-      <span>← <span class="sb-fnum">${num(nIn)}</span> LINK${nIn === 1 ? '' : 'S'} IN</span>
+      <span>← <span class="sb-fnum">${num(nIn)}</span> IN</span>
       <span><span class="sb-fnum">${num(nOut)}</span> OUT →</span>
       <span><span class="sb-fnum">${num(kinds)}</span> KIND${kinds === 1 ? '' : 'S'}</span>
+      ${nRetired > 0 ? `<span class="sb-fret">+${num(nRetired)} RETIRED</span>` : ''}
     </div>
     <div class="sb-fprov mono faint">
       ${esc(meta && meta.index ? meta.index : `brain ${brain}`)} · id ${esc(id)}${dangling ? ' · NO DOCUMENT BEHIND THIS ID' : ''}${earliest != null ? ` · in this brain since ${esc(fmtDay(earliest))}` : ''}
@@ -285,72 +313,133 @@ const EgoControls = ({ brain, brains, focus, asOf, trail, names, nodes }) => {
 
 // ----- belief-time scrubber ----------------------------------------
 
+/** Caret-label edge alignment: centred by default, left-anchored near
+ *  the left edge, right-anchored near the right edge — so the label
+ *  never clips off the strip at any width. Shared with the drag
+ *  preview in data/second-brain-api.js. */
+export const caretAlignClass = (pct) =>
+  pct < 12 ? 'sb-cl-left' : pct > 88 ? 'sb-cl-right' : '';
+
 /**
- * Full-width strip: one row per link, drawn from the moment the brain
- * started believing it to the moment it stopped (or to now). The
- * accent caret is draggable — drag anywhere on the strip; releasing
- * re-queries the server with `as_of` (the caret is a query parameter,
- * not a client filter). The interval set is pinned at NOW with
- * retired links included, so scrubbing never removes rows — only
- * their state changes.
+ * Full-width belief-time strip with a draggable as-of caret. Two forms
+ * from one time axis, picked by how many links there are:
+ *
+ *   ≤ SCRUB_LIFETIME_MAX  one row per link, drawn from the moment the
+ *                         brain started believing it to the moment it
+ *                         stopped (or to now); retired rows go dashed.
+ *   beyond                a 1px step curve counting how many links were
+ *                         believed at every moment (individual 1px rows
+ *                         beyond ~24 are an unreadable hatch).
+ *
+ * Dragging previews client-side; releasing re-queries the server with
+ * `as_of` (the caret is a query parameter, not a client filter). The
+ * interval set is pinned at NOW with retired links included, so
+ * scrubbing never removes data from the strip — only states change.
  */
 export const BeliefScrubber = ({ timeline, asOf }) => {
   const edges = (timeline && timeline.edges) || [];
   if (!edges.length) {
     return `<div class="sb-scrub" data-sb-scrub><div class="panel-empty mono faint">NOTHING TO REPLAY YET · EVERY LINK WILL DRAW ITS LIFETIME HERE</div></div>`;
   }
-  // Deterministic row order: strength desc, believed-since asc, id asc.
-  const rows = [...edges].sort((a, b) =>
-    (b.weight - a.weight)
-    || (Number(a.valid_at) - Number(b.valid_at))
-    || (a.edge_id < b.edge_id ? -1 : 1)
-  ).slice(0, SCRUB_ROW_CAP);
+  // The fetch that feeds the strip is capped (ego limit); when the
+  // server clipped, every count here is a floor — say so with '≥'.
+  const clipped = !!(timeline && timeline.not_shown && timeline.not_shown.edges_clipped > 0);
+  const floor = clipped ? '≥' : '';
 
   const now = Date.now();
-  const d0raw = Math.min(...rows.map((e) => Number(e.valid_at)));
+  const d0raw = Math.min(...edges.map((e) => Number(e.valid_at)));
   const span = Math.max(now - d0raw, 60_000);
   const d0 = d0raw - span * 0.04;         // 4% air before the first assertion
   const d1 = now;
   const pctOf = (ms) => Math.max(0, Math.min(100, ((ms - d0) / (d1 - d0)) * 100));
 
-  // Few links deserve thick, readable rows; many links compress.
-  const rowH = rows.length <= 6 ? 10 : rows.length <= 16 ? 7 : rows.length <= 32 ? 5 : 4;
-  const h = Math.max(44, rows.length * rowH + 8);
   const caretMs = asOf == null ? d1 : asOf;
   const caretPct = pctOf(caretMs);
-  const labelPct = Math.max(3, Math.min(97, caretPct)); // keep the label on-page at the edges
+  const labelPct = Math.max(1, Math.min(99, caretPct));
+  const liveAt = (t) => edges.reduce((a, e) => a + (edgeStateAt(e, t) === 'live' ? 1 : 0), 0);
+  const liveAtCaret = liveAt(asOf);
 
-  let liveAtCaret = 0;
-  const lines = rows.map((e, i) => {
-    const y = 6 + i * rowH;
-    const x1 = pctOf(Number(e.valid_at));
-    const x2 = e.invalid_at != null ? pctOf(Number(e.invalid_at)) : 100;
-    const state = edgeStateAt(e, asOf);
-    if (state === 'live') liveAtCaret += 1;
-    const tick = e.invalid_at != null
-      ? `<line class="sb-ltick" x1="${x2}%" x2="${x2}%" y1="${y - 3}" y2="${y + 3}" stroke="currentColor" stroke-width="1"/>`
-      : '';
-    return `<line class="sb-lseg sb-l-${state}" data-va="${esc(e.valid_at)}"${e.invalid_at != null ? ` data-vi="${esc(e.invalid_at)}"` : ''} x1="${x1}%" x2="${x2}%" y1="${y}" y2="${y}" stroke="currentColor" stroke-width="1"/>${tick}`;
-  }).join('');
+  const lifetimes = edges.length <= SCRUB_LIFETIME_MAX;
+  let stripInner = '';
+  let h = 0;
+  let stepsAttr = '';
+  let explain = '';
 
-  const capNote = edges.length > rows.length
-    ? ` · TOP ${num(rows.length)} OF ${num(edges.length)} BY STRENGTH`
-    : '';
+  if (lifetimes) {
+    // Deterministic row order: strength desc, believed-since asc, id asc.
+    const rows = [...edges].sort((a, b) =>
+      (b.weight - a.weight)
+      || (Number(a.valid_at) - Number(b.valid_at))
+      || (a.edge_id < b.edge_id ? -1 : 1)
+    );
+    const rowH = rows.length <= 6 ? 10 : rows.length <= 12 ? 8 : 6;
+    h = Math.max(44, rows.length * rowH + 8);
+    const lines = rows.map((e, i) => {
+      const y = 6 + i * rowH;
+      const x1 = pctOf(Number(e.valid_at));
+      let x2 = e.invalid_at != null ? pctOf(Number(e.invalid_at)) : 100;
+      // A belief held briefly must not vanish into a zero-width line.
+      if (x2 - x1 < 0.3) x2 = Math.min(100, x1 + 0.3);
+      const state = edgeStateAt(e, asOf);
+      const tick = e.invalid_at != null
+        ? `<line class="sb-ltick" x1="${x2}%" x2="${x2}%" y1="${y - 3}" y2="${y + 3}" stroke="currentColor" stroke-width="1"/>`
+        : '';
+      return `<line class="sb-lseg sb-l-${state}" data-va="${esc(e.valid_at)}"${e.invalid_at != null ? ` data-vi="${esc(e.invalid_at)}"` : ''} x1="${x1}%" x2="${x2}%" y1="${y}" y2="${y}" stroke="currentColor" stroke-width="1"/>${tick}`;
+    }).join('');
+    stripInner = `<svg class="chart sb-striplines" width="100%" height="${h}" aria-hidden="true">${lines}</svg>`;
+    explain = `EACH LINE IS ONE LINK'S LIFETIME · RETIRED LINKS KEEP THEIR ROW, DASHED`;
+  } else {
+    // Belief-count step curve. Events: +1 when a link starts being
+    // believed, −1 when it retires; the curve is the running count.
+    const ev = [];
+    for (const e of edges) {
+      ev.push([Number(e.valid_at), 1]);
+      if (e.invalid_at != null) ev.push([Number(e.invalid_at), -1]);
+    }
+    ev.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+    const steps = []; // [t, countFromT]
+    let c = 0;
+    for (const [t, d] of ev) {
+      c += d;
+      if (steps.length && steps[steps.length - 1][0] === t) steps[steps.length - 1][1] = c;
+      else steps.push([t, c]);
+    }
+    const maxC = Math.max(...steps.map((s) => s[1]), 1);
+    h = 88;
+    const X = 1000; // viewBox units; preserveAspectRatio=none stretches
+    const xOf = (ms) => (pctOf(ms) / 100) * X;
+    const yOf = (n) => 4 + (1 - n / maxC) * (h - 10);
+    let pts = `0,${yOf(0).toFixed(1)}`;
+    let prevY = yOf(0);
+    for (const [t, n] of steps) {
+      const x = xOf(t).toFixed(1);
+      const y = yOf(n);
+      pts += ` ${x},${prevY.toFixed(1)} ${x},${y.toFixed(1)}`;
+      prevY = y;
+    }
+    pts += ` ${X},${prevY.toFixed(1)}`;
+    stepsAttr = ` data-sb-steps="${esc(steps.map(([t, n]) => `${t}:${n}`).join(','))}"`;
+    stripInner = `<svg class="chart sb-striplines" width="100%" height="${h}" viewBox="0 0 ${X} ${h}" preserveAspectRatio="none" aria-hidden="true">
+      <polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1"/>
+    </svg>
+    <span class="sb-curvemax mono faint">peak ${esc(floor)}${num(maxC)}</span>`;
+    explain = `THE LINE COUNTS BELIEFS OVER TIME — TOO MANY LINKS (${floor}${num(edges.length)}) TO DRAW ONE PER ROW`;
+  }
 
   return `
-  <div class="sb-scrub" data-sb-scrub data-d0="${d0}" data-d1="${d1}">
+  <div class="sb-scrub" data-sb-scrub data-d0="${d0}" data-d1="${d1}"${stepsAttr}>
     <div class="key">BELIEF TIME · DRAG ANYWHERE ON THE STRIP — THE PAGE REPLAYS WHAT THIS BRAIN BELIEVED AT THAT MOMENT</div>
     <div class="sb-strip" data-sb-strip style="height:${h}px;">
-      <svg class="chart sb-striplines" width="100%" height="${h}" aria-hidden="true">${lines}</svg>
+      ${stripInner}
       <div class="sb-caret" data-sb-caret style="left:${caretPct}%;" role="slider" tabindex="0"
            aria-label="Belief time — what did this brain believe, when"
            aria-valuemin="${d0}" aria-valuemax="${d1}" aria-valuenow="${caretMs}"
            aria-valuetext="${asOf == null ? 'now' : esc(fmtTs(caretMs)) + ' UTC'}"></div>
-      <div class="sb-caret-label mono" data-sb-caret-label style="left:${labelPct}%;">${asOf == null ? 'NOW' : esc(fmtTs(caretMs))}</div>
+      <div class="sb-caret-label mono ${caretAlignClass(labelPct)}" data-sb-caret-label style="left:${labelPct}%;">${asOf == null ? 'NOW' : esc(fmtTs(caretMs))}</div>
     </div>
     <div class="sb-scrub-legend mono faint">
       <span>${esc(fmtDay(d0raw))}</span>
-      <span class="mid"><span data-sb-livecount>${num(liveAtCaret)} OF ${num(rows.length)}</span> BELIEVED AT THE CARET${esc(capNote)} · EACH LINE IS ONE LINK'S LIFETIME · RETIRED LINKS KEEP THEIR ROW</span>
+      <span class="mid"><span data-sb-livecount>${esc(floor)}${num(liveAtCaret)} OF ${esc(floor)}${num(edges.length)}</span> BELIEVED AT THIS MOMENT<span class="sb-scrub-explain"> · ${explain}</span></span>
       <span>${asOf != null ? `<button type="button" class="text-btn" data-sb-now>BACK TO NOW</button>` : `TODAY · ${esc(fmtDay(now))}`}</span>
     </div>
   </div>`;
@@ -394,7 +483,7 @@ export const EgoLedger = ({ data }) => {
   <div class="sb-ledger" data-sb-ledger>
     ${sideCol(inGroups, 'in', ctx, '← WHAT LINKS IN', 'NOTHING LINKS IN AT THIS MOMENT')}
     <div class="sb-rail" data-sb-rail="in" aria-hidden="true"></div>
-    ${FocusCard({ ego, nodes, names, brain: data.brain })}
+    ${FocusCard({ ego, nodes, names, brain: data.brain, asOf })}
     <div class="sb-rail" data-sb-rail="out" aria-hidden="true"></div>
     ${sideCol(outGroups, 'out', ctx, 'WHERE IT LINKS OUT →', 'NO OUTBOUND LINKS AT THIS MOMENT')}
   </div>`
@@ -402,7 +491,7 @@ export const EgoLedger = ({ data }) => {
   <div class="sb-ledger" data-sb-ledger>
     <div class="sb-col sb-col-in"></div>
     <div class="sb-rail" data-sb-rail="in" aria-hidden="true"></div>
-    ${FocusCard({ ego, nodes, names, brain: data.brain })}
+    ${FocusCard({ ego, nodes, names, brain: data.brain, asOf })}
     <div class="sb-rail" data-sb-rail="out" aria-hidden="true"></div>
     <div class="sb-col sb-col-out"></div>
   </div>
@@ -435,13 +524,15 @@ export const HonestyList = ({ data }) => {
   const dangling = Array.isArray(ns.dangling_ids) && ns.dangling_ids.length
     ? `<div class="sb-hids mono faint">no document behind: ${ns.dangling_ids.slice(0, 8).map(esc).join(', ')}${ns.dangling_ids.length > 8 ? ` +${ns.dangling_ids.length - 8} more` : ''}</div>`
     : '';
-  const timelineEdges = (data.sb && data.sb.timeline && data.sb.timeline.edges) || [];
-  const scrubHidden = Math.max(0, timelineEdges.length - SCRUB_ROW_CAP);
+  // The belief strip draws EVERY link it fetched (rows or count-curve —
+  // the form switches, the truth does not); what it can hide is what
+  // the fetch itself clipped server-side.
+  const tlns = (data.sb && data.sb.timeline && data.sb.timeline.not_shown) || {};
   return `
   <div class="sb-honesty mono">
     <div class="sb-hgroup key">THE LEDGER READ</div>
     ${hrow('links beyond the fetch cap (not drawn)', z(ns.edges_clipped), true, 'edges_clipped')}
-    ${hrow('start notes over the expansion cap', z(ns.frontier_clipped), true, 'frontier_clipped')}
+    ${hrow('starting notes the walk had to drop', z(ns.frontier_clipped), true, 'frontier_clipped')}
     ${hrow('links hidden by the belief-time cut', z(ns.expired_excluded), false, 'expired_excluded')}
     ${hrow('links hidden by a kind filter', z(ns.type_filtered), false, 'type_filtered')}
     ${hrow('storage segments this read had to skip', z(ns.segments_without_columns), true, 'segments_without_columns')}
@@ -454,8 +545,8 @@ export const HonestyList = ({ data }) => {
     ${hrow('most-citing notes beyond the top list', z(on.hubs_out_not_listed), false, 'hubs_out_not_listed')}
     ${hrow('most-cited notes beyond the top list', z(on.hubs_in_not_listed), false, 'hubs_in_not_listed')}
     <div class="sb-hgroup key">CAPS THIS PAGE APPLIES</div>
-    ${hrow('ledger rows per group', `≤ ${num(LEDGER_GROUP_CAP)} (capped groups say so)`, false)}
-    ${hrow('belief-strip rows hidden', z(scrubHidden), false)}
+    ${hrow('ledger rows per link kind (capped groups say so)', `≤ ${num(LEDGER_GROUP_CAP)}`, false)}
+    ${hrow('belief-strip lifetimes beyond its fetch cap', z(tlns.edges_clipped), true, 'edges_clipped')}
   </div>`;
 };
 
@@ -467,14 +558,14 @@ const hubList = (items, notListed, focus, ctx) => {
   const rows = items.map((i) => {
     const frac = Math.max(0, Math.min(1, i.live_edges / max));
     return `
-    <div class="sb-hubrow${i.id === focus ? ' sb-hub-active' : ''}" data-sb-focus="${esc(i.id)}" role="button" tabindex="0"
+    <button type="button" class="sb-hubrow${i.id === focus ? ' sb-hub-active' : ''}" data-sb-focus="${esc(i.id)}"
          title="Open the ledger for ${esc(i.id)}">
       <span class="sb-hubname">${esc(nodeName(i.id, ctx))}</span>
       <span class="sb-hubn">${esc(num(i.live_edges))}</span>
-      <svg class="chart sb-hubbar" height="6" viewBox="0 0 100 6" preserveAspectRatio="none">
+      <svg class="chart sb-hubbar" height="6" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true">
         <line x1="0" y1="5" x2="${(frac * 100).toFixed(1)}" y2="5" stroke="currentColor" stroke-width="1"/>
       </svg>
-    </div>`;
+    </button>`;
   }).join('');
   const tail = notListed > 0
     ? `<div class="hint">+ ${num(notListed)} more beyond this list</div>` : '';
@@ -522,8 +613,12 @@ const BelievedPanel = ({ data }) => {
     return Num({ value: '0', unit: 'links', hint: 'nothing asserted yet — see below', emphasis: true });
   }
   const W = 200;
-  const liveW = Math.round((ed.live / ed.total) * W);
-  const gap = ed.live > 0 && ed.invalidated > 0 ? 2 : 0;
+  const both = ed.live > 0 && ed.invalidated > 0;
+  let liveW = Math.round((ed.live / ed.total) * W);
+  // When both segments exist, neither may vanish (a 0.5% retired share
+  // must still be visibly present) and neither may go negative-width.
+  if (both) liveW = Math.max(4, Math.min(W - 4, liveW));
+  const gap = both ? 1 : 0;
   const bar = `
   <svg class="chart sb-split" width="100%" height="8" viewBox="0 0 ${W} 8" preserveAspectRatio="none" aria-hidden="true">
     ${ed.live > 0 ? `<line class="sb-seg-live" x1="0" y1="4" x2="${liveW - gap}" y2="4" stroke="currentColor" stroke-width="3"/>` : ''}
@@ -573,9 +668,9 @@ const TaughtByPanel = ({ data }) => {
   const max = Math.max(...shown.map((d) => d.live), 1);
   const rows = shown.map((d) => `
     <div class="sb-det">
-      <span class="sb-detname" title="deterministic detector ${esc(d.detector)} — same folder in, same links out">${esc(d.detector)}</span>
+      <span class="sb-detname" title="deterministic detector ${esc(d.detector)} — same folder in, same links out">${esc(detectorName(d.detector))}</span>
       <span class="sb-detn">${esc(num(d.live))}</span>
-      <svg class="chart sb-hubbar" height="6" viewBox="0 0 100 6" preserveAspectRatio="none">
+      <svg class="chart sb-hubbar" height="6" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true">
         <line x1="0" y1="5" x2="${((d.live / max) * 100).toFixed(1)}" y2="5" stroke="currentColor" stroke-width="1"/>
       </svg>
     </div>`).join('');
@@ -651,7 +746,6 @@ export const EmptyBrainNote = ({ brain, connected, error }) => {
     <div class="sb-cmdrow"><pre class="sb-cmd mono" data-sb-cmd>xerj</pre><button type="button" class="text-btn" data-sb-copy>COPY</button></div>
   </div>`;
   }
-  const b = brain || 'notes';
   return `
   <div class="sb-empty">
     <div class="sb-ftitle">THIS BRAIN IS EMPTY — ONE COMMAND FILLS IT</div>
@@ -659,10 +753,11 @@ export const EmptyBrainNote = ({ brain, connected, error }) => {
     relative link, reading sequence and folder neighborhood becomes a link that
     remembers the exact quote that taught it — then this page turns into a ledger
     of what your notes believe, replayable at any moment in time.</p>
-    <div class="sb-cmdrow"><pre class="sb-cmd mono" data-sb-cmd>xerj brain ~/${esc(b)}</pre><button type="button" class="text-btn" data-sb-copy>COPY</button></div>
-    <p class="sb-ftext">Detection is deterministic — the same folder always produces the same
-    brain, and re-running only picks up what changed. Agents can assert links of
-    their own through the graph API once there is something to build on.</p>
+    <div class="sb-cmdrow"><pre class="sb-cmd mono" data-sb-cmd>xerj brain ~/your-folder</pre><button type="button" class="text-btn" data-sb-copy>COPY</button></div>
+    <p class="sb-ftext">The folder's name becomes the brain's name here. Detection is
+    deterministic — the same folder always produces the same brain, and re-running
+    only picks up what changed. Agents can assert links of their own through the
+    graph API once there is something to build on.</p>
     <div class="mono faint">no upload · runs local · nothing is ever hard-deleted</div>
   </div>`;
 };
@@ -691,8 +786,14 @@ export function renderPanelBody(id, data) {
     }
   }
 
+  // Engine down ≠ empty brain: peripheral panels defer to the ledger
+  // panel's ENGINE UNREACHABLE state instead of teaching fill-me copy.
+  const offline = !sb.connected;
+  const offNote = `<div class="panel-empty mono faint">ENGINE UNREACHABLE · SEE THE LEDGER PANEL</div>`;
+
   switch (id) {
     case 'edgesLive':
+      if (offline) return offNote;
       return hasBrain ? BelievedPanel({ data }) : `<div class="panel-empty mono faint">NO BRAIN YET · SEE BELOW</div>`;
     case 'edgesTotal':
       return hasBrain ? AssertedPanel({ data }) : `<div class="panel-empty mono faint">—</div>`;
@@ -701,14 +802,22 @@ export function renderPanelBody(id, data) {
     case 'detectors':
       return hasBrain ? TaughtByPanel({ data }) : `<div class="panel-empty mono faint">—</div>`;
     case 'typeDist':
+      if (offline) return offNote;
       return hasEdges ? TypeDistPanel({ data }) : `<div class="panel-empty mono faint">LINK KINDS RANK HERE · WIKI-LINKS, FOLDER NEIGHBORS, READING ORDER…</div>`;
     case 'edgeTimeline':
+      if (offline) return offNote;
       return hasEdges ? TimelinePanel({ data }) : `<div class="panel-empty mono faint">EACH DAY’S NEW LINKS WILL DRAW HERE</div>`;
-    case 'ego':
-      return hasEdges
-        ? EgoLedger({ data })
-        : EmptyBrainNote({ brain: data.brain, connected: sb.connected, error: sb.error });
+    case 'ego': {
+      if (hasEdges) return EgoLedger({ data });
+      // An empty brain must not be a dead end when OTHER brains have
+      // data: keep the brain-switcher controls above the teaching copy.
+      const switcher = sb.connected && Array.isArray(sb.brains) && sb.brains.length > 1
+        ? EgoControls({ brain: data.brain, brains: sb.brains, focus: null, asOf: null, trail: [], names: sb.names || {} })
+        : '';
+      return switcher + EmptyBrainNote({ brain: data.brain, connected: sb.connected, error: sb.error });
+    }
     case 'hubs':
+      if (offline) return offNote;
       return hasEdges ? HubsPanel({ data }) : `<div class="panel-empty mono faint">YOUR MOST-CITED NOTES WILL RANK HERE</div>`;
     case 'notShown':
       // Always renders — zeros prove absence.

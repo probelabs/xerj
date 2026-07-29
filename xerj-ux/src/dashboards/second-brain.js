@@ -14,7 +14,7 @@
 // data/second-brain-api.js, which reads /_graph/{brain}/overview and
 // /_graph/{brain}/ego and NEVER falls back to mock — an empty or
 // unreachable brain renders an honest state that says how to fill it
-// (`xerj autoindex <folder>`), not invented beliefs.
+// (`xerj brain ~/your-folder`), not invented beliefs.
 // ============================================================
 
 import { renderPanelBody } from '../ux/ego-ledger.js';

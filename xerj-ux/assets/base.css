@@ -1758,12 +1758,17 @@ html.mobile-preview .nav-sub {
 }
 .sb-fdeg {
   display: flex;
-  gap: var(--sp-3);
+  flex-wrap: wrap;               /* wrap BETWEEN stats, never inside one */
+  gap: var(--sp-1) var(--sp-3);
   margin-top: var(--sp-2);
   font-size: var(--fs-13);
   color: var(--z-mute);
 }
+.sb-fdeg > span { white-space: nowrap; }
 .sb-fnum { color: var(--z-ink); font-weight: 700; }
+/* Retired-at-this-moment count on the focus card: quiet, struck like
+   the rows it summarizes. */
+.sb-fret { text-decoration: line-through; }
 .sb-fprov { margin-top: var(--sp-1); font-size: var(--fs-11); overflow-wrap: anywhere; }
 
 .sb-group { margin-bottom: var(--sp-3); }
@@ -1806,13 +1811,16 @@ html.mobile-preview .nav-sub {
   display: flex;
   gap: var(--sp-1);
   align-items: baseline;
+  min-width: 0; /* may shrink — the note's NAME wins the row */
   font-family: var(--font-data);
   font-size: var(--fs-11);
   color: var(--z-mute);
   white-space: nowrap;
   cursor: pointer;
 }
-.sb-emeta:hover .sb-eev, .sb-emeta:focus-visible .sb-eev { color: var(--z-accent); }
+/* The believed-window is the shrinkable part; tags/chips never clip. */
+.sb-ewin { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sb-emeta:hover .sb-eq, .sb-emeta:focus-visible .sb-eq { color: var(--z-accent); }
 .sb-ehop2 { color: var(--z-ink); }
 .sb-eq { letter-spacing: var(--track-label); font-size: 10px; }
 /* State tags. RETIRED wears the accent (the time-travel payoff);
@@ -1888,6 +1896,19 @@ html.mobile-preview .nav-sub {
   white-space: nowrap;
   pointer-events: none;
 }
+/* Near the strip edges the label anchors instead of centring, so it
+   never clips off-screen (matters at phone widths). */
+.sb-caret-label.sb-cl-left  { transform: none; }
+.sb-caret-label.sb-cl-right { transform: translateX(-100%); }
+/* Peak label of the belief-count curve (many-links form). */
+.sb-curvemax {
+  position: absolute;
+  top: 2px;
+  left: 6px;
+  font-size: var(--fs-11);
+  letter-spacing: 0.06em;
+  pointer-events: none;
+}
 .sb-scrub-legend {
   display: flex;
   justify-content: space-between;
@@ -1897,6 +1918,10 @@ html.mobile-preview .nav-sub {
   letter-spacing: 0.06em;
 }
 .sb-scrub-legend .mid { flex: 1; text-align: center; }
+/* Narrow screens keep the count; the how-to-read tail goes. */
+@media (max-width: 640px) {
+  .sb-scrub-explain { display: none; }
+}
 .sb-busy { opacity: 0.55; transition: opacity 0.15s; }
 
 /* Honesty panel — always rendered, zeros included */
@@ -1923,12 +1948,15 @@ html.mobile-preview .nav-sub {
   grid-template-columns: minmax(0, 1fr) auto 64px;
   gap: var(--sp-2);
   align-items: baseline;
+  width: 100%;       /* real <button> rows: full-bleed + left-aligned */
+  text-align: left;
   padding: 4px 0;
   border-bottom: 1px solid var(--z-faint);
   font-family: var(--font-data);
   font-size: var(--fs-13);
   cursor: pointer;
 }
+.sb-hubrow:focus-visible { outline: 1px solid var(--z-accent); outline-offset: 2px; }
 .sb-hubname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sb-hubn { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
 .sb-hubbar { width: 100%; align-self: center; }

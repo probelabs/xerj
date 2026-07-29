@@ -24,7 +24,7 @@
 // ============================================================
 
 import {
-  renderPanelBody, drawLedgerTraces, edgeStateAt, fmtTs,
+  renderPanelBody, drawLedgerTraces, edgeStateAt, fmtTs, caretAlignClass,
 } from '../ux/ego-ledger.js';
 
 /** Panel ids of the second-brain dashboard, in render order. The
@@ -497,10 +497,26 @@ function normalizeAsOf(ms, dom) {
   return (dom[1] - ms) / (dom[1] - dom[0]) < 0.01 ? null : ms;
 }
 
-/** Move the caret + relabel + restate every strip line and ledger row
+/** Belief count at `ms` from the strip's step attribute
+ *  ("t:count,t:count,…", ascending): the last step at or before ms. */
+function countFromSteps(stepsAttr, ms) {
+  let count = 0;
+  for (const part of stepsAttr.split(',')) {
+    const i = part.indexOf(':');
+    if (i < 1) continue;
+    const t = Number(part.slice(0, i));
+    if (t > ms) break;
+    count = Number(part.slice(i + 1)) || 0;
+  }
+  return count;
+}
+
+/** Move the caret + relabel + restate the strip and every ledger row
  *  for a candidate as-of. Pure DOM, no queries — this is the mid-drag
  *  preview over edges the server already returned. The live counter in
- *  the legend follows the caret so the drag narrates itself. */
+ *  the legend follows the caret so the drag narrates itself. Handles
+ *  both strip forms: lifetime rows restyle per-row; the belief-count
+ *  curve reads its count off `data-sb-steps`. */
 function previewAsOf(scrub, ms) {
   const dom = stripDomain(scrub);
   if (!dom) return;
@@ -514,22 +530,37 @@ function previewAsOf(scrub, ms) {
     caret.setAttribute('aria-valuetext', atNow ? 'now' : `${fmtTs(ms)} UTC`);
   }
   if (label) {
-    label.style.left = `${Math.max(3, Math.min(97, pct))}%`;
+    const lp = Math.max(1, Math.min(99, pct));
+    label.style.left = `${lp}%`;
     label.textContent = atNow ? 'NOW' : fmtTs(ms);
+    label.classList.toggle('sb-cl-left', caretAlignClass(lp) === 'sb-cl-left');
+    label.classList.toggle('sb-cl-right', caretAlignClass(lp) === 'sb-cl-right');
   }
   const t = atNow ? null : ms;
-  let live = 0;
-  let total = 0;
-  for (const seg of scrub.querySelectorAll('.sb-lseg')) {
-    const e = { valid_at: Number(seg.getAttribute('data-va')), invalid_at: seg.hasAttribute('data-vi') ? Number(seg.getAttribute('data-vi')) : null };
-    const state = edgeStateAt(e, t);
-    total += 1;
-    if (state === 'live') live += 1;
-    seg.classList.remove('sb-l-live', 'sb-l-future', 'sb-l-expired');
-    seg.classList.add(`sb-l-${state}`);
-  }
   const counter = scrub.querySelector('[data-sb-livecount]');
-  if (counter) counter.textContent = `${live} OF ${total}`;
+  const steps = scrub.getAttribute('data-sb-steps');
+  if (steps) {
+    // Curve form. The rendered counter may carry a '≥' floor prefix
+    // (clipped fetch) — preserve it.
+    if (counter) {
+      const floor = counter.textContent.trimStart().startsWith('≥') ? '≥' : '';
+      const total = (counter.textContent.split('OF')[1] || '').trim();
+      const live = countFromSteps(steps, t == null ? Date.now() : t);
+      counter.textContent = `${floor}${live.toLocaleString('en')} OF ${total}`;
+    }
+  } else {
+    let live = 0;
+    let total = 0;
+    for (const seg of scrub.querySelectorAll('.sb-lseg')) {
+      const e = { valid_at: Number(seg.getAttribute('data-va')), invalid_at: seg.hasAttribute('data-vi') ? Number(seg.getAttribute('data-vi')) : null };
+      const state = edgeStateAt(e, t);
+      total += 1;
+      if (state === 'live') live += 1;
+      seg.classList.remove('sb-l-live', 'sb-l-future', 'sb-l-expired');
+      seg.classList.add(`sb-l-${state}`);
+    }
+    if (counter) counter.textContent = `${live} OF ${total}`;
+  }
   for (const row of document.querySelectorAll('[data-sb-edge][data-va]')) {
     const e = { valid_at: Number(row.getAttribute('data-va')), invalid_at: row.hasAttribute('data-vi') ? Number(row.getAttribute('data-vi')) : null };
     const state = edgeStateAt(e, t);

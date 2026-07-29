@@ -5,6 +5,18 @@
 // dedup and recency-weighted recall for long-running agents.
 // This is the only dashboard in the category — nobody else
 // ships this at the data-layer level.
+//
+// HONESTY DEBT (flagged in the second-brain UX review): the live
+// adapter (data/backends/xerj.js liveAgentMemory) reads a user index
+// literally named `agent-memory` — NOT the real Agent-Memory API's
+// `.xerj-memory-*` namespaces — and when that index is absent the
+// query layer falls back to full demo data (mock.js) with only the
+// nav pill saying MOCK FALLBACK. Panels like the UMAP embed-space
+// render an invented world. This dashboard should be ported to the
+// live `/_memory` surfaces with honest empty states, exactly as
+// dashboards/second-brain.js does (its adapter never returns null,
+// so mock can never fire). Until then, treat every number here as
+// demo unless the pill says LIVE.
 // ============================================================
 
 import { Num }                     from '../ux/text.js';
