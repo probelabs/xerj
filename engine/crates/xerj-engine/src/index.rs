@@ -796,6 +796,488 @@ mod semantic_deadline_regression_tests {
     }
 
     #[tokio::test]
+    async fn mixed_short_and_chunked_semantic_docs_use_exact_passage_winner() {
+        let dir = TempDir::new().unwrap();
+        let engine_instance = engine(&dir);
+        let mut schema = Schema::empty();
+        let mut body = FieldConfig::new("body", FieldType::Text);
+        body.options.dimensions = Some(32);
+        body.options.similarity = Some("cosine".into());
+        body.embedding = Some(xerj_common::types::EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("body_vector".into()),
+        });
+        schema.add_field(body).unwrap();
+        let mut companion = FieldConfig::new("body_vector", FieldType::Vector);
+        companion.options.dimensions = Some(32);
+        companion.options.similarity = Some("cosine".into());
+        schema.add_field(companion).unwrap();
+        engine_instance
+            .create_index("mixed-passages", schema)
+            .unwrap();
+        let idx = engine_instance.get_index("mixed-passages").unwrap();
+        idx.schema.write().await.dynamic = xerj_common::schema::DynamicMapping::Runtime;
+
+        let query_text = "unique passage evidence";
+        let query = xerj_ai::local::local_embed(query_text, 32);
+        let mut decoy = query.clone();
+        decoy[0] += 0.35;
+        let norm = decoy.iter().map(|value| value * value).sum::<f32>().sqrt();
+        for value in &mut decoy {
+            *value /= norm;
+        }
+        let as_json = |vector: &[f32]| {
+            Value::Array(
+                vector
+                    .iter()
+                    .map(|value| Value::from(*value as f64))
+                    .collect(),
+            )
+        };
+
+        // These pooled vectors dominate the future long document's pooled
+        // vector, so a candidate-local chunk check cannot see the real winner.
+        for id in 0..1024 {
+            idx.index_document_prepared(
+                Some(format!("short-{id}")),
+                serde_json::json!({
+                    "body": "nearby but not exact evidence",
+                    "body_vector": as_json(&decoy),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let request = SearchRequest {
+            query: QueryNode::SemanticSearch {
+                field: "body".into(),
+                text: query_text.into(),
+                k: 1,
+                filter: None,
+                boost: None,
+            },
+            fields: vec![PASSAGE_RESPONSE_FIELD.into()],
+            size: 1,
+            ..SearchRequest::default()
+        };
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        let short_only = idx.search(&request).await.unwrap();
+        assert_eq!(short_only.hits.len(), 1);
+        assert_eq!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed),
+            0,
+            "an all-short corpus must remain ANN eligible"
+        );
+
+        let mut poor_pooled = query.iter().map(|value| -*value).collect::<Vec<_>>();
+        // Keep the pooled vector finite and unit length while placing it at
+        // the opposite end of cosine space from the query.
+        let norm = poor_pooled
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        for value in &mut poor_pooled {
+            *value /= norm;
+        }
+        let text = "noise section|unique passage evidence";
+        let split = text.find('|').unwrap();
+        idx.query_cache.clear();
+        idx.test_ann_passage_guard_pause
+            .store(true, Ordering::Release);
+        idx.test_ann_passage_guard_ready
+            .store(false, Ordering::Release);
+        let racing_index = Arc::clone(&idx);
+        let racing_request = request.clone();
+        let racing_query = tokio::spawn(async move { racing_index.search(&racing_request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !idx.test_ann_passage_guard_ready.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ANN query did not reach the post-admission pause");
+
+        idx.index_document_prepared(
+            Some("true-passage-winner".into()),
+            serde_json::json!({
+                "body": text,
+                "page": 17,
+                "body_vector": as_json(&poor_pooled),
+                "body_vector_chunks": [as_json(&poor_pooled), as_json(&query)],
+                (passage_metadata_field("body_vector")): {
+                    "field": "body",
+                    "chunks": [[0, split], [split + 1, text.len()]]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        idx.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        idx.test_ann_passage_guard_pause
+            .store(false, Ordering::Release);
+        let result = racing_query.await.unwrap().unwrap();
+
+        let stats = idx.hnsw_stats().await;
+        assert_eq!(
+            stats["passage_exact_fields"],
+            serde_json::json!(["body_vector"])
+        );
+        assert!(
+            !idx.schema().await.has_field("body_vector_chunks"),
+            "dynamic:false/runtime must not be required to persist the guard"
+        );
+        assert!(
+            idx.test_scan_checkpoint_count.load(Ordering::Relaxed) > 0,
+            "a passage-bearing field must use the exact scorer"
+        );
+        assert_eq!(result.hits[0].id, "true-passage-winner");
+        let passage = result.hits[0].passage.as_ref().expect("winning passage");
+        assert_eq!(passage.ordinal, 1);
+        assert_eq!(passage.text, query_text);
+        assert_eq!(passage.page, Some(17));
+
+        idx.passage_chunk_fields.write().unwrap().clear();
+        idx.hnsw_stale.store(true, Ordering::Release);
+        assert!(idx.rebuild_hnsw_from_docs().await.unwrap());
+        assert!(
+            idx.passage_chunks_require_exact("body_vector"),
+            "authoritative rebuild must union passage targets before clearing stale"
+        );
+
+        // The guard is deliberately monotonic: replacing the long document
+        // with a short one, or deleting it, cannot make legacy/history
+        // uncertainty look ANN-safe.
+        idx.index_document_prepared(
+            Some("true-passage-winner".into()),
+            serde_json::json!({
+                "body": "now short",
+                "body_vector": as_json(&decoy),
+            }),
+        )
+        .await
+        .unwrap();
+        idx.delete_document("true-passage-winner").await.unwrap();
+        assert!(idx.passage_chunks_require_exact("body_vector"));
+
+        idx.flush().await.unwrap();
+        let marker: Value = serde_json::from_slice(
+            &std::fs::read(idx.hnsw_ids_path()).expect("persisted HNSW identity"),
+        )
+        .unwrap();
+        assert_eq!(marker["passage_guard_version"], 1);
+        assert_eq!(
+            marker["passage_chunk_fields"],
+            serde_json::json!(["body_vector"])
+        );
+        drop(idx);
+        drop(engine_instance);
+        let restarted_engine = engine(&dir);
+        let restarted = restarted_engine.get_index("mixed-passages").unwrap();
+        assert!(
+            restarted.passage_chunks_require_exact("body_vector"),
+            "the monotonic passage guard must survive flush/restart"
+        );
+        let ids_path = restarted.hnsw_ids_path();
+        drop(restarted);
+        drop(restarted_engine);
+        let mut legacy: Value = serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("passage_guard_version");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("passage_chunk_fields");
+        std::fs::write(&ids_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_engine = engine(&dir);
+        let legacy_index = legacy_engine.get_index("mixed-passages").unwrap();
+        assert!(
+            legacy_index.passage_chunks_require_exact("body_vector"),
+            "a nonempty legacy sidecar without the marker must fail closed"
+        );
+    }
+
+    #[test]
+    fn passage_guard_marker_rejects_legacy_unknown_and_malformed_shapes() {
+        assert!(
+            parse_passage_guard(&serde_json::json!({})).is_none(),
+            "missing legacy marker is unknown, never safe"
+        );
+        assert!(
+            parse_passage_guard(&serde_json::json!({
+                "passage_guard_version": 2,
+                "passage_chunk_fields": []
+            }))
+            .is_none(),
+            "unknown marker versions are fail-closed"
+        );
+        assert!(
+            parse_passage_guard(&serde_json::json!({
+                "passage_guard_version": 1,
+                "passage_chunk_fields": ["body_vector", 7]
+            }))
+            .is_none(),
+            "mixed-type marker arrays are malformed"
+        );
+        assert_eq!(
+            parse_passage_guard(&serde_json::json!({
+                "passage_guard_version": 1,
+                "passage_chunk_fields": ["z", "a"]
+            }))
+            .unwrap(),
+            HashSet::from(["a".to_string(), "z".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_publication_paths_record_passage_guard_before_visibility() {
+        fn semantic_schema() -> Schema {
+            let mut schema = Schema::empty();
+            let mut body = FieldConfig::new("body", FieldType::Text);
+            body.options.dimensions = Some(2);
+            body.embedding = Some(xerj_common::types::EmbeddingConfig {
+                endpoint: None,
+                model: None,
+                target_field: Some("body_vector".into()),
+            });
+            schema.add_field(body).unwrap();
+            let mut vector = FieldConfig::new("body_vector", FieldType::Vector);
+            vector.options.dimensions = Some(2);
+            schema.add_field(vector).unwrap();
+            schema
+        }
+
+        let dir = TempDir::new().unwrap();
+        let engine_instance = engine(&dir);
+        engine_instance
+            .create_index("async-raw-passages", semantic_schema())
+            .unwrap();
+        let async_idx = engine_instance.get_index("async-raw-passages").unwrap();
+        let source = serde_json::json!({
+            "body": "two passages",
+            "body_vector": [0.5, 0.5],
+            "body_vector_chunks": [[1.0, 0.0], [0.0, 1.0]]
+        });
+        async_idx
+            .index_batch_turbo_raw(vec![(
+                "async".into(),
+                Arc::<[u8]>::from(serde_json::to_vec(&source).unwrap()),
+            )])
+            .await
+            .unwrap();
+        assert!(async_idx.passage_chunks_require_exact("body_vector"));
+
+        engine_instance
+            .create_index("sync-raw-passages", semantic_schema())
+            .unwrap();
+        let sync_idx = engine_instance.get_index("sync-raw-passages").unwrap();
+        sync_idx
+            .index_batch_sync_raw(vec![(
+                "sync".into(),
+                Arc::<[u8]>::from(serde_json::to_vec(&source).unwrap()),
+            )])
+            .unwrap();
+        assert!(sync_idx.passage_chunks_require_exact("body_vector"));
+    }
+
+    #[tokio::test]
+    async fn hnsw_save_racing_first_passage_write_reopens_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        let engine_instance = engine(&dir);
+        let mut schema = Schema::empty();
+        let mut vector = FieldConfig::new("v", FieldType::Vector);
+        vector.options.dimensions = Some(2);
+        vector.options.similarity = Some("cosine".into());
+        schema.add_field(vector).unwrap();
+        engine_instance
+            .create_index("save-race-passages", schema)
+            .unwrap();
+        let idx = engine_instance.get_index("save-race-passages").unwrap();
+        for id in 0..1024 {
+            idx.index_document(
+                Some(format!("short-{id}")),
+                serde_json::json!({
+                    "text": "short decoy",
+                    "v": [0.8, 0.6]
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        idx.test_hnsw_save_passage_snapshot_pause
+            .store(true, Ordering::Release);
+        idx.test_hnsw_save_passage_snapshot_ready
+            .store(false, Ordering::Release);
+        let saving_index = Arc::clone(&idx);
+        let saving = tokio::spawn(async move { saving_index.save_hnsw_to_disk().await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !idx
+                .test_hnsw_save_passage_snapshot_ready
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("save did not pause after passage marker snapshot");
+
+        let writer_after_fts = Arc::new(AtomicBool::new(false));
+        let writer_after_fts_hook = Arc::clone(&writer_after_fts);
+        idx.set_publication_test_hook(Some(Arc::new(move |id, point| {
+            if id == "passage-winner" && point == PublicationTestPoint::AfterFts {
+                writer_after_fts_hook.store(true, Ordering::Release);
+            }
+        })));
+        let writing_index = Arc::clone(&idx);
+        let writing = tokio::spawn(async move {
+            writing_index
+                .index_document(
+                    Some("passage-winner".into()),
+                    serde_json::json!({
+                        "text": "noise|exact winning passage",
+                        "page": 23,
+                        "v": [-1.0, 0.0],
+                        "v_chunks": [[-1.0, 0.0], [1.0, 0.0]],
+                        "__xerj_passage_meta__v": {
+                            "field": "text",
+                            "chunks": [[0, 5], [6, 27]]
+                        }
+                    }),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !writer_after_fts.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer did not publish WAL/memtable during save window");
+
+        idx.test_hnsw_save_passage_snapshot_pause
+            .store(false, Ordering::Release);
+        saving.await.unwrap().unwrap();
+        writing.await.unwrap().unwrap();
+        idx.set_publication_test_hook(None);
+
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(idx.hnsw_ids_path()).unwrap()).unwrap();
+        assert_eq!(saved["passage_guard_version"], 1);
+        assert_eq!(saved["passage_chunk_fields"], serde_json::json!([]));
+        assert_eq!(
+            saved["stale"], true,
+            "a sequence advance across graph/guard serialization must fail closed"
+        );
+        let stamped = saved["seq_no"].as_u64().unwrap();
+        assert!(
+            stamped < idx.current_seq_no(),
+            "sidecar must retain the pre-snapshot sequence, not bless the racing write"
+        );
+
+        drop(idx);
+        drop(engine_instance);
+        let restarted_engine = engine(&dir);
+        let restarted = restarted_engine.get_index("save-race-passages").unwrap();
+        assert!(restarted.passage_chunks_require_exact("v"));
+        restarted
+            .test_scan_checkpoint_count
+            .store(0, Ordering::Relaxed);
+        let result = restarted
+            .search(&SearchRequest {
+                query: QueryNode::Knn {
+                    field: "v".into(),
+                    vector: vec![1.0, 0.0],
+                    k: 1,
+                    num_candidates: None,
+                    filter: None,
+                    boost: None,
+                    similarity: None,
+                },
+                fields: vec![PASSAGE_RESPONSE_FIELD.into()],
+                size: 1,
+                ..SearchRequest::default()
+            })
+            .await
+            .unwrap();
+        assert!(restarted.test_scan_checkpoint_count.load(Ordering::Relaxed) > 0);
+        assert_eq!(result.hits[0].id, "passage-winner");
+        let passage = result.hits[0].passage.as_ref().unwrap();
+        assert_eq!(passage.ordinal, 1);
+        assert_eq!(passage.text, "exact winning passage");
+        assert_eq!(passage.page, Some(23));
+    }
+
+    #[tokio::test]
+    async fn explicit_nested_dense_vector_chunks_activate_only_their_field_guard() {
+        let dir = TempDir::new().unwrap();
+        let engine_instance = engine(&dir);
+        let mut schema = Schema::empty();
+        let mut nested_vector = FieldConfig::new("passages.vec", FieldType::Vector);
+        nested_vector.options.dimensions = Some(2);
+        schema.add_field(nested_vector).unwrap();
+        let mut unrelated = FieldConfig::new("other", FieldType::Vector);
+        unrelated.options.dimensions = Some(2);
+        schema.add_field(unrelated).unwrap();
+        engine_instance
+            .create_index("explicit-passage-vectors", schema)
+            .unwrap();
+        let idx = engine_instance
+            .get_index("explicit-passage-vectors")
+            .unwrap();
+        idx.index_document(
+            Some("nested".into()),
+            serde_json::json!({
+                "passages": {
+                    "vec": [0.5, 0.5],
+                    "vec_chunks": [[1.0, 0.0], [0.0, 1.0]]
+                },
+                "other": [1.0, 0.0]
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(idx.passage_chunks_require_exact("passages.vec"));
+        assert!(
+            !idx.passage_chunks_require_exact("other"),
+            "an unrelated vector field must remain eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn mapping_vector_over_existing_hidden_chunks_fails_closed_before_visibility() {
+        let dir = TempDir::new().unwrap();
+        let engine_instance = engine(&dir);
+        engine_instance
+            .create_index("late-vector-mapping", Schema::empty())
+            .unwrap();
+        let idx = engine_instance.get_index("late-vector-mapping").unwrap();
+        idx.schema.write().await.dynamic = xerj_common::schema::DynamicMapping::Runtime;
+        idx.index_document(
+            Some("hidden".into()),
+            serde_json::json!({
+                "future": [0.5, 0.5],
+                "future_chunks": [[1.0, 0.0], [0.0, 1.0]]
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!idx.passage_chunks_require_exact("future"));
+
+        let mut future = FieldConfig::new("future", FieldType::Vector);
+        future.options.dimensions = Some(2);
+        idx.add_field(future).await.unwrap();
+        assert!(
+            idx.passage_chunks_require_exact("future"),
+            "activating vector scoring over pre-existing hidden data must be \
+             conservative before the new schema is visible"
+        );
+    }
+
+    #[tokio::test]
     async fn timed_out_leader_is_not_cached() {
         let dir = TempDir::new().unwrap();
         let engine = engine(&dir);
@@ -2346,6 +2828,19 @@ pub struct Index {
     /// std (not tokio) RwLock: read on every ingested doc and inside the
     /// query gate; critical sections are a clone/compare with no `.await`.
     hnsw_field: Arc<std::sync::RwLock<Option<String>>>,
+    /// Semantic companion targets for which a passage-vector array has ever
+    /// been observed.
+    ///
+    /// This set is monotonic: update/delete never removes an entry. HNSW
+    /// contains pooled document vectors, so it cannot safely select candidates
+    /// for a field once any live or historical document may score by its best
+    /// passage. A false positive only keeps that field on the exact scorer;
+    /// a false negative could omit the true best-passage winner.
+    ///
+    /// Publication records the target before WAL/memtable visibility. The set
+    /// is persisted in the HNSW identity sidecar, unioned with WAL replay, and
+    /// reconstructed conservatively for legacy sidecars.
+    passage_chunk_fields: Arc<std::sync::RwLock<HashSet<String>>>,
     /// True when the loaded HNSW snapshot is flush-time stale relative to
     /// the replayed WAL (`ids.json` seq_no stamp != store.current_seq_no()).
     /// A WAL-tail UPDATE of an already-graphed doc leaves both
@@ -2388,6 +2883,14 @@ pub struct Index {
     test_scan_checkpoint_delay_ms: Arc<AtomicU64>,
     #[cfg(test)]
     test_scan_checkpoint_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_ann_passage_guard_pause: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_ann_passage_guard_ready: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_hnsw_save_passage_snapshot_pause: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_hnsw_save_passage_snapshot_ready: Arc<AtomicBool>,
     #[cfg(test)]
     test_stored_value_load_delay_ms: Arc<AtomicU64>,
     #[cfg(test)]
@@ -2822,6 +3325,7 @@ impl Index {
             .iter()
             .any(|f| matches!(f.field_type, FieldType::Date));
         let segment_hydration_budget = index_segment_hydration_budget(config);
+        let passage_chunk_fields_init = passage_chunk_fields_from_schema(&managed.schema);
         let index = Arc::new(Self {
             name,
             schema: Arc::new(RwLock::new(managed)),
@@ -2859,6 +3363,14 @@ impl Index {
             #[cfg(test)]
             test_scan_checkpoint_count: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
+            test_ann_passage_guard_pause: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_ann_passage_guard_ready: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_hnsw_save_passage_snapshot_pause: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_hnsw_save_passage_snapshot_ready: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             test_stored_value_load_delay_ms: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             test_stored_value_load_count: Arc::new(AtomicU64::new(0)),
@@ -2883,6 +3395,7 @@ impl Index {
             hnsw_publications_in_flight: Arc::new(AtomicU64::new(0)),
             hnsw_publication_generation: Arc::new(AtomicU64::new(0)),
             hnsw_field: Arc::new(std::sync::RwLock::new(None)),
+            passage_chunk_fields: Arc::new(std::sync::RwLock::new(passage_chunk_fields_init)),
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
@@ -2972,6 +3485,8 @@ impl Index {
         // the same custom analyzers (synonyms, ngrams, etc.) that were active
         // when the documents were originally indexed.
         let registry = Arc::new(build_registry_from_settings(&settings));
+        let passage_scored_fields_at_open = passage_scored_vector_fields(&schema.schema);
+        let mut wal_passage_chunk_fields = HashSet::new();
 
         // Replay WAL entries into the FTS memtable.  The IndexStore already
         // replays the WAL into its own storage memtable (for future flushes);
@@ -2992,6 +3507,11 @@ impl Index {
             for replay_entry in xerj_storage::wal::replay_all_sorted(&wal_dir) {
                 match replay_entry.entry {
                     WalEntry::Index { doc_id, source } => {
+                        observe_passage_chunks_in_source(
+                            &passage_scored_fields_at_open,
+                            &source,
+                            &mut wal_passage_chunk_fields,
+                        );
                         // Replay idempotence (2026-07, S2): mirror of the
                         // storage-memtable rule in `IndexStore::replay_wal`.
                         // If the version map (segments rebuilt + storage
@@ -3064,32 +3584,60 @@ impl Index {
             dv_fields_at_open.iter().any(|df| df == f)
         });
         let initial_hnsw = loaded_hnsw.as_ref().map(|_| ()).is_some();
-        let (hnsw_init, id_map_init, id_rev_init, next_id_init, hnsw_field_init, hnsw_stale_init) =
-            match loaded_hnsw {
-                Some(l) => {
-                    // Freshness stamp check: the snapshot is flush-time, but
-                    // WAL replay never calls index_vectors — so a WAL-tail
-                    // UPDATE of an already-graphed doc leaves the graph
-                    // holding the pre-update vector while the
-                    // `id_map.len() == doc_count` coverage guard still
-                    // passes (len and count both unchanged). A stamp
-                    // mismatch therefore marks the graph stale: ingest keeps
-                    // maintaining it and the kNN query path stays on exact
-                    // brute force until the background stale rebuild
-                    // (spawned at the end of open — RC4 W2 item 17)
-                    // re-derives the WAL-tail divergence and clears the
-                    // flag. (The loader gate guarantees `field` is Some.)
-                    let stale =
-                        l.stale || l.seq_no.is_none_or(|stamp| stamp != store.current_seq_no());
-                    (Some(l.graph), l.id_map, l.id_rev, l.next_id, l.field, stale)
-                }
-                None => (None, HashMap::new(), HashMap::new(), 1, None, false),
-            };
+        let (
+            hnsw_init,
+            id_map_init,
+            id_rev_init,
+            next_id_init,
+            hnsw_field_init,
+            hnsw_stale_init,
+            persisted_passage_chunk_fields,
+        ) = match loaded_hnsw {
+            Some(l) => {
+                // Freshness stamp check: the snapshot is flush-time, but
+                // WAL replay never calls index_vectors — so a WAL-tail
+                // UPDATE of an already-graphed doc leaves the graph
+                // holding the pre-update vector while the
+                // `id_map.len() == doc_count` coverage guard still
+                // passes (len and count both unchanged). A stamp
+                // mismatch therefore marks the graph stale: ingest keeps
+                // maintaining it and the kNN query path stays on exact
+                // brute force until the background stale rebuild
+                // (spawned at the end of open — RC4 W2 item 17)
+                // re-derives the WAL-tail divergence and clears the
+                // flag. (The loader gate guarantees `field` is Some.)
+                let stale = l.stale || l.seq_no.is_none_or(|stamp| stamp != store.current_seq_no());
+                (
+                    Some(l.graph),
+                    l.id_map,
+                    l.id_rev,
+                    l.next_id,
+                    l.field,
+                    stale,
+                    l.passage_chunk_fields,
+                )
+            }
+            None => (None, HashMap::new(), HashMap::new(), 1, None, false, None),
+        };
         // Item 8: seed the coverage-gate denominator from the persisted graph.
         // At flush time the graph covered every vector-bearing doc, so the
         // reloaded `id_map.len()` IS the vector-doc count. If the snapshot is
         // stale, `hnsw_stale` already forces brute regardless of this value.
         let vector_doc_count_init = id_map_init.len() as u64;
+        let mut passage_chunk_fields_init = passage_chunk_fields_from_schema(&schema.schema);
+        match persisted_passage_chunk_fields {
+            Some(fields) => passage_chunk_fields_init.extend(fields),
+            None if total_doc_count > 0 => {
+                // A missing marker means the index predates the passage guard.
+                // Its stored documents may contain chunks even when
+                // dynamic:false kept `<target>_chunks` out of schema.json.
+                // Refuse semantic ANN for every semantic target rather than
+                // infer safety from incomplete metadata.
+                passage_chunk_fields_init.extend(passage_scored_fields_at_open.iter().cloned());
+            }
+            None => {}
+        }
+        passage_chunk_fields_init.extend(wal_passage_chunk_fields);
         if initial_hnsw {
             info!(
                 name = name.as_str(),
@@ -3120,6 +3668,14 @@ impl Index {
             test_scan_checkpoint_delay_ms: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             test_scan_checkpoint_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_ann_passage_guard_pause: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_ann_passage_guard_ready: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_hnsw_save_passage_snapshot_pause: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_hnsw_save_passage_snapshot_ready: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_stored_value_load_delay_ms: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -3165,6 +3721,7 @@ impl Index {
             hnsw_publications_in_flight: Arc::new(AtomicU64::new(0)),
             hnsw_publication_generation: Arc::new(AtomicU64::new(0)),
             hnsw_field: Arc::new(std::sync::RwLock::new(hnsw_field_init)),
+            passage_chunk_fields: Arc::new(std::sync::RwLock::new(passage_chunk_fields_init)),
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(hnsw_stale_init)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
@@ -3433,6 +3990,12 @@ impl Index {
             .has_dense_vector_mapping()
             .await
             .then(|| self.begin_hnsw_publication());
+        // Publish the passage-ANN guard before this source can become visible
+        // through the WAL/version map or FTS memtable. A concurrent semantic
+        // query checks the guard both before and after ANN candidate work, so
+        // it either linearizes before this write or falls back to the exact
+        // passage scorer.
+        self.observe_passage_chunks(std::iter::once(&source)).await;
 
         // Invalidate the response cache only after admission and CAS succeed.
         self.dataset_version.fetch_add(1, Ordering::Release);
@@ -3724,6 +4287,8 @@ impl Index {
         };
         drop(schema_guard);
         let _hnsw_publication = has_vector_mapping.then(|| self.begin_hnsw_publication());
+        self.observe_passage_chunks(processed.iter().map(|ingest| ingest.source.as_ref()))
+            .await;
 
         // ── Step 3+4: WAL append + FTS memtable insert under one lock ─────
         //
@@ -4025,7 +4590,6 @@ impl Index {
         if prof {
             p_parse_us = raw_parse_elapsed.as_micros();
         }
-
         let (has_copy_to, has_vector_mapping) = {
             let schema = self.schema.read().await;
             (
@@ -4044,6 +4608,8 @@ impl Index {
                 .map(|source| Arc::new(apply_copy_to(source, &schema.schema)))
                 .collect();
             drop(schema);
+            self.observe_passage_chunks(sources.iter().map(|source| source.as_ref()))
+                .await;
             let wal_docs: Vec<(String, Arc<Value>)> = docs
                 .iter()
                 .zip(&sources)
@@ -4052,6 +4618,14 @@ impl Index {
             let seq_nos = self.store.wal_append_batch(&wal_docs)?;
             (docs, sources, seq_nos)
         } else {
+            self.observe_passage_chunks(
+                validated
+                    .parsed()
+                    .into_iter()
+                    .flatten()
+                    .map(|source| source.as_ref()),
+            )
+            .await;
             let seq_nos = self.store.wal_append_batch_raw(&validated)?;
             let (docs, parsed) = validated.into_parts();
             (
@@ -4359,18 +4933,31 @@ impl Index {
         // For the rare mapped case, materialize once, transform the sole
         // source authority, and retain transformed bytes for the raw
         // memtable so live GET, flush, and replay all observe the same value.
-        let has_copy_to = {
+        let (has_copy_to, passage_scored_fields) = {
             let schema = self.schema.try_read().map_err(|_| {
                 EngineError::Common(xerj_common::XerjError::resource_exhausted(
                     "schema is being updated during synchronous ingest; retry the batch",
                 ))
             })?;
-            schema_has_copy_to(&schema.schema)
+            (
+                schema_has_copy_to(&schema.schema),
+                passage_scored_vector_fields(&schema.schema),
+            )
         };
-        let (docs, seq_nos, copy_schema) = if has_copy_to {
-            let validated = crate::ingest_pool()
+        let validated = if has_copy_to || !passage_scored_fields.is_empty() {
+            crate::ingest_pool()
                 .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
-                .map_err(EngineError::Storage)?;
+                .map_err(EngineError::Storage)?
+        } else {
+            validated
+        };
+        if let Some(parsed) = validated.parsed() {
+            self.observe_passage_chunks_for_targets(
+                &passage_scored_fields,
+                parsed.iter().map(|source| source.as_ref()),
+            );
+        }
+        let (docs, seq_nos, copy_schema) = if has_copy_to {
             let (raw_docs, parsed) = validated.into_parts();
             let parsed = parsed.expect("parse_validated_raw_batch retains parsed values");
             let schema = self.schema.try_read().map_err(|_| {
@@ -4384,6 +4971,10 @@ impl Index {
                 .map(|source| Arc::new(apply_copy_to(source, &copy_schema)))
                 .collect();
             drop(schema);
+            self.observe_passage_chunks_for_targets(
+                &passage_scored_fields,
+                transformed.iter().map(|source| source.as_ref()),
+            );
             let wal_docs: Vec<(String, Arc<Value>)> = raw_docs
                 .iter()
                 .zip(&transformed)
@@ -4419,14 +5010,18 @@ impl Index {
         } else {
             let seq_nos = self.store.wal_append_batch_raw(&validated)?;
             let (docs, parsed) = validated.into_parts();
-            debug_assert!(parsed.is_none());
-            (
-                docs.into_iter()
+            let docs = match parsed {
+                Some(parsed) => docs
+                    .into_iter()
+                    .zip(parsed)
+                    .map(|((id, bytes), source)| (id, bytes, Some(source)))
+                    .collect(),
+                None => docs
+                    .into_iter()
                     .map(|(id, bytes)| (id, bytes, None))
                     .collect(),
-                seq_nos,
-                None,
-            )
+            };
+            (docs, seq_nos, None)
         };
         // RC4 W4 item 2: WAL durability-write latency.
         if let Some(m) = crate::engine_metrics() {
@@ -4694,6 +5289,8 @@ impl Index {
             .has_dense_vector_mapping()
             .await
             .then(|| self.begin_hnsw_publication());
+        self.observe_passage_chunks(processed.iter().map(|ingest| ingest.source.as_ref()))
+            .await;
 
         // Step 3: Update version map (lock-free atomic operations) — no WAL.
         // Assign monotonically increasing seq_nos from the engine's counter.
@@ -6264,6 +6861,44 @@ impl Index {
         Ok(Ok(Some(SerializedDocumentUpdate { response, created })))
     }
 
+    /// Record passage-bearing semantic targets before document visibility.
+    ///
+    /// The set is monotonic, so this method does no work for ordinary
+    /// lexical/vector documents after the cheap source-key scan. It must run
+    /// before WAL or memtable publication on every path that can carry a
+    /// semantic companion.
+    async fn observe_passage_chunks<'a, I>(&self, sources: I)
+    where
+        I: IntoIterator<Item = &'a Value>,
+    {
+        let targets = {
+            let schema = self.schema.read().await;
+            passage_scored_vector_fields(&schema.schema)
+        };
+        if targets.is_empty() {
+            return;
+        }
+        self.observe_passage_chunks_for_targets(&targets, sources);
+    }
+
+    fn observe_passage_chunks_for_targets<'a, I>(&self, targets: &[String], sources: I)
+    where
+        I: IntoIterator<Item = &'a Value>,
+    {
+        let mut observed = HashSet::new();
+        for source in sources {
+            observe_passage_chunks_in_source(targets, source, &mut observed);
+        }
+        if observed.is_empty() {
+            return;
+        }
+        self.passage_chunk_fields.write().unwrap().extend(observed);
+    }
+
+    fn passage_chunks_require_exact(&self, field: &str) -> bool {
+        self.passage_chunk_fields.read().unwrap().contains(field)
+    }
+
     /// Scan a document for vector fields and insert them into the HNSW graph.
     ///
     /// FIELD IDENTITY (see `hnsw_field`): one graph indexes exactly ONE
@@ -6540,6 +7175,11 @@ impl Index {
         if self.hnsw.read().await.is_none() {
             return Ok(false);
         }
+        let passage_scored_fields = {
+            let schema = self.schema.read().await;
+            passage_scored_vector_fields(&schema.schema)
+        };
+        let mut rebuilt_passage_fields = HashSet::new();
 
         'passes: for pass in 1..=MAX_PASSES {
             let seq_start = self.store.current_seq_no();
@@ -6553,6 +7193,11 @@ impl Index {
             let mut seen: HashSet<String> = HashSet::new();
             let mem_docs = self.memtable.all_docs_with_sources();
             for (doc_id, src) in &mem_docs {
+                observe_passage_chunks_in_source(
+                    &passage_scored_fields,
+                    src,
+                    &mut rebuilt_passage_fields,
+                );
                 seen.insert(doc_id.clone());
                 if let Some(vector) = extract_numeric_vector(src, &field) {
                     compared += 1;
@@ -6621,6 +7266,11 @@ impl Index {
                             &src_owned
                         }
                     };
+                    observe_passage_chunks_in_source(
+                        &passage_scored_fields,
+                        src,
+                        &mut rebuilt_passage_fields,
+                    );
                     if let Some(vector) = extract_numeric_vector(src, &field) {
                         compared += 1;
                         if !self.hnsw_vector_current(id, &vector).await
@@ -6683,6 +7333,13 @@ impl Index {
 
             let seq_end = self.store.current_seq_no();
             if seq_end == seq_start {
+                // This union must publish before stale=false. A query may
+                // observe the healed graph immediately after that release;
+                // it must already know whether passage scoring owns the field.
+                self.passage_chunk_fields
+                    .write()
+                    .unwrap()
+                    .extend(rebuilt_passage_fields.iter().cloned());
                 self.hnsw_stale
                     .store(false, std::sync::atomic::Ordering::Release);
                 info!(
@@ -6740,6 +7397,15 @@ impl Index {
         let vector_docs = self.vector_doc_count.load(Ordering::Relaxed);
         let doc_count = self.doc_count.load(Ordering::Relaxed);
         let covered = present && graphed == vector_docs && !self.hnsw_stale.load(Ordering::Acquire);
+        let mut passage_exact_fields: Vec<String> = self
+            .passage_chunk_fields
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        passage_exact_fields.sort();
+        let semantic_ann_blocked_by_passages = !passage_exact_fields.is_empty();
         serde_json::json!({
             "present": present,
             "field": self.hnsw_field.read().unwrap().clone(),
@@ -6752,6 +7418,8 @@ impl Index {
             "vector_doc_count": vector_docs,
             "total_docs": doc_count,
             "covered": covered,
+            "passage_exact_fields": passage_exact_fields,
+            "semantic_ann_blocked_by_passages": semantic_ann_blocked_by_passages,
             "stale": self.hnsw_stale.load(Ordering::Acquire),
             "rebuilding": self
                 .hnsw_rebuilding
@@ -6811,6 +7479,17 @@ impl Index {
         }
         if similarity != "cosine" {
             return None;
+        }
+        if self.passage_chunks_require_exact(field) {
+            return None;
+        }
+        #[cfg(test)]
+        if self.test_ann_passage_guard_pause.load(Ordering::Acquire) {
+            self.test_ann_passage_guard_ready
+                .store(true, Ordering::Release);
+            while self.test_ann_passage_guard_pause.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
         }
         let publication_generation = self.hnsw_publication_generation.load(Ordering::Acquire);
         if self.hnsw_publications_in_flight.load(Ordering::Acquire) != 0 {
@@ -6931,6 +7610,13 @@ impl Index {
             scored.push((doc_id, score, src, None));
         }
         if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        // A writer records this field before making a new chunked document
+        // visible. Recheck after graph search and hydration so a query racing
+        // the first such write either linearizes before that write or abandons
+        // ANN and lets the caller run the exact passage scorer.
+        if self.passage_chunks_require_exact(field) {
             return None;
         }
 
@@ -8426,6 +9112,11 @@ impl Index {
     pub async fn save_hnsw_to_disk(&self) -> Result<()> {
         let publication_generation_before =
             self.hnsw_publication_generation.load(Ordering::Acquire);
+        // This stamp brackets graph, identity-map, and passage-guard
+        // serialization. A write publishes its WAL before graph mutation, so
+        // any advance during this window means the captured pieces are not one
+        // current generation and must reopen stale.
+        let seq_before = self.store.current_seq_no();
         let hnsw_guard = self.hnsw.read().await;
         let hnsw = match &*hnsw_guard {
             Some(h) => h,
@@ -8458,22 +9149,43 @@ impl Index {
         // keys, and this loader treats a missing `field` as legacy.
         let id_map = self.hnsw_id_map.read().await;
         let hnsw_field = self.hnsw_field.read().unwrap().clone();
-        // Capture the WAL position before the final publication samples.
-        // Every guarded writer increments generation before WAL visibility,
-        // so a writer that is absent from these samples necessarily appends
-        // after this stamp and will be caught by the restart seq mismatch.
-        let seq_no = self.store.current_seq_no();
+        let mut passage_chunk_fields: Vec<String> = self
+            .passage_chunk_fields
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        passage_chunk_fields.sort();
+        #[cfg(test)]
+        if self
+            .test_hnsw_save_passage_snapshot_pause
+            .load(Ordering::Acquire)
+        {
+            self.test_hnsw_save_passage_snapshot_ready
+                .store(true, Ordering::Release);
+            while self
+                .test_hnsw_save_passage_snapshot_pause
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        }
+        let seq_after = self.store.current_seq_no();
         let publication_generation_after = self.hnsw_publication_generation.load(Ordering::Acquire);
         let publication_in_flight = self.hnsw_publications_in_flight.load(Ordering::Acquire);
-        let stale = self.hnsw_stale.load(Ordering::Acquire)
+        let snapshot_stale = self.hnsw_stale.load(Ordering::Acquire)
+            || seq_after != seq_before
             || publication_in_flight != 0
             || publication_generation_before != publication_generation_after;
         let snapshot = serde_json::json!({
             "next_id": self.hnsw_next_id.load(Ordering::Relaxed),
             "map": *id_map,
             "field": hnsw_field,
-            "seq_no": seq_no,
-            "stale": stale,
+            "seq_no": seq_before,
+            "stale": snapshot_stale,
+            "passage_guard_version": 1,
+            "passage_chunk_fields": passage_chunk_fields,
         });
         // Durable atomic publish (RC4 W2 item 19 — same treatment as
         // graph.bin in HnswIndex::save_to): fsync file + rename + fsync
@@ -8532,6 +9244,16 @@ impl Index {
                 .seq_no
                 .is_none_or(|stamp| stamp != self.store.current_seq_no());
         *self.hnsw_field.write().unwrap() = loaded.field;
+        let passage_scored_fields = {
+            let schema = self.schema.read().await;
+            passage_scored_vector_fields(&schema.schema)
+        };
+        let mut passage_fields = self.passage_chunk_fields.write().unwrap();
+        match loaded.passage_chunk_fields {
+            Some(fields) => passage_fields.extend(fields),
+            None => passage_fields.extend(passage_scored_fields),
+        }
+        drop(passage_fields);
         self.hnsw_stale
             .store(stale, std::sync::atomic::Ordering::Release);
         let nodes = loaded.graph.len();
@@ -13420,6 +14142,22 @@ impl Index {
         let mut candidate = current;
         for field in fields {
             candidate.add_field(field)?;
+        }
+        if self.live_doc_count() > 0 {
+            let active_before: HashSet<String> = passage_scored_vector_fields(&schema.schema)
+                .into_iter()
+                .collect();
+            let newly_active = passage_scored_vector_fields(&candidate.schema)
+                .into_iter()
+                .filter(|field| !active_before.contains(field));
+            // Existing sources can contain hidden `<field>_chunks` values
+            // (notably under dynamic:false). Without an authoritative scan in
+            // this mapping transaction, newly activating vector semantics
+            // must conservatively choose exact before schema visibility.
+            self.passage_chunk_fields
+                .write()
+                .unwrap()
+                .extend(newly_active);
         }
         self.save_schema(&candidate).await?;
         if let Some(embedder) = activated {
@@ -20414,6 +21152,10 @@ struct LoadedHnsw {
     /// Persisted staleness marker (a stale graph re-saved by a later flush
     /// must not come back fresh just because its seq stamp caught up).
     stale: bool,
+    /// Monotonic semantic targets known to carry passage vectors. `None`
+    /// means a legacy, unknown-version, or malformed marker and must be
+    /// interpreted conservatively by the caller.
+    passage_chunk_fields: Option<HashSet<String>>,
 }
 
 fn load_hnsw_artifacts_sync(
@@ -20501,6 +21243,7 @@ fn load_hnsw_artifacts_sync(
     // it as fresh.
     let seq_no = ids.get("seq_no").and_then(|v| v.as_u64());
     let stale = ids.get("stale").and_then(|v| v.as_bool()).unwrap_or(false);
+    let passage_chunk_fields = parse_passage_guard(&ids);
     Some(LoadedHnsw {
         graph,
         id_map,
@@ -20509,7 +21252,21 @@ fn load_hnsw_artifacts_sync(
         field,
         seq_no,
         stale,
+        passage_chunk_fields,
     })
+}
+
+fn parse_passage_guard(ids: &Value) -> Option<HashSet<String>> {
+    match (
+        ids.get("passage_guard_version").and_then(Value::as_u64),
+        ids.get("passage_chunk_fields").and_then(Value::as_array),
+    ) {
+        (Some(1), Some(fields)) => fields
+            .iter()
+            .map(|field| field.as_str().map(str::to_string))
+            .collect::<Option<HashSet<_>>>(),
+        _ => None,
+    }
 }
 
 fn store_config_from(config: &Config) -> IndexStoreConfig {
@@ -20832,6 +21589,44 @@ const HNSW_MIN_DOCS: u64 = 1024;
 /// measured mean recall@10 0.98 / min 0.90 (100 seeded probes), beam cost
 /// ~1.1 ms. A user-supplied num_candidates above the floor is honored.
 const HNSW_EF_FLOOR: usize = 800;
+
+fn passage_scored_vector_fields(schema: &Schema) -> Vec<String> {
+    let mut fields = collect_dense_vector_fields(schema);
+    fields.extend(schema.fields.iter().filter_map(|field| {
+        field.embedding.as_ref().map(|embedding| {
+            embedding
+                .target_field
+                .clone()
+                .unwrap_or_else(|| format!("{}_vector", field.name))
+        })
+    }));
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+fn observe_passage_chunks_in_source(
+    passage_scored_fields: &[String],
+    source: &Value,
+    observed: &mut HashSet<String>,
+) {
+    for field in passage_scored_fields {
+        let chunk_field = format!("{field}_chunks");
+        if matches!(
+            get_field_value(source, &chunk_field),
+            Some(Value::Array(chunks)) if !chunks.is_empty()
+        ) {
+            observed.insert(field.clone());
+        }
+    }
+}
+
+fn passage_chunk_fields_from_schema(schema: &Schema) -> HashSet<String> {
+    passage_scored_vector_fields(schema)
+        .into_iter()
+        .filter(|target| schema.has_field(&format!("{target}_chunks")))
+        .collect()
+}
 
 fn passage_metadata_field(target: &str) -> String {
     format!("{PASSAGE_METADATA_PREFIX}{target}")

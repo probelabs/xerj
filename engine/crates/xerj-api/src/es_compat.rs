@@ -14995,6 +14995,8 @@ async fn cat_ann_inner(
                     "vector_docs": s["vector_doc_count"],
                     "coverage": s["doc_coverage"],
                     "covered": s["covered"],
+                    "passage_exact_fields": s["passage_exact_fields"],
+                    "semantic_ann_blocked_by_passages": s["semantic_ann_blocked_by_passages"],
                     "stale": s["stale"],
                     "rebuilding": s["rebuilding"],
                 })

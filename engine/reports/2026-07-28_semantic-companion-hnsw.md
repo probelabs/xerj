@@ -11,6 +11,20 @@ with exact rescoring.
 This is a correctness/path-selection fix, not a throughput benchmark. No
 speedup claim is made here.
 
+The current-main composition adds a load-bearing passage guard. Document-level
+HNSW stores pooled vectors, while long semantic documents are ranked by their
+best passage. Once `<target>_chunks` has been observed, selecting only pooled
+ANN candidates can omit the true best-passage winner. That field therefore
+uses the exact passage scorer until a future passage-node ANN exists.
+
+This distinction is decisive for FinanceBench: the audited 20-PDF corpus has
+`body_vector_chunks` on 5,693 of 6,622 documents (85.97%), spanning all 19
+unique PDF titles. Correct behavior therefore keeps FinanceBench semantic
+queries exact. This change repairs graph construction and ANN serving for
+pooled-only corpora; it does **not** accelerate FinanceBench semantic queries.
+Passage-node ANN is the next query architecture, not candidate inflation in
+this patch.
+
 ## Root cause
 
 The API mapping converter attached `EmbeddingConfig` to the public text field
@@ -112,10 +126,48 @@ composition. Static inspection specifically confirmed that the replay retains:
 - the static HNSW storage view and reused-external-ID persistence repairs from
   merged PRs 65 and 64.
 
-At this pre-audit stage only `cargo fmt --all -- --check` and
-`git diff --check afcb3a7..HEAD` were run. Both passed. No current-main test,
-build, conformance, or benchmark result is claimed until an independent source
-audit approves compilation.
+The current-main audit additionally found that candidate-local detection of
+`<field>_chunks` was insufficient: the omitted best-passage document is, by
+definition, unavailable for that check. The composition now maintains a
+monotonic per-field exact-routing guard:
+
+- it covers semantic companion targets and explicitly mapped `dense_vector`
+  fields because the exact scorer supports `<field>_chunks` for both;
+- every parsed publication path records the guard before WAL or memtable
+  visibility, including semantic prepared writes, async raw turbo, sync raw,
+  copy-to transformed sources, and no-WAL realtime turbo;
+- HNSW checks before candidate work and again before returning, closing the
+  concurrent first-chunk publication window;
+- `ids.json` persists a sorted field set with `passage_guard_version: 1`;
+- graph/identity/guard persistence is bracketed by sequence stamps. If a write
+  advances the sequence during serialization, the sidecar retains the earlier
+  stamp and persists `stale: true` rather than blessing mixed-generation
+  graph, ID, and passage state;
+- WAL replay, schema hints, and stale-graph authoritative rebuilds union into
+  the marker; missing, unknown-version, or malformed legacy markers fail
+  closed;
+- update, delete, and short replacement never clear the marker. Reindexing is
+  the recovery for a false-positive historical marker.
+
+The deliberate tradeoff is conservative exact fallback after the last chunked
+document disappears. This costs query latency but cannot change winners.
+
+The first current-main focused debug regression,
+`mixed_short_and_chunked_semantic_docs_use_exact_passage_winner`, passed
+`1/1`. It constructs 1,024 pooled-only documents plus an adversarial chunked
+document whose pooled vector is outside the ANN winners while its second
+passage is the exact winner. The test proves the query racing the first chunked
+publication falls back, returns the correct document and passage ordinal/text,
+rebuilds the guard before clearing stale, remains conservative after
+replacement/delete, persists the marker, and fails closed for a legacy
+sidecar. Broader current-main gates remain pending.
+
+`hnsw_save_racing_first_passage_write_reopens_fail_closed` also passed `1/1`.
+Its deterministic hook pauses persistence after an empty guard snapshot,
+publishes the first passage-bearing document through WAL and memtable, then
+lets persistence finish. The sidecar records the old sequence with
+`stale: true`; restart unions WAL evidence, stays exact, and returns the true
+second-passage winner with provenance.
 
 ## Historical source-branch verification
 
