@@ -9257,12 +9257,13 @@ impl Index {
             let schema = self.schema.read().await;
             passage_scored_vector_fields(&schema.schema)
         };
-        let mut passage_fields = self.passage_chunk_fields.write().unwrap();
-        match loaded.passage_chunk_fields {
-            Some(fields) => passage_fields.extend(fields),
-            None => passage_fields.extend(passage_scored_fields),
+        {
+            let mut passage_fields = self.passage_chunk_fields.write().unwrap();
+            match loaded.passage_chunk_fields {
+                Some(fields) => passage_fields.extend(fields),
+                None => passage_fields.extend(passage_scored_fields),
+            }
         }
-        drop(passage_fields);
         self.hnsw_stale
             .store(stale, std::sync::atomic::Ordering::Release);
         let nodes = loaded.graph.len();
