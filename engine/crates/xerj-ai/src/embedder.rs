@@ -172,7 +172,7 @@ impl<T: Send + Sync + 'static> CancellationSafeInit<T> {
 
 #[cfg(feature = "onnx-experimental")]
 struct OnnxShared {
-    init: std::sync::Arc<CancellationSafeInit<crate::onnx::OnnxEmbedder>>,
+    init: std::sync::Arc<CancellationSafeInit<crate::onnx::OnnxPool>>,
     calls: std::sync::Arc<tokio::sync::Semaphore>,
     bytes: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -292,6 +292,8 @@ pub struct OnnxConfig {
     pub model_sha256: String,
     pub tokenizer_sha256: String,
     pub intra_threads: usize,
+    /// Number of independently constructed ONNX Runtime sessions.
+    pub session_pool_size: usize,
     pub microbatch: crate::onnx::MicrobatchConfig,
     pub max_inflight_calls: usize,
     pub max_input_bytes_per_call: usize,
@@ -336,7 +338,7 @@ impl OnnxHandle {
         Self { cfg, shared }
     }
 
-    async fn get(&self) -> Result<std::sync::Arc<crate::onnx::OnnxEmbedder>> {
+    async fn get(&self) -> Result<std::sync::Arc<crate::onnx::OnnxPool>> {
         let cfg = self.cfg.clone();
         self.shared
             .init
@@ -362,15 +364,17 @@ impl OnnxHandle {
                             actual_tokenizer
                         ));
                     }
-                    let embedder = crate::onnx::OnnxEmbedder::load_bytes(
+                    let embedder = crate::onnx::OnnxPool::load_bytes(
                         &model_bytes,
                         &tokenizer_bytes,
                         cfg.intra_threads,
+                        cfg.session_pool_size,
                     )?;
                     tracing::info!(
                         model_sha256 = %cfg.model_sha256,
                         tokenizer_sha256 = %cfg.tokenizer_sha256,
                         dimensions = crate::onnx::DIMS,
+                        session_pool_size = embedder.len(),
                         "experimental ONNX embedding backend active; first semantic inference loaded the verified model"
                     );
                     Ok(embedder)
@@ -400,12 +404,18 @@ impl OnnxHandle {
                     reason: "ONNX input byte count overflowed; split the request".into(),
                 })
             })?;
-        let (_call_permit, _byte_permits) = self.try_admit(input_bytes)?;
+        let (call_permit, byte_permits) = self.try_admit(input_bytes)?;
         let model = self.get().await?;
         let limits = self.cfg.microbatch;
-        tokio::task::spawn_blocking(move || model.embed_scheduled_blocking(&texts, limits))
-            .await
-            .map_err(|e| anyhow!("ONNX embed task panicked: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            // Admission remains charged until native inference returns even if
+            // the async waiter is cancelled.
+            let _call_permit = call_permit;
+            let _byte_permits = byte_permits;
+            model.embed_scheduled_blocking(&texts, limits)
+        })
+        .await
+        .map_err(|e| anyhow!("ONNX embed task panicked: {e}"))?
     }
 
     fn try_admit(
@@ -487,6 +497,7 @@ mod onnx_handle_tests {
             model_sha256: model_sha256.into(),
             tokenizer_sha256: "tokenizer-hash".into(),
             intra_threads: 4,
+            session_pool_size: 2,
             microbatch: MicrobatchConfig::default(),
             max_inflight_calls: 2,
             max_input_bytes_per_call: 10,
@@ -551,6 +562,38 @@ mod onnx_handle_tests {
 
         let error = handle.try_admit(11).unwrap_err().to_string();
         assert!(error.contains("per-call limit"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_keeps_admission_charged_until_blocking_work_returns() {
+        let handle = OnnxHandle::new(cfg("cancelled-native-admission"));
+        let (call, bytes) = handle.try_admit(8).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = tokio::task::spawn_blocking(move || {
+            let _call = call;
+            let _bytes = bytes;
+            let _ = started_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        blocking.abort();
+        let error = handle.try_admit(5).unwrap_err().to_string();
+        assert!(
+            error.contains("byte budget full") || error.contains("admission full"),
+            "{error}"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if handle.try_admit(5).is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native completion must release admission");
     }
 
     #[tokio::test]

@@ -146,16 +146,56 @@ The error tells the operator to restore the original assets or re-run
 autoindex with `--fresh` and a new prefix. XERJ never silently mixes vector
 spaces.
 
+## Throughput controls
+
+The default remains one ONNX Runtime session and a 64-passage caller window:
+
+```toml
+[embedding]
+mode = "onnx-experimental"
+onnx_model_path = "/models/all-MiniLM-L6-v2/model.onnx"
+onnx_tokenizer_path = "/models/all-MiniLM-L6-v2/tokenizer.json"
+onnx_scheduling_window = 64
+onnx_session_pool_size = 1
+```
+
+Larger windows give the existing length-aware scheduler more passages to group
+without changing the model, vectors, output dimensions, or internal
+`onnx_max_batch` cap. Valid values are 1 through 4096.
+
+Two independent sessions allow two complete scheduling windows to run at once:
+
+```toml
+[embedding]
+onnx_scheduling_window = 512
+onnx_session_pool_size = 2
+onnx_intra_threads = 8
+```
+
+This is opt-in because a second session retains another copy of ONNX Runtime's
+session state and therefore changes the memory/concurrency tradeoff. XERJ
+constructs the requested pool atomically and never publishes a partial pool.
+It runs at most two windows concurrently, drains both native calls, and applies
+their results in original input order. Cancelling an HTTP waiter does not
+release admission permits or return a session to the pool before its native
+call actually finishes.
+
+These controls do not select a smaller or quantized model. Model choice remains
+the operator's responsibility through the explicit ONNX assets (or another
+embedding backend).
+
 ## Admission and errors
 
-One safe ONNX Runtime session is shared per complete model configuration.
-Length-aware microbatches are serialized through it. Before model loading or
-tokenization, shared admission enforces:
+One bounded ONNX Runtime session pool is shared per complete model
+configuration. Length-aware microbatches are serialized through each member.
+Before model loading or tokenization, shared admission enforces:
 
 - `onnx_max_inflight_calls` (default 8);
 - `onnx_max_input_bytes_per_call` (default 8 MiB);
 - `onnx_max_inflight_input_bytes` (default 32 MiB);
 - `onnx_max_pending`, microbatch size, and padded-token limits.
+- `onnx_scheduling_window` (default 64, range 1 through 4096);
+- `onnx_session_pool_size` (default 1, range 1 through 2).
 
 Overload returns retryable HTTP 429. Autoindex does not call that junk and does
 not journal the affected source file complete; correct the pressure/config and
