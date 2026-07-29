@@ -21576,8 +21576,6 @@ fn is_doc_scan_query(q: &QueryNode) -> bool {
             | QueryNode::SpanFirst { .. }
             | QueryNode::SpanContaining { .. }
             | QueryNode::SpanWithin { .. }
-            | QueryNode::HasChild { .. }
-            | QueryNode::HasParent { .. }
             | QueryNode::Constant { .. }
             | QueryNode::Boosted { .. }
             | QueryNode::Intervals { .. }
@@ -21798,9 +21796,6 @@ fn query_needs_id_injection(q: &QueryNode) -> bool {
         } => query_needs_id_injection(positive) || query_needs_id_injection(negative),
         QueryNode::DisMax { queries, .. } => queries.iter().any(query_needs_id_injection),
         QueryNode::Pinned { organic, .. } => query_needs_id_injection(organic),
-        QueryNode::HasChild { query, .. } | QueryNode::HasParent { query, .. } => {
-            query_needs_id_injection(query)
-        }
         QueryNode::Knn { filter, .. } | QueryNode::SemanticSearch { filter, .. } => {
             filter.as_deref().is_some_and(query_needs_id_injection)
         }
@@ -22960,15 +22955,9 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                 .any(|b| littles.iter().any(|l| b.start <= l.start && l.end <= b.end))
         }
 
-        // ── Join queries — UNREACHABLE ─────────────────────────────────────────
-        // has_child/has_parent are rejected with a 400 at parse time
-        // (see xerj-query parser.rs::parse_has_child), so these AST variants
-        // are never built and these branches never execute. Previously they
-        // silently ran the inner query on the flat doc set, which returned
-        // wrong results (no parent/child join is materialized). Kept for
-        // exhaustiveness / a future real join executor.
-        QueryNode::HasChild { query, .. } => doc_matches_query(query, source),
-        QueryNode::HasParent { query, .. } => doc_matches_query(query, source),
+        // (has_child/has_parent have no AST variants: the parser 400s them, and
+        // the flat-match arms that would run the inner query on an unjoined doc
+        // set — wrong results — were removed along with the variants.)
 
         // ── Geo shape queries ─────────────────────────────────────────────────
 
@@ -30508,3 +30497,14 @@ mod flush_memory_integration_tests {
         run_post_warm_failure_case("flush-post-warm-panic", true).await;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Graph expansion (second brain) — batched, columnar, bounded
+// ─────────────────────────────────────────────────────────────────────────────
+// Declared as a CHILD of this module (via `#[path]`) rather than a sibling:
+// the hop path needs `dv_columns_for`, `ghost_positions_for`, `self.store`,
+// `self.memtable`, `self.data_dir` — all private to `index`. A child module
+// sees them without widening any visibility; the implementation still lives in
+// its own file (src/graph.rs) instead of growing this one.
+#[path = "graph.rs"]
+pub mod graph;

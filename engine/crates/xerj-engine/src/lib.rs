@@ -43,6 +43,10 @@ pub use index::{
     detect_log_format, resolve_date_math, resolve_field_alias, EnrichTable, FieldEncodingInfo,
     Index, IndexResponse, IndexStats, LogFormat,
 };
+// Second-brain graph expansion (bounded columnar traversal over an edges
+// index). Lives under `index` for private-field access; re-exported at the
+// crate root so callers write `xerj_engine::graph::GraphExpandRequest`.
+pub use index::graph;
 pub use memtable::FtsMemtable;
 
 // ── Process-global metrics handle ─────────────────────────────────────────────
