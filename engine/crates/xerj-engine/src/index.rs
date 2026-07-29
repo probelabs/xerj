@@ -136,6 +136,7 @@ mod raw_vector_publication_tests {
         let result = index
             .run_knn_hnsw(
                 &request,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
                 "embedding",
                 &[1.0, 0.0, 0.0],
                 vector_count,
@@ -384,6 +385,7 @@ mod raw_vector_publication_tests {
             index
                 .run_knn_hnsw(
                     &request,
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
                     "embedding",
                     &[1.0, 0.0, 0.0],
                     1,
@@ -1074,12 +1076,14 @@ mod semantic_deadline_regression_tests {
             .create_index("sync-raw-passages", semantic_schema())
             .unwrap();
         let sync_idx = engine_instance.get_index("sync-raw-passages").unwrap();
-        sync_idx
-            .index_batch_sync_raw(vec![(
-                "sync".into(),
-                Arc::<[u8]>::from(serde_json::to_vec(&source).unwrap()),
-            )])
-            .unwrap();
+        let sync_source = Arc::<[u8]>::from(serde_json::to_vec(&source).unwrap());
+        let sync_writer = Arc::clone(&sync_idx);
+        std::thread::spawn(move || {
+            sync_writer.index_batch_sync_raw(vec![("sync".into(), sync_source)])
+        })
+        .join()
+        .expect("dedicated sync ingest thread panicked")
+        .unwrap();
         assert!(sync_idx.passage_chunks_require_exact("body_vector"));
     }
 
@@ -4944,13 +4948,14 @@ impl Index {
                 passage_scored_vector_fields(&schema.schema),
             )
         };
-        let validated = if has_copy_to || !passage_scored_fields.is_empty() {
-            crate::ingest_pool()
-                .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
-                .map_err(EngineError::Storage)?
-        } else {
-            validated
-        };
+        let validated =
+            if (has_copy_to || !passage_scored_fields.is_empty()) && validated.parsed().is_none() {
+                crate::ingest_pool()
+                    .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
+                    .map_err(EngineError::Storage)?
+            } else {
+                validated
+            };
         if let Some(parsed) = validated.parsed() {
             self.observe_passage_chunks_for_targets(
                 &passage_scored_fields,
@@ -4995,9 +5000,13 @@ impl Index {
             // Ordinary sync ingest keeps its sealed raw-byte path. A mapped
             // vector index additionally needs parsed sources so the same
             // publication can maintain HNSW and its coverage denominator.
-            let validated = crate::ingest_pool()
-                .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
-                .map_err(EngineError::Storage)?;
+            let validated = if validated.parsed().is_some() {
+                validated
+            } else {
+                crate::ingest_pool()
+                    .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
+                    .map_err(EngineError::Storage)?
+            };
             let seq_nos = self.store.wal_append_batch_raw(&validated)?;
             let (raw_docs, parsed) = validated.into_parts();
             let parsed = parsed.expect("parse_validated_raw_batch retains parsed values");
