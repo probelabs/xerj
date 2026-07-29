@@ -1,4 +1,4 @@
-//! Dashboards: rich panel schema round-trip, first-launch seeding of the 13
+//! Dashboards: rich panel schema round-trip, first-launch seeding of the 14
 //! built-ins as editable backend data, managed-default edit/delete rules, and
 //! the bulk endpoint.
 //!
@@ -143,7 +143,7 @@ async fn list_dash(app: &TestApp) -> Value {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn seeds_thirteen_editable_defaults_on_first_boot() {
+async fn seeds_fourteen_editable_defaults_on_first_boot() {
     let app = boot().await;
     let body = list_dash(&app).await;
     let arr = body["data"]["dashboards"].as_array().unwrap();
@@ -152,7 +152,7 @@ async fn seeds_thirteen_editable_defaults_on_first_boot() {
         .iter()
         .filter(|d| d["id"].as_str().unwrap_or("").starts_with("default-"))
         .collect();
-    assert_eq!(defaults.len(), 13, "must seed exactly 13 defaults: {body}");
+    assert_eq!(defaults.len(), 14, "must seed exactly 14 defaults: {body}");
 
     // Every registry dashboard is present by its stable id.
     for id in [
@@ -160,6 +160,7 @@ async fn seeds_thirteen_editable_defaults_on_first_boot() {
         "default-rag-quality",
         "default-vector-index",
         "default-agent-memory",
+        "default-second-brain",
         "default-logs-overview",
         "default-anomaly-detect",
         "default-ingest-pipeline",
@@ -251,7 +252,7 @@ async fn seeding_is_idempotent_and_preserves_edits() {
         .iter()
         .filter(|d| d["id"].as_str().unwrap_or("").starts_with("default-"))
         .collect();
-    assert_eq!(defaults.len(), 13, "re-seed must not duplicate defaults");
+    assert_eq!(defaults.len(), 14, "re-seed must not duplicate defaults");
 
     // The edit survived the re-seed.
     let (_, sys) = get_dash(&app, "default-system").await;

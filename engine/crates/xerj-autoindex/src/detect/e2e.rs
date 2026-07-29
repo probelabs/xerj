@@ -54,7 +54,12 @@ impl MockEs {
     }
 
     fn index(&self, name: &str) -> BTreeMap<String, Value> {
-        self.docs.lock().unwrap().get(name).cloned().unwrap_or_default()
+        self.docs
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// rel path → anchor node `_id`, straight from the published node docs so
@@ -169,7 +174,9 @@ fn doc_route(path: &str) -> Option<(String, String)> {
         return None;
     }
     let id = segs.next()?;
-    segs.next().is_none().then(|| (index.to_string(), id.to_string()))
+    segs.next()
+        .is_none()
+        .then(|| (index.to_string(), id.to_string()))
 }
 
 fn bulk(body: &[u8], docs: &Arc<Mutex<Docs>>) -> Value {
@@ -290,8 +297,7 @@ fn journal_graph_summary(state_dir: &Path) -> Value {
     journal
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v.get("kind").and_then(Value::as_str) == Some("finish"))
-        .next_back()
+        .rfind(|v| v.get("kind").and_then(Value::as_str) == Some("finish"))
         .and_then(|v| v.pointer("/summary/graph").cloned())
         .expect("finish event with graph summary")
 }
@@ -397,21 +403,95 @@ fn fixture_folder_end_to_end_matches_the_contract_edge_set() {
     let alpha_line = "Alpha is the hub note. It links to [[beta]] and [[gamma]].";
     let mut expected = vec![
         // §8.2/§8.3 wikilink edges — exact quotes and byte offsets.
-        expect(&anchors, "alpha.md", "beta.md", "wikilink", "wikilink@1", "1.0", "0.95", alpha_line, 35),
-        expect(&anchors, "alpha.md", "gamma.md", "wikilink", "wikilink@1", "1.0", "0.95", alpha_line, 48),
-        expect(&anchors, "beta.md", "gamma.md", "wikilink", "wikilink@1", "1.0", "0.95",
-            "Beta continues the thread and references [[gamma]].", 41),
-        expect(&anchors, "delta.md", "alpha.md", "wikilink", "wikilink@1", "1.0", "0.95",
-            "Delta cites [[alpha]] as its source.", 12),
+        expect(
+            &anchors,
+            "alpha.md",
+            "beta.md",
+            "wikilink",
+            "wikilink@1",
+            "1.0",
+            "0.95",
+            alpha_line,
+            35,
+        ),
+        expect(
+            &anchors,
+            "alpha.md",
+            "gamma.md",
+            "wikilink",
+            "wikilink@1",
+            "1.0",
+            "0.95",
+            alpha_line,
+            48,
+        ),
+        expect(
+            &anchors,
+            "beta.md",
+            "gamma.md",
+            "wikilink",
+            "wikilink@1",
+            "1.0",
+            "0.95",
+            "Beta continues the thread and references [[gamma]].",
+            41,
+        ),
+        expect(
+            &anchors,
+            "delta.md",
+            "alpha.md",
+            "wikilink",
+            "wikilink@1",
+            "1.0",
+            "0.95",
+            "Delta cites [[alpha]] as its source.",
+            12,
+        ),
         // §8.3 samedir chain over rel-sorted files — 4 edges, not a clique.
-        expect(&anchors, "alpha.md", "beta.md", "same_dir", "samedir@1", "0.3", "0.4",
-            "alpha.md and beta.md share directory .", 0),
-        expect(&anchors, "beta.md", "delta.md", "same_dir", "samedir@1", "0.3", "0.4",
-            "beta.md and delta.md share directory .", 0),
-        expect(&anchors, "delta.md", "epsilon.md", "same_dir", "samedir@1", "0.3", "0.4",
-            "delta.md and epsilon.md share directory .", 0),
-        expect(&anchors, "epsilon.md", "gamma.md", "same_dir", "samedir@1", "0.3", "0.4",
-            "epsilon.md and gamma.md share directory .", 0),
+        expect(
+            &anchors,
+            "alpha.md",
+            "beta.md",
+            "same_dir",
+            "samedir@1",
+            "0.3",
+            "0.4",
+            "alpha.md and beta.md share directory .",
+            0,
+        ),
+        expect(
+            &anchors,
+            "beta.md",
+            "delta.md",
+            "same_dir",
+            "samedir@1",
+            "0.3",
+            "0.4",
+            "beta.md and delta.md share directory .",
+            0,
+        ),
+        expect(
+            &anchors,
+            "delta.md",
+            "epsilon.md",
+            "same_dir",
+            "samedir@1",
+            "0.3",
+            "0.4",
+            "delta.md and epsilon.md share directory .",
+            0,
+        ),
+        expect(
+            &anchors,
+            "epsilon.md",
+            "gamma.md",
+            "same_dir",
+            "samedir@1",
+            "0.3",
+            "0.4",
+            "epsilon.md and gamma.md share directory .",
+            0,
+        ),
     ];
     expected.sort();
     assert_eq!(edge_keys(&edges), expected, "the exact §8.3 edge set");
@@ -490,7 +570,11 @@ fn dangling_wikilink_is_counted_not_silently_dropped() {
 fn replaced_file_soft_invalidates_its_prior_edges() {
     let corpus = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    fs::write(corpus.path().join("alpha.md"), "Alpha cites [[beta]] today.").unwrap();
+    fs::write(
+        corpus.path().join("alpha.md"),
+        "Alpha cites [[beta]] today.",
+    )
+    .unwrap();
     fs::write(corpus.path().join("beta.md"), "Beta stands alone.").unwrap();
     let es = MockEs::start();
     assert_eq!(

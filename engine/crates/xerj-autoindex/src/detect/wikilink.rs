@@ -147,9 +147,14 @@ mod tests {
     #[test]
     fn fixture_offsets_and_targets() {
         let corpus = corpus();
-        let (out, c) = run(&corpus, "Alpha is the hub note. It links to [[beta]] and [[gamma]].");
-        // beta resolves ambiguously (beta.md vs sub/beta.txt) to the smallest
-        // rel; gamma is dangling and must be counted, not emitted.
+        let (out, c) = run(
+            &corpus,
+            "Alpha is the hub note. It links to [[beta]] and [[gamma]].",
+        );
+        // §6.5 resolution order: `[[beta]]` is an exact rel-path match minus
+        // extension (beta.md) — ONE candidate, so it is NOT ambiguous; the
+        // stem table (where sub/beta.txt would compete) is never consulted.
+        // gamma is dangling and must be counted, not emitted.
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].dst, corpus.files["beta.md"].anchor_doc_id);
         assert_eq!(out[0].offset, 35);
@@ -158,7 +163,10 @@ mod tests {
             "Alpha is the hub note. It links to [[beta]] and [[gamma]]."
         );
         assert_eq!(c.unresolved, 1);
-        assert_eq!(c.ambiguous, 1);
+        assert_eq!(
+            c.ambiguous, 0,
+            "exact rel-without-extension wins outright (ambiguity is a stem-table concept)"
+        );
     }
 
     #[test]

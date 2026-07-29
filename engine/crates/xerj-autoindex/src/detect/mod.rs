@@ -170,7 +170,10 @@ pub fn corpus_file(
         dataset_slug: dataset_slug.to_string(),
         anchor_doc_id: crate::ids::doc_id(dataset_slug, file_key, "s0"),
         mtime_ms,
-        dir: rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default(),
+        dir: rel
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default(),
         family: family.to_string(),
     }
 }
@@ -537,12 +540,7 @@ pub fn ensure_brain_meta(
 /// Each pass re-indexes its hits with `invalid_at = expired_at = now` and
 /// refreshes, so repeat-until-empty converges; the pass bound turns a broken
 /// endpoint into an error instead of an infinite loop.
-pub fn invalidate_prior_edges(
-    es: &Es,
-    edges_index: &str,
-    rel: &str,
-    now_ms: i64,
-) -> Result<u64> {
+pub fn invalidate_prior_edges(es: &Es, edges_index: &str, rel: &str, now_ms: i64) -> Result<u64> {
     const MAX_PASSES: usize = 1_000;
     let query = json!({
         "query": {"bool": {
@@ -678,7 +676,10 @@ mod tests {
         assert_eq!(doc["schema_version"], json!(1));
         assert_eq!(doc["created_at"], json!(99));
         assert_eq!(doc["evidence"]["source"], json!("a.md"));
-        assert!(doc.get("invalid_at").is_none(), "unset keys must be omitted");
+        assert!(
+            doc.get("invalid_at").is_none(),
+            "unset keys must be omitted"
+        );
         assert_eq!(doc["edge_id"], json!(out.edges[0].edge_id));
     }
 
@@ -730,7 +731,10 @@ mod tests {
             resolve_local(&corpus, "", "//cdn.example.com/x"),
             LinkTarget::External
         ));
-        assert!(matches!(resolve_local(&corpus, "", "#anchor"), LinkTarget::Empty));
+        assert!(matches!(
+            resolve_local(&corpus, "", "#anchor"),
+            LinkTarget::Empty
+        ));
         assert!(matches!(
             resolve_local(&corpus, "", "../../escape.md"),
             LinkTarget::Miss

@@ -77,22 +77,102 @@ fn edge_doc(
 fn fixture_edges() -> Vec<Value> {
     let alpha_line = "Alpha is the hub note. It links to [[beta]] and [[gamma]].";
     vec![
-        edge_doc(E_ALPHA_BETA_WIKI, "note-alpha", "note-beta", "wikilink", 1.0, 0.95,
-            "wikilink@1", alpha_line, "alpha.md", 35),
-        edge_doc(E_ALPHA_GAMMA_WIKI, "note-alpha", "note-gamma", "wikilink", 1.0, 0.95,
-            "wikilink@1", alpha_line, "alpha.md", 48),
-        edge_doc(E_BETA_GAMMA_WIKI, "note-beta", "note-gamma", "wikilink", 1.0, 0.95,
-            "wikilink@1", "Beta continues the thread and references [[gamma]].", "beta.md", 41),
-        edge_doc(E_DELTA_ALPHA_WIKI, "note-delta", "note-alpha", "wikilink", 1.0, 0.95,
-            "wikilink@1", "Delta cites [[alpha]] as its source.", "delta.md", 12),
-        edge_doc(E_ALPHA_BETA_DIR, "note-alpha", "note-beta", "same_dir", 0.3, 0.4,
-            "samedir@1", "alpha.md and beta.md share directory .", "alpha.md", 0),
-        edge_doc(E_BETA_DELTA_DIR, "note-beta", "note-delta", "same_dir", 0.3, 0.4,
-            "samedir@1", "beta.md and delta.md share directory .", "beta.md", 0),
-        edge_doc(E_DELTA_EPSILON_DIR, "note-delta", "note-epsilon", "same_dir", 0.3, 0.4,
-            "samedir@1", "delta.md and epsilon.md share directory .", "delta.md", 0),
-        edge_doc(E_EPSILON_GAMMA_DIR, "note-epsilon", "note-gamma", "same_dir", 0.3, 0.4,
-            "samedir@1", "epsilon.md and gamma.md share directory .", "epsilon.md", 0),
+        edge_doc(
+            E_ALPHA_BETA_WIKI,
+            "note-alpha",
+            "note-beta",
+            "wikilink",
+            1.0,
+            0.95,
+            "wikilink@1",
+            alpha_line,
+            "alpha.md",
+            35,
+        ),
+        edge_doc(
+            E_ALPHA_GAMMA_WIKI,
+            "note-alpha",
+            "note-gamma",
+            "wikilink",
+            1.0,
+            0.95,
+            "wikilink@1",
+            alpha_line,
+            "alpha.md",
+            48,
+        ),
+        edge_doc(
+            E_BETA_GAMMA_WIKI,
+            "note-beta",
+            "note-gamma",
+            "wikilink",
+            1.0,
+            0.95,
+            "wikilink@1",
+            "Beta continues the thread and references [[gamma]].",
+            "beta.md",
+            41,
+        ),
+        edge_doc(
+            E_DELTA_ALPHA_WIKI,
+            "note-delta",
+            "note-alpha",
+            "wikilink",
+            1.0,
+            0.95,
+            "wikilink@1",
+            "Delta cites [[alpha]] as its source.",
+            "delta.md",
+            12,
+        ),
+        edge_doc(
+            E_ALPHA_BETA_DIR,
+            "note-alpha",
+            "note-beta",
+            "same_dir",
+            0.3,
+            0.4,
+            "samedir@1",
+            "alpha.md and beta.md share directory .",
+            "alpha.md",
+            0,
+        ),
+        edge_doc(
+            E_BETA_DELTA_DIR,
+            "note-beta",
+            "note-delta",
+            "same_dir",
+            0.3,
+            0.4,
+            "samedir@1",
+            "beta.md and delta.md share directory .",
+            "beta.md",
+            0,
+        ),
+        edge_doc(
+            E_DELTA_EPSILON_DIR,
+            "note-delta",
+            "note-epsilon",
+            "same_dir",
+            0.3,
+            0.4,
+            "samedir@1",
+            "delta.md and epsilon.md share directory .",
+            "delta.md",
+            0,
+        ),
+        edge_doc(
+            E_EPSILON_GAMMA_DIR,
+            "note-epsilon",
+            "note-gamma",
+            "same_dir",
+            0.3,
+            0.4,
+            "samedir@1",
+            "epsilon.md and gamma.md share directory .",
+            "epsilon.md",
+            0,
+        ),
     ]
 }
 
@@ -141,10 +221,38 @@ fn assert_hop1_fixture(res: &GraphExpandResult) {
     // §8.4: EXACTLY this order (hop asc, weight desc, edge_id asc).
     let got = tuples(res);
     let want = vec![
-        (E_ALPHA_GAMMA_WIKI.into(), "note-alpha".into(), "note-gamma".into(), "wikilink".into(), 1.0, 1u8),
-        (E_ALPHA_BETA_WIKI.into(), "note-alpha".into(), "note-beta".into(), "wikilink".into(), 1.0, 1u8),
-        (E_DELTA_ALPHA_WIKI.into(), "note-delta".into(), "note-alpha".into(), "wikilink".into(), 1.0, 1u8),
-        (E_ALPHA_BETA_DIR.into(), "note-alpha".into(), "note-beta".into(), "same_dir".into(), 0.3, 1u8),
+        (
+            E_ALPHA_GAMMA_WIKI.into(),
+            "note-alpha".into(),
+            "note-gamma".into(),
+            "wikilink".into(),
+            1.0,
+            1u8,
+        ),
+        (
+            E_ALPHA_BETA_WIKI.into(),
+            "note-alpha".into(),
+            "note-beta".into(),
+            "wikilink".into(),
+            1.0,
+            1u8,
+        ),
+        (
+            E_DELTA_ALPHA_WIKI.into(),
+            "note-delta".into(),
+            "note-alpha".into(),
+            "wikilink".into(),
+            1.0,
+            1u8,
+        ),
+        (
+            E_ALPHA_BETA_DIR.into(),
+            "note-alpha".into(),
+            "note-beta".into(),
+            "same_dir".into(),
+            0.3,
+            1u8,
+        ),
     ];
     assert_eq!(got, want, "hop-1 edge list must match §8.4 exactly");
     assert_eq!(
@@ -314,7 +422,11 @@ async fn graph_expand_caps_and_bounds() {
         let mut req = expand_req(&["note-alpha"], 2);
         req.max_result_edges = 2;
         let res = idx.graph_expand(&req).expect("capped expand");
-        assert_eq!(res.edges.len(), 2, "cap bounds the result (flushed={flushed})");
+        assert_eq!(
+            res.edges.len(),
+            2,
+            "cap bounds the result (flushed={flushed})"
+        );
         assert!(
             res.stats.edges_clipped > 0,
             "overflow must be counted, never silent (flushed={flushed})"
@@ -360,7 +472,11 @@ async fn graph_expand_direction_and_type_filter() {
     req.direction = GraphDirection::In;
     let inn = idx.graph_expand(&req).expect("in expand");
     let ids: Vec<&str> = inn.edges.iter().map(|e| e.edge_id.as_str()).collect();
-    assert_eq!(ids, vec![E_DELTA_ALPHA_WIKI], "direction=in follows dst → src only");
+    assert_eq!(
+        ids,
+        vec![E_DELTA_ALPHA_WIKI],
+        "direction=in follows dst → src only"
+    );
 
     req.direction = GraphDirection::Both;
     req.types = Some(vec!["wikilink".to_string()]);

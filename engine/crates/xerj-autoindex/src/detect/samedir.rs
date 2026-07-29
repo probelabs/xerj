@@ -49,10 +49,7 @@ impl EdgeDetector for SameDir {
                     confidence: CONFIDENCE,
                     valid_at_ms: left.mtime_ms,
                     src_file: left.rel.clone(),
-                    quote: format!(
-                        "{} and {} share directory {shown_dir}",
-                        left.rel, right.rel
-                    ),
+                    quote: format!("{} and {} share directory {shown_dir}", left.rel, right.rel),
                     offset: 0,
                 });
             }
@@ -69,7 +66,9 @@ mod tests {
         let corpus = CorpusIndex::build(
             rels.iter()
                 .enumerate()
-                .map(|(i, rel)| corpus_file(rel, &format!("k{i}"), "notes", "txt-prose", 100 + i as i64))
+                .map(|(i, rel)| {
+                    corpus_file(rel, &format!("k{i}"), "notes", "txt-prose", 100 + i as i64)
+                })
                 .collect(),
         );
         let mut out = Vec::new();

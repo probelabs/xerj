@@ -49,10 +49,7 @@ fn anchor_re() -> &'static regex::Regex {
 
 fn scan_anchors(text: &str, mut hit: impl FnMut(usize, &str)) {
     for caps in anchor_re().captures_iter(text) {
-        let m = caps
-            .get(1)
-            .or_else(|| caps.get(2))
-            .or_else(|| caps.get(3));
+        let m = caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(3));
         if let Some(m) = m {
             hit(m.start(), m.as_str());
         }

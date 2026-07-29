@@ -27,7 +27,7 @@ use tracing::Level;
 use uuid::Uuid;
 use xerj_common::config::CorsConfig;
 
-use crate::{auth::auth_middleware, es_compat, memory_api, native, state::AppState};
+use crate::{auth::auth_middleware, es_compat, graph_api, memory_api, native, state::AppState};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Native xerj router (:8080)
@@ -762,6 +762,14 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         )
         .route("/_memory/:namespace/_recall", post(memory_api::recall))
         .route("/_memory/:namespace/:id", delete(memory_api::forget_one))
+        // ── Second-Brain Graph API ─────────────────────────────────────────────
+        // Edges are ordinary documents in reserved `.xerj-memory-{brain}-edges`
+        // indices; traversal is a bounded columnar expansion
+        // (Index::graph_expand), NOT a graph query language. See graph_api.rs.
+        .route("/_graph/:brain/link", post(graph_api::link))
+        .route("/_graph/:brain/link/:edge_id", delete(graph_api::unlink))
+        .route("/_graph/:brain/ego", get(graph_api::ego))
+        .route("/_graph/:brain/overview", get(graph_api::overview))
         // Shared state
         .with_state(state.clone())
         // Middleware stack (applied outermost-last)

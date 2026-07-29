@@ -28,6 +28,9 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use cli::{Cmd, IndexCfg, MapCfg, StatusCfg};
+// Trait must be in scope for `href_raw.counters()` (a concrete `Href`, not a
+// `Box<dyn EdgeDetector>` like the registry entries).
+use detect::EdgeDetector as _;
 use esclient::Es;
 use sniff::{Family, Sniffed};
 use state::{FileAssignment, FileDone, JunkFile, Plan, PlanDataset};
@@ -876,10 +879,7 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
         let brain = match &cfg.brain {
             Some(b) => b.clone(),
             None => {
-                let base = cfg
-                    .root
-                    .canonicalize()
-                    .unwrap_or_else(|_| cfg.root.clone());
+                let base = cfg.root.canonicalize().unwrap_or_else(|_| cfg.root.clone());
                 let name = base
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
@@ -924,7 +924,9 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            corpus_files.push(detect::corpus_file(&f.rel, key, &slug, &fa.family, mtime_ms));
+            corpus_files.push(detect::corpus_file(
+                &f.rel, key, &slug, &fa.family, mtime_ms,
+            ));
         }
         let corpus = detect::CorpusIndex::build(corpus_files);
         let detectors = detect::default_detectors();
@@ -957,8 +959,9 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
             replaced_rels.sort_unstable();
             replaced_rels.dedup();
             for rel in replaced_rels {
-                invalidated += detect::invalidate_prior_edges(&es, &edges_index, rel, created_at_ms)
-                    .with_context(|| format!("invalidate prior edges taught by {rel}"))?;
+                invalidated +=
+                    detect::invalidate_prior_edges(&es, &edges_index, rel, created_at_ms)
+                        .with_context(|| format!("invalidate prior edges taught by {rel}"))?;
             }
         }
 
@@ -1205,11 +1208,8 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                     // content::verify below still covers this re-read.
                     if send_err.is_none() {
                         if let Some(gr) = graph.as_ref() {
-                            if let Some(cf) = gr
-                                .corpus
-                                .files
-                                .get(&f.rel)
-                                .filter(|cf| cf.family == "html")
+                            if let Some(cf) =
+                                gr.corpus.files.get(&f.rel).filter(|cf| cf.family == "html")
                             {
                                 if let Ok(Some(bytes)) =
                                     extract::read_whole(&f.path, sn.gzip, extract::MAX_WHOLE_FILE)
@@ -1338,7 +1338,8 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
                         if let Some(gr) = graph.as_ref() {
                             let out =
                                 detect::assemble(&edge_drafts, &gr.edges_index, gr.created_at_ms);
-                            gr.self_dropped.fetch_add(out.self_dropped, Ordering::Relaxed);
+                            gr.self_dropped
+                                .fetch_add(out.self_dropped, Ordering::Relaxed);
                             let mut ebuf: Vec<u8> = Vec::new();
                             for edge in &out.edges {
                                 ebuf.extend_from_slice(&edge.ndjson);
@@ -1772,11 +1773,7 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
         if let Some(g) = &graph_summary {
             let by: Vec<String> = g["by_detector"]
                 .as_object()
-                .map(|m| {
-                    m.iter()
-                        .map(|(tag, n)| format!("{tag} {n}"))
-                        .collect()
-                })
+                .map(|m| m.iter().map(|(tag, n)| format!("{tag} {n}")).collect())
                 .unwrap_or_default();
             println!(
                 "graph: {} edges → {} ({}); {} unresolved, {} ambiguous, {} self-dropped, {} invalidated",
@@ -1949,7 +1946,9 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
                     .and_then(|v| v.pointer("/hits/total/value").and_then(Value::as_u64));
                 match live {
                     Some(n) => println!("\ngraph: {n} live edges in {edges_index} (brain {brain})"),
-                    None => println!("\ngraph: brain {brain} — edges index {edges_index} unreachable"),
+                    None => {
+                        println!("\ngraph: brain {brain} — edges index {edges_index} unreachable")
+                    }
                 }
             }
         }

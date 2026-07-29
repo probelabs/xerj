@@ -390,11 +390,10 @@ impl Index {
                 // processed exactly once.
                 let doc_count = k_src.doc_count;
                 for pos in 0..doc_count {
-                    let via_src = scan_src
-                        && k_src.ord_for(pos).is_some_and(|o| src_ords.contains(&o));
+                    let via_src =
+                        scan_src && k_src.ord_for(pos).is_some_and(|o| src_ords.contains(&o));
                     let admitted = via_src
-                        || (scan_dst
-                            && k_dst.ord_for(pos).is_some_and(|o| dst_ords.contains(&o)));
+                        || (scan_dst && k_dst.ord_for(pos).is_some_and(|o| dst_ords.contains(&o)));
                     if !admitted {
                         continue;
                     }
@@ -419,8 +418,7 @@ impl Index {
                     // Bi-temporal cut (counted). A null valid_at is a
                     // schema-corrupt row (writers always emit it); such a row
                     // cannot be placed on the timeline, so it is skipped.
-                    let Some(valid_at_ms) = n_valid.get(pos).map(|v| bits_to_f64(v) as i64)
-                    else {
+                    let Some(valid_at_ms) = n_valid.get(pos).map(|v| bits_to_f64(v) as i64) else {
                         continue;
                     };
                     let invalid_at_ms = n_invalid
@@ -490,19 +488,14 @@ impl Index {
                 for (id, source) in self.memtable.all_docs_with_sources_arc() {
                     stats.memtable_docs_scanned += 1;
                     // Tombstoned (deleted-by-API) rows are not edges.
-                    if self
-                        .store
-                        .version_map
-                        .get(&id)
-                        .is_some_and(|v| v.deleted)
-                    {
+                    if self.store.version_map.get(&id).is_some_and(|v| v.deleted) {
                         continue;
                     }
                     let src = source.get("src").and_then(Value::as_str);
                     let dst = source.get("dst").and_then(Value::as_str);
                     let via_src = scan_src && src.is_some_and(|s| frontier_set.contains(s));
-                    let admitted = via_src
-                        || (scan_dst && dst.is_some_and(|d| frontier_set.contains(d)));
+                    let admitted =
+                        via_src || (scan_dst && dst.is_some_and(|d| frontier_set.contains(d)));
                     if !admitted {
                         continue;
                     }
@@ -616,8 +609,7 @@ impl Index {
         }
 
         // ── Final order + reachable ──────────────────────────────────────────
-        let mut edges: Vec<GraphEdgeLite> =
-            collected.into_values().map(|c| c.edge).collect();
+        let mut edges: Vec<GraphEdgeLite> = collected.into_values().map(|c| c.edge).collect();
         edges.sort_by(|a, b| {
             a.hop
                 .cmp(&b.hop)
