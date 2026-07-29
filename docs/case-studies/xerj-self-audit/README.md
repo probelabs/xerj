@@ -18,25 +18,37 @@ that grep cannot, and — the part most demos skip — a **ground-truth recall t
 that measures whether the substrate actually finds real bugs before we trust it
 on unknown ones.
 
-## The credibility test: does this substrate actually find known bugs?
+## Detection quality, measured against known ground truth
 
 The day before this audit, PR #69 fixed **six** real, network-reachable
-vulnerabilities in this exact codebase, at locations we know precisely. So we
-indexed the **pre-#69 commit** and asked whether the substrate's queries surface
-each one — and re-ran them on current `main` to confirm the signal flips when the
-bug is fixed.
+vulnerabilities in this exact codebase, at known locations — a labelled test set.
+Full methodology and per-bug numbers: **[DETECTION-QUALITY.md](DETECTION-QUALITY.md)**.
 
-| Bug (PR #69) | Substrate signal | Pre-#69 | Current main |
-|---|---|---|---|
-| **F1** query_string stack overflow | recursion **cycle** with no depth guard | cycle **UNGUARDED** (rank #5 of 186) | same cycle **GUARDED** |
-| **F7** field-limit bypass on ingest | `evolve_schema_*` reads a config limit | `reads_config_limit: false` | `reads_config_limit: true` |
-| **F2/F9** path traversal | `.join(param)` with no containment check | present, no `containment` validator | `containment` validator present |
-| **F6** MLT cross-product OOM | allocation arg is a **product** of params | present | capped |
+| | XERJ substrate | grep baseline |
+|---|---|---|
+| **Bugs found (recall)** | **6 / 6** | 4 / 6 |
+| **Tokens to triage all candidates** | **84,122** | 2,715,003 (**32×** more) |
+| **Unit of a hit** | a function | a whole file |
 
-The two we instrumented most sharply — F1 and F7 — **flip exactly on the fix**.
-That is the difference between "this looks like a security tool" and "this
-detects the class of bug it claims to." It also means the signal is honest: when
-the code is fixed, the query goes quiet.
+Two findings, not one. **Recall:** grep cannot find F7 or F8 *even in principle* —
+both are **missing code** (an absent limit check, an absent action cap), and you
+cannot grep for code that is not there; `grep max_actions_per_bulk` on the pre-fix
+tree returns 0 lines. **Triage cost** is the bigger result: grep's literal recall
+is fine, but triaging `grep with_capacity` for F6 means reading 56 whole files
+(1.34M tokens) versus 27 functions (17.9K).
+
+**The caveat that matters: 6/6 is in-sample.** The first run scored **XERJ 3/6 —
+worse than grep.** The test set exposed three real defects in the *extractor*
+(argument parsing truncating `a.len() * b.len()` at the first paren; taint
+provenance not following one hop into locals; validator detection being
+presence-only rather than order-aware). Fixing those took it to 6/6, and each fix
+was verified to **go quiet on the patched code** — so it discriminates rather than
+merely matching. The genuinely out-of-sample result is the `/_sql` Critical below:
+not in the test set, found on current `main`, proven by crashing a server.
+
+Precision is the weak axis and is stated plainly in DETECTION-QUALITY.md: the true
+positive lands at rank 6 of 186, 12 of 13, 18 of 27, 19 of 21. The substrate is a
+strong *filter* and a mediocre *ranker*.
 
 ## The headline: XERJ-assisted vs. "the agent reads all 197 files"
 

@@ -69,6 +69,20 @@ curl -s localhost:9310/rustfns/_search -H 'Content-Type: application/json' \
 #   → reads_config_limit:true   (fixed)
 ```
 
+## 3b. Detection quality: XERJ vs grep on all six known bugs
+
+```bash
+python3 detection_quality.py --url http://127.0.0.1:9310 --suffix _pre69 \
+    --tree /tmp/pre69 --astdir ./ast-pre69
+# → RECALL   XERJ 6/6   grep 4/6
+#   TRIAGE   XERJ 84,122 tokens   grep 2,715,003 tokens
+```
+
+Per-bug candidates, ranks, and the in-sample caveat are in
+[DETECTION-QUALITY.md](DETECTION-QUALITY.md). Note that `grep max_actions_per_bulk`
+on the pre-fix tree returns **0 lines** — F7 and F8 are *missing* code, which no
+grep can find.
+
 ## 4. The Critical finding — crash a live server
 
 ```bash

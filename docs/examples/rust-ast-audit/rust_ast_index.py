@@ -276,7 +276,13 @@ class Extractor:
 
         extractors = [e for e in EXTRACTORS if e in params]
         param_names = self.param_names(params_node, src) if params_node else []
-        alloc_from_param = self.alloc_from_param(body, param_names)
+        # Taint provenance is ONE HOP: a size or path is usually not the parameter
+        # itself but a local derived from it (`let fields = params.get(...)` then
+        # `with_capacity(fields.len() * like.len())`). Measured on the PR #69 test
+        # set, tracking direct parameters only MISSED two of six known bugs.
+        tainted = param_names + self.derived_locals(body, param_names)
+        alloc_from_param = self.alloc_from_param(body, tainted)
+        alloc_args_all = self.alloc_args_all(body)
 
         record = {
             "id": fn_id,
@@ -328,10 +334,18 @@ class Extractor:
             "alloc_from_param_count": len(alloc_from_param),
             "alloc_args": [a["arg"] for a in alloc_from_param][:12],
             "alloc_param_names": sorted({a["param"] for a in alloc_from_param}),
-            "alloc_product": any("*" in a["arg"] for a in alloc_from_param),
-            # what gets path-joined — "join a raw parameter" is the traversal shape
-            "path_join_args": self.join_args(body, param_names)[:12],
-            "path_join_from_param": bool(self.join_args(body, param_names)),
+            # The cross-product blowup shape is a MULTIPLICATION in an allocation
+            # size, whether or not provenance resolves. Gating this on parameter
+            # provenance hid PR #69's F6, whose factors are locals.
+            "alloc_product": any("*" in a for a in alloc_args_all),
+            "alloc_args_all": alloc_args_all[:16],
+            # what gets path-joined — "join tainted input" is the traversal shape
+            "path_join_args": self.join_args(body, tainted)[:12],
+            "path_join_from_param": bool(self.join_args(body, tainted)),
+            # ORDER MATTERS: a validator that runs AFTER the destructive op is not
+            # a guard. PR #69's F2 called IndexName::new *after* remove_dir_all —
+            # a presence-only validator signal scores that function as "guarded".
+            "guard_after_destructive_op": self.guard_after_sink(body),
             # recursion + depth guarding (the stack-overflow shape)
             "calls_self": (name + "(") in body,
             "has_depth_guard": any(
@@ -547,6 +561,98 @@ class Extractor:
                                     "param": p})
                         break
         return out
+
+    def derived_locals(self, body, param_names):
+        """Locals bound from an expression mentioning a parameter (one hop).
+
+        `let fields = params.get("fields")` makes `fields` carry `params`' taint.
+        Without this hop, an allocation sized by `fields.len()` reads as
+        untainted — which is how PR #69's F6 and F8 escaped detection.
+        """
+        if not param_names:
+            return []
+        real = [p for p in param_names if p and p != "self"]
+        if not real:
+            return []
+        out = []
+        for line in body.split("\n"):
+            s = line.strip()
+            if not s.startswith("let "):
+                continue
+            if "=" not in s:
+                continue
+            lhs, rhs = s[4:].split("=", 1)
+            if not any(p in rhs for p in real):
+                continue
+            name = lhs.replace("mut ", "").split(":")[0].strip()
+            if name and name.replace("_", "").isalnum():
+                out.append(name)
+        return out
+
+    @staticmethod
+    def balanced_arg(body, open_at, opener="(", closer=")"):
+        """Text of the argument list starting after `open_at`, paren-balanced.
+
+        Splitting on the first `)` truncates `with_capacity(a.len() * b.len())`
+        to `a.len(` — which silently loses the multiplication that IS the
+        cross-product signal. Measured: that truncation hid PR #69's F6.
+        """
+        depth = 1
+        i = open_at
+        n = len(body)
+        while i < n and depth > 0:
+            c = body[i]
+            if c == opener:
+                depth += 1
+            elif c == closer:
+                depth -= 1
+                if depth == 0:
+                    return body[open_at:i]
+            i += 1
+        return body[open_at : min(n, open_at + 200)]
+
+    def alloc_args_all(self, body):
+        """Every allocation-size argument, regardless of provenance."""
+        out = []
+        for pat, closer in (("with_capacity(", ")"), (".reserve(", ")"),
+                            ("vec![", "]"), (".repeat(", ")")):
+            start = 0
+            while True:
+                i = body.find(pat, start)
+                if i < 0:
+                    break
+                start = i + len(pat)
+                opener = "[" if closer == "]" else "("
+                arg = self.balanced_arg(body, i + len(pat), opener, closer)
+                out.append(arg.strip()[:160])
+        return out
+
+    DESTRUCTIVE = ("remove_dir_all(", "remove_file(", "remove_dir(", "create_dir_all(",
+                   "File::create(", "fs::write(", "fs::rename(")
+    # Only STRONG name/path validators count for the ordering test. Generic
+    # helpers like `starts_with(` appear all over a large function for unrelated
+    # reasons (glob matching), and taking the earliest of those masks a genuinely
+    # late path validator — that is what hid PR #69's F2 on the first pass.
+    PATH_GUARDS = ("IndexName::new", "IndexName::validate", "Namespace::new",
+                   "validate_snapshot", "canonicalize(", 'contains("..")')
+
+    def guard_after_sink(self, body):
+        """True when a path/name validator only appears AFTER a destructive op.
+
+        Presence of a validator says nothing about whether it protects anything —
+        ordering does. This is the exact shape of PR #69's F2: `IndexName::new`
+        ran *after* `remove_dir_all` had already deleted the directory.
+        """
+        sink_at = min((body.find(p) for p in self.DESTRUCTIVE if p in body),
+                      default=-1)
+        if sink_at < 0:
+            return False
+        positions = [body.find(g) for g in self.PATH_GUARDS if g in body]
+        if not positions:
+            return False
+        # unguarded-before-the-sink: no strong validator runs before it, but one
+        # does run after — the validation is decorative.
+        return min(positions) > sink_at
 
     def join_args(self, body, param_names):
         """`.join(x)` arguments that mention a parameter name.

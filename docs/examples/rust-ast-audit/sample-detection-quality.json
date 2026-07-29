@@ -1,0 +1,131 @@
+{
+  "cases": 6,
+  "xerj_recall": "6/6",
+  "grep_recall": "4/6",
+  "xerj_total_triage_tokens": 84122,
+  "grep_total_triage_tokens": 2715003,
+  "results": [
+    {
+      "id": "F1",
+      "title": "query_string unbounded paren recursion \u2192 stack overflow",
+      "xerj": {
+        "candidates": 186,
+        "hit": true,
+        "rank": 6,
+        "triage_tokens": 25049,
+        "tokenizer": "tiktoken",
+        "via": "find_recursion_cycles.py"
+      },
+      "grep": {
+        "match_lines": 162,
+        "match_files": 21,
+        "hit": true,
+        "triage_tokens": 1010124,
+        "tokenizer": "tiktoken"
+      },
+      "grep_pattern": "fn parse_",
+      "grep_note": "no grep can express 'recursion cycle with no depth guard'; the closest proxy is 'every parse fn', then read them all"
+    },
+    {
+      "id": "F2",
+      "title": "IndexName accepts '..' \u2192 snapshot restore deletes parent of data_dir",
+      "xerj": {
+        "candidates": 13,
+        "returned": 13,
+        "hit": true,
+        "rank": 12,
+        "triage_tokens": 2894,
+        "tokenizer": "tiktoken"
+      },
+      "grep": {
+        "match_lines": 2,
+        "match_files": 2,
+        "hit": true,
+        "triage_tokens": 327583,
+        "tokenizer": "tiktoken"
+      },
+      "grep_pattern": "remove_dir_all"
+    },
+    {
+      "id": "F6",
+      "title": "more_like_this fields\u00d7like cross-product \u2192 unbounded alloc",
+      "xerj": {
+        "candidates": 27,
+        "returned": 27,
+        "hit": true,
+        "rank": 18,
+        "triage_tokens": 17895,
+        "tokenizer": "tiktoken"
+      },
+      "grep": {
+        "match_lines": 314,
+        "match_files": 56,
+        "hit": true,
+        "triage_tokens": 1340250,
+        "tokenizer": "tiktoken"
+      },
+      "grep_pattern": "with_capacity"
+    },
+    {
+      "id": "F7",
+      "title": "max_fields_per_index not enforced on the ingest path",
+      "xerj": {
+        "candidates": 3,
+        "returned": 3,
+        "hit": true,
+        "rank": 2,
+        "triage_tokens": 1050,
+        "tokenizer": "tiktoken"
+      },
+      "grep": {
+        "match_lines": 2,
+        "match_files": 1,
+        "hit": false,
+        "triage_tokens": 13366,
+        "tokenizer": "tiktoken"
+      },
+      "grep_pattern": "max_fields_per_index"
+    },
+    {
+      "id": "F8",
+      "title": "bulk NDJSON parse-phase memory amplification (no action cap)",
+      "xerj": {
+        "candidates": 30,
+        "returned": 30,
+        "hit": true,
+        "rank": 9,
+        "triage_tokens": 25760,
+        "tokenizer": "tiktoken"
+      },
+      "grep": {
+        "match_lines": 0,
+        "match_files": 0,
+        "hit": false,
+        "triage_tokens": 0,
+        "tokenizer": "n/a"
+      },
+      "grep_pattern": "max_actions_per_bulk",
+      "grep_note": "the fix's config key does not exist pre-fix, so this grep returns 0 \u2014 the auditor cannot grep for absent code"
+    },
+    {
+      "id": "F9",
+      "title": "snapshot repo_path/name unvalidated \u2192 write outside the repo",
+      "xerj": {
+        "candidates": 21,
+        "returned": 21,
+        "hit": true,
+        "rank": 19,
+        "triage_tokens": 11474,
+        "tokenizer": "tiktoken"
+      },
+      "grep": {
+        "match_lines": 6,
+        "match_files": 3,
+        "hit": true,
+        "triage_tokens": 23680,
+        "tokenizer": "tiktoken"
+      },
+      "grep_pattern": "\\.join\\(name\\)"
+    }
+  ]
+}

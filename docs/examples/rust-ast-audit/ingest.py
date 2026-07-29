@@ -64,6 +64,8 @@ FUNCTIONS_MAPPING = {
             "alloc_args": TEXT,
             "alloc_param_names": KEYWORD,
             "alloc_product": BOOL,
+            "alloc_args_all": TEXT,
+            "guard_after_destructive_op": BOOL,
             "path_join_args": TEXT,
             "path_join_from_param": BOOL,
             "calls_self": BOOL,

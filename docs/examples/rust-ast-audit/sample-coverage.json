@@ -5,17 +5,17 @@
   "files_with_error_nodes": 0,
   "error_files": [],
   "error_nodes_total": 0,
-  "ast_function_nodes": 5095,
-  "emitted_function_records": 5095,
+  "ast_function_nodes": 5098,
+  "emitted_function_records": 5098,
   "function_coverage_pct": 100.0,
-  "call_edges": 87137,
+  "call_edges": 87150,
   "routes": 477,
   "unsafe_block_sites": 23,
   "unsafe_fn_declarations": 2,
   "functions_with_unsafe": 21,
   "handler_shaped_functions": 299,
   "functions_with_narrowing_casts": 433,
-  "functions_with_alloc_from_param": 149,
+  "functions_with_alloc_from_param": 218,
   "per_file": [
     {
       "file": "crates/xerj-ai/examples/onnx_experimental.rs",
@@ -1199,10 +1199,10 @@
     {
       "file": "crates/xerj-engine/src/sql.rs",
       "crate": "xerj-engine",
-      "bytes": 22557,
-      "lines": 725,
-      "ast_functions": 12,
-      "emitted_functions": 12,
+      "bytes": 24892,
+      "lines": 779,
+      "ast_functions": 15,
+      "emitted_functions": 15,
       "error_nodes": 0
     },
     {

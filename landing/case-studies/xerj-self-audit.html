@@ -116,14 +116,52 @@
   </div>
 </div>
 
-<!-- Ground-truth recall -->
+<!-- Detection quality -->
 <section class="scene-section">
-  <h2 class="scene" style="font-size:var(--fs-56);">DOES IT ACTUALLY <span class="accent">FIND BUGS?</span></h2>
-  <p class="wide">Before trusting the substrate on unknown bugs, we tested it on known ones. The day before, a PR fixed six real vulnerabilities in this exact engine. We indexed the <em>pre-fix</em> commit and re-ran the queries on both — the signal has to flip when the bug is fixed, or it is noise.</p>
-  <div class="laws">
-    <div class="n">F1</div><div class="law"><div class="t">QUERY-PARSER STACK OVERFLOW</div><div class="b">The recursion-cycle query flags the query_string parser cycle as <strong>UNGUARDED pre-fix</strong> and the same cycle as <strong>GUARDED</strong> on current main. The signal flips exactly on the fix.</div></div>
-    <div class="n">F7</div><div class="law"><div class="t">FIELD-LIMIT BYPASS ON INGEST</div><div class="b"><code class="inline">evolve_schema_*</code> shows <code class="inline">reads_config_limit: false</code> pre-fix and <code class="inline">true</code> after. The substrate distinguishes the vulnerable version from the patched one.</div></div>
+  <h2 class="scene" style="font-size:var(--fs-56);">DETECTION QUALITY, <span class="accent">MEASURED.</span></h2>
+  <p class="wide">Before trusting a substrate on unknown bugs, test it on known ones. The day before, a PR fixed six real network-reachable vulnerabilities in this exact engine — a labelled test set. We indexed the <em>pre-fix</em> commit and, for each bug, ran the query an auditor would write for that bug <em>class</em> (never its name or line), against the baseline they would otherwise use: grep.</p>
+
+  <div class="viz-block" style="margin-top:var(--sp-6);">
+    <div class="kicker"><span>MEASURED · 6 KNOWN BUGS · PRE-FIX TREE</span></div>
+    <div class="cmp-bars">
+      <div class="cmp-bars-head">
+        <span></span>
+        <span class="cmp-a">XERJ SUBSTRATE</span>
+        <span class="cmp-b">GREP</span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Bugs found (recall)</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:90.0%;"></span>
+          <span class="cmp-num">6 / 6</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:60.0%;"></span>
+          <span class="cmp-num">4 / 6</span>
+        </span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Tokens to triage candidates</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:2.8%;"></span>
+          <span class="cmp-num">84,122</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90.0%;"></span>
+          <span class="cmp-num">2,715,003 <span class="cmp-ratio">32×</span></span>
+        </span>
+      </div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">A GREP HIT IS A FILE; AN AST HIT IS A FUNCTION · RECALL 6/6 IS IN-SAMPLE — SEE THE CAVEAT BELOW · FULL PER-BUG TABLE IN <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/xerj-self-audit/DETECTION-QUALITY.md" rel="external">DETECTION-QUALITY.md &rarr;</a></p>
   </div>
+
+  <div class="laws" style="margin-top:var(--sp-6);">
+    <div class="n">01</div><div class="law"><div class="t">GREP CANNOT FIND <span class="accent">MISSING CODE.</span></div><div class="b">Two of the six bugs are an <em>absent</em> limit check and an <em>absent</em> action cap. You cannot grep for code that is not there — <code class="inline">grep max_actions_per_bulk</code> on the pre-fix tree returns 0 lines. "Ingest function that never consults a configured limit" is an AST property, not a string.</div></div>
+    <div class="n">02</div><div class="law"><div class="t">THE FIRST RUN SCORED <span class="accent">3/6 — WORSE THAN GREP.</span></div><div class="b">Publishing only the tuned number would misrepresent the method. The test set exposed three real extractor defects: argument parsing truncated <code class="inline">a.len() * b.len()</code> at the first paren, losing the multiplication; taint provenance did not follow one hop into locals; validator detection was presence-only, scoring decorative validation that runs <em>after</em> the delete as "guarded". Fixing those reached 6/6 — so 6/6 is in-sample.</div></div>
+    <div class="n">03</div><div class="law"><div class="t">THE SIGNALS <span class="accent">GO QUIET WHEN FIXED.</span></div><div class="b">Each signal was checked to discriminate, not merely match: the query-parser cycle reads UNGUARDED pre-fix and GUARDED after; <code class="inline">guard_after_destructive_op</code> is true for pre-fix <code class="inline">restore_snapshot</code> and false after. A detector that fires on patched code is noise.</div></div>
+    <div class="n">04</div><div class="law"><div class="t">PRECISION IS THE <span class="accent">WEAK AXIS.</span></div><div class="b">The true positive lands at rank 6 of 186, 12 of 13, 18 of 27, 19 of 21. This is a strong <em>filter</em> and a mediocre <em>ranker</em>. It narrows 207k lines to a few dozen functions you can read in full — it does not point at the bug.</div></div>
+  </div>
+  <p class="wide" style="margin-top:var(--sp-5);">The genuinely out-of-sample result is the finding below: not in the test set, found on current <code class="inline">main</code>, and proven by aborting a live server.</p>
 </section>
 
 <section class="scene-section">
@@ -164,7 +202,7 @@ $ python3 ingest.py ./ast-out --url $XERJ              <span class="comment"># s
   <div class="laws">
     <div class="n">01</div><div class="law"><div class="t">XERJ DOES NOT <span class="accent">FIND BUGS.</span></div><div class="b">The tree-sitter extractor and the call-graph analysis produce the candidates; XERJ stores and queries them at scale. The substrate narrows the search; a human or agent still reads the survivors.</div></div>
     <div class="n">02</div><div class="law"><div class="t">THE GRAPH IS <span class="accent">NAME-BASED.</span></div><div class="b">Method-call edges are excluded on purpose — resolving <code class="inline">.len()</code> by name collapses the graph into one false component. Cycles through trait dispatch or macros are out of reach; the recursion result covers free functions.</div></div>
-    <div class="n">03</div><div class="law"><div class="t">EVERY CANDIDATE STILL <span class="accent">NEEDS A READ.</span></div><div class="b">Blunt category filters over-return (87 for one alloc query); argument-provenance signals sharpen them, and every published finding was read and, where possible, executed. Two unproven traversal leads were <em>not</em> published.</div></div>
+    <div class="n">03</div><div class="law"><div class="t">EVERY CANDIDATE STILL <span class="accent">NEEDS A READ.</span></div><div class="b">Blunt category filters over-return (87 for one alloc query); argument-provenance signals sharpen them, and every published finding was read and, where possible, executed. A promising highlight-tag allocation blowup was <strong>refuted by testing</strong> — the highlighter truncates to a fragment, so the product is bounded — and two unproven traversal leads were <em>not</em> published.</div></div>
     <div class="n">04</div><div class="law"><div class="t">ONE PASS, HIGHEST-VALUE <span class="accent">LENSES.</span></div><div class="b">This publishes what was proven or fully enumerated — the DoS and the unsafe inventory. The broader auth-flow and business-logic lenses are scoped in the walkthrough, not exhausted here.</div></div>
   </div>
 </section>
