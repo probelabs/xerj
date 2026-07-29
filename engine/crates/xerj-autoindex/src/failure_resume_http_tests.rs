@@ -190,6 +190,11 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         max_file_gb: 1,
         sample: 50,
         no_semantic: true,
+        // These tests count data bulks to place injected failures; graph
+        // edge bulks would shift that numbering, so keep detection off here
+        // (the graph pipeline has its own e2e suite in detect::e2e).
+        brain: None,
+        no_graph: true,
         dry_run: false,
         json: false,
         quiet: true,
