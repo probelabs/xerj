@@ -1,0 +1,14 @@
+{
+  "without_xerj_tokens": 1805277,
+  "without_xerj_files": 197,
+  "without_xerj_bytes": 8025201,
+  "with_xerj_tokens": 10533,
+  "with_xerj_breakdown": {
+    "cycle_finder": 7511,
+    "read_functions": 3002,
+    "n_functions_read": 4,
+    "route_lookup": 20
+  },
+  "ratio": 171.4,
+  "tokenizer": "tiktoken cl100k_base (public GPT-4-class BPE, used as an LLM-token proxy)"
+}

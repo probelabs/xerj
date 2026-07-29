@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ.ai — XERJ audits its own Rust</title>
+<meta name="description" content="XERJ indexed its own Rust engine as an AST/call-graph substrate and found a real unauthenticated stack-overflow DoS — reached for 10,533 tokens instead of the 1,805,277 it costs to read the source once. A call-graph query grep cannot express; the fix is shipped.">
+<meta property="og:title" content="XERJ.ai — XERJ audits its own Rust">
+<meta property="og:description" content="197 files / ~201k lines indexed with 100% function coverage. A recursion-cycle query found an unauth /_sql process-abort DoS grep cannot express — 171× fewer tokens than read-all, proven by crashing a live server, fixed and tested.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
+<link rel="stylesheet" href="/style.css?v=cs0728">
+<style>
+  /* page-local: comparison series wears the validated --z-cmp token, never gray */
+  .cmp-b .cmp-bar { background: var(--z-cmp); opacity: 1; }
+  .cmp-bars-head .cmp-b { color: var(--z-cmp); font-weight: 700; }
+  @media (max-width: 720px) {
+    .cmp-num { white-space: normal; overflow-wrap: break-word; text-align: left; flex-shrink: 1; min-width: 0; }
+    .cmp-label { white-space: normal; }
+  }
+</style>
+</head>
+<body>
+
+<!-- nav -->
+<nav class="nav" aria-label="Primary">
+  <a href="/index.html" class="brand">XERJ.AI</a>
+  <a href="/index.html">HOME</a>
+  <a href="/product.html">PRODUCT</a>
+  <span class="nav-drop">
+    <a href="/use-cases.html">USE CASES</a>
+  </span>
+  <a href="/case-studies.html" class="active">CASE STUDIES</a>
+  <span class="spacer"></span>
+  <a href="/for-agents.html">FOR AGENTS</a>
+  <a href="/docs/index.html">DOCS</a>
+  <a href="/docs/recipes/index.html">RECIPES</a>
+  <a href="/playground.html">DASHBOARDS</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="theme">
+    <button type="button" data-theme="day">DAY</button>
+    <span class="dash">·</span>
+    <button type="button" data-theme="night" class="active">NIGHT</button>
+  </span>
+</nav>
+
+<nav class="uc-subnav" aria-label="Case studies">
+  <a href="/case-studies.html">ALL CASE STUDIES</a>
+  <a href="/case-studies/xerj-self-audit.html" class="active">RUST SELF-AUDIT</a>
+  <a href="/case-studies/wordpress-security-audit.html">WORDPRESS SECURITY AUDIT</a>
+  <a href="/case-studies/calltree-analytics.html">SEMANTIC ANALYTICS</a>
+  <a href="/case-studies/daily-dev-postgres-cdc.html">POSTGRES CDC + HYBRID</a>
+</nav>
+
+<div class="uc-hero">
+  <div class="uc-eyebrow">CASE STUDY · RUST SELF-AUDIT</div>
+  <h1>XERJ AUDITED ITS OWN RUST.<br><span class="accent">IT FOUND A REAL 0-DAY.</span></h1>
+  <p class="uc-lead">XERJ indexed its own engine — 197 Rust files, ~201k lines — as a queryable AST and call graph, then hunted for security bugs on top of it. A call-graph query that grep cannot express surfaced an <strong>unauthenticated <code class="inline">POST /_sql</code> stack-overflow that aborts the whole process</strong>. Reaching it cost <strong>10,533 tokens</strong> instead of the <strong>1,805,277</strong> it takes to read the source once. The bug is fixed and the fix is proven by crashing — then not crashing — a live server.</p>
+  <div class="kicker"><span>FOR</span><span class="dash">·</span><span>SECURITY ENGINEERS</span><span class="dash">·</span><span>AI-AGENT BUILDERS</span><span class="dash">·</span><span>RUST TEAMS</span></div>
+</div>
+
+<!-- Hero chart -->
+<section class="scene-section" style="border-top:0; padding-top:0;">
+  <div class="viz-block">
+    <div class="kicker"><span>MEASURED · TOKENS TO REACH THE /_sql FINDING · tiktoken cl100k_base</span></div>
+    <div class="cmp-bars">
+      <div class="cmp-bars-head">
+        <span></span>
+        <span class="cmp-a">XERJ-ASSISTED</span>
+        <span class="cmp-b">READ EVERY FILE</span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Tokens to the finding</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:0.5%;"></span>
+          <span class="cmp-num">10,533</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90.0%;"></span>
+          <span class="cmp-num">1,805,277 <span class="cmp-ratio">171×</span></span>
+        </span>
+      </div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">READ-ALL = EVERY .rs FILE UNDER engine/ TOKENIZED (tiktoken cl100k_base, an LLM-token proxy) · XERJ-ASSISTED = cycle-finder output + the 4 parser functions actually read + the route lookup · NOT A LATENCY BENCHMARK · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/xerj-self-audit" rel="external">docs/case-studies/xerj-self-audit &rarr;</a></p>
+  </div>
+</section>
+
+<div class="pain-solve">
+  <div class="pain">
+    <h3>THE CONTEXT-WINDOW WALL</h3>
+    <ul><li><strong>The code does not fit.</strong> ~201k lines is ~9× a 200k-token window — "read everything to audit it" is not an option.</li><li><strong>Chunking kills the reach.</strong> A stack-overflow in a parser is a recursion <em>cycle</em> across several functions; split them across chunks and the cycle vanishes.</li><li><strong>grep cannot say the shape.</strong> "Mutually recursive functions with no depth guard anywhere in the cycle" is not a literal string.</li></ul>
+  </div>
+  <div class="solve">
+    <h3>THE XERJ ANSWER</h3>
+    <ul><li><strong>Index once as facts.</strong> 5,095 functions, 87,137 call edges, 477 routes, a full unsafe inventory — extracted in ~3.2 s, ingested in ~1.9 s.</li><li><strong>Query the bug shape.</strong> Strongly-connected components of the call graph, filtered to cycles with no depth guard.</li><li><strong>Prove it, then fix it.</strong> Trace the cycle to its route, crash a live server, ship a bounded-depth fix, watch the same payload return HTTP 400.</li></ul>
+  </div>
+</div>
+
+<div class="proof-row">
+  <div class="stat">
+    <div class="num">100%</div>
+    <div class="label">FUNCTION COVERAGE</div>
+    <div class="ctx">5,095 / 5,095 functions · 197 files · 0 tree-sitter parse errors</div>
+  </div>
+  <div class="stat">
+    <div class="num">1</div>
+    <div class="label">UNAUTH CRITICAL, FIXED</div>
+    <div class="ctx">/_sql stack-overflow → process abort · proven live · depth-guard shipped</div>
+  </div>
+  <div class="stat">
+    <div class="num">22 / 0</div>
+    <div class="label">UNSAFE BLOCKS · UNSOUND</div>
+    <div class="ctx">every unsafe site enumerated and reviewed; all invariants hold</div>
+  </div>
+</div>
+
+<!-- Ground-truth recall -->
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">DOES IT ACTUALLY <span class="accent">FIND BUGS?</span></h2>
+  <p class="wide">Before trusting the substrate on unknown bugs, we tested it on known ones. The day before, a PR fixed six real vulnerabilities in this exact engine. We indexed the <em>pre-fix</em> commit and re-ran the queries on both — the signal has to flip when the bug is fixed, or it is noise.</p>
+  <div class="laws">
+    <div class="n">F1</div><div class="law"><div class="t">QUERY-PARSER STACK OVERFLOW</div><div class="b">The recursion-cycle query flags the query_string parser cycle as <strong>UNGUARDED pre-fix</strong> and the same cycle as <strong>GUARDED</strong> on current main. The signal flips exactly on the fix.</div></div>
+    <div class="n">F7</div><div class="law"><div class="t">FIELD-LIMIT BYPASS ON INGEST</div><div class="b"><code class="inline">evolve_schema_*</code> shows <code class="inline">reads_config_limit: false</code> pre-fix and <code class="inline">true</code> after. The substrate distinguishes the vulnerable version from the patched one.</div></div>
+  </div>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">THE QUERY GREP <span class="accent">CANNOT WRITE.</span></h2>
+  <p class="wide">A stack overflow in a recursive-descent parser is rarely direct self-recursion — it is a cycle: <code class="inline">parse_or_expr → parse_and_expr → parse_condition → parse_or_expr</code>, one turn per <code class="inline">(</code>. No single file, function, or regex shows it. The free-function call graph does.</p>
+
+  <div class="kicker" style="margin-top:var(--sp-6);"><span>INDEX ONCE · ~5 S · 100% FUNCTION COVERAGE</span></div>
+  <pre class="code">$ python3 rust_ast_index.py ./engine --out ./ast-out   <span class="comment"># 5,095 fns, 87,137 edges, 477 routes</span>
+$ python3 ingest.py ./ast-out --url $XERJ              <span class="comment"># sent == indexed, asserted</span></pre>
+
+  <div class="kicker" style="margin-top:var(--sp-6);"><span>ONE GRAPH QUERY · 186 UNGUARDED CYCLES</span></div>
+  <pre class="code">$ python3 find_recursion_cycles.py ./ast-out
+<span class="comment"># strongly-connected components of the call graph,</span>
+<span class="comment"># flagged where NO member establishes a depth bound.</span>
+<span class="comment"># ranks the /_sql WHERE-clause parser cycle as UNGUARDED.</span></pre>
+
+  <div class="kicker" style="margin-top:var(--sp-6);"><span>TRACE TO THE ROUTE · ONE REQUEST</span></div>
+  <pre class="code">$ curl -s "$XERJ/rustroutes/_search" -H 'Content-Type: application/json' \
+  -d '{"query":{"wildcard":{"path":"*sql*"}},"_source":["method","path","handler"]}'
+<span class="comment"># POST /_sql -> sql_query (crates/xerj-api/src/router.rs:637) — unauthenticated</span></pre>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">PROVEN BY <span class="accent">CRASHING IT.</span></h2>
+  <p class="wide">A finding is a claim until you trigger it. One <code class="inline">POST /_sql</code> with ~50k nested parens in the WHERE clause aborts the entire server — every tenant, every index — with a stack overflow that no <code class="inline">catch_unwind</code> can save.</p>
+  <pre class="code">$ curl -s $XERJ/_sql -d '{"query":"SELECT * FROM t WHERE ((((...50k...))))"}'
+<span class="comment"># thread 'xerj-rt' has overflowed its stack</span>
+<span class="comment"># fatal runtime error: stack overflow, aborting</span>
+<span class="comment"># ... Aborted (core dumped)   — exit 134 (SIGABRT)</span></pre>
+  <p class="wide" style="margin-top:var(--sp-5);">The fix mirrors the query_string parser: a bounded recursion depth. After it, the identical payload returns a clean error in ~2 ms and the server stays up.</p>
+  <pre class="code">$ curl -s $XERJ/_sql -d '{"query":"SELECT * FROM t WHERE ((((...50k...))))"}'
+<span class="comment"># {"error":{"reason":"SQL parse error: WHERE clause nesting exceeds max depth of 64"},"status":400}</span>
+<span class="comment"># server still answering 200 afterwards.</span></pre>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">WHAT THIS <span class="accent">DOES NOT SHOW.</span></h2>
+  <div class="laws">
+    <div class="n">01</div><div class="law"><div class="t">XERJ DOES NOT <span class="accent">FIND BUGS.</span></div><div class="b">The tree-sitter extractor and the call-graph analysis produce the candidates; XERJ stores and queries them at scale. The substrate narrows the search; a human or agent still reads the survivors.</div></div>
+    <div class="n">02</div><div class="law"><div class="t">THE GRAPH IS <span class="accent">NAME-BASED.</span></div><div class="b">Method-call edges are excluded on purpose — resolving <code class="inline">.len()</code> by name collapses the graph into one false component. Cycles through trait dispatch or macros are out of reach; the recursion result covers free functions.</div></div>
+    <div class="n">03</div><div class="law"><div class="t">EVERY CANDIDATE STILL <span class="accent">NEEDS A READ.</span></div><div class="b">Blunt category filters over-return (87 for one alloc query); argument-provenance signals sharpen them, and every published finding was read and, where possible, executed. Two unproven traversal leads were <em>not</em> published.</div></div>
+    <div class="n">04</div><div class="law"><div class="t">ONE PASS, HIGHEST-VALUE <span class="accent">LENSES.</span></div><div class="b">This publishes what was proven or fully enumerated — the DoS and the unsafe inventory. The broader auth-flow and business-logic lenses are scoped in the walkthrough, not exhausted here.</div></div>
+  </div>
+</section>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">READ THE <span class="accent">WALKTHROUGH.</span></h2>
+  <p class="wide">The extractor, the ingest script, the recursion-cycle finder, the query cookbook with live hit counts, the ground-truth recall test, and the coverage accounting are all published. Every number reproduces from scratch.</p>
+  <div style="display:flex; gap:var(--sp-6); margin-top:var(--sp-6); flex-wrap:wrap;">
+    <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/xerj-self-audit" rel="external" class="cta" style="font-size:var(--fs-20); padding:var(--sp-4) 0; border-bottom:0; flex:1; min-width:280px;">
+      <span>OPEN THE WALKTHROUGH</span>
+      <span class="arrow">→</span>
+    </a>
+    <a href="https://github.com/xerj-org/xerj/tree/main/docs/examples/rust-ast-audit" rel="external" class="cta" style="font-size:var(--fs-20); padding:var(--sp-4) 0; border-bottom:0; flex:1; min-width:280px;">
+      <span>GET THE TOOLING</span>
+      <span class="arrow">→</span>
+    </a>
+  </div>
+</section>
+
+<section class="lead-capture" id="demo">
+  <div class="kicker"><span>READY?</span><span class="dash">·</span><span>REQUEST ACCESS</span></div>
+  <h3>AUDIT YOUR<br><span class="accent">OWN RUST.</span></h3>
+  <p>The same extractor + queries index your crate into XERJ and hunt the same bug shapes — recursion cycles, unbounded allocation, unsafe soundness, path traversal. Want a walkthrough with your team? Leave an email.</p>
+  <form class="lead-form" id="leadForm" action="#" method="post" novalidate>
+    <div class="lead-form-input">
+      <input type="email" name="email" placeholder="you@company.com" required aria-label="Work email" autocomplete="email" />
+    </div>
+    <button type="submit" class="demo">SEE THE DEMO <span class="arrow">→</span></button>
+    <span class="note">We only use this email to send you the binary. Ever.</span>
+    <span class="ok">✓ THANKS. CHECK YOUR INBOX WITHIN 24 HOURS.</span>
+  </form>
+</section>
+
+<footer class="footer">
+  <span>XERJ.AI · CASE STUDIES · V0.1</span>
+  <span>STORAGE FOR THE AGENT ERA</span>
+  <span><a href="/index.html">HOME</a> · <a href="/case-studies.html">ALL CASE STUDIES</a> · <a href="/docs/index.html">DOCS</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+</footer>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    for (const btn of document.querySelectorAll('[data-theme]')) {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-theme');
+        root.setAttribute('data-theme', t);
+        for (const b of document.querySelectorAll('[data-theme]')) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        }
+      });
+    }
+    const form = document.getElementById('leadForm');
+    if (form) {
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const email = form.querySelector('input[type=email]').value.trim();
+        if (!email || !email.includes('@')) return;
+        console.log('[xerj lead]', email);
+        try { fetch('/lead', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, source: 'xerj-self-audit' }), keepalive: true }).catch(function () {}); } catch (_) {}
+        form.classList.add('sent');
+      });
+    }
+  })();
+</script>
+
+</body>
+</html>

@@ -42,16 +42,21 @@ the code is fixed, the query goes quiet.
 
 | | Agent reads all files | XERJ-assisted audit |
 |---|---|---|
-| **Tokens to load the codebase once** | ~2,000,000 (approx: 8.0 MB source ÷ 4) | index once, then read only flagged functions |
-| **Fits one context?** | No — ~10× a 200k window; must chunk | Yes — targeted queries return tens of candidates |
+| **Tokens to reach the `/_sql` finding** | **1,805,277** (every `.rs` under `engine/`) | **10,533** (cycle-finder output + 4 parser fns read + route lookup) |
+| **Ratio** | — | **171× fewer tokens**, measured, to the same bug |
+| **Fits one context?** | No — ~9× a 200k window; must chunk | Yes — targeted queries return tens of candidates |
 | **Interprocedural reach** | Lost at chunk boundaries | 87,137 call edges preserved across all files |
 | **Finds a recursion *cycle*?** | Only if the whole cycle lands in one chunk | One query over the call graph |
-| **Grounded?** | Skimming 2M tokens → guesses | Every finding cites a real `file:line`, verified by reading it |
+| **Grounded?** | Skimming 1.8M tokens → guesses | Every finding cites a real `file:line`, verified by reading it |
 | **Reproducible?** | No | Yes — extractor + queries reproduce exactly |
 
-Substrate build: **~3.2s extract + ~1.9s ingest** for the whole workspace; 31 MB
-on disk. The token figure is a labelled approximation (source bytes ÷ 4), not a
-measured tokenizer count.
+Both token figures are **measured with tiktoken (`cl100k_base`)**, a public
+GPT-4-class BPE used as an LLM-token proxy — not a chars÷4 estimate. Read-all =
+every `.rs` file under `engine/` tokenized (197 files, 8,025,201 bytes). The
+XERJ-assisted figure is the actual path to *this* finding: the cycle-finder's
+stdout (7,511 tok) + the four SQL parser function bodies the auditor read (3,002
+tok) + the route lookup (20 tok). Substrate build: **~3.2s extract + ~1.9s
+ingest**, 31 MB on disk.
 
 ## Coverage (the explicit goal was 100%)
 

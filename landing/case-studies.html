@@ -56,6 +56,7 @@
 
 <nav class="uc-subnav" aria-label="Case studies">
   <a href="/case-studies.html" class="active">ALL CASE STUDIES</a>
+  <a href="/case-studies/xerj-self-audit.html">RUST SELF-AUDIT</a>
   <a href="/case-studies/wordpress-security-audit.html">WORDPRESS SECURITY AUDIT</a>
   <a href="/case-studies/calltree-analytics.html">SEMANTIC ANALYTICS</a>
   <a href="/case-studies/daily-dev-postgres-cdc.html">POSTGRES CDC + HYBRID</a>
@@ -65,20 +66,53 @@
   <div class="kicker"><span>CASE STUDIES</span><span class="dash">·</span><span>REPRODUCIBLE WALKTHROUGHS</span></div>
   <h1 class="hero">REAL QUESTIONS.<br><span class="accent">RUNNABLE ANSWERS.</span></h1>
   <p class="lead" style="max-width:720px;">
-    WordPress core — ~619k lines — security-audited by an AI agent for ~26,000
-    tokens: that is the one study measured on real code. The other two are
+    XERJ audited its own Rust engine and found a real unauthenticated
+    process-abort DoS — reached for 10,533 tokens instead of the 1.8M it takes to
+    read the source once. WordPress core — ~619k lines — was security-audited for
+    ~26,000 tokens. Those two are measured on real code; the other two are
     functional proofs on small synthetic corpora — they show the shape works,
-    not how fast.
-    Three engineering questions, answered end to end with published code and
-    recorded output. The questions came from calltree.ai and daily.dev; neither
-    is a customer. Every number traces to a walkthrough in the repo.
+    not how fast. Every number traces to a walkthrough in the repo.
   </p>
 </section>
 
-<!-- 01 WORDPRESS SECURITY AUDIT -->
+<!-- 01 RUST SELF-AUDIT -->
 <div class="uc-showcase">
   <div class="uc-copy">
     <span class="uc-num">01</span>
+    <div class="uc-title">XERJ AUDITS<br>ITS OWN<br><span class="accent">RUST.</span></div>
+    <p class="uc-pitch">XERJ indexed its own engine — 197 files, ~201k lines — as a queryable AST and call graph, then found an unauthenticated <code class="inline">POST /_sql</code> stack-overflow that aborts the process. A call-graph recursion-cycle query grep cannot express. Yellow is the tokens to reach the finding; blue is what it costs to read the source once.</p>
+    <div class="uc-metric">10,533 TOKENS INSTEAD OF 1.8M · BUG FIXED</div>
+    <div class="uc-persona">SECURITY ENGINEERS · AI-AGENT BUILDERS · RUST TEAMS</div>
+    <a href="/case-studies/xerj-self-audit.html" class="uc-cta">FULL CASE STUDY →</a>
+  </div>
+  <div class="uc-viz">
+    <div class="kicker"><span>MEASURED · tiktoken cl100k_base · TOKENS TO THE /_sql FINDING</span></div>
+    <div class="cmp-bars">
+      <div class="cmp-bars-head">
+        <span></span>
+        <span class="cmp-a">XERJ-ASSISTED</span>
+        <span class="cmp-b">READ EVERY FILE</span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Tokens to the finding</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:0.5%;"></span>
+          <span class="cmp-num">10,533</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90.0%;"></span>
+          <span class="cmp-num">1,805,277 <span class="cmp-ratio">171×</span></span>
+        </span>
+      </div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">TOKEN ACCOUNTING, NOT A LATENCY BENCHMARK · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/xerj-self-audit" rel="external">docs/case-studies/xerj-self-audit &rarr;</a></p>
+  </div>
+</div>
+
+<!-- 02 WORDPRESS SECURITY AUDIT -->
+<div class="uc-showcase">
+  <div class="uc-copy">
+    <span class="uc-num">02</span>
     <div class="uc-title">WORDPRESS<br>SECURITY<br><span class="accent">AUDIT.</span></div>
     <p class="uc-pitch">WordPress core is ~619k lines — ~26× a 200k-token context window. An agent indexed it as a queryable code graph and read only what queries surfaced. Yellow is the whole audit's token bill; blue is what it costs just to load the code once.</p>
     <div class="uc-metric">~26K TOKENS INSTEAD OF ~5.2M</div>
@@ -109,10 +143,10 @@
   </div>
 </div>
 
-<!-- 02 SEMANTIC ANALYTICS -->
+<!-- 03 SEMANTIC ANALYTICS -->
 <div class="uc-showcase">
   <div class="uc-copy">
-    <span class="uc-num">02</span>
+    <span class="uc-num">03</span>
     <div class="uc-title">SEMANTIC<br>ANALYTICS IN<br><span class="accent">ONE REQUEST.</span></div>
     <p class="uc-pitch">"Of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what are the key issues?" — asked by calltree.ai. Half retrieval, half analytics: normally two stores and an ETL. One XERJ <code class="inline">POST /_search</code> returns the slice, the breakdown, the metrics, and the evidence.</p>
     <div class="uc-metric">1 REQUEST · 1 STORE — WAS 2 + ETL</div>
@@ -161,10 +195,10 @@
   </div>
 </div>
 
-<!-- 03 POSTGRES CDC + HYBRID SEARCH -->
+<!-- 04 POSTGRES CDC + HYBRID SEARCH -->
 <div class="uc-showcase">
   <div class="uc-copy">
-    <span class="uc-num">03</span>
+    <span class="uc-num">04</span>
     <div class="uc-title">POSTGRES CDC +<br><span class="accent">HYBRID SEARCH.</span></div>
     <p class="uc-pitch">daily.dev's founder asked: can XERJ replicate automatically from Postgres? A logical-replication slot streams every INSERT, UPDATE, and DELETE into XERJ — no reindex jobs — and one hybrid query fuses BM25 + vector rankings server-side, replacing the tsvector + pgvector two-query app merge.</p>
     <div class="uc-metric">3/3 MUTATION TYPES REPLICATED · 0 CHANGES LOST</div>

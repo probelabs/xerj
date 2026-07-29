@@ -5,7 +5,9 @@
 ### `POST /_sql` unauthenticated stack-overflow → process abort
 
 **Severity:** Critical (unauthenticated, single request, whole-process abort).
-**Status:** confirmed by crashing a live server. **Not fixed** on current `main`.
+**Status:** confirmed by crashing a live server; **fixed** on branch
+`feat/rust-self-audit` (commit `657db52`) and the fix proven against the same
+payload — see "The fix" below.
 
 **The code.** `engine/crates/xerj-engine/src/sql.rs`, the WHERE-clause
 recursive-descent parser:
@@ -59,10 +61,23 @@ fatal runtime error: stack overflow, aborting
 A stack-overflow abort is not a catchable panic — `catch_unwind` cannot save it,
 and the whole server (every tenant, every index) goes down.
 
-**Suggested fix.** Enter a `DepthGuard` at the top of `parse_condition` (and/or
-`parse_or_expr`), returning a parse error past `MAX_QUERY_DEPTH`, exactly as PR
-#69 did for `parse_qs_unary`. A parse-time token-count/paren-count cap on the raw
-SQL string is a cheap defense-in-depth second layer.
+**The fix (shipped).** An explicit `depth` parameter is threaded through
+`parse_or_expr` / `parse_and_expr` / `parse_condition`, rejected past
+`MAX_SQL_DEPTH = 64` (mirroring `xerj-query`'s `MAX_QUERY_DEPTH`). Proof on the
+rebuilt binary:
+
+```
+# baseline still works
+POST /_sql {"query":"SELECT * FROM t WHERE (a = 1)"}      → HTTP 200
+# the exact payload that aborted the unpatched server
+POST /_sql {"query":"SELECT * FROM t WHERE ((…50k…))"}    → HTTP 400 in ~2ms
+  {"reason":"SQL parse error: WHERE clause nesting exceeds max depth of 64"}
+# server still answering afterwards
+GET /                                                      → HTTP 200
+```
+
+Three regression tests (deep parens, deep `NOT`, moderate nesting still parses)
+plus the full `xerj-engine` lib suite pass; `fmt` + `clippy -D warnings` clean.
 
 ---
 
