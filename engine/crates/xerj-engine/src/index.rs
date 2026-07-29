@@ -8553,10 +8553,18 @@ impl Index {
                         .map(|(window, result)| (window.0, window.1, window.2, result)),
                 );
             } else {
-                for &(start, end, passages) in &windows {
+                let results = collect_ordinal_sequential(windows.len(), |ordinal| {
+                    let (start, end, _) = windows[ordinal];
                     let texts = semantic_embedding_window_texts(&jobs, start, end);
-                    window_results.push((start, end, passages, embedder.embed_batch(texts).await));
-                }
+                    embedder.embed_batch(texts)
+                })
+                .await;
+                window_results.extend(
+                    windows
+                        .iter()
+                        .zip(results)
+                        .map(|(window, result)| (window.0, window.1, window.2, result)),
+                );
             }
 
             for (start, end, passages, batch_result) in window_results {
@@ -29740,6 +29748,20 @@ fn semantic_embedding_window_texts(jobs: &[EmbedJob], start: usize, end: usize) 
         .collect()
 }
 
+/// Run one future at a time and retain the completed results in input order.
+/// Each launched future is dropped before the next window is materialized.
+async fn collect_ordinal_sequential<T, F, Fut>(count: usize, launch: F) -> Vec<T>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut results = Vec::with_capacity(count);
+    for ordinal in 0..count {
+        results.push(launch(ordinal).await);
+    }
+    results
+}
+
 /// Run no more than two futures concurrently and return every result in input
 /// order. `join!` waits for both siblings even when one fails.
 async fn collect_ordinal_buffered_two<T, F, Fut>(count: usize, launch: F) -> Vec<T>
@@ -29770,7 +29792,7 @@ fn dual_session_scheduler_enabled(onnx_pinned: bool, pool_size: usize) -> bool {
 #[cfg(test)]
 mod semantic_embedding_window_tests {
     use super::{
-        collect_ordinal_buffered_two, dual_session_scheduler_enabled,
+        collect_ordinal_buffered_two, collect_ordinal_sequential, dual_session_scheduler_enabled,
         semantic_embedding_window_end, semantic_embedding_window_limit,
         semantic_embedding_window_texts, EmbedJob,
     };
@@ -29784,6 +29806,49 @@ mod semantic_embedding_window_tests {
             start = end;
         }
         result
+    }
+
+    #[tokio::test]
+    async fn sequential_scheduler_owns_exactly_one_materialized_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct OwnedWindow {
+            count: Arc<AtomicUsize>,
+            texts: Vec<String>,
+        }
+        impl Drop for OwnedWindow {
+            fn drop(&mut self) {
+                self.count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let jobs = vec![job(0, &["zero"]), job(1, &["one"]), job(2, &["two"])];
+        let boundaries = windows(&[1, 1, 1], 1);
+        let owned = Arc::new(AtomicUsize::new(0));
+        let peak_owned = Arc::new(AtomicUsize::new(0));
+        let results = collect_ordinal_sequential(boundaries.len(), |ordinal| {
+            let range = boundaries[ordinal].0.clone();
+            let texts = semantic_embedding_window_texts(&jobs, range.start, range.end);
+            let owned_count = owned.fetch_add(1, Ordering::SeqCst) + 1;
+            peak_owned.fetch_max(owned_count, Ordering::SeqCst);
+            let owned_window = OwnedWindow {
+                count: Arc::clone(&owned),
+                texts,
+            };
+            async move {
+                tokio::task::yield_now().await;
+                (ordinal, owned_window.texts[0].clone())
+            }
+        })
+        .await;
+
+        assert_eq!(peak_owned.load(Ordering::SeqCst), 1);
+        assert_eq!(owned.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            results,
+            vec![(0, "zero".into()), (1, "one".into()), (2, "two".into())]
+        );
     }
 
     fn job(ordinal: usize, texts: &[&str]) -> EmbedJob {
