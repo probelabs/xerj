@@ -60,6 +60,423 @@ fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudge
     panic!("Index construction requires the process ResourceGovernor to be initialised");
 }
 
+struct HnswPublicationGuard {
+    in_flight: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+}
+
+impl HnswPublicationGuard {
+    fn begin(in_flight: &Arc<AtomicU64>, generation: &Arc<AtomicU64>) -> Self {
+        generation.fetch_add(1, Ordering::AcqRel);
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        Self {
+            in_flight: Arc::clone(in_flight),
+            generation: Arc::clone(generation),
+        }
+    }
+}
+
+impl Drop for HnswPublicationGuard {
+    fn drop(&mut self) {
+        let previous = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "HNSW publication counter underflow");
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod raw_vector_publication_tests {
+    use super::*;
+
+    fn vector_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("embedding", FieldType::Vector))
+            .unwrap();
+        schema
+    }
+
+    fn baseline_vector_docs(prefix: &str) -> Vec<(String, Value)> {
+        (0..HNSW_MIN_DOCS)
+            .map(|i| {
+                let x = (i + 1) as f32 / (HNSW_MIN_DOCS as f32 * 2.0);
+                (
+                    format!("{prefix}-{i}"),
+                    serde_json::json!({"embedding": [x, 1.0 - x, 0.1]}),
+                )
+            })
+            .collect()
+    }
+
+    fn baseline_raw_vector_docs(prefix: &str) -> Vec<(String, Arc<[u8]>)> {
+        baseline_vector_docs(prefix)
+            .into_iter()
+            .map(|(id, source)| raw(&id, source))
+            .collect()
+    }
+
+    fn raw(id: &str, source: Value) -> (String, Arc<[u8]>) {
+        (
+            id.to_owned(),
+            Arc::<[u8]>::from(serde_json::to_vec(&source).unwrap()),
+        )
+    }
+
+    fn sync_raw_on_dedicated_thread(
+        index: Arc<Index>,
+        docs: Vec<(String, Arc<[u8]>)>,
+    ) -> Result<usize> {
+        std::thread::spawn(move || index.index_batch_sync_raw(docs))
+            .join()
+            .expect("dedicated sync ingest thread panicked")
+    }
+
+    async fn assert_ann_winner(index: &Index, expected: &str, vector_count: usize) {
+        let request = knn_request(vector_count, vector_count);
+        let result = index
+            .run_knn_hnsw(
+                &request,
+                "embedding",
+                &[1.0, 0.0, 0.0],
+                vector_count,
+                Some(vector_count),
+                "cosine",
+            )
+            .await
+            .expect("complete >=HNSW_MIN_DOCS graph must serve ANN");
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "request size must trim exact-rescored ANN"
+        );
+        assert_eq!(result.hits[0].id, expected);
+    }
+
+    fn knn_request(k: usize, num_candidates: usize) -> SearchRequest {
+        SearchRequest {
+            query: QueryNode::Knn {
+                field: "embedding".to_owned(),
+                vector: vec![1.0, 0.0, 0.0],
+                k,
+                num_candidates: Some(num_candidates),
+                filter: None,
+                boost: None,
+                similarity: None,
+            },
+            size: 1,
+            ..SearchRequest::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn value_turbo_scans_past_first_nonvector_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("mixed-value-vectors", vector_schema())
+            .unwrap();
+        let index = engine.get_index("mixed-value-vectors").unwrap();
+
+        let mut docs = Vec::with_capacity(HNSW_MIN_DOCS as usize + 1);
+        docs.push((
+            "ordinary-first".to_owned(),
+            serde_json::json!({"body": "text"}),
+        ));
+        docs.push((
+            "true-winner".to_owned(),
+            serde_json::json!({"embedding": [1.0, 0.0, 0.0]}),
+        ));
+        docs.extend((1..HNSW_MIN_DOCS).map(|i| {
+            let x = i as f32 / (HNSW_MIN_DOCS as f32 * 2.0);
+            (
+                format!("other-{i}"),
+                serde_json::json!({"embedding": [x, 1.0 - x, 0.1]}),
+            )
+        }));
+        index.index_batch_turbo(docs, true, false).await.unwrap();
+
+        let stats = index.hnsw_stats().await;
+        assert_eq!(stats["vector_doc_count"], HNSW_MIN_DOCS);
+        assert_eq!(stats["doc_coverage"], HNSW_MIN_DOCS);
+        assert_eq!(stats["covered"], true);
+        assert!(
+            index
+                .hnsw_vector_current("true-winner", &[1.0, 0.0, 0.0])
+                .await,
+            "the second document's unique winning vector must enter HNSW"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_raw_publication_adds_the_true_ann_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("async-raw-vectors", vector_schema())
+            .unwrap();
+        let index = engine.get_index("async-raw-vectors").unwrap();
+        index
+            .index_batch_turbo_raw(baseline_raw_vector_docs("async-base"))
+            .await
+            .unwrap();
+
+        index
+            .index_batch_turbo_raw(vec![raw(
+                "async-base-0",
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0]}),
+            )])
+            .await
+            .unwrap();
+
+        let stats = index.hnsw_stats().await;
+        assert_eq!(stats["vector_doc_count"], HNSW_MIN_DOCS);
+        assert_eq!(stats["doc_coverage"], HNSW_MIN_DOCS);
+        assert_eq!(stats["covered"], true);
+        assert_ann_winner(&index, "async-base-0", HNSW_MIN_DOCS as usize).await;
+
+        index.flush().await.unwrap();
+        drop(index);
+        drop(engine);
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let reopened = crate::Engine::new(config).unwrap();
+        let index = reopened.get_index("async-raw-vectors").unwrap();
+        let stats = index.hnsw_stats().await;
+        assert_eq!(stats["vector_doc_count"], HNSW_MIN_DOCS);
+        assert_eq!(stats["doc_coverage"], HNSW_MIN_DOCS);
+        assert_eq!(stats["covered"], true);
+        assert_ann_winner(&index, "async-base-0", HNSW_MIN_DOCS as usize).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_raw_publication_adds_the_true_ann_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("sync-raw-vectors", vector_schema())
+            .unwrap();
+        let index = engine.get_index("sync-raw-vectors").unwrap();
+        sync_raw_on_dedicated_thread(Arc::clone(&index), baseline_raw_vector_docs("sync-base"))
+            .unwrap();
+
+        sync_raw_on_dedicated_thread(
+            Arc::clone(&index),
+            vec![raw(
+                "sync-base-0",
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0]}),
+            )],
+        )
+        .unwrap();
+
+        let stats = index.hnsw_stats().await;
+        assert_eq!(stats["vector_doc_count"], HNSW_MIN_DOCS);
+        assert_eq!(stats["doc_coverage"], HNSW_MIN_DOCS);
+        assert_eq!(stats["covered"], true);
+        assert_ann_winner(&index, "sync-base-0", HNSW_MIN_DOCS as usize).await;
+
+        index.flush().await.unwrap();
+        drop(index);
+        drop(engine);
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let reopened = crate::Engine::new(config).unwrap();
+        let index = reopened.get_index("sync-raw-vectors").unwrap();
+        assert_ann_winner(&index, "sync-base-0", HNSW_MIN_DOCS as usize).await;
+    }
+
+    #[tokio::test]
+    async fn sync_raw_vector_ingest_rejects_tokio_thread_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("sync-runtime-reject", vector_schema())
+            .unwrap();
+        let index = engine.get_index("sync-runtime-reject").unwrap();
+        let before_seq = index.store.current_seq_no();
+
+        let error = index
+            .index_batch_sync_raw(vec![raw(
+                "must-not-publish",
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0]}),
+            )])
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Tokio runtime thread"),
+            "{error}"
+        );
+        assert_eq!(index.store.current_seq_no(), before_seq);
+        assert!(index.store.version_map.get("must-not-publish").is_none());
+        assert!(!index.memtable.contains("must-not-publish"));
+        assert_eq!(index.hnsw_publications_in_flight.load(Ordering::Acquire), 0);
+    }
+
+    async fn paused_pre_hnsw_case(reused: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let name = if reused {
+            "paused-reused-vector"
+        } else {
+            "paused-new-vector"
+        };
+        engine.create_index(name, vector_schema()).unwrap();
+        let index = engine.get_index(name).unwrap();
+        index
+            .index_batch_turbo_raw(baseline_raw_vector_docs("paused-base"))
+            .await
+            .unwrap();
+
+        let target = if reused {
+            "paused-base-0"
+        } else {
+            "paused-new-winner"
+        };
+        let pause_point = if reused {
+            PublicationTestPoint::AfterFts
+        } else {
+            PublicationTestPoint::RawBeforeHnsw
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let ready_tx = parking_lot::Mutex::new(Some(ready_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        let target_for_hook = target.to_owned();
+        index.set_publication_test_hook(Some(Arc::new(move |id, point| {
+            if id == target_for_hook && point == pause_point {
+                ready_tx.lock().take().unwrap().send(()).unwrap();
+                resume_rx.lock().take().unwrap().recv().unwrap();
+            }
+        })));
+
+        let writer_index = Arc::clone(&index);
+        let writer_target = target.to_owned();
+        let writer = tokio::spawn(async move {
+            let source = serde_json::json!({"embedding": [1.0, 0.0, 0.0]});
+            if reused {
+                writer_index
+                    .index_document(Some(writer_target), source)
+                    .await
+                    .map(|_| ())
+            } else {
+                writer_index
+                    .index_batch_turbo_raw(vec![raw(&writer_target, source)])
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::task::spawn_blocking(move || ready_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(index.hnsw_publications_in_flight.load(Ordering::Acquire), 1);
+        let request = knn_request(1, 64);
+        assert!(
+            index
+                .run_knn_hnsw(
+                    &request,
+                    "embedding",
+                    &[1.0, 0.0, 0.0],
+                    1,
+                    Some(64),
+                    "cosine",
+                )
+                .await
+                .is_none(),
+            "ANN must yield to exact scan while source and HNSW differ"
+        );
+        let exact = index.search(&request).await.unwrap();
+        assert_eq!(exact.hits[0].id, target);
+
+        // Saving after WAL/FTS visibility but before HNSW completion must
+        // explicitly persist a stale snapshot, never old graph + fresh stamp.
+        index.save_hnsw_to_disk().await.unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(index.hnsw_ids_path()).unwrap()).unwrap();
+        assert_eq!(persisted["stale"], true);
+
+        resume_tx.send(()).unwrap();
+        writer.await.unwrap().unwrap();
+        index.set_publication_test_hook(None);
+        assert_eq!(index.hnsw_publications_in_flight.load(Ordering::Acquire), 0);
+        index.save_hnsw_to_disk().await.unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(index.hnsw_ids_path()).unwrap()).unwrap();
+        assert_eq!(persisted["stale"], false);
+        let count = if reused {
+            HNSW_MIN_DOCS
+        } else {
+            HNSW_MIN_DOCS + 1
+        };
+        assert_ann_winner(&index, target, count as usize).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn paused_new_raw_publication_forces_exact_query_and_stale_save() {
+        paused_pre_hnsw_case(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn paused_reused_single_publication_forces_exact_query_and_stale_save() {
+        paused_pre_hnsw_case(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ann_generation_change_after_graph_search_forces_exact_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("ann-generation-race", vector_schema())
+            .unwrap();
+        let index = engine.get_index("ann-generation-race").unwrap();
+        index
+            .index_batch_turbo_raw(baseline_raw_vector_docs("race-base"))
+            .await
+            .unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let ready_tx = parking_lot::Mutex::new(Some(ready_tx));
+        let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
+        index.set_publication_test_hook(Some(Arc::new(move |_, point| {
+            if point == PublicationTestPoint::AnnAfterGraphSearch {
+                ready_tx.lock().take().unwrap().send(()).unwrap();
+                resume_rx.lock().take().unwrap().recv().unwrap();
+            }
+        })));
+
+        let query_index = Arc::clone(&index);
+        let request = knn_request(HNSW_MIN_DOCS as usize, HNSW_MIN_DOCS as usize);
+        let query = tokio::spawn(async move { query_index.search(&request).await });
+        tokio::task::spawn_blocking(move || ready_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        index
+            .index_batch_turbo_raw(vec![raw(
+                "race-new-winner",
+                serde_json::json!({"embedding": [1.0, 0.0, 0.0]}),
+            )])
+            .await
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        let result = query.await.unwrap().unwrap();
+        index.set_publication_test_hook(None);
+        assert_eq!(result.hits[0].id, "race-new-winner");
+    }
+}
+
 /// Clears an index's `merge_in_progress` flag on every exit path of the
 /// merge holder (background pass or forcemerge), including panics.
 struct MergeFlagClear<'a>(&'a std::sync::atomic::AtomicBool);
@@ -1558,6 +1975,8 @@ enum PublicationTestPoint {
     AfterWalVersionMap,
     AfterFts,
     AfterHnsw,
+    RawBeforeHnsw,
+    AnnAfterGraphSearch,
     BeforeRelease,
 }
 
@@ -1654,6 +2073,16 @@ pub struct Index {
     /// delete; never above the true count (over-count on updates biases the
     /// gate to brute, which is safe).
     vector_doc_count: Arc<AtomicU64>,
+    /// Vector-bearing batch publications that have made, or are about to
+    /// make, their authoritative document source visible but have not yet
+    /// completed the corresponding HNSW update. Any non-zero value forces
+    /// ANN to exact fallback so equality of graph coverage counters cannot
+    /// expose a stale graph during this interval.
+    hnsw_publications_in_flight: Arc<AtomicU64>,
+    /// Monotonic begin/end epoch paired with `hnsw_publications_in_flight`.
+    /// Snapshot persistence samples this around graph serialization so even
+    /// a publication that starts and finishes during the save is detected.
+    hnsw_publication_generation: Arc<AtomicU64>,
     /// FIELD IDENTITY: the single field this index's HNSW graph indexes.
     ///
     /// Pinned when the graph is first created (preferring the schema's first
@@ -1996,6 +2425,18 @@ pub struct Index {
 }
 
 impl Index {
+    fn begin_hnsw_publication(&self) -> HnswPublicationGuard {
+        HnswPublicationGuard::begin(
+            &self.hnsw_publications_in_flight,
+            &self.hnsw_publication_generation,
+        )
+    }
+
+    async fn has_dense_vector_mapping(&self) -> bool {
+        let schema = self.schema.read().await;
+        !collect_dense_vector_fields(&schema.schema).is_empty()
+    }
+
     /// Aggregate DashMap table capacities for the seven hydration families.
     /// These are diagnostic table slots, separate from the refundable
     /// retained-payload/key budget.
@@ -2190,6 +2631,8 @@ impl Index {
             hnsw_id_rev: Arc::new(RwLock::new(HashMap::new())),
             hnsw_next_id: Arc::new(AtomicU64::new(1)),
             vector_doc_count: Arc::new(AtomicU64::new(0)),
+            hnsw_publications_in_flight: Arc::new(AtomicU64::new(0)),
+            hnsw_publication_generation: Arc::new(AtomicU64::new(0)),
             hnsw_field: Arc::new(std::sync::RwLock::new(None)),
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2470,6 +2913,8 @@ impl Index {
             hnsw_id_rev: Arc::new(RwLock::new(id_rev_init)),
             hnsw_next_id: Arc::new(AtomicU64::new(next_id_init)),
             vector_doc_count: Arc::new(AtomicU64::new(vector_doc_count_init)),
+            hnsw_publications_in_flight: Arc::new(AtomicU64::new(0)),
+            hnsw_publication_generation: Arc::new(AtomicU64::new(0)),
             hnsw_field: Arc::new(std::sync::RwLock::new(hnsw_field_init)),
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(hnsw_stale_init)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2732,6 +3177,13 @@ impl Index {
                 }
             }
         }
+
+        // From the first authoritative visibility change through HNSW
+        // publication, ANN must not observe the old graph as complete.
+        let _hnsw_publication = self
+            .has_dense_vector_mapping()
+            .await
+            .then(|| self.begin_hnsw_publication());
 
         // Invalidate the response cache only after admission and CAS succeed.
         self.dataset_version.fetch_add(1, Ordering::Release);
@@ -2998,6 +3450,7 @@ impl Index {
         // source in an Arc directly.
         let schema_guard = self.schema.read().await;
         let has_copy_to = schema_has_copy_to(&schema_guard.schema);
+        let has_vector_mapping = !collect_dense_vector_fields(&schema_guard.schema).is_empty();
         let processed: Vec<_> = if has_copy_to {
             results
                 .into_iter()
@@ -3021,6 +3474,7 @@ impl Index {
             results
         };
         drop(schema_guard);
+        let _hnsw_publication = has_vector_mapping.then(|| self.begin_hnsw_publication());
 
         // ── Step 3+4: WAL append + FTS memtable insert under one lock ─────
         //
@@ -3190,22 +3644,21 @@ impl Index {
         }
 
         // Vector indexing is only meaningful when at least one document
-        // in the batch carries an array of numbers.  Detecting that
-        // costs a single pass over the first doc's top-level object;
-        // for log workloads (no vector fields) this skips the async
-        // HNSW lock acquire entirely.
-        if processed
-            .first()
-            .and_then(|r| r.source.as_object())
-            .map(|obj| {
-                obj.values().any(|v| {
-                    v.as_array()
-                        .map(|arr| !arr.is_empty() && arr.iter().all(Value::is_number))
-                        .unwrap_or(false)
+        // in the batch carries an array of numbers. Scan until the first
+        // candidate instead of inspecting only processed[0]: mixed batches
+        // may legitimately begin with an ordinary text/log document.
+        if processed.iter().any(|r| {
+            r.source
+                .as_object()
+                .map(|obj| {
+                    obj.values().any(|v| {
+                        v.as_array()
+                            .map(|arr| !arr.is_empty() && arr.iter().all(Value::is_number))
+                            .unwrap_or(false)
+                    })
                 })
-            })
-            .unwrap_or(false)
-        {
+                .unwrap_or(false)
+        }) {
             for ingest in &processed {
                 self.index_vectors(&ingest.id, &ingest.source).await;
             }
@@ -3324,10 +3777,14 @@ impl Index {
             p_parse_us = raw_parse_elapsed.as_micros();
         }
 
-        let has_copy_to = {
+        let (has_copy_to, has_vector_mapping) = {
             let schema = self.schema.read().await;
-            schema_has_copy_to(&schema.schema)
+            (
+                schema_has_copy_to(&schema.schema),
+                !collect_dense_vector_fields(&schema.schema).is_empty(),
+            )
         };
+        let _hnsw_publication = has_vector_mapping.then(|| self.begin_hnsw_publication());
         let wal_t = std::time::Instant::now();
         let (docs, sources, seq_nos) = if has_copy_to {
             let (docs, parsed) = validated.into_parts();
@@ -3516,6 +3973,17 @@ impl Index {
             })
             .collect();
 
+        // The raw path already parsed every source for schema evolution and
+        // FTS analysis. Publish those same authoritative values to HNSW before
+        // the batch becomes observable to its caller.
+        #[cfg(test)]
+        if let Some((doc, _)) = docs.first() {
+            self.publication_test_point(doc, PublicationTestPoint::RawBeforeHnsw);
+        }
+        for (doc, source) in docs.iter().zip(&sources) {
+            self.index_vectors(&doc.0, source).await;
+        }
+
         self.maybe_spawn_flush().await;
 
         let elapsed_ms = index_start.elapsed().as_millis() as u64;
@@ -3553,6 +4021,30 @@ impl Index {
         }
         let batch_len = docs.len();
         self.governor_write_gate()?;
+        let has_vector_mapping = {
+            let schema = self.schema.try_read().map_err(|_| {
+                EngineError::Common(xerj_common::XerjError::resource_exhausted(
+                    "schema is being updated during synchronous ingest; retry the batch",
+                ))
+            })?;
+            !collect_dense_vector_fields(&schema.schema).is_empty()
+        };
+        if has_vector_mapping {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::resource_exhausted(
+                        "synchronous vector ingest cannot run on a Tokio runtime thread; call it from a dedicated/Rayon worker or use async turbo ingest",
+                    ),
+                ));
+            }
+            if self.flush_signal.runtime().is_none() {
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::resource_exhausted(
+                        "synchronous vector ingest requires the engine runtime; retry through async turbo ingest",
+                    ),
+                ));
+            }
+        }
         let validated = crate::ingest_pool()
             .install(|| xerj_storage::IndexStore::validate_raw_batch(docs))
             .map_err(|error| match error {
@@ -3610,6 +4102,7 @@ impl Index {
             }
         }
 
+        let _hnsw_publication = has_vector_mapping.then(|| self.begin_hnsw_publication());
         let index_start = std::time::Instant::now();
         let wal_t = std::time::Instant::now();
         // Preserve copy_to semantics on the synchronous CLI path too. The
@@ -3658,6 +4151,22 @@ impl Index {
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             (docs, seq_nos, Some(copy_schema))
+        } else if has_vector_mapping {
+            // Ordinary sync ingest keeps its sealed raw-byte path. A mapped
+            // vector index additionally needs parsed sources so the same
+            // publication can maintain HNSW and its coverage denominator.
+            let validated = crate::ingest_pool()
+                .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
+                .map_err(EngineError::Storage)?;
+            let seq_nos = self.store.wal_append_batch_raw(&validated)?;
+            let (raw_docs, parsed) = validated.into_parts();
+            let parsed = parsed.expect("parse_validated_raw_batch retains parsed values");
+            let docs = raw_docs
+                .into_iter()
+                .zip(parsed)
+                .map(|((id, bytes), source)| (id, bytes, Some(source)))
+                .collect();
+            (docs, seq_nos, None)
         } else {
             let seq_nos = self.store.wal_append_batch_raw(&validated)?;
             let (docs, parsed) = validated.into_parts();
@@ -3680,6 +4189,17 @@ impl Index {
         // every sibling ID hashing elsewhere was therefore invisible until
         // flush. Preserve request order within each shard so duplicate IDs are
         // deterministic last-write-wins.
+        let vector_sources: Vec<(String, Arc<Value>)> = if has_vector_mapping {
+            docs.iter()
+                .filter_map(|(id, _, source)| {
+                    source
+                        .as_ref()
+                        .map(|source| (id.clone(), Arc::clone(source)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let n_shards = self.memtable.shard_count().max(1);
         let mut buckets: Vec<Vec<(u64, String, Arc<[u8]>, Option<Arc<Value>>)>> =
             (0..n_shards).map(|_| Vec::new()).collect();
@@ -3728,6 +4248,20 @@ impl Index {
         // cache-line bouncing on `doc_count`.
         self.doc_count
             .fetch_add(batch_len as u64, Ordering::Relaxed);
+
+        if !vector_sources.is_empty() {
+            // This API runs on the CLI's Rayon workers. Cross into the cached
+            // engine runtime once per vector-bearing batch (not once per doc)
+            // and complete graph publication before reporting success.
+            #[cfg(test)]
+            self.publication_test_point(&vector_sources[0].0, PublicationTestPoint::RawBeforeHnsw);
+            let rt = self.flush_signal.runtime().expect("validated above");
+            rt.block_on(async {
+                for (id, source) in vector_sources {
+                    self.index_vectors(&id, &source).await;
+                }
+            });
+        }
 
         for shard in touched_shards {
             let per_shard_doc_t =
@@ -3907,6 +4441,10 @@ impl Index {
             })
             .collect();
         drop(schema_guard);
+        let _hnsw_publication = self
+            .has_dense_vector_mapping()
+            .await
+            .then(|| self.begin_hnsw_publication());
 
         // Step 3: Update version map (lock-free atomic operations) — no WAL.
         // Assign monotonically increasing seq_nos from the engine's counter.
@@ -6020,6 +6558,10 @@ impl Index {
         if similarity != "cosine" {
             return None;
         }
+        let publication_generation = self.hnsw_publication_generation.load(Ordering::Acquire);
+        if self.hnsw_publications_in_flight.load(Ordering::Acquire) != 0 {
+            return None;
+        }
         if self.hnsw_stale.load(Ordering::Acquire) {
             return None;
         }
@@ -6079,6 +6621,8 @@ impl Index {
                 Err(_) => return None,
             }
         };
+        #[cfg(test)]
+        self.publication_test_point("", PublicationTestPoint::AnnAfterGraphSearch);
 
         // node_id → doc_id under a short id_rev read. Nodes without a rev
         // entry were deleted between search and mapping — skip them (brute
@@ -6123,6 +6667,15 @@ impl Index {
             }
             let score = compute_vector_similarity(similarity, query_vec, &doc_vec);
             scored.push((doc_id, score, src, None));
+        }
+
+        // A writer may start after the pre-check and finish while ANN searches
+        // or hydrates. Never return candidates from a graph generation that
+        // overlapped source visibility: hand the whole request to exact scan.
+        if self.hnsw_publications_in_flight.load(Ordering::Acquire) != 0
+            || self.hnsw_publication_generation.load(Ordering::Acquire) != publication_generation
+        {
+            return None;
         }
 
         // Item 8: this line is only reached when the coverage gate admitted
@@ -7572,6 +8125,8 @@ impl Index {
     /// `self.hnsw` is None (no vector field has been indexed yet).
     /// Called on flush completion and graceful shutdown.
     pub async fn save_hnsw_to_disk(&self) -> Result<()> {
+        let publication_generation_before =
+            self.hnsw_publication_generation.load(Ordering::Acquire);
         let hnsw_guard = self.hnsw.read().await;
         let hnsw = match &*hnsw_guard {
             Some(h) => h,
@@ -7604,12 +8159,22 @@ impl Index {
         // keys, and this loader treats a missing `field` as legacy.
         let id_map = self.hnsw_id_map.read().await;
         let hnsw_field = self.hnsw_field.read().unwrap().clone();
+        // Capture the WAL position before the final publication samples.
+        // Every guarded writer increments generation before WAL visibility,
+        // so a writer that is absent from these samples necessarily appends
+        // after this stamp and will be caught by the restart seq mismatch.
+        let seq_no = self.store.current_seq_no();
+        let publication_generation_after = self.hnsw_publication_generation.load(Ordering::Acquire);
+        let publication_in_flight = self.hnsw_publications_in_flight.load(Ordering::Acquire);
+        let stale = self.hnsw_stale.load(Ordering::Acquire)
+            || publication_in_flight != 0
+            || publication_generation_before != publication_generation_after;
         let snapshot = serde_json::json!({
             "next_id": self.hnsw_next_id.load(Ordering::Relaxed),
             "map": *id_map,
             "field": hnsw_field,
-            "seq_no": self.store.current_seq_no(),
-            "stale": self.hnsw_stale.load(Ordering::Acquire),
+            "seq_no": seq_no,
+            "stale": stale,
         });
         // Durable atomic publish (RC4 W2 item 19 — same treatment as
         // graph.bin in HnswIndex::save_to): fsync file + rename + fsync
@@ -8059,6 +8624,11 @@ impl Index {
                 version,
             });
         }
+
+        let _hnsw_publication = self
+            .has_dense_vector_mapping()
+            .await
+            .then(|| self.begin_hnsw_publication());
 
         // Invalidate response caches only once the OCC check has succeeded and
         // the delete will mutate publication state. A rejected conditional
