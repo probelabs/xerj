@@ -964,22 +964,34 @@ export const secondBrain = {
   name: 'Second Brain',
   render: ({ data, time }) => ({
     title:  'SECOND BRAIN',
-    kicker: 'GRAPH MEMORY · EVIDENCE · TIME TRAVEL',
+    kicker: 'WHAT YOUR NOTES BELIEVE · EVERY LINK HAS A QUOTE · REPLAYABLE AT ANY MOMENT',
     meta:   [time, 'XERJ-GRAPH'],
     panels: [
-      { id: 'edgesLive',    eyebrow: 'LIVE EDGES',        cols: 3, type: 'metric',   /* Num */ },
-      { id: 'edgesTotal',   eyebrow: 'TOTAL ASSERTED',    cols: 3, type: 'metric',   /* Num */ },
-      { id: 'invalidated',  eyebrow: 'INVALIDATED (KEPT)',cols: 3, type: 'metric',   /* Num */ },
-      { id: 'detectors',    eyebrow: 'DETECTORS',         cols: 3, type: 'metric',   /* Num */ },
-      { id: 'typeDist',     eyebrow: 'EDGE TYPES',        cols: 6, type: 'dist',     /* Dist */ },
-      { id: 'edgeTimeline', eyebrow: 'EDGES OVER TIME',   cols: 6, type: 'series',   /* Series */ },
-      { id: 'ego',          eyebrow: 'EGO · 1 HOP FROM SELECTED NODE', cols: 12, type: 'ego' },
-      { id: 'hubs',         eyebrow: 'HUBS · IN / OUT',   cols: 6, type: 'topn',     /* TopN */ },
+      { id: 'edgesLive',    eyebrow: 'BELIEVED AT THIS MOMENT',   cols: 3, type: 'metric' },
+      { id: 'edgesTotal',   eyebrow: 'EVER ASSERTED',             cols: 3, type: 'metric' },
+      { id: 'invalidated',  eyebrow: 'RETIRED · KEPT FOR REPLAY', cols: 3, type: 'metric' },
+      { id: 'detectors',    eyebrow: 'WHAT TAUGHT THIS BRAIN',    cols: 3, type: 'metric' },
+      { id: 'typeDist',     eyebrow: 'HOW NOTES CONNECT',         cols: 6, type: 'dist',   /* Dist */ },
+      { id: 'edgeTimeline', eyebrow: 'NEW LINKS PER DAY',         cols: 6, type: 'series', /* Series */ },
+      { id: 'ego',          eyebrow: 'THE LEDGER · ONE NOTE, EVERYTHING IT TOUCHES', cols: 12, type: 'ego' },
+      { id: 'hubs',         eyebrow: 'CENTERS OF GRAVITY',        cols: 6, type: 'topn' },
       { id: 'notShown',     eyebrow: 'WHAT THIS VIEW DID NOT SHOW', cols: 6, type: 'honesty' },
     ],
   }),
 };
 ```
+
+Integrator edit (UX review, 2026-07-28): the ids/kinds/cols above are
+UNCHANGED from v1; only the human-visible titles moved to user words.
+LANGUAGE RULE (binding for every console surface of this feature): panel
+titles and labels say "link / believed since / retired / what taught
+this" — schema vocabulary (`edge`, `src`/`dst`, `valid_at`, `as_of`,
+`edge_id`) may appear only inside the evidence paper-trail (the raw
+developer view) and in API documentation. The four metric panels carry a
+visual value story, not bare counters: believed-vs-retired composition
+(the ONE two-series comparison — `--z-accent` vs the validated `--z-cmp`
+token, both segments directly labelled), cumulative growth spark,
+retired share, and per-detector count rows.
 Import surface identical to vector-index.js (`Num` from `../ux/text.js`,
 `Dist`/`Series` from `../ux/charts.js`, `TopN` from `../ux/layout.js`). Two
 new panel renderers are UX-stream-owned: `ego` (node-link view of the §4.3
@@ -1011,9 +1023,9 @@ data = {
   overview: /* EXACTLY the §4.4 response body */,
   ego:      /* EXACTLY the §4.3 response body for the currently selected node */,
   metrics: {           // derived by the data layer from `overview`, pre-formatted
-    edgesLive:   { formatted: '8',  hint: 'visible at as-of' },
-    edgesTotal:  { formatted: '8',  hint: 'incl. invalidated' },
-    invalidated: { formatted: '0',  hint: 'soft-deleted, kept for time travel' },
+    edgesLive:   { formatted: '8',  hint: 'held true right now' },   // as-of-aware: 'held true at <ts> UTC' when scrubbed
+    edgesTotal:  { formatted: '8',  hint: 'nothing is ever deleted' },
+    invalidated: { formatted: '0',  hint: 'drag belief time left to revisit' },
     detectors:   { formatted: '2',  hint: 'deterministic, versioned' },
   },
   series: { created: overview.created_over_time.map(b => b.count) },
@@ -1034,14 +1046,14 @@ DashboardSpec {
     section: Some("dashboards"),
     group: Some("ai"),
     panels: vec![
-        p("edgesLive",    "metric",  "LIVE EDGES",                          3),
-        p("edgesTotal",   "metric",  "TOTAL ASSERTED",                      3),
-        p("invalidated",  "metric",  "INVALIDATED (KEPT)",                  3),
-        p("detectors",    "metric",  "DETECTORS",                           3),
-        p("typeDist",     "dist",    "EDGE TYPES",                          6),
-        p("edgeTimeline", "series",  "EDGES OVER TIME",                     6),
-        p("ego",          "ego",     "EGO · 1 HOP FROM SELECTED NODE",     12),
-        p("hubs",         "topn",    "HUBS · IN / OUT",                     6),
+        p("edgesLive",    "metric",  "BELIEVED AT THIS MOMENT",             3),
+        p("edgesTotal",   "metric",  "EVER ASSERTED",                       3),
+        p("invalidated",  "metric",  "RETIRED · KEPT FOR REPLAY",           3),
+        p("detectors",    "metric",  "WHAT TAUGHT THIS BRAIN",              3),
+        p("typeDist",     "dist",    "HOW NOTES CONNECT",                   6),
+        p("edgeTimeline", "series",  "NEW LINKS PER DAY",                   6),
+        p("ego",          "ego",     "THE LEDGER · ONE NOTE, EVERYTHING IT TOUCHES", 12),
+        p("hubs",         "topn",    "CENTERS OF GRAVITY",                  6),
         p("notShown",     "honesty", "WHAT THIS VIEW DID NOT SHOW",         6),
     ],
 },

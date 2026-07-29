@@ -392,7 +392,10 @@ function runSearchNow() {
  * redirects to `#/settings`.
  */
 function parseRoute() {
-  const raw = (location.hash || '').replace(/^#\/?/, '');
+  // Route = the hash *path* only. A `?query` tail inside the hash (e.g.
+  // `#/second-brain?brain=notes`, the deep link `xerj brain` prints) is
+  // view state owned by the dashboard, never part of the route.
+  const raw = (location.hash || '').replace(/^#\/?/, '').split('?')[0];
   const parts = raw.split('/').filter(Boolean);
   const merged = mergedDashboards(defaults, { includeHidden: true });
 

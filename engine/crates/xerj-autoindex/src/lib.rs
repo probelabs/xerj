@@ -413,7 +413,37 @@ fn alias_keys_to_reindex(
     changed
 }
 
+/// Default second-brain name for a corpus root: `sanitize_slug(basename)`
+/// (SECOND_BRAIN_SPEC §6.1), falling back to `"brain"` when the basename
+/// sanitizes to nothing (e.g. `/`). Public because `xerj brain` must know
+/// the SAME name this pipeline will use — the console URL it prints and
+/// opens embeds it — and two copies of this rule would drift.
+pub fn derive_brain_name(root: &Path) -> String {
+    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let name = base
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let slug = dataset::sanitize_slug(&name);
+    if slug.is_empty() {
+        "brain".into()
+    } else {
+        slug
+    }
+}
+
 fn run_index(cfg: IndexCfg) -> Result<i32> {
+    run_index_report(cfg).map(|(code, _)| code)
+}
+
+/// `run_index` plus the machine-readable run summary — the same JSON the
+/// run writes to the catalog as `run:{run_id}` (datasets, `records_total`
+/// as *live* per-dataset counts, `graph.edges_written` etc.). `xerj brain`
+/// composes autoindex through this so it can be honest about what actually
+/// got indexed without re-querying or parsing stdout. The summary is
+/// `None` when the run ended before a plan produced one (empty folder,
+/// `--dry-run`).
+pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     extract::pdf::configure_workers(cfg.pdf_workers);
     extract::pdf::configure_timeout(cfg.pdf_timeout_secs);
     use rayon::prelude::*;
@@ -430,7 +460,7 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
     let discovered_files = walk::walk(&cfg.root, cfg.follow_symlinks)?;
     if discovered_files.is_empty() {
         println!("no files found under {}", cfg.root.display());
-        return Ok(0);
+        return Ok((0, None));
     }
     let root_str = cfg
         .root
@@ -724,7 +754,7 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
     if cfg.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         eprintln!("(dry run — nothing indexed)");
-        return Ok(0);
+        return Ok((0, None));
     }
 
     // ── create indices with explicit mappings ────────────────────────────
@@ -878,19 +908,7 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
     } else {
         let brain = match &cfg.brain {
             Some(b) => b.clone(),
-            None => {
-                let base = cfg.root.canonicalize().unwrap_or_else(|_| cfg.root.clone());
-                let name = base
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let slug = dataset::sanitize_slug(&name);
-                if slug.is_empty() {
-                    "brain".into()
-                } else {
-                    slug
-                }
-            }
+            None => derive_brain_name(&cfg.root),
         };
         if let Err(reason) = detect::validate_brain(&brain) {
             anyhow::bail!(
@@ -1791,11 +1809,12 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
             cfg.url, cfg.prefix
         );
     }
-    Ok(if junk_total_records > 0 || !all_junk.is_empty() {
+    let code = if junk_total_records > 0 || !all_junk.is_empty() {
         3
     } else {
         0
-    })
+    };
+    Ok((code, Some(run_doc)))
 }
 
 fn format_str(sn: Option<&Sniffed>) -> String {

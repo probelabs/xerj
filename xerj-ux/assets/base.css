@@ -1785,6 +1785,8 @@ html.mobile-preview .nav-sub {
 }
 .sb-ghcount { font-family: var(--font-data); font-size: var(--fs-11); color: var(--z-mute); white-space: nowrap; }
 
+.sb-sidecap { margin-bottom: var(--sp-1); }
+
 .sb-erow { border-bottom: 1px solid var(--z-faint); }
 .sb-erow-main { display: flex; gap: var(--sp-2); align-items: baseline; padding: 6px 0; }
 .sb-ename {
@@ -1812,11 +1814,19 @@ html.mobile-preview .nav-sub {
 }
 .sb-emeta:hover .sb-eev, .sb-emeta:focus-visible .sb-eev { color: var(--z-accent); }
 .sb-ehop2 { color: var(--z-ink); }
-.sb-extag { display: none; color: var(--z-accent); letter-spacing: var(--track-label); font-size: var(--fs-11); }
-.sb-erow.sb-expired .sb-extag { display: inline; }
+.sb-eq { letter-spacing: var(--track-label); font-size: 10px; }
+/* State tags. RETIRED wears the accent (the time-travel payoff);
+   NOT YET stays muted — the future is quiet, the past is loud. */
+.sb-tag { display: none; letter-spacing: var(--track-label); font-size: var(--fs-11); }
+.sb-tag-retired { color: var(--z-accent); }
+.sb-tag-notyet  { color: var(--z-mute); }
+.sb-erow.sb-expired .sb-tag-retired { display: inline; }
+.sb-erow.sb-off .sb-tag-notyet { display: inline; }
 .sb-erow.sb-expired .sb-ename,
 .sb-erow.sb-expired .sb-ewin { text-decoration: line-through; color: var(--z-mute); }
-.sb-erow.sb-off { display: none; }
+/* A link not yet believed at the caret stays visible but ghosted —
+   rows never pop in and out while scrubbing, they dim. */
+.sb-erow.sb-off .sb-erow-main { opacity: 0.35; }
 .sb-sidenote { font-size: var(--fs-11); letter-spacing: 0.06em; padding: var(--sp-2) 0; }
 
 .sb-evbody { padding: 2px 0 10px; }
@@ -1844,7 +1854,9 @@ html.mobile-preview .nav-sub {
 }
 .sb-striplines { width: 100%; color: var(--z-ink); }
 .sb-lseg.sb-l-live    { stroke-opacity: 1; }
-.sb-lseg.sb-l-expired { stroke-opacity: 0.45; }
+/* Retired lifetimes go dashed as well as dim — state never rides on
+   opacity alone (print / forced-colors / low-contrast screens). */
+.sb-lseg.sb-l-expired { stroke-opacity: 0.45; stroke-dasharray: 3 2; }
 .sb-lseg.sb-l-future  { stroke-opacity: 0.15; }
 .sb-ltick { stroke-opacity: 0.7; }
 .sb-caret {
@@ -1902,22 +1914,76 @@ html.mobile-preview .nav-sub {
 .sb-hv { font-weight: 700; }
 .sb-hids { padding: 4px 0; font-size: var(--fs-11); }
 
-/* Hubs */
+/* Hubs (centers of gravity). Own row grid: the shared .row template
+   starves the name column — names are the point of this panel. */
 .sb-hubs { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4); }
 .sb-hubs .key { margin-bottom: 8px; }
-.sb-hub-active .row__label { color: var(--z-accent); }
+.sb-hubrow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 64px;
+  gap: var(--sp-2);
+  align-items: baseline;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  cursor: pointer;
+}
+.sb-hubname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-hubn { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sb-hubbar { width: 100%; align-self: center; }
+.sb-hubrow:hover .sb-hubname,
+.sb-hubrow:focus-visible .sb-hubname { color: var(--z-accent); }
+.sb-hub-active .sb-hubname { color: var(--z-accent); }
+@media (max-width: 640px) {
+  .sb-hubs { grid-template-columns: 1fr; gap: var(--sp-3); }
+}
+
+/* Detector mini-rows (WHAT TAUGHT THIS BRAIN) */
+.sb-dets { display: flex; flex-direction: column; }
+.sb-det {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 48px;
+  gap: var(--sp-2);
+  align-items: baseline;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+}
+.sb-detname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--z-ink); }
+.sb-detn { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* Believed-vs-retired composition bar — the one two-series comparison.
+   Accent = believed, --z-cmp = retired; both directly labelled. */
+.sb-splitwrap { margin-top: var(--sp-2); }
+.sb-split { width: 100%; height: 8px; display: block; }
+.sb-seg-live    { color: var(--z-accent); }
+.sb-seg-retired { color: var(--z-cmp); }
+.sb-splitleg { display: flex; gap: var(--sp-3); margin-top: 6px; font-size: var(--fs-11); color: var(--z-ink); }
+.sb-leg { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.sb-legline { flex: none; }
 
 /* Empty / live-only states */
 .sb-empty { padding: var(--sp-2) 0 var(--sp-4); max-width: 760px; }
 .sb-empty .sb-ftext { margin: var(--sp-2) 0; }
+.sb-cmdrow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0;
+}
 .sb-cmd {
-  font-size: var(--fs-13);
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: var(--fs-16);
   color: var(--z-ink);
   border-left: 1px solid var(--z-accent);
   padding: var(--sp-1) var(--sp-2);
-  margin: var(--sp-2) 0;
+  margin: 0;
   overflow-x: auto;
   white-space: pre;
+  user-select: all; /* one click selects the whole command */
 }
 
 /* Narrow screens: stack — focus card first, then in, then out. */

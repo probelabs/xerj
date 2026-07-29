@@ -74,6 +74,7 @@ use xerj_common::{config::Config, metrics::Metrics};
 use xerj_console_api::{state::ClusterMode, ConsoleState};
 use xerj_engine::Engine;
 
+mod brain;
 #[cfg(all(target_os = "linux", feature = "debug-profiling"))]
 mod debug_profiling;
 mod grpc;
@@ -201,6 +202,8 @@ fn print_help() {
              xerj index      <opts>          direct NDJSON → engine ingest (see xerj index --help)\n\
              xerj autoindex  <folder> [opts] zero-config folder discovery + indexing (see xerj autoindex --help)\n\
              xerj autoindex  map             print the discovered data map\n\
+             xerj brain      <folder>        one command: index a folder into a running, browsable\n\
+                                             second brain in your browser (see xerj brain --help)\n\
          \n\
          ENVIRONMENT:\n\
              XERJ_LOG         Log level filter (default: info)\n\
@@ -1287,6 +1290,16 @@ async fn async_main() -> Result<()> {
         // Zero-config folder discovery + indexing over the ES-compat API.
         // Fully synchronous internally — run it off the async runtime.
         let code = tokio::task::spawn_blocking(xerj_autoindex::run_cli)
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("brain")) {
+        // One command → running, browsable second brain: boots/attaches the
+        // server, reuses the autoindex pipeline with graph detection on,
+        // then opens the console. Fully synchronous internally — run it off
+        // the async runtime like `autoindex`.
+        let code = tokio::task::spawn_blocking(brain::run_cli)
             .await
             .unwrap_or(1);
         std::process::exit(code);

@@ -34,24 +34,27 @@ export const secondBrain = {
     sbAfterRender();
     return {
       title: 'SECOND BRAIN',
-      kicker: 'GRAPH MEMORY · EVIDENCE · TIME TRAVEL',
+      kicker: 'WHAT YOUR NOTES BELIEVE · EVERY LINK HAS A QUOTE · REPLAYABLE AT ANY MOMENT',
       meta: [time, 'XERJ-GRAPH'],
+      // Eyebrows speak user words — link / believed / retired / taught.
+      // Schema vocabulary (edge, src/dst, as-of) stays in the API and
+      // in the evidence paper-trail, never in a panel title.
       panels: [
-        { id: 'edgesLive', eyebrow: 'LIVE EDGES', cols: 3, type: 'metric',
+        { id: 'edgesLive', eyebrow: 'BELIEVED AT THIS MOMENT', cols: 3, type: 'metric',
           render: () => body('edgesLive', data) },
-        { id: 'edgesTotal', eyebrow: 'TOTAL ASSERTED', cols: 3, type: 'metric',
+        { id: 'edgesTotal', eyebrow: 'EVER ASSERTED', cols: 3, type: 'metric',
           render: () => body('edgesTotal', data) },
-        { id: 'invalidated', eyebrow: 'INVALIDATED (KEPT)', cols: 3, type: 'metric',
+        { id: 'invalidated', eyebrow: 'RETIRED · KEPT FOR REPLAY', cols: 3, type: 'metric',
           render: () => body('invalidated', data) },
-        { id: 'detectors', eyebrow: 'DETECTORS', cols: 3, type: 'metric',
+        { id: 'detectors', eyebrow: 'WHAT TAUGHT THIS BRAIN', cols: 3, type: 'metric',
           render: () => body('detectors', data) },
-        { id: 'typeDist', eyebrow: 'EDGE TYPES', cols: 6, type: 'dist',
+        { id: 'typeDist', eyebrow: 'HOW NOTES CONNECT', cols: 6, type: 'dist',
           render: () => body('typeDist', data) },
-        { id: 'edgeTimeline', eyebrow: 'EDGES OVER TIME', cols: 6, type: 'series',
+        { id: 'edgeTimeline', eyebrow: 'NEW LINKS PER DAY', cols: 6, type: 'series',
           render: () => body('edgeTimeline', data) },
-        { id: 'ego', eyebrow: 'EGO · 1 HOP FROM SELECTED NODE', cols: 12, type: 'ego',
+        { id: 'ego', eyebrow: 'THE LEDGER · ONE NOTE, EVERYTHING IT TOUCHES', cols: 12, type: 'ego',
           render: () => body('ego', data) },
-        { id: 'hubs', eyebrow: 'HUBS · IN / OUT', cols: 6, type: 'topn',
+        { id: 'hubs', eyebrow: 'CENTERS OF GRAVITY', cols: 6, type: 'topn',
           render: () => body('hubs', data) },
         { id: 'notShown', eyebrow: 'WHAT THIS VIEW DID NOT SHOW', cols: 6, type: 'honesty',
           render: () => body('notShown', data) },

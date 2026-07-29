@@ -56,15 +56,28 @@ const S = {
   connected: false,
   error: null,     // transport-level error (engine unreachable)
   uiError: null,   // last interaction-level error (shown inline, non-fatal)
+  overviewError: null, // overview read failed on a REAL brain — an error state, never "empty"
   brains: [],
   brain: null,
+  lastHashBrain: null, // last `?brain=` deep-link value already applied
   focus: null,
   asOf: null,      // epoch-ms | null = NOW
   trail: [],
   overview: null,  // §4.4 body (or exists:false body)
   ego: null,       // §4.3 body — the belief at the caret
   timeline: null,  // §4.3 body — hop-1, include_expired, pinned at NOW
+  names: {},       // node id → { title } — display names for hub ids / crumbs
 };
+
+/** `brain` out of the hash's query tail (`#/second-brain?brain=X`), or
+ *  null. The router (app.js parseRoute) ignores everything after `?`. */
+function hashBrain() {
+  const h = location.hash || '';
+  const q = h.indexOf('?');
+  if (q < 0) return null;
+  const b = (new URLSearchParams(h.slice(q + 1)).get('brain') || '').trim();
+  return b || null;
+}
 
 function loadBrainState() {
   try {
@@ -138,6 +151,48 @@ async function discoverBrains(baseUrl, signal) {
 
 const enc = encodeURIComponent;
 
+/**
+ * Hub lists and focus crumbs come back from the overview as raw node
+ * ids — for autoindex brains those are opaque hashes no person should
+ * have to read. One bounded ids-query against the brain's nodes index
+ * turns them into titles. Best-effort and honest: any id that does not
+ * resolve keeps rendering as its (shortened) id, never as a guess.
+ */
+async function hydrateNames(signal) {
+  const o = S.overview;
+  if (!o || o.exists === false || !o.nodes_index) return;
+  const ids = new Set();
+  for (const h of (o.hubs && o.hubs.in) || []) ids.add(h.id);
+  for (const h of (o.hubs && o.hubs.out) || []) ids.add(h.id);
+  for (const t of S.trail) ids.add(t);
+  if (S.focus) ids.add(S.focus);
+  const want = [...ids].filter((id) => !(id in S.names)).slice(0, 40);
+  if (!want.length) return;
+  try {
+    const r = await fetch(`${S.baseUrl}/${enc(o.nodes_index)}/_search`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        query: { ids: { values: want } },
+        size: want.length,
+        _source: ['title', 'text', 'body'],
+      }),
+      signal,
+    });
+    if (!r.ok) return; // cosmetic enrichment only — ids still render
+    const j = await r.json();
+    for (const h of (j.hits && j.hits.hits) || []) {
+      const src = h._source || {};
+      const title = typeof src.title === 'string' && src.title.trim()
+        ? src.title.trim()
+        : (typeof src.text === 'string' && src.text.trim()
+          ? src.text.trim().slice(0, 60)
+          : (typeof src.body === 'string' && src.body.trim() ? src.body.trim().slice(0, 60) : null));
+      if (title) S.names[h._id] = { title };
+    }
+  } catch { /* names are sugar; the ids remain the truth */ }
+}
+
 function fetchOverview(signal) {
   const qs = new URLSearchParams({ top: '10', histogram_interval: 'day' });
   if (S.asOf != null) qs.set('as_of', String(S.asOf));
@@ -146,7 +201,7 @@ function fetchOverview(signal) {
 
 /**
  * The belief at the caret. `include_expired=true` so an invalidated
- * fact comes back struck-through + EXPIRED instead of silently gone;
+ * fact comes back struck-through + RETIRED instead of silently gone;
  * hops=2 feeds the neighbour onward-counts; include_nodes hydrates
  * titles/previews for the focus card and rows.
  */
@@ -182,14 +237,17 @@ function assemble() {
   const num = (v) => new Intl.NumberFormat('en').format(v || 0);
   const detectors = (o && o.detectors) || [];
   const detTail = o && o.not_shown && o.not_shown.detectors_not_listed > 0 ? '+' : '';
+  // Hints in user words, and as-of-aware: the same tile must say
+  // WHEN it is true once the belief caret leaves NOW.
+  const atHint = S.asOf != null ? `at ${fmtTs(S.asOf)} UTC` : 'right now';
   return {
     brain: S.brain,
     overview: S.overview,
     ego: S.ego,
     metrics: {
-      edgesLive: { formatted: num(ed.live), hint: 'visible at as-of' },
-      edgesTotal: { formatted: num(ed.total), hint: 'incl. invalidated' },
-      invalidated: { formatted: num(ed.invalidated), hint: 'soft-deleted, kept for time travel' },
+      edgesLive: { formatted: num(ed.live), hint: `held true ${atHint}` },
+      edgesTotal: { formatted: num(ed.total), hint: 'nothing is ever deleted' },
+      invalidated: { formatted: num(ed.invalidated), hint: 'drag belief time left to revisit' },
       detectors: { formatted: num(detectors.length) + detTail, hint: 'deterministic, versioned' },
     },
     series: {
@@ -200,11 +258,13 @@ function assemble() {
       connected: S.connected,
       error: S.error,
       uiError: S.uiError,
+      overviewError: S.overviewError,
       brains: S.brains.slice(),
       focus: S.focus,
       asOf: S.asOf,
       trail: S.trail.slice(),
       timeline: S.timeline,
+      names: S.names,
     },
   };
 }
@@ -241,6 +301,20 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
 
   let persisted = null;
   try { persisted = localStorage.getItem(K.brain); } catch { /* private mode */ }
+  // Deep link: `#/second-brain?brain=X` — the URL `xerj brain` prints and
+  // opens. Applied when it CHANGES (pasting a new link switches brains) but
+  // never re-asserted on every render, so the in-app picker still wins for
+  // the rest of the session.
+  const fromHash = hashBrain();
+  if (fromHash && fromHash !== S.lastHashBrain) {
+    S.lastHashBrain = fromHash;
+    if (S.brains.includes(fromHash)) {
+      persisted = fromHash;
+      try { localStorage.setItem(K.brain, fromHash); } catch { /* private mode */ }
+    } else {
+      S.uiError = `brain "${fromHash}" not found on this engine`;
+    }
+  }
   S.brain = persisted && S.brains.includes(persisted) ? persisted : (S.brains[0] || null);
   if (!S.brain) {
     S.overview = null; S.ego = null; S.timeline = null;
@@ -250,10 +324,15 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
 
   try {
     S.overview = await fetchOverview(signal);
+    S.overviewError = null;
   } catch (e) {
+    // A failed read on a real brain is an ERROR, not an empty brain:
+    // the renderer must show "could not read", never zeros or the
+    // fill-me teaching copy.
     S.overview = null; S.ego = null; S.timeline = null;
+    S.overviewError = String((e && e.message) || e);
     const data = assemble();
-    data.error = `overview failed: ${String((e && e.message) || e)}`;
+    data.error = `overview failed: ${S.overviewError}`;
     return data;
   }
 
@@ -279,6 +358,7 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
   } else {
     S.ego = null; S.timeline = null;
   }
+  await hydrateNames(signal);
   saveBrainState();
   return assemble();
 }
@@ -347,13 +427,15 @@ async function refetch({ overview = false, belief = false, timeline = false }) {
   S.uiError = null;
   try {
     const jobs = [];
-    if (overview) jobs.push(fetchOverview(signal).then((r) => { S.overview = r; }));
+    if (overview) jobs.push(fetchOverview(signal).then((r) => { S.overview = r; S.overviewError = null; }));
     if (belief && S.focus) jobs.push(fetchBelief(signal).then((r) => { S.ego = r; }));
     if (timeline && S.focus) jobs.push(fetchTimeline(signal).then((r) => { S.timeline = r; }));
     await Promise.all(jobs);
+    await hydrateNames(signal);
   } catch (e) {
     if (!(e && e.name === 'AbortError')) {
       S.uiError = String((e && e.message) || e);
+      if (overview) S.overviewError = S.uiError;
     }
   } finally {
     setBusy(false);
@@ -417,7 +499,8 @@ function normalizeAsOf(ms, dom) {
 
 /** Move the caret + relabel + restate every strip line and ledger row
  *  for a candidate as-of. Pure DOM, no queries — this is the mid-drag
- *  preview over edges the server already returned. */
+ *  preview over edges the server already returned. The live counter in
+ *  the legend follows the caret so the drag narrates itself. */
 function previewAsOf(scrub, ms) {
   const dom = stripDomain(scrub);
   if (!dom) return;
@@ -425,18 +508,28 @@ function previewAsOf(scrub, ms) {
   const caret = scrub.querySelector('[data-sb-caret]');
   const label = scrub.querySelector('[data-sb-caret-label]');
   const atNow = normalizeAsOf(ms, dom) == null;
-  if (caret) caret.style.left = `${pct}%`;
+  if (caret) {
+    caret.style.left = `${pct}%`;
+    caret.setAttribute('aria-valuenow', String(ms));
+    caret.setAttribute('aria-valuetext', atNow ? 'now' : `${fmtTs(ms)} UTC`);
+  }
   if (label) {
-    label.style.left = `${pct}%`;
+    label.style.left = `${Math.max(3, Math.min(97, pct))}%`;
     label.textContent = atNow ? 'NOW' : fmtTs(ms);
   }
   const t = atNow ? null : ms;
+  let live = 0;
+  let total = 0;
   for (const seg of scrub.querySelectorAll('.sb-lseg')) {
     const e = { valid_at: Number(seg.getAttribute('data-va')), invalid_at: seg.hasAttribute('data-vi') ? Number(seg.getAttribute('data-vi')) : null };
     const state = edgeStateAt(e, t);
+    total += 1;
+    if (state === 'live') live += 1;
     seg.classList.remove('sb-l-live', 'sb-l-future', 'sb-l-expired');
     seg.classList.add(`sb-l-${state}`);
   }
+  const counter = scrub.querySelector('[data-sb-livecount]');
+  if (counter) counter.textContent = `${live} OF ${total}`;
   for (const row of document.querySelectorAll('[data-sb-edge][data-va]')) {
     const e = { valid_at: Number(row.getAttribute('data-va')), invalid_at: row.hasAttribute('data-vi') ? Number(row.getAttribute('data-vi')) : null };
     const state = edgeStateAt(e, t);
@@ -450,15 +543,25 @@ function previewAsOf(scrub, ms) {
 let wired = false;
 let drag = null; // { scrub, dom, ms }
 
+/**
+ * Belief-time dragging starts ANYWHERE on the strip, not only on the
+ * 13px caret — discoverability beats precision here. A press previews
+ * immediately at the pointer; moving scrubs; releasing commits (a
+ * plain click is just a zero-length drag). pointercancel reverts the
+ * preview instead of committing a half-drag.
+ */
 function onPointerDown(e) {
-  const caret = e.target.closest && e.target.closest('[data-sb-caret]');
-  if (!caret) return;
-  const scrub = caret.closest('[data-sb-scrub]');
+  const strip = e.target.closest && e.target.closest('[data-sb-strip]');
+  if (!strip) return;
+  const scrub = strip.closest('[data-sb-scrub]');
   const dom = scrub && stripDomain(scrub);
   if (!dom) return;
   e.preventDefault();
-  drag = { scrub, dom, ms: S.asOf == null ? dom[1] : S.asOf };
-  if (caret.setPointerCapture && e.pointerId != null) {
+  const ms = msFromClientX(strip, dom, e.clientX);
+  drag = { scrub, dom, ms };
+  previewAsOf(scrub, ms);
+  const caret = scrub.querySelector('[data-sb-caret]');
+  if (caret && caret.setPointerCapture && e.pointerId != null) {
     try { caret.setPointerCapture(e.pointerId); } catch { /* older engines */ }
   }
 }
@@ -478,6 +581,15 @@ function onPointerUp() {
   commitAsOf(ms);
 }
 
+/** A cancelled drag (scroll steal, palm touch) must not time-travel:
+ *  put the preview back where the committed caret is. */
+function onPointerCancel() {
+  if (!drag) return;
+  const { scrub, dom } = drag;
+  drag = null;
+  previewAsOf(scrub, S.asOf == null ? dom[1] : S.asOf);
+}
+
 function onClick(e) {
   const t = e.target;
   if (!t || !t.closest) return;
@@ -486,6 +598,25 @@ function onClick(e) {
   if (brainBtn) { switchBrain(brainBtn.getAttribute('data-sb-brain')); return; }
 
   if (t.closest('[data-sb-now]')) { commitAsOf(null); return; }
+
+  if (t.closest('[data-sb-retry]')) {
+    refetch({ overview: true, belief: true, timeline: true });
+    return;
+  }
+
+  const copyBtn = t.closest('[data-sb-copy]');
+  if (copyBtn) {
+    const cmd = copyBtn.parentElement && copyBtn.parentElement.querySelector('[data-sb-cmd]');
+    const text = cmd ? cmd.textContent.trim() : '';
+    if (text && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => {
+        const was = copyBtn.textContent;
+        copyBtn.textContent = 'COPIED';
+        setTimeout(() => { copyBtn.textContent = was; }, 1200);
+      }).catch(() => { /* clipboard blocked — the text is selectable */ });
+    }
+    return;
+  }
 
   const focusBtn = t.closest('[data-sb-focus]');
   if (focusBtn) { refocus(focusBtn.getAttribute('data-sb-focus')); return; }
@@ -497,18 +628,8 @@ function onClick(e) {
     if (body) body.hidden = !body.hidden;
     return;
   }
-
-  // Click on the strip (not the caret) = jump the caret there.
-  const strip = t.closest('[data-sb-strip]');
-  if (strip && !t.closest('[data-sb-caret]')) {
-    const scrub = strip.closest('[data-sb-scrub]');
-    const dom = scrub && stripDomain(scrub);
-    if (dom) {
-      const ms = msFromClientX(strip, dom, e.clientX);
-      previewAsOf(scrub, ms);
-      commitAsOf(normalizeAsOf(ms, dom));
-    }
-  }
+  // Strip clicks are handled by the pointer pipeline above (a click is
+  // a zero-length drag) — no second commit path here.
 }
 
 let keyCommit = 0;
@@ -540,7 +661,7 @@ function onResize() {
   document.addEventListener('pointerdown', onPointerDown);
   document.addEventListener('pointermove', onPointerMove);
   document.addEventListener('pointerup', onPointerUp);
-  document.addEventListener('pointercancel', onPointerUp);
+  document.addEventListener('pointercancel', onPointerCancel);
   document.addEventListener('keydown', onKeyDown);
   window.addEventListener('resize', onResize);
 })();

@@ -81,6 +81,21 @@ impl Es {
         Ok(resp.json().unwrap_or(Value::Null))
     }
 
+    /// GET an arbitrary path and return only the HTTP status code.
+    ///
+    /// One attempt, no retry/backoff: `xerj brain` uses this to probe
+    /// whether a server is listening (`/health/ready`, auth-exempt) and
+    /// whether its credentials are accepted (`/`), and a liveness probe
+    /// that silently retried for ~16s would misreport "already running"
+    /// as "boot took 16s". A transport error means nothing answered.
+    pub fn get_status(&self, path: &str) -> Result<u16> {
+        let resp = self
+            .req(reqwest::Method::GET, path)
+            .send()
+            .with_context(|| format!("no response from {}{}", self.base, path))?;
+        Ok(resp.status().as_u16())
+    }
+
     /// Retry wrapper: 429/5xx/transport → backoff 250ms..8s, 6 attempts.
     fn with_retry<T>(
         &self,

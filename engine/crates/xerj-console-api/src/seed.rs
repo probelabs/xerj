@@ -284,15 +284,18 @@ fn seed_specs() -> Vec<DashboardSpec> {
             name: "Second Brain",
             section: Some("dashboards"),
             group: Some("ai"),
+            // Titles mirror the SPA eyebrows 1:1 (§7.1) — user words
+            // only: "link / believed / retired / taught", never schema
+            // vocabulary (edge, src/dst, as-of) in a panel title.
             panels: vec![
-                p("edgesLive", "metric", "LIVE EDGES", 3),
-                p("edgesTotal", "metric", "TOTAL ASSERTED", 3),
-                p("invalidated", "metric", "INVALIDATED (KEPT)", 3),
-                p("detectors", "metric", "DETECTORS", 3),
-                p("typeDist", "dist", "EDGE TYPES", 6),
-                p("edgeTimeline", "series", "EDGES OVER TIME", 6),
-                p("ego", "ego", "EGO · 1 HOP FROM SELECTED NODE", 12),
-                p("hubs", "topn", "HUBS · IN / OUT", 6),
+                p("edgesLive", "metric", "BELIEVED AT THIS MOMENT", 3),
+                p("edgesTotal", "metric", "EVER ASSERTED", 3),
+                p("invalidated", "metric", "RETIRED · KEPT FOR REPLAY", 3),
+                p("detectors", "metric", "WHAT TAUGHT THIS BRAIN", 3),
+                p("typeDist", "dist", "HOW NOTES CONNECT", 6),
+                p("edgeTimeline", "series", "NEW LINKS PER DAY", 6),
+                p("ego", "ego", "THE LEDGER · ONE NOTE, EVERYTHING IT TOUCHES", 12),
+                p("hubs", "topn", "CENTERS OF GRAVITY", 6),
                 p("notShown", "honesty", "WHAT THIS VIEW DID NOT SHOW", 6),
             ],
         },
