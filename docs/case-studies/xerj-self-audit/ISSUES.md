@@ -1,13 +1,25 @@
-# Issue drafts — five-stage instruction/data audit pass
+# Issues — five-stage instruction/data audit pass
 
-**DRAFTS ONLY. Not filed.** Both findings below are network-reachable and
-**unfixed** on `main`. Public disclosure before a fix ships is a security
-decision for a human to make, not an agent — nothing here was posted via `gh`.
-Full detail, taint paths and live-reproduction transcripts:
-[FINDINGS-V2.md](FINDINGS-V2.md).
+**FILED (2026-07-29), after the three application-layer Highs were fixed on
+`feat/rust-self-audit` (`58fc73f`).** Full detail, taint paths, and
+live-reproduction transcripts: [FINDINGS-V2.md](FINDINGS-V2.md).
 
-Suggested handling: fix both on a private branch, then open these as public
-issues (or a security advisory) once a release carries the fix.
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| [#72](https://github.com/xerj-org/xerj/issues/72) | INJ-01 search-template injection | High | fixed, tracking merge |
+| [#73](https://github.com/xerj-org/xerj/issues/73) | F-PATH-02 snapshot location traversal | High | fixed, tracking merge |
+| [#74](https://github.com/xerj-org/xerj/issues/74) | S5-1 session-revocation lost update | High | fixed, tracking merge |
+| [#75](https://github.com/xerj-org/xerj/issues/75) | DESER-EGRESS-01 unauth Raft transport | High (gated) | open — Raft-auth Phase 2 |
+| [#76](https://github.com/xerj-org/xerj/issues/76) | Console hardening: S5-4, S5-3, S5-5, AUTHZ-2 | Med/Low/Info | open |
+
+The three Highs were filed publicly only *after* the fix was committed. The
+open ones are either operator-gated (DESER-EGRESS-01, needs `cluster.enabled`) or
+Medium-and-below, described by class + location + fix without copy-paste exploit
+payloads.
+
+---
+
+The original drafts (INJ-01, F-PATH-02) that seeded #72 and #73 follow.
 
 **Shared caveat for both severity labels.** Both routes sit behind
 `auth_middleware`, but `crates/xerj-api/src/auth.rs:96` short-circuits to fully
