@@ -5818,6 +5818,18 @@ mod search_task_lifetime_tests {
     }
 }
 
+/// Shard count used only to size the `profile` response's per-shard array.
+///
+/// SECURITY: a stored `number_of_shards` of `-1` becomes `u64::MAX` through an
+/// `as u64` cast, and `Vec::with_capacity(usize::MAX)` capacity-overflow-panics.
+/// Under this crate's `panic = "abort"` that aborts the whole process, so a
+/// single unauthenticated `POST /{index}/_search {"profile":true}` on an index
+/// created with a negative shard count kills the node. Clamp to a sane positive
+/// range, mirroring the `.max(1)` the primary shard-count reader already applies.
+fn profile_shard_count(n: i64) -> u64 {
+    n.clamp(1, 1024) as u64
+}
+
 pub async fn search(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -11440,7 +11452,7 @@ pub async fn search(
                         n.as_i64()
                             .or_else(|| n.as_str().and_then(|s| s.parse::<i64>().ok()))
                     })
-                    .map(|n| n as u64)
+                    .map(profile_shard_count)
             })
             .unwrap_or(1);
         let mut shard_profiles: Vec<Value> = Vec::with_capacity(profile_shards_n as usize);
@@ -31114,6 +31126,22 @@ mod request_validation_tests {
             "status": 400
         });
         assert_eq!(unknown_search_key_body("foobar", "VALUE_STRING", 1, 20), es);
+    }
+
+    /// Regression: a negative or absurd `number_of_shards` must never size the
+    /// profile array to a giant capacity (that aborts the process). See
+    /// `profile_shard_count`.
+    #[test]
+    fn profile_shard_count_never_overflows_capacity() {
+        assert_eq!(profile_shard_count(-1), 1, "the live node-kill payload");
+        assert_eq!(profile_shard_count(i64::MIN), 1);
+        assert_eq!(profile_shard_count(0), 1);
+        assert_eq!(profile_shard_count(1), 1);
+        assert_eq!(profile_shard_count(5), 5);
+        assert_eq!(profile_shard_count(i64::MAX), 1024, "clamped, not u64::MAX");
+        // The value is only ever used as a Vec capacity — prove it cannot panic.
+        let _v: Vec<u8> = Vec::with_capacity(profile_shard_count(-1) as usize);
+        let _v2: Vec<u8> = Vec::with_capacity(profile_shard_count(i64::MAX) as usize);
     }
 
     // ── item 4b: search_after sort counting ──
