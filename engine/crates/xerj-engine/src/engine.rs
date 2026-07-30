@@ -1942,53 +1942,6 @@ fn validate_snapshot_path(
     }
 }
 
-#[cfg(test)]
-mod snapshot_path_security_tests {
-    use super::validate_snapshot_path;
-
-    #[test]
-    fn f_path_02_repo_location_outside_data_dir_is_rejected_by_default() {
-        let data = tempfile::TempDir::new().unwrap();
-        // A repo location pointing outside data_dir (the F-PATH-02 exploit shape)
-        // with an empty allowlist must be refused.
-        let outside = tempfile::TempDir::new().unwrap();
-        let repo = outside.path().to_str().unwrap();
-        let snap = std::path::Path::new(repo).join("s1");
-        let err = validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
-            .expect_err("external repo location must be rejected");
-        assert!(err.to_string().contains("outside data_dir"), "{err}");
-    }
-
-    #[test]
-    fn location_inside_data_dir_is_allowed() {
-        let data = tempfile::TempDir::new().unwrap();
-        let repo_dir = data.path().join("backups");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        let repo = repo_dir.to_str().unwrap();
-        let snap = repo_dir.join("s1");
-        validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
-            .expect("a repo under data_dir must be allowed");
-    }
-
-    #[test]
-    fn explicit_allowlist_permits_an_external_root() {
-        let data = tempfile::TempDir::new().unwrap();
-        let ext = tempfile::TempDir::new().unwrap();
-        let repo = ext.path().to_str().unwrap().to_string();
-        let snap = std::path::Path::new(&repo).join("s1");
-        validate_snapshot_path(&repo, "s1", &snap, data.path(), &[repo.clone()])
-            .expect("an allowlisted external root must be permitted");
-    }
-
-    #[test]
-    fn traversal_name_still_rejected_even_inside_an_allowed_base() {
-        let data = tempfile::TempDir::new().unwrap();
-        let snap = data.path().join("..");
-        let repo = data.path().to_str().unwrap();
-        assert!(validate_snapshot_path(repo, "..", &snap, data.path(), &[]).is_err());
-    }
-}
-
 /// Recursively copy all files from `src` to `dst`, recording relative paths in `files`.
 fn copy_dir_recursive(
     src: &std::path::Path,
@@ -2052,5 +2005,52 @@ fn es_type_to_field_type(es_type: &str) -> xerj_common::types::FieldType {
         "binary" => FieldType::Binary,
         "nested" => FieldType::Nested,
         _ => FieldType::Object,
+    }
+}
+
+#[cfg(test)]
+mod snapshot_path_security_tests {
+    use super::validate_snapshot_path;
+
+    #[test]
+    fn f_path_02_repo_location_outside_data_dir_is_rejected_by_default() {
+        let data = tempfile::TempDir::new().unwrap();
+        // A repo location pointing outside data_dir (the F-PATH-02 exploit shape)
+        // with an empty allowlist must be refused.
+        let outside = tempfile::TempDir::new().unwrap();
+        let repo = outside.path().to_str().unwrap();
+        let snap = std::path::Path::new(repo).join("s1");
+        let err = validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
+            .expect_err("external repo location must be rejected");
+        assert!(err.to_string().contains("outside data_dir"), "{err}");
+    }
+
+    #[test]
+    fn location_inside_data_dir_is_allowed() {
+        let data = tempfile::TempDir::new().unwrap();
+        let repo_dir = data.path().join("backups");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let repo = repo_dir.to_str().unwrap();
+        let snap = repo_dir.join("s1");
+        validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
+            .expect("a repo under data_dir must be allowed");
+    }
+
+    #[test]
+    fn explicit_allowlist_permits_an_external_root() {
+        let data = tempfile::TempDir::new().unwrap();
+        let ext = tempfile::TempDir::new().unwrap();
+        let repo = ext.path().to_str().unwrap().to_string();
+        let snap = std::path::Path::new(&repo).join("s1");
+        validate_snapshot_path(&repo, "s1", &snap, data.path(), std::slice::from_ref(&repo))
+            .expect("an allowlisted external root must be permitted");
+    }
+
+    #[test]
+    fn traversal_name_still_rejected_even_inside_an_allowed_base() {
+        let data = tempfile::TempDir::new().unwrap();
+        let snap = data.path().join("..");
+        let repo = data.path().to_str().unwrap();
+        assert!(validate_snapshot_path(repo, "..", &snap, data.path(), &[]).is_err());
     }
 }

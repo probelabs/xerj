@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.7] - 2026-07-30
+
+Seventh release candidate: the **second brain and security-hardening
+release**. Headline for users: point one binary at a folder with
+`xerj brain <folder>` and get a bi-temporal, evidence-carrying link graph
+over your own documents, with a console view — THE MAP — that stays
+readable at any corpus size. Alongside it, six network-reachable security
+findings from a whitebox self-audit are fixed.
+
+### Added
+
+- **`xerj brain <folder>`** — one command turns a folder into a queryable
+  knowledge graph. Structural detectors (wiki-links, markdown links,
+  hrefs, folder adjacency, reading order) record, for every link, the
+  exact sentence that created it and the byte offset it came from.
+  Measured: 10 notes → 25 links in 0.1s; a 943 MB repo copy → 7,571 files,
+  2,128,360 notes, 20,930 links in 322.7s.
+- **Graph HTTP API** — `POST`/`DELETE /_graph/{brain}/link`,
+  `GET /_graph/{brain}/ego`, `GET /_graph/{brain}/overview`. Bi-temporal:
+  links are retired, never deleted, and any past moment is replayable via
+  `as_of`. Traversal is capped at 2 hops per call by design — XERJ is a
+  search engine with a graph-shaped index, not a graph database.
+- **THE MAP** (console) — a Canvas knowledge-graph view whose default
+  "helicopter" altitude is bounded by construction: any corpus collapses
+  to at most a dozen named groups plus one catch-all. Measured 19,299
+  links / 1,550 documents → 13 groups in 44 ms; a synthetic 50,000-link
+  budget → 13 groups / 60 bundles in 122 ms, byte-identical across runs;
+  60 fps pan/zoom/expand. Small corpora skip clustering and draw real
+  notes, so the view is adaptive rather than one-size.
+- **Cross-file-type links** — new `pathcite@1` and `cratecite@1`
+  detectors relate documents to the code and files they cite, so a PDF or
+  a design note can be shown next to the crate it references, with the
+  citing text as evidence.
+- **Agent surface** — four MCP tools (`xerj_brain_ego`, `xerj_brain_link`,
+  `xerj_brain_unlink`, `xerj_brain_overview`) under
+  `contract: xerj-second-brain/1`.
+- `limits.snapshot_repo_allowlist` — an Elasticsearch `path.repo`
+  equivalent bounding where snapshot repositories may live.
+
+### Fixed
+
+- **Security (unauthenticated):** `POST /_sql` with a deeply nested
+  `WHERE` clause overflowed the stack and aborted the whole process. The
+  WHERE parser now bounds recursion depth (`MAX_SQL_DEPTH`), as the
+  query_string parser already did.
+- **Security:** search-template parameters were spliced into the query
+  JSON unescaped and re-parsed, so a parameter could inject query
+  structure and drop the template's own filter. Parameters are now
+  JSON-escaped and can no longer emit structural tokens.
+- **Security:** a snapshot repository's `settings.location` was an
+  unvalidated absolute path, so snapshots could read and write index data
+  outside `data_dir`. Locations are now bounded by `data_dir` or the new
+  allowlist.
+- **Security:** the console's session `last_seen` refresh blind-wrote a
+  stale copy of the session, which could resurrect a session revoked
+  moments earlier. The refresh now re-reads and skips revoked sessions.
+- Console: the Second Brain dashboard is no longer always present — it
+  appears once at least one brain exists, so a user who has never run
+  `xerj brain` is not shown an empty dashboard.
+- Console: several second-brain counts reported the engine's 10,000-hit
+  floor as an exact total on multi-million-note brains; totals are now
+  exact, and floors are shown as `≥`.
+
+### Notes
+
+- The second brain's link detection is **structural and lexical** — there
+  is no LLM and no semantic model in the loop, and the node-store embedder
+  remains a lexical feature hash. Scale beyond the measured corpus above
+  is not claimed.
+
 ## [1.0.0-rc.6] - 2026-07-28
 
 Sixth release candidate: the **semantic-analytics and bounded-memory
