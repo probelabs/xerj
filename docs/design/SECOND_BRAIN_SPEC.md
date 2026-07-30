@@ -112,6 +112,8 @@ per crate; keep byte-identical):
       "confidence":     { "type": "float" },
       "schema_version": { "type": "integer" },
       "src_file":       { "type": "keyword" },
+      "src_format":     { "type": "keyword" },
+      "dst_format":     { "type": "keyword" },
       "evidence": {
         "properties": {
           "quote":  { "type": "text" },
@@ -143,6 +145,12 @@ ships NO column for that segment. Therefore every edge writer MUST emit:
   `null_bitmap`, which is exactly the "still valid" signal the hop reads.
 - `evidence` — JSON object. Objects produce no doc-values column (by design);
   evidence is read only on hydration paths, never on the hop.
+- `src_format` / `dst_format` — JSON **string** when the writer knows the
+  endpoint file types (autoindex stamps `CorpusFile.format`: lowercase
+  extension, else sniffed family), **key omitted entirely when unknown**
+  (API-asserted edges about arbitrary node ids carry neither). Additive
+  optional fields — they do NOT bump `schema_version`; both writers stamp the
+  same mapping and `1`.
 - `schema_version` — the integer `1` for every edge this contract produces.
 
 Every edge document's **`_id` is exactly its `edge_id` field value**. This is
@@ -552,7 +560,8 @@ bi-temporal pair; both are set on the same call.
 Query params:
 | param | type | default | notes |
 |---|---|---|---|
-| `node` | string | REQUIRED | 400 if missing/empty |
+| `node` | string | — | exactly one of `node`/`nodes` required (400 otherwise); `node` is the 1-seed case |
+| `nodes` | comma-list | — | multi-seed frontier, mutually exclusive with `node`; deduped, then clamped to 64 seeds with the clip counted in `not_shown.frontier_clipped` |
 | `hops` | int | 1 | 1 or 2; >2 → 400 with §4.6 wording |
 | `direction` | `out`\|`in`\|`both` | `both` | |
 | `types` | comma-list | all | |
@@ -564,7 +573,9 @@ Query params:
 | `include_evidence` | bool | true | hydrate evidence for RETURNED edges |
 
 Handler: brain/index existence check (404) → `graph_expand` with
-`frontier = [node]`, `max_result_edges = limit` → post-traversal hydration:
+`frontier = <seeds>` (the engine expands a whole frontier at
+frontier-size-independent cost), `max_result_edges = limit` → post-traversal
+hydration:
 - `include_evidence`: ONE `es_compat::search` on the edges index with
   `{"query": {"ids": {"values": [<returned edge_ids>]}}, "size": <n>}`
   (bounded ≤1000; rides the existing `build_ids_prefilter_cached` fast path,
@@ -580,6 +591,7 @@ Response (fixture-exact instance in §8.5):
   "brain": "notes",
   "contract": "xerj-second-brain/1",
   "node": "note-alpha",
+  "seeds": ["note-alpha"],
   "as_of": 1753700000000,
   "hops": 1,
   "direction": "both",
@@ -595,7 +607,7 @@ Response (fixture-exact instance in §8.5):
   "neighbors": [
     { "id": "note-gamma", "hop": 1, "via_edge": "<edge_id of first sorted edge that reached it>" }
   ],
-  "nodes": { "note-beta": { "title": "…", "preview": "…", "index": ".xerj-memory-notes" } },
+  "nodes": { "note-beta": { "title": "…", "preview": "…", "path": "notes/beta.md", "index": ".xerj-memory-notes" } },
   "not_shown": {
     "edges_clipped": 0,
     "frontier_clipped": 0,
@@ -610,13 +622,17 @@ Response (fixture-exact instance in §8.5):
 ```
 Rules: `edges` in the §3.2 stable order, each annotated with
 `direction: "out"|"in"` relative to the expansion (an edge admitted by both
-scans reports `"out"`); `neighbors` excludes `node` itself, first-discovery
-order; `edge.invalid_at` is `null` in JSON when unset (response-side null is
-fine — §2.2's omit-rule binds stored docs, not responses); `nodes` present
-only when `include_nodes=true` — summary = `{title, preview, index}` where
-`title` = `_source.title` if string else null, `preview` = first 160 chars of
-`_source.text` else `_source.body` else null, `index` = the index the doc was
-found in. `not_shown` maps `GraphExpandStats` 1:1 plus the dangling fields;
+scans reports `"out"`; with multi-seed, "out" means src is one of the seeds);
+`seeds` echoes the ADMITTED seed list (post-dedupe, post-clamp) and `node` is
+present only when there is exactly one seed; `neighbors` excludes every seed,
+first-discovery order; `edge.invalid_at` is `null` in JSON when unset
+(response-side null is fine — §2.2's omit-rule binds stored docs, not
+responses); `nodes` present only when `include_nodes=true` — summary =
+`{title, preview, path, index}` where `title` = `_source.title` if string else
+null, `preview` = first 160 chars of `_source.text` else `_source.body` else
+null, `path` = `_source.ax_path` if string else null (never guessed), `index`
+= the index the doc was found in. `not_shown` maps `GraphExpandStats` 1:1
+(handler-clipped seeds fold into `frontier_clipped`) plus the dangling fields;
 `segments_scanned`/`memtable_docs_scanned` ride along as cost honesty.
 
 ### 4.4 GET /_graph/{brain}/overview — brain-level stats (dashboard feed)
@@ -634,6 +650,10 @@ Handler composes exactly three `es_compat::search` calls on the edges index
 3. timeline: `exists src` with
    `{"created": {"date_histogram": {"field": "created_at", "calendar_interval": "<interval>"}}}`.
 
+Plus one size-0 `match_all` count on `nodes_index` → `nodes.total` (0 when
+that index does not exist yet — a brain fed through the link API alone
+truthfully has no stored notes).
+
 Response:
 ```json
 {
@@ -642,6 +662,7 @@ Response:
   "exists": true,
   "as_of": 1753700000000,
   "nodes_index": ".xerj-memory-notes",
+  "nodes": { "total": 0 },
   "embedder": "lexical-feature-hash",
   "edges": { "total": 8, "live": 8, "invalidated": 0 },
   "types":     [ { "type": "wikilink", "live": 4 }, { "type": "same_dir", "live": 4 } ],
@@ -792,9 +813,18 @@ engine/crates/xerj-autoindex/src/detect/
   wikilink.rs   // [[target]]                       type "wikilink"  w 1.0  conf 0.95
   mdlink.rs     // [text](relative/path.md)         type "mdlink"    w 0.9  conf 0.9
   href.rs       // <a href="relative-or-corpus-url">type "href"      w 0.7  conf 0.85
-  sequence.rs   // section s_i -> s_{i+1}, same file type "sequence" w 0.8  conf 0.99
+  pathcite.rs   // bare path token in prose         type "pathcite"  w 0.6  conf 0.7
+  cratecite.rs  // crate-dir name in prose          type "cratecite" w 0.5  conf 0.6
+  sequence.rs   // card → s_0, s_i -> s_{i+1}       type "sequence"  w 0.8  conf 0.99
   samedir.rs    // chain over sorted files per dir  type "same_dir"  w 0.3  conf 0.4
 ```
+
+Detector tags as of the cross-file-type revision: `wikilink@2`, `mdlink@2`,
+`href@2`, `pathcite@1`, `cratecite@1`, `sequence@2`, `samedir@2`. The @2 bumps
+record two behavior changes (per the "bump on ANY behavior change" rule):
+every file-level endpoint moved from the target's `s0` section to its
+**file-card node**, and edges gained `src_format`/`dst_format`. Edges written
+by @1 detectors remain in place, attributable, and time-travelable.
 
 ### 6.3 Detector trait (exact shape)
 
@@ -802,23 +832,41 @@ engine/crates/xerj-autoindex/src/detect/
 /// Edge-schema version stamped into every emitted edge (`schema_version`).
 pub const EDGE_SCHEMA_VERSION: u32 = 1;
 
+/// Locator of the per-file card node (see §6.6.2a). Cannot collide with
+/// content locators — extractor locators are letter+digit shaped.
+pub const FILE_CARD_LOCATOR: &str = "file";
+
 /// Corpus-wide resolution table, built once after Phase A (plan assignment):
-/// every indexed file's rel path → identity + the doc id of its first section.
+/// every indexed file's rel path → identity + its file-card node id.
 pub struct CorpusIndex {
     /// key: root-relative path with forward slashes (`FileEntry.rel`).
     pub files: std::collections::BTreeMap<String, CorpusFile>,
     /// lowercase file-stem → rel paths bearing it (wikilink resolution;
     /// BTreeMap so ambiguity resolution below is deterministic).
     pub by_stem: std::collections::BTreeMap<String, Vec<String>>,
+    /// exact file NAME (final segment, case-sensitive) → rel paths bearing it
+    /// (pathcite suffix resolution).
+    pub by_name: std::collections::BTreeMap<String, Vec<String>>,
+    /// crate-directory basename → rels of `Cargo.toml` files directly inside a
+    /// directory of that name (cratecite table; DIRECTORY name, contents never
+    /// read).
+    pub crate_dirs: std::collections::BTreeMap<String, Vec<String>>,
 }
 pub struct CorpusFile {
     pub rel: String,
     pub file_key: String,      // ids::file_key output
     pub dataset_slug: String,
-    /// ids::doc_id(dataset_slug, file_key, "s0") — the file's anchor node.
+    /// ids::doc_id(dataset_slug, file_key, FILE_CARD_LOCATOR) — the file's
+    /// CARD node, a real emitted doc (§6.6.2a). Every file-level edge lands
+    /// here. (Pre-@2 this was the `s0` section id, which does not exist for
+    /// row/line/page families — links to a CSV or PDF pointed at a ghost.)
     pub anchor_doc_id: String,
     pub mtime_ms: i64,
     pub dir: String,           // parent dir rel path, "" for root
+    pub family: String,        // sniffed Family::as_str from the frozen plan
+    /// File-type label stamped as src_format/dst_format: lowercase extension
+    /// when the name has one ("md", "rs", "pdf"), else `family`.
+    pub format: String,
 }
 
 /// One detected edge before identity/envelope assembly.
@@ -832,6 +880,8 @@ pub struct EdgeDraft {
     pub src_file: String,      // rel path that taught this edge (top-level keyword)
     pub quote: String,         // evidence.quote (≤240 chars, trimmed)
     pub offset: u64,           // evidence.offset (byte offset in section text; 0 for structural)
+    pub src_format: String,    // CorpusFile.format of the endpoints; "" = unknown,
+    pub dst_format: String,    // stored key omitted (§2.2)
 }
 
 /// Per-section textual context. `text` is the exact section string that became
@@ -839,7 +889,13 @@ pub struct EdgeDraft {
 pub struct SectionCtx<'a> {
     pub corpus: &'a CorpusIndex,
     pub file: &'a CorpusFile,
-    pub section_ordinal: u32,
+    /// Human label from the locator ("section 3", "page 2 section 0") —
+    /// §6.6.2's `section_label`. Used verbatim in sequence rationales.
+    pub section_label: &'a str,
+    /// (doc id, label) of the previously STAGED section of the same file,
+    /// None for the first. Stream-order truth — the only source that can name
+    /// a PDF page boundary's predecessor.
+    pub prev_section: Option<(&'a str, &'a str)>,
     pub section_doc_id: &'a str,
     pub text: &'a str,
 }
@@ -858,7 +914,8 @@ pub trait EdgeDetector: Sync {
 
 /// The registry. Order is normative (fixture edge ordering depends on it only
 /// via edge sort, so this is cosmetic — but keep it).
-pub fn default_detectors() -> Vec<Box<dyn EdgeDetector>>;  // wikilink, mdlink, href, sequence, samedir
+pub fn default_detectors() -> Vec<Box<dyn EdgeDetector>>;
+// wikilink, mdlink, href, pathcite, cratecite, sequence, samedir
 ```
 
 ### 6.4 Determinism + edge identity rules
@@ -874,7 +931,11 @@ pub fn default_detectors() -> Vec<Box<dyn EdgeDetector>>;  // wikilink, mdlink, 
 
 ### 6.5 Per-detector emission rules (normative)
 
-- **wikilink@1**: scan section text for `[[target]]` / `[[target|alias]]`
+All detectors stamp `src_format` = the containing file's `CorpusFile.format`
+and `dst_format` = the target file's; every `anchor_doc_id` below is the
+target's FILE CARD (§6.6.2a).
+
+- **wikilink@2**: scan section text for `[[target]]` / `[[target|alias]]`
   (target = text before `|`, trimmed). Resolve: exact rel-path match first
   (with or without extension), else `by_stem[target.to_lowercase()]`; if
   multiple candidates, pick the lexicographically smallest rel (deterministic;
@@ -882,19 +943,46 @@ pub fn default_detectors() -> Vec<Box<dyn EdgeDetector>>;  // wikilink, mdlink, 
   no edge, count `edges_unresolved`. src = section doc id; dst = target's
   `anchor_doc_id`; quote = the full trimmed line containing the link (≤240
   chars); offset = byte offset of the `[[` within the section text.
-- **mdlink@1**: `[text](url)` where url has no scheme and no leading `//`;
+- **mdlink@2**: `[text](url)` where url has no scheme and no leading `//`;
   strip fragment/query; resolve relative to the containing file's dir, then as
   root-relative; must resolve to a corpus file. Same evidence rules (offset of
   the `[`).
-- **href@1**: `<a href="…">` (html-extracted files only, case-insensitive
+- **href@2**: `<a href="…">` (html-extracted files only, case-insensitive
   attr); same scheme-less resolution as mdlink. Offset = offset of the `href`
   attribute value start in the section text (best effort; 0 when the extractor
   lost byte positions).
-- **sequence@1** (structural per file, emitted from `detect_text` on section
-  i>0 to avoid a second pass): for each multi-section file, edge
-  `section s_{i-1} doc id → section s_i doc id`, quote =
-  `"section {i-1} precedes section {i} of {rel}"`, offset 0.
-- **samedir@1** (structural): per directory with ≥2 indexed files, sort files
+- **pathcite@1**: bare path tokens in section text — maximal
+  `[A-Za-z0-9_./-]` runs ending `\.[A-Za-z0-9_]+`, leading `/` `./` `../`
+  stripped (a trailing `:line` never enters the token; `:` is outside the
+  class). Resolve: exact rel-path match; else, for tokens with ≥2 path
+  segments, path-SUFFIX match at a `/` boundary (several candidates →
+  smallest rel + `edges_ambiguous`; none → `edges_unresolved`). Bare
+  one-segment names (`index.rs`) are NEVER suffix-matched: if any corpus file
+  bears the name the mention counts as ambiguous, otherwise it is ignored as
+  prose noise (not counted — "e.g", domains, version numbers are not
+  citations). Self-citations are skipped silently. src = section doc id;
+  dst = target's `anchor_doc_id`; quote = full trimmed line; offset = byte
+  offset of the (stripped) token. UI name: **"cites file"**.
+- **cratecite@1**: whole-word occurrences of a `crate_dirs` key (a corpus
+  directory directly containing `Cargo.toml`, keyed by directory basename) in
+  section text. Only names containing `-` or `_` are citable (a crate dir
+  named `server` would turn ordinary English into edges). Word boundaries
+  exclude `[A-Za-z0-9_\-./]`, except a trailing sentence period (`.` not
+  followed by an alphanumeric) which does not suppress the match. Underscore
+  import spellings (`xerj_fts`) are NOT matched — that equivalence cannot be
+  verified without reading manifests. >1 dirs sharing a basename → smallest
+  rel + `edges_ambiguous`. dst = that `Cargo.toml`'s `anchor_doc_id`; quote =
+  full trimmed line; offset = byte offset of the mention. UI name:
+  **"cites crate"**.
+- **sequence@2** (structural per file, emitted from `detect_text` to avoid a
+  second pass): the file's FIRST staged section gets
+  `anchor_doc_id → section doc id`, quote = `"{label} opens {rel}"`; every
+  later section gets `prev section doc id → section doc id`, quote =
+  `"{prev_label} precedes {label} of {rel}"`; offset 0. Labels per §6.6.2.
+  The opener is what connects a file's card (where citations land) to its
+  content — without it a cited file's text would be unreachable from the
+  ego of its own card.
+- **samedir@2** (structural): per directory with ≥2 indexed files, sort files
   by rel; emit a CHAIN — one edge per consecutive pair
   (`left.anchor_doc_id → right.anchor_doc_id`). A chain, not a clique: cliques
   are O(n²) and would drown real signal; chain keeps directory cohesion
@@ -911,12 +999,35 @@ All hooks live in `lib.rs::run_index`:
    with the §2.1 mapping; `create` the §2.5 meta doc with `nodes_index` =
    comma-list of this run's dataset index names (e.g. `"ax-notes-docs"`);
    bulk-write structural edges (§6.7).
-2. **Inside the Phase B per-file sink** (lib.rs ~917, the closure that stages
-   each `RawRecord`): after the node action is staged for a text-family record,
+2. **Inside the Phase B per-file sink** (the closure that stages each
+   `RawRecord`): after the node action is staged for a text-section record,
    run `detect_text` for each detector with the section text
-   (`fields["body"]`), section ordinal (parsed from `rec.locator` `"s{i}"`),
-   and the just-computed node `id`. Append resulting edge actions to a
-   per-worker edge buffer (NOT the node staging file — different target index).
+   (`fields["body"]`), the section label, the previously staged section's
+   (doc id, label), and the just-computed node `id`. Append resulting edge
+   actions to a per-worker edge buffer (NOT the node staging file — different
+   target index).
+
+   **Text-section locators** (`lib.rs::section_label`) are exactly two forms:
+   `s{i}` (from `emit_document` — md/txt/html/docx prose) and `p{page}-s{sec}`
+   (from the PDF extractor — page-major, so stream order IS the lexicographic
+   (page, sec) reading order). Any other locator (row/line/byte/table) is not
+   a text section and never reaches `detect_text`. Labels: `s3` → "section 3";
+   `p2-s0` → "page 2 section 0". The pipeline tracks the previously staged
+   section per file in stream order; that predecessor — not locator
+   arithmetic — feeds sequence@2, which is what lets PDF sections chain
+   across page boundaries.
+
+2a. **File-card node** (before extraction, once per Phase-B file): stage one
+   card doc to the file's dataset index at `_id = anchor_doc_id`
+   (`ids::doc_id(slug, file_key, FILE_CARD_LOCATOR)`), fields:
+   `title` = filename, `ax_path`, `ax_paths`, `ax_file`,
+   `ax_locator = "file"`, `ax_dataset`, `ax_run`, `ax_format`. No body — it
+   is anchor infrastructure, not content, and is not counted as an extracted
+   record. This is the node that makes every file-level edge hydratable
+   (row/line/page families have no `s0` doc; pre-@2 their anchors were
+   ghosts). Replacement safety: the card carries `ax_file`, so the existing
+   delete-before-replace `delete_by_query` removes and the re-run re-stages
+   it under the same deterministic id.
 3. **Replacement invalidation** (same site as the existing
    `delete_by_query(index, {"term": {"ax_file": key}})` cleanup, lib.rs ~1000):
    when a file is being replaced, soft-invalidate its prior edges FIRST:
@@ -946,11 +1057,13 @@ converges, and readers surface dangling honestly (§4.3).
 ### 6.8 Autoindex tests
 
 `detect/mod.rs` unit tests: the §2.3 pin vector; wikilink/mdlink resolution
-incl. ambiguity determinism; samedir chain (not clique) on the §8 fixture
-folder; sequence on a 3-section file. Integration (behind the existing
-live-server test pattern): index the §8.1 folder twice, assert the edge set is
-byte-identical across runs and matches §8.3's (src, dst, type, detector)
-tuples with autoindex-derived node ids.
+incl. ambiguity determinism; pathcite exact/suffix/bare-refusal/noise rules;
+cratecite whole-word + citability rules; samedir chain (not clique) on the §8
+fixture folder; sequence opener + chaining (incl. a PDF page boundary).
+Integration (behind the existing mock-ES test pattern): index the §8.1 folder
+twice, assert the edge set is byte-identical across runs and matches §8.3's
+(src, dst, type, detector) tuples with autoindex-derived node ids per the
+§8.3a delta (file cards, @2 tags, sequence openers).
 
 ---
 
@@ -1005,6 +1118,23 @@ and `honesty` (definition list over `not_shown`; MUST always render, showing
 zeros — the panel exists to prove absence). The subtitle under `edgeTimeline`
 must carry the embedder honesty string when `overview.embedder` is
 `"lexical-feature-hash"`: `"recall is lexical (feature hashing) — not neural"`.
+
+Amendment (map + statistics revision, 2026-07-30): the dashboard now renders
+SIX additional panels around the nine above, in this page order —
+`controls` (12, brain switcher · trail · FIND), `map` (12, mount point for
+`ux/brain-map.js`; the panel body owns only the mount + the permanent
+"GROUPED BY LINK STRUCTURE — CITATIONS AND FOLDER NEIGHBORHOOD, NOT MEANING"
+disclosure), `scrub` (12, the ONE belief-time caret for the whole page,
+hoisted out of `ego`), then after `edgeTimeline`: `notes` (4, note total +
+by-file-type tally the page itself ran), `crossings` (4, links across file
+types from the §2.1 `src_format`/`dst_format` stamps; brains indexed before
+stamping show the REINDEX message, never a guess), `reads` (4, the page's own
+attributed fetch log — what/how much/why — plus the server's per-index search
+counters framed as since-boot). The original nine keep their ids/kinds/cols;
+`ego` remains the terminal evidence surface (the anti-hairball rationale in
+`ux/ego-ledger.js` stands). §7.4's seed skeleton stays at the nine v1 panels
+on purpose — the SPA registry is the render truth and absent ids are created
+on boot, so the seed is a durable skeleton, not the composition.
 
 ### 7.2 registry.js (exact edits)
 
@@ -1112,6 +1242,21 @@ alpha.md, etc. — src_file = evidence.source for all fixture edges. Note edges
 #1 and #5 share (src,dst) but differ in type → distinct edge_ids: parallel
 edges of different types are legal and expected.)
 
+### 8.3a Autoindex-output delta (cross-file-type revision)
+
+The table above is the API-seeded fixture (abstract `note-*` ids, @1 tags) and
+stays normative for §8.4–§8.6 — those edge_ids are pinned. **Autoindex output
+over the same folder now differs in exactly three ways** (asserted by the
+`detect/e2e.rs` suite):
+
+1. Detector tags are `wikilink@2` / `samedir@2` (and node-id derivation is
+   autoindex's, as before): wikilink src = the s0 SECTION doc (where the
+   evidence lives), wikilink dst and both samedir endpoints = FILE CARDS.
+2. Five additional `sequence@2` opener edges, one per file:
+   `card → s0`, quote `"section 0 opens {rel}"`, weight 0.8, conf 0.99.
+   Total fixture edge count: 13 (4 wikilink + 4 samedir + 5 sequence).
+3. Every edge carries `src_format: "md"`, `dst_format: "md"`.
+
 ### 8.4 Expected `graph_expand` (engine-level)
 
 Request: `frontier=["note-alpha"], hops=1, direction=Both, types=None,
@@ -1146,6 +1291,7 @@ direction both, limit 100, include_evidence true, include_nodes false):
   "brain": "notes",
   "contract": "xerj-second-brain/1",
   "node": "note-alpha",
+  "seeds": ["note-alpha"],
   "as_of": 1753700000000,
   "hops": 1,
   "direction": "both",

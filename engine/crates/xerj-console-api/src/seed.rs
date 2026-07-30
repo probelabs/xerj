@@ -280,6 +280,13 @@ fn seed_specs() -> Vec<DashboardSpec> {
             // structure. NOTE (module-doc contract): adding this id needs
             // NO `SEED_REVISION` bump — absent ids are created on every
             // boot; the revision only migrates *changed* skeletons.
+            //
+            // NAV PRESENCE IS NOT SEEDED FROM HERE: `visibility:"default"`
+            // docs are skipped by the SPA's dashboard-store hydrate, and
+            // the SPA hides this dashboard from the nav until the engine
+            // holds ≥ 1 brain (registry `requiresLive:'brains'` +
+            // data/brains-probe.js). Deep links and MANAGE still resolve
+            // it — this seed stays the durable skeleton either way.
             registry_id: "second-brain",
             name: "Second Brain",
             section: Some("dashboards"),

@@ -1,8 +1,12 @@
-//! href@1 — `<a href="…">` to a corpus file, html-extracted files only.
+//! href@2 — `<a href="…">` to a corpus file, html-extracted files only.
 //!
 //! Weight 0.7: an HTML anchor is authored intent, but exported HTML (wikis,
 //! doc generators) also mass-produces navigation links, so one anchor says
 //! less than one hand-written markdown link.
+//!
+//! @2: dst moved from the target's `s0` section to its file-card node (the
+//! raw pass's SRC is the file card too) and edges carry
+//! `src_format`/`dst_format`.
 //!
 //! ## Why there is a raw-source pass
 //! The HTML extractor strips markup before sectioning — an `<a>` tag never
@@ -22,7 +26,7 @@ use super::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-pub const TAG: &str = "href@1";
+pub const TAG: &str = "href@2";
 pub const EDGE_TYPE: &str = "href";
 pub const WEIGHT: f32 = 0.7;
 pub const CONFIDENCE: f32 = 0.85;
@@ -73,6 +77,8 @@ fn draft(
         src_file: file.rel.clone(),
         quote,
         offset,
+        src_format: file.format.clone(),
+        dst_format: target.format.clone(),
     }
 }
 
@@ -194,7 +200,8 @@ mod tests {
         let ctx = SectionCtx {
             corpus: &corpus,
             file: &corpus.files["notes.md"],
-            section_ordinal: 0,
+            section_label: "section 0",
+            prev_section: None,
             section_doc_id: "sec0",
             text: "<a href=\"site/about.html\">x</a>",
         };
@@ -211,7 +218,8 @@ mod tests {
         let ctx = SectionCtx {
             corpus: &corpus,
             file: &corpus.files["site/index.html"],
-            section_ordinal: 0,
+            section_label: "section 0",
+            prev_section: None,
             section_doc_id: "sec0",
             text,
         };

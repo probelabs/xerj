@@ -21,6 +21,15 @@
 // ux/ego-ledger.js#renderPanelBody. Scrub previews are client-side
 // over already-fetched edges; RELEASING the caret re-queries the
 // server with `as_of` — the server owns the bi-temporal cut.
+//
+// Two additions ride along:
+//   READ LOG — every fetch this page makes records what/how much/why
+//   (the reads panel is the only honest "which data was read and why";
+//   the engine does not record other callers' intentions).
+//   MAP SEAM — ux/brain-map.js is dynamic-imported and mounted into
+//   the map panel's `[data-sb-map-mount]`; it talks back through
+//   sbRefocus/sbLogRead/sbPublishMapStats/sbSnapshot and hears the
+//   shared belief caret as sb:asof-preview / sb:asof-commit events.
 // ============================================================
 
 import {
@@ -29,10 +38,14 @@ import {
 } from '../ux/ego-ledger.js';
 
 /** Panel ids of the second-brain dashboard, in render order. The
- *  controller patches exactly these after an interaction. */
+ *  controller patches exactly these after an interaction — except a
+ *  LIVE map body, which is the one panel that owns its own DOM (a
+ *  canvas is not re-renderable from an HTML string; see patchPanels). */
 export const SB_PANEL_IDS = [
+  'controls', 'map', 'scrub',
   'edgesLive', 'edgesTotal', 'invalidated', 'detectors',
-  'typeDist', 'edgeTimeline', 'ego', 'hubs', 'notShown',
+  'typeDist', 'edgeTimeline', 'notes', 'crossings', 'reads',
+  'ego', 'hubs', 'notShown',
 ];
 
 /** Returned edge budget for the belief query. Hops=2 so neighbour rows
@@ -76,7 +89,56 @@ const S = {
   collapsed: new Set(), // folded link-kind groups ("side:type"), per-brain
   recentRetired: null,  // three most recently retired links (RetiredPanel)
   lastShift: null,      // what the last time-travel changed (scrubber readout)
+  // ---- statistics row state ----------------------------------------
+  nodeStats: null,      // { total, formats:[{format,count}], otherFormats } | { error }
+  crossings: null,      // { total, crossCount, pairs:[{src,dst,count}], otherPairs } | { error }
+  serverReads: null,    // { rows:[{index,count}] } | { error } — /v1/metrics counters
+  reads: [],            // the page's own attributed fetch log (capped)
+  readsTotal: 0,        // reads ever logged this session (survives the cap)
+  mapStats: null,       // published by ux/brain-map.js via sbPublishMapStats
 };
+
+// ----- the page's own read log --------------------------------------
+//
+// Every fetch this dashboard makes records WHAT it read, HOW MUCH, and
+// WHY — the only honest answer to "which data was read and why". The
+// engine records neither other callers' whys nor per-note read counts;
+// the reads panel says so instead of inventing them.
+
+const READS_CAP = 48;
+
+function logRead(surface, detail, reason) {
+  const last = S.reads[S.reads.length - 1];
+  S.readsTotal += 1;
+  if (last && last.surface === surface && last.detail === detail && last.reason === reason) {
+    // The same read repeating back-to-back (render loops, re-probes)
+    // collapses into one row with a ×count — the log stays a record,
+    // not a scroll of noise.
+    last.n += 1;
+    last.t = Date.now();
+  } else {
+    S.reads.push({ t: Date.now(), surface, detail, reason, n: 1 });
+    if (S.reads.length > READS_CAP) S.reads = S.reads.slice(-READS_CAP);
+  }
+  scheduleReadsPatch();
+}
+
+/** The map module (and any other in-page reader) logs its reads
+ *  through the same front door: sbLogRead('links index', '10 pages',
+ *  'building the map'). */
+export const sbLogRead = logRead;
+
+let readsRaf = 0;
+/** Repaint just the reads panel after a log entry — logs land mid-
+ *  flight (FIND keystrokes, map pages) when no full patch will run. */
+function scheduleReadsPatch() {
+  if (typeof requestAnimationFrame === 'undefined' || readsRaf) return;
+  readsRaf = requestAnimationFrame(() => {
+    readsRaf = 0;
+    const el = document.querySelector('[data-sb-body="reads"]');
+    if (el) el.innerHTML = renderPanelBody('reads', assemble());
+  });
+}
 
 /**
  * The deep-link query tail (`#/second-brain?brain=X&focus=Y&as_of=Z`),
@@ -220,13 +282,16 @@ async function hydrateNames(signal) {
   const want = [...ids].filter((id) => !(id in S.names)).slice(0, 40);
   if (!want.length) return;
   try {
+    logRead('notes index', `${want.length} note name${want.length === 1 ? '' : 's'}`, 'turning ids into titles');
     const r = await fetch(`${S.baseUrl}/${enc(o.nodes_index)}/_search`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         query: { ids: { values: want } },
         size: want.length,
-        _source: ['title', 'text', 'body'],
+        // ax_path/path: the real file behind a note — a truthful label
+        // for the focus card and the map, never derived from the id.
+        _source: ['title', 'text', 'body', 'ax_path', 'path'],
       }),
       signal,
     });
@@ -239,7 +304,10 @@ async function hydrateNames(signal) {
         : (typeof src.text === 'string' && src.text.trim()
           ? src.text.trim().slice(0, 60)
           : (typeof src.body === 'string' && src.body.trim() ? src.body.trim().slice(0, 60) : null));
-      if (title) S.names[h._id] = { title };
+      const path = (typeof src.ax_path === 'string' && src.ax_path.trim())
+        ? src.ax_path.trim()
+        : (typeof src.path === 'string' && src.path.trim() ? src.path.trim() : null);
+      if (title || path) S.names[h._id] = { title, path };
     }
   } catch { /* names are sugar; the ids remain the truth */ }
 }
@@ -247,7 +315,16 @@ async function hydrateNames(signal) {
 function fetchOverview(signal) {
   const qs = new URLSearchParams({ top: '10', histogram_interval: 'day' });
   if (S.asOf != null) qs.set('as_of', String(S.asOf));
+  logRead('link counts', 'one overview read', 'the tiles on this page');
   return getJson(`${S.baseUrl}/_graph/${enc(S.brain)}/overview?${qs}`, signal);
+}
+
+/** The focus note's display name for the read log — hydrated title if
+ *  the console knows one, else the (shortened) id. Never a guess. */
+function focusLabel() {
+  const n = S.focus && S.names[S.focus] && S.names[S.focus].title;
+  const raw = n || String(S.focus || '');
+  return raw.length > 28 ? `${raw.slice(0, 27)}…` : raw;
 }
 
 /**
@@ -263,6 +340,7 @@ async function fetchRecentRetired(signal) {
     && S.overview.edges && S.overview.edges.invalidated > 0;
   if (!inval) { S.recentRetired = []; return; }
   try {
+    logRead('links index', 'three newest retirements', 'the retired tile');
     const r = await fetch(`${S.baseUrl}/${enc(`.xerj-memory-${S.brain}-edges`)}/_search`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -294,6 +372,7 @@ function fetchBelief(signal) {
     include_expired: 'true', include_nodes: 'true', include_evidence: 'true',
   });
   if (S.asOf != null) qs.set('as_of', String(S.asOf));
+  logRead('the ledger', `one 2-hop walk from “${focusLabel()}”`, 'you focused this note');
   return getJson(`${S.baseUrl}/_graph/${enc(S.brain)}/ego?${qs}`, signal);
 }
 
@@ -308,7 +387,138 @@ function fetchTimeline(signal) {
     limit: String(EGO_LIMIT),
     include_expired: 'true', include_evidence: 'false',
   });
+  logRead('belief strip', `one 1-hop walk from “${focusLabel()}”`, 'drawing every link’s lifetime');
   return getJson(`${S.baseUrl}/_graph/${enc(S.brain)}/ego?${qs}`, signal);
+}
+
+// ----- statistics-row fetches (all best-effort, never throw) --------
+
+/**
+ * Notes total + by-file-type tally: one size-0 search over the brain's
+ * nodes indices. The total is the search's own hit count — a ran
+ * number; the panel prefers it and falls back to overview.nodes.total
+ * only when this tally failed (see NotesPanel's rationale).
+ */
+async function fetchNodeStats(signal) {
+  const o = S.overview;
+  if (!o || o.exists === false || !o.nodes_index) { S.nodeStats = null; return; }
+  try {
+    logRead('notes index', 'one tally by file type', 'the notes tile');
+    const r = await fetch(`${S.baseUrl}/${enc(o.nodes_index)}/_search`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        size: 0,
+        // Exact, not the engine's 10,000 'gte' floor: the tile's
+        // headline is the note count, and this brain's own per-type
+        // rows summed to 2.1M under a "10,000 NOTES" headline before
+        // this flag (live-caught on `repo`, 2026-07-30).
+        track_total_hits: true,
+        aggs: { formats: { terms: { field: 'ax_format', size: 12 } } },
+      }),
+      signal,
+    });
+    if (!r.ok) { S.nodeStats = { error: `HTTP ${r.status}` }; return; }
+    const j = await r.json();
+    const t = j.hits && j.hits.total;
+    let total = t == null ? null : (typeof t === 'object' ? t.value : t);
+    // A 'gte' floor is not a count — refuse it rather than print it.
+    if (t && typeof t === 'object' && t.relation === 'gte') total = null;
+    const agg = (j.aggregations && j.aggregations.formats) || {};
+    S.nodeStats = {
+      total: Number.isFinite(total) ? total : null,
+      formats: (agg.buckets || []).map((b) => ({ format: b.key, count: b.doc_count })),
+      otherFormats: agg.sum_other_doc_count || 0,
+    };
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    S.nodeStats = { error: String((e && e.message) || e) };
+  }
+}
+
+/**
+ * File-type crossings: which file types link to which, from the
+ * src_format/dst_format stamps on the links index. Brains indexed
+ * before stamping return zero stamped links — the panel then says
+ * REINDEX TO SEE FILE-TYPE CROSSINGS instead of guessing from ids.
+ */
+async function fetchCrossings(signal) {
+  if (!S.brain) { S.crossings = null; return; }
+  try {
+    logRead('links index', 'one file-type crossing tally', 'the crossings tile');
+    const r = await fetch(`${S.baseUrl}/${enc(`.xerj-memory-${S.brain}-edges`)}/_search`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        size: 0,
+        // Exact, not the engine's 10,000 'gte' floor — the tile prints
+        // this as "N stamped links tallied" and a floor there is a
+        // false number (live-caught at 20,930 links, 2026-07-30).
+        track_total_hits: true,
+        query: { exists: { field: 'src_format' } },
+        aggs: {
+          src: {
+            terms: { field: 'src_format', size: 20 },
+            aggs: { dst: { terms: { field: 'dst_format', size: 20 } } },
+          },
+        },
+      }),
+      signal,
+    });
+    if (!r.ok) { S.crossings = { error: `HTTP ${r.status}` }; return; }
+    const j = await r.json();
+    const t = j.hits && j.hits.total;
+    const total = (t == null ? 0 : (typeof t === 'object' ? t.value : t)) || 0;
+    const srcAgg = (j.aggregations && j.aggregations.src) || {};
+    const pairs = [];
+    let otherPairs = 0;
+    for (const sb of srcAgg.buckets || []) {
+      const dstAgg = sb.dst || {};
+      for (const db of dstAgg.buckets || []) {
+        pairs.push({ src: sb.key, dst: db.key, count: db.doc_count });
+      }
+      if (dstAgg.sum_other_doc_count > 0) otherPairs += 1;
+    }
+    if (srcAgg.sum_other_doc_count > 0) otherPairs += 1;
+    // Deterministic order: count desc, then label asc.
+    pairs.sort((a, b) => b.count - a.count
+      || (a.src < b.src ? -1 : a.src > b.src ? 1 : 0)
+      || (a.dst < b.dst ? -1 : a.dst > b.dst ? 1 : 0));
+    const crossCount = pairs.reduce((n, p) => n + (p.src !== p.dst ? p.count : 0), 0);
+    const sameCount = pairs.reduce((n, p) => n + (p.src === p.dst ? p.count : 0), 0);
+    // Bucket caps can hide pairs; when they did, every derived count
+    // is a floor and the tile must say so.
+    const truncated = otherPairs > 0;
+    S.crossings = { total, crossCount, sameCount, truncated, pairs, otherPairs };
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    S.crossings = { error: String((e && e.message) || e) };
+  }
+}
+
+/**
+ * Per-index search counters from the server's own metrics — framed
+ * exactly as what they are: since server start, reset at boot. If the
+ * metrics endpoint refuses the console's credentials, the panel shows
+ * the refusal rather than a stale or invented number.
+ */
+async function fetchServerReads(signal) {
+  try {
+    logRead('server counters', 'one metrics read', 'searches per index');
+    const r = await fetch(`${S.baseUrl}/v1/metrics`, { signal });
+    if (!r.ok) { S.serverReads = { error: `HTTP ${r.status}` }; return; }
+    const text = await r.text();
+    const rows = [];
+    for (const line of text.split('\n')) {
+      const m = line.match(/^xerj_queries_by_index_total\{index="([^"]*)"\}\s+(\d+)/);
+      if (m) rows.push({ index: m[1], count: Number(m[2]) });
+    }
+    rows.sort((a, b) => b.count - a.count || (a.index < b.index ? -1 : 1));
+    S.serverReads = { rows };
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    S.serverReads = { error: String((e && e.message) || e) };
+  }
 }
 
 // ----- data assembly (§7.3 shape, extras under `sb`) ---------------
@@ -357,6 +567,12 @@ function assemble() {
       collapsed: S.collapsed,
       recentRetired: S.recentRetired,
       lastShift: S.lastShift,
+      nodeStats: S.nodeStats,
+      crossings: S.crossings,
+      serverReads: S.serverReads,
+      reads: S.reads,
+      readsTotal: S.readsTotal,
+      mapStats: S.mapStats,
     },
   };
 }
@@ -377,6 +593,7 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
   S.baseUrl = (baseUrl || '').replace(/\/+$/, '');
   S.uiError = null;
   try {
+    logRead('brain list', 'one index listing', 'finding your brains');
     S.brains = await discoverBrains(S.baseUrl, signal);
     S.connected = true;
     S.error = null;
@@ -441,15 +658,21 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
     && S.overview.edges && S.overview.edges.total > 0;
   if (!hasEdges) {
     S.ego = null; S.timeline = null;
+    // A brain can hold notes before it holds links — count them anyway.
+    await Promise.all([fetchNodeStats(signal), fetchServerReads(signal)]);
     return assemble();
   }
 
   if (!S.focus) S.focus = defaultFocus();
+  const statJobs = [ // best-effort, never throw
+    fetchNodeStats(signal), fetchCrossings(signal), fetchServerReads(signal),
+  ];
   if (S.focus) {
     try {
       const [belief, timeline] = await Promise.all([
         fetchBelief(signal), fetchTimeline(signal),
         fetchRecentRetired(signal), // best-effort, never throws
+        ...statJobs,
       ]);
       S.ego = belief;
       S.timeline = timeline;
@@ -459,7 +682,7 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
     }
   } else {
     S.ego = null; S.timeline = null;
-    await fetchRecentRetired(signal);
+    await Promise.all([fetchRecentRetired(signal), ...statJobs]);
   }
   await hydrateNames(signal);
   saveBrainState();
@@ -494,6 +717,13 @@ function patchPanels() {
     : null;
   const data = assemble();
   for (const id of SB_PANEL_IDS) {
+    if (id === 'map') {
+      // A LIVE map owns its DOM — a mounted canvas cannot be re-created
+      // from an HTML string. Skip the innerHTML swap and let the map
+      // module restyle itself from state (syncBrainMap below).
+      const mapEl = document.querySelector('[data-sb-map]');
+      if (mapEl && mapEl.hasAttribute('data-sb-map-live')) continue;
+    }
     const el = document.querySelector(`[data-sb-body="${id}"]`);
     if (el) el.innerHTML = renderPanelBody(id, data);
   }
@@ -504,6 +734,8 @@ function patchPanels() {
   showUiError();
   scheduleTraces();
   flashFlipped();
+  ensureMap();
+  syncMap();
 }
 
 /** One-shot outline flash on every ledger row whose belief state the
@@ -550,11 +782,102 @@ function scheduleTraces() {
  */
 export function sbAfterRender() {
   scheduleTraces();
+  ensureMap();
+}
+
+// ----- THE MAP seam -------------------------------------------------
+//
+// The map lives in ux/brain-map.js (its own slice). This controller
+// only (1) loads it, (2) hands it a mount point (`[data-sb-map-mount]`
+// drawn by the map panel body), (3) keeps panel patching from eating
+// its canvas, and (4) speaks to it through the narrow API below plus
+// two document events: `sb:asof-preview` / `sb:asof-commit`
+// (detail.ms = epoch-ms | null for NOW). Expected module exports:
+//   mountBrainMap()  idempotent; finds the mount, draws, and sets
+//                    `data-sb-map-live` on [data-sb-map]
+//   syncBrainMap()   restyle from current state after a panel patch
+
+let mapMod;            // undefined = not tried · null = not in this build
+let mapModLoading = null;
+
+/** The controller calls this from render() while the dashboard is
+ *  still assembling HTML strings — the mount point may not be in the
+ *  DOM yet. Without a post-paint retry the first (often only) data-
+ *  carrying render never mounts the map: ensureMapNow bails on the
+ *  missing mount, nothing re-arms it, and the panel shows its waiting
+ *  placeholder forever (live-caught on the 19k-link `repo` brain,
+ *  2026-07-30). Same rAF pattern mountBrainMap uses for its own
+ *  pre-commit calls. */
+let ensureMapRaf = 0;
+function ensureMap() {
+  if (typeof document === 'undefined') return;
+  if (typeof requestAnimationFrame !== 'undefined' && !ensureMapRaf) {
+    ensureMapRaf = requestAnimationFrame(() => { ensureMapRaf = 0; ensureMapNow(); });
+  }
+  ensureMapNow();
+}
+
+function ensureMapNow() {
+  if (!document.querySelector('[data-sb-map-mount]')) return;
+  if (mapMod === null) { markMapMissing(); return; }
+  if (mapMod) { try { mapMod.mountBrainMap && mapMod.mountBrainMap(); } catch { /* map draws best-effort */ } return; }
+  if (!mapModLoading) {
+    mapModLoading = import('../ux/brain-map.js')
+      .then((m) => { mapMod = m; ensureMap(); })
+      .catch(() => { mapMod = null; markMapMissing(); });
+  }
+}
+
+/** No ux/brain-map.js in this build: say so — never a spinner that
+ *  promises a map that cannot arrive. */
+function markMapMissing() {
+  const el = document.querySelector('[data-sb-map-mount]');
+  if (el && el.querySelector('[data-sb-map-waiting]')) {
+    el.innerHTML = '<div class="panel-empty mono faint">THE MAP IS NOT IN THIS BUILD · THE LEDGER BELOW SHOWS EVERY LINK</div>';
+  }
+}
+
+function syncMap() {
+  if (mapMod && mapMod.syncBrainMap) {
+    try { mapMod.syncBrainMap(); } catch { /* the map never takes the page down */ }
+  }
+}
+
+/** Map → ledger routing: every terminal click on the map lands in the
+ *  ledger (the leaf view), scrolled into sight. */
+export function sbRefocus(id) {
+  refocus(id);
+  const ego = document.querySelector('[data-sb-body="ego"]');
+  if (ego && ego.scrollIntoView) ego.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/**
+ * The map publishes what it actually read and derived so the
+ * statistics row can state it: { orphansFloor, orphansIsFloor,
+ * edgesFetched, edgesTotal, … } — every field optional, every consumer
+ * renders only what is present.
+ */
+export function sbPublishMapStats(stats) {
+  S.mapStats = stats && typeof stats === 'object' ? stats : null;
+  if (typeof document === 'undefined') return;
+  const data = assemble();
+  for (const id of ['notes', 'crossings']) {
+    const el = document.querySelector(`[data-sb-body="${id}"]`);
+    if (el) el.innerHTML = renderPanelBody(id, data);
+  }
+}
+
+/** Read-only view state for the map module. */
+export function sbSnapshot() {
+  return {
+    baseUrl: S.baseUrl, brain: S.brain, focus: S.focus, asOf: S.asOf,
+    overview: S.overview, names: S.names,
+  };
 }
 
 // ----- interaction ops ----------------------------------------------
 
-async function refetch({ overview = false, belief = false, timeline = false }) {
+async function refetch({ overview = false, belief = false, timeline = false, stats = false }) {
   abortInflight();
   inflight = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const signal = inflight && inflight.signal;
@@ -562,10 +885,24 @@ async function refetch({ overview = false, belief = false, timeline = false }) {
   S.uiError = null;
   try {
     const jobs = [];
-    if (overview) jobs.push(fetchOverview(signal).then((r) => { S.overview = r; S.overviewError = null; }));
-    if (overview) jobs.push(fetchRecentRetired(signal)); // rides along; never throws
+    const ovJob = overview
+      ? fetchOverview(signal).then((r) => { S.overview = r; S.overviewError = null; })
+      : null;
+    if (ovJob) jobs.push(ovJob, fetchRecentRetired(signal)); // retired rides along; never throws
     if (belief && S.focus) jobs.push(fetchBelief(signal).then((r) => { S.ego = r; }));
     if (timeline && S.focus) jobs.push(fetchTimeline(signal).then((r) => { S.timeline = r; }));
+    if (stats) {
+      // Truth-now tallies (notes, crossings, server counters):
+      // refreshed on brain switch / retry, deliberately NOT on every
+      // as-of commit — they are statements about the record, not about
+      // the caret. They need the overview's index names, so they wait
+      // for it when one is in flight (and stand down if it failed —
+      // the error state owns the page then).
+      const run = () => Promise.all([
+        fetchNodeStats(signal), fetchCrossings(signal), fetchServerReads(signal),
+      ]);
+      jobs.push(ovJob ? ovJob.then(run, () => {}) : run());
+    }
     await Promise.all(jobs);
     await hydrateNames(signal);
   } catch (e) {
@@ -593,6 +930,12 @@ function refocus(id) {
   // time-travel readout belong to the note that had them.
   S.openEvidence = new Set();
   S.lastShift = null;
+  // Announce the change for any in-page listener. (The map does NOT
+  // subscribe today — it re-reads focus via sbSnapshot on the sync
+  // that follows patchPanels; this event is a seam, not a claim.)
+  if (typeof document !== 'undefined') {
+    document.dispatchEvent(new CustomEvent('sb:refocus', { detail: { id } }));
+  }
   writeMoment();
   patchPanels(); // immediate: focus card swaps to the new node id
   refetch({ belief: true, timeline: true });
@@ -604,11 +947,13 @@ function switchBrain(name) {
   S.brain = name;
   S.overview = null; S.ego = null; S.timeline = null;
   S.recentRetired = null; S.openEvidence = new Set(); S.lastShift = null;
+  // Another brain is another record: its tallies and its map stats.
+  S.nodeStats = null; S.crossings = null; S.mapStats = null;
   loadBrainState();
   writeMoment();
   patchPanels();
   (async () => {
-    await refetch({ overview: true });
+    await refetch({ overview: true, stats: true });
     if (!S.focus) S.focus = defaultFocus();
     if (S.focus) await refetch({ belief: true, timeline: true });
   })();
@@ -651,6 +996,11 @@ function computeShift(prevMs, nextMs) {
 function commitAsOf(ms) {
   S.lastShift = computeShift(S.asOf, ms);
   S.asOf = ms;
+  // One caret, whole page: the map restyles its live/retired states
+  // from the same commit the ledger re-queries on.
+  if (typeof document !== 'undefined') {
+    document.dispatchEvent(new CustomEvent('sb:asof-commit', { detail: { ms } }));
+  }
   writeMoment();
   refetch({ overview: true, belief: true });
 }
@@ -714,6 +1064,8 @@ function previewAsOf(scrub, ms) {
     label.classList.toggle('sb-cl-right', caretAlignClass(lp) === 'sb-cl-right');
   }
   const t = atNow ? null : ms;
+  // Mid-drag, the map previews the same moment the ledger rows do.
+  document.dispatchEvent(new CustomEvent('sb:asof-preview', { detail: { ms: t } }));
   const counter = scrub.querySelector('[data-sb-livecount]');
   const steps = scrub.getAttribute('data-sb-steps');
   if (steps) {
@@ -837,7 +1189,7 @@ function onClick(e) {
   if (t.closest('[data-sb-now]')) { commitAsOf(null); return; }
 
   if (t.closest('[data-sb-retry]')) {
-    refetch({ overview: true, belief: true, timeline: true });
+    refetch({ overview: true, belief: true, timeline: true, stats: true });
     return;
   }
 
@@ -950,6 +1302,7 @@ async function runFind(q) {
   if (!o || o.exists === false || !o.nodes_index) return;
   const seq = ++findSeq;
   try {
+    logRead('notes index', `one text search “${q.slice(0, 24)}${q.length > 24 ? '…' : ''}”`, 'you typed in FIND');
     const r = await fetch(`${S.baseUrl}/${enc(o.nodes_index)}/_search`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

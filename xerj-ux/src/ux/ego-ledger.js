@@ -18,6 +18,13 @@
 // nodes. The signature interaction is the BELIEF-TIME strip: every
 // link's lifetime on one time axis with a draggable as-of caret.
 //
+// THE MAP (ux/brain-map.js) sits ABOVE this ledger and does not repeal
+// the rationale: it draws a BOUNDED number of structure-derived groups
+// with a deterministic seeded layout (no live simulation), and every
+// terminal click lands back HERE — the ledger stays the leaf view and
+// the only evidence surface. This file also renders the mount point,
+// the shared scrubber panel, and the statistics row.
+//
 // LANGUAGE RULE: this surface speaks user words — "link", "believed
 // since", "retired", "what taught this". Schema names (src/dst/
 // valid_at/edge_id) appear ONLY inside the evidence paper-trail, which
@@ -53,6 +60,8 @@ const TYPE_WORDS = {
   wikilink: 'WIKI-LINKS',
   mdlink: 'MARKDOWN LINKS',
   href: 'HTML LINKS',
+  pathcite: 'CITES FILE',
+  cratecite: 'CITES CRATE',
   sequence: 'READING ORDER',
   same_dir: 'SAME FOLDER',
   manual: 'HAND-ASSERTED',
@@ -68,6 +77,8 @@ const DETECTOR_WORDS = {
   wikilink: 'WIKI-LINKS',
   mdlink: 'MARKDOWN LINKS',
   href: 'HTML LINKS',
+  pathcite: 'CITES FILE',
+  cratecite: 'CITES CRATE',
   sequence: 'READING ORDER',
   samedir: 'FOLDER NEIGHBORS',
   manual: 'HAND-ASSERTED',
@@ -90,7 +101,9 @@ export const detectorName = (tag) => {
 //   Links with no evidence at all (asserted by hand or agent without a
 //     quote) say so — absence is shown, not papered over.
 
-const AUTHORED_DETECTORS = new Set(['wikilink', 'mdlink', 'href']);
+// pathcite/cratecite quote the author's actual line (a real citation the
+// author typed, resolved structurally) — authored, quote-rendered.
+const AUTHORED_DETECTORS = new Set(['wikilink', 'mdlink', 'href', 'pathcite', 'cratecite']);
 const STRUCTURAL_DETECTORS = new Set(['samedir', 'sequence']);
 const detectorBase = (tag) => String(tag || '').split('@')[0];
 
@@ -352,6 +365,10 @@ const FocusCard = ({ ego, nodes, names, brain, asOf }) => {
   const preview = meta && meta.preview
     ? `<p class="sb-ftext">${esc(meta.preview)}</p>`
     : '';
+  // The real file behind the note, when the engine (or the console's
+  // name cache) knows it — a truthful label, never derived from the id.
+  const path = (meta && typeof meta.path === 'string' && meta.path)
+    || (names && names[id] && names[id].path) || null;
   const dangling = !meta && ego.not_shown
     && Array.isArray(ego.not_shown.dangling_ids)
     && ego.not_shown.dangling_ids.includes(id);
@@ -367,7 +384,7 @@ const FocusCard = ({ ego, nodes, names, brain, asOf }) => {
       ${nRetired > 0 ? `<span class="sb-fret">+${num(nRetired)} RETIRED</span>` : ''}
     </div>
     <div class="sb-fprov mono faint">
-      ${esc(meta && meta.index ? meta.index : `brain ${brain}`)} · id ${esc(id)}${dangling ? ' · NO DOCUMENT BEHIND THIS ID' : ''}${earliest != null ? ` · in this brain since ${esc(fmtDay(earliest))}` : ''}
+      ${esc(meta && meta.index ? meta.index : `brain ${brain}`)}${path ? ` · ${esc(path)}` : ''} · id ${esc(id)}${dangling ? ' · NO DOCUMENT BEHIND THIS ID' : ''}${earliest != null ? ` · in this brain since ${esc(fmtDay(earliest))}` : ''}
     </div>
   </div>`;
 };
@@ -605,18 +622,21 @@ const sideCol = (groups, side, ctx, caption, emptyLabel) => {
   </div>`;
 };
 
-/** The three-column ego ledger + rails + scrubber. */
+/**
+ * The three-column ego ledger + rails. The brain/focus/FIND controls
+ * and the belief-time scrubber used to render inside this panel; they
+ * are now panels of their own (`controls` at the top of the page, and
+ * `scrub` between the map and the statistics row) so ONE caret drives
+ * both the map and the ledger — same module state, same commit path.
+ */
 export const EgoLedger = ({ data }) => {
   const sb = data.sb || {};
   const ego = data.ego;
   const asOf = sb.asOf ?? null;
   const names = sb.names || {};
   if (!ego) {
-    // Controls stay up even without a belief response so the user can
-    // switch brain / reset the caret out of a dead end.
     return `
-  ${EgoControls({ brain: data.brain, brains: sb.brains, focus: sb.focus, asOf, trail: sb.trail, names })}
-  <div class="panel-empty mono faint">${sb.focus ? 'READING WHAT THE BRAIN BELIEVES ABOUT ' + esc(String(sb.focus).toUpperCase()) + '…' : 'NO NOTE IN FOCUS · CLICK ANY NOTE BELOW TO OPEN ITS LEDGER'}</div>`;
+  <div class="panel-empty mono faint">${sb.focus ? 'READING WHAT THE BRAIN BELIEVES ABOUT ' + esc(String(sb.focus).toUpperCase()) + '…' : 'NO NOTE IN FOCUS · CLICK ANY NOTE ON THIS PAGE TO OPEN ITS LEDGER'}</div>`;
   }
   const nodes = ego.nodes || {};
   const clipped = !!(ego.not_shown && ego.not_shown.edges_clipped > 0);
@@ -649,10 +669,7 @@ export const EgoLedger = ({ data }) => {
   </div>
   <div class="panel-empty mono faint">NO LINKS TOUCH THIS NOTE AT THIS MOMENT · DRAG BELIEF TIME BACK TO NOW, OR CLICK ANOTHER NOTE BELOW</div>`;
 
-  return `
-  ${EgoControls({ brain: data.brain, brains: sb.brains, focus: ego.node, asOf, trail: sb.trail, names, nodes })}
-  ${body}
-  ${BeliefScrubber({ timeline: sb.timeline, asOf, shift: sb.lastShift })}`;
+  return body;
 };
 
 // ----- honesty panel ------------------------------------------------
@@ -942,6 +959,225 @@ export const EmptyBrainNote = ({ brain, connected, error }) => {
   </div>`;
 };
 
+// ----- composition panels: controls / map / scrub -------------------
+
+/**
+ * The header strip — brain switcher, trail crumbs, FIND — hoisted out
+ * of the ledger so it sits at the top of the page and survives no
+ * matter which panel below is empty or broken.
+ */
+const ControlsPanel = ({ data }) => {
+  const sb = data.sb || {};
+  if (!data.brain) {
+    return `<div class="panel-empty mono faint">NO BRAIN ON THIS ENGINE YET · THE LEDGER PANEL BELOW HAS THE ONE COMMAND THAT MAKES ONE</div>`;
+  }
+  const nodes = (data.ego && data.ego.nodes) || {};
+  return EgoControls({
+    brain: data.brain, brains: sb.brains, focus: sb.focus,
+    asOf: sb.asOf ?? null, trail: sb.trail, names: sb.names || {}, nodes,
+  });
+};
+
+/**
+ * THE MAP panel body — a MOUNT POINT, not the map itself.
+ *
+ * Seam contract with ux/brain-map.js (built as its own slice):
+ *   - this renderer draws `[data-sb-map] > [data-sb-map-mount]` plus
+ *     the permanent structural-honesty disclosure;
+ *   - data/second-brain-api.js dynamic-imports ux/brain-map.js and
+ *     calls its `mountBrainMap()` (idempotent) after every render;
+ *   - once mounted, the module sets `data-sb-map-live` on
+ *     `[data-sb-map]`; panel patching then SKIPS this body (so the
+ *     canvas is never destroyed) and calls `syncBrainMap()` instead;
+ *   - the module may import { sbRefocus, sbLogRead, sbPublishMapStats,
+ *     sbSnapshot } from data/second-brain-api.js, and hears belief-
+ *     time moves as `sb:asof-preview` / `sb:asof-commit` document
+ *     events (detail.ms — epoch-ms, or null for NOW).
+ */
+const MapPanel = ({ data }) => {
+  const hasEdges = !!(data.overview && data.overview.exists !== false
+    && data.overview.edges && data.overview.edges.total > 0);
+  const inner = hasEdges
+    ? `<div class="panel-empty mono faint" data-sb-map-waiting>THE MAP DRAWS HERE</div>`
+    : `<div class="panel-empty mono faint">THE MAP DRAWS ONCE THIS BRAIN HAS LINKS</div>`;
+  return `
+  <div class="sb-map" data-sb-map>
+    <div class="sb-map-mount" data-sb-map-mount>${inner}</div>
+    <div class="sb-map-disclosure mono faint">GROUPED BY LINK STRUCTURE — CITATIONS AND FOLDER NEIGHBORHOOD, NOT MEANING</div>
+  </div>`;
+};
+
+/** The shared belief-time scrubber: ONE caret for the whole page — the
+ *  map restyles and the ledger rows restate from the same drag. */
+const ScrubPanel = ({ data }) => {
+  const sb = data.sb || {};
+  return BeliefScrubber({ timeline: sb.timeline, asOf: sb.asOf ?? null, shift: sb.lastShift });
+};
+
+// ----- statistics row -----------------------------------------------
+//
+// Every number in these panels comes from a call THIS page made and can
+// name. What the engine does not record (per-note read counts, other
+// callers' whys, semantic similarity) is refused in as many words —
+// never approximated.
+
+/** ax_format values → short honest labels. Raw-ish on purpose: the
+ *  format tag is the detector's truth, not marketing copy. */
+const fmtFormat = (f) => String(f || 'unknown').replace(/[_-]+/g, ' ').toUpperCase();
+
+/** 1px identity+magnitude row, TaughtByPanel style. */
+const statRow = (label, count, max, title) => `
+  <div class="sb-det">
+    <span class="sb-detname"${title ? ` title="${esc(title)}"` : ''}>${esc(label)}</span>
+    <span class="sb-detn">${esc(num(count))}</span>
+    <svg class="chart sb-hubbar" height="6" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true">
+      <line x1="0" y1="5" x2="${((count / Math.max(max, 1)) * 100).toFixed(1)}" y2="5" stroke="currentColor" stroke-width="1"/>
+    </svg>
+  </div>`;
+
+/**
+ * WHAT THIS BRAIN HOLDS — notes total + by file type + the no-links
+ * floor. Total is the size-0 tally this page ran over exactly the
+ * indices whose file types are listed below it (so the headline can
+ * never contradict its own rows); the overview's nodes.total is the
+ * fallback when that tally failed. Both are numbers something
+ * returned, never an estimate. (Live-verified 2026-07-30: on a
+ * multi-index brain the overview field returns 0 while the same
+ * engine counts 634 by search — preferring the tally is what keeps
+ * this tile truthful until that server field handles index lists.)
+ */
+const NotesPanel = ({ data }) => {
+  const o = data.overview || {};
+  const sb = data.sb || {};
+  const st = sb.nodeStats || null;
+  // overview.nodes.total is live-verified to be a false 0 when the
+  // brain spans several notes indices (comma-list) — only fall back to
+  // it for single-index brains.
+  const singleIndex = !!(o.nodes_index && !String(o.nodes_index).includes(','));
+  const total = (st && Number.isFinite(st.total)) ? st.total
+    : (singleIndex && o.nodes && Number.isFinite(o.nodes.total) ? o.nodes.total : null);
+  if (total == null) {
+    return st && st.error
+      ? `<div class="panel-empty mono faint">COULD NOT COUNT THE NOTES · ${esc(String(st.error).slice(0, 60))}</div>`
+      : `<div class="panel-empty mono faint">NOT COUNTED YET</div>`;
+  }
+  const formats = (st && st.formats) || [];
+  const max = Math.max(...formats.map((f) => f.count), 1);
+  const rows = formats.map((f) => statRow(fmtFormat(f.format), f.count, max)).join('');
+  const other = st && st.otherFormats > 0
+    ? `<div class="hint">+ ${num(st.otherFormats)} notes in file types beyond this list</div>` : '';
+  // Notes with no links: the map computes it (distinct linked notes out
+  // of its weight-ranked fetch), so it is a floor whenever that fetch
+  // was budget-truncated — say which.
+  const ms = sb.mapStats || null;
+  const orphans = ms && Number.isFinite(ms.orphansFloor)
+    ? `<div class="hint" style="margin-top:6px;">notes with no links: ${ms.orphansIsFloor ? '≥ ' : ''}${num(ms.orphansFloor)}${ms.orphansIsFloor ? ' — a floor; the map read the strongest links, not all of them' : ''}</div>`
+    : `<div class="hint" style="margin-top:6px;">notes with no links: counted once the map has read the links</div>`;
+  return `
+  ${Num({ value: num(total), unit: 'notes', hint: 'each file counts once, and its sections count as their own notes', emphasis: false })}
+  <div class="sb-dets" style="margin-top:var(--sp-1);">${rows}</div>
+  ${other}${orphans}`;
+};
+
+/**
+ * LINKS ACROSS FILE TYPES — how many links leave one file type for
+ * another (md → rs, md → pdf …), from a file-type tally on the links
+ * index. Brains indexed before links carried file-type stamps have
+ * nothing to tally — that is a fact about the record, said plainly,
+ * never guessed around.
+ */
+const CrossingsPanel = ({ data }) => {
+  const o = data.overview || {};
+  const sb = data.sb || {};
+  const c = sb.crossings || null;
+  // §0 invariant 8: no surface may imply the links mean anything —
+  // they are citations and structure found by deterministic detectors.
+  const embed = o.embedder
+    ? `<div class="hint" style="margin-top:var(--sp-1);">LINKS COME FROM STRUCTURE AND CITATIONS, NOT MEANING — embedder: ${esc(o.embedder)}</div>`
+    : '';
+  if (!c) return `<div class="panel-empty mono faint">NOT TALLIED YET</div>${embed}`;
+  if (c.error) return `<div class="panel-empty mono faint">COULD NOT TALLY · ${esc(String(c.error).slice(0, 60))}</div>${embed}`;
+  if (!c.total) {
+    return `
+  <div class="panel-empty mono faint">REINDEX TO SEE FILE-TYPE CROSSINGS</div>
+  <div class="hint">links in this brain carry no file-type stamp on their ends — run <span class="mono">xerj brain</span> on the folder again to stamp them</div>${embed}`;
+  }
+  // The headline of this panel is CROSSINGS — so the list shows the
+  // pairs that actually cross (md → rs, html → pdf …). Same-type pairs
+  // dominate every real corpus and would drown the 8 rows this tile
+  // can hold; they get one summary line instead of the whole list.
+  const crossPairs = c.pairs.filter((p) => p.src !== p.dst).slice(0, 8);
+  const max = Math.max(...crossPairs.map((p) => p.count), 1);
+  const rows = crossPairs.map((p) => statRow(
+    `${fmtFormat(p.src)} → ${fmtFormat(p.dst)}`, p.count, max,
+    'links that cross from one file type to another',
+  )).join('');
+  const beyondCross = c.pairs.filter((p) => p.src !== p.dst).length - crossPairs.length + (c.otherPairs || 0);
+  const floor = c.truncated ? '≥ ' : '';
+  const tail = beyondCross > 0 ? `<div class="hint">+ ${num(beyondCross)} more pairings beyond this list</div>` : '';
+  const same = c.sameCount > 0
+    ? `<div class="hint">${floor}${num(c.sameCount)} more links join files of the SAME type — not listed here</div>` : '';
+  return `
+  ${Num({ value: `${floor}${num(c.crossCount)}`, unit: 'crossings', hint: `links joining two DIFFERENT file types · ${num(c.total)} stamped links tallied`, emphasis: false })}
+  <div class="sb-dets" style="margin-top:var(--sp-1);">${rows}</div>
+  ${tail}${same}${embed}`;
+};
+
+/** HH:MM:SS (UTC) for the read log — the strip's fmtTs stops at minutes. */
+const fmtClock = (ms) => new Date(Number(ms)).toISOString().slice(11, 19);
+
+/**
+ * WHAT THIS VIEW READ · AND WHY — the dashboard's own attributed fetch
+ * log (every call it made: what, how much, why), then the server's
+ * per-index search counters. The log is the ONLY honest answer to
+ * "which data was read and why": the engine does not record other
+ * callers' intentions, and this panel says so instead of inventing.
+ */
+const ReadsPanel = ({ data }) => {
+  const sb = data.sb || {};
+  const reads = sb.reads || [];
+  const latest = reads.slice(-10).reverse();
+  const logRows = latest.map((r) => `
+    <div class="sb-readrow">
+      <span class="sb-readwhat">${esc(r.surface)}</span>
+      <span class="sb-readhow">${esc(r.detail)}</span>
+      <span class="sb-readwhy">${esc(r.reason)}</span>
+      <span class="sb-readat">${r.n > 1 ? `×${num(r.n)} · ` : ''}${esc(fmtClock(r.t))}</span>
+    </div>`).join('');
+  const logCap = reads.length > latest.length
+    ? `<div class="hint">latest ${num(latest.length)} of ${num(sb.readsTotal || reads.length)} reads this page made this session</div>`
+    : (reads.length ? `<div class="hint">${num(sb.readsTotal || reads.length)} read${(sb.readsTotal || reads.length) === 1 ? '' : 's'} this page made this session</div>` : '');
+  const log = reads.length
+    ? `${logRows}${logCap}`
+    : `<div class="panel-empty mono faint">EVERY CALL THIS PAGE MAKES LOGS ITSELF HERE</div>`;
+
+  // The reserved links index renders in user words (raw name on
+  // hover) — the LANGUAGE RULE covers identifiers we can translate.
+  const idxLabel = (ix) => {
+    const m = String(ix).match(/^\.xerj-memory-(.+)-edges$/);
+    return m ? `links of brain “${m[1]}”` : String(ix);
+  };
+  const srv = sb.serverReads || null;
+  let srvRows;
+  if (!srv) srvRows = `<div class="panel-empty mono faint">NOT READ YET</div>`;
+  else if (srv.error) srvRows = `<div class="panel-empty mono faint">SERVER COUNTERS UNREADABLE · ${esc(String(srv.error).slice(0, 40))}</div>`;
+  else if (!srv.rows.length) srvRows = `<div class="panel-empty mono faint">NO SEARCHES COUNTED YET</div>`;
+  else {
+    const top = srv.rows.slice(0, 6);
+    const max = Math.max(...top.map((r) => r.count), 1);
+    srvRows = top.map((r) => statRow(idxLabel(r.index), r.count, max, `index: ${r.index}`)).join('')
+      + (srv.rows.length > 6 ? `<div class="hint">+ ${num(srv.rows.length - 6)} more indices</div>` : '');
+  }
+  return `
+  <div class="sb-reads">
+    <div class="key">THIS PAGE'S OWN READS · WHAT — HOW MUCH — WHY</div>
+    ${log}
+    <div class="key" style="margin-top:var(--sp-2);">SEARCHES PER INDEX · SINCE SERVER START (COUNTERS RESET AT BOOT)</div>
+    ${srvRows}
+    <div class="hint" style="margin-top:6px;">who else read what, and why, is not recorded by the engine — showing it would be invention</div>
+  </div>`;
+};
+
 // ----- panel dispatcher ---------------------------------------------
 //
 // One function renders the INNER body of every second-brain panel so
@@ -962,6 +1198,10 @@ export function renderPanelBody(id, data) {
     switch (id) {
       case 'ego': return BrainErrorNote({ brain: data.brain, reason: sb.overviewError });
       case 'notShown': return HonestyList({ data });
+      // The way OUT of a dead end is switching brains — keep the
+      // controls up; the read log stays honest about what was tried.
+      case 'controls': return ControlsPanel({ data });
+      case 'reads': return ReadsPanel({ data });
       default: return `<div class="panel-empty mono faint">COULD NOT READ THIS BRAIN · SEE THE LEDGER PANEL</div>`;
     }
   }
@@ -972,6 +1212,25 @@ export function renderPanelBody(id, data) {
   const offNote = `<div class="panel-empty mono faint">ENGINE UNREACHABLE · SEE THE LEDGER PANEL</div>`;
 
   switch (id) {
+    case 'controls':
+      if (offline) return offNote;
+      return ControlsPanel({ data });
+    case 'map':
+      if (offline) return offNote;
+      return hasBrain ? MapPanel({ data }) : `<div class="panel-empty mono faint">THE MAP DRAWS ONCE A BRAIN EXISTS · SEE THE LEDGER PANEL BELOW</div>`;
+    case 'scrub':
+      if (offline) return offNote;
+      return hasEdges ? ScrubPanel({ data }) : `<div class="panel-empty mono faint">NOTHING TO REPLAY YET · EVERY LINK WILL DRAW ITS LIFETIME HERE</div>`;
+    case 'notes':
+      if (offline) return offNote;
+      return hasBrain ? NotesPanel({ data }) : `<div class="panel-empty mono faint">—</div>`;
+    case 'crossings':
+      if (offline) return offNote;
+      return hasEdges ? CrossingsPanel({ data }) : `<div class="panel-empty mono faint">HOW LINKS CROSS FILE TYPES RANKS HERE · MD → RS, MD → PDF…</div>`;
+    case 'reads':
+      // Renders even offline — failed calls were still reads this page
+      // made, and the log is the record of trying.
+      return ReadsPanel({ data });
     case 'edgesLive':
       if (offline) return offNote;
       return hasBrain ? BelievedPanel({ data }) : `<div class="panel-empty mono faint">NO BRAIN YET · SEE BELOW</div>`;
@@ -987,15 +1246,11 @@ export function renderPanelBody(id, data) {
     case 'edgeTimeline':
       if (offline) return offNote;
       return hasEdges ? TimelinePanel({ data }) : `<div class="panel-empty mono faint">EACH DAY’S NEW LINKS WILL DRAW HERE</div>`;
-    case 'ego': {
+    case 'ego':
+      // An empty brain is not a dead end: the controls panel at the top
+      // keeps the brain switcher up; this panel teaches the one command.
       if (hasEdges) return EgoLedger({ data });
-      // An empty brain must not be a dead end when OTHER brains have
-      // data: keep the brain-switcher controls above the teaching copy.
-      const switcher = sb.connected && Array.isArray(sb.brains) && sb.brains.length > 1
-        ? EgoControls({ brain: data.brain, brains: sb.brains, focus: null, asOf: null, trail: [], names: sb.names || {} })
-        : '';
-      return switcher + EmptyBrainNote({ brain: data.brain, connected: sb.connected, error: sb.error });
-    }
+      return EmptyBrainNote({ brain: data.brain, connected: sb.connected, error: sb.error });
     case 'hubs':
       if (offline) return offNote;
       return hasEdges ? HubsPanel({ data }) : `<div class="panel-empty mono faint">YOUR MOST-CITED NOTES WILL RANK HERE</div>`;

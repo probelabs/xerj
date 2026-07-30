@@ -1,16 +1,19 @@
-//! wikilink@1 — `[[Target]]` / `[[Target|alias]]` in section text.
+//! wikilink@2 — `[[Target]]` / `[[Target|alias]]` in section text.
 //!
 //! The strongest signal the detectors have: a human deliberately named
 //! another note. Hence weight 1.0; confidence 0.95 rather than 1.0 because
 //! resolution is by name, and a corpus can hold two files answering to the
 //! same stem (the ambiguity is counted, never hidden).
+//!
+//! @2: dst moved from the target's `s0` section to its file-card node
+//! (`FILE_CARD_LOCATOR`) and edges carry `src_format`/`dst_format`.
 
 use super::{
     line_at, CorpusFile, CorpusIndex, DetectorCounters, EdgeDetector, EdgeDraft, SectionCtx,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const TAG: &str = "wikilink@1";
+pub const TAG: &str = "wikilink@2";
 pub const EDGE_TYPE: &str = "wikilink";
 pub const WEIGHT: f32 = 1.0;
 pub const CONFIDENCE: f32 = 0.95;
@@ -104,6 +107,8 @@ impl EdgeDetector for Wikilink {
                 src_file: ctx.file.rel.clone(),
                 quote: line_at(text, open),
                 offset: open as u64,
+                src_format: ctx.file.format.clone(),
+                dst_format: file.format.clone(),
             });
         }
     }
@@ -135,7 +140,8 @@ mod tests {
         let ctx = SectionCtx {
             corpus,
             file,
-            section_ordinal: 0,
+            section_label: "section 0",
+            prev_section: None,
             section_doc_id: "sec0",
             text,
         };

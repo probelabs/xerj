@@ -1,16 +1,19 @@
-//! mdlink@1 — `[text](relative/path.md)` where the target is a corpus file.
+//! mdlink@2 — `[text](relative/path.md)` where the target is a corpus file.
 //!
 //! Slightly below wikilink (weight 0.9): an inline markdown link is still an
 //! explicit authorial act, but it is also how people cite external material,
 //! so a resolved local target carries marginally less "these notes belong
 //! together" intent than a `[[wiki link]]`.
+//!
+//! @2: dst moved from the target's `s0` section to its file-card node and
+//! edges carry `src_format`/`dst_format`.
 
 use super::{
     line_at, resolve_local, DetectorCounters, EdgeDetector, EdgeDraft, LinkTarget, SectionCtx,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const TAG: &str = "mdlink@1";
+pub const TAG: &str = "mdlink@2";
 pub const EDGE_TYPE: &str = "mdlink";
 pub const WEIGHT: f32 = 0.9;
 pub const CONFIDENCE: f32 = 0.9;
@@ -71,6 +74,8 @@ impl EdgeDetector for Mdlink {
                     src_file: ctx.file.rel.clone(),
                     quote: line_at(ctx.text, open),
                     offset: open as u64,
+                    src_format: ctx.file.format.clone(),
+                    dst_format: target.format.clone(),
                 }),
                 // External links are what markdown links are FOR — skipping
                 // them silently is correct, only local misses are dangling.
@@ -108,7 +113,8 @@ mod tests {
         let ctx = SectionCtx {
             corpus,
             file,
-            section_ordinal: 0,
+            section_label: "section 0",
+            prev_section: None,
             section_doc_id: "sec0",
             text,
         };

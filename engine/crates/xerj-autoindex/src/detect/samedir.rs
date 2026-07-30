@@ -1,4 +1,6 @@
-//! samedir@1 — files sharing a directory, chained, never a clique.
+//! samedir@2 — files sharing a directory, chained, never a clique.
+//! (@2: endpoints moved from `s0` sections to file-card nodes; edges carry
+//! `src_format`/`dst_format`.)
 //!
 //! Directory co-location is weak evidence (weight 0.3, confidence 0.4 — the
 //! floor of the detector set): it often means "same topic", but it is the
@@ -17,7 +19,7 @@
 
 use super::{CorpusIndex, EdgeDetector, EdgeDraft};
 
-pub const TAG: &str = "samedir@1";
+pub const TAG: &str = "samedir@2";
 pub const EDGE_TYPE: &str = "same_dir";
 pub const WEIGHT: f32 = 0.3;
 pub const CONFIDENCE: f32 = 0.4;
@@ -51,6 +53,8 @@ impl EdgeDetector for SameDir {
                     src_file: left.rel.clone(),
                     quote: format!("{} and {} share directory {shown_dir}", left.rel, right.rel),
                     offset: 0,
+                    src_format: left.format.clone(),
+                    dst_format: right.format.clone(),
                 });
             }
         }

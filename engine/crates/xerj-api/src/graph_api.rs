@@ -18,7 +18,8 @@
 //! ```text
 //! POST   /_graph/{brain}/link            assert an edge (lazy index create)
 //! DELETE /_graph/{brain}/link/{edge_id}  soft-invalidate (bi-temporal; never removes)
-//! GET    /_graph/{brain}/ego             neighborhood of one node (+ hydration)
+//! GET    /_graph/{brain}/ego             neighborhood of one node — or up to
+//!                                        64 via `nodes=` (+ hydration)
 //! GET    /_graph/{brain}/overview        brain-level stats (dashboard feed)
 //! ```
 //!
@@ -71,6 +72,13 @@ const BRAIN_META_ID: &str = "__xerj-brain-meta";
 
 /// Max returned edges for `ego` (`limit` clamp ceiling).
 const MAX_EGO_LIMIT: usize = 1000;
+
+/// Max seed ids accepted by `ego`'s `nodes=` param (multi-seed expansion).
+/// Excess seeds are dropped and counted into `not_shown.frontier_clipped` —
+/// the same honesty channel the engine uses for its own frontier clip. Deeper
+/// exploration composes by iterating: expand again from a slice of the
+/// previous response's `reachable` ids.
+const EGO_SEEDS_CAP: usize = 64;
 
 /// Max dangling node ids listed verbatim in `not_shown.dangling_ids`.
 const MAX_DANGLING_LISTED: usize = 50;
@@ -164,6 +172,8 @@ fn edge_index_mapping() -> Value {
                 "confidence":     { "type": "float" },
                 "schema_version": { "type": "integer" },
                 "src_file":       { "type": "keyword" },
+                "src_format":     { "type": "keyword" },
+                "dst_format":     { "type": "keyword" },
                 "evidence": {
                     "properties": {
                         "quote":  { "type": "text" },
@@ -595,9 +605,16 @@ pub async fn unlink(
 /// Query params for `GET /_graph/{brain}/ego` (SECOND_BRAIN_SPEC §4.3).
 #[derive(Debug, Default, Deserialize)]
 pub struct EgoParams {
-    /// REQUIRED — the node to expand from.
+    /// The node to expand from. Exactly one of `node`/`nodes` is required.
     #[serde(default)]
     pub node: Option<String>,
+    /// Comma-separated seed ids for multi-seed expansion (mutually exclusive
+    /// with `node`; `node` is the 1-element case). Deduped; clamped to
+    /// [`EGO_SEEDS_CAP`] with the clip counted in
+    /// `not_shown.frontier_clipped`. This is the sanctioned drill-down
+    /// iterator: feed a slice of the previous response's `reachable` back in.
+    #[serde(default)]
+    pub nodes: Option<String>,
     /// 1 (default) or 2; anything else is a 400 with the not-a-graph-database
     /// wording.
     #[serde(default)]
@@ -629,9 +646,12 @@ pub struct EgoParams {
     pub include_evidence: Option<bool>,
 }
 
-/// `GET /_graph/{brain}/ego` — the bounded neighborhood of one node.
-/// Traversal reads doc-values columns only; evidence and node summaries are
-/// hydrated AFTER traversal, on the bounded result set, via `ids` queries.
+/// `GET /_graph/{brain}/ego` — the bounded neighborhood of one node, or of up
+/// to [`EGO_SEEDS_CAP`] seeds via `nodes=` (the engine expands a whole
+/// frontier at frontier-size-independent cost, so multi-seed is the same one
+/// bounded read). Traversal reads doc-values columns only; evidence and node
+/// summaries are hydrated AFTER traversal, on the bounded result set, via
+/// `ids` queries.
 pub async fn ego(
     State(state): State<AppState>,
     Path(brain): Path<String>,
@@ -640,15 +660,45 @@ pub async fn ego(
     if let Err(reason) = validate_brain(&brain) {
         return error_response(StatusCode::BAD_REQUEST, reason);
     }
-    let node = match params.node.as_deref() {
-        Some(n) if !n.is_empty() => n.to_string(),
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "`node` is required: the node id to expand from",
-            );
-        }
+    if params.node.is_some() && params.nodes.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "`node` and `nodes` are mutually exclusive — `nodes` is the multi-seed form",
+        );
+    }
+    // Seed list: `node` is the 1-element case of `nodes`. Deduped preserving
+    // order (the order is part of the `reachable` contract), then clamped to
+    // EGO_SEEDS_CAP with the clip counted — never silent.
+    let raw_seeds: Vec<String> = match (params.node.as_deref(), params.nodes.as_deref()) {
+        (Some(n), None) if !n.is_empty() => vec![n.to_string()],
+        (None, Some(ns)) => ns
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
     };
+    let mut seeds: Vec<String> = Vec::with_capacity(raw_seeds.len());
+    {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(raw_seeds.len());
+        for id in &raw_seeds {
+            if seen.insert(id.as_str()) {
+                seeds.push(id.clone());
+            }
+        }
+    }
+    if seeds.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "`node` (or comma-separated `nodes`) is required: the node id(s) to expand from",
+        );
+    }
+    let mut seeds_clipped = 0u64;
+    if seeds.len() > EGO_SEEDS_CAP {
+        seeds_clipped = (seeds.len() - EGO_SEEDS_CAP) as u64;
+        seeds.truncate(EGO_SEEDS_CAP);
+    }
     let hops = params.hops.unwrap_or(1);
     if hops == 0 || hops > 2 {
         return error_response(StatusCode::BAD_REQUEST, GRAPH_HOPS_CAP_REASON);
@@ -699,7 +749,7 @@ pub async fn ego(
     };
 
     let req = GraphExpandRequest {
-        frontier: vec![node.clone()],
+        frontier: seeds.clone(),
         hops: hops as u8,
         direction,
         types,
@@ -714,10 +764,9 @@ pub async fn ego(
 
     // Per-edge direction relative to the expansion: an edge discovered at hop
     // h is "out" iff its src was in hop h's frontier (an edge admitted by both
-    // scans reports "out"). The hop-1 frontier is the ego node; the hop-2
+    // scans reports "out"). The hop-1 frontier is the seed set; the hop-2
     // frontier is every endpoint hop 1 discovered.
-    let mut frontier1: HashSet<&str> = HashSet::new();
-    frontier1.insert(node.as_str());
+    let frontier1: HashSet<&str> = seeds.iter().map(String::as_str).collect();
     let mut frontier2: HashSet<&str> = HashSet::new();
     for e in result.edges.iter().filter(|e| e.hop == 1) {
         for id in [e.src.as_str(), e.dst.as_str()] {
@@ -814,6 +863,14 @@ pub async fn ego(
                         })
                         .map(|t| Value::from(t.chars().take(160).collect::<String>()))
                         .unwrap_or(Value::Null);
+                    // Truthful file label for the map/ledger: the autoindex
+                    // writer stamps `ax_path` on every note; null when absent
+                    // (manually-written nodes) — never fabricated.
+                    let path = src
+                        .and_then(|s| s.get("ax_path"))
+                        .and_then(Value::as_str)
+                        .map(Value::from)
+                        .unwrap_or(Value::Null);
                     let hit_index = h
                         .get("_index")
                         .cloned()
@@ -821,7 +878,7 @@ pub async fn ego(
                     found.insert(id.to_string());
                     nodes_obj.insert(
                         id.to_string(),
-                        json!({ "title": title, "preview": preview, "index": hit_index }),
+                        json!({ "title": title, "preview": preview, "path": path, "index": hit_index }),
                     );
                 }
             }
@@ -878,11 +935,10 @@ pub async fn ego(
         .collect();
 
     // Neighbors: first-discovery order following the sorted edge list,
-    // excluding the ego node; `via_edge` is the first sorted edge that
+    // excluding the seed nodes; `via_edge` is the first sorted edge that
     // reached each one.
     let mut neighbors: Vec<Value> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    seen.insert(node.as_str());
+    let mut seen: HashSet<&str> = seeds.iter().map(String::as_str).collect();
     for e in &result.edges {
         for id in [e.src.as_str(), e.dst.as_str()] {
             if seen.insert(id) {
@@ -891,10 +947,15 @@ pub async fn ego(
         }
     }
 
+    // `seeds` echoes the ADMITTED seed list (post-dedupe, post-clamp) so the
+    // caller can bookkeep exactly what was expanded; `node` stays on the
+    // response whenever there is exactly one seed (the 1-element case keeps
+    // its historical shape). Handler-clipped seeds fold into the same
+    // `frontier_clipped` counter the engine uses — one honesty channel.
     let mut resp = json!({
         "brain": brain,
         "contract": GRAPH_CONTRACT,
-        "node": node,
+        "seeds": seeds,
         "as_of": as_of,
         "hops": hops,
         "direction": direction_str,
@@ -902,7 +963,7 @@ pub async fn ego(
         "neighbors": neighbors,
         "not_shown": {
             "edges_clipped": result.stats.edges_clipped,
-            "frontier_clipped": result.stats.frontier_clipped,
+            "frontier_clipped": result.stats.frontier_clipped + seeds_clipped,
             "expired_excluded": result.stats.expired_excluded,
             "type_filtered": result.stats.type_filtered,
             "segments_without_columns": result.stats.segments_without_columns,
@@ -911,6 +972,21 @@ pub async fn ego(
             "dangling_ids": dangling_ids,
         }
     });
+    if let [only] = resp["seeds"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        // §8.5 is a normative instance including key order: `node` sits
+        // between `contract` and `seeds`, so rebuild in place rather than
+        // appending (which would serialize `node` last).
+        let only = only.clone();
+        let old = std::mem::take(resp.as_object_mut().expect("ego response is an object"));
+        let mut ordered = serde_json::Map::with_capacity(old.len() + 1);
+        for (k, v) in old {
+            if k == "seeds" {
+                ordered.insert("node".to_string(), only.clone());
+            }
+            ordered.insert(k, v);
+        }
+        resp = Value::Object(ordered);
+    }
     if include_nodes {
         resp["nodes"] = Value::Object(nodes_obj);
     }
@@ -1006,8 +1082,9 @@ fn embedder_id(state: &AppState) -> String {
 }
 
 /// `GET /_graph/{brain}/overview` — totals, live slice (types/detectors/
-/// hubs), and the created-over-time histogram. Exactly three composed
-/// searches; every top-N tail is reported in `not_shown`.
+/// hubs), the created-over-time histogram, and the notes total. Exactly three
+/// composed searches on the edges index plus one size-0 count on the nodes
+/// index; every top-N tail is reported in `not_shown`.
 pub async fn overview(
     State(state): State<AppState>,
     Path(brain): Path<String>,
@@ -1134,12 +1211,36 @@ pub async fn overview(
         .unwrap_or_default();
 
     let nodes_index = resolve_nodes_index(&state, &brain, &index).await;
+
+    // 4. Notes total: one size-0 count on the nodes index. A brain whose
+    // nodes index was never created (edges asserted through the API alone)
+    // truthfully has 0 stored notes — reported as such, not a 404 and never
+    // fabricated from edge endpoints.
+    let nodes_total = if index_exists(&state, &nodes_index) {
+        let count_body = EsSearchBody {
+            query: Some(json!({ "match_all": {} })),
+            size: 0,
+            track_total_hits: Some(json!(true)),
+            ..Default::default()
+        };
+        match overview_search(&state, &nodes_index, count_body).await {
+            Ok(v) => v
+                .pointer("/hits/total/value")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            Err(r) => return r,
+        }
+    } else {
+        0
+    };
+
     Json(json!({
         "brain": brain,
         "contract": GRAPH_CONTRACT,
         "exists": true,
         "as_of": as_of,
         "nodes_index": nodes_index,
+        "nodes": { "total": nodes_total },
         "embedder": embedder_id(&state),
         "edges": {
             "total": total,
@@ -1393,10 +1494,36 @@ mod tests {
         );
         got["not_shown"]["memtable_docs_scanned"] = json!(0);
 
+        // §8.5 is normative INCLUDING top-level key order: `node` sits between
+        // `contract` and `seeds` on the wire (Value equality alone can't see
+        // an order regression).
+        let keys: Vec<&str> = got
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "brain",
+                "contract",
+                "node",
+                "seeds",
+                "as_of",
+                "hops",
+                "direction",
+                "edges",
+                "neighbors",
+                "not_shown"
+            ]
+        );
+
         let expected = json!({
             "brain": "notes",
             "contract": "xerj-second-brain/1",
             "node": "note-alpha",
+            "seeds": ["note-alpha"],
             "as_of": 1753700000000i64,
             "hops": 1,
             "direction": "both",
@@ -1579,6 +1706,8 @@ mod tests {
         assert_eq!(b["exists"], json!(true));
         assert_eq!(b["nodes_index"], json!(".xerj-memory-notes"));
         assert_eq!(b["embedder"], json!("lexical-feature-hash"));
+        // No nodes index exists for this brain yet → 0 stored notes, honestly.
+        assert_eq!(b["nodes"], json!({ "total": 0 }));
         assert_eq!(
             b["edges"],
             json!({ "total": 8, "live": 8, "invalidated": 0 })
@@ -1657,6 +1786,224 @@ mod tests {
         assert_eq!(
             b,
             json!({ "brain": "nope", "contract": GRAPH_CONTRACT, "exists": false })
+        );
+    }
+
+    /// The wire-level contract for multi-seed: `?nodes=a,b` arrives through
+    /// the real axum `Query` extractor as ONE comma-separated string (the
+    /// urlencoded parser does not split on commas) — this pins that.
+    #[test]
+    fn ego_params_parse_from_a_real_query_string() {
+        let uri: axum::http::Uri =
+            "/_graph/notes/ego?nodes=note-beta,note-epsilon&hops=2&as_of=1753700000000"
+                .parse()
+                .unwrap();
+        let Query(p) = Query::<EgoParams>::try_from_uri(&uri).unwrap();
+        assert_eq!(p.nodes.as_deref(), Some("note-beta,note-epsilon"));
+        assert_eq!(p.node, None);
+        assert_eq!(p.hops, Some(2));
+        assert_eq!(p.as_of.as_deref(), Some("1753700000000"));
+    }
+
+    /// Multi-seed ego (`nodes=`): the union of the seed neighborhoods in the
+    /// §3.2 stable order, directions relative to the seed SET, neighbors
+    /// excluding every seed, `seeds` echoed, `node` absent (>1 seed).
+    #[tokio::test]
+    async fn ego_multi_seed_unions_neighborhoods() {
+        let state = test_state();
+        link_fixture(&state).await;
+
+        let p = EgoParams {
+            nodes: Some("note-beta,note-epsilon".into()),
+            as_of: Some(AS_OF.to_string()),
+            ..Default::default()
+        };
+        let (s, b) = do_ego(&state, "notes", p).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["seeds"], json!(["note-beta", "note-epsilon"]));
+        assert!(
+            b.get("node").is_none(),
+            "multi-seed response must not carry a single `node`: {b}"
+        );
+
+        // beta touches fixture edges 0/2/4/5; epsilon touches 6/7 — six edges
+        // in (hop asc, weight desc, edge_id asc) order, direction "out" iff
+        // the edge's src is one of the seeds.
+        let got: Vec<(&str, &str)> = b["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["edge_id"].as_str().unwrap(),
+                    e["direction"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (FIXTURE_IDS[2], "out"), // beta → gamma (wikilink)
+                (FIXTURE_IDS[0], "in"),  // alpha → beta (wikilink)
+                (FIXTURE_IDS[6], "in"),  // delta → epsilon (same_dir)
+                (FIXTURE_IDS[4], "in"),  // alpha → beta (same_dir)
+                (FIXTURE_IDS[7], "out"), // epsilon → gamma (same_dir)
+                (FIXTURE_IDS[5], "out"), // beta → delta (same_dir)
+            ]
+        );
+        let neighbor_ids: Vec<&str> = b["neighbors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(neighbor_ids, vec!["note-gamma", "note-alpha", "note-delta"]);
+        assert_eq!(b["not_shown"]["frontier_clipped"], json!(0));
+
+        // node+nodes together → 400 (mutually exclusive).
+        let p = EgoParams {
+            node: Some("note-alpha".into()),
+            nodes: Some("note-beta".into()),
+            as_of: Some(AS_OF.to_string()),
+            ..Default::default()
+        };
+        let (s, b) = do_ego(&state, "notes", p).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(b["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("mutually exclusive"));
+
+        // An all-empty seed list → the same 400 as a missing `node`.
+        let p = EgoParams {
+            nodes: Some(", ,".into()),
+            ..Default::default()
+        };
+        let (s, _) = do_ego(&state, "notes", p).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // A 1-element `nodes` IS the `node` case: `node` stays on the shape.
+        let p = EgoParams {
+            nodes: Some("note-alpha".into()),
+            as_of: Some(AS_OF.to_string()),
+            ..Default::default()
+        };
+        let (s, b) = do_ego(&state, "notes", p).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["node"], json!("note-alpha"));
+        assert_eq!(b["seeds"], json!(["note-alpha"]));
+    }
+
+    /// A seed list beyond EGO_SEEDS_CAP is clipped — never silently — into
+    /// the same `frontier_clipped` counter the engine uses; duplicates dedupe
+    /// before the cap so they cost nothing.
+    #[tokio::test]
+    async fn ego_seed_cap_is_counted() {
+        let state = test_state();
+        link_fixture(&state).await;
+
+        // 70 distinct seeds (note-alpha first + 69 unknowns) → 64 kept, 6
+        // clipped; input order preserved so note-alpha survives the clamp.
+        let mut ids: Vec<String> = vec!["note-alpha".into()];
+        ids.extend((0..69).map(|i| format!("ghost-{i:02}")));
+        let p = EgoParams {
+            nodes: Some(ids.join(",")),
+            as_of: Some(AS_OF.to_string()),
+            ..Default::default()
+        };
+        let (s, b) = do_ego(&state, "notes", p).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["seeds"].as_array().unwrap().len(), 64);
+        assert_eq!(b["seeds"][0], json!("note-alpha"));
+        assert_eq!(b["not_shown"]["frontier_clipped"], json!(6));
+        assert_eq!(b["edges"].as_array().unwrap().len(), 4);
+
+        // 100 copies of one id are one seed — dedupe precedes the cap.
+        let p = EgoParams {
+            nodes: Some(vec!["note-alpha"; 100].join(",")),
+            as_of: Some(AS_OF.to_string()),
+            ..Default::default()
+        };
+        let (s, b) = do_ego(&state, "notes", p).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["seeds"], json!(["note-alpha"]));
+        assert_eq!(b["not_shown"]["frontier_clipped"], json!(0));
+    }
+
+    /// A2 + A3: `overview.nodes.total` counts stored notes once the nodes
+    /// index exists (0, honestly, before that), and ego node hydration
+    /// carries `path` from `ax_path` (null when the note has none).
+    #[tokio::test]
+    async fn overview_nodes_total_and_hydrated_path() {
+        let state = test_state();
+        link_fixture(&state).await;
+
+        async fn put_node(state: &AppState, id: &str, doc: Value) {
+            let resp = es_compat::index_doc(
+                State(state.clone()),
+                Path((".xerj-memory-notes".to_string(), id.to_string())),
+                Query(IndexDocParams::default()),
+                Json(doc),
+            )
+            .await
+            .into_response();
+            let (s, b) = drain_json(resp).await;
+            assert!(s.is_success(), "storing node {id} failed: {b}");
+        }
+        async fn ov(state: &AppState) -> Value {
+            let resp = overview(
+                State(state.clone()),
+                Path("notes".to_string()),
+                Query(OverviewParams {
+                    as_of: Some(AS_OF.to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            drain_json(resp).await.1
+        }
+
+        // Before any node doc exists: total 0 (no nodes index — not a 404).
+        assert_eq!(ov(&state).await["nodes"], json!({ "total": 0 }));
+
+        put_node(
+            &state,
+            "note-alpha",
+            json!({
+                "title": "Alpha", "text": "Alpha is the hub note.",
+                "ax_path": "notes/alpha.md", "ax_format": "md"
+            }),
+        )
+        .await;
+        put_node(
+            &state,
+            "note-beta",
+            json!({ "title": "Beta", "body": "Beta continues the thread." }),
+        )
+        .await;
+
+        assert_eq!(ov(&state).await["nodes"], json!({ "total": 2 }));
+
+        let mut p = ego_params("note-alpha", AS_OF);
+        p.include_nodes = Some(true);
+        let (s, b) = do_ego(&state, "notes", p).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["nodes"]["note-alpha"],
+            json!({
+                "title": "Alpha",
+                "preview": "Alpha is the hub note.",
+                "path": "notes/alpha.md",
+                "index": ".xerj-memory-notes"
+            })
+        );
+        // No ax_path on beta → null, never guessed.
+        assert_eq!(b["nodes"]["note-beta"]["path"], json!(null));
+        // gamma + delta still dangle — counted and listed.
+        assert_eq!(b["not_shown"]["dangling_nodes"], json!(2));
+        assert_eq!(
+            b["not_shown"]["dangling_ids"],
+            json!(["note-delta", "note-gamma"])
         );
     }
 }

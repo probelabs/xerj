@@ -212,8 +212,23 @@ pub fn decode_text(bytes: &[u8]) -> (String, &'static str) {
 
 fn classify_text(text: &str, nonblank: &[&str]) -> Family {
     let trimmed = text.trim_start();
+    // A lone `[section]` opening line that does not parse as JSON is a
+    // TOML/INI table header (`[package]` in Cargo.toml, `[Unit]` in a
+    // systemd unit), not a JSON array. Without this guard every such file
+    // fell into the JSON branch below (any '['-opener passes
+    // `looks_like_json_start`), reached the JSON extractor, and was junked
+    // — which, for Cargo.toml, also silently disabled the cratecite
+    // detector on every real repository (its crate table only holds
+    // indexed files). Live-verified 2026-07-30: three Cargo.tomls junked
+    // as "json candidate family" before this guard, indexed after.
+    let ini_table_header = nonblank.first().is_some_and(|l| {
+        let t = l.trim();
+        t.starts_with('[')
+            && t.ends_with(']')
+            && serde_json::from_str::<serde_json::Value>(t).is_err()
+    });
     // JSON / JSONL
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+    if !ini_table_header && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
         if nonblank.len() >= 2 {
             let parse_ok = nonblank
                 .iter()
@@ -505,6 +520,28 @@ mod tests {
         assert_eq!(
             classify("key: value\nother: 1\nnested:\n  a: 2\n"),
             Family::Yaml
+        );
+    }
+
+    /// `[package]`-style openers are TOML/INI table headers, not JSON
+    /// arrays. Before the guard, Cargo.toml sniffed as Json, the JSON
+    /// extractor junked it, and cratecite's crate table stayed empty on
+    /// every real repository (its dst must be an INDEXED Cargo.toml).
+    #[test]
+    fn toml_table_header_is_not_json() {
+        let cargo = "[package]\nname = \"xerj-fts\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                     [dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n\
+                     serde_json = \"1\"\nanyhow = \"1\"\n";
+        assert_eq!(classify(cargo), Family::TxtLines);
+        let ini = "[Unit]\nDescription=demo\nAfter=network.target\n\n\
+                   [Service]\nExecStart=/bin/true\nRestart=always\n\n\
+                   [Install]\nWantedBy=multi-user.target\n";
+        assert_eq!(classify(ini), Family::TxtLines);
+        // …while real JSON arrays keep their family.
+        assert_eq!(classify("[1, 2, 3]\n"), Family::Json);
+        assert_eq!(
+            classify("[\n  {\"a\": 1},\n  {\"a\": 2}\n]\n"),
+            Family::Json
         );
     }
 

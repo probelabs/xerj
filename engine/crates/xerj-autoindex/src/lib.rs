@@ -155,14 +155,22 @@ struct GraphRt {
     invalidated: u64,
 }
 
-/// `emit_document` section locators are `s{i}`; everything else (row/line/
-/// table locators) is not a text section and must not reach `detect_text`.
-fn section_ordinal(locator: &str) -> Option<u32> {
-    let rest = locator.strip_prefix('s')?;
-    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+/// Text-section locator → human label ("section 3", "page 2 section 0").
+/// `emit_document` section locators are `s{i}`; PDF sections are
+/// `p{page}-s{sec}` (extract/pdf.rs — page-major, so stream order IS the
+/// lexicographic (page, sec) reading order). Everything else (row/line/byte/
+/// table locators) is not a text section, returns None, and must not reach
+/// `detect_text`. The label is used verbatim in sequence evidence rationales.
+fn section_label(locator: &str) -> Option<String> {
+    fn digits(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
     }
-    rest.parse().ok()
+    if let Some(rest) = locator.strip_prefix('s') {
+        return digits(rest).then(|| format!("section {rest}"));
+    }
+    let rest = locator.strip_prefix('p')?;
+    let (page, sec) = rest.split_once("-s")?;
+    (digits(page) && digits(sec)).then(|| format!("page {page} section {sec}"))
 }
 
 // ─── Phase A: per-file scan (sniff + bounded sampling) ───────────────────
@@ -1106,6 +1114,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     // staging file (different target index) and sent only
                     // after the node bulks are accepted (§6.7).
                     let mut edge_drafts: Vec<detect::EdgeDraft> = Vec::new();
+                    // (doc id, label) of the last staged text section — the
+                    // sequence detector's predecessor. Stream order is the
+                    // only source that can name a PDF page boundary's
+                    // predecessor (p2-s0 follows the LAST section of page 1).
+                    let mut prev_section: Option<(String, String)> = None;
                     let mut staged = match tempfile::Builder::new()
                         .prefix(".autoindex-stage-")
                         .tempfile_in(&state_dir)
@@ -1128,6 +1141,62 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             errors.push(format!("{error:#}"));
                         }
                         continue;
+                    }
+                    // File-card anchor node (§6.6.2a): one card doc per corpus
+                    // file, staged BEFORE the file's records. Its
+                    // deterministic id is `CorpusFile.anchor_doc_id` — the
+                    // node every file-level edge (wikilink/mdlink/href/
+                    // pathcite/cratecite/samedir dst, sequence opener src)
+                    // terminates at. Row/line/page families have no `s0`
+                    // section doc, so without the card those edges pointed at
+                    // ghosts. Not counted as an extracted record: it is
+                    // derived anchor infrastructure, not file content.
+                    if let Some(gr) = graph.as_ref() {
+                        if let Some(cf) = gr.corpus.files.get(&f.rel) {
+                            if let Some(rt) = ds_rt.get(&cf.dataset_slug) {
+                                let name = f.rel.rsplit('/').next().unwrap_or(&f.rel);
+                                let mut fields = Map::new();
+                                fields.insert("title".into(), Value::String(name.to_string()));
+                                fields.insert("ax_path".into(), Value::String(f.rel.clone()));
+                                fields.insert(
+                                    "ax_paths".into(),
+                                    Value::Array(
+                                        paths_by_key
+                                            .get(key)
+                                            .into_iter()
+                                            .flatten()
+                                            .cloned()
+                                            .map(Value::String)
+                                            .collect(),
+                                    ),
+                                );
+                                fields.insert("ax_file".into(), Value::String(key.clone()));
+                                fields.insert(
+                                    "ax_locator".into(),
+                                    Value::String(detect::FILE_CARD_LOCATOR.into()),
+                                );
+                                fields.insert(
+                                    "ax_dataset".into(),
+                                    Value::String(cf.dataset_slug.clone()),
+                                );
+                                fields.insert("ax_run".into(), Value::String(run_id.clone()));
+                                fields.insert(
+                                    "ax_format".into(),
+                                    Value::String(format_str(Some(&sn))),
+                                );
+                                let action = json!({"index": {
+                                    "_index": rt.index, "_id": cf.anchor_doc_id}});
+                                if let Err(error) = writeln!(
+                                    staged.as_file_mut(),
+                                    "{}\n{}",
+                                    action,
+                                    Value::Object(fields)
+                                ) {
+                                    send_err =
+                                        Some(format!("stage file card for {}: {error}", f.rel));
+                                }
+                            }
+                        }
                     }
                     {
                         let mut sink = |rec: extract::RawRecord| -> bool {
@@ -1182,7 +1251,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             // string the node doc carries, and `id` is the
                             // section node the evidence lives in.
                             if let Some(gr) = graph.as_ref() {
-                                if let Some(ordinal) = section_ordinal(&rec.locator) {
+                                if let Some(label) = section_label(&rec.locator) {
                                     if let (Some(cf), Some(body)) = (
                                         gr.corpus.files.get(&f.rel),
                                         doc.get("body").and_then(Value::as_str),
@@ -1190,13 +1259,17 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                         let ctx = detect::SectionCtx {
                                             corpus: &gr.corpus,
                                             file: cf,
-                                            section_ordinal: ordinal,
+                                            section_label: &label,
+                                            prev_section: prev_section
+                                                .as_ref()
+                                                .map(|(pid, pl)| (pid.as_str(), pl.as_str())),
                                             section_doc_id: &id,
                                             text: body,
                                         };
                                         for det in &gr.detectors {
                                             det.detect_text(&ctx, &mut edge_drafts);
                                         }
+                                        prev_section = Some((id.clone(), label));
                                     }
                                 }
                             }
@@ -2055,6 +2128,31 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod section_label_tests {
+    use super::section_label;
+
+    /// The two text-section locator grammars (§6.6.2) and their labels; every
+    /// other locator shape must be None so row/line/byte records never reach
+    /// `detect_text`.
+    #[test]
+    fn labels_only_text_section_locators() {
+        assert_eq!(section_label("s0").as_deref(), Some("section 0"));
+        assert_eq!(section_label("s17").as_deref(), Some("section 17"));
+        assert_eq!(section_label("p1-s0").as_deref(), Some("page 1 section 0"));
+        assert_eq!(
+            section_label("p12-s3").as_deref(),
+            Some("page 12 section 3")
+        );
+        for not_a_section in [
+            "s", "sx", "s1x", "p1", "p1-s", "p-s1", "px-s1", "b1024", "row7", "file", "line3",
+            "p1-s2-x",
+        ] {
+            assert_eq!(section_label(not_a_section), None, "{not_a_section}");
+        }
+    }
 }
 
 #[cfg(test)]

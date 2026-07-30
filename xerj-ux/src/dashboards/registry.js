@@ -49,6 +49,13 @@ for (const d of [aiOverview, ragQuality, vectorIndex, agentMemory, secondBrain, 
   d.section = 'dashboards';
   d.group = DEFAULT_GROUP[d.id] || 'other';
 }
+// Second Brain only earns a NAV entry once the engine holds at least
+// one brain (someone ran `xerj brain <folder>`). Generic flag: the
+// shell (app.js) filters the nav list on `state.liveFeatures[key]`,
+// fed by data/brains-probe.js — no dashboard id is hardcoded there.
+// Routing, MANAGE, and deep links (`#/dashboards/second-brain?...`)
+// always resolve; only nav presence is gated.
+secondBrain.requiresLive = 'brains';
 // Search-discover gets tagged as the DISCOVER section (promoted out of the dashboards list).
 searchDiscover.section = 'discover';
 

@@ -4,11 +4,23 @@
 // The relationship layer over documents that already exist: edges are
 // ordinary XERJ documents, bi-temporal and soft-delete-only, asserted
 // by deterministic detectors (or by hand) with the exact source quote
-// as evidence. This dashboard is an EGO LEDGER — inbound edges left,
-// the focus memory centre, outbound edges right — with a belief-time
-// scrubber to replay what the brain believed at any moment. A global
-// force-directed graph was rejected by design (non-deterministic
-// layout, collapses past ~200 nodes); see ux/ego-ledger.js.
+// as evidence.
+//
+// Composition, top to bottom (the decided §1.1 order):
+//   controls   brain switcher · trail crumbs · FIND
+//   map        THE MAP — bounded, deterministic overview (mounted by
+//              ux/brain-map.js; this dashboard renders the mount point)
+//   scrub      ONE belief-time caret for the whole page — the map
+//              restyles and the ledger restates from the same drag
+//   stats      counts, kinds, teachers, file types, crossings, and the
+//              page's own attributed read log — ran numbers only
+//   ego        THE LEDGER — the leaf view; every link's evidence
+//   hubs/honesty
+//
+// The ledger is still the terminal surface: a global force-directed
+// hairball stays rejected (see ux/ego-ledger.js). The map above it is
+// bounded by construction and routes every terminal click back into
+// the ledger.
 //
 // LIVE DATA ONLY. data/backends/xerj.js routes this dashboard to
 // data/second-brain-api.js, which reads /_graph/{brain}/overview and
@@ -29,8 +41,8 @@ export const secondBrain = {
   id: 'second-brain',
   name: 'Second Brain',
   render: ({ data, time }) => {
-    // Traces (the 1px focus→group lines) need real layout; schedule a
-    // post-paint measure+draw pass. No-op outside a browser.
+    // Traces + the map mount need real layout; schedule a post-paint
+    // measure+draw pass. No-op outside a browser.
     sbAfterRender();
     return {
       title: 'SECOND BRAIN',
@@ -44,6 +56,12 @@ export const secondBrain = {
       // Schema vocabulary (edge, src/dst, as-of) stays in the API and
       // in the evidence paper-trail, never in a panel title.
       panels: [
+        { id: 'controls', eyebrow: 'YOU ARE HERE · BRAIN, FOCUS, FIND', cols: 12, type: 'controls',
+          render: () => body('controls', data) },
+        { id: 'map', eyebrow: 'THE MAP · THE WHOLE BRAIN AT A GLANCE', cols: 12, type: 'map',
+          render: () => body('map', data) },
+        { id: 'scrub', eyebrow: 'BELIEF TIME · ONE CARET DRIVES THE WHOLE PAGE', cols: 12, type: 'scrub',
+          render: () => body('scrub', data) },
         { id: 'edgesLive', eyebrow: 'BELIEVED AT THIS MOMENT', cols: 3, type: 'metric',
           render: () => body('edgesLive', data) },
         { id: 'edgesTotal', eyebrow: 'EVER ASSERTED', cols: 3, type: 'metric',
@@ -56,6 +74,12 @@ export const secondBrain = {
           render: () => body('typeDist', data) },
         { id: 'edgeTimeline', eyebrow: 'NEW LINKS PER DAY', cols: 6, type: 'series',
           render: () => body('edgeTimeline', data) },
+        { id: 'notes', eyebrow: 'WHAT THIS BRAIN HOLDS', cols: 4, type: 'notes',
+          render: () => body('notes', data) },
+        { id: 'crossings', eyebrow: 'LINKS ACROSS FILE TYPES', cols: 4, type: 'crossings',
+          render: () => body('crossings', data) },
+        { id: 'reads', eyebrow: 'WHAT THIS VIEW READ · AND WHY', cols: 4, type: 'reads',
+          render: () => body('reads', data) },
         { id: 'ego', eyebrow: 'THE LEDGER · ONE NOTE, EVERYTHING IT TOUCHES', cols: 12, type: 'ego',
           render: () => body('ego', data) },
         { id: 'hubs', eyebrow: 'CENTERS OF GRAVITY', cols: 6, type: 'topn',

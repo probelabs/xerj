@@ -62,16 +62,18 @@ impl MockEs {
             .unwrap_or_default()
     }
 
-    /// rel path → anchor node `_id`, straight from the published node docs so
-    /// the expectation uses exactly the ids the pipeline derived.
-    fn anchors(&self) -> HashMap<String, String> {
+    /// rel path → node `_id` for one locator, straight from the published
+    /// node docs so expectations use exactly the ids the pipeline derived.
+    /// `"file"` = the per-file card (anchor of every file-level edge);
+    /// `"s0"` = the first text section.
+    fn nodes_at(&self, locator: &str) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for (index, docs) in self.docs.lock().unwrap().iter() {
             if index.starts_with('.') {
                 continue; // catalog + edges indices are not node datasets
             }
             for (id, source) in docs {
-                if source.get("ax_locator").and_then(Value::as_str) == Some("s0") {
+                if source.get("ax_locator").and_then(Value::as_str) == Some(locator) {
                     if let Some(rel) = source.get("ax_path").and_then(Value::as_str) {
                         out.insert(rel.to_string(), id.clone());
                     }
@@ -79,6 +81,10 @@ impl MockEs {
             }
         }
         out
+    }
+
+    fn anchors(&self) -> HashMap<String, String> {
+        self.nodes_at(detect::FILE_CARD_LOCATOR)
     }
 }
 
@@ -315,6 +321,8 @@ struct EdgeKey {
     src_file: String,
     quote: String,
     offset: u64,
+    src_format: String,
+    dst_format: String,
 }
 
 fn edge_keys(edges: &BTreeMap<String, Value>) -> Vec<EdgeKey> {
@@ -344,6 +352,8 @@ fn edge_keys(edges: &BTreeMap<String, Value>) -> Vec<EdgeKey> {
                 src_file: s["src_file"].as_str().unwrap().into(),
                 quote: s["evidence"]["quote"].as_str().unwrap().into(),
                 offset: s["evidence"]["offset"].as_u64().unwrap(),
+                src_format: s["src_format"].as_str().unwrap_or("").into(),
+                dst_format: s["dst_format"].as_str().unwrap_or("").into(),
             }
         })
         .collect();
@@ -351,9 +361,13 @@ fn edge_keys(edges: &BTreeMap<String, Value>) -> Vec<EdgeKey> {
     out
 }
 
+/// `src_map`/`dst_map` pick the endpoint node per edge semantics: authored
+/// text edges (wikilink) START at the section holding the evidence and LAND on
+/// the target's file card; structural samedir edges connect card to card.
 #[allow(clippy::too_many_arguments)]
 fn expect(
-    anchors: &HashMap<String, String>,
+    src_map: &HashMap<String, String>,
+    dst_map: &HashMap<String, String>,
     src_rel: &str,
     dst_rel: &str,
     edge_type: &str,
@@ -364,8 +378,8 @@ fn expect(
     offset: u64,
 ) -> EdgeKey {
     EdgeKey {
-        src: anchors[src_rel].clone(),
-        dst: anchors[dst_rel].clone(),
+        src: src_map[src_rel].clone(),
+        dst: dst_map[dst_rel].clone(),
         edge_type: edge_type.into(),
         detector: detector.into(),
         weight: weight.into(),
@@ -373,6 +387,29 @@ fn expect(
         src_file: src_rel.into(),
         quote: quote.into(),
         offset,
+        src_format: "md".into(),
+        dst_format: "md".into(),
+    }
+}
+
+/// The @2 opening edge of every text file's reading chain: card → section 0.
+fn expect_opener(
+    anchors: &HashMap<String, String>,
+    sections: &HashMap<String, String>,
+    rel: &str,
+) -> EdgeKey {
+    EdgeKey {
+        src: anchors[rel].clone(),
+        dst: sections[rel].clone(),
+        edge_type: "sequence".into(),
+        detector: "sequence@2".into(),
+        weight: "0.8".into(),
+        confidence: "0.99".into(),
+        src_file: rel.into(),
+        quote: format!("section 0 opens {rel}"),
+        offset: 0,
+        src_format: "md".into(),
+        dst_format: "md".into(),
     }
 }
 
@@ -389,7 +426,15 @@ fn fixture_folder_end_to_end_matches_the_contract_edge_set() {
     );
 
     let anchors = es.anchors();
-    assert_eq!(anchors.len(), 5, "five single-section note anchors");
+    assert_eq!(anchors.len(), 5, "five file-card anchor nodes");
+    let sections = es.nodes_at("s0");
+    assert_eq!(sections.len(), 5, "five s0 section nodes");
+    for rel in anchors.keys() {
+        assert_ne!(
+            anchors[rel], sections[rel],
+            "card and first section are distinct nodes"
+        );
+    }
     let edges = es.index(EDGES_INDEX);
     assert!(
         edges.contains_key(detect::BRAIN_META_ID),
@@ -404,44 +449,48 @@ fn fixture_folder_end_to_end_matches_the_contract_edge_set() {
     let mut expected = vec![
         // §8.2/§8.3 wikilink edges — exact quotes and byte offsets.
         expect(
+            &sections,
             &anchors,
             "alpha.md",
             "beta.md",
             "wikilink",
-            "wikilink@1",
+            "wikilink@2",
             "1.0",
             "0.95",
             alpha_line,
             35,
         ),
         expect(
+            &sections,
             &anchors,
             "alpha.md",
             "gamma.md",
             "wikilink",
-            "wikilink@1",
+            "wikilink@2",
             "1.0",
             "0.95",
             alpha_line,
             48,
         ),
         expect(
+            &sections,
             &anchors,
             "beta.md",
             "gamma.md",
             "wikilink",
-            "wikilink@1",
+            "wikilink@2",
             "1.0",
             "0.95",
             "Beta continues the thread and references [[gamma]].",
             41,
         ),
         expect(
+            &sections,
             &anchors,
             "delta.md",
             "alpha.md",
             "wikilink",
-            "wikilink@1",
+            "wikilink@2",
             "1.0",
             "0.95",
             "Delta cites [[alpha]] as its source.",
@@ -450,10 +499,11 @@ fn fixture_folder_end_to_end_matches_the_contract_edge_set() {
         // §8.3 samedir chain over rel-sorted files — 4 edges, not a clique.
         expect(
             &anchors,
+            &anchors,
             "alpha.md",
             "beta.md",
             "same_dir",
-            "samedir@1",
+            "samedir@2",
             "0.3",
             "0.4",
             "alpha.md and beta.md share directory .",
@@ -461,10 +511,11 @@ fn fixture_folder_end_to_end_matches_the_contract_edge_set() {
         ),
         expect(
             &anchors,
+            &anchors,
             "beta.md",
             "delta.md",
             "same_dir",
-            "samedir@1",
+            "samedir@2",
             "0.3",
             "0.4",
             "beta.md and delta.md share directory .",
@@ -472,10 +523,11 @@ fn fixture_folder_end_to_end_matches_the_contract_edge_set() {
         ),
         expect(
             &anchors,
+            &anchors,
             "delta.md",
             "epsilon.md",
             "same_dir",
-            "samedir@1",
+            "samedir@2",
             "0.3",
             "0.4",
             "delta.md and epsilon.md share directory .",
@@ -483,23 +535,32 @@ fn fixture_folder_end_to_end_matches_the_contract_edge_set() {
         ),
         expect(
             &anchors,
+            &anchors,
             "epsilon.md",
             "gamma.md",
             "same_dir",
-            "samedir@1",
+            "samedir@2",
             "0.3",
             "0.4",
             "epsilon.md and gamma.md share directory .",
             0,
         ),
+        // sequence@2 opening edges: every file's card starts its reading
+        // chain (single-section notes have exactly the opener).
+        expect_opener(&anchors, &sections, "alpha.md"),
+        expect_opener(&anchors, &sections, "beta.md"),
+        expect_opener(&anchors, &sections, "delta.md"),
+        expect_opener(&anchors, &sections, "epsilon.md"),
+        expect_opener(&anchors, &sections, "gamma.md"),
     ];
     expected.sort();
     assert_eq!(edge_keys(&edges), expected, "the exact §8.3 edge set");
 
     let g = journal_graph_summary(state.path());
-    assert_eq!(g["edges_written"], json!(8));
-    assert_eq!(g["by_detector"]["wikilink@1"], json!(4));
-    assert_eq!(g["by_detector"]["samedir@1"], json!(4));
+    assert_eq!(g["edges_written"], json!(13));
+    assert_eq!(g["by_detector"]["wikilink@2"], json!(4));
+    assert_eq!(g["by_detector"]["samedir@2"], json!(4));
+    assert_eq!(g["by_detector"]["sequence@2"], json!(5));
     assert_eq!(g["edges_unresolved"], json!(0));
     assert_eq!(g["edges_ambiguous"], json!(0));
     assert_eq!(g["edges_self_dropped"], json!(0));
@@ -550,20 +611,26 @@ fn dangling_wikilink_is_counted_not_silently_dropped() {
 
     let edges = es.index(EDGES_INDEX);
     let keys = edge_keys(&edges);
-    let types: Vec<(&str, &str)> = keys
-        .iter()
-        .map(|k| (k.edge_type.as_str(), k.detector.as_str()))
-        .collect();
-    // One resolved wikilink + one samedir chain edge; [[nowhere]] must not
-    // fabricate an edge…
+    let mut by_type: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    for k in &keys {
+        *by_type
+            .entry((k.edge_type.as_str(), k.detector.as_str()))
+            .or_default() += 1;
+    }
+    // One resolved wikilink + one samedir chain edge + two sequence openers
+    // (card → s0, one per file); [[nowhere]] must not fabricate an edge…
     assert_eq!(
-        types,
-        vec![("same_dir", "samedir@1"), ("wikilink", "wikilink@1")]
+        by_type,
+        BTreeMap::from([
+            (("same_dir", "samedir@2"), 1),
+            (("sequence", "sequence@2"), 2),
+            (("wikilink", "wikilink@2"), 1),
+        ])
     );
     // …but it must not vanish either: it is a dangling-link fact of record.
     let g = journal_graph_summary(state.path());
     assert_eq!(g["edges_unresolved"], json!(1));
-    assert_eq!(g["edges_written"], json!(2));
+    assert_eq!(g["edges_written"], json!(4));
 }
 
 #[test]

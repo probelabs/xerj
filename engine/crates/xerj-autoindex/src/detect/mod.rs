@@ -16,8 +16,10 @@
 //! WAL → memtable → segment path and are soft-invalidated (never deleted) so
 //! "what did it believe last Tuesday" stays answerable.
 
+pub mod cratecite;
 pub mod href;
 pub mod mdlink;
+pub mod pathcite;
 pub mod samedir;
 pub mod sequence;
 pub mod wikilink;
@@ -113,6 +115,8 @@ pub fn edge_index_mapping() -> Value {
                 "confidence":     { "type": "float" },
                 "schema_version": { "type": "integer" },
                 "src_file":       { "type": "keyword" },
+                "src_format":     { "type": "keyword" },
+                "dst_format":     { "type": "keyword" },
                 "evidence": {
                     "properties": {
                         "quote":  { "type": "text" },
@@ -135,6 +139,16 @@ pub struct CorpusIndex {
     /// lowercase file-stem → rel paths bearing it (wikilink resolution;
     /// BTreeMap + sorted values so ambiguity resolution is deterministic).
     pub by_stem: BTreeMap<String, Vec<String>>,
+    /// exact file NAME (final path segment, case-sensitive) → rel paths
+    /// bearing it. pathcite's suffix resolution: a token's last segment keys
+    /// this table, then candidates are filtered by full-suffix match — O(log n)
+    /// instead of scanning every rel per token.
+    pub by_name: BTreeMap<String, Vec<String>>,
+    /// crate-directory basename → rels of the `Cargo.toml` files directly
+    /// inside a directory of that name (cratecite's Phase-A crate table). Keyed
+    /// by DIRECTORY name, not `[package] name` — CorpusIndex never reads file
+    /// contents, and saying otherwise would overclaim.
+    pub crate_dirs: BTreeMap<String, Vec<String>>,
 }
 
 pub struct CorpusFile {
@@ -142,16 +156,27 @@ pub struct CorpusFile {
     /// `ids::file_key` output.
     pub file_key: String,
     pub dataset_slug: String,
-    /// `ids::doc_id(dataset_slug, file_key, "s0")` — the file's anchor node.
+    /// `ids::doc_id(dataset_slug, file_key, "file")` — the file's CARD node.
+    /// Every file-level edge terminates here. Historically this was the `s0`
+    /// section doc id, which does not exist for row/line/page-locator families
+    /// (CSV, JSONL, PDF…) — incoming links then pointed at a ghost. The card
+    /// is a real emitted node for EVERY indexed file (lib.rs stages it before
+    /// the file's records), so anchors are always hydratable and focusable.
     pub anchor_doc_id: String,
     pub mtime_ms: i64,
     /// Parent dir rel path, "" for root.
     pub dir: String,
     /// Sniffed format family (`Family::as_str`), from the frozen plan — NOT
-    /// guessed from the extension. href@1 gates on this: the contract scopes
+    /// guessed from the extension. href@2 gates on this: the contract scopes
     /// anchor detection to html-extracted files, and an `.html` extension is
     /// not proof of that (sniffing decides the family).
     pub family: String,
+    /// File-type label stamped into edges as `src_format`/`dst_format`:
+    /// lowercase extension when the name has one ("md", "rs", "pdf"), else the
+    /// sniffed family. Extension-level truth is what makes the dashboard's
+    /// cross-type counts (md→rs, md→pdf) sayable at all — two txt-prose
+    /// families would hide exactly the crossings the map exists to show.
+    pub format: String,
 }
 
 /// Build one [`CorpusFile`], deriving the anchor node id and parent dir from
@@ -168,13 +193,38 @@ pub fn corpus_file(
         rel: rel.to_string(),
         file_key: file_key.to_string(),
         dataset_slug: dataset_slug.to_string(),
-        anchor_doc_id: crate::ids::doc_id(dataset_slug, file_key, "s0"),
+        anchor_doc_id: crate::ids::doc_id(dataset_slug, file_key, FILE_CARD_LOCATOR),
         mtime_ms,
         dir: rel
             .rsplit_once('/')
             .map(|(d, _)| d.to_string())
             .unwrap_or_default(),
         family: family.to_string(),
+        format: format_of(rel, family),
+    }
+}
+
+/// Locator of the per-file card node. Cannot collide with content locators —
+/// every extractor's locators are letter+digit shaped (`s3`, `p2-s0`, `b1024`,
+/// `row7`, table/row pairs), never the bare word `file`.
+pub const FILE_CARD_LOCATOR: &str = "file";
+
+/// Lowercase extension of the final path segment, falling back to the sniffed
+/// family for extension-less names and dotfiles. Extensions longer than 12
+/// chars or with non-alphanumerics are treated as not-an-extension (version
+/// suffixes, minified-name noise).
+pub(crate) fn format_of(rel: &str, family: &str) -> String {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    match name.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 12
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+        {
+            ext.to_ascii_lowercase()
+        }
+        _ => family.to_string(),
     }
 }
 
@@ -182,20 +232,46 @@ impl CorpusIndex {
     pub fn build(files: Vec<CorpusFile>) -> Self {
         let mut map: BTreeMap<String, CorpusFile> = BTreeMap::new();
         let mut by_stem: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut crate_dirs: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for f in files {
             by_stem
                 .entry(stem_of(&f.rel).to_ascii_lowercase())
                 .or_default()
                 .push(f.rel.clone());
+            let name = f.rel.rsplit('/').next().unwrap_or(&f.rel);
+            by_name
+                .entry(name.to_string())
+                .or_default()
+                .push(f.rel.clone());
+            if let Some(dir) = f.rel.strip_suffix("/Cargo.toml") {
+                let dir_name = dir.rsplit('/').next().unwrap_or(dir);
+                if !dir_name.is_empty() {
+                    crate_dirs
+                        .entry(dir_name.to_string())
+                        .or_default()
+                        .push(f.rel.clone());
+                }
+            }
             map.insert(f.rel.clone(), f);
         }
         for rels in by_stem.values_mut() {
             rels.sort();
             rels.dedup();
         }
+        for rels in by_name.values_mut() {
+            rels.sort();
+            rels.dedup();
+        }
+        for rels in crate_dirs.values_mut() {
+            rels.sort();
+            rels.dedup();
+        }
         CorpusIndex {
             files: map,
             by_stem,
+            by_name,
+            crate_dirs,
         }
     }
 }
@@ -248,6 +324,11 @@ pub struct EdgeDraft {
     pub quote: String,
     /// evidence.offset (byte offset in section text; 0 for structural).
     pub offset: u64,
+    /// File-type labels of the two endpoints (`CorpusFile.format`), stored as
+    /// `src_format`/`dst_format`. Empty string = unknown → key omitted from
+    /// the stored doc (same omission discipline as `invalid_at`).
+    pub src_format: String,
+    pub dst_format: String,
 }
 
 /// Per-section textual context. `text` is the exact section string that became
@@ -255,7 +336,16 @@ pub struct EdgeDraft {
 pub struct SectionCtx<'a> {
     pub corpus: &'a CorpusIndex,
     pub file: &'a CorpusFile,
-    pub section_ordinal: u32,
+    /// Human label of this section within its file, derived from the locator
+    /// by `lib.rs::section_label`: "section 3" for `s3`, "page 2 section 0"
+    /// for `p2-s0`. Used verbatim in sequence evidence rationales.
+    pub section_label: &'a str,
+    /// (doc id, label) of the previously staged section of the SAME file;
+    /// None for the file's first section. Tracked by the pipeline in stream
+    /// order — the only way to know a page boundary's predecessor (`p2-s0`'s
+    /// predecessor is the LAST section of page 1, which the locator alone
+    /// cannot name).
+    pub prev_section: Option<(&'a str, &'a str)>,
     pub section_doc_id: &'a str,
     pub text: &'a str,
 }
@@ -295,6 +385,8 @@ pub fn default_detectors() -> Vec<Box<dyn EdgeDetector>> {
         Box::new(wikilink::Wikilink::default()),
         Box::new(mdlink::Mdlink::default()),
         Box::new(href::Href::default()),
+        Box::new(pathcite::Pathcite::default()),
+        Box::new(cratecite::Cratecite::default()),
         Box::new(sequence::Sequence),
         Box::new(samedir::SameDir),
     ]
@@ -308,6 +400,8 @@ pub fn detector_tag_for(edge_type: &str) -> &'static str {
         wikilink::EDGE_TYPE => wikilink::TAG,
         mdlink::EDGE_TYPE => mdlink::TAG,
         href::EDGE_TYPE => href::TAG,
+        pathcite::EDGE_TYPE => pathcite::TAG,
+        cratecite::EDGE_TYPE => cratecite::TAG,
         sequence::EDGE_TYPE => sequence::TAG,
         samedir::EDGE_TYPE => samedir::TAG,
         _ => "unknown@0",
@@ -461,7 +555,7 @@ pub fn assemble(drafts: &[EdgeDraft], edges_index: &str, created_at_ms: i64) -> 
         let id = edge_id(&d.src, d.edge_type, &d.dst, d.valid_at_ms);
         let tag = detector_tag_for(d.edge_type);
         let action = json!({"index": {"_index": edges_index, "_id": id}});
-        let doc = json!({
+        let mut doc = json!({
             "edge_id": id,
             "src": d.src,
             "dst": d.dst,
@@ -479,6 +573,17 @@ pub fn assemble(drafts: &[EdgeDraft], edges_index: &str, created_at_ms: i64) -> 
                 "offset": d.offset,
             }
         });
+        // Endpoint file-type labels: omitted (not null) when unknown, same
+        // discipline as invalid_at — the API stream's hand-asserted edges
+        // carry neither, and that absence must stay a null_bitmap fact.
+        if let Some(obj) = doc.as_object_mut() {
+            if !d.src_format.is_empty() {
+                obj.insert("src_format".into(), json!(d.src_format));
+            }
+            if !d.dst_format.is_empty() {
+                obj.insert("dst_format".into(), json!(d.dst_format));
+            }
+        }
         let mut ndjson = action.to_string().into_bytes();
         ndjson.push(b'\n');
         ndjson.extend_from_slice(doc.to_string().as_bytes());
@@ -648,6 +753,8 @@ mod tests {
                 src_file: "a.md".into(),
                 quote: "self".into(),
                 offset: 0,
+                src_format: "md".into(),
+                dst_format: "md".into(),
             },
             EdgeDraft {
                 src: "n1".into(),
@@ -659,6 +766,8 @@ mod tests {
                 src_file: "a.md".into(),
                 quote: "a.md and b.md share directory .".into(),
                 offset: 0,
+                src_format: "md".into(),
+                dst_format: "md".into(),
             },
         ];
         let out = assemble(&drafts, ".xerj-memory-t-edges", 99);
@@ -680,7 +789,90 @@ mod tests {
             doc.get("invalid_at").is_none(),
             "unset keys must be omitted"
         );
+        assert_eq!(doc["src_format"], json!("md"));
+        assert_eq!(doc["dst_format"], json!("md"));
         assert_eq!(doc["edge_id"], json!(out.edges[0].edge_id));
+    }
+
+    #[test]
+    fn unknown_endpoint_formats_are_omitted_not_null() {
+        let draft = EdgeDraft {
+            src: "n1".into(),
+            dst: "n2".into(),
+            edge_type: wikilink::EDGE_TYPE,
+            weight: 1.0,
+            confidence: 0.95,
+            valid_at_ms: 5,
+            src_file: "a.md".into(),
+            quote: "q".into(),
+            offset: 0,
+            src_format: String::new(),
+            dst_format: String::new(),
+        };
+        let out = assemble(std::slice::from_ref(&draft), "i", 7);
+        let lines: Vec<&str> = std::str::from_utf8(&out.edges[0].ndjson)
+            .unwrap()
+            .lines()
+            .collect();
+        let doc: Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(doc.get("src_format").is_none());
+        assert!(doc.get("dst_format").is_none());
+    }
+
+    #[test]
+    fn format_labels_prefer_extension_and_fall_back_to_family() {
+        assert_eq!(format_of("docs/a.md", "txt-prose"), "md");
+        assert_eq!(format_of("src/lib.rs", "txt-lines"), "rs");
+        assert_eq!(format_of("gtm/brief.PDF", "pdf"), "pdf");
+        assert_eq!(format_of("Makefile", "txt-lines"), "txt-lines");
+        assert_eq!(format_of(".env", "txt-lines"), "txt-lines");
+        assert_eq!(
+            format_of("x.tar.reallylongextension", "binary"),
+            "binary",
+            "over-long extensions are not extensions"
+        );
+    }
+
+    #[test]
+    fn corpus_index_builds_name_and_crate_tables() {
+        let corpus = CorpusIndex::build(vec![
+            corpus_file(
+                "engine/crates/xerj-fts/Cargo.toml",
+                "k1",
+                "d",
+                "txt-lines",
+                1,
+            ),
+            corpus_file(
+                "engine/crates/xerj-fts/src/lib.rs",
+                "k2",
+                "d",
+                "txt-lines",
+                1,
+            ),
+            corpus_file(
+                "engine/crates/xerj-api/src/lib.rs",
+                "k3",
+                "d",
+                "txt-lines",
+                1,
+            ),
+            corpus_file("Cargo.toml", "k4", "d", "txt-lines", 1),
+        ]);
+        assert_eq!(
+            corpus.by_name["lib.rs"],
+            vec![
+                "engine/crates/xerj-api/src/lib.rs",
+                "engine/crates/xerj-fts/src/lib.rs"
+            ]
+        );
+        // Crate table keys on the containing directory's basename; the root
+        // Cargo.toml has no containing directory name and must not register.
+        assert_eq!(
+            corpus.crate_dirs.get("xerj-fts"),
+            Some(&vec!["engine/crates/xerj-fts/Cargo.toml".to_string()])
+        );
+        assert_eq!(corpus.crate_dirs.len(), 1);
     }
 
     #[test]
@@ -695,6 +887,8 @@ mod tests {
             src_file: "a.md".into(),
             quote: "q".into(),
             offset: 3,
+            src_format: "md".into(),
+            dst_format: "md".into(),
         };
         let a = assemble(std::slice::from_ref(&draft), "i", 7);
         let b = assemble(std::slice::from_ref(&draft), "i", 7);
