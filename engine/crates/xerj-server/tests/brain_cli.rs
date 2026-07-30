@@ -195,8 +195,8 @@ fn brain_end_to_end_five_note_fixture() {
     let edges1 = live_edges(&es);
     assert_eq!(
         edges1.len(),
-        8,
-        "fixture yields 4 wikilink + 4 same_dir edges, got: {edges1:#?}"
+        13,
+        "fixture yields 4 wikilink + 4 same_dir + 5 sequence openers (SPEC \u{00a7}8.3), got: {edges1:#?}"
     );
     let mut by_detector: BTreeMap<String, u64> = BTreeMap::new();
     for e in &edges1 {
@@ -206,12 +206,16 @@ fn brain_end_to_end_five_note_fixture() {
     }
     assert_eq!(
         by_detector,
-        BTreeMap::from([("wikilink@1".to_string(), 4), ("samedir@1".to_string(), 4)])
+        BTreeMap::from([
+            ("wikilink@2".to_string(), 4),
+            ("samedir@2".to_string(), 4),
+            ("sequence@2".to_string(), 5),
+        ])
     );
     // §8.2 — wikilink evidence (source file, byte offset), exact.
     let wikilinks: BTreeSet<(String, u64)> = edges1
         .iter()
-        .filter(|e| e["_source"]["detector"] == json!("wikilink@1"))
+        .filter(|e| e["_source"]["detector"] == json!("wikilink@2"))
         .map(|e| {
             (
                 e["_source"]["evidence"]["source"].as_str().unwrap().into(),
