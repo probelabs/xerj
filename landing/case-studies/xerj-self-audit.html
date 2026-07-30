@@ -198,6 +198,17 @@ $ python3 ingest.py ./ast-out --url $XERJ              <span class="comment"># s
 </section>
 
 <section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">SECOND PASS: ONE <span class="accent">PRINCIPLE.</span></h2>
+  <p class="wide">A deeper pass (24 verified agents) replaced the category checklist with a single test — <strong>a function is dangerous when instruction and data share one channel with no separator, and a filter is only real if it strips the instruction power from the data channel</strong>. Five stages: flag the dangerous sinks, trace each to user input, map the privilege model, validate every filter for bypasses, and check the state machines for races. Full playbook: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/xerj-self-audit/METHODOLOGY.md" rel="external">METHODOLOGY.md</a>.</p>
+  <div class="proof-row" style="margin-top:var(--sp-6);">
+    <div class="stat"><div class="num">8 / 8</div><div class="label">CONFIRMED / REFUTED</div><div class="ctx">a 50% cull at the adversarial-verify stage — the refuted half is the point</div></div>
+    <div class="stat"><div class="num">4 High</div><div class="label">CONFIRMED SEVERITY</div><div class="ctx">+ 2 Medium, 1 Low, 1 Info · the 3 app-layer Highs are fixed on the branch, live-proven</div></div>
+    <div class="stat"><div class="num">19.6×</div><div class="label">FEWER TOKENS (FLOOR)</div><div class="ctx">the five grep sweeps touch 153 of 197 files — grepping the stages is reading the codebase</div></div>
+  </div>
+  <p class="wide" style="margin-top:var(--sp-5);">The two sharpest findings are corollary failures, not missing filters. <strong>INJ-01</strong>: a search-template param was spliced into the query JSON unescaped and re-parsed, so a value could drop the template's own ACL filter — live-proven leaking a private document, now fixed. <strong>F-PATH-02</strong>: the three filters guarding a snapshot's <em>name</em> are all real and tested; the hole is the un-validated sibling field, the repo <em>location</em> — a snapshot wrote index data outside <code class="inline">data_dir</code>, now bounded by a <code class="inline">path.repo</code>-style allowlist. Both, plus a session-revocation lost-update, ship fixed with regression tests. Every finding, severity-ranked with its instruction/data analysis: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/xerj-self-audit/FINDINGS-V2.md" rel="external">FINDINGS-V2.md</a>.</p>
+</section>
+
+<section class="scene-section">
   <h2 class="scene" style="font-size:var(--fs-56);">WHAT THIS <span class="accent">DOES NOT SHOW.</span></h2>
   <div class="laws">
     <div class="n">01</div><div class="law"><div class="t">XERJ DOES NOT <span class="accent">FIND BUGS.</span></div><div class="b">The tree-sitter extractor and the call-graph analysis produce the candidates; XERJ stores and queries them at scale. The substrate narrows the search; a human or agent still reads the survivors.</div></div>

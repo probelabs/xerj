@@ -140,3 +140,60 @@ flagged.
   three functions with no depth guard anywhere in it," or "a `.join()` of a
   request parameter with no containment check in the same function." The call
   graph makes both a single query.
+
+## Five-stage methodology (second pass)
+
+A second, deeper pass (24 Fable-5 agents, adversarially verified) replaced the
+category checklist with a single organizing principle and ran five stages against
+it. Full reusable playbook — principle, taxonomy, the XERJ query and the grep
+baseline for every stage: **[METHODOLOGY.md](METHODOLOGY.md)**. All eight findings,
+severity-ranked: **[FINDINGS-V2.md](FINDINGS-V2.md)**. Issue drafts:
+**[ISSUES.md](ISSUES.md)**.
+
+> **A function is dangerous when INSTRUCTION and DATA share one channel with no
+> separator** — and a filter is only real if it removes the instruction power
+> from the data channel. "It calls `escape()`" is not enough.
+
+The strongest findings are failures of that corollary rather than missing filters:
+in F-PATH-02 all three filters guarding the snapshot *name* are real, well-written
+and tested, and the vulnerability is in the un-validated sibling field (the repo
+*location*) none of them look at.
+
+| Stage | XERJ query returns | XERJ tokens | grep lines | grep files | grep tokens | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 · Flag dangerous sinks | 318 functions | 40,623 | 1,132 | 110 | 1,585,177 | **39×** |
+| 2 · Trace to user input | 13 caller edges | 1,232 | 23 | 5 | 374,872 | **304×** |
+| 3 · Privilege model + flows | 477 routes + 24 auth fns | 40,218 | 874 | 73 | 1,271,510 | **32×** |
+| 4 · Validate filters for bypass | 18 functions | 1,940 | 711 | 66 | 1,317,109 | **679×** |
+| 5 · State machines (TOCTOU/locks) | 16 functions | 1,814 | 3,377 | 96 | 1,381,258 | **761×** |
+| **Total, per-stage sum** | | **85,827** | **6,117** | — | **5,929,926** | **69×** |
+| **Total, deduplicated file union** | | **85,827** | | **153** | **1,685,346** | **19.6×** |
+
+All figures measured with tiktoken `cl100k_base`. Two totals on purpose: the
+per-stage sum (69×) is what an auditor working stage by stage pays; the
+deduplicated union (**19.6×**) is the honest floor, and it carries the sharper
+point — the five grep sweeps together touch **153 of 197 `.rs` files, 93% of the
+engine's 1,805,277 tokens**. Grepping the five stages *is* reading the codebase,
+in a worse order and without the call graph.
+
+**Result: 8 confirmed, 8 refuted (a 50% cull).** By verifier-corrected severity:
+**4 High** (INJ-01 search-template injection, F-PATH-02 snapshot-location
+traversal, S5-1 session-revocation lost-update, DESER-EGRESS-01 unauthenticated
+Raft control messages), **2 Medium** (S5-4 `x-forwarded-for` trust, S5-3
+magic-link TOCTOU), **1 Low** (S5-5 field-limit bypass on the explicit path), **1
+Info** (AUTHZ-2 unauth `cluster/info` disclosure). The three application-layer
+Highs are **fixed** on this branch (`58fc73f`, with regression tests and live
+before/after proof); DESER-EGRESS-01 is tracked as the cluster Raft-auth Phase-2
+item.
+
+An honesty note carried into [FINDINGS-V2.md](FINDINGS-V2.md): the workflow's
+auto-synthesis under-reported this as "2 confirmed, 1 refuted." The eight
+per-finding verifiers had actually confirmed eight; the gap was caught by
+reconciling the synthesis against the raw verdicts, and each High was re-verified
+by hand before publication — a reminder that the synthesis layer needs auditing
+too.
+
+The refuted half is load-bearing: the most instructive miss (`F-PATH-01`) had
+every code observation correct and was still wrong, because the guard it thought
+was missing lived in the caller. A finder without an independent,
+refutation-first verifier would have shipped it.
