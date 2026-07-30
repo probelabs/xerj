@@ -34,7 +34,11 @@ export const secondBrain = {
     sbAfterRender();
     return {
       title: 'SECOND BRAIN',
-      kicker: 'WHAT YOUR NOTES BELIEVE · EVERY LINK HAS A QUOTE · REPLAYABLE AT ANY MOMENT',
+      // "EVERY LINK SHOWS ITS EVIDENCE", not "HAS A QUOTE": manual and
+      // agent-asserted links may carry no quote, and structural links
+      // carry a rationale, not note text. The kicker must not claim
+      // more than the schema enforces (spec §7.1, amended 2026-07-30).
+      kicker: 'WHAT YOUR NOTES BELIEVE · EVERY LINK SHOWS ITS EVIDENCE · REPLAYABLE AT ANY MOMENT',
       meta: [time, 'XERJ-GRAPH'],
       // Eyebrows speak user words — link / believed / retired / taught.
       // Schema vocabulary (edge, src/dst, as-of) stays in the API and

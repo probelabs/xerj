@@ -2014,6 +2014,134 @@ html.mobile-preview .nav-sub {
   user-select: all; /* one click selects the whole command */
 }
 
+/* Evidence chips — QUOTE (authored text) keeps the ink treatment;
+   WHY (structural rationale) and NO EVIDENCE are muted: they must
+   never carry the same visual promise as a real quote. */
+.sb-eq-why  { color: var(--z-mute); }
+.sb-eq-none { color: var(--z-mute); opacity: 0.75; }
+
+/* Structural rationale in the paper trail: data face, mute ink, faint
+   rule — deliberately NOT the quote treatment (prose face, accent
+   rule, quotation marks). The style is the honesty. */
+.sb-evwhy {
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  line-height: 1.6;
+  color: var(--z-mute);
+  border-left: 1px solid var(--z-faint);
+  padding-left: var(--sp-2);
+  margin: 4px 0 8px;
+}
+
+/* Floating evidence preview (hover / keyboard focus). Display-only:
+   pointer-events none so it can never steal the click that pins. */
+.sb-evpreview {
+  position: fixed;
+  z-index: 60; /* above the ledger; below nothing it needs to yield to */
+  max-width: 44ch;
+  background: var(--z-paper);
+  border: 1px solid var(--z-faint);
+  padding: var(--sp-2);
+  pointer-events: none;
+}
+.sb-evpreview .sb-evquote,
+.sb-evpreview .sb-evwhy { margin: 0 0 6px; }
+
+/* One-shot flash on rows the last time-travel flipped. */
+@keyframes sb-flipflash {
+  from { outline-color: var(--z-accent); }
+  to   { outline-color: transparent; }
+}
+.sb-erow.sb-flip {
+  outline: 1px solid transparent;
+  outline-offset: -1px;
+  animation: sb-flipflash 0.6s ease-out;
+}
+
+/* What-changed readout in the scrubber legend (mid slot, own line). */
+.sb-changeout { display: block; margin-top: 2px; color: var(--z-ink); }
+
+/* Assertion ticks on the belief-count curve — snap targets, muted. */
+.sb-atick { color: var(--z-mute); }
+
+/* FIND — the house frameless-input pattern (.filter-bar .kql),
+   inlined into the controls row. */
+.sb-cfind {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex: 1 1 180px;
+  min-width: 140px;
+}
+.sb-findinput {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  color: var(--z-ink);
+  padding: 2px 0;
+  text-transform: none;
+  letter-spacing: 0;
+  outline: none;
+}
+.sb-findinput:focus { border-bottom-color: var(--z-accent); }
+.sb-findinput::placeholder { color: var(--z-mute); opacity: 0.6; }
+.sb-findresults {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-2);
+  padding: var(--sp-1) 0 var(--sp-2);
+  border-bottom: 1px solid var(--z-faint);
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-13);
+}
+.sb-findrow { font-family: var(--font-data); }
+
+/* Group headers are buttons now (client-side fold); the global button
+   reset keeps the look — this only restores full-width flex. */
+button.sb-grouphead { width: 100%; }
+.sb-ghcaret {
+  display: inline-block;
+  width: 12px;
+  font-size: 9px;
+  color: var(--z-mute);
+}
+
+/* RETIRED panel churn rows: dashed — the visual grammar of retirement
+   everywhere on this page — each with the evidence it carried. */
+.sb-retrows { margin-top: var(--sp-2); }
+.sb-retrow {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-11);
+}
+.sb-retrow:hover .sb-retpair,
+.sb-retrow:focus-visible .sb-retpair { color: var(--z-accent); }
+.sb-retpair {
+  display: block;
+  color: var(--z-ink);
+  text-decoration: line-through;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sb-retwhen { color: var(--z-accent); }
+.sb-retev {
+  display: block;
+  color: var(--z-mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Narrow screens: stack — focus card first, then in, then out. */
 @media (max-width: 1100px) {
   .sb-ledger { grid-template-columns: 1fr; row-gap: var(--sp-3); }

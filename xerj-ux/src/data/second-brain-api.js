@@ -25,6 +25,7 @@
 
 import {
   renderPanelBody, drawLedgerTraces, edgeStateAt, fmtTs, caretAlignClass,
+  EvidencePreview, FindResults, authoredSplit, splitLabel,
 } from '../ux/ego-ledger.js';
 
 /** Panel ids of the second-brain dashboard, in render order. The
@@ -59,7 +60,7 @@ const S = {
   overviewError: null, // overview read failed on a REAL brain — an error state, never "empty"
   brains: [],
   brain: null,
-  lastHashBrain: null, // last `?brain=` deep-link value already applied
+  lastHashApplied: null, // last deep-link query tail already applied
   focus: null,
   asOf: null,      // epoch-ms | null = NOW
   trail: [],
@@ -67,16 +68,54 @@ const S = {
   ego: null,       // §4.3 body — the belief at the caret
   timeline: null,  // §4.3 body — hop-1, include_expired, pinned at NOW
   names: {},       // node id → { title } — display names for hub ids / crumbs
+  // Pinned paper trails (edge ids). Living here — NOT in the DOM — is
+  // the point: every patchPanels()/scrub commit re-renders rows from
+  // this set, so a pinned quote survives any re-render. Cleared on
+  // refocus (a new ledger is a new reading), never on an as-of commit.
+  openEvidence: new Set(),
+  collapsed: new Set(), // folded link-kind groups ("side:type"), per-brain
+  recentRetired: null,  // three most recently retired links (RetiredPanel)
+  lastShift: null,      // what the last time-travel changed (scrubber readout)
 };
 
-/** `brain` out of the hash's query tail (`#/second-brain?brain=X`), or
- *  null. The router (app.js parseRoute) ignores everything after `?`. */
-function hashBrain() {
+/**
+ * The deep-link query tail (`#/second-brain?brain=X&focus=Y&as_of=Z`),
+ * parsed: a URL that is a MOMENT in a brain's beliefs, not just a
+ * brain. The router (app.js parseRoute) ignores everything after `?`.
+ * `raw` is the verbatim tail so "already applied" is one comparison.
+ */
+function hashMoment() {
   const h = location.hash || '';
   const q = h.indexOf('?');
   if (q < 0) return null;
-  const b = (new URLSearchParams(h.slice(q + 1)).get('brain') || '').trim();
-  return b || null;
+  const raw = h.slice(q + 1);
+  const p = new URLSearchParams(raw);
+  const brain = (p.get('brain') || '').trim() || null;
+  const focus = (p.get('focus') || '').trim() || null;
+  const asOfN = Number(p.get('as_of'));
+  const asOf = Number.isFinite(asOfN) && asOfN > 0 ? asOfN : null;
+  if (!brain && !focus && asOf == null) return null;
+  return { raw, brain, focus, asOf };
+}
+
+/**
+ * Write the current moment back into the hash (replaceState — no
+ * history spam) so the address bar is always a shareable artifact:
+ * copy it, and the receiver opens the same brain, the same note, the
+ * same point in belief time. Only touches the hash while ON the
+ * second-brain route.
+ */
+function writeMoment() {
+  if (typeof history === 'undefined' || typeof location === 'undefined') return;
+  if (!S.brain) return;
+  const h = location.hash || '';
+  if (!h.startsWith('#/second-brain')) return;
+  const qs = new URLSearchParams({ brain: S.brain });
+  if (S.focus) qs.set('focus', S.focus);
+  if (S.asOf != null) qs.set('as_of', String(S.asOf));
+  const raw = qs.toString();
+  S.lastHashApplied = raw; // our own write is by definition applied
+  try { history.replaceState(null, '', `#/second-brain?${raw}`); } catch { /* sandboxed */ }
 }
 
 function loadBrainState() {
@@ -86,8 +125,9 @@ function loadBrainState() {
     S.focus = st.focus || null;
     S.asOf = Number.isFinite(st.asOf) ? st.asOf : null;
     S.trail = Array.isArray(st.trail) ? st.trail : [];
+    S.collapsed = new Set(Array.isArray(st.collapsed) ? st.collapsed : []);
   } catch {
-    S.focus = null; S.asOf = null; S.trail = [];
+    S.focus = null; S.asOf = null; S.trail = []; S.collapsed = new Set();
   }
 }
 
@@ -96,7 +136,10 @@ function saveBrainState() {
     if (!S.brain) return;
     sessionStorage.setItem(
       K.perBrain(S.brain),
-      JSON.stringify({ focus: S.focus, asOf: S.asOf, trail: S.trail.slice(-8) }),
+      JSON.stringify({
+        focus: S.focus, asOf: S.asOf, trail: S.trail.slice(-8),
+        collapsed: [...S.collapsed].slice(0, 64),
+      }),
     );
   } catch { /* storage full/blocked — view still works, just not sticky */ }
 }
@@ -126,9 +169,16 @@ async function getJson(url, signal) {
  * tolerate a JSON array in case a later build adds it. A wildcard
  * matching nothing is an empty 200 — an engine with no brains is a
  * normal state, not an error.
+ *
+ * The fetch pattern is `.xerj-memory-*` (prefix only): live-verified
+ * 2026-07-30 that this engine's index-pattern matcher supports a
+ * single leading or trailing `*` but NOT an infix wildcard —
+ * `.xerj-memory-*-edges` returns an empty 200 even when the index
+ * exists. The `-edges` cut happens in the client filter below either
+ * way, so the result set is identical.
  */
 async function discoverBrains(baseUrl, signal) {
-  const r = await fetch(`${baseUrl}/_cat/indices/.xerj-memory-*-edges`, { signal });
+  const r = await fetch(`${baseUrl}/_cat/indices/.xerj-memory-*`, { signal });
   if (r.status === 404) return [];
   if (!r.ok) throw new Error(`_cat/indices HTTP ${r.status}`);
   const text = await r.text();
@@ -166,6 +216,7 @@ async function hydrateNames(signal) {
   for (const h of (o.hubs && o.hubs.out) || []) ids.add(h.id);
   for (const t of S.trail) ids.add(t);
   if (S.focus) ids.add(S.focus);
+  for (const e of S.recentRetired || []) { ids.add(e.src); ids.add(e.dst); }
   const want = [...ids].filter((id) => !(id in S.names)).slice(0, 40);
   if (!want.length) return;
   try {
@@ -197,6 +248,37 @@ function fetchOverview(signal) {
   const qs = new URLSearchParams({ top: '10', histogram_interval: 'day' });
   if (S.asOf != null) qs.set('as_of', String(S.asOf));
   return getJson(`${S.baseUrl}/_graph/${enc(S.brain)}/overview?${qs}`, signal);
+}
+
+/**
+ * The RETIRED panel's churn rows: the three most recently retired
+ * links, one bounded ordinary search on the edges index. Deliberately
+ * truth-now (not as-of-aware): "most recently retired" is a statement
+ * about the record, not about the caret. Best-effort — on any failure
+ * the rows simply don't render; the count above them is the truth
+ * either way.
+ */
+async function fetchRecentRetired(signal) {
+  const inval = S.overview && S.overview.exists !== false
+    && S.overview.edges && S.overview.edges.invalidated > 0;
+  if (!inval) { S.recentRetired = []; return; }
+  try {
+    const r = await fetch(`${S.baseUrl}/${enc(`.xerj-memory-${S.brain}-edges`)}/_search`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        query: { exists: { field: 'invalid_at' } },
+        sort: [{ invalid_at: { order: 'desc' } }],
+        size: 3,
+        _source: ['src', 'dst', 'type', 'detector', 'evidence', 'valid_at', 'invalid_at'],
+      }),
+      signal,
+    });
+    if (!r.ok) { S.recentRetired = null; return; }
+    const j = await r.json();
+    S.recentRetired = (((j.hits && j.hits.hits) || []))
+      .map((h) => ({ edge_id: h._id, ...(h._source || {}) }));
+  } catch { S.recentRetired = null; }
 }
 
 /**
@@ -240,6 +322,12 @@ function assemble() {
   // Hints in user words, and as-of-aware: the same tile must say
   // WHEN it is true once the belief caret leaves NOW.
   const atHint = S.asOf != null ? `at ${fmtTs(S.asOf)} UTC` : 'right now';
+  // The detectors hint carries the authored/structural split — the
+  // honesty device that stops folder position from counting at par
+  // with written citations.
+  const detHint = detectors.length
+    ? splitLabel(authoredSplit(detectors))
+    : 'deterministic, versioned';
   return {
     brain: S.brain,
     overview: S.overview,
@@ -248,7 +336,7 @@ function assemble() {
       edgesLive: { formatted: num(ed.live), hint: `held true ${atHint}` },
       edgesTotal: { formatted: num(ed.total), hint: 'nothing is ever deleted' },
       invalidated: { formatted: num(ed.invalidated), hint: 'drag belief time left to revisit' },
-      detectors: { formatted: num(detectors.length) + detTail, hint: 'deterministic, versioned' },
+      detectors: { formatted: num(detectors.length) + detTail, hint: detHint },
     },
     series: {
       created: ((o && o.created_over_time) || []).map((b) => b.count),
@@ -265,6 +353,10 @@ function assemble() {
       trail: S.trail.slice(),
       timeline: S.timeline,
       names: S.names,
+      openEvidence: S.openEvidence,
+      collapsed: S.collapsed,
+      recentRetired: S.recentRetired,
+      lastShift: S.lastShift,
     },
   };
 }
@@ -301,18 +393,23 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
 
   let persisted = null;
   try { persisted = localStorage.getItem(K.brain); } catch { /* private mode */ }
-  // Deep link: `#/second-brain?brain=X` — the URL `xerj brain` prints and
-  // opens. Applied when it CHANGES (pasting a new link switches brains) but
-  // never re-asserted on every render, so the in-app picker still wins for
-  // the rest of the session.
-  const fromHash = hashBrain();
-  if (fromHash && fromHash !== S.lastHashBrain) {
-    S.lastHashBrain = fromHash;
-    if (S.brains.includes(fromHash)) {
-      persisted = fromHash;
-      try { localStorage.setItem(K.brain, fromHash); } catch { /* private mode */ }
-    } else {
-      S.uiError = `brain "${fromHash}" not found on this engine`;
+  // Deep link: `#/second-brain?brain=X&focus=Y&as_of=Z` — the URL
+  // `xerj brain` prints, and the shareable-moment URLs this page writes
+  // back on every refocus / time-travel. Applied when it CHANGES
+  // (pasting a new link jumps to that moment) but never re-asserted on
+  // every render, so in-app navigation still wins for the session.
+  const fromHash = hashMoment();
+  let hashFocus = null;
+  let hashAsOf = null;
+  if (fromHash && fromHash.raw !== S.lastHashApplied) {
+    S.lastHashApplied = fromHash.raw;
+    if (fromHash.brain && S.brains.includes(fromHash.brain)) {
+      persisted = fromHash.brain;
+      hashFocus = fromHash.focus;
+      hashAsOf = fromHash.asOf;
+      try { localStorage.setItem(K.brain, fromHash.brain); } catch { /* private mode */ }
+    } else if (fromHash.brain) {
+      S.uiError = `brain "${fromHash.brain}" not found on this engine`;
     }
   }
   S.brain = persisted && S.brains.includes(persisted) ? persisted : (S.brains[0] || null);
@@ -321,6 +418,10 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
     return assemble();
   }
   loadBrainState();
+  // The pasted moment outranks the persisted one — that is what makes
+  // the URL an artifact: the receiver sees the sender's view.
+  if (hashFocus) S.focus = hashFocus;
+  if (hashAsOf != null) S.asOf = hashAsOf;
 
   try {
     S.overview = await fetchOverview(signal);
@@ -348,6 +449,7 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
     try {
       const [belief, timeline] = await Promise.all([
         fetchBelief(signal), fetchTimeline(signal),
+        fetchRecentRetired(signal), // best-effort, never throws
       ]);
       S.ego = belief;
       S.timeline = timeline;
@@ -357,6 +459,7 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
     }
   } else {
     S.ego = null; S.timeline = null;
+    await fetchRecentRetired(signal);
   }
   await hydrateNames(signal);
   saveBrainState();
@@ -374,16 +477,48 @@ function abortInflight() {
 }
 
 /** Re-render every second-brain panel body currently in the DOM from
- *  module state, then redraw the traces post-paint. */
+ *  module state, then redraw the traces post-paint. Pinned paper
+ *  trails re-render open (S.openEvidence is module state, not DOM
+ *  state) — this is what makes a pin survive scrub commits. */
 function patchPanels() {
   if (typeof document === 'undefined') return;
+  hidePreview();
+  // innerHTML replacement destroys the focused element; without this,
+  // arrow-key time travel dies after its first commit (the second
+  // keypress lands on a detached caret). Remember what held keyboard
+  // focus and restore it on the freshly-rendered twin.
+  const focused = document.activeElement;
+  const refocusSel = focused && focused.matches
+    ? (focused.matches('[data-sb-caret]') ? '[data-sb-caret]'
+      : (focused.matches('[data-sb-find]') ? '[data-sb-find]' : null))
+    : null;
   const data = assemble();
   for (const id of SB_PANEL_IDS) {
     const el = document.querySelector(`[data-sb-body="${id}"]`);
     if (el) el.innerHTML = renderPanelBody(id, data);
   }
+  if (refocusSel) {
+    const again = document.querySelector(refocusSel);
+    if (again && again.focus) again.focus();
+  }
   showUiError();
   scheduleTraces();
+  flashFlipped();
+}
+
+/** One-shot outline flash on every ledger row whose belief state the
+ *  last time-travel flipped. Runs once per commit, right after the
+ *  post-commit re-render; the class removes itself after the fade. */
+function flashFlipped() {
+  const shift = S.lastShift;
+  if (!shift || !shift.flashPending || !shift.flipped || !shift.flipped.length) return;
+  shift.flashPending = false;
+  for (const id of shift.flipped) {
+    for (const row of document.querySelectorAll(`[data-sb-edge="${CSS.escape(id)}"]`)) {
+      row.classList.add('sb-flip');
+      setTimeout(() => row.classList.remove('sb-flip'), 700);
+    }
+  }
 }
 
 function showUiError() {
@@ -428,6 +563,7 @@ async function refetch({ overview = false, belief = false, timeline = false }) {
   try {
     const jobs = [];
     if (overview) jobs.push(fetchOverview(signal).then((r) => { S.overview = r; S.overviewError = null; }));
+    if (overview) jobs.push(fetchRecentRetired(signal)); // rides along; never throws
     if (belief && S.focus) jobs.push(fetchBelief(signal).then((r) => { S.ego = r; }));
     if (timeline && S.focus) jobs.push(fetchTimeline(signal).then((r) => { S.timeline = r; }));
     await Promise.all(jobs);
@@ -453,6 +589,11 @@ function refocus(id) {
   }
   S.focus = id;
   S.ego = null; S.timeline = null;
+  // A new ledger is a new reading: pinned paper trails and the last
+  // time-travel readout belong to the note that had them.
+  S.openEvidence = new Set();
+  S.lastShift = null;
+  writeMoment();
   patchPanels(); // immediate: focus card swaps to the new node id
   refetch({ belief: true, timeline: true });
 }
@@ -462,7 +603,9 @@ function switchBrain(name) {
   try { localStorage.setItem(K.brain, name); } catch { /* private mode */ }
   S.brain = name;
   S.overview = null; S.ego = null; S.timeline = null;
+  S.recentRetired = null; S.openEvidence = new Set(); S.lastShift = null;
   loadBrainState();
+  writeMoment();
   patchPanels();
   (async () => {
     await refetch({ overview: true });
@@ -471,10 +614,44 @@ function switchBrain(name) {
   })();
 }
 
+/**
+ * What did moving the caret change? Diffed over the pinned timeline
+ * set (hop-1, include_expired, fetched at NOW), so scrubbing never has
+ * to guess: appearances = believed-since inside the crossed interval,
+ * retirements = believed-until inside it — counted separately, never
+ * netted (a link that appeared AND retired inside the interval counts
+ * in both — that is the honest reading). `flipped` lists the rows
+ * whose visible state changed, for the one-shot flash.
+ */
+function computeShift(prevMs, nextMs) {
+  const edges = (S.timeline && S.timeline.edges) || [];
+  if (!edges.length) return null;
+  const a = prevMs == null ? Date.now() : prevMs;
+  const b = nextMs == null ? Date.now() : nextMs;
+  if (a === b) return null;
+  const t0 = Math.min(a, b);
+  const t1 = Math.max(a, b);
+  let appeared = 0;
+  let retired = 0;
+  const flipped = [];
+  for (const e of edges) {
+    const va = Number(e.valid_at);
+    const vi = e.invalid_at != null ? Number(e.invalid_at) : null;
+    if (va > t0 && va <= t1) appeared += 1;
+    if (vi != null && vi > t0 && vi <= t1) retired += 1;
+    if (edgeStateAt(e, prevMs) !== edgeStateAt(e, nextMs)) flipped.push(e.edge_id);
+  }
+  return { t0, t1, appeared, retired, flipped, flashPending: true };
+}
+
 /** Commit an as-of. `null` = NOW. Overview + belief re-query (both are
- *  as-of-dependent); the timeline stays pinned at NOW by design. */
+ *  as-of-dependent); the timeline stays pinned at NOW by design.
+ *  Pinned paper trails are NOT cleared here — time travel must not
+ *  eat an open quote. */
 function commitAsOf(ms) {
+  S.lastShift = computeShift(S.asOf, ms);
   S.asOf = ms;
+  writeMoment();
   refetch({ overview: true, belief: true });
 }
 
@@ -559,7 +736,12 @@ function previewAsOf(scrub, ms) {
       seg.classList.remove('sb-l-live', 'sb-l-future', 'sb-l-expired');
       seg.classList.add(`sb-l-${state}`);
     }
-    if (counter) counter.textContent = `${live} OF ${total}`;
+    if (counter) {
+      // Same floor rule as the curve branch: a clipped fetch renders
+      // '≥' on both numbers — the preview must not quietly drop it.
+      const floor = counter.textContent.trimStart().startsWith('≥') ? '≥' : '';
+      counter.textContent = `${floor}${live} OF ${floor}${total}`;
+    }
   }
   for (const row of document.querySelectorAll('[data-sb-edge][data-va]')) {
     const e = { valid_at: Number(row.getAttribute('data-va')), invalid_at: row.hasAttribute('data-vi') ? Number(row.getAttribute('data-vi')) : null };
@@ -605,9 +787,33 @@ function onPointerMove(e) {
   previewAsOf(drag.scrub, drag.ms);
 }
 
+/** The strip's belief events (assertions + retirements), ascending.
+ *  Snap targets and arrow-key stops — moments where nothing changed
+ *  are not interesting places to stand. */
+function stripEvents(scrub) {
+  const attr = scrub.getAttribute('data-sb-events');
+  if (!attr) return [];
+  return attr.split(',').map(Number).filter(Number.isFinite);
+}
+
+/** Within 1.5% of the strip span of a belief event, land ON the event
+ *  (an assertion snaps to its believed-since, a retirement to its
+ *  believed-until) — pixel-hunting the exact moment is the strip's
+ *  job, not the user's. */
+function snapToEvent(scrub, ms, dom) {
+  const events = stripEvents(scrub);
+  if (!events.length) return ms;
+  let best = null;
+  for (const t of events) {
+    if (best == null || Math.abs(t - ms) < Math.abs(best - ms)) best = t;
+  }
+  return best != null && Math.abs(best - ms) <= (dom[1] - dom[0]) * 0.015 ? best : ms;
+}
+
 function onPointerUp() {
   if (!drag) return;
-  const ms = normalizeAsOf(drag.ms, drag.dom);
+  const snapped = snapToEvent(drag.scrub, drag.ms, drag.dom);
+  const ms = normalizeAsOf(snapped, drag.dom);
   drag = null;
   commitAsOf(ms);
 }
@@ -654,9 +860,37 @@ function onClick(e) {
 
   const evBtn = t.closest('[data-sb-evidence]');
   if (evBtn) {
+    // Pin / unpin the full paper trail. The pin lives in S.openEvidence
+    // (module state), so it survives every re-render; the direct DOM
+    // toggle here is just the immediate feedback.
+    const id = evBtn.getAttribute('data-sb-evidence');
+    const pin = !S.openEvidence.has(id);
+    if (pin) S.openEvidence.add(id); else S.openEvidence.delete(id);
     const row = evBtn.closest('[data-sb-edge]');
     const body = row && row.querySelector('[data-sb-evbody]');
-    if (body) body.hidden = !body.hidden;
+    if (body) body.hidden = !pin;
+    evBtn.setAttribute('aria-expanded', String(pin));
+    hidePreview();
+    scheduleTraces(); // row heights changed under the rails
+    return;
+  }
+
+  const foldBtn = t.closest('[data-sb-collapse]');
+  if (foldBtn) {
+    // Fold / unfold a link-kind group. Pure client-side: header + count
+    // stay, honesty counters don't move, nothing is refetched. Direct
+    // DOM toggle (not patchPanels) so an open FIND list isn't eaten.
+    const key = foldBtn.getAttribute('data-sb-collapse');
+    const fold = !S.collapsed.has(key);
+    if (fold) S.collapsed.add(key); else S.collapsed.delete(key);
+    const rows = foldBtn.closest('.sb-group');
+    const body = rows && rows.querySelector('[data-sb-grouprows]');
+    if (body) body.hidden = fold;
+    const glyph = foldBtn.querySelector('[data-sb-ghcaret]');
+    if (glyph) glyph.textContent = fold ? '▸' : '▾';
+    foldBtn.setAttribute('aria-expanded', String(!fold));
+    saveBrainState();
+    scheduleTraces(); // group geometry changed under the rails
     return;
   }
   // Strip clicks are handled by the pointer pipeline above (a click is
@@ -667,14 +901,28 @@ let keyCommit = 0;
 function onKeyDown(e) {
   const caret = e.target && e.target.closest && e.target.closest('[data-sb-caret]');
   if (!caret) return;
-  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'End') return;
   const scrub = caret.closest('[data-sb-scrub]');
   const dom = scrub && stripDomain(scrub);
   if (!dom) return;
   e.preventDefault();
-  const step = Math.max(60_000, Math.round((dom[1] - dom[0]) / 100));
   const cur = S.asOf == null ? dom[1] : S.asOf;
-  const next = Math.max(dom[0], Math.min(dom[1], cur + (e.key === 'ArrowRight' ? step : -step)));
+  let next;
+  if (e.key === 'End') {
+    next = dom[1]; // NOW
+  } else {
+    // Step between belief events — each keypress lands on the previous/
+    // next moment something actually changed, not a blind 1% hop.
+    const events = stripEvents(scrub);
+    if (e.key === 'ArrowRight') {
+      next = events.find((t) => t > cur);
+      if (next == null) next = dom[1];
+    } else {
+      const prevs = events.filter((t) => t < cur);
+      next = prevs.length ? prevs[prevs.length - 1] : dom[0];
+    }
+    next = Math.max(dom[0], Math.min(dom[1], next));
+  }
   previewAsOf(scrub, next);
   // Debounce the server commit so holding the key doesn't queue queries.
   clearTimeout(keyCommit);
@@ -683,6 +931,155 @@ function onKeyDown(e) {
 
 function onResize() {
   scheduleTraces();
+}
+
+// ----- FIND — a note by the words in it ------------------------------
+//
+// One bounded query against the brain's nodes index (the same index
+// hydrateNames reads), debounced 250ms, capped at 7 hits. Results are
+// ordinary refocus links; an empty answer says what the brain is.
+
+let findTimer = 0;
+let findSeq = 0; // only the latest keystroke's response may render
+
+async function runFind(q) {
+  const slot = document.querySelector('[data-sb-findresults]');
+  if (!slot) return;
+  if (!q) { slot.hidden = true; slot.innerHTML = ''; return; }
+  const o = S.overview;
+  if (!o || o.exists === false || !o.nodes_index) return;
+  const seq = ++findSeq;
+  try {
+    const r = await fetch(`${S.baseUrl}/${enc(o.nodes_index)}/_search`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        query: {
+          bool: {
+            should: [
+              { match: { title: q } },
+              { match: { text: q } },
+              { match: { body: q } },
+            ],
+          },
+        },
+        size: 7,
+        _source: ['title'],
+      }),
+    });
+    if (seq !== findSeq) return; // a newer keystroke owns the slot
+    if (!r.ok) {
+      slot.innerHTML = `<span class="sb-sidenote mono faint">FIND FAILED · HTTP ${r.status}</span>`;
+      slot.hidden = false;
+      return;
+    }
+    const j = await r.json();
+    const hits = ((j.hits && j.hits.hits) || []).map((h) => ({
+      id: h._id,
+      title: (h._source && typeof h._source.title === 'string' && h._source.title.trim())
+        ? h._source.title.trim() : null,
+    }));
+    slot.innerHTML = FindResults({ hits, names: S.names });
+    slot.hidden = false;
+  } catch (e) {
+    if (seq !== findSeq) return;
+    slot.innerHTML = `<span class="sb-sidenote mono faint">FIND FAILED · ${String((e && e.message) || e).slice(0, 60)}</span>`;
+    slot.hidden = false;
+  }
+}
+
+function onFindInput(e) {
+  const inp = e.target && e.target.closest && e.target.closest('[data-sb-find]');
+  if (!inp) return;
+  clearTimeout(findTimer);
+  const q = inp.value.trim();
+  findTimer = setTimeout(() => runFind(q), 250);
+}
+
+function onFindKey(e) {
+  const inp = e.target && e.target.closest && e.target.closest('[data-sb-find]');
+  if (!inp) return;
+  if (e.key === 'Enter') {
+    // Enter opens the first match — the keyboard path to a refocus.
+    const first = document.querySelector('[data-sb-findresults] .sb-findfirst');
+    if (first) { e.preventDefault(); refocus(first.getAttribute('data-sb-focus')); }
+  } else if (e.key === 'Escape') {
+    inp.value = '';
+    clearTimeout(findTimer);
+    const slot = document.querySelector('[data-sb-findresults]');
+    if (slot) { slot.hidden = true; slot.innerHTML = ''; }
+  }
+}
+
+// ----- evidence hover preview ---------------------------------------
+//
+// Pointer rest (≥300ms) or keyboard focus on a row's meta button
+// floats the quote/rationale up in a small fixed card; clicking pins
+// the full in-flow paper trail instead. The card is display-only
+// (pointer-events none) and never shows raw ids.
+
+let pvTimer = 0;
+let pvEl = null; // the one floating card, if any
+
+function edgeById(id) {
+  for (const e of (S.ego && S.ego.edges) || []) if (e.edge_id === id) return e;
+  for (const e of (S.timeline && S.timeline.edges) || []) if (e.edge_id === id) return e;
+  return null;
+}
+
+function hidePreview() {
+  clearTimeout(pvTimer);
+  pvTimer = 0;
+  if (pvEl && pvEl.parentNode) pvEl.parentNode.removeChild(pvEl);
+  pvEl = null;
+}
+
+function showPreview(btn) {
+  const id = btn.getAttribute('data-sb-evidence');
+  if (S.openEvidence.has(id)) return; // already pinned in-flow — no float
+  const e = edgeById(id);
+  if (!e) return;
+  hidePreview();
+  pvEl = document.createElement('div');
+  pvEl.className = 'sb-evpreview';
+  pvEl.innerHTML = EvidencePreview(e);
+  document.body.appendChild(pvEl);
+  // Float up: above the row when there is room, below it otherwise,
+  // clamped to the viewport either way.
+  const r = btn.getBoundingClientRect();
+  const w = pvEl.offsetWidth;
+  const h = pvEl.offsetHeight;
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+  const top = r.top - h - 6 >= 4 ? r.top - h - 6 : r.bottom + 6;
+  pvEl.style.left = `${Math.round(left)}px`;
+  pvEl.style.top = `${Math.round(top)}px`;
+}
+
+function onPointerOver(e) {
+  const btn = e.target && e.target.closest && e.target.closest('[data-sb-evidence]');
+  if (!btn) return;
+  clearTimeout(pvTimer);
+  pvTimer = setTimeout(() => showPreview(btn), 300);
+}
+
+function onPointerOut(e) {
+  const btn = e.target && e.target.closest && e.target.closest('[data-sb-evidence]');
+  if (!btn) return;
+  // Still inside the same button (child-to-child move)? Keep the card.
+  if (e.relatedTarget && btn.contains(e.relatedTarget)) return;
+  hidePreview();
+}
+
+function onFocusIn(e) {
+  const btn = e.target && e.target.closest && e.target.closest('[data-sb-evidence]');
+  if (!btn) return;
+  showPreview(btn); // keyboard focus previews immediately — no rest delay
+}
+
+function onFocusOut(e) {
+  const btn = e.target && e.target.closest && e.target.closest('[data-sb-evidence]');
+  if (!btn) return;
+  hidePreview();
 }
 
 (function wire() {
@@ -694,5 +1091,11 @@ function onResize() {
   document.addEventListener('pointerup', onPointerUp);
   document.addEventListener('pointercancel', onPointerCancel);
   document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('input', onFindInput);
+  document.addEventListener('keydown', onFindKey);
+  document.addEventListener('pointerover', onPointerOver);
+  document.addEventListener('pointerout', onPointerOut);
+  document.addEventListener('focusin', onFocusIn);
+  document.addEventListener('focusout', onFocusOut);
   window.addEventListener('resize', onResize);
 })();

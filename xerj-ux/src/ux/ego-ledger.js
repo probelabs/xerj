@@ -79,6 +79,51 @@ export const detectorName = (tag) => {
   return v ? `${w} · v${v}` : w;
 };
 
+// ----- evidence honesty classes -------------------------------------
+//
+// Not every link's evidence is a quote, and saying so is load-bearing:
+//   AUTHORED links (wikilink/mdlink/href) carry the exact text the
+//     author wrote — a real quote, quoted.
+//   STRUCTURAL links (samedir/sequence) carry a detector-generated
+//     rationale — real evidence of WHY, but never text from the note,
+//     so it must never wear quotation marks.
+//   Links with no evidence at all (asserted by hand or agent without a
+//     quote) say so — absence is shown, not papered over.
+
+const AUTHORED_DETECTORS = new Set(['wikilink', 'mdlink', 'href']);
+const STRUCTURAL_DETECTORS = new Set(['samedir', 'sequence']);
+const detectorBase = (tag) => String(tag || '').split('@')[0];
+
+/** 'quote' | 'rationale' | 'none' — how this link's evidence renders. */
+export const evidenceKind = (e) => {
+  const q = e && e.evidence && e.evidence.quote;
+  if (!q) return 'none';
+  return STRUCTURAL_DETECTORS.has(detectorBase(e.detector)) ? 'rationale' : 'quote';
+};
+
+/**
+ * Live-link counts split by what kind of teaching stands behind them,
+ * from `overview.detectors`. AUTHORED = a person wrote that link;
+ * STRUCTURAL = folder position / sort order (a prior, not a citation);
+ * anything else (hand- or agent-asserted vocabularies) is counted
+ * apart, never folded in. This split is what keeps a wikilink-free
+ * corpus honest: "0 authored · 214 structural", not a proud 214.
+ */
+export function authoredSplit(detectors) {
+  const s = { authored: 0, structural: 0, asserted: 0 };
+  for (const d of detectors || []) {
+    const b = detectorBase(d.detector);
+    if (AUTHORED_DETECTORS.has(b)) s.authored += d.live || 0;
+    else if (STRUCTURAL_DETECTORS.has(b)) s.structural += d.live || 0;
+    else s.asserted += d.live || 0;
+  }
+  return s;
+}
+
+/** The split as one lowercase hint phrase. */
+export const splitLabel = (s) =>
+  `${num(s.authored)} authored · ${num(s.structural)} structural${s.asserted > 0 ? ` · ${num(s.asserted)} asserted` : ''}`;
+
 /** Ids are opaque doc ids — autoindex ones are long hashes. Never make
  *  a human read 32 hex chars as a name. */
 const looksHashy = (id) => /^[0-9a-f]{16,}$/i.test(String(id || ''));
@@ -174,13 +219,22 @@ export function hop2Counts(edges, asOfMs) {
 
 // ----- evidence -----------------------------------------------------
 
-/** The exact source quote that taught this link, plus its full paper
- *  trail. This block is the ONLY place raw ids surface — labelled. */
-const EvidenceBlock = (e) => {
+/** Detector-aware evidence line. A quote is quoted; a structural
+ *  rationale is prefixed WHY — and never dressed as text from the
+ *  note; no evidence says so in as many words. */
+const evidenceLine = (e) => {
+  const kind = evidenceKind(e);
+  if (kind === 'quote') return `<p class="sb-evquote">“${esc(e.evidence.quote)}”</p>`;
+  if (kind === 'rationale') return `<p class="sb-evwhy">WHY — ${esc(e.evidence.quote)}</p>`;
+  return `<p class="sb-evquote sb-evnone">NO EVIDENCE RECORDED — ASSERTED, NOT DETECTED</p>`;
+};
+
+/** The evidence that taught this link, plus its full paper trail.
+ *  This block is the ONLY place raw ids surface — labelled. `pinned`
+ *  renders it open in-flow (the pin set lives in module state on the
+ *  controller side, so pins survive every re-render). */
+const EvidenceBlock = (e, pinned) => {
   const ev = e.evidence || {};
-  const quote = ev.quote
-    ? `<p class="sb-evquote">“${esc(ev.quote)}”</p>`
-    : `<p class="sb-evquote sb-evnone">no source quote was recorded for this link</p>`;
   const src = ev.source
     ? `<span>from ${esc(ev.source)}${ev.offset != null && ev.offset > 0 ? ` · byte ${esc(ev.offset)}` : ''}</span>`
     : '';
@@ -190,8 +244,8 @@ const EvidenceBlock = (e) => {
   const expired = e.expired_at != null
     ? ` · retirement recorded ${esc(fmtTs(e.expired_at))}` : '';
   return `
-  <div class="sb-evbody" data-sb-evbody hidden>
-    ${quote}
+  <div class="sb-evbody" data-sb-evbody${pinned ? '' : ' hidden'}>
+    ${evidenceLine(e)}
     <div class="sb-evmeta mono faint">
       ${src}
       <span>taught by ${esc(detectorName(e.detector).toLowerCase())} (${esc(e.detector || 'unknown detector')}) · ${esc(fmt(conf * 100, { decimals: 0 }))}% confident · strength ${esc(fmt(e.weight ?? 1, { decimals: 2 }))}</span>
@@ -201,12 +255,36 @@ const EvidenceBlock = (e) => {
   </div>`;
 };
 
+/**
+ * Floating hover card: the evidence line + one taught-by sentence. No
+ * raw ids here — the full paper trail is one click (the pin) away.
+ * Rendered into a fixed-position card by the interaction controller.
+ */
+export const EvidencePreview = (e) => {
+  const conf = e.confidence ?? 1;
+  return `
+  ${evidenceLine(e)}
+  <div class="sb-evmeta mono faint">
+    <span>taught by ${esc(detectorName(e.detector).toLowerCase())} · ${esc(fmt(conf * 100, { decimals: 0 }))}% confident · click to pin the paper trail</span>
+  </div>`;
+};
+
 // ----- rows + groups ------------------------------------------------
 
-const edgeRow = (e, side, { counts, asOf, clipped, nodes, names }) => {
+/** The row chip naming what stands behind the link: QUOTE (authored
+ *  text), WHY (structural rationale), or NO EVIDENCE. */
+const evidenceChip = (e) => {
+  const kind = evidenceKind(e);
+  if (kind === 'quote') return '<span class="sb-eq">QUOTE</span>';
+  if (kind === 'rationale') return '<span class="sb-eq sb-eq-why">WHY</span>';
+  return '<span class="sb-eq sb-eq-none">NO EVIDENCE</span>';
+};
+
+const edgeRow = (e, side, { counts, asOf, clipped, nodes, names, open }) => {
   const id = farEnd(e);
   const state = edgeStateAt(e, asOf);
   const n = counts.get(id) || 0;
+  const pinned = !!(open && open.has(e.edge_id));
   const hop2 = n > 0
     ? `+${clipped ? '≥' : ''}${num(n)} MORE`
     : '';
@@ -217,15 +295,16 @@ const edgeRow = (e, side, { counts, asOf, clipped, nodes, names }) => {
       <button type="button" class="sb-ename" data-sb-focus="${esc(id)}"
               title="Open the ledger for ${esc(id)}">${esc(nodeName(id, { nodes, names }))}</button>
       <button type="button" class="sb-emeta" data-sb-evidence="${esc(e.edge_id)}"
-              title="Show the source quote that taught this link">
+              aria-expanded="${pinned}"
+              title="Show what taught this link — click to pin the full paper trail">
         <span class="sb-ewin">${esc(fmtWindow(e.valid_at, e.invalid_at))}</span>
-        ${(e.evidence && e.evidence.quote) ? '<span class="sb-eq">QUOTE</span>' : ''}
+        ${evidenceChip(e)}
         ${hop2 ? `<span class="sb-ehop2" title="${esc(num(n))} more link${n === 1 ? '' : 's'} one step beyond — click the name to walk there">${esc(hop2)}</span>` : ''}
         <span class="sb-tag sb-tag-retired">RETIRED</span>
         <span class="sb-tag sb-tag-notyet">NOT YET</span>
       </button>
     </div>
-    ${EvidenceBlock(e)}
+    ${EvidenceBlock(e, pinned)}
   </div>`;
 };
 
@@ -235,13 +314,21 @@ const groupBlock = (g, side, ctx) => {
   const countLabel = shown < total
     ? `TOP ${num(shown)} OF ${num(total)}`
     : `${num(total)}`;
+  // Collapse is a client-side fold — header + count stay visible, the
+  // honesty counters never change, nothing is refetched.
+  const key = `${side}:${g.type}`;
+  const collapsed = !!(ctx.collapsed && ctx.collapsed.has(key));
   return `
   <div class="sb-group">
-    <div class="sb-grouphead" data-sb-grouphead="${side}">
-      <span class="sb-ghtype">${esc(typeName(g.type))}</span>
+    <button type="button" class="sb-grouphead" data-sb-grouphead="${side}"
+            data-sb-collapse="${esc(key)}" aria-expanded="${!collapsed}"
+            title="${collapsed ? 'Show' : 'Fold away'} these links (nothing is refetched)">
+      <span class="sb-ghtype"><span class="sb-ghcaret" data-sb-ghcaret>${collapsed ? '▸' : '▾'}</span>${esc(typeName(g.type))}</span>
       <span class="sb-ghcount">${esc(countLabel)}</span>
+    </button>
+    <div class="sb-grouprows" data-sb-grouprows${collapsed ? ' hidden' : ''}>
+      ${g.list.slice(0, LEDGER_GROUP_CAP).map((e) => edgeRow(e, side, ctx)).join('')}
     </div>
-    ${g.list.slice(0, LEDGER_GROUP_CAP).map((e) => edgeRow(e, side, ctx)).join('')}
   </div>`;
 };
 
@@ -307,8 +394,28 @@ const EgoControls = ({ brain, brains, focus, asOf, trail, names, nodes }) => {
     <span><span class="key">BRAIN</span> <span class="sb-cval">${esc(brain || '—')}</span> ${brainSwitch}</span>
     <span><span class="key">FOCUS</span> ${trailHtml}<span class="sb-cval">${esc(focus ? crumbName(focus) : '—')}</span></span>
     <span><span class="key">VIEWING</span> <span class="sb-cval${asOf != null ? ' accent' : ''}">${asOf != null ? esc(fmtTs(asOf)) + ' UTC' : 'NOW'}</span>${asOf != null ? ` <button type="button" class="sb-clink" data-sb-now>BACK TO NOW</button>` : ''}</span>
+    <span class="sb-cfind"><span class="key">FIND</span><input class="sb-findinput" type="text"
+      data-sb-find spellcheck="false" autocomplete="off"
+      placeholder="a note, by the words in it"
+      aria-label="Find a note in this brain — Enter opens the first match"></span>
     <span class="sb-cerr" data-sb-error></span>
-  </div>`;
+  </div>
+  <div class="sb-findresults" data-sb-findresults hidden></div>`;
+};
+
+/**
+ * FIND results: a temporary strip of note links under the controls.
+ * Every hit is the same refocus affordance as any other note name; an
+ * empty answer teaches what the brain is (and is not).
+ */
+export const FindResults = ({ hits, names }) => {
+  if (!hits || !hits.length) {
+    return `<span class="sb-sidenote mono faint">NO NOTE MATCHES — THE BRAIN ONLY KNOWS WHAT THE FOLDER TAUGHT IT</span>`;
+  }
+  return hits.map((h, i) =>
+    `<button type="button" class="sb-clink sb-findrow${i === 0 ? ' sb-findfirst' : ''}"
+      data-sb-focus="${esc(h.id)}" title="Open the ledger for ${esc(h.id)}">${esc(h.title || nodeName(h.id, { names }))}</button>`)
+    .join('<span class="faint"> · </span>');
 };
 
 // ----- belief-time scrubber ----------------------------------------
@@ -336,7 +443,7 @@ export const caretAlignClass = (pct) =>
  * interval set is pinned at NOW with retired links included, so
  * scrubbing never removes data from the strip — only states change.
  */
-export const BeliefScrubber = ({ timeline, asOf }) => {
+export const BeliefScrubber = ({ timeline, asOf, shift }) => {
   const edges = (timeline && timeline.edges) || [];
   if (!edges.length) {
     return `<div class="sb-scrub" data-sb-scrub><div class="panel-empty mono faint">NOTHING TO REPLAY YET · EVERY LINK WILL DRAW ITS LIFETIME HERE</div></div>`;
@@ -358,6 +465,17 @@ export const BeliefScrubber = ({ timeline, asOf }) => {
   const labelPct = Math.max(1, Math.min(99, caretPct));
   const liveAt = (t) => edges.reduce((a, e) => a + (edgeStateAt(e, t) === 'live' ? 1 : 0), 0);
   const liveAtCaret = liveAt(asOf);
+
+  // Every belief event on the strip (assertions AND retirements),
+  // sorted, deduped: the caret snaps to these on release and the arrow
+  // keys step between them — moments where nothing changed are not
+  // interesting stops.
+  const eventTimes = [...new Set(
+    edges.flatMap((e) => (e.invalid_at != null
+      ? [Number(e.valid_at), Number(e.invalid_at)]
+      : [Number(e.valid_at)])),
+  )].sort((a, b) => a - b);
+  const eventsAttr = ` data-sb-events="${esc(eventTimes.join(','))}"`;
 
   const lifetimes = edges.length <= SCRUB_LIFETIME_MAX;
   let stripInner = '';
@@ -419,15 +537,45 @@ export const BeliefScrubber = ({ timeline, asOf }) => {
     }
     pts += ` ${X},${prevY.toFixed(1)}`;
     stepsAttr = ` data-sb-steps="${esc(steps.map(([t, n]) => `${t}:${n}`).join(','))}"`;
+    // Assertion ticks: one 1px mute tick per moment a link started
+    // being believed (deduped at tick resolution) — the snap targets,
+    // made visible on the curve form where individual rows are gone.
+    const seenX = new Set();
+    let ticks = '';
+    for (const e of edges) {
+      const x = xOf(Number(e.valid_at));
+      const xq = Math.round(x);
+      if (seenX.has(xq)) continue;
+      seenX.add(xq);
+      ticks += `<line class="sb-atick" x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${h - 6}" y2="${h - 1}" stroke="currentColor" stroke-width="1"/>`;
+    }
     stripInner = `<svg class="chart sb-striplines" width="100%" height="${h}" viewBox="0 0 ${X} ${h}" preserveAspectRatio="none" aria-hidden="true">
+      ${ticks}
       <polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1"/>
     </svg>
     <span class="sb-curvemax mono faint">peak ${esc(floor)}${num(maxC)}</span>`;
     explain = `THE LINE COUNTS BELIEFS OVER TIME — TOO MANY LINKS (${floor}${num(edges.length)}) TO DRAW ONE PER ROW`;
   }
 
+  // What the last time-travel changed, stated in the legend: counts of
+  // appearances and retirements between the two carets — always named
+  // separately, never netted, '≥' floors when the fetch was clipped.
+  // "THIS MOMENT" must name the caret's end of the crossed interval:
+  // dragging right the caret sits at t1, dragging left it sits at t0 —
+  // the other endpoint is named by its date, never misattributed.
+  const shiftWhen = shift
+    ? (Math.abs(caretMs - shift.t1) <= Math.abs(caretMs - shift.t0)
+      ? `BETWEEN ${esc(fmtDay(shift.t0))} AND THIS MOMENT`
+      : `BETWEEN THIS MOMENT AND ${esc(fmtDay(shift.t1))}`)
+    : '';
+  const shiftHtml = shift
+    ? `<span class="sb-changeout" data-sb-changeout>↳ ${shift.appeared === 0 && shift.retired === 0
+      ? 'NOTHING CHANGED'
+      : `${esc(floor)}${num(shift.appeared)} APPEARED · ${esc(floor)}${num(shift.retired)} RETIRED`} ${shiftWhen}</span>`
+    : '';
+
   return `
-  <div class="sb-scrub" data-sb-scrub data-d0="${d0}" data-d1="${d1}"${stepsAttr}>
+  <div class="sb-scrub" data-sb-scrub data-d0="${d0}" data-d1="${d1}"${stepsAttr}${eventsAttr}>
     <div class="key">BELIEF TIME · DRAG ANYWHERE ON THE STRIP — THE PAGE REPLAYS WHAT THIS BRAIN BELIEVED AT THAT MOMENT</div>
     <div class="sb-strip" data-sb-strip style="height:${h}px;">
       ${stripInner}
@@ -439,7 +587,7 @@ export const BeliefScrubber = ({ timeline, asOf }) => {
     </div>
     <div class="sb-scrub-legend mono faint">
       <span>${esc(fmtDay(d0raw))}</span>
-      <span class="mid"><span data-sb-livecount>${esc(floor)}${num(liveAtCaret)} OF ${esc(floor)}${num(edges.length)}</span> BELIEVED AT THIS MOMENT<span class="sb-scrub-explain"> · ${explain}</span></span>
+      <span class="mid"><span data-sb-livecount>${esc(floor)}${num(liveAtCaret)} OF ${esc(floor)}${num(edges.length)}</span> BELIEVED AT THIS MOMENT<span class="sb-scrub-explain"> · ${explain}</span>${shiftHtml}</span>
       <span>${asOf != null ? `<button type="button" class="text-btn" data-sb-now>BACK TO NOW</button>` : `TODAY · ${esc(fmtDay(now))}`}</span>
     </div>
   </div>`;
@@ -473,7 +621,11 @@ export const EgoLedger = ({ data }) => {
   const nodes = ego.nodes || {};
   const clipped = !!(ego.not_shown && ego.not_shown.edges_clipped > 0);
   const counts = hop2Counts(ego.edges, asOf);
-  const ctx = { nodes, names, counts, asOf, clipped };
+  const ctx = {
+    nodes, names, counts, asOf, clipped,
+    open: sb.openEvidence,     // pinned paper trails — survive re-renders
+    collapsed: sb.collapsed,   // folded link-kind groups
+  };
   const inGroups = groupEdges(ego.edges, 'in');
   const outGroups = groupEdges(ego.edges, 'out');
   const hop1 = (ego.edges || []).filter((e) => e.hop === 1);
@@ -500,7 +652,7 @@ export const EgoLedger = ({ data }) => {
   return `
   ${EgoControls({ brain: data.brain, brains: sb.brains, focus: ego.node, asOf, trail: sb.trail, names, nodes })}
   ${body}
-  ${BeliefScrubber({ timeline: sb.timeline, asOf })}`;
+  ${BeliefScrubber({ timeline: sb.timeline, asOf, shift: sb.lastShift })}`;
 };
 
 // ----- honesty panel ------------------------------------------------
@@ -647,15 +799,35 @@ const AssertedPanel = ({ data }) => {
   return Num({ value: m.formatted, unit: 'links', spark, hint: m.hint, emphasis: false });
 };
 
-/** RETIRED — count + share of everything ever asserted. */
+/** RETIRED — count + share of everything ever asserted + the three
+ *  most recently retired links, each with the evidence it carried.
+ *  The churn rows are truth-now (most recent retirements on record),
+ *  regardless of where the belief caret sits. */
 const RetiredPanel = ({ data }) => {
   const o = data.overview || {};
+  const sb = data.sb || {};
   const ed = o.edges || { total: 0, invalidated: 0 };
   const m = (data.metrics && data.metrics.invalidated) || { formatted: num(ed.invalidated || 0), hint: '' };
   const share = ed.total > 0 ? `${((100 * ed.invalidated) / ed.total).toFixed(ed.invalidated ? 1 : 0)}% of all links` : '';
+  const names = sb.names || {};
+  const recent = Array.isArray(sb.recentRetired) ? sb.recentRetired : [];
+  const evSnippet = (e) => {
+    const kind = evidenceKind(e);
+    if (kind === 'quote') return `“${e.evidence.quote}”`;
+    if (kind === 'rationale') return `WHY — ${e.evidence.quote}`;
+    return 'no evidence recorded';
+  };
+  const rows = recent.map((e) => `
+    <button type="button" class="sb-retrow" data-sb-focus="${esc(e.src)}"
+            title="Open the ledger for ${esc(e.src)}">
+      <span class="sb-retpair">${esc(nodeName(e.src, { names }))} → ${esc(nodeName(e.dst, { names }))}</span>
+      <span class="sb-retwhen">retired ${esc(fmtDay(e.invalid_at))}</span>
+      <span class="sb-retev">${esc(evSnippet(e))}</span>
+    </button>`).join('');
   return `
   ${Num({ value: m.formatted, unit: 'links', hint: m.hint, emphasis: false })}
-  ${share ? `<div class="hint" style="margin-top:6px;">${esc(share)} · never deleted, only retired</div>` : ''}`;
+  ${share ? `<div class="hint" style="margin-top:6px;">${esc(share)} · never deleted, only retired</div>` : ''}
+  ${rows ? `<div class="sb-retrows">${rows}</div>` : ''}`;
 };
 
 /** WHAT TAUGHT THIS BRAIN — the detectors as identity + magnitude
@@ -677,8 +849,12 @@ const TaughtByPanel = ({ data }) => {
   const notListed = (o.not_shown && o.not_shown.detectors_not_listed) || 0;
   const tail = (dets.length > 4 || notListed > 0)
     ? `<div class="hint">+ ${num(Math.max(0, dets.length - 4) + notListed)} more</div>` : '';
+  // Authored vs structural, always stated: a corpus with no written
+  // links must read "0 authored · N structural", never a proud N.
+  const split = authoredSplit(dets);
   return `<div class="sb-dets">${rows}${tail}</div>
-  <div class="hint" style="margin-top:6px;">deterministic · versioned · no LLM</div>`;
+  <div class="hint" style="margin-top:6px;">${esc(splitLabel(split))}</div>
+  <div class="hint">deterministic · versioned · no LLM</div>`;
 };
 
 const TypeDistPanel = ({ data }) => {
@@ -687,7 +863,11 @@ const TypeDistPanel = ({ data }) => {
   if (!types.length) return `<div class="panel-empty mono faint">NO LINKS AT THIS MOMENT</div>`;
   const tail = o.not_shown && o.not_shown.types_not_listed > 0
     ? `<div class="hint">+ ${num(o.not_shown.types_not_listed)} kinds beyond this list</div>` : '';
-  return Dist({ segments: types.map((t) => ({ label: typeName(t.type), value: t.live })) }) + tail;
+  // The same authored/structural honesty as the detectors tile: how
+  // much of this distribution is written citation vs folder position.
+  const split = authoredSplit(o.detectors);
+  const splitNote = `<div class="hint" style="margin-top:6px;">${esc(splitLabel(split))} — authored links are written citations; structural ones are folder position and sort order</div>`;
+  return Dist({ segments: types.map((t) => ({ label: typeName(t.type), value: t.live })) }) + tail + splitNote;
 };
 
 const TimelinePanel = ({ data }) => {
