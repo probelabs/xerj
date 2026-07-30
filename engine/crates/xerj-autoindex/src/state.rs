@@ -541,6 +541,12 @@ mod compatibility_tests {
 
     #[test]
     fn replacement_start_durably_invalidates_done_until_a_durable_commit() {
+        // The failpoint is a global one-shot: any test that reaches
+        // `file_done` while another test has it armed would consume the
+        // injection meant for the armer (observed live 2026-07-30 as a
+        // parallel-run flake + poison cascade). Every file_done-reaching
+        // test holds this lock, armer or not.
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
             Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
@@ -592,6 +598,8 @@ mod compatibility_tests {
 
     #[test]
     fn torn_file_done_tail_is_truncated_before_repair_commit_is_appended() {
+        // Reaches file_done → must hold the failpoint lock (see above).
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
             Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
@@ -687,6 +695,8 @@ mod compatibility_tests {
 
     #[test]
     fn stale_generation_completion_cannot_clear_newer_pending_replacement() {
+        // Reaches file_done → must hold the failpoint lock (see above).
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
             Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();

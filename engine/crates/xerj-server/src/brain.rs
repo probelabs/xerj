@@ -121,7 +121,7 @@ fn parse(args: Vec<String>) -> Result<Option<BrainCfg>, String> {
             "--data-dir" => {
                 data_dir = Some(PathBuf::from(it.next().ok_or("--data-dir needs a value")?))
             }
-            "--api-key" => api_key = it.next(),
+            "--api-key" => api_key = Some(it.next().ok_or("--api-key needs a value")?),
             "--fresh" => fresh = true,
             "--no-open" => no_open = true,
             "--help" | "-h" => return Ok(None),
@@ -370,6 +370,7 @@ fn run(cfg: BrainCfg) -> Result<i32> {
         t0.elapsed().as_secs_f64()
     );
     println!("  → {console_url}");
+    println!("  agents: XERJ_URL={} xerj-mcp", cfg.url);
     if let Some(link) = &setup_link {
         println!("  one-time passkey setup (open once, valid 30 min):");
         println!("  → {link}");

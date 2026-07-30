@@ -964,7 +964,12 @@ export const secondBrain = {
   name: 'Second Brain',
   render: ({ data, time }) => ({
     title:  'SECOND BRAIN',
-    kicker: 'WHAT YOUR NOTES BELIEVE · EVERY LINK HAS A QUOTE · REPLAYABLE AT ANY MOMENT',
+    // Amended 2026-07-30 (integrator, honesty review): was "EVERY LINK HAS A
+    // QUOTE". The schema does not enforce a quote — §4.1 `evidence` is
+    // optional (manual/agent asserts may omit it) and structural detectors
+    // record a rationale, not note text. The surface may not claim more than
+    // the schema enforces.
+    kicker: 'WHAT YOUR NOTES BELIEVE · EVERY LINK SHOWS ITS EVIDENCE · REPLAYABLE AT ANY MOMENT',
     meta:   [time, 'XERJ-GRAPH'],
     panels: [
       { id: 'edgesLive',    eyebrow: 'BELIEVED AT THIS MOMENT',   cols: 3, type: 'metric' },

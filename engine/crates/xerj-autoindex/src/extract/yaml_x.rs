@@ -20,8 +20,15 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
         let yv: serde_yaml::Value = match serde_yaml::Value::deserialize(de) {
             Ok(v) => v,
             Err(_) => {
+                // MUST break, never continue: serde_yaml's multi-document
+                // iterator does not advance past a document that fails to
+                // parse — `continue` re-yields the same broken document
+                // forever (live hang: a markdown task list `- [ ] …` sniffed
+                // as YAML spun autoindex phase A indefinitely). Junk-file the
+                // rest of the stream instead; the loss is recorded, not
+                // hidden.
                 stats.junk += 1;
-                continue;
+                break;
             }
         };
         any = true;
@@ -107,5 +114,49 @@ fn yaml_to_json(v: serde_yaml::Value) -> Value {
             Value::Object(out)
         }
         serde_yaml::Value::Tagged(t) => yaml_to_json(t.value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract_str(text: &str) -> (ExtractStats, usize) {
+        let dir = std::env::temp_dir().join(format!(
+            "xerj-yamlx-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.yaml");
+        std::fs::write(&path, text).unwrap();
+        let mut n = 0usize;
+        let stats = extract(&path, false, &mut |_r| {
+            n += 1;
+            true
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        (stats, n)
+    }
+
+    /// Regression for a live hang: serde_yaml's multi-document iterator does
+    /// not advance past a document that fails to parse, so `continue` on the
+    /// error re-yielded the same broken document forever. A markdown task
+    /// list sniffed as YAML (`- [ ] …` is invalid YAML) spun autoindex phase
+    /// A indefinitely. The extractor must terminate and junk-file instead.
+    #[test]
+    fn broken_document_terminates_as_junk_not_forever() {
+        let (stats, n) = extract_str("# Launch checklist\n- [ ] alpha\n- [ ] beta\n");
+        assert_eq!(n, 0, "invalid YAML must not fabricate records");
+        assert!(stats.junk >= 1, "the unparseable stream is junk-filed");
+    }
+
+    #[test]
+    fn valid_multi_document_stream_still_yields_records() {
+        let (stats, n) = extract_str("a: 1\nb: two\n---\nc: 3\n");
+        assert_eq!(n, 2);
+        assert_eq!(stats.records, 2);
+        assert_eq!(stats.junk, 0);
     }
 }

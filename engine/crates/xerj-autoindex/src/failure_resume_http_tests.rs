@@ -228,6 +228,11 @@ fn event_count(state_dir: &Path, kind: &str) -> usize {
 #[test]
 fn fresh_publication_skips_delete_and_noop_resume_does_not_append_plan() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    // run_index reaches Journal::file_done; the file_done IO failpoint is
+    // a global one-shot, so every file_done-reaching test must hold its
+    // lock (armer or not) or it can steal an armed injection. Acquired
+    // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -255,6 +260,11 @@ fn fresh_publication_skips_delete_and_noop_resume_does_not_append_plan() {
 #[test]
 fn legacy_plan_without_completion_cleans_possible_partial_visibility() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    // run_index reaches Journal::file_done; the file_done IO failpoint is
+    // a global one-shot, so every file_done-reaching test must hold its
+    // lock (armer or not) or it can steal an armed injection. Acquired
+    // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let first_state = tempfile::tempdir().unwrap();
     let legacy_state = tempfile::tempdir().unwrap();
@@ -327,6 +337,11 @@ fn legacy_plan_without_completion_cleans_possible_partial_visibility() {
 #[test]
 fn legacy_key_collision_fails_before_visibility_with_scoped_guidance() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    // run_index reaches Journal::file_done; the file_done IO failpoint is
+    // a global one-shot, so every file_done-reaching test must hold its
+    // lock (armer or not) or it can steal an armed injection. Acquired
+    // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let mut owner = vec![b'x'; 65_537];
@@ -393,6 +408,11 @@ fn legacy_key_collision_fails_before_visibility_with_scoped_guidance() {
 #[test]
 fn existing_completion_is_invalidated_and_partial_visibility_is_deleted_on_resume() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    // run_index reaches Journal::file_done; the file_done IO failpoint is
+    // a global one-shot, so every file_done-reaching test must hold its
+    // lock (armer or not) or it can steal an armed injection. Acquired
+    // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     // 1: failure immediately after delete; 2: one complete 5,000-doc bulk
     // then a partial final bulk; 3: two complete bulks then a partial final
     // bulk immediately before the file_done journal append.
@@ -490,6 +510,11 @@ fn existing_completion_is_invalidated_and_partial_visibility_is_deleted_on_resum
 #[test]
 fn resume_repairs_kills_after_plan_delete_and_final_bulk_before_file_done() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    // run_index reaches Journal::file_done; the file_done IO failpoint is
+    // a global one-shot, so every file_done-reaching test must hold its
+    // lock (armer or not) or it can steal an armed injection. Acquired
+    // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     for boundary in [1u8, 2, 4] {
         let rows = 6_001usize;
         let corpus = tempfile::tempdir().unwrap();
@@ -592,6 +617,11 @@ fn file_done_append_and_fsync_failures_are_fatal_and_resume_repairs() {
 #[test]
 fn pending_generation_b_is_superseded_when_source_changes_to_c() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    // run_index reaches Journal::file_done; the file_done IO failpoint is
+    // a global one-shot, so every file_done-reaching test must hold its
+    // lock (armer or not) or it can steal an armed injection. Acquired
+    // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let path = corpus.path().join("records.csv");
@@ -657,6 +687,11 @@ fn pending_generation_b_is_superseded_when_source_changes_to_c() {
 #[test]
 fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    // run_index reaches Journal::file_done; the file_done IO failpoint is
+    // a global one-shot, so every file_done-reaching test must hold its
+    // lock (armer or not) or it can steal an armed injection. Acquired
+    // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let original = "id,value\n0,original\n1,original\n";
@@ -718,6 +753,11 @@ fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
 #[test]
 fn deleting_an_entire_duplicate_group_strands_no_pending_replacement() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    // run_index reaches Journal::file_done; the file_done IO failpoint is
+    // a global one-shot, so every file_done-reaching test must hold its
+    // lock (armer or not) or it can steal an armed injection. Acquired
+    // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("dup-a.csv"), "id,value\n0,dup\n1,dup\n").unwrap();

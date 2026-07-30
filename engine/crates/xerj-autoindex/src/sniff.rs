@@ -293,7 +293,17 @@ fn yaml_line_ratio(nonblank: &[&str]) -> f64 {
     let re = regex::Regex::new(r"^\s*(- )?[\w.@/-]+:(\s|$)").unwrap();
     let hits = nonblank
         .iter()
-        .filter(|l| re.is_match(l) || l.trim_start().starts_with("- "))
+        .filter(|l| {
+            let t = l.trim_start();
+            // Markdown task-list items (`- [ ]` / `- [x]`) are NOT YAML
+            // evidence: `- [ ] text` is invalid YAML (flow sequence followed
+            // by a scalar), while checklists are everywhere in real notes.
+            // Counting them here routed whole checklist files into the YAML
+            // extractor, which can only junk-file them.
+            let checkbox =
+                t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ");
+            re.is_match(l) || (t.starts_with("- ") && !checkbox)
+        })
         .count();
     hits as f64 / nonblank.len() as f64
 }
@@ -335,7 +345,32 @@ fn txt_kind(nonblank: &[&str]) -> Family {
     if sentence_ratio >= 0.40 {
         return Family::TxtProse;
     }
+
+    // Hard-wrapped markdown rescue. Sentence density per LINE undercounts
+    // prose whose author wraps at ~70-80 columns: sentences end mid-line, so
+    // a five-paragraph note with a `# Title` scores ~0.30 and landed in
+    // TxtLines — which silently cost it its title, its section anchors, and
+    // (second brain) its wikilink detection. Content evidence, not the
+    // extension: a file that OPENS with an ATX heading and shows either
+    // markdown link syntax or some terminal punctuation is a markdown
+    // document. The heading-opener requirement keeps shebang'd scripts
+    // (`#!…`) and most code/config out; the second signal keeps out comment
+    // banners over pure record streams.
+    let md_link = nonblank
+        .iter()
+        .any(|l| l.contains("[[") || l.contains("]("));
+    if md_heading(nonblank[0]) && (md_link || sentence_ratio >= 0.20) {
+        return Family::TxtProse;
+    }
     Family::TxtLines
+}
+
+/// `# Title` … `###### Title` — an ATX markdown heading (1-6 `#`, a space,
+/// then text). `#!/bin/sh` and bare `#` fail the space-then-text rule.
+fn md_heading(line: &str) -> bool {
+    let t = line.trim_start();
+    let hashes = t.bytes().take_while(|&b| b == b'#').count();
+    (1..=6).contains(&hashes) && t.as_bytes().get(hashes) == Some(&b' ') && t.len() > hashes + 1
 }
 
 /// Quote-aware field split (supports " and ' quoting).
@@ -581,5 +616,51 @@ mod text_family_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(kind(&t), Family::TxtProse);
+    }
+
+    /// Regression: a markdown checklist (`- [ ]` task items under a heading)
+    /// used to sniff as YAML — 2 of 3 nonblank lines start with `- ` — and
+    /// the YAML extractor then junk-filed it (and, before the yaml_x
+    /// non-progress fix, hung on it). Checkbox items are invalid YAML and
+    /// must not count as YAML evidence.
+    #[test]
+    fn markdown_checklist_is_prose_not_yaml() {
+        let md = "# Launch checklist\n\n\
+                  - [ ] Sign off the [business plan](01-business-plan.md)\n\
+                  - [x] Close out permits\n\
+                  - [ ] Dry run: two full batches back to back\n";
+        assert_eq!(classify_full(md), Family::TxtProse);
+        // A real YAML list is still YAML.
+        let yaml = "- alpha\n- beta\n- gamma\n";
+        assert_eq!(classify_full(yaml), Family::Yaml);
+    }
+
+    /// Regression (second-brain demo vault, live 2026-07-30): a markdown
+    /// note hard-wrapped at ~75 columns averages < 60 chars/line and ends
+    /// most lines mid-sentence, so it scored below the 0.40 sentence ratio
+    /// and landed in TxtLines — silently losing its title, its `s0` section
+    /// anchor, and its wikilink detection (8 of 39 vault files). A file that
+    /// opens with an ATX heading and shows markdown link syntax (or some
+    /// terminal punctuation) is markdown prose.
+    #[test]
+    fn hard_wrapped_markdown_note_is_prose_not_lines() {
+        let md = "# Hydration\n\n\
+                  Hydration is water as a percentage of flour weight, the core of\n\
+                  [[baker-percentages]]. 65% is a tight sandwich loaf; 75-80% is where open\n\
+                  [[crumb-structure]] lives; past 85% the dough demands real skill.\n\n\
+                  Higher hydration = looser dough, longer bulk, bigger holes. It is the single\n\
+                  most consequential number in the formula.\n";
+        assert_eq!(classify_full(md), Family::TxtProse);
+        // No heading opener → the rescue must not fire: a Python file whose
+        // comment banner starts mid-file stays wherever the base heuristics
+        // put it, and a shebang is not a heading.
+        let sh = "#!/usr/bin/env bash\n\
+                  set -euo pipefail\n\
+                  for f in a b c; do\n\
+                  echo one\n\
+                  echo two\n\
+                  echo three\n\
+                  done\n";
+        assert_eq!(classify_full(sh), Family::TxtLines);
     }
 }
