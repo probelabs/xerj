@@ -23162,15 +23162,90 @@ fn render_template(source: &str, params: &serde_json::Map<String, Value>) -> Str
     for (key, val) in params {
         let placeholder = format!("{{{{{}}}}}", key);
         let replacement = match val {
-            Value::String(s) => s.clone(),
+            // SECURITY: a string param must NOT be able to carry JSON structural
+            // tokens into the rendered query. Splicing the raw string lets a
+            // value like `50,"query":{"match_all":{}}` inject a duplicate key and
+            // drop the template's own filter (an unescaped-substitution injection).
+            // Emit the JSON-escaped INNER content (no surrounding quotes, so a
+            // placeholder used inside a template string literal — `"title":"{{q}}"`
+            // — still renders correctly). Inside a string context the escaping is
+            // transparent; in a bare value position a malicious value becomes an
+            // invalid `\"` sequence that fails the re-parse rather than injecting.
+            Value::String(s) => match serde_json::to_string(s) {
+                Ok(quoted) if quoted.len() >= 2 => quoted[1..quoted.len() - 1].to_string(),
+                _ => String::new(),
+            },
             Value::Number(n) => n.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Null => "null".to_string(),
-            other => other.to_string(),
+            // Objects/arrays serialize to their canonical JSON — a single value token.
+            other => serde_json::to_string(other).unwrap_or_default(),
         };
         result = result.replace(&placeholder, &replacement);
     }
     result
+}
+
+#[cfg(test)]
+mod render_template_security_tests {
+    use super::render_template;
+    use serde_json::{json, Map, Value};
+
+    fn params(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn string_param_cannot_inject_query_structure() {
+        // INJ-01 regression: a template that encodes an ACL filter and takes an
+        // untrusted `size`. The attacker sends a string that tries to splice in a
+        // second `query` key to drop the filter.
+        let src =
+            r#"{"query":{"bool":{"filter":[{"term":{"visibility":"public"}}]}},"size":{{size}}}"#;
+        let p = params(json!({ "size": "50,\"query\":{\"match_all\":{}}" }));
+        let rendered = render_template(src, &p);
+        // The malicious value must NOT parse into a query with a dropped filter.
+        // With escaping it becomes an invalid bare `\"` sequence → parse fails,
+        // so the injection is rejected rather than executed.
+        let parsed = serde_json::from_str::<Value>(&rendered);
+        assert!(
+            parsed.is_err()
+                || parsed
+                    .as_ref()
+                    .unwrap()
+                    .get("query")
+                    .and_then(|q| q.get("bool"))
+                    .is_some(),
+            "malicious size must not yield a match_all query: {rendered}"
+        );
+    }
+
+    #[test]
+    fn legitimate_in_string_substitution_still_works() {
+        let src = r#"{"query":{"match":{"title":"{{q}}"}}}"#;
+        let p = params(json!({ "q": "hello world" }));
+        let rendered = render_template(src, &p);
+        let v: Value = serde_json::from_str(&rendered).expect("must parse");
+        assert_eq!(v["query"]["match"]["title"], "hello world");
+    }
+
+    #[test]
+    fn quotes_in_a_string_value_are_escaped_not_broken_out() {
+        let src = r#"{"query":{"match":{"title":"{{q}}"}}}"#;
+        let p = params(json!({ "q": "a\"b" }));
+        let rendered = render_template(src, &p);
+        let v: Value = serde_json::from_str(&rendered).expect("must parse");
+        assert_eq!(v["query"]["match"]["title"], "a\"b");
+    }
+
+    #[test]
+    fn numeric_param_in_value_position_still_works() {
+        let src = r#"{"query":{"match_all":{}},"size":{{size}}}"#;
+        let p = params(json!({ "size": 25 }));
+        let rendered = render_template(src, &p);
+        let v: Value = serde_json::from_str(&rendered).expect("must parse");
+        assert_eq!(v["size"], 25);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

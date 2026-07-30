@@ -918,6 +918,16 @@ pub struct LimitsConfig {
     /// oversized bulks at the top of the parse phase with a 413-style per-item
     /// error instead of letting jemalloc abort the process on OOM.
     pub max_actions_per_bulk: usize,
+    /// Filesystem locations under which a snapshot repository's `settings.location`
+    /// is allowed to resolve (an ES `path.repo` equivalent). Empty (the default)
+    /// means **only `data_dir`** is permitted. Without this bound a write-capable
+    /// client could `PUT /_snapshot/<repo>` with an arbitrary absolute `location`
+    /// and then create/restore snapshots that read or write index data outside
+    /// `data_dir` (path-traversal via the repo root, F-PATH-02). Each entry is a
+    /// base directory; a repo location is accepted only if it canonicalizes to a
+    /// path inside `data_dir` or inside one of these bases.
+    #[serde(default)]
+    pub snapshot_repo_allowlist: Vec<String>,
     /// Maximum HTTP request body size in bytes (default: `100 * 1024 * 1024`,
     /// i.e. 100 MiB). Caps NDJSON bulk payloads, large mget bodies, etc.
     /// Raise this only if your client routinely sends bigger requests; the
@@ -984,6 +994,7 @@ impl Default for LimitsConfig {
             max_concurrent_searches: 64,
             max_fields_per_index: 500,
             max_actions_per_bulk: 50_000,
+            snapshot_repo_allowlist: Vec::new(),
             max_body_bytes: 100 * 1024 * 1024,
             max_result_window: 10_000,
             max_mget_docs: 10_000,
@@ -1433,13 +1444,14 @@ mod tests {
         //                   default_quantization, max_dimensions)
         //   logs:   2      (retention_days, time_partition)
         //   embedding: 4   (default_endpoint, default_model, batch_size, timeout_ms)
-        //   limits: 11     (query/concurrency/mapping/body/result/mget/bucket limits,
-        //                   total memtable, segment hydration cache, RSS, disk)
+        //   limits: 12     (query/concurrency/mapping/bulk-actions/body/result/mget/bucket
+        //                   limits, snapshot repo allowlist, total memtable,
+        //                   segment hydration cache, RSS, disk)
         //   indexing: 3    (turbo_batch_size, turbo_parallel, turbo_fast_analyzer)
         //   logging: 2     (format, access_log)                      ← RC4-W4 item 6
         //   ─────────
-        //   total: 58 fields, minus 1 auto-generated (admin_api_key) = 57 meaningful user settings
-        let total: usize = 5 + 3 + 3 + 10 + 5 + 3 + 1 + 6 + 2 + 4 + 11 + 3 + 2;
-        assert_eq!(total, 58);
+        //   total: 59 fields, minus 1 auto-generated (admin_api_key) = 58 meaningful user settings
+        let total: usize = 5 + 3 + 3 + 10 + 5 + 3 + 1 + 6 + 2 + 4 + 12 + 3 + 2;
+        assert_eq!(total, 59);
     }
 }

@@ -313,6 +313,14 @@ max_fields_per_index = 500
 # disable the cap (not recommended in production).
 max_actions_per_bulk = 50000
 
+# Filesystem roots a snapshot repository's settings.location may resolve under
+# (an Elasticsearch path.repo equivalent). Empty = only data_dir is permitted.
+# Without this bound, a write-capable client can PUT a snapshot repo whose
+# location is any absolute path and then read/write index data outside data_dir.
+# Add absolute base paths here only to allow snapshots on external/backup roots.
+# Example: snapshot_repo_allowlist = ["/mnt/backups"]
+snapshot_repo_allowlist = []
+
 # Process-wide retained-payload budget for the seven immutable segment
 # hydration caches (MiB). 0 derives 20% of the effective cgroup/system memory
 # limit with no minimum floor. This is not an RSS limit: query-owned results,

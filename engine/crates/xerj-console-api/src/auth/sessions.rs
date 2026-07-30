@@ -34,6 +34,7 @@ use crate::bootstrap::sha256_hex;
 use crate::error::{ConsoleApiError, ConsoleResult};
 use crate::state::ConsoleState;
 use crate::time::{epoch_ms_to_iso, now_epoch_ms, now_iso, parse_iso};
+use xerj_engine::Engine;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -180,12 +181,14 @@ impl FromRequestParts<ConsoleState> for AuthSession {
             return Err(ConsoleApiError::Unauthorized("user disabled".into()));
         }
 
-        // Bump last_seen so the session stays fresh while the user is
-        // active. Best-effort — we don't fail the request if the write
-        // races with another tab.
-        let mut bumped = session.clone();
-        bumped.last_seen_at = now_iso();
-        let _ = store::put_session(&state.engine, &bumped).await;
+        // Bump last_seen so the session stays fresh while the user is active.
+        // Best-effort — we don't fail the request if the write races with another
+        // tab. SECURITY (S5-1): do NOT blind-write the session we read at the top
+        // of this function. A concurrent revoke_session() between that read and
+        // this write would be clobbered by the stale copy (revoked_at: None),
+        // resurrecting a revoked session — a revocation bypass. Re-read and bump
+        // only the fresh record, skipping entirely if it is now revoked or gone.
+        bump_last_seen(&state.engine, &session_id).await;
 
         Ok(AuthSession { session_id, user })
     }
@@ -194,6 +197,28 @@ impl FromRequestParts<ConsoleState> for AuthSession {
 // ─────────────────────────────────────────────────────────────────────────────
 // Bearer (API token) authentication
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Refresh a session's `last_seen_at` without clobbering a concurrent revocation.
+///
+/// S5-1 fix: re-reads the session immediately before writing and skips the write
+/// if it is now gone or revoked, so a `revoke_session()` that landed after the
+/// request's initial auth read cannot be overwritten by a stale copy. The write
+/// carries the *fresh* record's fields (including its `revoked_at`), so even the
+/// tiny residual window between this re-read and the put cannot resurrect a
+/// revoked session — it would only rewrite an already-revoked record unchanged.
+/// Best-effort: any store error is swallowed, exactly as before.
+pub(crate) async fn bump_last_seen(engine: &Engine, session_id: &str) {
+    let fresh = match store::get_session(engine, session_id).await {
+        Ok(Some(s)) => s,
+        _ => return, // gone (revoked-by-delete or expired-out) → do not recreate
+    };
+    if fresh.revoked_at.is_some() {
+        return; // revoked between auth read and now → must not refresh
+    }
+    let mut bumped = fresh;
+    bumped.last_seen_at = now_iso();
+    let _ = store::put_session(engine, &bumped).await;
+}
 
 /// Pull the secret out of an `Authorization: Bearer <secret>` header.
 /// Returns `None` when the header is absent, is not a bearer scheme, or
@@ -328,5 +353,73 @@ mod tests {
     fn cookie_rejects_wrong_key() {
         let signed = sign_session_id("abc123", &[7u8; 32]);
         assert!(verify_session_cookie(&signed, &[8u8; 32]).is_none());
+    }
+
+    async fn test_engine() -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = xerj_common::config::Config::default();
+        cfg.server.data_dir = dir.path().to_str().unwrap().to_string();
+        let engine = Engine::new(cfg).expect("engine");
+        crate::bootstrap::run(&engine, dir.path(), "http://localhost:9200")
+            .await
+            .expect("bootstrap");
+        (engine, dir)
+    }
+
+    fn session(id: &str, revoked: bool) -> store::Session {
+        store::Session {
+            id: id.to_string(),
+            user_id: "u1".into(),
+            created_at: now_iso(),
+            expires_at: crate::time::epoch_ms_to_iso(now_epoch_ms() + 3_600_000),
+            last_seen_at: crate::time::epoch_ms_to_iso(now_epoch_ms() - 600_000),
+            ip: None,
+            ua: None,
+            idp: "passkey".into(),
+            revoked_at: if revoked { Some(now_iso()) } else { None },
+        }
+    }
+
+    /// S5-1: bump_last_seen must NOT resurrect a session that was revoked before
+    /// the bump. Pre-fix, the extractor blind-wrote a stale (revoked_at: None)
+    /// copy, un-revoking it — a revocation bypass.
+    #[tokio::test]
+    async fn bump_does_not_resurrect_a_revoked_session() {
+        let (engine, _dir) = test_engine().await;
+        // A session that is live, then revoked (the realistic race outcome:
+        // revoke lands before the in-flight request's bump).
+        store::put_session(&engine, &session("s-revoked", false))
+            .await
+            .unwrap();
+        store::revoke_session(&engine, "s-revoked", &now_iso())
+            .await
+            .unwrap();
+
+        bump_last_seen(&engine, "s-revoked").await;
+
+        let after = store::get_session(&engine, "s-revoked").await.unwrap();
+        assert!(
+            after.is_some() && after.unwrap().revoked_at.is_some(),
+            "bump must not clear revoked_at"
+        );
+    }
+
+    /// A live session's bump still refreshes last_seen (the feature still works).
+    #[tokio::test]
+    async fn bump_refreshes_a_live_session() {
+        let (engine, _dir) = test_engine().await;
+        let mut s = session("s-live", false);
+        s.last_seen_at = crate::time::epoch_ms_to_iso(now_epoch_ms() - 600_000);
+        let before = s.last_seen_at.clone();
+        store::put_session(&engine, &s).await.unwrap();
+
+        bump_last_seen(&engine, "s-live").await;
+
+        let after = store::get_session(&engine, "s-live")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.revoked_at.is_none());
+        assert_ne!(after.last_seen_at, before, "last_seen should advance");
     }
 }

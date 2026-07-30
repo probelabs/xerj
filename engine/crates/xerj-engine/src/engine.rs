@@ -1560,7 +1560,13 @@ impl Engine {
         indices: Option<Vec<String>>,
     ) -> Result<Value> {
         let snap_dir = std::path::Path::new(repo_path).join(name);
-        let snap_dir = validate_snapshot_path(repo_path, name, &snap_dir)?;
+        let snap_dir = validate_snapshot_path(
+            repo_path,
+            name,
+            &snap_dir,
+            &self.data_dir,
+            &self.config.limits.snapshot_repo_allowlist,
+        )?;
         std::fs::create_dir_all(&snap_dir).map_err(EngineError::Io)?;
 
         // Wall-clock start, captured BEFORE the flush+copy work so
@@ -1652,7 +1658,13 @@ impl Engine {
         indices: Option<Vec<String>>,
     ) -> Result<Vec<String>> {
         let snap_dir = std::path::Path::new(repo_path).join(name);
-        let snap_dir = validate_snapshot_path(repo_path, name, &snap_dir)?;
+        let snap_dir = validate_snapshot_path(
+            repo_path,
+            name,
+            &snap_dir,
+            &self.data_dir,
+            &self.config.limits.snapshot_repo_allowlist,
+        )?;
         let manifest_path = snap_dir.join("manifest.json");
 
         let manifest_bytes = std::fs::read(&manifest_path).map_err(EngineError::Io)?;
@@ -1853,12 +1865,37 @@ fn validate_snapshot_path(
     repo_path: &str,
     name: &str,
     snap_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    allowlist: &[String],
 ) -> Result<std::path::PathBuf> {
     if repo_path.is_empty() {
         return Err(EngineError::Common(
             xerj_common::XerjError::invalid_mapping(
                 "snapshot repository location must not be empty",
             ),
+        ));
+    }
+    // F-PATH-02: the repo `location` is operator/attacker-supplied via
+    // `PUT /_snapshot/{repo}`. The name-containment checks below only prove the
+    // snapshot stays inside THAT location — they say nothing about whether the
+    // location itself is sane. Bound the location to `data_dir` (default) or a
+    // configured allowlist (an ES `path.repo` equivalent), so a repo cannot point
+    // at `/etc`, `/root/.ssh`, another tenant's dir, etc.
+    let base_canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let repo_base = base_canon(std::path::Path::new(repo_path));
+    let mut allowed_bases: Vec<std::path::PathBuf> = vec![base_canon(data_dir)];
+    allowed_bases.extend(
+        allowlist
+            .iter()
+            .map(|b| base_canon(std::path::Path::new(b))),
+    );
+    if !allowed_bases.iter().any(|base| repo_base.starts_with(base)) {
+        return Err(EngineError::Common(
+            xerj_common::XerjError::invalid_mapping(format!(
+                "snapshot repository location [{repo_path}] is outside data_dir and not in \
+                 limits.snapshot_repo_allowlist; refusing (set the allowlist to permit external \
+                 snapshot roots)"
+            )),
         ));
     }
     if name.is_empty()
@@ -1902,6 +1939,53 @@ fn validate_snapshot_path(
             ));
         }
         Ok(snap_lex)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_path_security_tests {
+    use super::validate_snapshot_path;
+
+    #[test]
+    fn f_path_02_repo_location_outside_data_dir_is_rejected_by_default() {
+        let data = tempfile::TempDir::new().unwrap();
+        // A repo location pointing outside data_dir (the F-PATH-02 exploit shape)
+        // with an empty allowlist must be refused.
+        let outside = tempfile::TempDir::new().unwrap();
+        let repo = outside.path().to_str().unwrap();
+        let snap = std::path::Path::new(repo).join("s1");
+        let err = validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
+            .expect_err("external repo location must be rejected");
+        assert!(err.to_string().contains("outside data_dir"), "{err}");
+    }
+
+    #[test]
+    fn location_inside_data_dir_is_allowed() {
+        let data = tempfile::TempDir::new().unwrap();
+        let repo_dir = data.path().join("backups");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let repo = repo_dir.to_str().unwrap();
+        let snap = repo_dir.join("s1");
+        validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
+            .expect("a repo under data_dir must be allowed");
+    }
+
+    #[test]
+    fn explicit_allowlist_permits_an_external_root() {
+        let data = tempfile::TempDir::new().unwrap();
+        let ext = tempfile::TempDir::new().unwrap();
+        let repo = ext.path().to_str().unwrap().to_string();
+        let snap = std::path::Path::new(&repo).join("s1");
+        validate_snapshot_path(&repo, "s1", &snap, data.path(), &[repo.clone()])
+            .expect("an allowlisted external root must be permitted");
+    }
+
+    #[test]
+    fn traversal_name_still_rejected_even_inside_an_allowed_base() {
+        let data = tempfile::TempDir::new().unwrap();
+        let snap = data.path().join("..");
+        let repo = data.path().to_str().unwrap();
+        assert!(validate_snapshot_path(repo, "..", &snap, data.path(), &[]).is_err());
     }
 }
 
