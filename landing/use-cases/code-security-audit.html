@@ -40,11 +40,10 @@
 
 <nav class="uc-subnav" aria-label="Use cases">
   <a href="/use-cases.html">ALL USE CASES</a>
+  <a href="/use-cases/code-security-audit.html" class="active">AI SECURITY REVIEW</a>
   <a href="/use-cases/security-analytics.html">SECURITY ANALYTICS</a>
   <a href="/use-cases/operational-intelligence.html">OPERATIONAL INTELLIGENCE</a>
   <a href="/use-cases/ai-search-retrieval.html">AI SEARCH</a>
-  <a href="/use-cases/semantic-analytics.html">SEMANTIC ANALYTICS</a>
-  <a href="/use-cases/code-security-audit.html" class="active">AI SECURITY REVIEW</a>
   <a href="/use-cases/elasticsearch-replacement.html">ES REPLACEMENT</a>
   <a href="/use-cases/unified-observability.html">OBSERVABILITY</a>
 </nav>
@@ -55,6 +54,11 @@
   <p class="uc-lead">This is a method, and it is four steps. Read once to learn the rule — the invariant you actually care about. Compile it into a queryable fingerprint over the tree indexed as security <em>facts</em>: one document per function carrying its taint sources, its sinks, whether it sanitizes, and its outgoing call edges. Query the fingerprint, so only the violators come back. Read only the survivors — and execute the check where the code can be executed; in the proof run that was the SSRF validator, ported and run. XERJ is the agent's second brain in that loop: it holds a whole codebase's structure as queryable facts, so the agent reasons over all of it without ever loading the whole tree into context — it reads only the survivors the queries name. The proof run below is real WordPress core — 1,492 PHP files, ~619,000 lines, about 26× a 200k-token context window — indexed in ≈3.6 seconds. The entire structured audit summed to ~26,000 tokens, against ~5,200,000 just to load the tree once.</p>
   <div class="kicker"><span>FOR</span><span class="dash">·</span><span>CISO</span><span class="dash">·</span><span>APPSEC ENGINEER</span><span class="dash">·</span><span>SECURITY RESEARCHER</span></div>
 </div>
+
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-40);">TWO REAL <span class="accent">PROOF RUNS.</span></h2>
+  <p class="wide">The method has been run end to end on two real codebases, not a demo corpus. The WordPress proof (below) is the token-economics story. The second run turned the method on <strong>XERJ's own Rust engine</strong> — and it is the stronger proof, because it found and <em>fixed</em> real vulnerabilities: an unauthenticated <code class="inline">/_sql</code> stack-overflow that aborts the process, a search-template injection that drops a query's ACL filter and leaks private documents, and a snapshot path-traversal that writes outside the data directory. Each was proven by crashing (then, after the fix, not crashing) a live server. Against six known-fixed bugs the substrate recalled <strong>6/6 where grep managed 4/6</strong> — grep cannot find a missing check — and reached the <code class="inline">/_sql</code> finding for <strong>171× fewer tokens</strong> than reading the tree. Full methodology, all eight findings, and the honest in-sample caveat: <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/xerj-self-audit" rel="external">docs/case-studies/xerj-self-audit →</a>.</p>
+</section>
 
 <!-- Hero chart -->
 <section class="scene-section" style="border-top:0; padding-top:0;">

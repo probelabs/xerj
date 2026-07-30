@@ -327,7 +327,6 @@ AI security review of a codebase too big to read:
 
 Aggregate a semantic slice in one request (kNN + aggregations, rc.6):
   https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics
-  https://xerj.org/use-cases/semantic-analytics.html
   https://xerj.org/case-studies/calltree-analytics.html
   The deep-research shape, where one question is half retrieval and half
   analytics — "of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what

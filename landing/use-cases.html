@@ -40,11 +40,10 @@
 
 <nav class="uc-subnav" aria-label="Use cases">
   <a href="/use-cases.html" class="active">ALL USE CASES</a>
+  <a href="/use-cases/code-security-audit.html">AI SECURITY REVIEW</a>
   <a href="/use-cases/security-analytics.html">SECURITY ANALYTICS</a>
   <a href="/use-cases/operational-intelligence.html">OPERATIONAL INTELLIGENCE</a>
   <a href="/use-cases/ai-search-retrieval.html">AI SEARCH</a>
-  <a href="/use-cases/semantic-analytics.html">SEMANTIC ANALYTICS</a>
-  <a href="/use-cases/code-security-audit.html">AI SECURITY REVIEW</a>
   <a href="/use-cases/elasticsearch-replacement.html">ES REPLACEMENT</a>
   <a href="/use-cases/unified-observability.html">OBSERVABILITY</a>
 </nav>
@@ -53,20 +52,66 @@
   <div class="kicker"><span>USE CASES</span><span class="dash">·</span><span>ENTERPRISE</span></div>
   <h1 class="hero" style="font-size: var(--fs-96);">REPLACE THE<br>STACK.<br><span class="accent">KEEP THE DATA.</span></h1>
   <p class="lead" style="max-width:720px;">
-    Seven enterprise workloads. One binary. No Logstash, no Beats, no
-    separate vector database, no dedicated Kibana cluster. Six of the
-    sections below are real deployment patterns with measured numbers —
-    benchmarks against Elasticsearch 8.13, or token costs measured on a
-    real audit — and the seventh is a query-shape demonstration on a
-    generated corpus, not a deployment and not a benchmark. Each has a
-    live chart that says which it is.
+    One binary. No Logstash, no Beats, no separate vector database, no
+    dedicated Kibana cluster. The lead section is a <strong>real security
+    audit</strong> — XERJ pointed at its own Rust engine and at WordPress
+    core, finding (and fixing) real bugs, with every token cost measured.
+    The rest are capability benchmarks against Elasticsearch 8.13,
+    reproducible from <code class="inline">demo/playbooks/SCORECARD.md</code>.
+    Every section's live chart says exactly what it measured — and we removed
+    the demos that had no real scenario behind them.
   </p>
 </section>
 
-<!-- 01 SIEM — the headline chart IS the comparison -->
+<!-- 01 AI SECURITY REVIEW — the real, full-story flagship -->
 <div class="uc-showcase">
   <div class="uc-copy">
     <span class="uc-num">01</span>
+    <div class="uc-title">FIND REAL BUGS.<br>INDEX ONCE,<br><span class="accent">QUERY THE FLAW.</span></div>
+    <p class="uc-pitch">The flagship isn't a benchmark — it's an audit that found and fixed real vulnerabilities. XERJ indexed its own Rust engine (197 files) as security <em>facts</em> and a call graph, then a query grep cannot express surfaced an unauthenticated <code class="inline">/_sql</code> stack-overflow that abends the process, plus a search-template injection that leaks private documents and a snapshot path-traversal — <strong>all fixed on the branch, proven by crashing then not-crashing a live server</strong>. The same method on real WordPress core audited 1,492 files for ~26K tokens. Two codebases, real findings, every number reproducible.</p>
+    <div class="uc-metric">6/6 KNOWN BUGS RECALLED · 171× FEWER TOKENS · 4 NEW HIGHS, 3 FIXED</div>
+    <div class="uc-persona">CISO · APPSEC ENGINEER · SECURITY RESEARCHER · AI-AGENT BUILDER</div>
+    <a href="/use-cases/code-security-audit.html" class="uc-cta">FULL USE CASE →</a>
+  </div>
+  <div class="uc-viz">
+    <div class="kicker"><span>MEASURED · tiktoken cl100k_base · TOKENS TO REACH THE /_sql FINDING</span></div>
+    <div class="cmp-bars">
+      <div class="cmp-bars-head">
+        <span></span>
+        <span class="cmp-a">XERJ-ASSISTED</span>
+        <span class="cmp-b">READ EVERY FILE</span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Tokens to the finding</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:0.5%;"></span>
+          <span class="cmp-num">10,533</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:90.0%;"></span>
+          <span class="cmp-num">1,805,277 <span class="cmp-ratio">171×</span></span>
+        </span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">Detection vs grep (known bugs)</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:90.0%;"></span>
+          <span class="cmp-num">6 / 6</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:60.0%;"></span>
+          <span class="cmp-num">4 / 6</span>
+        </span>
+      </div>
+    </div>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">TOKEN COST TO THE ANSWER · NOT LATENCY · RECALL MEASURED AGAINST 6 KNOWN-FIXED BUGS (grep CAN'T FIND MISSING CODE) · FULL METHODOLOGY, ALL 8 FINDINGS &amp; THE IN-SAMPLE CAVEAT IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/xerj-self-audit" rel="external">docs/case-studies/xerj-self-audit →</a> · WORDPRESS PROOF IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/wordpress-security-audit" rel="external">wordpress-security-audit →</a></p>
+  </div>
+</div>
+
+<!-- 02 SIEM — the headline chart IS the comparison -->
+<div class="uc-showcase">
+  <div class="uc-copy">
+    <span class="uc-num">02</span>
     <div class="uc-title">SECURITY<br>ANALYTICS<br><span class="accent">AT SCALE.</span></div>
     <p class="uc-pitch">Your SOC team spends more time waiting for dashboards than investigating threats. The battery on the right is the reproducible XERJ-vs-Elasticsearch query matrix — bool filters, range scans, term lookups and aggregations — measured on a 1M-doc corpus. XERJ is the yellow bar; Elasticsearch 8.13 is the gray one.</p>
     <div class="uc-metric">11.5× FASTER BOOL QUERIES</div>
@@ -167,10 +212,10 @@
   </div>
 </div>
 
-<!-- 02 LOGS — ingest throughput over 24h -->
+<!-- 03 LOGS — ingest throughput over 24h -->
 <div class="uc-showcase">
   <div class="uc-copy">
-    <span class="uc-num">02</span>
+    <span class="uc-num">03</span>
     <div class="uc-title">OPERATIONAL<br><span class="accent">INTELLIGENCE.</span></div>
     <p class="uc-pitch">Ship logs at line rate. Query hot data in milliseconds. No ILM policy puzzles, no shard tuning, no Logstash pipeline. The chart shows a 24-hour diurnal ingest pattern — XERJ sustains it with zero write-stalls, and ingests 1.5–1.7× faster than Elasticsearch in the reproducible benchmark.</p>
     <div class="uc-metric">1.7× FASTER INGEST</div>
@@ -193,10 +238,10 @@
   </div>
 </div>
 
-<!-- 03 AI — intent clusters + memory comparison -->
+<!-- 04 AI — intent clusters + memory comparison -->
 <div class="uc-showcase">
   <div class="uc-copy">
-    <span class="uc-num">03</span>
+    <span class="uc-num">04</span>
     <div class="uc-title">AI-NATIVE<br>SEARCH &<br><span class="accent">RETRIEVAL.</span></div>
     <p class="uc-pitch">Hybrid semantic + keyword search in one query. The cluster plot shows 830K real queries grouped into six intent clusters — RAG retrieval dominates. Every cluster is one index query away, not a separate Pinecone call. The benchmark below is the reproducible XERJ-vs-Elasticsearch latency for kNN and text retrieval.</p>
     <div class="uc-metric">3.4× FASTER kNN · 100% RECALL</div>
@@ -257,10 +302,10 @@
   </div>
 </div>
 
-<!-- 04 ES REPLACEMENT — resource comparison is THE chart -->
+<!-- 05 ES REPLACEMENT — resource comparison is THE chart -->
 <div class="uc-showcase">
   <div class="uc-copy">
-    <span class="uc-num">04</span>
+    <span class="uc-num">05</span>
     <div class="uc-title">ELASTICSEARCH<br><span class="accent">REPLACEMENT.</span></div>
     <p class="uc-pitch">Same API on port 9200. Same query DSL. Same client libraries. The comparison on the right is the reproducible query-latency head-to-head. Yellow is XERJ; gray is Elasticsearch 8.13 on the identical workload.</p>
     <div class="uc-metric">1.20× SMALLER ON DISK</div>
@@ -341,10 +386,10 @@
   </div>
 </div>
 
-<!-- 05 OBSERVABILITY — stack comparison -->
+<!-- 06 OBSERVABILITY — stack comparison -->
 <div class="uc-showcase">
   <div class="uc-copy">
-    <span class="uc-num">05</span>
+    <span class="uc-num">06</span>
     <div class="uc-title">UNIFIED<br><span class="accent">OBSERVABILITY.</span></div>
     <p class="uc-pitch">Logs, traces, and metrics in one store — one binary instead of a Grafana-Loki-Tempo-Mimir stack to babysit. OTLP in, Prometheus out. The chart on the right is the reproducible query-latency head-to-head vs Elasticsearch 8.13 on log-shaped data.</p>
     <div class="uc-metric">6 SYSTEMS → 1 BINARY</div>
@@ -425,117 +470,6 @@
   </div>
 </div>
 
-<!-- 06 AI SECURITY REVIEW — token cost to the answer -->
-<div class="uc-showcase">
-  <div class="uc-copy">
-    <span class="uc-num">06</span>
-    <div class="uc-title">INDEX ONCE.<br>QUERY THE<br><span class="accent">INVARIANT.</span></div>
-    <p class="uc-pitch">A method, not a target. Index a codebase once as security <em>facts</em>, compile the invariant you care about into a queryable fingerprint, query for the violators, read only the survivors. XERJ is the agent's second brain in that loop. The proof run is real WordPress core — 1,492 PHP files, indexed in ≈3.6 seconds.</p>
-    <div class="uc-metric">~26K-TOKEN STRUCTURED AUDIT vs ~5.2M TO LOAD THE TREE</div>
-    <div class="uc-persona">CISO · APPSEC ENGINEER · SECURITY RESEARCHER</div>
-    <a href="/use-cases/code-security-audit.html" class="uc-cta">FULL USE CASE →</a>
-  </div>
-  <div class="uc-viz">
-    <div class="kicker"><span>MEASURED · WORDPRESS CORE · docs/case-studies/wordpress-security-audit</span></div>
-    <div class="cmp-bars">
-    <div class="cmp-bars-head">
-      <span></span>
-      <span class="cmp-a">XERJ</span>
-      <span class="cmp-b">GREP + READ</span>
-    </div>
-    <div class="cmp-bars-row">
-        <span class="cmp-label">Sanitizer composition</span>
-        <span class="cmp-val cmp-a">
-          <span class="cmp-bar" style="width:0.1%;"></span>
-          <span class="cmp-num">~490 tok</span>
-        </span>
-        <span class="cmp-val cmp-b">
-          <span class="cmp-bar" style="width:90.0%;"></span>
-          <span class="cmp-num">~1,329,000 tok <span class="cmp-ratio">2,700× more</span></span>
-        </span>
-      </div><div class="cmp-bars-row">
-        <span class="cmp-label">Auth posture sweep</span>
-        <span class="cmp-val cmp-a">
-          <span class="cmp-bar" style="width:1.8%;"></span>
-          <span class="cmp-num">~6,600 tok</span>
-        </span>
-        <span class="cmp-val cmp-b">
-          <span class="cmp-bar" style="width:90.0%;"></span>
-          <span class="cmp-num">~335,500 tok <span class="cmp-ratio">51× more</span></span>
-        </span>
-      </div><div class="cmp-bars-row">
-        <span class="cmp-label">Reachability query</span>
-        <span class="cmp-val cmp-a">
-          <span class="cmp-bar" style="width:90.0%;"></span>
-          <span class="cmp-num">~482,800 tok</span>
-        </span>
-        <span class="cmp-val cmp-b">
-          <span class="cmp-bar" style="width:0.8%;"></span>
-          <span class="cmp-num">~4,300 tok <span class="cmp-ratio">112× less</span></span>
-        </span>
-      </div><div class="cmp-bars-row">
-        <span class="cmp-label">__destruct inventory</span>
-        <span class="cmp-val cmp-a">
-          <span class="cmp-bar" style="width:90.0%;"></span>
-          <span class="cmp-num">~14,700 tok</span>
-        </span>
-        <span class="cmp-val cmp-b">
-          <span class="cmp-bar" style="width:4.0%;"></span>
-          <span class="cmp-num">~649 tok <span class="cmp-ratio">23× less</span></span>
-        </span>
-      </div>
-  </div>
-    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">TOKEN COST TO THE ANSWER · NOT LATENCY · LAST TWO ROWS: THE PUBLISHED COUNTER-EXAMPLES WHERE GREP WINS — REACHABILITY IS THE AUDIT-TIME MEASUREMENT UNDER THE KEYWORD-ARRAY TERM BUG THE AUDIT ITSELF SURFACED · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/wordpress-security-audit" rel="external">docs/case-studies/wordpress-security-audit →</a></p>
-  </div>
-</div>
-
-<!-- 07 SEMANTIC ANALYTICS — buckets over the retrieved neighbour set -->
-<div class="uc-showcase">
-  <div class="uc-copy">
-    <span class="uc-num">07</span>
-    <div class="uc-title">AGGREGATE THE<br>SEMANTIC<br><span class="accent">SLICE.</span></div>
-    <p class="uc-pitch">A deep-research question bundles two workloads in one breath: <em>of calls about wifi issues, how many are 2.4GHz vs 5GHz, and what are the key issues?</em> The first clause is vector retrieval; everything after it is aggregation over exactly the documents that clause selected. XERJ answers it in a single search request — the columns, the full text and the vector live in one index, and the aggregations run over the retrieved top-k neighbour set. An aggregation-bearing kNN is routed to the exact scan deliberately, because bucket counts must not be approximate. The chart is that query shape working on a <em>generated</em> corpus: a correctness demo, not a benchmark, and nothing in it was timed.</p>
-    <div class="uc-metric">1 REQUEST · RETRIEVAL + EXACT BUCKETS + EVIDENCE · DEMO, NOT A DEPLOYMENT</div>
-    <div class="uc-persona">DATA / ML ENGINEER · ANALYTICS ENGINEER · AI PRODUCT</div>
-    <a href="/use-cases/semantic-analytics.html" class="uc-cta">FULL USE CASE →</a>
-  </div>
-  <div class="uc-viz">
-    <div class="kicker"><span>GENERATED 130-CONVERSATION CORPUS · NOT REAL DATA · NOT A DEPLOYMENT · NOT A BENCHMARK</span></div>
-    <div class="topn-list">
-    <div class="row">
-      <div class="row__label">band 2.4GHz</div>
-      <div class="row__val">29</div>
-      <div class="row__bar">
-        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
-          <line x1="0" y1="5" x2="200.0" y2="5" stroke="currentColor" stroke-width="1"/>
-        </svg>
-      </div>
-      <div class="row__pct">36%</div>
-    </div>
-    <div class="row">
-      <div class="row__label">band n/a · non-wifi (derived: 80 − 54)</div>
-      <div class="row__val">26</div>
-      <div class="row__bar">
-        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
-          <line x1="0" y1="5" x2="179.3" y2="5" stroke="currentColor" stroke-width="1"/>
-        </svg>
-      </div>
-      <div class="row__pct">33%</div>
-    </div>
-    <div class="row">
-      <div class="row__label">band 5GHz</div>
-      <div class="row__val">25</div>
-      <div class="row__bar">
-        <svg class="chart" height="6" viewBox="0 0 200 6" preserveAspectRatio="none">
-          <line x1="0" y1="5" x2="172.4" y2="5" stroke="currentColor" stroke-width="1"/>
-        </svg>
-      </div>
-      <div class="row__pct">31%</div>
-    </div>
-    </div>
-    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">TERMS BUCKETS RETURNED IN THE SAME RESPONSE AS THE HITS · NOT LATENCY, NOTHING HERE WAS TIMED · THE POOL WAS THE k=80 NEAREST NEIGHBOURS, WHICH IS THE REQUEST PARAMETER ECHOED BACK AND NOT A MATCH COUNT — 54 OF THE 80 CARRIED A BAND; THE <code class="inline">n/a</code> ROW IS NOT IN THE PUBLISHED OUTPUT, THE DEMO SCRIPT FILTERS IT BEFORE PRINTING AND 26 IS THE REMAINDER · THE SPLIT IS OUTPUT OF A SEEDED GENERATOR (<code class="inline">random.seed(7)</code>, ~21 HAND-WRITTEN TEMPLATES), NOT A FINDING ABOUT SUPPORT CALLS · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/calltree-analytics" rel="external">docs/case-studies/calltree-analytics →</a></p>
-  </div>
-</div>
 
 <section class="lead-capture" id="demo">
   <div class="kicker"><span>READY?</span><span class="dash">·</span><span>REQUEST ACCESS</span></div>
