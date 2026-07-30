@@ -648,21 +648,6 @@ fn plan_node(query: QueryNode, schema: &Schema) -> ExecutionPlan {
             plan_node(*big, schema)
         }
 
-        // ── Join queries — UNREACHABLE ────────────────────────────────────────
-        // has_child/has_parent are rejected with a 400 at parse time
-        // (see parser.rs::parse_has_child), so these AST variants are never
-        // built and this branch is never taken. Kept for exhaustiveness and
-        // in case the AST variant is ever wired to a real join executor.
-        QueryNode::HasChild { query, .. } | QueryNode::HasParent { query, .. } => {
-            let inner = plan_node(*query, schema);
-            let cost = inner.cost() + 10.0;
-            ExecutionPlan::Boost {
-                boost: 1.0,
-                inner: Box::new(inner),
-                cost,
-            }
-        }
-
         // ── Geo shape queries — treat as doc-scans ────────────────────────────
         QueryNode::GeoPolygon { field, .. } => ExecutionPlan::ExistsScan { field },
         QueryNode::GeoShape { field, .. } => ExecutionPlan::ExistsScan { field },

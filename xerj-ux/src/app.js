@@ -23,6 +23,8 @@ import {
   listClusters, listIndices, listFields, listClustersSync,
   defaultClusterId, setDefaultCluster,
 } from './data/data-sources.js';
+import { sbBrainsPresent } from './data/brains-probe.js';
+import { activeBackendId, backendBaseUrl } from './data/backends/index.js';
 
 // ---------- state -----------------------------------------
 const LS = {
@@ -88,6 +90,11 @@ const state = {
     };
   })(),
   _focusSelector: null, // set by handlers that need focus restored
+  // Live-gated features: a dashboard whose registry entry sets
+  // `requiresLive: '<key>'` only appears in the NAV once the matching
+  // key here is true (fed by a probe against the live engine). Routes
+  // and MANAGE are never filtered — a deep link must always resolve.
+  liveFeatures: { brains: false },
 };
 // Merge any URL-seeded filters into the current dashboard's filter set.
 if (_urlState.filters) {
@@ -259,8 +266,35 @@ function setRefreshInterval(ms) {
   if (state.refreshTimer) { clearInterval(state.refreshTimer); state.refreshTimer = null; }
   if (ms > 0) {
     state.refreshTimer = setInterval(() => {
+      probeLiveFeatures();
       if (state.section === 'dashboards' || state.section === 'discover') render();
     }, ms);
+  }
+}
+
+// ---------- live-feature probes ---------------------------
+// Some dashboards only earn a nav entry once the engine actually has
+// data for them (registry `requiresLive` flag). This asks the probes,
+// updates `state.liveFeatures`, and re-renders on a change so the nav
+// entry appears/disappears without a reload. The probe module caches
+// per baseUrl (~30 s), so calling this on every refresh tick is cheap,
+// and a backend/base-URL change naturally re-probes the new target.
+let _probingLive = false;
+async function probeLiveFeatures() {
+  if (_probingLive) return;
+  _probingLive = true;
+  try {
+    const brains = await sbBrainsPresent(backendBaseUrl(activeBackendId()));
+    if (brains !== state.liveFeatures.brains) {
+      state.liveFeatures.brains = brains;
+      // Same guards as the store/panel re-render hooks: never nuke an
+      // in-flight drag gesture or steal focus from a form field.
+      const ae = document.activeElement;
+      const typing = ae && (ae.tagName === 'INPUT' || ae.tagName === 'SELECT' || ae.isContentEditable);
+      if (!geomDrag && !typing) render();
+    }
+  } finally {
+    _probingLive = false;
   }
 }
 
@@ -392,7 +426,10 @@ function runSearchNow() {
  * redirects to `#/settings`.
  */
 function parseRoute() {
-  const raw = (location.hash || '').replace(/^#\/?/, '');
+  // Route = the hash *path* only. A `?query` tail inside the hash (e.g.
+  // `#/second-brain?brain=notes`, the deep link `xerj brain` prints) is
+  // view state owned by the dashboard, never part of the route.
+  const raw = (location.hash || '').replace(/^#\/?/, '').split('?')[0];
   const parts = raw.split('/').filter(Boolean);
   const merged = mergedDashboards(defaults, { includeHidden: true });
 
@@ -866,7 +903,13 @@ async function render() {
   const dash = allDash.find((d) => d.id === state.route)
     || dashboardsInSection(state.section, allDash)[0]
     || registry['ai-overview'];
-  const navDash = mergedDashboards(defaults);
+  // NAV list only: hide live-gated dashboards until their probe says
+  // the engine has data for them (e.g. Second Brain before any
+  // `xerj brain` run). `allDash` above is deliberately NOT filtered —
+  // the deep link a fresh `xerj brain` prints must resolve instantly;
+  // the nav catches up on the next probe tick.
+  const navDash = mergedDashboards(defaults)
+    .filter((d) => !d.requiresLive || state.liveFeatures[d.requiresLive]);
   const dashboardsForSection = dashboardsInSection('dashboards', navDash);
 
   // For the SEARCH dashboard, eagerly run the search so panels see hits.
@@ -1914,11 +1957,22 @@ window.addEventListener('hashchange', () => {
     saveFilters(state.route);
   }
   writeUrlState();
+  // Route changes also re-ask the live-feature probes (cached ~30 s):
+  // with the auto-refresh interval off, this is what lets the nav
+  // catch up after a `xerj brain` run — e.g. when the user opens the
+  // deep link the CLI printed.
+  probeLiveFeatures();
   render();
 });
 
 // Boot the refresh interval if the user had one saved.
 if (state.refresh > 0) setRefreshInterval(state.refresh);
+
+// Probe live-gated features once at boot (re-render happens inside on
+// change, same pattern as the setOnChange hook below). Re-probes ride
+// the refresh interval; the probe's per-baseUrl cache handles a
+// backend/base-URL change without an explicit invalidation hook.
+probeLiveFeatures();
 
 // Restore mobile preview class if it was active.
 if (state.mobile) document.documentElement.classList.add('mobile-preview');

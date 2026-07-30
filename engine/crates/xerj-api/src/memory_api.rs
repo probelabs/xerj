@@ -120,6 +120,13 @@ fn validate_namespace(ns: &str) -> Result<(), String> {
     if ns.contains("..") {
         return Err("namespace must not contain '..'".into());
     }
+    // Second-brain collision guard (SECOND_BRAIN_SPEC §1): brain `B` keeps its
+    // graph edges in `.xerj-memory-{B}-edges`, so a namespace ending in
+    // `-edges` would silently write memories into another brain's edge index.
+    // Deliberate breaking change — record in the release notes.
+    if ns.ends_with("-edges") {
+        return Err("namespace suffix '-edges' is reserved for graph edge indices".into());
+    }
     Ok(())
 }
 
@@ -424,7 +431,42 @@ pub struct RecallBody {
     /// Absent → existing relevance-only behavior is preserved exactly.
     #[serde(default)]
     pub recency_weight: Option<f32>,
+    /// Optional graph coupling for recall (SECOND_BRAIN_SPEC §5). The
+    /// namespace's brain is the namespace itself: edges live in
+    /// `.xerj-memory-{ns}-edges`. Absent → behavior is bit-identical to a
+    /// graph-less recall.
+    #[serde(default)]
+    pub graph: Option<GraphRecallOpts>,
 }
+
+/// Graph coupling options for `_recall` (SECOND_BRAIN_SPEC §5).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphRecallOpts {
+    /// "restrict" | "blend" (required). `restrict` = recall only within reach
+    /// of the seeds; `blend` = let graph proximity pull related memories up.
+    pub mode: String,
+    /// Seed node ids. REQUIRED for restrict (400 if absent/empty).
+    /// Optional for blend (default: ids of the top-5 base-recall hits).
+    #[serde(default)]
+    pub seeds: Option<Vec<String>>,
+    /// 1 (default) or 2.
+    #[serde(default)]
+    pub hops: Option<u8>,
+    /// Edge-type allowlist.
+    #[serde(default)]
+    pub types: Option<Vec<String>>,
+    /// Blend weight in [0,1], default 0.3. Ignored for restrict.
+    #[serde(default)]
+    pub weight: Option<f32>,
+    /// Bi-temporal cut, default now. Epoch-ms number or RFC3339 string.
+    #[serde(default)]
+    pub as_of: Option<Value>,
+}
+
+/// Hard ceiling on the reachable-id set folded into a `restrict` filter (the
+/// `ids` query stays a bounded doc-values prefilter, not an unbounded OR).
+const MAX_RESTRICT_IDS: usize = 10_000;
 
 /// `POST /_memory/{namespace}/_recall` — recall the top-k relevant memories.
 pub async fn recall(
@@ -442,7 +484,7 @@ pub async fn recall(
     // score 1.0.  (Unknown keys are already rejected at deserialization via
     // `deny_unknown_fields`.)  Recent-memory listing lives at
     // `GET /_memory/{namespace}`, which needs no query.
-    let Some(body) = body.0 else {
+    let Some(mut body) = body.0 else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "recall requires a JSON body with exactly one of `vector` (query \
@@ -483,15 +525,80 @@ pub async fn recall(
     // Recency blending needs a wider candidate pool than the final k so the
     // re-rank can actually promote recent-but-slightly-less-relevant memories.
     let recency_weight = body.recency_weight.map(|w| w.clamp(0.0, 1.0));
+    // Optional graph coupling (SECOND_BRAIN_SPEC §5): validate up front so a
+    // bad mode / out-of-bounds hops fails fast (with the §4.6 wording), before
+    // any search runs.
+    let graph_ctx = match parse_graph_opts(body.graph.as_ref()) {
+        Ok(g) => g,
+        Err(resp) => return *resp,
+    };
     let fetch = match recency_weight {
         Some(_) => (k * 4).max(50),
         None => k,
     };
+    // Graph blend also needs a wider pool than k: proximity can only promote
+    // candidates that were fetched (same over-fetch convention as recency).
+    let fetch = match &graph_ctx {
+        Some(g) if !g.restrict => fetch.max((k * 4).max(50)),
+        _ => fetch,
+    };
     let index = backing_index(&namespace);
+    let edges_index_name = format!("{MEMORY_PREFIX}{namespace}-edges");
+    let caller_filter = body.filter.take();
 
-    // Unknown namespace → no memories (also enforces isolation cleanly).
+    // Graph restrict: expand the seeds FIRST and fold the reachable set into
+    // the metadata filter as an `ids` clause — recall itself is unchanged, it
+    // just runs over a graph-bounded universe. A missing edges index is NOT
+    // an error: recall proceeds ungated with the honesty flagged in-band (an
+    // agent must be able to opt into graph recall before its first link
+    // exists).
+    let mut restrict_expansion: Option<GraphExpansion> = None;
+    let filter_opt: Option<Value> = match &graph_ctx {
+        Some(g) if g.restrict => {
+            let seeds = g.seeds.clone().unwrap_or_default(); // validated non-empty
+            match expand_graph(&state, &edges_index_name, &seeds, g) {
+                Err(resp) => return *resp,
+                Ok(None) => caller_filter,
+                Ok(Some(exp)) => {
+                    let ids = json!({ "ids": { "values": &exp.reachable } });
+                    let folded = match caller_filter {
+                        Some(f) => json!({ "bool": { "filter": [f, ids] } }),
+                        None => json!({ "bool": { "filter": [ids] } }),
+                    };
+                    restrict_expansion = Some(exp);
+                    Some(folded)
+                }
+            }
+        }
+        _ => caller_filter,
+    };
+
+    // Unknown namespace → no memories (also enforces isolation cleanly). The
+    // graph object stays honest even here: the edges index can exist without
+    // the memory index (a brain linked before its first memory was stored),
+    // so `no_edges_index` is only claimed when the edges index truly is
+    // absent — for blend with explicit seeds that means actually expanding.
     if !index_exists(&state, &index) {
-        return Json(json!({ "hits": [], "namespace": namespace })).into_response();
+        let mut resp = json!({ "hits": [], "namespace": namespace });
+        if let Some(g) = &graph_ctx {
+            let seeds = g.seeds.clone().unwrap_or_default();
+            let expansion = if g.restrict {
+                restrict_expansion
+            } else if seeds.is_empty() {
+                if index_exists(&state, &edges_index_name) {
+                    Some(GraphExpansion::default())
+                } else {
+                    None
+                }
+            } else {
+                match expand_graph(&state, &edges_index_name, &seeds, g) {
+                    Err(resp) => return *resp,
+                    Ok(e) => e,
+                }
+            };
+            resp["graph"] = graph_obj(g, &seeds, expansion.as_ref());
+        }
+        return Json(resp).into_response();
     }
 
     // Build the search body, reusing the proven kNN / BM25 / filter paths.
@@ -503,7 +610,7 @@ pub async fn recall(
     if let Some(vec) = body.vector {
         // (1) Caller-supplied embedding → pure kNN over the stored `vector`.
         let knn = json!({ "field": "vector", "query_vector": vec, "k": fetch });
-        match body.filter {
+        match filter_opt {
             Some(filter) => {
                 // kNN with a metadata pre-filter: express kNN as a bool `must`
                 // clause so the `filter` narrows the candidate set.
@@ -535,7 +642,7 @@ pub async fn recall(
         // rather than wrapping in a `bool` — a `semantic` node nested in a
         // `bool` is not dispatched to the vector path.
         let mut semantic = json!({ "field": "text", "query": q, "k": fetch });
-        if let Some(filter) = body.filter {
+        if let Some(filter) = filter_opt {
             semantic["filter"] = filter;
         }
         search_body.query = Some(json!({ "semantic": semantic }));
@@ -545,7 +652,7 @@ pub async fn recall(
             Some(q) if !q.is_empty() => json!({ "match": { "text": q } }),
             _ => json!({ "match_all": {} }),
         };
-        search_body.query = Some(match body.filter {
+        search_body.query = Some(match filter_opt {
             Some(filter) => json!({ "bool": { "must": [ inner ], "filter": [ filter ] } }),
             None => inner,
         });
@@ -560,16 +667,285 @@ pub async fn recall(
     .await
     .into_response();
 
-    let (status, body) = drain_json(resp).await;
+    let (status, response) = drain_json(resp).await;
     if !status.is_success() {
-        return error_response(status, format!("recall failed: {body}"));
+        return error_response(status, format!("recall failed: {response}"));
     }
 
-    let hits = match recency_weight {
-        Some(w) => blend_recency(&body, w, k),
-        None => extract_hits(&body),
+    let (hits, graph_out) = match &graph_ctx {
+        // No graph coupling → bit-identical to the graph-less recall.
+        None => {
+            let hits = match recency_weight {
+                Some(w) => blend_recency(&response, w, k),
+                None => extract_hits(&response),
+            };
+            (hits, None)
+        }
+        // restrict: the search already ran over the graph-bounded universe;
+        // hit shaping is unchanged, the response just gains the graph object.
+        Some(g) if g.restrict => {
+            let hits = match recency_weight {
+                Some(w) => blend_recency(&response, w, k),
+                None => extract_hits(&response),
+            };
+            let seeds = g.seeds.clone().unwrap_or_default();
+            (
+                hits,
+                Some(graph_obj(g, &seeds, restrict_expansion.as_ref())),
+            )
+        }
+        // blend: expand (seeds given, or the top-5 base hits), then re-rank
+        // the fetched candidates by (1-w)·norm_score + w·proximity. The graph
+        // blend applies FIRST, then the existing recency blend over the
+        // graph-blended ordering — each re-rank is order+truncate only, so
+        // they compose.
+        Some(g) => {
+            let raw: Vec<&Value> = response
+                .pointer("/hits/hits")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().collect())
+                .unwrap_or_default();
+            let seeds: Vec<String> = match &g.seeds {
+                Some(s) if !s.is_empty() => s.clone(),
+                _ => raw
+                    .iter()
+                    .take(5)
+                    .filter_map(|h| h.get("_id").and_then(Value::as_str))
+                    .map(String::from)
+                    .collect(),
+            };
+            let expansion = if seeds.is_empty() {
+                // No seeds derivable (empty base recall): nothing to expand.
+                // Distinguish "no edges index" (flagged) from "no seeds".
+                if index_exists(&state, &edges_index_name) {
+                    Some(GraphExpansion::default())
+                } else {
+                    None
+                }
+            } else {
+                match expand_graph(&state, &edges_index_name, &seeds, g) {
+                    Err(resp) => return *resp,
+                    Ok(e) => e,
+                }
+            };
+            let graph_ranked: Vec<&Value> = match &expansion {
+                Some(exp) => rank_by_proximity(&raw, &exp.proximity, g.weight, k),
+                // No edges index → recall proceeds ungated (base order).
+                None => raw.clone(),
+            };
+            let final_ranked: Vec<&Value> = match recency_weight {
+                Some(w) => rank_by_recency(&graph_ranked, f64::from(w), k),
+                None => graph_ranked.into_iter().take(k).collect(),
+            };
+            let hits: Vec<Value> = final_ranked
+                .into_iter()
+                .map(|h| {
+                    let mut m = map_hit(h);
+                    let id = h.get("_id").and_then(Value::as_str).unwrap_or("");
+                    let prox = expansion
+                        .as_ref()
+                        .and_then(|e| e.proximity.get(id))
+                        .copied()
+                        .unwrap_or(0.0);
+                    m["graph_proximity"] = json!(prox);
+                    m
+                })
+                .collect();
+            (hits, Some(graph_obj(g, &seeds, expansion.as_ref())))
+        }
     };
-    Json(json!({ "hits": hits, "namespace": namespace })).into_response()
+    let mut resp = json!({ "hits": hits, "namespace": namespace });
+    if let Some(gobj) = graph_out {
+        resp["graph"] = gobj;
+    }
+    Json(resp).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Graph coupling (SECOND_BRAIN_SPEC §5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parsed + validated `graph` recall options.
+struct GraphCtx {
+    /// true = restrict, false = blend.
+    restrict: bool,
+    seeds: Option<Vec<String>>,
+    hops: u8,
+    types: Option<Vec<String>>,
+    /// Blend weight in [0,1] (ignored for restrict).
+    weight: f64,
+    as_of_ms: i64,
+}
+
+/// One completed expansion over the namespace's edges index.
+#[derive(Default)]
+struct GraphExpansion {
+    /// Reachable node ids (seeds first), clipped to [`MAX_RESTRICT_IDS`].
+    reachable: Vec<String>,
+    /// node id → graph proximity in [0,1]: seeds = 1.0, a node reached at hop
+    /// h via edge e = max over paths of `0.5^h * clamp(e.weight, 0, 1)`.
+    proximity: std::collections::HashMap<String, f64>,
+    stats: xerj_engine::graph::GraphExpandStats,
+    reachable_clipped: u64,
+}
+
+/// Validate the `graph` options (400s carry the memory_error shape — this
+/// endpoint keeps its existing error type; the hops bound carries the §4.6
+/// not-a-graph-database wording).
+fn parse_graph_opts(opts: Option<&GraphRecallOpts>) -> Result<Option<GraphCtx>, Box<Response>> {
+    let Some(o) = opts else { return Ok(None) };
+    let restrict = match o.mode.as_str() {
+        "restrict" => true,
+        "blend" => false,
+        other => {
+            return Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("graph.mode must be 'restrict' or 'blend' (got '{other}')"),
+            )));
+        }
+    };
+    if restrict && o.seeds.as_deref().is_none_or(<[String]>::is_empty) {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "graph.mode 'restrict' requires non-empty graph.seeds",
+        )));
+    }
+    let hops = o.hops.unwrap_or(1);
+    if hops == 0 || hops > 2 {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            xerj_engine::graph::GRAPH_HOPS_CAP_REASON,
+        )));
+    }
+    let as_of_ms = match &o.as_of {
+        None => chrono::Utc::now().timestamp_millis(),
+        Some(v) => match parse_epoch_ms(v) {
+            Some(ms) => ms,
+            None => {
+                return Err(Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "graph.as_of must be an epoch-ms number or an RFC3339 string",
+                )));
+            }
+        },
+    };
+    Ok(Some(GraphCtx {
+        restrict,
+        seeds: o.seeds.clone(),
+        hops,
+        types: o.types.clone(),
+        weight: f64::from(o.weight.unwrap_or(0.3)).clamp(0.0, 1.0),
+        as_of_ms,
+    }))
+}
+
+/// Epoch-ms from a JSON number or an RFC3339 string (inputs accept both;
+/// outputs are always numbers).
+fn parse_epoch_ms(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(_) => v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)),
+        Value::String(s) => {
+            if let Ok(n) = s.parse::<i64>() {
+                return Some(n);
+            }
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_millis())
+        }
+        _ => None,
+    }
+}
+
+/// Expand `seeds` over the namespace's edges index (direction Both, no
+/// expired edges). `Ok(None)` = the edges index does not exist — the caller
+/// proceeds ungated with the honesty flagged, per §5.
+fn expand_graph(
+    state: &AppState,
+    edges_index: &str,
+    seeds: &[String],
+    g: &GraphCtx,
+) -> Result<Option<GraphExpansion>, Box<Response>> {
+    use xerj_engine::graph::{GraphDirection, GraphExpandRequest};
+    let Ok(idx) = state.engine.get_index(edges_index) else {
+        return Ok(None);
+    };
+    let req = GraphExpandRequest {
+        frontier: seeds.to_vec(),
+        hops: g.hops,
+        direction: GraphDirection::Both,
+        types: g.types.clone(),
+        as_of_ms: g.as_of_ms,
+        include_expired: false,
+        max_result_edges: MAX_RESTRICT_IDS,
+    };
+    let res = match idx.graph_expand(&req) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                e.to_string(),
+            )))
+        }
+    };
+    // Proximity: seeds anchor at 1.0; every edge contributes
+    // `0.5^hop * clamp(weight, 0, 1)` to both endpoints, max over paths
+    // (deterministic; a seed can never be demoted since 0.5^h·w ≤ 0.5 < 1).
+    let mut proximity: std::collections::HashMap<String, f64> =
+        seeds.iter().map(|s| (s.clone(), 1.0)).collect();
+    for e in &res.edges {
+        let p = 0.5f64.powi(i32::from(e.hop)) * e.weight.clamp(0.0, 1.0);
+        for id in [&e.src, &e.dst] {
+            let entry = proximity.entry(id.clone()).or_insert(0.0);
+            if p > *entry {
+                *entry = p;
+            }
+        }
+    }
+    let mut reachable = res.reachable;
+    let mut reachable_clipped = 0u64;
+    if reachable.len() > MAX_RESTRICT_IDS {
+        reachable_clipped = (reachable.len() - MAX_RESTRICT_IDS) as u64;
+        reachable.truncate(MAX_RESTRICT_IDS);
+    }
+    Ok(Some(GraphExpansion {
+        reachable,
+        proximity,
+        stats: res.stats,
+        reachable_clipped,
+    }))
+}
+
+/// The top-level `graph` response object (§5). `exp = None` means the edges
+/// index did not exist — reported in-band as `no_edges_index`, never hidden.
+fn graph_obj(g: &GraphCtx, seeds: &[String], exp: Option<&GraphExpansion>) -> Value {
+    let mode = if g.restrict { "restrict" } else { "blend" };
+    let not_shown = match exp {
+        Some(e) => json!({
+            "frontier_clipped": e.stats.frontier_clipped,
+            "edges_clipped": e.stats.edges_clipped,
+            "expired_excluded": e.stats.expired_excluded,
+            "type_filtered": e.stats.type_filtered,
+            "segments_without_columns": e.stats.segments_without_columns,
+            "reachable_clipped": e.reachable_clipped,
+        }),
+        None => json!({
+            "frontier_clipped": 0,
+            "edges_clipped": 0,
+            "expired_excluded": 0,
+            "type_filtered": 0,
+            "segments_without_columns": 0,
+            "reachable_clipped": 0,
+            "no_edges_index": true,
+        }),
+    };
+    json!({
+        "mode": mode,
+        "seeds": seeds,
+        "hops": g.hops,
+        "as_of": g.as_of_ms,
+        "reachable": exp.map(|e| e.reachable.len()).unwrap_or(0),
+        "not_shown": not_shown,
+    })
 }
 
 /// Map a single ES search hit into the agent-memory hit shape.
@@ -611,7 +987,32 @@ fn blend_recency(search_response: &Value, w: f32, k: usize) -> Vec<Value> {
         Some(h) if !h.is_empty() => h,
         _ => return Vec::new(),
     };
+    let refs: Vec<&Value> = hits.iter().collect();
+    rank_by_recency(&refs, f64::from(w), k)
+        .into_iter()
+        .map(map_hit)
+        .collect()
+}
 
+/// Min-max normalize a value against a range; a uniform range (hi == lo)
+/// normalizes to 0.0 so that dimension contributes nothing to a blend rather
+/// than dividing by zero.
+fn min_max_norm(v: f64, lo: f64, hi: f64) -> f64 {
+    if hi > lo {
+        (v - lo) / (hi - lo)
+    } else {
+        0.0
+    }
+}
+
+/// Order+truncate re-rank by `blended = (1 - w)·norm_score + w·norm_recency`
+/// (both min-max normalized across the candidate set). Returns raw hit refs
+/// so re-ranks compose — the recall handler applies this AFTER the graph
+/// blend when both are requested.
+fn rank_by_recency<'a>(hits: &[&'a Value], w: f64, k: usize) -> Vec<&'a Value> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
     let scores: Vec<f64> = hits
         .iter()
         .map(|h| h.get("_score").and_then(Value::as_f64).unwrap_or(0.0))
@@ -624,31 +1025,61 @@ fn blend_recency(search_response: &Value, w: f32, k: usize) -> Vec<Value> {
                 .unwrap_or(0.0)
         })
         .collect();
-
     let smin = scores.iter().copied().fold(f64::INFINITY, f64::min);
     let smax = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let tmin = times.iter().copied().fold(f64::INFINITY, f64::min);
     let tmax = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    // Uniform values (hi == lo) normalize to 0.0 so that dimension contributes
-    // nothing to the blend rather than dividing by zero.
-    let norm = |v: f64, lo: f64, hi: f64| if hi > lo { (v - lo) / (hi - lo) } else { 0.0 };
-    let w = w as f64;
 
     let mut ranked: Vec<(f64, &Value)> = hits
         .iter()
         .zip(scores.iter().zip(times.iter()))
         .map(|(h, (&sc, &tm))| {
-            let blended = (1.0 - w) * norm(sc, smin, smax) + w * norm(tm, tmin, tmax);
-            (blended, h)
+            let blended =
+                (1.0 - w) * min_max_norm(sc, smin, smax) + w * min_max_norm(tm, tmin, tmax);
+            (blended, *h)
         })
         .collect();
-
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    ranked
-        .into_iter()
-        .take(k)
-        .map(|(_, h)| map_hit(h))
-        .collect()
+    ranked.into_iter().take(k).map(|(_, h)| h).collect()
+}
+
+/// Order+truncate re-rank by `blended = (1 - w)·norm_score + w·proximity`
+/// (SECOND_BRAIN_SPEC §5 blend). `norm_score` uses the same min-max
+/// normalization as [`rank_by_recency`]; proximity is already an absolute
+/// [0,1] quantity (seed = 1.0, hop-decayed otherwise) and is deliberately NOT
+/// re-normalized. Hits absent from the proximity map contribute 0.
+fn rank_by_proximity<'a>(
+    hits: &[&'a Value],
+    proximity: &std::collections::HashMap<String, f64>,
+    w: f64,
+    k: usize,
+) -> Vec<&'a Value> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let scores: Vec<f64> = hits
+        .iter()
+        .map(|h| h.get("_score").and_then(Value::as_f64).unwrap_or(0.0))
+        .collect();
+    let smin = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    let smax = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    let mut ranked: Vec<(f64, &Value)> = hits
+        .iter()
+        .zip(scores.iter())
+        .map(|(h, &sc)| {
+            let prox = h
+                .get("_id")
+                .and_then(Value::as_str)
+                .and_then(|id| proximity.get(id))
+                .copied()
+                .unwrap_or(0.0);
+            let blended = (1.0 - w) * min_max_norm(sc, smin, smax) + w * prox;
+            (blended, *h)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.into_iter().take(k).map(|(_, h)| h).collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -881,6 +1312,12 @@ mod tests {
         assert!(validate_namespace("_x").is_err()); // leading underscore
         assert!(validate_namespace("a/b").is_err()); // slash
         assert!(validate_namespace("a..b").is_err()); // path traversal
+                                                      // Second-brain collision guard: `POST /_memory/kb-edges` would write
+                                                      // memories into brain `kb`'s edge index.
+        assert_eq!(
+            validate_namespace("kb-edges").unwrap_err(),
+            "namespace suffix '-edges' is reserved for graph edge indices"
+        );
     }
 
     #[tokio::test]
@@ -1205,6 +1642,255 @@ mod tests {
             count_of(&state, "dd").await,
             3,
             "dedup defaults OFF: omitting it stores duplicates"
+        );
+    }
+
+    /// Link one SECOND_BRAIN_SPEC §8.3 fixture edge through the graph API
+    /// (same brain name as the memory namespace; explicit fixture timestamps
+    /// so the pinned edge_ids and the §8.6 sort order reproduce exactly).
+    async fn link_edge(state: &AppState, src: &str, dst: &str, ty: &str, weight: f64) {
+        let b: crate::graph_api::LinkBody = serde_json::from_value(json!({
+            "src": src, "dst": dst, "type": ty, "weight": weight,
+            "valid_at": 1_753_600_000_000i64, "created_at": 1_753_600_000_000i64,
+        }))
+        .unwrap();
+        let resp = crate::graph_api::link(
+            State(state.clone()),
+            Path("notes".to_string()),
+            OptionalJson(Some(b)),
+        )
+        .await;
+        let (s, body) = drain_json(resp).await;
+        assert!(s.is_success(), "fixture link {src}->{dst} failed: {body}");
+    }
+
+    /// The §8 fixture world: the five notes as memories (fixture node ids)
+    /// plus the eight §8.3 edges in brain `notes`.
+    async fn graph_fixture(state: &AppState) {
+        for (id, text) in [
+            (
+                "note-alpha",
+                "Alpha is the hub note. It links to [[beta]] and [[gamma]].",
+            ),
+            (
+                "note-beta",
+                "Beta continues the thread and references [[gamma]].",
+            ),
+            (
+                "note-gamma",
+                "Gamma is the sink note with no outgoing links.",
+            ),
+            ("note-delta", "Delta cites [[alpha]] as its source."),
+            ("note-epsilon", "Epsilon stands alone."),
+        ] {
+            let (s, _) = store_mem(state, "notes", json!({"text": text, "id": id})).await;
+            assert_eq!(s, StatusCode::CREATED);
+        }
+        for (src, dst, ty, w) in [
+            ("note-alpha", "note-beta", "wikilink", 1.0),
+            ("note-alpha", "note-gamma", "wikilink", 1.0),
+            ("note-beta", "note-gamma", "wikilink", 1.0),
+            ("note-delta", "note-alpha", "wikilink", 1.0),
+            ("note-alpha", "note-beta", "same_dir", 0.3),
+            ("note-beta", "note-delta", "same_dir", 0.3),
+            ("note-delta", "note-epsilon", "same_dir", 0.3),
+            ("note-epsilon", "note-gamma", "same_dir", 0.3),
+        ] {
+            link_edge(state, src, dst, ty, w).await;
+        }
+    }
+
+    /// SECOND_BRAIN_SPEC §5 + §8.6: `graph.mode=restrict` narrows recall to
+    /// the seeds' bounded reach; the graph object reports the expansion
+    /// honestly.
+    #[tokio::test]
+    async fn recall_graph_restrict_bounds_the_universe() {
+        let state = test_state();
+        graph_fixture(&state).await;
+
+        // Sanity: ungated recall for "note" surfaces alpha AND gamma.
+        let (_, b) = recall_mem(&state, "notes", json!({"query": "note", "k": 10})).await;
+        let ids: Vec<&str> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"note-alpha") && ids.contains(&"note-gamma"));
+        assert!(b.get("graph").is_none(), "no graph key without graph opts");
+
+        // §8.6: restrict from seed note-delta, hops 1, at the fixture as-of.
+        // 1-hop both-direction reach = {delta, alpha, epsilon, beta} — gamma
+        // is out of reach and must vanish from the hits.
+        let (s, b) = recall_mem(
+            &state,
+            "notes",
+            json!({
+                "query": "note", "k": 10,
+                "graph": {"mode": "restrict", "seeds": ["note-delta"],
+                          "hops": 1, "as_of": 1_753_700_000_000i64}
+            }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let ids: Vec<&str> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["note-alpha"], "gamma is outside the 1-hop reach");
+        let graph = &b["graph"];
+        assert_eq!(graph["mode"], json!("restrict"));
+        assert_eq!(graph["seeds"], json!(["note-delta"]));
+        assert_eq!(graph["hops"], json!(1));
+        assert_eq!(graph["as_of"], json!(1_753_700_000_000i64));
+        assert_eq!(graph["reachable"], json!(4), "§8.6: 'reachable': 4");
+        assert_eq!(graph["not_shown"]["reachable_clipped"], json!(0));
+        assert!(
+            graph["not_shown"].get("no_edges_index").is_none(),
+            "the edges index exists — no honesty flag"
+        );
+    }
+
+    /// §5 blend: graph proximity re-ranks the fetched candidates; every hit
+    /// carries `graph_proximity`; seeds derive from the base recall when
+    /// absent.
+    #[tokio::test]
+    async fn recall_graph_blend_reranks_by_proximity() {
+        let state = test_state();
+        graph_fixture(&state).await;
+
+        let (s, b) = recall_mem(
+            &state,
+            "notes",
+            json!({
+                "query": "note", "k": 10,
+                "graph": {"mode": "blend", "seeds": ["note-alpha"],
+                          "weight": 0.9, "as_of": 1_753_700_000_000i64}
+            }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty());
+        // The seed itself anchors at proximity 1.0 and, at w=0.9, must
+        // outrank gamma (proximity 0.5 via the hop-1 wikilink).
+        assert_eq!(hits[0]["id"], json!("note-alpha"));
+        assert_eq!(hits[0]["graph_proximity"], json!(1.0));
+        let gamma = hits
+            .iter()
+            .find(|h| h["id"] == json!("note-gamma"))
+            .expect("gamma stays recalled (blend re-ranks, never filters)");
+        assert_eq!(gamma["graph_proximity"], json!(0.5));
+        assert_eq!(b["graph"]["mode"], json!("blend"));
+
+        // Seeds absent → derived from the top base hits, echoed back.
+        let (s, b) = recall_mem(
+            &state,
+            "notes",
+            json!({"query": "note", "k": 10, "graph": {"mode": "blend"}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let seeds = b["graph"]["seeds"].as_array().unwrap();
+        assert!(!seeds.is_empty(), "blend derives seeds from base recall");
+        assert!(b["graph"]["reachable"].as_u64().unwrap() > 0);
+    }
+
+    /// §5: a namespace with no edges index is NOT an error — recall proceeds
+    /// ungated with `no_edges_index` flagged; malformed graph opts are loud
+    /// 400s (including the not-a-graph-database hops wording).
+    #[tokio::test]
+    async fn recall_graph_no_edges_index_and_errors() {
+        let state = test_state();
+        let (s, _) = store_mem(&state, "lonely", json!({"text": "solo memory", "id": "m1"})).await;
+        assert_eq!(s, StatusCode::CREATED);
+
+        let (s, b) = recall_mem(
+            &state,
+            "lonely",
+            json!({"query": "solo", "graph": {"mode": "restrict", "seeds": ["m1"]}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let ids: Vec<&str> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["m1"], "recall proceeds ungated");
+        assert_eq!(b["graph"]["reachable"], json!(0));
+        assert_eq!(b["graph"]["not_shown"]["no_edges_index"], json!(true));
+
+        // Unknown mode.
+        let (s, _) = recall_mem(
+            &state,
+            "lonely",
+            json!({"query": "solo", "graph": {"mode": "pagerank"}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // restrict without seeds.
+        let (s, b) = recall_mem(
+            &state,
+            "lonely",
+            json!({"query": "solo", "graph": {"mode": "restrict"}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            b["error"]["reason"],
+            json!("graph.mode 'restrict' requires non-empty graph.seeds")
+        );
+
+        // hops beyond the cap → the §4.6 sentence.
+        let (s, b) = recall_mem(
+            &state,
+            "lonely",
+            json!({"query": "solo", "graph": {"mode": "blend", "hops": 3}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(b["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not a graph database"));
+
+        // The inverse corner: an edges index CAN exist before the memory
+        // index does (a brain linked before its first memory). The empty
+        // recall must NOT claim no_edges_index — that flag is a statement
+        // about the world, not a shrug.
+        let b: crate::graph_api::LinkBody = serde_json::from_value(json!({
+            "src": "g1", "dst": "g2", "type": "wikilink"
+        }))
+        .unwrap();
+        let resp = crate::graph_api::link(
+            State(state.clone()),
+            Path("ghost".to_string()),
+            OptionalJson(Some(b)),
+        )
+        .await;
+        let (s, _) = drain_json(resp).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let (s, b) = recall_mem(
+            &state,
+            "ghost",
+            json!({"query": "anything", "graph": {"mode": "blend", "seeds": ["g1"]}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["hits"], json!([]), "no memory index → no hits");
+        assert!(
+            b["graph"]["not_shown"].get("no_edges_index").is_none(),
+            "the edges index exists — the flag would be a lie: {b}"
+        );
+        assert_eq!(
+            b["graph"]["reachable"],
+            json!(2),
+            "expansion still reports the seeds' true reach"
         );
     }
 

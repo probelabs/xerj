@@ -5,12 +5,20 @@
    ============================================================ */
 
 :root {
-  /* Color — five values, no more */
+  /* Color — six values, no more.
+     --z-cmp is the ONLY comparison-series color: it pairs with
+     --z-accent when two series share one scale (e.g. believed vs
+     retired). Validated against both surfaces: CVD ΔE 23.2 night /
+     17.7 day vs the accent (target ≥ 8) — never use mute-gray as a
+     second series; gray-vs-accent fails colorblind separation in day
+     mode. Deliberately low-chroma (recessive): every cmp mark must
+     carry a direct numeric label, so color is never the sole carrier. */
   --z-paper:  #0D0D0D;
   --z-ink:    #E0E0E0;
   --z-mute:   #555555;
   --z-faint:  #2A2A2A;
   --z-accent: #EEBB00;
+  --z-cmp:    #7F93AA;
 
   /* Type families */
   --font-display: 'Big Shoulders Display', 'Impact', 'Helvetica Neue Condensed', sans-serif;
@@ -54,6 +62,7 @@
   --z-ink:    #E0E0E0;
   --z-mute:   #555555;
   --z-faint:  #2A2A2A;
+  --z-cmp:    #7F93AA;
 }
 :root[data-theme='day'] {
   --z-paper:  #FBFAF6;
@@ -64,4 +73,7 @@
      The night accent (#EEBB00) is 1.7:1 on paper — unreadable.
      #A06800 is 5.7:1, passes AA body text. Same hue family. */
   --z-accent: #A06800;
+  /* Day comparison — same steel family, stepped for the light
+     surface (CVD ΔE 17.7 vs the day accent, ≥3:1 on paper). */
+  --z-cmp:    #6F8AA8;
 }

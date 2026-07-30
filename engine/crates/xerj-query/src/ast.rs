@@ -662,20 +662,12 @@ pub enum QueryNode {
         big: Box<QueryNode>,
     },
 
-    // ── Join queries ──────────────────────────────────────────────────────────
-    /// Has-child — matches parent documents that have child documents matching the query.
-    HasChild {
-        child_type: String,
-        query: Box<QueryNode>,
-        score_mode: Option<String>,
-    },
-
-    /// Has-parent — matches child documents that have parent documents matching the query.
-    HasParent {
-        parent_type: String,
-        query: Box<QueryNode>,
-        score: bool,
-    },
+    // NOTE: there are deliberately NO join-query variants (has_child /
+    // has_parent). XERJ never materializes a parent/child join, so an AST
+    // variant here would only exist to be flat-matched — silently wrong
+    // results — if anyone re-enabled parsing. The parser rejects both with a
+    // 400 (parser.rs::parse_has_child / parse_has_parent); the corpse variants
+    // and their dead planner/executor arms were removed.
 
     // ── Geo shape queries ─────────────────────────────────────────────────────
     /// Geo polygon — matches documents whose geo_point falls within the polygon.

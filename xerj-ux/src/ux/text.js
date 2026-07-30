@@ -15,6 +15,8 @@ const nf = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDig
 export const fmt = (v, { decimals } = {}) => {
   if (v == null || Number.isNaN(v)) return '—';
   if (decimals != null) return Number(v).toFixed(decimals);
+  // Exact integers stay integers — a count of 4 must never read "4.0".
+  if (Number.isInteger(v) && Math.abs(v) < 10_000) return new Intl.NumberFormat('en').format(v);
   if (Math.abs(v) < 1) return Number(v).toFixed(2);
   if (Math.abs(v) < 100) return Number(v).toFixed(1);
   return nf.format(v);

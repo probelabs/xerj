@@ -142,6 +142,17 @@ function clearHash() {
 }
 
 const token = tokenFromHash();
+// Optional post-setup destination (`&next=…` in the fragment) — e.g. the
+// second-brain view `xerj brain` printed. Restricted to an in-console hash
+// route: anything with a scheme, `//`, or characters outside a route is
+// discarded, so a magic link can never become an open redirect. Captured
+// now because clearHash() wipes the fragment on redeem.
+const nextRoute = (() => {
+  const frag = window.location.hash.replace(/^#/, '');
+  const n = new URLSearchParams(frag).get('next') || '';
+  if (!n || n.includes(':') || n.includes('//') || !/^[A-Za-z0-9/?&=_-]+$/.test(n)) return '';
+  return '#/' + n.replace(/^[#/]+/, '');
+})();
 if (!token) {
   showError('No magic-link token in URL. The link must include #token=…');
   $btnEnrol.disabled = true;
@@ -214,7 +225,7 @@ async function enrol() {
 
     showStep('step-done');
     showOk('Enrolled. Redirecting…');
-    setTimeout(() => { window.location.href = '/_xerj-console/'; }, 800);
+    setTimeout(() => { window.location.href = '/_xerj-console/' + nextRoute; }, 800);
   } catch (e) {
     showStep('step-info');
     showError(e.message || String(e));

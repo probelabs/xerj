@@ -19,6 +19,10 @@ pub struct IndexCfg {
     pub max_file_gb: u64,
     pub sample: usize,
     pub no_semantic: bool,
+    /// Second-brain name; None derives it from the root folder basename.
+    pub brain: Option<String>,
+    /// Disable edge detection entirely (no `.xerj-memory-*-edges` writes).
+    pub no_graph: bool,
     pub dry_run: bool,
     pub json: bool,
     pub quiet: bool,
@@ -75,6 +79,10 @@ pub fn print_help() {
              --max-file-gb <N>    skip+record oversized non-streamable files (default 2)\n\
              --sample <N>         records sampled per file for inference (default 500)\n\
              --no-semantic        skip semantic_text on body fields (pure BM25+keyword)\n\
+             --brain <NAME>       second-brain name; relationship edges land in\n\
+                                  .xerj-memory-<NAME>-edges (default: folder name slug)\n\
+             --no-graph           skip relationship detection (wikilinks, local links,\n\
+                                  section order, directory chains) — no edges are written\n\
              --dry-run            walk+sniff+infer, print the plan, index nothing\n\
              --json               machine-readable output (map: raw catalog docs)\n\
              --quiet              errors only\n\
@@ -132,6 +140,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut max_file_gb = 2u64;
     let mut sample = 500usize;
     let mut no_semantic = false;
+    let mut brain: Option<String> = None;
+    let mut no_graph = false;
     let mut dry_run = false;
     let mut json = false;
     let mut quiet = false;
@@ -198,6 +208,15 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     .ok_or("--sample needs a number")?
             }
             "--no-semantic" => no_semantic = true,
+            "--brain" => {
+                let name = it.next().ok_or("--brain needs a value")?;
+                // Fail at parse time — a bad brain name after a long Phase A
+                // would be a rude place to learn about the '-edges' rule.
+                crate::detect::validate_brain(&name)
+                    .map_err(|reason| format!("--brain {name}: {reason}"))?;
+                brain = Some(name);
+            }
+            "--no-graph" => no_graph = true,
             "--dry-run" => dry_run = true,
             "--json" => json = true,
             "--md" => json = false,
@@ -254,6 +273,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             max_file_gb,
             sample: sample.max(50),
             no_semantic,
+            brain,
+            no_graph,
             dry_run,
             json,
             quiet,
@@ -276,6 +297,32 @@ mod tests {
     #[test]
     fn bulk_timeout_defaults_to_300_seconds() {
         assert_eq!(index(&["data"]).bulk_timeout_secs, 300);
+    }
+
+    #[test]
+    fn graph_is_on_by_default_with_derived_brain() {
+        let cfg = index(&["data"]);
+        assert!(!cfg.no_graph);
+        assert_eq!(cfg.brain, None, "brain derives from the folder at run time");
+        assert!(index(&["data", "--no-graph"]).no_graph);
+        assert_eq!(
+            index(&["data", "--brain", "notes"]).brain.as_deref(),
+            Some("notes")
+        );
+    }
+
+    #[test]
+    fn brain_names_are_validated_at_parse_time() {
+        for bad in ["kb-edges", "Notes", "-x", "a..b"] {
+            let err = parse(
+                ["data", "--brain", bad]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            )
+            .unwrap_err();
+            assert!(err.contains("--brain"), "{err}");
+        }
     }
 
     #[test]

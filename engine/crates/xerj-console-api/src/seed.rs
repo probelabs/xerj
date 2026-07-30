@@ -1,10 +1,10 @@
 //! First-launch seeding of the built-in dashboards as **editable backend data**.
 //!
-//! The SPA historically defined its 13 flagship dashboards in code
+//! The SPA historically defined its flagship dashboards in code
 //! (`xerj-ux/src/dashboards/*.js` + `registry.js`).  That made them a fixed,
 //! un-editable set: a layout tweak or a rename never survived a reload, and
 //! there was no server object to attach a per-panel query to.  This module
-//! materialises those same 13 dashboards as rows in `.xerj_dashboards` on
+//! materialises those same 14 dashboards as rows in `.xerj_dashboards` on
 //! first launch, so from that point on they are *data* the operator can edit
 //! (title, layout, panel geometry, per-panel query/viz) and that persists
 //! through the CRUD surface in [`crate::dashboards`].
@@ -125,7 +125,7 @@ fn pd(
     }
 }
 
-/// The 13 built-in dashboards, in registry order.  Titles are the panel
+/// The 14 built-in dashboards, in registry order.  Titles are the panel
 /// `eyebrow` strings from the `.js` sources; dynamic eyebrows are captured as
 /// a stable static string.
 fn seed_specs() -> Vec<DashboardSpec> {
@@ -271,6 +271,44 @@ fn seed_specs() -> Vec<DashboardSpec> {
                     "WHY THIS PANEL EXISTS · USER FEEDBACK",
                     12,
                 ),
+            ],
+        },
+        DashboardSpec {
+            // Second brain — the graph-memory ego ledger (contract §7.4).
+            // Live-data-only in the SPA: its panels read /_graph/{brain}/*
+            // and never bind mock data, so the seeded skeleton is pure
+            // structure. NOTE (module-doc contract): adding this id needs
+            // NO `SEED_REVISION` bump — absent ids are created on every
+            // boot; the revision only migrates *changed* skeletons.
+            //
+            // NAV PRESENCE IS NOT SEEDED FROM HERE: `visibility:"default"`
+            // docs are skipped by the SPA's dashboard-store hydrate, and
+            // the SPA hides this dashboard from the nav until the engine
+            // holds ≥ 1 brain (registry `requiresLive:'brains'` +
+            // data/brains-probe.js). Deep links and MANAGE still resolve
+            // it — this seed stays the durable skeleton either way.
+            registry_id: "second-brain",
+            name: "Second Brain",
+            section: Some("dashboards"),
+            group: Some("ai"),
+            // Titles mirror the SPA eyebrows 1:1 (§7.1) — user words
+            // only: "link / believed / retired / taught", never schema
+            // vocabulary (edge, src/dst, as-of) in a panel title.
+            panels: vec![
+                p("edgesLive", "metric", "BELIEVED AT THIS MOMENT", 3),
+                p("edgesTotal", "metric", "EVER ASSERTED", 3),
+                p("invalidated", "metric", "RETIRED · KEPT FOR REPLAY", 3),
+                p("detectors", "metric", "WHAT TAUGHT THIS BRAIN", 3),
+                p("typeDist", "dist", "HOW NOTES CONNECT", 6),
+                p("edgeTimeline", "series", "NEW LINKS PER DAY", 6),
+                p(
+                    "ego",
+                    "ego",
+                    "THE LEDGER · ONE NOTE, EVERYTHING IT TOUCHES",
+                    12,
+                ),
+                p("hubs", "topn", "CENTERS OF GRAVITY", 6),
+                p("notShown", "honesty", "WHAT THIS VIEW DID NOT SHOW", 6),
             ],
         },
         // ── Logs group ──────────────────────────────────────────────────────
@@ -572,8 +610,13 @@ fn height_for(kind: &str) -> u32 {
         "citations" => 3,
         "heatmap" | "ribbon3d" | "embedspace" | "chord" | "pcoords" | "attention" | "flowband"
         | "multiples" | "treemap" | "scatter" | "stacked" | "anomalyband" => 6,
-        // line, topn, table, events, dist, bar, histogram, markdown, and the
-        // section-specific view types (hits, facet, plan, clusters, …).
+        // The second-brain ego ledger stacks three columns of edges plus a
+        // full-width belief-time scrubber — it is the tallest single panel
+        // we seed.
+        "ego" => 8,
+        // line, series, topn, table, events, dist, bar, histogram, honesty,
+        // markdown, and the section-specific view types (hits, facet, plan,
+        // clusters, …).
         _ => 4,
     }
 }
@@ -741,12 +784,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seeds_the_thirteen_dashboards() {
+    fn seeds_the_fourteen_dashboards() {
         let specs = seed_specs();
         assert_eq!(
             specs.len(),
-            13,
-            "must seed exactly the 13 registry dashboards"
+            14,
+            "must seed exactly the 14 registry dashboards"
         );
         // Deterministic ids, all `default-` prefixed and unique.
         let mut ids: Vec<String> = specs
@@ -759,6 +802,7 @@ mod tests {
         assert_eq!(ids.len(), n, "seed ids must be unique");
         assert!(ids.iter().all(|id| id.starts_with("default-")));
         assert!(ids.contains(&"default-ai-overview".to_string()));
+        assert!(ids.contains(&"default-second-brain".to_string()));
         assert!(ids.contains(&"default-settings".to_string()));
     }
 
@@ -771,6 +815,10 @@ mod tests {
         };
         assert_eq!(
             by("ai-overview"),
+            (Some("dashboards".into()), Some("ai".into()))
+        );
+        assert_eq!(
+            by("second-brain"),
             (Some("dashboards".into()), Some("ai".into()))
         );
         assert_eq!(

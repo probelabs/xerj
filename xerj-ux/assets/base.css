@@ -1697,3 +1697,580 @@ html.mobile-preview .nav-sub {
   padding: 4px 0 8px;
   letter-spacing: 0.02em;
 }
+
+/* ---- Second Brain · ego ledger ---------------------------- */
+/* All color through tokens; the only accent uses are the as-of
+   caret, the EXPIRED tag, evidence rules, and hover/focus — one
+   accent colour, correct in both themes by construction. */
+
+.sb-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-4);
+  align-items: baseline;
+  font-size: var(--fs-13);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--z-faint);
+  margin-bottom: var(--sp-3);
+}
+.sb-cval  { color: var(--z-ink); font-weight: 700; }
+.sb-clink { font-family: var(--font-data); color: var(--z-mute); cursor: pointer; }
+.sb-clink:hover { color: var(--z-accent); }
+.sb-cerr  { color: var(--z-accent); font-size: var(--fs-11); letter-spacing: 0.04em; }
+
+.sb-ledger {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) 48px minmax(260px, 1.15fr) 48px minmax(200px, 1fr);
+  column-gap: 0;
+  align-items: start;
+  margin-bottom: var(--sp-4);
+}
+.sb-col { min-width: 0; }
+.sb-rail {
+  position: relative;
+  align-self: stretch;
+  min-height: 40px;
+  color: var(--z-mute); /* the 1px focus→group traces inherit this */
+}
+.sb-trace { position: absolute; inset: 0; display: block; shape-rendering: crispEdges; }
+
+.sb-focuscard {
+  border: 1px solid var(--z-faint);
+  padding: var(--sp-3);
+  min-width: 0;
+}
+.sb-ftitle {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: var(--fs-32);
+  line-height: 1;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+.sb-ftext {
+  font-family: var(--font-prose);
+  font-size: var(--fs-13);
+  line-height: 1.6;
+  color: var(--z-mute);
+  margin-top: var(--sp-1);
+}
+.sb-fdeg {
+  display: flex;
+  flex-wrap: wrap;               /* wrap BETWEEN stats, never inside one */
+  gap: var(--sp-1) var(--sp-3);
+  margin-top: var(--sp-2);
+  font-size: var(--fs-13);
+  color: var(--z-mute);
+}
+.sb-fdeg > span { white-space: nowrap; }
+.sb-fnum { color: var(--z-ink); font-weight: 700; }
+/* Retired-at-this-moment count on the focus card: quiet, struck like
+   the rows it summarizes. */
+.sb-fret { text-decoration: line-through; }
+.sb-fprov { margin-top: var(--sp-1); font-size: var(--fs-11); overflow-wrap: anywhere; }
+
+.sb-group { margin-bottom: var(--sp-3); }
+.sb-grouphead {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--sp-2);
+  border-top: 1px solid var(--z-mute); /* the 1px rule the traces land on */
+  padding-top: 6px;
+  margin-bottom: 4px;
+}
+.sb-ghtype {
+  font-weight: 600;
+  font-size: var(--fs-11);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--z-ink);
+}
+.sb-ghcount { font-family: var(--font-data); font-size: var(--fs-11); color: var(--z-mute); white-space: nowrap; }
+
+.sb-sidecap { margin-bottom: var(--sp-1); }
+
+.sb-erow { border-bottom: 1px solid var(--z-faint); }
+.sb-erow-main { display: flex; gap: var(--sp-2); align-items: baseline; padding: 6px 0; }
+.sb-ename {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  color: var(--z-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.sb-ename:hover, .sb-ename:focus-visible { color: var(--z-accent); }
+.sb-emeta {
+  display: flex;
+  gap: var(--sp-1);
+  align-items: baseline;
+  min-width: 0; /* may shrink — the note's NAME wins the row */
+  font-family: var(--font-data);
+  font-size: var(--fs-11);
+  color: var(--z-mute);
+  white-space: nowrap;
+  cursor: pointer;
+}
+/* The believed-window is the shrinkable part; tags/chips never clip. */
+.sb-ewin { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sb-emeta:hover .sb-eq, .sb-emeta:focus-visible .sb-eq { color: var(--z-accent); }
+.sb-ehop2 { color: var(--z-ink); }
+.sb-eq { letter-spacing: var(--track-label); font-size: 10px; }
+/* State tags. RETIRED wears the accent (the time-travel payoff);
+   NOT YET stays muted — the future is quiet, the past is loud. */
+.sb-tag { display: none; letter-spacing: var(--track-label); font-size: var(--fs-11); }
+.sb-tag-retired { color: var(--z-accent); }
+.sb-tag-notyet  { color: var(--z-mute); }
+.sb-erow.sb-expired .sb-tag-retired { display: inline; }
+.sb-erow.sb-off .sb-tag-notyet { display: inline; }
+.sb-erow.sb-expired .sb-ename,
+.sb-erow.sb-expired .sb-ewin { text-decoration: line-through; color: var(--z-mute); }
+/* A link not yet believed at the caret stays visible but ghosted —
+   rows never pop in and out while scrubbing, they dim. */
+.sb-erow.sb-off .sb-erow-main { opacity: 0.35; }
+.sb-sidenote { font-size: var(--fs-11); letter-spacing: 0.06em; padding: var(--sp-2) 0; }
+
+.sb-evbody { padding: 2px 0 10px; }
+.sb-evquote {
+  font-family: var(--font-prose);
+  font-size: var(--fs-13);
+  line-height: 1.6;
+  color: var(--z-ink);
+  border-left: 1px solid var(--z-accent);
+  padding-left: var(--sp-2);
+  margin: 4px 0 8px;
+}
+.sb-evquote.sb-evnone { color: var(--z-mute); border-left-color: var(--z-faint); }
+.sb-evmeta { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-11); overflow-wrap: anywhere; }
+
+/* Belief-time scrubber */
+.sb-scrub { margin-top: var(--sp-4); }
+.sb-strip {
+  position: relative;
+  margin-top: 28px; /* air for the floating caret label */
+  border-top: 1px solid var(--z-faint);
+  border-bottom: 1px solid var(--z-faint);
+  cursor: crosshair;
+  touch-action: none;
+}
+.sb-striplines { width: 100%; color: var(--z-ink); }
+.sb-lseg.sb-l-live    { stroke-opacity: 1; }
+/* Retired lifetimes go dashed as well as dim — state never rides on
+   opacity alone (print / forced-colors / low-contrast screens). */
+.sb-lseg.sb-l-expired { stroke-opacity: 0.45; stroke-dasharray: 3 2; }
+.sb-lseg.sb-l-future  { stroke-opacity: 0.15; }
+.sb-ltick { stroke-opacity: 0.7; }
+.sb-caret {
+  position: absolute;
+  top: -6px;
+  bottom: -6px;
+  width: 13px;            /* wide hit target for a 1px line */
+  margin-left: -7px;
+  cursor: ew-resize;
+  touch-action: none;
+}
+.sb-caret::after {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--z-accent);
+}
+.sb-caret:focus-visible { outline: 1px solid var(--z-accent); outline-offset: 2px; }
+.sb-caret-label {
+  position: absolute;
+  top: -24px;
+  transform: translateX(-50%);
+  color: var(--z-accent);
+  font-size: var(--fs-11);
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  pointer-events: none;
+}
+/* Near the strip edges the label anchors instead of centring, so it
+   never clips off-screen (matters at phone widths). */
+.sb-caret-label.sb-cl-left  { transform: none; }
+.sb-caret-label.sb-cl-right { transform: translateX(-100%); }
+/* Peak label of the belief-count curve (many-links form). */
+.sb-curvemax {
+  position: absolute;
+  top: 2px;
+  left: 6px;
+  font-size: var(--fs-11);
+  letter-spacing: 0.06em;
+  pointer-events: none;
+}
+.sb-scrub-legend {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+  font-size: var(--fs-11);
+  letter-spacing: 0.06em;
+}
+.sb-scrub-legend .mid { flex: 1; text-align: center; }
+/* Narrow screens keep the count; the how-to-read tail goes. */
+@media (max-width: 640px) {
+  .sb-scrub-explain { display: none; }
+}
+.sb-busy { opacity: 0.55; transition: opacity 0.15s; }
+
+/* Honesty panel — always rendered, zeros included */
+.sb-honesty { font-size: var(--fs-13); }
+.sb-honesty .sb-hgroup { margin: var(--sp-2) 0 6px; }
+.sb-honesty .sb-hgroup:first-child { margin-top: 0; }
+.sb-hrow {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 3px 0;
+  border-bottom: 1px solid var(--z-faint);
+}
+.sb-hk { color: var(--z-mute); }
+.sb-hv { font-weight: 700; }
+.sb-hids { padding: 4px 0; font-size: var(--fs-11); }
+
+/* Hubs (centers of gravity). Own row grid: the shared .row template
+   starves the name column — names are the point of this panel. */
+.sb-hubs { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4); }
+.sb-hubs .key { margin-bottom: 8px; }
+.sb-hubrow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 64px;
+  gap: var(--sp-2);
+  align-items: baseline;
+  width: 100%;       /* real <button> rows: full-bleed + left-aligned */
+  text-align: left;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  cursor: pointer;
+}
+.sb-hubrow:focus-visible { outline: 1px solid var(--z-accent); outline-offset: 2px; }
+.sb-hubname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-hubn { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sb-hubbar { width: 100%; align-self: center; }
+.sb-hubrow:hover .sb-hubname,
+.sb-hubrow:focus-visible .sb-hubname { color: var(--z-accent); }
+.sb-hub-active .sb-hubname { color: var(--z-accent); }
+@media (max-width: 640px) {
+  .sb-hubs { grid-template-columns: 1fr; gap: var(--sp-3); }
+}
+
+/* Detector mini-rows (WHAT TAUGHT THIS BRAIN) */
+.sb-dets { display: flex; flex-direction: column; }
+.sb-det {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 48px;
+  gap: var(--sp-2);
+  align-items: baseline;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+}
+.sb-detname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--z-ink); }
+.sb-detn { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* Believed-vs-retired composition bar — the one two-series comparison.
+   Accent = believed, --z-cmp = retired; both directly labelled. */
+.sb-splitwrap { margin-top: var(--sp-2); }
+.sb-split { width: 100%; height: 8px; display: block; }
+.sb-seg-live    { color: var(--z-accent); }
+.sb-seg-retired { color: var(--z-cmp); }
+.sb-splitleg { display: flex; gap: var(--sp-3); margin-top: 6px; font-size: var(--fs-11); color: var(--z-ink); }
+.sb-leg { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.sb-legline { flex: none; }
+
+/* Empty / live-only states */
+.sb-empty { padding: var(--sp-2) 0 var(--sp-4); max-width: 760px; }
+.sb-empty .sb-ftext { margin: var(--sp-2) 0; }
+.sb-cmdrow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0;
+}
+.sb-cmd {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: var(--fs-16);
+  color: var(--z-ink);
+  border-left: 1px solid var(--z-accent);
+  padding: var(--sp-1) var(--sp-2);
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre;
+  user-select: all; /* one click selects the whole command */
+}
+
+/* Evidence chips — QUOTE (authored text) keeps the ink treatment;
+   WHY (structural rationale) and NO EVIDENCE are muted: they must
+   never carry the same visual promise as a real quote. */
+.sb-eq-why  { color: var(--z-mute); }
+.sb-eq-none { color: var(--z-mute); opacity: 0.75; }
+
+/* Structural rationale in the paper trail: data face, mute ink, faint
+   rule — deliberately NOT the quote treatment (prose face, accent
+   rule, quotation marks). The style is the honesty. */
+.sb-evwhy {
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  line-height: 1.6;
+  color: var(--z-mute);
+  border-left: 1px solid var(--z-faint);
+  padding-left: var(--sp-2);
+  margin: 4px 0 8px;
+}
+
+/* Floating evidence preview (hover / keyboard focus). Display-only:
+   pointer-events none so it can never steal the click that pins. */
+.sb-evpreview {
+  position: fixed;
+  z-index: 60; /* above the ledger; below nothing it needs to yield to */
+  max-width: 44ch;
+  background: var(--z-paper);
+  border: 1px solid var(--z-faint);
+  padding: var(--sp-2);
+  pointer-events: none;
+}
+.sb-evpreview .sb-evquote,
+.sb-evpreview .sb-evwhy { margin: 0 0 6px; }
+
+/* One-shot flash on rows the last time-travel flipped. */
+@keyframes sb-flipflash {
+  from { outline-color: var(--z-accent); }
+  to   { outline-color: transparent; }
+}
+.sb-erow.sb-flip {
+  outline: 1px solid transparent;
+  outline-offset: -1px;
+  animation: sb-flipflash 0.6s ease-out;
+}
+
+/* What-changed readout in the scrubber legend (mid slot, own line). */
+.sb-changeout { display: block; margin-top: 2px; color: var(--z-ink); }
+
+/* Assertion ticks on the belief-count curve — snap targets, muted. */
+.sb-atick { color: var(--z-mute); }
+
+/* FIND — the house frameless-input pattern (.filter-bar .kql),
+   inlined into the controls row. */
+.sb-cfind {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex: 1 1 180px;
+  min-width: 140px;
+}
+.sb-findinput {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  color: var(--z-ink);
+  padding: 2px 0;
+  text-transform: none;
+  letter-spacing: 0;
+  outline: none;
+}
+.sb-findinput:focus { border-bottom-color: var(--z-accent); }
+.sb-findinput::placeholder { color: var(--z-mute); opacity: 0.6; }
+.sb-findresults {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-2);
+  padding: var(--sp-1) 0 var(--sp-2);
+  border-bottom: 1px solid var(--z-faint);
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-13);
+}
+.sb-findrow { font-family: var(--font-data); }
+
+/* Group headers are buttons now (client-side fold); the global button
+   reset keeps the look — this only restores full-width flex. */
+button.sb-grouphead { width: 100%; }
+.sb-ghcaret {
+  display: inline-block;
+  width: 12px;
+  font-size: 9px;
+  color: var(--z-mute);
+}
+
+/* RETIRED panel churn rows: dashed — the visual grammar of retirement
+   everywhere on this page — each with the evidence it carried. */
+.sb-retrows { margin-top: var(--sp-2); }
+.sb-retrow {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-11);
+}
+.sb-retrow:hover .sb-retpair,
+.sb-retrow:focus-visible .sb-retpair { color: var(--z-accent); }
+.sb-retpair {
+  display: block;
+  color: var(--z-ink);
+  text-decoration: line-through;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sb-retwhen { color: var(--z-accent); }
+.sb-retev {
+  display: block;
+  color: var(--z-mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Second Brain · map mount + statistics row ------------- */
+/* The map panel body is a MOUNT POINT (ux/brain-map.js draws into
+   it); the disclosure line below it is permanent and DOM-rendered so
+   it survives whatever the canvas does. */
+.sb-map { position: relative; }
+.sb-map-mount { min-height: 140px; position: relative; }
+.sb-map-disclosure {
+  margin-top: 6px;
+  font-size: var(--fs-11);
+  letter-spacing: 0.04em;
+}
+/* Once the map is live its stage carries the same disclosure in the
+   corner — one copy of the sentence at a time. */
+[data-sb-map-live] .sb-map-disclosure { display: none; }
+
+/* The page's own attributed read log: what — how much — why · when. */
+.sb-reads { font-size: var(--fs-13); }
+.sb-readrow {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: baseline;
+  font-family: var(--font-data);
+  padding: 3px 0;
+  border-bottom: 1px solid var(--z-faint);
+  min-width: 0;
+}
+.sb-readrow:last-of-type { border-bottom: none; }
+.sb-readwhat { color: var(--z-ink); font-weight: 700; white-space: nowrap; }
+.sb-readhow  { color: var(--z-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sb-readwhy  {
+  color: var(--z-mute);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+.sb-readat { color: var(--z-mute); opacity: 0.7; white-space: nowrap; }
+
+/* ---- Second Brain · THE MAP (canvas + rail, ux/brain-map.js) ----
+   Once mounted (`data-sb-map-live`), the mount becomes stage + rail.
+   The canvas draws 1px strokes and text only — all color comes from
+   the tokens, read at draw time, so theme flips restyle on redraw. */
+[data-sb-map-live] .sb-map-mount {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: var(--sp-3);
+  align-items: start;
+}
+.sb-map-stage {
+  position: relative;
+  height: 55vh;
+  min-height: 420px;
+  border: 1px solid var(--z-faint);
+  overflow: hidden;
+}
+.sb-map-canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.sb-map-status {
+  position: absolute;
+  top: var(--sp-1);
+  left: var(--sp-1);
+  font-size: var(--fs-11);
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+.sb-map-tools {
+  position: absolute;
+  top: var(--sp-1);
+  right: var(--sp-1);
+  display: flex;
+  gap: var(--sp-2);
+  font-size: var(--fs-11);
+}
+.sb-map-rail {
+  max-height: max(55vh, 420px);
+  overflow-y: auto;
+  font-size: var(--fs-13);
+  min-width: 0;
+}
+.sb-map-selname {
+  font-family: var(--font-data);
+  font-weight: 700;
+  font-size: var(--fs-16);
+  margin-bottom: var(--sp-1);
+  overflow-wrap: anywhere;
+}
+.sb-map-note { font-size: var(--fs-11); letter-spacing: 0.04em; margin: 6px 0; }
+.sb-map-act {
+  display: block;
+  text-align: left;
+  margin: var(--sp-1) 0;
+  border-left: 1px solid var(--z-accent);
+  padding-left: var(--sp-1);
+}
+.sb-map-act[disabled] { color: var(--z-mute); border-left-color: var(--z-faint); cursor: default; }
+.sb-map-evlist { margin-top: var(--sp-1); }
+.sb-map-evrow {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--z-faint);
+  font-family: var(--font-data);
+  font-size: var(--fs-11);
+}
+.sb-map-evrow:hover .sb-map-evline,
+.sb-map-evrow:focus-visible .sb-map-evline { color: var(--z-accent); }
+.sb-map-evline { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-map-evrow.sb-expired .sb-map-evline { text-decoration: line-through; color: var(--z-mute); }
+.sb-map-evmeta { display: block; margin-top: 2px; }
+.sb-map-satlist { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-1); }
+.sb-map-satrow {
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 0;
+}
+@media (max-width: 1100px) {
+  [data-sb-map-live] .sb-map-mount { grid-template-columns: 1fr; }
+  .sb-map-stage { height: 46vh; min-height: 320px; }
+  .sb-map-rail { max-height: none; }
+}
+
+/* Narrow screens: stack — focus card first, then in, then out. */
+@media (max-width: 1100px) {
+  .sb-ledger { grid-template-columns: 1fr; row-gap: var(--sp-3); }
+  .sb-rail { display: none; }
+  .sb-focuscard { order: -1; }
+  .sb-readhow { display: none; } /* what + why survive; the how is a detail */
+}
