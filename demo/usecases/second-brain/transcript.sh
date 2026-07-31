@@ -66,8 +66,12 @@ ck "contract xerj-second-brain/1"          J '.contract == "xerj-second-brain/1"
 ck "embedder honesty marker is lexical"    J '.embedder == "lexical-feature-hash"'
 ck "edges.total >= 1"                      J '.edges.total >= 1'
 ck "invalidated == total - live"           J '.edges.invalidated == .edges.total - .edges.live'
-for tag in wikilink@1 mdlink@1 href@1 sequence@1 samedir@1; do
-  ck "detector $tag has live edges"        J --arg t "$tag" '[.detectors[] | select(.detector == $t and .live > 0)] | length == 1'
+# Matched on the detector family, not the pinned `@N`: the contract is that
+# each of these five fires on the vault, while the version is *designed* to
+# move (detect/mod.rs mandates bumping @N on any behavior change), so pinning
+# it here would fail every deliberate bump instead of every real regression.
+for tag in wikilink mdlink href sequence samedir; do
+  ck "detector $tag has live edges"        J --arg t "$tag@" '[.detectors[] | select((.detector | startswith($t)) and .live > 0)] | length == 1'
 done
 ck "not_shown accounting present"          J '.not_shown | has("types_not_listed") and has("hubs_out_not_listed")'
 echo "  measured: $(jq -c '{edges, types: [.types[] | {(.type): .live}] | add}' "$WORK/resp.json")"
