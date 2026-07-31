@@ -198,6 +198,24 @@ jobs:
         if: always()
         run: kill "${XERJ_PID:-}" 2>/dev/null || true
 
+  # THE MAP's clustering pipeline is pure, dependency-free JS, so its two
+  # load-bearing claims — "≤ 13 groups at any scale" and "byte-identical
+  # across runs" — are checkable offline in a few hundred milliseconds. Until
+  # this job existed the whole pipeline was covered only by a manual Puppeteer
+  # script that needs a live server and a real browser, i.e. by nothing.
+  ux-tests:
+    name: UX pipeline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: THE MAP pipeline contract
+        run: node --test xerj-ux/test/*.test.mjs
+
   # Per-OS runtime gate. The earlier autoindex "Too many open files" crash was
   # macOS-only and slipped through because nothing in CI actually RAN the binary
   # on macOS/Windows. This job boots xerj and autoindexes a many-dataset corpus
