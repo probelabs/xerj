@@ -2449,7 +2449,18 @@ fn parse_hybrid(params: &Value) -> Result<QueryNode> {
                 .get("query")
                 .ok_or_else(|| qerr(format!("`hybrid.queries[{i}]` missing `query`")))?;
             let query = parse_query(q_val)?;
-            let weight = entry.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            // Negative finite weights remain accepted for compatibility: callers
+            // may intentionally use them to penalise one result list. Reject
+            // values that overflow f32, however, because infinite weights can
+            // produce NaN fused scores (for example `INFINITY * 0.0` in linear
+            // fusion) and make ranking semantics meaningless.
+            let weight_f64 = entry.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let weight = weight_f64 as f32;
+            if !weight.is_finite() {
+                return invalid(format!(
+                    "`hybrid.queries[{i}].weight` must be finite and representable as f32"
+                ));
+            }
             Ok(WeightedQuery { query, weight })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -4858,6 +4869,41 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn test_hybrid_rejects_weights_that_overflow_f32() {
+        for weight in [1e308, -1e308] {
+            let err = parse_query(&json!({
+                "hybrid": {
+                    "queries": [
+                        {"query": {"match_all": {}}, "weight": weight}
+                    ]
+                }
+            }))
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("`hybrid.queries[0].weight` must be finite and representable as f32"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hybrid_accepts_negative_finite_weight() {
+        let node = q(json!({
+            "hybrid": {
+                "queries": [
+                    {"query": {"match_all": {}}, "weight": -2.5}
+                ]
+            }
+        }));
+
+        let QueryNode::Hybrid { queries, .. } = node else {
+            panic!("wrong variant");
+        };
+        assert_eq!(queries[0].weight, -2.5);
     }
 
     #[test]

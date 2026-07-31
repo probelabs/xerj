@@ -22103,11 +22103,7 @@ fn fuse_rrf(sub_results: &[(Vec<Hit>, f32)], k: u32) -> Vec<Hit> {
             h
         })
         .collect();
-    combined.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    combined.sort_by(fusion_hit_order);
     combined
 }
 
@@ -22158,12 +22154,128 @@ fn fuse_linear(sub_results: &[(Vec<Hit>, f32)]) -> Vec<Hit> {
             h
         })
         .collect();
-    combined.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    combined.sort_by(fusion_hit_order);
     combined
+}
+
+/// Total order for fused hits: score descending, then external document ID
+/// ascending. Fusion accumulates through a `HashMap`, whose iteration order is
+/// intentionally randomized; without the ID tie-break, equal-score hits leak
+/// that order into responses and can move across restarts.
+fn fusion_hit_order(a: &Hit, b: &Hit) -> std::cmp::Ordering {
+    // `total_cmp` keeps this comparator transitive even if an internal caller
+    // supplies NaN or infinity. Preserve ordinary floating-point equality for
+    // signed zero so +0.0/-0.0 ties still fall through to the public document ID.
+    let score_order = if a.score == 0.0 && b.score == 0.0 {
+        std::cmp::Ordering::Equal
+    } else {
+        b.score.total_cmp(&a.score)
+    };
+    score_order.then_with(|| a.id.cmp(&b.id))
+}
+
+#[cfg(test)]
+mod fusion_order_tests {
+    use super::*;
+
+    fn hit(id: &str, score: f32) -> Hit {
+        Hit {
+            id: id.into(),
+            score,
+            source: serde_json::json!({"id": id}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        }
+    }
+
+    fn ids(hits: Vec<Hit>) -> Vec<String> {
+        hits.into_iter().map(|hit| hit.id).collect()
+    }
+
+    #[test]
+    fn rrf_equal_scores_have_the_same_order_for_reversed_inputs() {
+        let forward = vec![(vec![hit("b", 7.0)], 1.0), (vec![hit("a", 3.0)], 1.0)];
+        let reversed = vec![(vec![hit("a", 3.0)], 1.0), (vec![hit("b", 7.0)], 1.0)];
+
+        assert_eq!(ids(fuse_rrf(&forward, 60)), ["a", "b"]);
+        assert_eq!(ids(fuse_rrf(&reversed, 60)), ["a", "b"]);
+    }
+
+    #[test]
+    fn rrf_equal_scores_are_stable_across_fresh_accumulators() {
+        let expected = ["a", "b", "c", "d"];
+        for iteration in 0..128 {
+            // Every fuse call creates a fresh RandomState-backed HashMap.
+            // Alternate the sub-list order as a second source-order control.
+            let mut lists = vec![
+                (vec![hit("d", 4.0)], 1.0),
+                (vec![hit("b", 3.0)], 1.0),
+                (vec![hit("c", 2.0)], 1.0),
+                (vec![hit("a", 1.0)], 1.0),
+            ];
+            if iteration % 2 == 1 {
+                lists.reverse();
+            }
+            assert_eq!(ids(fuse_rrf(&lists, 60)), expected);
+        }
+    }
+
+    #[test]
+    fn rrf_score_order_still_wins_over_the_id_tie_break() {
+        let ranked = vec![(vec![hit("z", 1.0), hit("a", 1.0)], 1.0)];
+
+        assert_eq!(ids(fuse_rrf(&ranked, 60)), ["z", "a"]);
+    }
+
+    #[test]
+    fn linear_equal_scores_use_the_same_total_order() {
+        let forward = vec![(vec![hit("b", 1.0)], 1.0), (vec![hit("a", 1.0)], 1.0)];
+        let reversed = vec![(vec![hit("a", 1.0)], 1.0), (vec![hit("b", 1.0)], 1.0)];
+
+        assert_eq!(ids(fuse_linear(&forward)), ["a", "b"]);
+        assert_eq!(ids(fuse_linear(&reversed)), ["a", "b"]);
+    }
+
+    #[test]
+    fn comparator_totally_orders_non_finite_and_ordinary_scores() {
+        let mut hits = vec![
+            hit("negative_infinity", f32::NEG_INFINITY),
+            hit("ordinary_low", -3.0),
+            hit("positive_infinity", f32::INFINITY),
+            hit("ordinary_high", 7.0),
+            hit("nan", f32::NAN),
+        ];
+
+        hits.sort_by(fusion_hit_order);
+        assert_eq!(
+            ids(hits),
+            [
+                "nan",
+                "positive_infinity",
+                "ordinary_high",
+                "ordinary_low",
+                "negative_infinity"
+            ]
+        );
+    }
+
+    #[test]
+    fn comparator_uses_id_for_signed_zero_ties() {
+        let mut hits = vec![hit("b", 0.0), hit("a", -0.0)];
+
+        hits.sort_by(fusion_hit_order);
+        assert_eq!(ids(hits), ["a", "b"]);
+    }
+
+    #[test]
+    fn linear_negative_finite_weight_preserves_score_semantics() {
+        let ranked = vec![(vec![hit("a", 1.0), hit("z", 0.0)], -1.0)];
+
+        assert_eq!(ids(fuse_linear(&ranked)), ["z", "a"]);
+    }
 }
 
 /// Detect a semantic query (parser node `QueryNode::SemanticSearch`)
