@@ -28,11 +28,14 @@ symbols instead of plain text.
 
 - **Autoindex `Too many open files` (os error 24) crash** on large repos. Each
   index holds segment mmaps, a WAL and a merge task, so discovering a repo that
-  infers dozens of datasets (django ≈ 74 indices) exhausted file descriptors on
-  a default macOS soft limit (256), failing at the second index. The server now
-  raises `RLIMIT_NOFILE` to the hard limit at startup (stepping down for the
-  macOS kernel cap; best-effort). Reproduced and fixed against real django and
-  redis clones.
+  infers hundreds of datasets (WooCommerce ≈ 413 indices, ~16 descriptors each)
+  exhausted file descriptors on a default macOS soft limit (256), failing near
+  the start. At startup the server now raises `RLIMIT_NOFILE` toward the hard
+  limit using a **concrete** `rlim_max`: macOS rejects `setrlimit(RLIMIT_NOFILE)`
+  when `rlim_max` is `RLIM_INFINITY` (its launchd default), so passing that back
+  was a silent no-op and the limit stayed at 256 — the raise now sets a concrete
+  ceiling and steps down for the `kern.maxfilesperproc` cap (best-effort).
+  Reproduced and fixed against real django, redis and WooCommerce clones.
 - **jemalloc `background_thread currently supports pthread only`** printed on
   every macOS launch — the `background_thread` option is now Linux-only, where
   it is supported; the decay policy is unchanged.

@@ -1293,31 +1293,79 @@ fn raise_nofile_limit() {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
             return;
         }
-        let cur = lim.rlim_cur;
-        // An "infinity" hard limit (macOS launchd) must be capped to a concrete
-        // value or setrlimit fails outright; 1,048,576 is generous headroom.
-        let hard = if lim.rlim_max == libc::RLIM_INFINITY {
-            1_048_576
-        } else {
-            lim.rlim_max
-        };
-        if hard <= cur {
-            return; // already at the ceiling
-        }
-        let mut want = hard;
-        loop {
+        for (cur, max) in nofile_plan(lim.rlim_cur, lim.rlim_max) {
             let next = libc::rlimit {
-                rlim_cur: want,
-                rlim_max: lim.rlim_max,
+                rlim_cur: cur,
+                rlim_max: max,
             };
             if libc::setrlimit(libc::RLIMIT_NOFILE, &next) == 0 {
                 return; // raised
             }
-            if want <= cur.saturating_add(1) {
-                return; // can't beat the inherited soft limit; leave it be
-            }
-            want = (want / 2).max(cur + 1);
         }
+    }
+}
+
+/// The ordered `(rlim_cur, rlim_max)` pairs to try for RLIMIT_NOFILE, highest
+/// first. Pure, so the macOS-only `RLIM_INFINITY` path is unit-testable without
+/// a Mac. Every pair uses `rlim_max == rlim_cur` — a CONCRETE value: macOS
+/// REJECTS `setrlimit(RLIMIT_NOFILE)` when `rlim_max` is `RLIM_INFINITY` (its
+/// launchd default), so the earlier "pass the inherited hard limit back"
+/// version was a silent no-op there and the limit stayed at 256. Steps down by
+/// halving for the macOS `kern.maxfilesperproc` ceiling until one is accepted.
+#[cfg(unix)]
+fn nofile_plan(cur: libc::rlim_t, max: libc::rlim_t) -> Vec<(libc::rlim_t, libc::rlim_t)> {
+    // Cap an "infinite" hard limit to concrete headroom (1,048,576).
+    let hard = if max == libc::RLIM_INFINITY {
+        1_048_576
+    } else {
+        max
+    };
+    if hard <= cur {
+        return Vec::new(); // already at the ceiling
+    }
+    let mut plan = Vec::new();
+    let mut want = hard;
+    loop {
+        plan.push((want, want));
+        if want <= cur.saturating_add(1) {
+            break;
+        }
+        want = (want / 2).max(cur + 1);
+    }
+    plan
+}
+
+#[cfg(all(test, unix))]
+mod nofile_tests {
+    use super::nofile_plan;
+
+    #[test]
+    fn infinity_hard_yields_only_concrete_maxes() {
+        // The macOS case the earlier version silently failed on.
+        let plan = nofile_plan(256, libc::RLIM_INFINITY);
+        assert!(!plan.is_empty());
+        assert_eq!(plan[0], (1_048_576, 1_048_576)); // highest first, concrete
+        assert!(plan
+            .iter()
+            .all(|&(c, m)| c == m && m != libc::RLIM_INFINITY));
+        for w in plan.windows(2) {
+            assert!(w[0].0 > w[1].0, "must step strictly down");
+        }
+        assert!(
+            plan.last().unwrap().0 <= 257,
+            "ends just above the soft limit"
+        );
+    }
+
+    #[test]
+    fn concrete_hard_is_targeted_directly() {
+        assert_eq!(nofile_plan(256, 524_288)[0], (524_288, 524_288));
+    }
+
+    #[test]
+    fn already_at_ceiling_is_noop() {
+        assert!(nofile_plan(524_288, 524_288).is_empty());
+        assert!(nofile_plan(1024, 512).is_empty());
     }
 }
 
