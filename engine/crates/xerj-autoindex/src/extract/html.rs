@@ -210,28 +210,7 @@ fn parse(html: &str) -> Doc {
                 j += 1;
             }
             let name = html[name_start..j].to_lowercase();
-            // find tag end, respecting quoted attrs
-            let mut k = j;
-            let mut quote: Option<u8> = None;
-            while k < bytes.len() {
-                let c = bytes[k];
-                match quote {
-                    Some(q) => {
-                        if c == q {
-                            quote = None;
-                        }
-                    }
-                    None => {
-                        if c == b'"' || c == b'\'' {
-                            quote = Some(c);
-                        } else if c == b'>' {
-                            break;
-                        }
-                    }
-                }
-                k += 1;
-            }
-            let tag_end = k.min(bytes.len());
+            let (tag_end, self_closing) = scan_tag(bytes, j);
 
             flush_text(&mut cur_text, &text_sink, &mut doc, &mut cur_cell);
 
@@ -240,10 +219,7 @@ fn parse(html: &str) -> Doc {
             // never buffered, never flushed, and a `<` in JS cannot be mistaken
             // for a tag and eat the rest of the page. XHTML-style `<script/>`
             // has no contents to skip.
-            if !close
-                && matches!(name.as_str(), "script" | "style")
-                && bytes.get(tag_end - 1) != Some(&b'/')
-            {
+            if !close && matches!(name.as_str(), "script" | "style") && !self_closing {
                 i = raw_text_end(bytes, tag_end + 1, name.as_bytes());
                 continue;
             }
@@ -325,9 +301,81 @@ fn parse(html: &str) -> Doc {
     doc
 }
 
+/// Where the attribute scanner stands, which is what decides whether a `/`
+/// closes the tag or is just a byte of an attribute value.
+#[derive(PartialEq)]
+enum Attr {
+    /// Between attributes, or inside an attribute name.
+    Bare,
+    /// Just past `=`, with the value not yet started.
+    BeforeValue,
+    /// Inside an unquoted value, where every byte up to the next whitespace
+    /// or `>` belongs to the value.
+    Unquoted,
+}
+
+/// Offset of the tag's `>` (or EOF) given `from` at the end of its name, plus
+/// whether the tag self-closes.
+///
+/// The byte before `>` cannot answer the second question on its own: a slash
+/// is also legal inside an unquoted attribute value, as in
+/// `<script src=/cdn/lib/>`. Reading that as `/>` would skip raw-text mode for
+/// an element that is never void and does have contents to skip. Only a slash
+/// outside quotes and outside an unquoted value closes the tag.
+fn scan_tag(bytes: &[u8], from: usize) -> (usize, bool) {
+    let mut k = from;
+    let mut quote: Option<u8> = None;
+    let mut attr = Attr::Bare;
+    let mut self_closing = false;
+    while k < bytes.len() {
+        let c = bytes[k];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                    attr = Attr::Bare;
+                }
+            }
+            None => {
+                if c == b'>' {
+                    break;
+                }
+                // Only a slash immediately before `>` closes the tag; anything
+                // following one reopens attribute scanning.
+                self_closing = false;
+                match c {
+                    b'"' | b'\'' => quote = Some(c),
+                    b'=' if attr != Attr::Unquoted => attr = Attr::BeforeValue,
+                    // `<p a= />` makes the slash itself the value.
+                    b'/' if attr == Attr::BeforeValue => attr = Attr::Unquoted,
+                    b'/' if attr == Attr::Bare => self_closing = true,
+                    _ if c.is_ascii_whitespace() => {
+                        if attr == Attr::Unquoted {
+                            attr = Attr::Bare;
+                        }
+                    }
+                    _ => {
+                        if attr == Attr::BeforeValue {
+                            attr = Attr::Unquoted;
+                        }
+                    }
+                }
+            }
+        }
+        k += 1;
+    }
+    (k, self_closing)
+}
+
 /// Offset of the `<` opening `</name...>` at or after `from`, or EOF if there
 /// is none — an unterminated raw-text element runs to the end of the file, as
 /// it does in a browser.
+///
+/// Only an *appropriate* end tag terminates raw text: HTML5 lets the name be
+/// followed by whitespace, `/` or `>` and nothing else, so `</script-foo>` is
+/// script text that the surrounding code goes on hiding. Accepting any
+/// non-alphanumeric follower would end the skip at `-`, `_` or `.` and index
+/// the code after it.
 fn raw_text_end(bytes: &[u8], from: usize, name: &[u8]) -> usize {
     let mut p = from.min(bytes.len());
     while let Some(off) = memchr::memchr(b'<', &bytes[p..]) {
@@ -336,7 +384,9 @@ fn raw_text_end(bytes: &[u8], from: usize, name: &[u8]) -> usize {
         if bytes.get(at + 1) == Some(&b'/')
             && after <= bytes.len()
             && bytes[at + 2..after].eq_ignore_ascii_case(name)
-            && !bytes.get(after).is_some_and(u8::is_ascii_alphanumeric)
+            && bytes
+                .get(after)
+                .is_some_and(|&c| c.is_ascii_whitespace() || c == b'/' || c == b'>')
         {
             return at;
         }
@@ -513,6 +563,45 @@ mod tests {
             "{body:?}"
         );
         assert!(!body.contains("hidden"), "{body:?}");
+    }
+
+    /// A slash also ends an unquoted attribute value, and `script` is never a
+    /// void element — so the byte before `>` cannot decide self-closing on its
+    /// own, and `<script src=/cdn/lib/>` still has contents to skip.
+    #[test]
+    fn a_slash_ending_an_unquoted_attribute_value_does_not_read_as_self_closing() {
+        let (_, recs) = run(
+            "unquoted-slash.html",
+            "<html><body><p>alpha</p><script src=/cdn/lib/>var leak=\"SEKRIT\";</script>\
+             <p>omega</p></body></html>",
+        );
+        let body = body_of(&recs[0]);
+        assert!(body.contains("alpha") && body.contains("omega"), "{body:?}");
+        for leak in ["SEKRIT", "leak", "cdn"] {
+            assert!(
+                !body.contains(leak),
+                "{leak:?} was indexed as prose: {body:?}"
+            );
+        }
+    }
+
+    /// Raw text ends only at an *appropriate* end tag: HTML5 requires
+    /// whitespace, `/` or `>` after the name, so `</script-foo>` is script
+    /// text. Any other follower — `_` and `.` alike — is the same case.
+    #[test]
+    fn a_run_on_end_tag_name_does_not_end_raw_text_early() {
+        let (_, recs) = run(
+            "runon.html",
+            "<p>alpha</p><script>a=1;</script-foo>b=\"LEAK2\";</script><p>omega</p>",
+        );
+        let body = body_of(&recs[0]);
+        assert!(body.contains("alpha") && body.contains("omega"), "{body:?}");
+        for leak in ["LEAK2", "a=1", "script"] {
+            assert!(
+                !body.contains(leak),
+                "{leak:?} was indexed as prose: {body:?}"
+            );
+        }
     }
 
     /// An unclosed `<script>` swallows the rest of the file, as a real HTML
