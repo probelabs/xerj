@@ -93,10 +93,20 @@ it is easy to misread as a data-loss bug.
   record: BM25 noise, and — the reason this is more than a quality bug
   — inline configuration blocks carrying API keys, tokens and internal
   endpoints were stored in `_source`. For the "point xerj at my project
-  folder" use case that is a real exposure. Text is now dropped at the
-  point it is read rather than at the closing tag, which also bounds an
-  unclosed `<script>`: the tail of the file is discarded instead of
-  buffered.
+  folder" use case that is a real exposure. Script and style elements
+  are now treated as the raw-text elements they are — the scanner jumps
+  to the literal end tag instead of tokenising inside them, which also
+  bounds an unclosed `<script>`: the tail of the file is discarded
+  rather than buffered and indexed. Two narrower ways the leak survived
+  a first attempt were caught in review and are closed here. A trailing
+  `/` inside an *unquoted* attribute value (`<script src=/cdn/lib/>`)
+  was read as a self-closing tag, so the element was never entered —
+  legal HTML5, since `script` is never a void element. And an end tag
+  whose name ran on into a non-alphanumeric character
+  (`</script-foo>`) was accepted as the terminator, ending raw text
+  early and indexing everything after it. The tag scanner now tracks
+  attribute state to decide self-closing, and the end-tag test follows
+  the spec's appropriate-end-tag rule: whitespace, `/`, or `>`.
 - **XML record election is deterministic.** `elect_record_tag` chose the
   repeating element with `max_by_key` over a `HashMap`, and `max_by_key`
   settles ties by iteration order — which is seeded randomly per map.
@@ -117,6 +127,22 @@ it is easy to misread as a data-loss bug.
   index built before this fix does **not** heal itself: it keeps
   whatever shape it rolled until the XML file's bytes change or the
   index is rebuilt with `--fresh`.
+- **Three further inference elections are deterministic.** Reviewing the
+  fix above found the same defect — `max_by_key` over a `HashMap`, ties
+  settled by a per-instance random hash seed — at three more decisions,
+  each with a wider blast radius than the XML one. Each now has a
+  tie-break argued from what the decision means rather than a copied
+  rule. The log extractor elects the template an *entire file* is parsed
+  with, and every line missing that template is demoted to a
+  continuation, so a flip changes the record count; ties now go to the
+  most specific template, in the order `parse_kind` already tries them
+  (app before clf before syslog), so an ambiguous file resolves the way
+  an ambiguous line does. Field inference elects the date encoding
+  written into the mapping, the catalog and the coercion plan; ties go
+  to the lowest `DateEnc` in declaration order, which is `parse_date_str`'s
+  own richest-first priority, so a field mixing `…T00:00:13` with
+  `… 00:00:13` names the encoding that concedes the least. The third
+  elects a field's entity type, keyword versus text.
 
 - **The ONNX embedding path no longer materialises every window upfront.**
   `embed_semantic_jobs` built and cloned the passage text of every window
