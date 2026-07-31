@@ -7,6 +7,284 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.9] - 2026-07-31
+
+Ninth release candidate: the **cross-platform correctness release**.
+Headline for users, stated plainly because it is the most serious defect
+this project has shipped: **the Windows binaries published as rc.4
+through rc.8 could not start.** Every index creation returned
+`Access is denied. (os error 5)`, and because the console bootstrap
+creates a system index on first boot, the server aborted before it ever
+listened. `xerj.org/get.ps1` installed those binaries for three weeks.
+The cause was one unguarded Unix idiom in the durability path; the fix
+is four lines, and a Windows runner now boots the binary, writes a
+document, reads it back and indexes 400 datasets on every pull request.
+Nothing else caught this because, until this release, no CI job had ever
+*run* the binary anywhere except Ubuntu — `release.yml` built eight
+targets and executed none of them.
+
+The release also closes the self-contained half of the post-audit
+security backlog — a snapshot location that could still escape
+`data_dir`, index-name validation missing at the create boundary, a
+field limit that dynamic ingest enforced and explicit mapping updates
+did not, an unserialised magic-link redemption, and node identity leaking
+from an unauthenticated endpoint — and it carries the consequences of
+taking the Windows lesson seriously: a test pass over the surfaces that
+shipped untested, and the four real defects writing those tests exposed.
+A create-time file-descriptor exhaustion reachable from an index-create
+request, inline `<script>` contents indexed as prose, XML record election
+that changed shape between runs of the same file, and a core dump on
+`xerj … | head`. The Rust suite grows from 1,420 to 1,486 test
+functions; conformance is unchanged at 1360 passed / 0 failed / 3
+skipped. The only performance change is a memory regression fix in the
+ONNX embedding path; no speed measurement was taken and none is claimed.
+The `_reindex` keyset behaviour is untouched — a test around it was
+wrong, not the code, and that distinction is spelled out below because
+it is easy to misread as a data-loss bug.
+
+### Fixed
+
+- **The server can start on Windows.** `xerj_common::fsio::fsync_dir`
+  was `std::fs::File::open(dir)` followed by `sync_all()`, with no
+  platform gate. On Windows, obtaining a handle to a *directory* that
+  way always fails with `ERROR_ACCESS_DENIED (os error 5)`: the standard
+  library cannot pass `FILE_FLAG_BACKUP_SEMANTICS`, which that call
+  requires. `IndexStore::save_snapshot` fsyncs the parent directory
+  after publishing the segment manifest, so **every index creation
+  returned an I/O error**, and the unconditional `xerj-console`
+  bootstrap — which creates `.xerj_users` on first boot — turned that
+  into a fatal `xerj-console bootstrap` error at startup. Introduced in
+  `297be60` (2026-07-12) as part of the power-loss-ordered publish
+  chain, so it affected rc.4, rc.5, rc.6, rc.7 and rc.8. Windows now
+  takes a separate `fsync_dir` that returns `Ok(())`, because Windows
+  exposes no directory-flush primitive at all — `FlushFileBuffers` is
+  not defined for directory handles. **State the consequence honestly:
+  durability on Windows is weaker than on Unix.** The file contents are
+  still fsynced by the callers before the rename; what is not forced is
+  the rename itself, which relies on NTFS metadata journalling. That is
+  the best available behaviour on the platform, and it is now a
+  documented property rather than an error returned on every call.
+- **`xerj … | head` no longer aborts with a core dump.** The Rust
+  runtime installs `SIG_IGN` for `SIGPIPE` before `main`, so once the
+  reader closed the pipe the next write returned `EPIPE`, `println!`
+  panicked with `failed printing to stdout: Broken pipe`, and the
+  release profile's `panic = "abort"` turned that into a core dump —
+  which also swallowed the command's real exit status. The binary now
+  restores the default disposition before anything can write to stdout
+  (unix only), so the kernel terminates the process on the signal and
+  shells report the conventional 141. Found because `xerj autoindex map
+  | head -80` core-dumped on every run of a use-case harness. **Two
+  consequences worth knowing.** Client sockets are unaffected: the
+  standard library writes those with `MSG_NOSIGNAL` (`SO_NOSIGPIPE` on
+  macOS), so a client disconnecting mid-response still surfaces as
+  `EPIPE` and cannot signal the server. The server's own stdout does
+  change — previously tracing discarded write errors and a server
+  outlived a vanished stdout; now the next log line terminates it.
+  Supervised deployments redirect stdout to a file or `/dev/null` (the
+  `brain` boot path included), so in practice this reaches only
+  `xerj | reader-that-leaves`.
+- **Inline `<script>` and `<style>` contents are no longer indexed as
+  prose.** The HTML extractor's `skip_until` state suppressed the
+  *tags* inside those elements but the tokenizer's text branch appended
+  their contents to the buffer unconditionally, and the closing tag
+  continued without discarding it — so the buffered CSS and JavaScript
+  were flushed into the document body at the next tag boundary.
+  Minified stylesheets and scripts became indexed prose in every HTML
+  record: BM25 noise, and — the reason this is more than a quality bug
+  — inline configuration blocks carrying API keys, tokens and internal
+  endpoints were stored in `_source`. For the "point xerj at my project
+  folder" use case that is a real exposure. Text is now dropped at the
+  point it is read rather than at the closing tag, which also bounds an
+  unclosed `<script>`: the tail of the file is discarded instead of
+  buffered.
+- **XML record election is deterministic.** `elect_record_tag` chose the
+  repeating element with `max_by_key` over a `HashMap`, and `max_by_key`
+  settles ties by iteration order — which is seeded randomly per map.
+  When a wrapper element and one of its children were both structured
+  and equally frequent, repeated runs over the *same bytes* elected
+  different tags: 200 runs of one fixture split 89 / 111. The record
+  count and the locators held, so the documents kept their `_id`s, but
+  every one was rewritten with a completely different field set, and
+  field inference for that dataset never settled. The comparison is now
+  total — most occurrences, then the outermost tag, then the lowest name
+  — with the outermost tag as the principled key: when a wrapper repeats
+  as often as its child, the wrapper is the record and the child is one
+  of its fields.
+
+- **The ONNX embedding path no longer materialises every window upfront.**
+  `embed_semantic_jobs` built and cloned the passage text of every window
+  before embedding any of them, so peak memory scaled with the whole job
+  rather than with what was in flight. Windows now carry
+  `(start, end, passages)` and their texts are built lazily and moved
+  into `embed_batch`, with at most two batches in flight. This closes a
+  memory regression at default settings (#71); no throughput measurement
+  was taken and no speed claim is made.
+
+### Security
+
+Five items from the post-audit backlog, each with a regression test
+where the defect is testable, plus one found while writing this
+release's tests. The three that remain open are listed under Known
+limitations rather than quietly omitted.
+
+- **Snapshot repository locations could still escape `data_dir`
+  (#73, High).** The residual half of F-PATH-02: a `settings.location`
+  containing `..` that resolved to a *nonexistent* target slipped past
+  the guard, because canonicalisation fell back to a lexical path and
+  the containment check compared components of a path that had never
+  been resolved. `..` components are now rejected outright, before any
+  resolution. The regression test covers both the direct form and
+  laundering it through an explicit allowlist entry.
+- **Index-name validation is enforced at the create-index boundary
+  (#80).** `IndexName::validate` existed and was applied elsewhere;
+  the ES-compatible `create_index` handler did not call it. Wiring it up
+  is defense in depth against path traversal through index names — the
+  accepted set is unchanged, so no previously valid name is now
+  rejected.
+- **The field limit applies to explicit mapping updates (#76 S5-5).**
+  `max_fields_per_index` was enforced on dynamic ingest but not on the
+  explicit `add_fields` path, so `PUT _mapping` and schema evolution
+  could push an index past the ceiling that exists to bound mapping
+  explosion.
+- **Concurrent magic-link redemptions cannot both mint a session
+  (#76 S5-3).** The check-then-consume sequence in the redeem handler
+  was not serialised, so two requests carrying the same token could both
+  pass the used-check. Redemption is now serialised behind a gate.
+  Stated precisely, because it is easy to overclaim: in the shipped
+  engine the second session was already being blocked incidentally, by
+  the index's optimistic concurrency rejecting the colliding write — so
+  the observable pre-fix exposure was a 500 with internal detail instead
+  of a clean 401, plus a single-use guarantee that rested on what the
+  store happened to do with racing writes rather than on the handler.
+  The fix moves that guarantee into the handler where it belongs. This
+  is covered by 25 rounds of 6 concurrent redemptions.
+- **The unauthenticated `cluster/info` body no longer leaks the node
+  identifier or exact build version (#76 AUTHZ-2).** It now carries only
+  mode and uptime.
+- **A per-index setting could exhaust file descriptors at index-create
+  time.** `index.xerj_ingest_shards` — added in rc.8 to *reduce*
+  descriptor usage — was accepted with only a `>= 1` check, and the
+  ES-compatible create-index handler threads the request body's
+  `settings` through verbatim. `IndexStore::open` eagerly creates a
+  directory and opens a WAL file descriptor per shard, so
+  `{"settings":{"index":{"xerj_ingest_shards": 100000}}}` was a
+  single-request descriptor and inode exhaustion — precisely the failure
+  the setting exists to prevent. The override is now bounded to
+  `1..=256`, the same ceiling `EngineConfig::validate` already enforced
+  on the global `engine.ingest_shards`. Out-of-range values are
+  **refused, not clamped**, so a typo falls back to the engine default
+  rather than silently taking a different one. Found while writing the
+  tests that rc.8 shipped without.
+
+### Added
+
+- **CI runs the binary on macOS and Windows.** A new
+  `autoindex-fd-smoke` job on an `[ubuntu, macos, windows]` matrix boots
+  the server under a constrained descriptor budget (soft 256 / hard
+  4096 — between the pre-fix need of roughly 6,400 for 400 datasets and
+  the post-fix 600), asserts a create-index / index-document / search
+  round-trip, autoindexes a 400-dataset corpus and fails on any
+  `EMFILE`. macOS runners default to `ulimit -n 256`, the exact
+  condition the rc.8 descriptor bug regressed under, so the job
+  reproduces it rather than approximating it. The explicit round-trip
+  exists so that the next platform-specific break names the operation
+  that failed instead of surfacing as an opaque "server exited during
+  boot".
+- **The use-case harnesses run in CI.** A new `usecase-smoke.sh` gate
+  drives the second-brain transcript (overview counts and detector
+  families, ego evidence and `not_shown`, idempotent link, unlink
+  retiring rather than deleting, `as_of` replay, and the normative
+  `hops > 2` / self-edge 400s and unknown-brain 404), the MCP tool
+  surface (initialize handshake, the four `xerj_brain_*` tools listed
+  with their honesty strings, and a real `tools/call` round-trip), and
+  autoindex discovery with post-discovery search. These harnesses
+  already existed but were manual, so a regression in the brain API or
+  the MCP tool list was caught by nothing. Wiring them up immediately
+  found two assertions that could never have passed: the transcript
+  pinned detector versions at `@1` when five of them are at `@2`, and
+  the autoindex idempotency check compared whole `_cat/indices` rows
+  including on-disk size, which legitimately changes across a re-extract.
+- **THE MAP's bounded-graph claims are tested.** The knowledge-graph
+  pipeline shipped in rc.7 on two load-bearing claims — at most 13
+  groups at any scale, and byte-identical output across runs — with no
+  automated test in any language behind either; the only exercise was a
+  manual browser script needing a live server and a real Chrome. The
+  pipeline is pure dependency-free JavaScript, so 23 offline cases now
+  run in under a second over four corpus scales (8, 12, 40 and 120
+  folders, straddling the 12-cluster cap): the group bound with at most
+  one pooled "everything else" body, every file landing in exactly one
+  group with the membership lists and the index agreeing both ways, link
+  conservation against the honesty row the UI computes from,
+  run-to-run determinism, the pairwise bundle bound, and `as_of` replay
+  making a retired link live again.
+- **Regression cover for four surfaces that shipped without any.** The
+  DOCX decompression and paragraph caps from rc.7 (both verified by
+  removing each guard in turn and confirming the matching test fails);
+  the six autoindex extractors that had no direct tests at all — HTML,
+  CSV, JSON, JSONL, XML and SQLite, 49 cases; the magic-link redemption
+  race hardened in rc.9's Phase-2 work, driven with 25 rounds of 6
+  concurrent redemptions; and the per-index WAL shard override,
+  including a reopen test that pins a shard count, writes documents that
+  live only in the memtable and WAL, restarts, and asserts both the
+  layout and every document survive. An installer lint gate covers
+  `landing/get` and `landing/get.ps1`, which had no verification of any
+  kind despite being the only user-facing entry point.
+
+### Changed
+
+- **A test was measuring the CI runner's core count, not the code.**
+  `reindex_pages_past_10k_via_keyset` failed on any machine with real
+  core count (`left: 0, right: 10050`) and passed on CI's two-core
+  runners, so `cargo test --workspace` was red for every developer and
+  green for the project. Turbo ingest routes documents to memtable
+  shards by worker thread: on two cores they all land in one
+  incidentally-visible shard, on a real box they scatter into
+  unpublished shards that the search the reindex pages over cannot see.
+  The sanity assertion above it passed either way because
+  `live_doc_count` reads the version map rather than the search surface.
+  The test now refreshes the source. **The `_reindex` product path was
+  never affected** — driven end to end over HTTP, bulk-indexing 10,050
+  documents and reindexing with `size: 1000` reports
+  `total: 10050, created: 10050, batches: 11` and the destination counts
+  10,050, both with and without an explicit refresh. This was the test
+  reaching under the API, not a reindex defect, and it is recorded here
+  because a bare changelog line about "reindex returning 0 documents"
+  would badly misrepresent it.
+
+### Known limitations
+
+- **DOCX truncation at the decompression cap is silent.** When a
+  document's XML inflates past the 72 MiB cap the reader simply hits
+  end-of-file; because a truncated tag reads as a clean `Eof` rather
+  than an error, nothing increments the junk counter. A bomb-truncated
+  document is therefore indistinguishable from a legitimately short one
+  — the caller gets a well-formed record that is quietly missing
+  content. The memory bound itself holds and is tested; only the
+  *reporting* is missing. Making truncation observable would change the
+  statistics autoindex reports, so it is deliberately left for a
+  separate change.
+- **`index.xerj_ingest_shards` is only read in its nested spelling.**
+  `{"index": {"xerj_ingest_shards": 1}}` is honoured;
+  `{"index.xerj_ingest_shards": 1}` is not, unlike the neighbouring
+  `index.sort.*` settings which accept both. Nothing in the product
+  emits the flat form, so this is an inconsistency rather than a break.
+- **A brain is still not an authorization boundary.** Any authenticated
+  caller can read any brain's `overview` and `ego`; with a shared engine
+  that is a multi-tenant exposure. This needs an access model rather
+  than a patch and is tracked in #79, deliberately not rushed into a
+  release candidate. The concrete part of that issue — the walker
+  indexing `.env` and other dotfiles — was fixed in rc.7.
+- **Cluster transport control messages are still unauthenticated**
+  (#75). Reachable only with cluster mode enabled, which is off by
+  default.
+- **`x-forwarded-for` is still trusted for client identity** (#76 S5-4),
+  which means a caller can spoof the address the per-IP rate limiter
+  keys on. The fix needs `ConnectInfo` threaded through the shared
+  serve and TLS path and is deliberately not bundled with the smaller
+  items above.
+- **Windows durability is weaker than Unix durability**, as described
+  under Fixed. The platform provides no way to make it otherwise.
+
 ## [1.0.0-rc.8] - 2026-07-31
 
 Eighth release candidate: an **autoindex robustness + code-AST release**.
