@@ -21,6 +21,21 @@ impl Entity {
             Entity::Uuid => "uuid",
         }
     }
+
+    /// Tie-break rank for a field-level election, lowest wins. Kept in the
+    /// order `classify` below tries the tests in — most specific first — so an
+    /// ambiguous FIELD resolves the way an ambiguous VALUE does: an exact
+    /// `IpAddr` parse, then the fixed 36-char uuid shape, then email, then the
+    /// loosest test, url. Distinct per variant, which is what makes an
+    /// ordering built on it total. Change this only alongside `classify`.
+    pub fn precedence(&self) -> u8 {
+        match self {
+            Entity::Ip => 0,
+            Entity::Uuid => 1,
+            Entity::Email => 2,
+            Entity::Url => 3,
+        }
+    }
 }
 
 struct Res {

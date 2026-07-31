@@ -334,6 +334,52 @@ fn p95(samples: &[u32]) -> u32 {
     v[((v.len() - 1) * 95) / 100]
 }
 
+/// Elect the date encoding recorded in the field's mapping.
+///
+/// `date_hits` is a `HashMap`, so this comparator has to be TOTAL: anything
+/// left tied would be settled by the map's per-instance random hash seed, and
+/// the same sample would write a different `date_enc` on every run — which
+/// then reaches the catalog and the coercion plan (`coerce::plan_from_specs`),
+/// where the elected encoding decides how bare integers are read.
+///
+/// Most evidence wins; a tie goes to the lowest `DateEnc` in declaration
+/// order. That order is not arbitrary: it is the order `parse_date_str` tries
+/// the encodings in, richest first — rfc3339 carries an explicit zone,
+/// iso-naive and space-naive carry a time we have to assume is UTC, date-only
+/// carries no time at all. On a genuine 50/50 split (a field mixing
+/// `2026-03-17T00:00:13` with `2026-03-17 00:00:13`) we name the encoding that
+/// concedes the least. It is also the order `date_evidence` is sorted in, so
+/// the elected encoding is always the first of the tied ones listed there.
+fn elect_date_enc(date_hits: &HashMap<DateEnc, u64>) -> Option<DateEnc> {
+    date_hits
+        .iter()
+        .min_by(|(a_enc, a_n), (b_enc, b_n)| b_n.cmp(a_n).then_with(|| a_enc.cmp(b_enc)))
+        .map(|(k, _)| *k)
+}
+
+/// Elect the field's semantic entity tag (keyword + `semantic`).
+///
+/// `entity` is a `HashMap`, so the comparator has to be TOTAL for the same
+/// reason as above. Note that a tie cannot change TODAY's verdict: the caller
+/// demands the winner hold ≥90% of the field's values, and two entities each
+/// holding ≥90% of the same sample is arithmetically impossible. That safety
+/// is an accident of one constant, not a property of this election — relax the
+/// supermajority to a plurality and the hash seed picks the mapping. Ordering
+/// it totally costs nothing and does not wait for that edit.
+///
+/// Most values wins; a tie goes to the most specific classifier, so a field
+/// split between shapes is tagged the way `entities::classify` tags a value
+/// that could be read as either.
+fn elect_entity(entity: &HashMap<Entity, u64>) -> Option<Entity> {
+    entity
+        .iter()
+        .min_by(|(a_ent, a_n), (b_ent, b_n)| {
+            b_n.cmp(a_n)
+                .then_with(|| a_ent.precedence().cmp(&b_ent.precedence()))
+        })
+        .map(|(k, _)| *k)
+}
+
 /// Infer the full field spec list for a dataset. `records` = sampled record
 /// count (for null ratios). Two passes so epoch candidates can corroborate
 /// against elected date fields.
@@ -382,12 +428,7 @@ pub fn infer_fields(
         // string dates
         let date_total: u64 = acc.date_hits.values().sum();
         if acc.str_n > 0 && th95(date_total) && date_total > 0 {
-            let elected = acc
-                .date_hits
-                .iter()
-                .max_by_key(|(_, v)| **v)
-                .map(|(k, _)| *k)
-                .unwrap();
+            let elected = elect_date_enc(&acc.date_hits).unwrap();
             spec.es_type = "date".into();
             spec.date_enc = Some(elected.as_str().into());
             let mut ev: Vec<(DateEnc, u64)> = acc.date_hits.iter().map(|(k, v)| (*k, *v)).collect();
@@ -445,12 +486,7 @@ pub fn infer_fields(
             continue;
         }
         // strings → entity / keyword / text
-        let ent = acc
-            .entity
-            .iter()
-            .max_by_key(|(_, v)| **v)
-            .filter(|(_, v)| **v * 10 >= n * 9 && n >= 20)
-            .map(|(k, _)| *k);
+        let ent = elect_entity(&acc.entity).filter(|e| acc.entity[e] * 10 >= n * 9 && n >= 20);
         if let Some(e) = ent {
             spec.es_type = "keyword".into();
             spec.semantic = Some(e.as_str().into());
@@ -573,4 +609,136 @@ pub fn elect_time_field(specs: &[FieldSpec]) -> Option<String> {
                 .then_with(|| b.name.cmp(&a.name))
         })
         .map(|s| s.name.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every election runs over a freshly built `HashMap`, and every fresh map
+    /// gets its own random hash seed — so 500 in-process elections sample 500
+    /// different iteration orders. `max_by_key` settled a tie by whichever of
+    /// them came last.
+    #[test]
+    fn a_tied_date_encoding_election_elects_the_richest_encoding_every_run() {
+        for _ in 0..500 {
+            let hits: HashMap<DateEnc, u64> = [
+                (DateEnc::SpaceNaive, 10),
+                (DateEnc::IsoNaive, 10),
+                (DateEnc::DateOnly, 10),
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(
+                elect_date_enc(&hits),
+                Some(DateEnc::IsoNaive),
+                "of the tied encodings, iso-naive concedes the least"
+            );
+
+            let hits: HashMap<DateEnc, u64> = [(DateEnc::Clf, 4), (DateEnc::Rfc2822, 4)]
+                .into_iter()
+                .collect();
+            assert_eq!(elect_date_enc(&hits), Some(DateEnc::Clf));
+
+            let hits: HashMap<DateEnc, u64> = [(DateEnc::DateOnly, 9), (DateEnc::Rfc3339, 8)]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                elect_date_enc(&hits),
+                Some(DateEnc::DateOnly),
+                "declaration order is only the tie-break; more evidence still wins"
+            );
+
+            assert_eq!(elect_date_enc(&HashMap::new()), None);
+        }
+    }
+
+    /// The end-to-end symptom: one unchanged sample, split 50/50 between two
+    /// string encodings, must always write the same `date_enc` into the spec —
+    /// that string reaches the catalog and `coerce::plan_from_specs`.
+    #[test]
+    fn a_field_tied_between_two_date_encodings_maps_identically_every_run() {
+        for _ in 0..200 {
+            let mut acc = FieldAcc::default();
+            for i in 0..10 {
+                acc.add(&Value::String(format!("2026-03-{:02}T00:00:13", i + 1)));
+                acc.add(&Value::String(format!("2026-03-{:02} 00:00:13", i + 1)));
+            }
+            assert_eq!(acc.date_hits[&DateEnc::IsoNaive], 10);
+            assert_eq!(acc.date_hits[&DateEnc::SpaceNaive], 10);
+
+            let mut fields = HashMap::new();
+            fields.insert("ts".to_string(), acc);
+            let specs = infer_fields(&fields, 20, true);
+            assert_eq!(specs.len(), 1);
+            assert_eq!(specs[0].es_type, "date");
+            assert_eq!(
+                specs[0].date_enc.as_deref(),
+                Some(DateEnc::IsoNaive.as_str())
+            );
+            assert_eq!(
+                specs[0].date_evidence,
+                [
+                    "iso-naive (assumed UTC): 10".to_string(),
+                    "yyyy-mm-dd hh:mm:ss (assumed UTC): 10".to_string(),
+                ],
+                "the elected encoding is the first of the tied ones listed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tied_entity_election_elects_the_most_specific_entity_every_run() {
+        for _ in 0..500 {
+            let votes: HashMap<Entity, u64> = [
+                (Entity::Url, 6),
+                (Entity::Uuid, 6),
+                (Entity::Ip, 6),
+                (Entity::Email, 6),
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(
+                elect_entity(&votes),
+                Some(Entity::Ip),
+                "an exact IpAddr parse is the most specific classifier"
+            );
+
+            let votes: HashMap<Entity, u64> =
+                [(Entity::Url, 3), (Entity::Email, 3)].into_iter().collect();
+            assert_eq!(elect_entity(&votes), Some(Entity::Email));
+
+            let votes: HashMap<Entity, u64> =
+                [(Entity::Url, 7), (Entity::Ip, 6)].into_iter().collect();
+            assert_eq!(
+                elect_entity(&votes),
+                Some(Entity::Url),
+                "precedence is only the tie-break; more values still wins"
+            );
+
+            assert_eq!(elect_entity(&HashMap::new()), None);
+        }
+    }
+
+    /// Pins the reason the entity tie is latent rather than live: the ≥90%
+    /// supermajority gate rejects any tied field, so the winner never reaches
+    /// the spec. If this test starts failing because the gate was relaxed, the
+    /// total ordering in `elect_entity` is the only thing keeping the mapping
+    /// stable — do not remove it.
+    #[test]
+    fn a_tied_entity_field_is_rejected_by_the_supermajority_gate() {
+        let mut acc = FieldAcc::default();
+        for i in 0..15u32 {
+            acc.add(&Value::String(format!("10.0.0.{i}")));
+            acc.add(&Value::String(format!(
+                "741e7b6b-dbd2-4a7f-93a9-4ba50fb561{i:02}"
+            )));
+        }
+        assert_eq!(acc.entity[&Entity::Ip], 15);
+        assert_eq!(acc.entity[&Entity::Uuid], 15);
+        let mut fields = HashMap::new();
+        fields.insert("addr".to_string(), acc);
+        let specs = infer_fields(&fields, 30, true);
+        assert_eq!(specs[0].semantic, None, "neither side holds 90% of 30");
+    }
 }
