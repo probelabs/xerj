@@ -379,3 +379,236 @@ fn ip_from_headers(headers: &HeaderMap) -> String {
     }
     "unknown".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::http::HeaderValue;
+    use tempfile::TempDir;
+    use tokio::sync::Barrier;
+
+    use super::*;
+    use crate::state::ClusterMode;
+
+    /// Console state with the `.xerj_*` system indices in place. We skip
+    /// `bootstrap::run` — redeem only touches magic links, users and audit,
+    /// and dashboard seeding would dominate the runtime of a test that races
+    /// hundreds of redemptions.
+    fn test_state() -> (ConsoleState, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = xerj_common::config::Config::default();
+        cfg.server.data_dir = dir.path().to_str().unwrap().to_string();
+        let engine = xerj_engine::Engine::new(cfg).expect("engine");
+        indices::ensure_all(&engine).expect("system indices");
+        let state = ConsoleState::new(engine, "local".into(), [0u8; 32], ClusterMode::Standalone);
+        (state, dir)
+    }
+
+    /// Write an invite link for `token` plus the pending invitee row it
+    /// points at — the same pair `issue` persists. `ttl_ms` may be negative
+    /// to mint an already-expired link.
+    async fn mint_invite(state: &ConsoleState, token: &str, ttl_ms: i64) {
+        let user_id = format!("invitee-{token}");
+        let user = store::User {
+            id: user_id.clone(),
+            email: format!("{token}@example.com"),
+            display_name: String::new(),
+            role: "editor".to_string(),
+            status: store::UserStatus::Pending,
+            created_at: now_iso(),
+            last_seen_at: None,
+        };
+        store::upsert_user(&state.engine, &user).await.unwrap();
+
+        let link = store::MagicLink {
+            id: sha256_hex(token.as_bytes()),
+            purpose: "invite".to_string(),
+            user_id: Some(user_id),
+            email: Some(user.email),
+            role: "editor".to_string(),
+            created_by: "admin-test".to_string(),
+            created_at: now_iso(),
+            expires_at: crate::time::epoch_ms_to_iso(now_epoch_ms() + ttl_ms),
+            used_at: None,
+        };
+        store::put_magic_link(&state.engine, &link).await.unwrap();
+    }
+
+    /// Drive the handler exactly as axum would. Every call declares its own
+    /// source IP so the per-IP limiter (10/min) never fires — a 429 would
+    /// silently stand in for a rejected redemption and hide the invariant
+    /// under test.
+    async fn redeem_as(state: &ConsoleState, token: &str, ip: &str) -> ConsoleResult<Response> {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_str(ip).unwrap());
+        redeem(
+            State(state.clone()),
+            headers,
+            Json(RedeemBody {
+                token: token.to_string(),
+            }),
+        )
+        .await
+    }
+
+    async fn used_at_of(state: &ConsoleState, token: &str) -> Option<String> {
+        store::get_magic_link(&state.engine, &sha256_hex(token.as_bytes()))
+            .await
+            .unwrap()
+            .expect("link row must survive redemption")
+            .used_at
+    }
+
+    /// #76 S5-3: the used-check and the `mark_magic_link_used` commit are
+    /// separated by several awaits, so without the redeem gate every racer
+    /// passes the used-check on one token and they all go on to consume it —
+    /// the single-use rule then rests on whatever the store does with the
+    /// colliding writes, not on this handler. Race a fresh token per round,
+    /// many rounds, and pin both halves of the guarantee: one winner, and
+    /// losers rejected as *used* (the generic 401) rather than surfacing a
+    /// write collision from underneath.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_redemptions_of_one_token_mint_exactly_one_session() {
+        const ROUNDS: usize = 25;
+        const RACERS: usize = 6;
+
+        let (state, _dir) = test_state();
+
+        for round in 0..ROUNDS {
+            let token = format!("race-token-{round}");
+            mint_invite(&state, &token, INVITE_TTL_MS).await;
+
+            let start = Arc::new(Barrier::new(RACERS));
+            let mut racers = Vec::with_capacity(RACERS);
+            for racer in 0..RACERS {
+                let state = state.clone();
+                let token = token.clone();
+                let start = start.clone();
+                racers.push(tokio::spawn(async move {
+                    start.wait().await;
+                    redeem_as(&state, &token, &format!("10.0.{round}.{racer}")).await
+                }));
+            }
+
+            let mut winners = 0usize;
+            let mut losses = Vec::new();
+            for racer in racers {
+                match racer.await.expect("redeem must not panic") {
+                    Ok(_) => winners += 1,
+                    Err(e) => losses.push(e),
+                }
+            }
+
+            assert_eq!(
+                winners, 1,
+                "round {round}: exactly one of {RACERS} concurrent redemptions may mint a session"
+            );
+            for loss in &losses {
+                assert!(
+                    matches!(loss, ConsoleApiError::Unauthorized(_)),
+                    "round {round}: a losing racer must get the generic 401, got {loss}"
+                );
+            }
+            assert_eq!(
+                state.enrollment_sessions.len(),
+                round + 1,
+                "round {round}: one enrollment session per token, never two"
+            );
+            assert!(
+                used_at_of(&state, &token).await.is_some(),
+                "round {round}: the winning redemption must leave the link consumed"
+            );
+        }
+    }
+
+    /// The gate serializes redemptions but must not reject them: two invitees
+    /// redeeming their own links at the same instant both get a session. This
+    /// is also the control for the test above — it proves the racing harness
+    /// can produce more than one winner, so `winners == 1` there is the
+    /// single-use rule holding, not the harness serializing the calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_redemptions_of_distinct_tokens_all_succeed() {
+        const RACERS: usize = 6;
+
+        let (state, _dir) = test_state();
+        for racer in 0..RACERS {
+            mint_invite(&state, &format!("distinct-token-{racer}"), INVITE_TTL_MS).await;
+        }
+
+        let start = Arc::new(Barrier::new(RACERS));
+        let mut racers = Vec::with_capacity(RACERS);
+        for racer in 0..RACERS {
+            let state = state.clone();
+            let start = start.clone();
+            racers.push(tokio::spawn(async move {
+                start.wait().await;
+                redeem_as(
+                    &state,
+                    &format!("distinct-token-{racer}"),
+                    &format!("10.1.0.{racer}"),
+                )
+                .await
+            }));
+        }
+        for racer in racers {
+            let outcome = racer.await.expect("redeem must not panic");
+            assert!(
+                outcome.is_ok(),
+                "a distinct token must still redeem under contention: {:?}",
+                outcome.err()
+            );
+        }
+        assert_eq!(state.enrollment_sessions.len(), RACERS);
+    }
+
+    /// An invite past its `expires_at` is refused, and refusing it neither
+    /// mints a session nor consumes the link.
+    #[tokio::test]
+    async fn an_expired_token_is_refused_and_never_mints_a_session() {
+        let (state, _dir) = test_state();
+        mint_invite(&state, "stale-token", -60_000).await;
+
+        let outcome = redeem_as(&state, "stale-token", "10.2.0.1").await;
+        assert!(
+            matches!(outcome, Err(ConsoleApiError::Unauthorized(_))),
+            "an expired link must be refused with the generic 401"
+        );
+        assert!(state.enrollment_sessions.is_empty());
+        assert!(
+            used_at_of(&state, "stale-token").await.is_none(),
+            "a refused redemption must not consume the link"
+        );
+    }
+
+    /// Replay of a consumed token is refused and leaves the original
+    /// consumption record intact — a second attempt must not re-stamp
+    /// `used_at` and so blur who redeemed the link and when.
+    #[tokio::test]
+    async fn an_already_redeemed_token_cannot_be_replayed() {
+        let (state, _dir) = test_state();
+        mint_invite(&state, "replay-token", INVITE_TTL_MS).await;
+
+        redeem_as(&state, "replay-token", "10.3.0.1")
+            .await
+            .expect("first redemption");
+        let consumed_at = used_at_of(&state, "replay-token").await;
+        assert!(consumed_at.is_some());
+
+        let outcome = redeem_as(&state, "replay-token", "10.3.0.2").await;
+        assert!(
+            matches!(outcome, Err(ConsoleApiError::Unauthorized(_))),
+            "a redeemed link must be refused with the generic 401"
+        );
+        assert_eq!(
+            state.enrollment_sessions.len(),
+            1,
+            "the replay must not mint a second enrollment session"
+        );
+        assert_eq!(
+            used_at_of(&state, "replay-token").await,
+            consumed_at,
+            "the replay must not re-stamp used_at"
+        );
+    }
+}
