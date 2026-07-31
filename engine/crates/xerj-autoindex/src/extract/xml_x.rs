@@ -278,3 +278,192 @@ fn elect_record_tag(path: &Path, gzip: bool) -> Result<Option<String>> {
         .max_by_key(|(_, (n, _))| *n)
         .map(|(k, _)| k))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(xml: &str) -> (ExtractStats, Vec<RawRecord>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.xml");
+        std::fs::write(&path, xml).unwrap();
+        let mut recs = Vec::new();
+        let stats = extract(&path, false, &mut |r| {
+            recs.push(r);
+            true
+        })
+        .unwrap();
+        (stats, recs)
+    }
+
+    #[test]
+    fn the_repeating_structured_element_becomes_one_record_per_occurrence() {
+        let (stats, recs) = run(r#"<catalog site="shop">
+                 <item id="1"><name>Widget</name></item>
+                 <item id="2"><name>Gadget</name></item>
+                 <item id="3"><name>Doohickey</name></item>
+                 <item id="4"><name>Thing</name><price cur="USD">4.50</price></item>
+               </catalog>"#);
+        assert_eq!(stats.records, 4);
+        assert_eq!(stats.junk, 0);
+        assert_eq!(
+            recs.iter().map(|r| r.locator.as_str()).collect::<Vec<_>>(),
+            ["e0", "e1", "e2", "e3"]
+        );
+        assert_eq!(
+            recs[0].fields["id"],
+            serde_json::json!("1"),
+            "attributes of the record element are top-level fields"
+        );
+        assert_eq!(
+            recs[0].fields["name"],
+            serde_json::json!("Widget"),
+            "child text is keyed by the child element path"
+        );
+        assert!(
+            recs[0].fields.get("site").is_none(),
+            "the root element is not part of a record"
+        );
+        assert_eq!(recs[3].fields["price"], serde_json::json!("4.50"));
+        assert_eq!(
+            recs[3].fields["price_cur"],
+            serde_json::json!("USD"),
+            "a child's attribute is prefixed with the child's path"
+        );
+    }
+
+    #[test]
+    fn a_self_closing_element_is_emitted_from_its_attributes_alone() {
+        let (stats, recs) =
+            run(r#"<rows><row a="1" b="x"/><row a="2" b="y"/><row a="3" b="z"/></rows>"#);
+        assert_eq!(stats.records, 3, "no End event must not lose the record");
+        assert_eq!(recs[2].fields["a"], serde_json::json!("3"));
+        assert_eq!(recs[2].fields["b"], serde_json::json!("z"));
+    }
+
+    #[test]
+    fn a_child_element_repeated_inside_a_record_becomes_a_multi_valued_field() {
+        let (stats, recs) = run(r#"<catalog>
+                 <item id="1"><tag>red</tag><tag>blue</tag></item>
+                 <item id="2"><tag>green</tag></item>
+                 <item id="3"><tag>red</tag></item>
+               </catalog>"#);
+        assert_eq!(stats.records, 3);
+        assert_eq!(recs[0].fields["tag"], serde_json::json!(["red", "blue"]));
+        assert_eq!(
+            recs[1].fields["tag"],
+            serde_json::json!("green"),
+            "a single occurrence stays a scalar"
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_repeating_element_becomes_one_record_keyed_by_path() {
+        let (stats, recs) = run(
+            r#"<config><server><host>localhost</host><port>8080</port></server><debug>true</debug></config>"#,
+        );
+        assert_eq!(stats.records, 1);
+        assert_eq!(recs[0].locator, "doc");
+        assert_eq!(
+            recs[0].fields["server_host"],
+            serde_json::json!("localhost")
+        );
+        assert_eq!(recs[0].fields["server_port"], serde_json::json!("8080"));
+        assert_eq!(
+            recs[0].fields["debug"],
+            serde_json::json!("true"),
+            "the root element is stripped from every key"
+        );
+    }
+
+    #[test]
+    fn entities_are_unescaped_and_cdata_is_kept_verbatim() {
+        let (_, recs) =
+            run(r#"<doc><p>5 &lt; 10 &amp; rising</p><p><![CDATA[<b>raw</b>]]></p></doc>"#);
+        let p = recs[0].fields["p"].as_array().unwrap();
+        assert!(p.contains(&serde_json::json!("5 < 10 & rising")));
+        assert!(p.contains(&serde_json::json!("<b>raw</b>")));
+    }
+
+    #[test]
+    fn a_truncated_document_is_junk_filed_and_keeps_what_it_parsed() {
+        let (stats, recs) =
+            run(r#"<catalog><item id="1"><name>A</name></item><item id="2"><name>B<"#);
+        assert_eq!(stats.junk, 1);
+        assert_eq!(stats.records, 1);
+        assert_eq!(
+            recs[0].fields["item_id"],
+            serde_json::json!(["1", "2"]),
+            "everything read before the break is still emitted"
+        );
+
+        let (stats, recs) = run("<a><b>1</c></a>");
+        assert_eq!(stats.junk, 1, "a mismatched end tag ends the parse");
+        assert_eq!(recs[0].fields["b"], serde_json::json!("1"));
+    }
+
+    #[test]
+    fn text_that_is_not_xml_yields_nothing_at_all() {
+        let (stats, recs) = run("not xml at all, just words");
+        assert_eq!(
+            (stats.records, stats.junk),
+            (0, 0),
+            "text outside any element is dropped; the caller junk-files the file"
+        );
+        assert!(recs.is_empty());
+    }
+
+    /// DEFECT, pinned as CURRENT behaviour.
+    ///
+    /// `elect_record_tag` picks the winner with `max_by_key` over a `HashMap`,
+    /// which breaks ties by iteration order — and that order is randomly
+    /// seeded per map. When two structured tags occur the same number of times
+    /// (here the `item` wrapper and its `price` child, three each) the elected
+    /// record element differs BETWEEN RUNS on the same file: the records carry
+    /// different fields each time, so re-indexing an unchanged file rewrites
+    /// every document under the same locator.
+    ///
+    /// A deterministic tie-break (outermost tag, or lowest name) would fix it;
+    /// when it lands this test fails and should be replaced by the
+    /// stable-election assertion.
+    #[test]
+    fn a_tied_record_tag_election_picks_an_arbitrary_winner_each_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tie.xml");
+        std::fs::write(
+            &path,
+            r#"<catalog>
+                 <item id="1"><price cur="USD">9.99</price></item>
+                 <item id="2"><price cur="EUR">19.99</price></item>
+                 <item id="3"><price cur="USD">4.50</price></item>
+               </catalog>"#,
+        )
+        .unwrap();
+
+        let mut shapes = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            let mut n = 0usize;
+            let mut first = String::new();
+            extract(&path, false, &mut |r| {
+                if n == 0 {
+                    let mut keys: Vec<&str> = r.fields.keys().map(|k| k.as_str()).collect();
+                    keys.sort_unstable();
+                    first = keys.join(",");
+                }
+                n += 1;
+                true
+            })
+            .unwrap();
+            assert_eq!(n, 3, "the record COUNT is stable whichever tag wins");
+            shapes.insert(first);
+        }
+        assert_eq!(
+            shapes,
+            ["cur,text", "id,price,price_cur"]
+                .into_iter()
+                .map(String::from)
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the tie-break became deterministic — replace this test"
+        );
+    }
+}

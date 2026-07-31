@@ -43,6 +43,9 @@ port `9331` (override with `XERJ_BRAIN_DEMO_ROOT` / `XERJ_BRAIN_DEMO_PORT`),
 binaries from `engine/target/release/`. All scripts are idempotent; stop the
 booted server with `kill $(cat <root>/data/server.pid)`.
 
+These three are also what CI runs, via `.github/scripts/usecase-smoke.sh` — so
+the gate on every PR is this exact harness, not a separate copy of it.
+
 ## What the transcript proves
 
 1. **Overview** — brain exists, live/retired counts, all five detectors

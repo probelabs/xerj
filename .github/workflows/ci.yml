@@ -216,6 +216,45 @@ jobs:
       - name: THE MAP pipeline contract
         run: node --test xerj-ux/test/*.test.mjs
 
+  # The harnesses under demo/usecases/ are the only executable proof that the
+  # shipped use cases still work — the brain HTTP surface, the MCP tool surface
+  # an agent actually sees, and autoindex's zero-config discovery. Every one of
+  # them was manual until this job, so a regression in any was caught by
+  # nothing. The installer lint rides along: landing/get{,.ps1} had no
+  # verification of any kind and needs no toolchain, so it gates first and
+  # cheaply.
+  usecase-smoke:
+    name: Use-case harnesses (brain + MCP + autoindex)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer script lint (landing/get, landing/get.ps1)
+        run: bash .github/scripts/installer-lint.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            engine/target
+          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: ci-cargo-
+
+      - name: Build xerj + xerj-mcp (release)
+        working-directory: engine
+        run: cargo build --release -p xerj-server -p xerj-mcp
+
+      # Drives the demo/usecases scripts themselves, so the thing CI gates is
+      # the same thing a reader runs. No browser, no model, no network.
+      - name: Use-case smoke (brain transcript, MCP tools, autoindex discovery)
+        run: bash .github/scripts/usecase-smoke.sh
+
   # Per-OS runtime gate. The earlier autoindex "Too many open files" crash was
   # macOS-only and slipped through because nothing in CI actually RAN the binary
   # on macOS/Windows. This job boots xerj and autoindexes a many-dataset corpus
