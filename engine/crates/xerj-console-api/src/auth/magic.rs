@@ -207,6 +207,14 @@ pub async fn redeem(
     }
     let token_hash = sha256_hex(body.token.as_bytes());
 
+    // #76 S5-3: serialize the single-use check and the mark-used commit. The
+    // used-check (below) and `mark_magic_link_used` (get→delete→create) are
+    // separated by several awaits with no exclusive lock, so two concurrent
+    // redeems of one token could both pass the check and both mint a session.
+    // Hold the gate for the rest of this function so check→consume is atomic.
+    // `lock_owned` avoids tying the guard's lifetime to `state` across awaits.
+    let _redeem_guard = state.redeem_gate.clone().lock_owned().await;
+
     // Look it up.
     let link = store::get_magic_link(&state.engine, &token_hash)
         .await?

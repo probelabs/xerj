@@ -118,6 +118,15 @@ pub struct ConsoleState {
     /// `data_dir/.xerj_master_key` file or the `XERJ_CONSOLE_KEY`
     /// env var; generated on first start and persisted).
     pub master_key: Arc<[u8; 32]>,
+
+    /// Serializes magic-link redemption (#76 S5-3). The single-use check and
+    /// the `mark_magic_link_used` commit are separated by several awaits and
+    /// the store's mark-used is itself get→delete→create, so two concurrent
+    /// redeems of one token could both pass the used-check and both mint a
+    /// session. Holding this gate across the whole check→consume makes the
+    /// transition atomic. Redemptions are rare (enrollment/recovery), so a
+    /// single gate is cheaper than a per-token map and needs no cleanup.
+    pub redeem_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +168,7 @@ impl ConsoleState {
             enrollment_sessions: Arc::new(DashMap::new()),
             auth_rate_counters: Arc::new(DashMap::new()),
             master_key: Arc::new(master_key),
+            redeem_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }

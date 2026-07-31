@@ -1881,6 +1881,24 @@ fn validate_snapshot_path(
     // location itself is sane. Bound the location to `data_dir` (default) or a
     // configured allowlist (an ES `path.repo` equivalent), so a repo cannot point
     // at `/etc`, `/root/.ssh`, another tenant's dir, etc.
+    // F-PATH-02 (residual): a location whose fully-resolved target does not yet
+    // exist makes `canonicalize()` below fail, so the lexical fallback keeps any
+    // `..` components. A component-based `starts_with` then treats
+    // `<data_dir>/../../escape` as *inside* `<data_dir>` (it never normalizes
+    // `..`), and `create_dir_all` lets the OS walk out. Reject `..` outright —
+    // no legitimate snapshot root needs parent-dir traversal — so neither the
+    // location containment check nor the snapshot-name check can be bypassed
+    // with an unresolved parent reference.
+    if std::path::Path::new(repo_path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(EngineError::Common(
+            xerj_common::XerjError::invalid_mapping(format!(
+                "snapshot repository location [{repo_path}] must not contain '..' path components"
+            )),
+        ));
+    }
     let base_canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let repo_base = base_canon(std::path::Path::new(repo_path));
     let mut allowed_bases: Vec<std::path::PathBuf> = vec![base_canon(data_dir)];
@@ -2052,5 +2070,26 @@ mod snapshot_path_security_tests {
         let snap = data.path().join("..");
         let repo = data.path().to_str().unwrap();
         assert!(validate_snapshot_path(repo, "..", &snap, data.path(), &[]).is_err());
+    }
+
+    #[test]
+    fn f_path_02_residual_parent_ref_to_nonexistent_target_is_rejected() {
+        // The residual escape (#73): a location containing `..` whose fully
+        // resolved target does NOT yet exist. canonicalize() fails, the lexical
+        // fallback keeps the `..`, and a component-based starts_with(data_dir)
+        // would pass — letting create_dir_all write outside data_dir. It must be
+        // refused before any directory is created.
+        let data = tempfile::TempDir::new().unwrap();
+        let repo = format!("{}/../../xerj-escape", data.path().display());
+        let snap = std::path::Path::new(&repo).join("s1");
+        let err = validate_snapshot_path(&repo, "s1", &snap, data.path(), &[])
+            .expect_err("a location containing `..` must be rejected");
+        assert!(err.to_string().contains(".."), "unexpected error: {err}");
+        // And it stays rejected even if the operator allowlists a broad root:
+        // the `..` guard runs before containment, so a parent-ref cannot be
+        // laundered through the allowlist either.
+        let err2 = validate_snapshot_path(&repo, "s1", &snap, data.path(), &["/".to_string()])
+            .expect_err("`..` must be rejected even with a permissive allowlist");
+        assert!(err2.to_string().contains(".."), "unexpected error: {err2}");
     }
 }

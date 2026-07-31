@@ -28,12 +28,42 @@ pub async fn info(State(state): State<ConsoleState>) -> ConsoleResult<Response> 
         ClusterMode::Raft => "raft",
     };
 
-    let body = json!({
-        "mode":          mode,
-        "node_id":       state.node_id.as_str(),
-        "version":       env!("CARGO_PKG_VERSION"),
-        "started_at_ms": state.started_at.0,
-    });
+    Ok(ok(info_body(mode, state.started_at.0), None))
+}
 
-    Ok(ok(body, None))
+/// Build the unauthenticated `cluster/info` body.
+///
+/// AUTHZ-2: this endpoint is unauthenticated (the SPA reads it at boot, before
+/// login, to choose standalone-vs-topology view). It must therefore expose only
+/// what that decision needs — `mode` — plus the benign uptime. `node_id` and
+/// the exact build `version` are deliberately omitted: a pre-auth version string
+/// hands an attacker a precise target for known-CVE matching, and the node
+/// identity leaks cluster topology. Authenticated callers get the full detail
+/// from the credentialed cluster/status paths.
+fn info_body(mode: &str, started_at_ms: i64) -> serde_json::Value {
+    json!({
+        "mode":          mode,
+        "started_at_ms": started_at_ms,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::info_body;
+
+    #[test]
+    fn info_body_omits_node_id_and_version_pre_auth() {
+        let v = info_body("standalone", 1_700_000_000_000);
+        assert_eq!(v.get("mode").and_then(|m| m.as_str()), Some("standalone"));
+        assert!(v.get("started_at_ms").is_some());
+        // The AUTHZ-2 disclosure fields must be gone from the pre-auth body.
+        assert!(v.get("node_id").is_none(), "node_id must not leak pre-auth");
+        assert!(v.get("version").is_none(), "version must not leak pre-auth");
+        // And the whole serialized body must not contain the build version.
+        let s = v.to_string();
+        assert!(
+            !s.contains(env!("CARGO_PKG_VERSION")),
+            "build version must not appear in the pre-auth body: {s}"
+        );
+    }
 }
