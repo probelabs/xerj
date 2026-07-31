@@ -675,6 +675,16 @@ pub async fn create_index(
         return ApiError::new(e).into_response();
     }
 
+    // #80: make the path-traversal guarantee LOCAL at this handler boundary.
+    // `Engine::create_index` also runs `IndexName::new`, but validating the name
+    // here means the es_compat surface itself rejects `..`, path separators, NUL
+    // and other malformed names up front — defense-in-depth, not a guarantee
+    // that lives only in a distant call. Same accepted set as before (the engine
+    // enforced the identical rule); the rejection is just local and obvious.
+    if let Err(e) = xerj_common::IndexName::validate(&index) {
+        return ApiError::new(e).into_response();
+    }
+
     // Validate mapping field types before creating — ES returns
     // mapper_parsing_exception for unsupported types.
     let mappings_val = body.get("mappings").cloned().unwrap_or(Value::Null);

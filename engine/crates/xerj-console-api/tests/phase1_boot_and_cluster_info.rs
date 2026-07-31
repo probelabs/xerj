@@ -89,10 +89,16 @@ async fn cluster_info_returns_standalone_mode() {
     let body = body_json(resp).await;
     let data = &body["data"];
     assert_eq!(data["mode"], "standalone");
-    assert_eq!(data["node_id"], "local");
+    // AUTHZ-2 (#76): node_id and the exact build version must NOT appear in the
+    // unauthenticated cluster/info response — they are fingerprinting vectors.
     assert!(
-        data["version"].is_string(),
-        "version must echo the crate version: got {}",
+        data["node_id"].is_null(),
+        "node_id must not leak pre-auth: got {}",
+        data["node_id"]
+    );
+    assert!(
+        data["version"].is_null(),
+        "version must not leak pre-auth: got {}",
         data["version"]
     );
     assert!(
@@ -132,7 +138,12 @@ async fn cluster_info_returns_raft_mode_when_clustered() {
     assert_eq!(resp.status(), 200);
     let body = body_json(resp).await;
     assert_eq!(body["data"]["mode"], "raft");
-    assert_eq!(body["data"]["node_id"], "10.0.0.1:7000");
+    // AUTHZ-2 (#76): node_id must not leak pre-auth even in raft mode.
+    assert!(
+        body["data"]["node_id"].is_null(),
+        "node_id must not leak pre-auth: got {}",
+        body["data"]["node_id"]
+    );
 }
 
 #[tokio::test]

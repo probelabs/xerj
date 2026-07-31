@@ -1252,6 +1252,44 @@ mod semantic_deadline_regression_tests {
     }
 
     #[tokio::test]
+    async fn explicit_add_fields_enforces_max_fields_per_index() {
+        // #76 S5-5: the explicit mapping path (`add_fields` / PUT _mapping /
+        // schema evolve) must enforce `max_fields_per_index` too. The dynamic
+        // ingest path did, but `Index::add_fields` previously bypassed the cap,
+        // so an authenticated caller could bloat the schema unbounded by sending
+        // fields explicitly.
+        let dir = TempDir::new().unwrap();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.limits.max_fields_per_index = 50;
+        let engine_instance = Engine::new(config).expect("engine");
+        engine_instance
+            .create_index("field-cap", Schema::empty())
+            .unwrap();
+        let index = engine_instance.get_index("field-cap").unwrap();
+
+        // Fill exactly to the cap (robust to whatever base fields exist).
+        let base = index.schema().await.field_count() as u32;
+        let fill: Vec<FieldConfig> = (0..(50 - base))
+            .map(|i| FieldConfig::new(format!("f{i}"), FieldType::Keyword))
+            .collect();
+        index
+            .add_fields(fill)
+            .await
+            .expect("filling exactly to the cap must succeed");
+
+        // One field over the cap via the explicit path must be REFUSED.
+        let err = index
+            .add_fields(vec![FieldConfig::new("overflow", FieldType::Keyword)])
+            .await
+            .expect_err("exceeding max_fields_per_index on the explicit path must be rejected");
+        assert!(
+            err.to_string().contains("Limit of total fields"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn mapping_vector_over_existing_hidden_chunks_fails_closed_before_visibility() {
         let dir = TempDir::new().unwrap();
         let engine_instance = engine(&dir);
@@ -8526,18 +8564,27 @@ impl Index {
             // useful cross-document scheduling window without giant padding.
             let max_passages_per_window = self.embedding_config.onnx_scheduling_window;
             let passage_counts = jobs.iter().map(|job| job.texts.len()).collect::<Vec<_>>();
+            // Window boundaries only — do NOT materialize passage texts here.
+            // Pre-building (and cloning) every window's texts up front held
+            // ~N× the request's semantic text for the entire embedding loop
+            // (#71). Keep `(start, end, passages)` and build each window's texts
+            // lazily, MOVING them into `embed_batch`, so only the in-flight
+            // window(s) are resident at a time.
             let mut windows = Vec::new();
             let mut start = 0;
             while start < jobs.len() {
                 let (end, passages) =
                     semantic_embedding_window_end(&passage_counts, start, max_passages_per_window);
-                let texts: Vec<String> = jobs[start..end]
-                    .iter()
-                    .flat_map(|job| job.texts.iter().cloned())
-                    .collect();
-                windows.push((start, end, passages, texts));
+                windows.push((start, end, passages));
                 start = end;
             }
+            // Collect one window's passage texts on demand (borrows `jobs`).
+            let window_texts = |start: usize, end: usize| -> Vec<String> {
+                jobs[start..end]
+                    .iter()
+                    .flat_map(|job| job.texts.iter().cloned())
+                    .collect()
+            };
 
             // Two sessions are an explicit opt-in. Launch at most two complete
             // windows together, drain both, then consume results in input
@@ -8549,7 +8596,8 @@ impl Index {
                 self.embedding_config.onnx_session_pool_size,
             ) {
                 let results = collect_ordinal_buffered_two(windows.len(), |ordinal| {
-                    embedder.embed_batch(windows[ordinal].3.clone())
+                    let (start, end, _passages) = windows[ordinal];
+                    embedder.embed_batch(window_texts(start, end))
                 })
                 .await;
                 window_results.extend(
@@ -8559,12 +8607,12 @@ impl Index {
                         .map(|(window, result)| (window.0, window.1, window.2, result)),
                 );
             } else {
-                for (start, end, passages, texts) in &windows {
+                for &(start, end, passages) in &windows {
                     window_results.push((
-                        *start,
-                        *end,
-                        *passages,
-                        embedder.embed_batch(texts.clone()).await,
+                        start,
+                        end,
+                        passages,
+                        embedder.embed_batch(window_texts(start, end)).await,
                     ));
                 }
             }
@@ -14198,6 +14246,22 @@ impl Index {
         let mut candidate = current;
         for field in fields {
             candidate.add_field(field)?;
+        }
+        // Mapping-explosion guard (#76 S5-5): enforce `max_fields_per_index` on
+        // the EXPLICIT mapping path (`PUT /:index/_mapping`,
+        // `POST /v1/schema/:name/evolve`) too, not only the dynamic-ingest path.
+        // `ManagedSchema::add_field` does not check the cap, so without this an
+        // authenticated caller could bypass the mapping-explosion limit by
+        // supplying fields explicitly. Reject before publishing the candidate.
+        let projected = candidate.schema.field_count() as u32;
+        if projected > self.max_fields_per_index {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::invalid_mapping(format!(
+                    "Limit of total fields [{}] has been exceeded: this mapping update would \
+                     bring the index to {projected} fields",
+                    self.max_fields_per_index
+                )),
+            ));
         }
         if self.live_doc_count() > 0 {
             let active_before: HashSet<String> = passage_scored_vector_fields(&schema.schema)

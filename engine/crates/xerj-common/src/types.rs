@@ -93,7 +93,11 @@ impl IndexName {
         &self.0
     }
 
-    fn validate(name: &str) -> Result<(), XerjError> {
+    /// Validate an index name against the traversal/charset rules without
+    /// constructing an `IndexName`. Public so handler boundaries (e.g. the
+    /// es_compat `create_index` surface, #80) can reject `..`/separators/NUL
+    /// locally instead of relying solely on the deeper `IndexName::new` guard.
+    pub fn validate(name: &str) -> Result<(), XerjError> {
         if name.len() > 255 {
             return Err(XerjError::invalid_mapping(format!(
                 "index name too long: {} chars (max 255)",
