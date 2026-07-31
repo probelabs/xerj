@@ -714,20 +714,17 @@ impl Engine {
 
     /// Create a new index, applying any matching index template.
     pub fn create_index(&self, name: &str, schema: Schema) -> Result<()> {
-        let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+        self.create_index_with_settings(name, schema, Value::Null)
+    }
 
-        if self.indices.contains_key(name) {
-            return Err(EngineError::Common(
-                xerj_common::XerjError::index_already_exists(name),
-            ));
-        }
-
-        // Apply matching template (highest priority wins).
+    /// Merge the highest-priority matching index template's declared fields
+    /// into `schema` (adding any the schema does not already define). Applied
+    /// on every create path so template behavior is independent of whether the
+    /// caller supplied settings.
+    fn apply_index_template(&self, name: &str, schema: Schema) -> Schema {
         let mut effective_schema = schema;
         if let Some(tmpl) = self.best_matching_template(name) {
-            // Merge template mappings into schema.
             if let Some(props) = tmpl.mappings.get("properties") {
-                // Parse template properties and add any missing fields.
                 if let Some(obj) = props.as_object() {
                     for (field_name, field_def) in obj {
                         let es_type = field_def
@@ -750,11 +747,7 @@ impl Engine {
                 }
             }
         }
-
-        let idx = Index::create(index_name, effective_schema, &self.config, &self.data_dir)?;
-        self.indices.insert(name.to_string(), idx);
-        info!(name, "index created");
-        Ok(())
+        effective_schema
     }
 
     /// Create a new index with explicit settings (e.g. custom analysis configuration).
@@ -775,9 +768,11 @@ impl Engine {
             ));
         }
 
+        // Apply matching template (highest priority wins) on every create path.
+        let effective_schema = self.apply_index_template(name, schema);
         let idx = Index::create_with_settings(
             index_name,
-            schema,
+            effective_schema,
             settings,
             &self.config,
             &self.data_dir,

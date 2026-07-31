@@ -744,7 +744,16 @@ pub async fn create_index(
         })
         .unwrap_or_else(|| "asc".to_string());
 
-    match state.engine.create_index(&index, schema) {
+    // Thread the request's `settings` into the store config at create time
+    // (custom analysis config, and the per-index `index.xerj_ingest_shards` WAL
+    // shard override that `xerj autoindex` uses to keep each of its hundreds of
+    // indices at a single WAL file descriptor). create_index_with_settings
+    // applies index templates identically to create_index.
+    let create_settings = body.get("settings").cloned().unwrap_or(Value::Null);
+    match state
+        .engine
+        .create_index_with_settings(&index, schema, create_settings)
+    {
         Ok(()) => {
             // Store the raw settings / mappings / aliases blob as written.
             // These are used by `GET /{index}/_settings`, `GET /{index}/_mapping`,
