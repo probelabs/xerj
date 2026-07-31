@@ -754,7 +754,16 @@ pub async fn create_index(
         })
         .unwrap_or_else(|| "asc".to_string());
 
-    match state.engine.create_index(&index, schema) {
+    // Thread the request's `settings` into the store config at create time
+    // (custom analysis config, and the per-index `index.xerj_ingest_shards` WAL
+    // shard override that `xerj autoindex` uses to keep each of its hundreds of
+    // indices at a single WAL file descriptor). create_index_with_settings
+    // applies index templates identically to create_index.
+    let create_settings = body.get("settings").cloned().unwrap_or(Value::Null);
+    match state
+        .engine
+        .create_index_with_settings(&index, schema, create_settings)
+    {
         Ok(()) => {
             // Store the raw settings / mappings / aliases blob as written.
             // These are used by `GET /{index}/_settings`, `GET /{index}/_mapping`,
@@ -30989,6 +30998,17 @@ mod reindex_keyset_tests {
             n as u64,
             "sanity: all source docs indexed"
         );
+        // `live_doc_count` reads the version map, but reindex pages the SEARCH
+        // surface, and turbo ingest with `parallel = true` scatters docs across
+        // memtable shards by worker thread. Without this refresh the assertion
+        // below silently measures how many cores the machine has: on a 2-core
+        // runner every doc lands in one shard and happens to be visible, so CI
+        // saw 10050/10050 and went green, while any developer box with real
+        // core count searched an unpublished memtable and got 0. The HTTP
+        // `_reindex` path is unaffected — verified end-to-end at 10050/10050
+        // both with and without an explicit `_refresh` — so this is the test
+        // reaching under the API, not a product defect.
+        src.refresh().await.expect("refresh src");
 
         // Reindex src -> dst with a 1000-doc page size (forces >10 pages,
         // crossing the 10k window that a from-offset pager cannot).

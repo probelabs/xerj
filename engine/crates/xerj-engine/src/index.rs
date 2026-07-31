@@ -3321,7 +3321,7 @@ impl Index {
         );
         std::fs::create_dir_all(&index_dir)?;
 
-        let store_config = store_config_from(config);
+        let store_config = store_config_from(config, wal_shards_override_from_settings(&settings));
         let store = IndexStore::open(&index_dir, store_config)?;
 
         let managed = ManagedSchema {
@@ -3516,7 +3516,11 @@ impl Index {
             ));
         }
 
-        let store_config = store_config_from(config);
+        // Load persisted settings BEFORE opening the store so the WAL shard
+        // count (index.xerj_ingest_shards) matches what create used — the WAL
+        // write layout (root vs s{N}/) and doc routing depend on it.
+        let settings = load_settings(&index_dir).unwrap_or(Value::Null);
+        let store_config = store_config_from(config, wal_shards_override_from_settings(&settings));
         let store = IndexStore::open(&index_dir, store_config)?;
 
         // Estimate doc count from snapshot.
@@ -3535,8 +3539,8 @@ impl Index {
         )?;
         let effective_embedder = make_embedder_for_schema(&schema.schema, &config.embedding)?;
 
-        // Load persisted settings early so we can build the registry before WAL replay.
-        let settings = load_settings(&index_dir).unwrap_or(Value::Null);
+        // `settings` was loaded above (before the store was opened) so the WAL
+        // shard count, the analyzer registry, and WAL replay all agree.
 
         // Build analyzer registry from persisted settings so WAL replay uses
         // the same custom analyzers (synonyms, ngrams, etc.) that were active
@@ -21448,7 +21452,28 @@ fn parse_passage_guard(ids: &Value) -> Option<HashSet<String>> {
     }
 }
 
-fn store_config_from(config: &Config) -> IndexStoreConfig {
+/// Per-index WAL shard count read from index settings
+/// (`settings.index.xerj_ingest_shards`), if set. `xerj autoindex` sets this to
+/// 1 so each of its (potentially hundreds of) small indices pins a single WAL
+/// file descriptor instead of one per ingest shard — the ingest-shard count
+/// scales with CPU cores, so N indices held ~N×cores WAL fds open and exhausted
+/// the (low, ~256) macOS file-descriptor limit at a few hundred datasets.
+/// Absent => the global `engine.ingest_shards` default (backward compatible).
+///
+/// MUST be persisted at create and honored on open so the WAL *write* layout
+/// stays consistent (doc routing is `xxh3(id) & (num_shards-1)`). Replay itself
+/// is self-describing (`wal::replay_all_sorted` discovers both the root and
+/// `s{N}/` layouts from disk), so a mismatch cannot lose data, but honoring the
+/// persisted value keeps writes from splitting across two layouts.
+fn wal_shards_override_from_settings(settings: &Value) -> Option<usize> {
+    settings
+        .pointer("/index/xerj_ingest_shards")
+        .and_then(Value::as_u64)
+        .filter(|&n| n >= 1)
+        .map(|n| n as usize)
+}
+
+fn store_config_from(config: &Config, wal_shards_override: Option<usize>) -> IndexStoreConfig {
     let sync_mode = match config.storage.wal_sync {
         xerj_common::config::WalSync::Sync => SyncMode::Strict,
         xerj_common::config::WalSync::Batched | xerj_common::config::WalSync::Async => {
@@ -21470,7 +21495,7 @@ fn store_config_from(config: &Config) -> IndexStoreConfig {
         wal_batch_ms,
         schema_version: 1,
         storage_mode: xerj_storage::StorageMode::Local,
-        num_wal_shards: config.engine.ingest_shards,
+        num_wal_shards: wal_shards_override.unwrap_or(config.engine.ingest_shards),
     }
 }
 

@@ -24,6 +24,31 @@ pub struct BulkOutcome {
     pub first_server_error: Option<String>,
 }
 
+/// Ensure an autoindex index-create body pins the index to a single WAL shard.
+///
+/// autoindex creates one index per inferred dataset — hundreds for a large
+/// repo. Each index otherwise opens one WAL file per ingest shard (a count that
+/// scales with the server's CPU cores), so hundreds of indices exhaust the
+/// process file-descriptor limit — fatal on macOS, whose default soft limit is
+/// 256. `index.xerj_ingest_shards = 1` keeps each index at a single WAL fd.
+/// Non-destructive: only fills the key when absent.
+fn with_single_wal_shard(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(obj) = body.as_object_mut() {
+        let settings = obj
+            .entry("settings")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(sobj) = settings.as_object_mut() {
+            let index = sobj.entry("index").or_insert_with(|| serde_json::json!({}));
+            if let Some(iobj) = index.as_object_mut() {
+                iobj.entry("xerj_ingest_shards")
+                    .or_insert_with(|| serde_json::json!(1));
+            }
+        }
+    }
+    body
+}
+
 impl Es {
     pub fn new(url: &str, api_key: Option<String>) -> Result<Self> {
         Self::with_bulk_timeout(url, api_key, 300)
@@ -128,9 +153,10 @@ impl Es {
 
     /// PUT index with explicit mapping; tolerates already-exists.
     pub fn ensure_index(&self, index: &str, body: &Value) -> Result<()> {
+        let body = with_single_wal_shard(body);
         let resp = self
             .req(reqwest::Method::PUT, &format!("/{index}"))
-            .json(body)
+            .json(&body)
             .send()
             .context("PUT index")?;
         let status = resp.status();

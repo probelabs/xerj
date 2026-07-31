@@ -197,3 +197,59 @@ jobs:
       - name: Stop xerj
         if: always()
         run: kill "${XERJ_PID:-}" 2>/dev/null || true
+
+  # THE MAP's clustering pipeline is pure, dependency-free JS, so its two
+  # load-bearing claims — "≤ 13 groups at any scale" and "byte-identical
+  # across runs" — are checkable offline in a few hundred milliseconds. Until
+  # this job existed the whole pipeline was covered only by a manual Puppeteer
+  # script that needs a live server and a real browser, i.e. by nothing.
+  ux-tests:
+    name: UX pipeline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: THE MAP pipeline contract
+        run: node --test xerj-ux/test/*.test.mjs
+
+  # Per-OS runtime gate. The earlier autoindex "Too many open files" crash was
+  # macOS-only and slipped through because nothing in CI actually RAN the binary
+  # on macOS/Windows. This job boots xerj and autoindexes a many-dataset corpus
+  # on each OS under a constrained descriptor budget, failing on any EMFILE.
+  # macOS runners default to `ulimit -n 256` — the exact condition it regressed
+  # under.
+  autoindex-fd-smoke:
+    name: Autoindex FD smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            engine/target
+          key: ci-smoke-${{ matrix.os }}-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: ci-smoke-${{ matrix.os }}-
+
+      - name: Build xerj (release)
+        working-directory: engine
+        run: cargo build --release -p xerj-server
+
+      - name: Autoindex a many-dataset corpus (must not exhaust file descriptors)
+        shell: bash
+        run: bash .github/scripts/autoindex-fd-smoke.sh
