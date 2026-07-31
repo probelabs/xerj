@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.8] - 2026-07-31
+
+Eighth release candidate: an **autoindex robustness + code-AST release**.
+Headline for users: `xerj autoindex` no longer crashes with `Too many open
+files` on large source trees, and source code is now parsed into searchable
+symbols instead of plain text.
+
+### Added
+
+- **AST code extraction.** Source files are parsed with tree-sitter — Python,
+  JavaScript, TypeScript, TSX, Rust, Go, Java, C, C++, Ruby, PHP, C#, Bash —
+  rather than indexed as prose. Each file carries its `language`, a structured
+  `symbols` array (`{name, kind, line}`), and a searchable `defs` list, so a
+  query like `class Model` retrieves the file that defines it. Grammars are
+  version-decoupled via `tree-sitter-language`, so one tree-sitter 0.25 core
+  serves all of them and adding a language is a grammar dep plus one row.
+
+### Fixed
+
+- **Autoindex `Too many open files` (os error 24) crash** on large repos. Each
+  index holds segment mmaps, a WAL and a merge task, so discovering a repo that
+  infers dozens of datasets (django ≈ 74 indices) exhausted file descriptors on
+  a default macOS soft limit (256), failing at the second index. The server now
+  raises `RLIMIT_NOFILE` to the hard limit at startup (stepping down for the
+  macOS kernel cap; best-effort). Reproduced and fixed against real django and
+  redis clones.
+- **jemalloc `background_thread currently supports pthread only`** printed on
+  every macOS launch — the `background_thread` option is now Linux-only, where
+  it is supported; the decay policy is unchanged.
+- **Empty console dashboards on a fresh or brain-only engine.** The AI, RAG,
+  vector, agent-memory and logs dashboards fell back to mock data when their
+  backing index was empty; each dashboard's nav entry is now gated on its data
+  existing, so a brain-only launch opens on Second Brain and an empty engine
+  shows only System.
+
 ## [1.0.0-rc.7] - 2026-07-30
 
 Seventh release candidate: the **second brain and security-hardening
