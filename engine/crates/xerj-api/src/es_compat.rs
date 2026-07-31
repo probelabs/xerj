@@ -1031,6 +1031,10 @@ fn is_supported_field_type(t: &str) -> bool {
             | "object"
             | "nested"
             | "flattened"
+            // OpenSearch's name for the same "index without expanding
+            // sub-fields" object type — every "flattened" special case
+            // below also treats this as an alias.
+            | "flat_object"
             | "geo_point"
             | "geo_shape"
             | "point"
@@ -4422,7 +4426,7 @@ fn synthetic_transform_object_ext2(
         // Flattened fields reconstruct as a single-level dotted-key map
         // (`{host:{name:x}}` -> `{"host.name":x}`), not a re-nested object.
         // Collapse here and skip the normal object recursion.
-        if child_type == Some("flattened") {
+        if matches!(child_type, Some("flattened") | Some("flat_object")) {
             if let Some(cv) = target.get_mut(&name) {
                 match cv {
                     Value::Object(_) => {
@@ -9110,7 +9114,7 @@ pub async fn search(
                         .and_then(|p| p.get(field));
                     let ftype_static: &'static str = match fspec.and_then(|f| f.get("type")).and_then(Value::as_str) {
                         Some("keyword") => "keyword",
-                        Some("flattened") => "flattened",
+                        Some("flattened") | Some("flat_object") => "flattened",
                         _ => "other",
                     };
                     let explicit = fspec.and_then(|f| f.get("ignore_above")).and_then(Value::as_u64).map(|n| n as usize);
@@ -9452,12 +9456,14 @@ pub async fn search(
                         // include the root itself (leaf-only expand may
                         // have dropped it).
                         let is_flattened = |field: &str| -> bool {
-                            mapping_for_fields.as_ref()
-                                .and_then(|m| m.get("mappings").and_then(|mm| mm.get("properties")).or_else(|| m.get("properties")))
-                                .and_then(|p| p.get(field))
-                                .and_then(|f| f.get("type"))
-                                .and_then(Value::as_str)
-                                == Some("flattened")
+                            matches!(
+                                mapping_for_fields.as_ref()
+                                    .and_then(|m| m.get("mappings").and_then(|mm| mm.get("properties")).or_else(|| m.get("properties")))
+                                    .and_then(|p| p.get(field))
+                                    .and_then(|f| f.get("type"))
+                                    .and_then(Value::as_str),
+                                Some("flattened") | Some("flat_object")
+                            )
                         };
                         // First pass: identify declared flattened roots
                         // that match the pattern (either among current
@@ -9467,7 +9473,7 @@ pub async fn search(
                             let props = m.get("mappings").and_then(|mm| mm.get("properties")).or_else(|| m.get("properties"));
                             if let Some(pobj) = props.and_then(Value::as_object) {
                                 for (fname, fspec) in pobj {
-                                    if fspec.get("type").and_then(Value::as_str) == Some("flattened")
+                                    if matches!(fspec.get("type").and_then(Value::as_str), Some("flattened") | Some("flat_object"))
                                         && wildcard_match(field_name, fname)
                                     {
                                         flat_roots.push(fname.clone());
@@ -9504,7 +9510,7 @@ pub async fn search(
                             let props = m.get("mappings").and_then(|mm| mm.get("properties")).or_else(|| m.get("properties"));
                             if let Some(pobj) = props.and_then(Value::as_object) {
                                 let ancestor_flat: Vec<String> = pobj.iter()
-                                    .filter(|(_, s)| s.get("type").and_then(Value::as_str) == Some("flattened"))
+                                    .filter(|(_, s)| matches!(s.get("type").and_then(Value::as_str), Some("flattened") | Some("flat_object")))
                                     .map(|(k, _)| k.clone())
                                     .filter(|root| prefix_root.starts_with(root) && prefix_root != *root)
                                     .collect();
@@ -11725,7 +11731,7 @@ pub async fn search(
                                     }
                                 }
                             }
-                            "flattened" => {
+                            "flattened" | "flat_object" => {
                                 if let Some(v) = src.get_mut(field) {
                                     reorder(v, max);
                                 }
