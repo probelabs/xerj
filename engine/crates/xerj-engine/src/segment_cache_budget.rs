@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::ingest_memory::{Category, Retained};
 
-pub const CATEGORY_COUNT: usize = 7;
+pub const CATEGORY_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -22,6 +22,7 @@ pub enum SegmentCacheCategory {
     IdPositions,
     RowSequences,
     DecodedStored,
+    VectorProjection,
 }
 
 impl SegmentCacheCategory {
@@ -33,6 +34,7 @@ impl SegmentCacheCategory {
         Self::IdPositions,
         Self::RowSequences,
         Self::DecodedStored,
+        Self::VectorProjection,
     ];
 
     fn trace_category(self) -> Category {
@@ -44,6 +46,7 @@ impl SegmentCacheCategory {
             Self::IdPositions => Category::CacheIdPositions,
             Self::RowSequences => Category::CacheRowSequences,
             Self::DecodedStored => Category::CacheDecodedStored,
+            Self::VectorProjection => Category::CacheVectorProjection,
         }
     }
 }

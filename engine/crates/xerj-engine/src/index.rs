@@ -43,6 +43,37 @@ use crate::segment_cache_estimates as cache_estimates;
 pub(crate) type Resident<T> = Arc<CacheResident<T>>;
 pub(crate) type DocValueMap = std::collections::BTreeMap<String, xerj_storage::doc_values::Column>;
 
+/// One request-wide completion window for sources of an already-ranked exact
+/// kNN winner set. It is captured once after ranking (never renewed per
+/// segment/winner), so timeout overrun is bounded while partial responses keep
+/// exact sources, passages, and aggregation inputs.
+const SEMANTIC_TIMEOUT_HYDRATION_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[cfg(test)]
+static TEST_SELECTIVE_KNN_HYDRATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_COLD_DECODE_CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_COLD_ROW_ACTIVE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_COLD_ROW_MAX_ACTIVE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_COLD_ROW_READER_OPEN: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_PAUSE_COLD_ROW_AFTER_OPEN: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_PROJECTION_DECODES: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_PROJECTION_PUBLICATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_PROJECTION_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+fn cold_decode_cancelled<T>(value: T) -> T {
+    #[cfg(test)]
+    TEST_COLD_DECODE_CANCELLATIONS.fetch_add(1, Ordering::Relaxed);
+    value
+}
+
 fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudget> {
     if let Some(governor) = crate::governor::global() {
         return governor.segment_hydration_budget();
@@ -1596,6 +1627,7 @@ mod semantic_deadline_regression_tests {
                         vec![b'{', b'}'],
                     );
                 }
+                SegmentCacheCategory::VectorProjection => {}
             }));
         }
 
@@ -2907,6 +2939,22 @@ pub struct Index {
     test_segment_cache_publish_pause_mask: Arc<AtomicU64>,
     #[cfg(test)]
     test_segment_cache_publish_ready_mask: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_projection_ready: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_projection_ready_to_publish: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_pause_before_projection_publish: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_winners_ranked: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_pause_before_winner_hydration: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_force_timeout_after_knn_ranking: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_force_cold_row_fallback: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_cold_row_decode_delay_ms: Arc<AtomicU64>,
     // ── Per-index enrich lookup tables ────────────────────────────────────────
     /// Named enrich tables: each table maps a key to a JSON object of extra
     /// fields to merge into matching documents at ingest time.
@@ -3049,6 +3097,12 @@ pub struct Index {
     /// are immutable once flushed, so this cache is correct without
     /// invalidation. Same `Left unbounded for now` caveat as `dv_cache`.
     stored_value_cache: Arc<dashmap::DashMap<String, Resident<Vec<Value>>>>,
+    cold_knn_projection_cache: Arc<
+        dashmap::DashMap<
+            ColdProjectionKey,
+            Resident<xerj_storage::stored_codec::StoredV2KnnProjection>,
+        >,
+    >,
     /// Serializes the short "is this segment still published? + cache insert"
     /// transaction against merge eviction. Segment parsing never holds it.
     segment_cache_lifecycle: Arc<parking_lot::RwLock<()>>,
@@ -3404,6 +3458,22 @@ impl Index {
             test_segment_cache_publish_pause_mask: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             test_segment_cache_publish_ready_mask: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_projection_ready: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_projection_ready_to_publish: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_pause_before_projection_publish: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_winners_ranked: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_pause_before_winner_hydration: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_force_timeout_after_knn_ranking: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_force_cold_row_fallback: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_cold_row_decode_delay_ms: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             hnsw: Arc::new(RwLock::new(None)),
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
@@ -3442,6 +3512,7 @@ impl Index {
             id_pos_cache: Arc::new(dashmap::DashMap::new()),
             row_seq_cache: Arc::new(dashmap::DashMap::new()),
             stored_value_cache: Arc::new(dashmap::DashMap::new()),
+            cold_knn_projection_cache: Arc::new(dashmap::DashMap::new()),
             segment_cache_lifecycle: Arc::new(parking_lot::RwLock::new(())),
             segment_hydration_budget,
             stored_value_loads: Arc::new(dashmap::DashMap::new()),
@@ -3711,6 +3782,22 @@ impl Index {
             test_segment_cache_publish_pause_mask: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             test_segment_cache_publish_ready_mask: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_projection_ready: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_projection_ready_to_publish: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_pause_before_projection_publish: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_winners_ranked: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_pause_before_winner_hydration: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_force_timeout_after_knn_ranking: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_force_cold_row_fallback: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_cold_row_decode_delay_ms: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             store,
             memtable: Arc::new(memtable),
@@ -3769,6 +3856,7 @@ impl Index {
             id_pos_cache: Arc::new(dashmap::DashMap::new()),
             row_seq_cache: Arc::new(dashmap::DashMap::new()),
             stored_value_cache: Arc::new(dashmap::DashMap::new()),
+            cold_knn_projection_cache: Arc::new(dashmap::DashMap::new()),
             segment_cache_lifecycle: Arc::new(parking_lot::RwLock::new(())),
             segment_hydration_budget,
             stored_value_loads: Arc::new(dashmap::DashMap::new()),
@@ -7751,6 +7839,18 @@ impl Index {
             tracing::info!(index=%self.name, field, k, "semantic_phase=start_brute");
         }
 
+        // Filters and SQ8 need complete sources while scoring.  The unfiltered
+        // exact FP32 path can decode typed ZBS2 identity/vector columns and
+        // defer source reconstruction until the global winners are known.
+        let use_sq8 = {
+            let schema = self.schema.read().await;
+            lookup_vector_quantization(&schema.schema, field).as_deref() == Some("scalar8")
+        };
+        let cold_projection_eligible = filter.is_none() && !use_sq8;
+        let chunk_field = format!("{field}_chunks");
+        let mut cold_scored: Vec<(String, f32, Value, Option<u32>)> = Vec::new();
+        let mut cold_locations: HashMap<String, (String, u32, u64)> = HashMap::new();
+
         // ── Collect all candidate (doc_id, source) pairs ──────────────
         let mut candidates: Vec<(String, Value)> = Vec::new();
         // Memtable first (newest writes).
@@ -7758,12 +7858,128 @@ impl Index {
             let mem = &*self.memtable;
             candidates.extend(mem.all_docs_with_sources());
         }
+        let mut encounter_order: HashMap<String, u64> = candidates
+            .iter()
+            .enumerate()
+            .map(|(position, (id, _))| (id.clone(), position as u64))
+            .collect();
+        let mut next_encounter_order = candidates.len() as u64;
         // Then every flushed segment's stored section.
         let snap = self.store.snapshot();
         // Track seen IDs so later-segment copies don't duplicate memtable entries.
         let mut seen: HashSet<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
         'segments: for meta in snap.segments.iter() {
             let segment_started = std::time::Instant::now();
+            if cold_projection_eligible
+                && !self.stored_value_cache.contains_key(meta.id.as_str())
+                && !self.stored_slices_cache.contains_key(meta.id.as_str())
+                && !self.decoded_stored_cache.contains_key(meta.id.as_str())
+            {
+                match self
+                    .cold_v2_knn_for_async(
+                        meta.id.as_str(),
+                        field,
+                        Some(chunk_field.as_str()),
+                        deadline,
+                    )
+                    .await?
+                {
+                    ColdV2Knn::Projected(projected) => {
+                        // Missing sequence metadata has legacy first-seen
+                        // semantics; do not mix that shape with the typed path.
+                        let legacy_identity = projected
+                            .ids
+                            .iter()
+                            .zip(&projected.seq_nos)
+                            .any(|(id, seq)| id.is_some() && seq.is_none());
+                        if !legacy_identity {
+                            for position in 0..projected.num_docs {
+                                if position & 127 == 0
+                                    && self.exact_scan_checkpoint(position, deadline).await
+                                {
+                                    timed_out = true;
+                                    break 'segments;
+                                }
+                                let Some(id) = projected.ids[position].as_ref() else {
+                                    continue;
+                                };
+                                let Some(row_seq) = projected.seq_nos[position] else {
+                                    continue;
+                                };
+                                if let Some(version) = self.store.version_map.get(id) {
+                                    if version.deleted || row_seq != version.seq_no {
+                                        continue;
+                                    }
+                                }
+                                if !seen.insert(id.clone()) {
+                                    continue;
+                                }
+                                let (score, passage_ordinal) = match projected
+                                    .vector_chunks
+                                    .as_ref()
+                                    .and_then(|rows| rows.get(position))
+                                    .and_then(Option::as_ref)
+                                {
+                                    Some(chunks) => {
+                                        let mut best: Option<(f32, u32)> = None;
+                                        for (chunk_position, vector) in chunks.iter().enumerate() {
+                                            if vector.len() != query_vec.len() {
+                                                continue;
+                                            }
+                                            let Some(ordinal) = u32::try_from(chunk_position).ok()
+                                            else {
+                                                continue;
+                                            };
+                                            choose_passage_winner(
+                                                &mut best,
+                                                compute_vector_similarity(
+                                                    similarity, query_vec, vector,
+                                                ),
+                                                ordinal,
+                                            );
+                                        }
+                                        let Some((score, ordinal)) = best else {
+                                            continue;
+                                        };
+                                        (score, Some(ordinal))
+                                    }
+                                    None => {
+                                        let Some(vector) = projected.vectors[position].as_ref()
+                                        else {
+                                            continue;
+                                        };
+                                        if vector.len() != query_vec.len() {
+                                            continue;
+                                        }
+                                        (
+                                            compute_vector_similarity(
+                                                similarity, query_vec, vector,
+                                            ),
+                                            Some(0),
+                                        )
+                                    }
+                                };
+                                cold_locations.insert(
+                                    id.clone(),
+                                    (meta.id.clone(), position as u32, row_seq),
+                                );
+                                encounter_order.insert(id.clone(), next_encounter_order);
+                                next_encounter_order = next_encounter_order.saturating_add(1);
+                                cold_scored.push((id.clone(), score, Value::Null, passage_ordinal));
+                            }
+                            if trace_phases {
+                                tracing::info!(index=%self.name, segment=%meta.id, elapsed_ms=segment_started.elapsed().as_millis() as u64, candidates=cold_scored.len(), "semantic_phase=project_segment");
+                            }
+                            continue;
+                        }
+                    }
+                    ColdV2Knn::Cancelled => {
+                        timed_out = true;
+                        break;
+                    }
+                    ColdV2Knn::Fallback => {}
+                }
+            }
             // Cache-backed: first KNN against this segment pays the
             // I/O + decompress + serde_json parse, every subsequent
             // query reads from `stored_value_cache`. For a 100-segment
@@ -7845,6 +8061,8 @@ impl Index {
                     }
                     d
                 });
+                encounter_order.insert(id.clone(), next_encounter_order);
+                next_encounter_order = next_encounter_order.saturating_add(1);
                 candidates.push((id, src));
             }
             if trace_phases {
@@ -7853,19 +8071,9 @@ impl Index {
         }
         let collect_elapsed = started.elapsed();
 
-        // ── Determine whether this field opts into SQ8 (scalar8) ──────
-        // Default fields keep the exact f32 brute-force scan below,
-        // byte-identical to before. A `scalar8` field instead scores against
-        // a per-field u8 code store — decoding each doc's SQ8 codes rather
-        // than reading its f32 vector from `_source` for scoring.
-        let use_sq8 = {
-            let schema = self.schema.read().await;
-            lookup_vector_quantization(&schema.schema, field).as_deref() == Some("scalar8")
-        };
-
         // ── Score each candidate against the query vector ─────────────
         let mut scored: Vec<(String, f32, Value, Option<u32>)> =
-            Vec::with_capacity(candidates.len());
+            Vec::with_capacity(cold_scored.len().saturating_add(candidates.len()));
         if use_sq8 {
             // Cosine fields are L2-normalised before quantising so SQ8 fits
             // over bounded [-1,1] per-dim ranges (much better recall); cosine
@@ -7971,7 +8179,6 @@ impl Index {
             // that section, not on the whole-doc average. Plain `dense_vector`
             // kNN and short single-chunk docs have no such companion, so they
             // fall through to the exact single-vector scan below (unchanged).
-            let chunk_field = format!("{field}_chunks");
             for (position, (id, src)) in candidates.into_iter().enumerate() {
                 if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
                     timed_out = true;
@@ -8041,6 +8248,11 @@ impl Index {
                 scored.push((id, score, src, passage_ordinal));
             }
         }
+        scored.extend(cold_scored);
+        // Projection scores are emitted during segment collection whereas
+        // compatibility scores are emitted later. Restore historical stable
+        // memtable/segment encounter order before equal-score ranking.
+        scored.sort_by_key(|(id, _, _, _)| encounter_order.get(id).copied().unwrap_or(u64::MAX));
         if trace_phases {
             tracing::info!(index=%self.name, collect_ms=collect_elapsed.as_millis() as u64, elapsed_ms=started.elapsed().as_millis() as u64, scored=scored.len(), "semantic_phase=scored");
         }
@@ -8065,6 +8277,139 @@ impl Index {
                     *score *= b;
                 }
             }
+        }
+
+        // Rank the complete scored set exactly as the shared result builder
+        // does, then reconstruct source only for the global k winners. This
+        // deliberately keeps the existing O(N) score collector; bounded top-k
+        // retention is a separate change.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k.max(1));
+        // Capture exactly one absolute completion boundary for the already-
+        // ranked winner set. Every selective and compatibility hydration uses
+        // this same instant; no segment or retry can renew the grace.
+        let ranking_completed_at = std::time::Instant::now();
+        #[allow(unused_mut)]
+        let mut hydration_deadline = deadline.max(
+            ranking_completed_at
+                .checked_add(SEMANTIC_TIMEOUT_HYDRATION_GRACE)
+                .unwrap_or(deadline),
+        );
+        #[cfg(test)]
+        if self
+            .test_force_timeout_after_knn_ranking
+            .load(Ordering::Acquire)
+        {
+            timed_out = true;
+            hydration_deadline = ranking_completed_at
+                .checked_add(SEMANTIC_TIMEOUT_HYDRATION_GRACE)
+                .unwrap_or(ranking_completed_at);
+        }
+        #[cfg(test)]
+        {
+            self.test_winners_ranked.store(true, Ordering::Release);
+            while self
+                .test_pause_before_winner_hydration
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        }
+        if !cold_locations.is_empty() {
+            let mut by_segment: HashMap<String, Vec<(String, u32, u64)>> = HashMap::new();
+            for (id, _, _, _) in &scored {
+                if let Some((segment, row, seq_no)) = cold_locations.get(id) {
+                    by_segment.entry(segment.clone()).or_default().push((
+                        id.clone(),
+                        *row,
+                        *seq_no,
+                    ));
+                }
+            }
+            let mut hydrated: HashMap<String, Value> = HashMap::new();
+            for (segment, winners) in by_segment {
+                let ordinals: Vec<usize> = winners
+                    .iter()
+                    .map(|(_, ordinal, _)| *ordinal as usize)
+                    .collect();
+                match self
+                    .cold_v2_rows_for_async(&segment, ordinals, hydration_deadline)
+                    .await?
+                {
+                    ColdV2Rows::Hydrated(rows) => {
+                        for (id, ordinal, seq_no) in &winners {
+                            let row = rows.get(ordinal).ok_or_else(|| {
+                                EngineError::Common(xerj_common::XerjError::internal(format!(
+                                    "selective source hydration omitted exact kNN winner `{id}`"
+                                )))
+                            })?;
+                            if row.id != *id || row.seq_no != *seq_no {
+                                return Err(EngineError::Common(xerj_common::XerjError::internal(
+                                    format!("selective source hydration identity mismatch for exact kNN winner `{id}`"),
+                                )));
+                            }
+                            hydrated.insert(id.clone(), row.source.clone());
+                        }
+                    }
+                    ColdV2Rows::Fallback => {
+                        let docs = match tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(hydration_deadline),
+                            self.stored_values_for_async(&segment),
+                        )
+                        .await
+                        {
+                            Ok(Some(docs)) => docs,
+                            Ok(None) => {
+                                return Err(EngineError::Common(xerj_common::XerjError::internal(
+                                    "compatibility winner segment became unreadable",
+                                )))
+                            }
+                            Err(_) => {
+                                timed_out = true;
+                                break;
+                            }
+                        };
+                        for (id, ordinal, seq_no) in winners {
+                            let doc = docs.get(ordinal as usize).ok_or_else(|| {
+                                EngineError::Common(xerj_common::XerjError::internal(
+                                    "compatibility winner ordinal is absent",
+                                ))
+                            })?;
+                            if doc.get("_id").and_then(Value::as_str) != Some(id.as_str())
+                                || doc.get("_seq_no").and_then(Value::as_u64) != Some(seq_no)
+                            {
+                                return Err(EngineError::Common(xerj_common::XerjError::internal(
+                                    "compatibility winner identity changed after scoring",
+                                )));
+                            }
+                            hydrated.insert(
+                                id,
+                                doc.get("_source").cloned().unwrap_or_else(|| doc.clone()),
+                            );
+                        }
+                    }
+                    ColdV2Rows::Cancelled => {
+                        timed_out = true;
+                        break;
+                    }
+                }
+            }
+            // Hydration may complete inside the one fixed post-ranking grace
+            // after the caller's original deadline. Preserve those exact,
+            // fully-hydrated winners, but report the response as partial.
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+            }
+            if timed_out {
+                scored.retain(|(id, _, _, _)| {
+                    !cold_locations.contains_key(id) || hydrated.contains_key(id)
+                });
+            }
+            apply_cold_winner_hydration(&mut scored, &cold_locations, &mut hydrated)?;
+        }
+        if timed_out {
+            scored
+                .retain(|(id, _, source, _)| !cold_locations.contains_key(id) || !source.is_null());
         }
 
         // ── Rank, cap the candidate pool at k, then paginate ──────────
@@ -15858,6 +16203,8 @@ impl Index {
     /// Caller holds `segment_cache_lifecycle.write()`.
     fn remove_segment_hydration_entries(&self, segment_id: &str) {
         self.stored_value_cache.remove(segment_id);
+        self.cold_knn_projection_cache
+            .retain(|key, _| key.segment_id != segment_id);
         self.dv_cache.remove(segment_id);
         self.id_pos_cache.remove(segment_id);
         self.row_seq_cache.remove(segment_id);
@@ -18600,6 +18947,85 @@ impl Index {
             bytes,
             slices,
         ))
+    }
+
+    /// Decode only typed identity/vector columns for an exact scan of a cold
+    /// ZBS2 segment. The blocking decoder is cooperatively cancelled when the
+    /// caller future is dropped or its absolute deadline expires.
+    async fn cold_v2_knn_for_async(
+        &self,
+        seg_id: &str,
+        vector_field: &str,
+        vector_chunks_field: Option<&str>,
+        deadline: std::time::Instant,
+    ) -> Result<ColdV2Knn> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut cancel_on_drop = ColdDecodeCancelOnDrop::new(Arc::clone(&cancelled));
+        let worker = ColdProjectionWorker {
+            store: Arc::clone(&self.store),
+            build_locks: Arc::clone(&self.stored_slices_build_locks),
+            stored_value_cache: Arc::clone(&self.stored_value_cache),
+            stored_slices_cache: Arc::clone(&self.stored_slices_cache),
+            decoded_stored_cache: Arc::clone(&self.decoded_stored_cache),
+            projection_cache: Arc::clone(&self.cold_knn_projection_cache),
+            lifecycle: Arc::clone(&self.segment_cache_lifecycle),
+            budget: Arc::clone(&self.segment_hydration_budget),
+            cancelled,
+            #[cfg(test)]
+            projection_ready: Arc::clone(&self.test_projection_ready),
+            #[cfg(test)]
+            projection_ready_to_publish: Arc::clone(&self.test_projection_ready_to_publish),
+            #[cfg(test)]
+            pause_before_projection_publish: Arc::clone(&self.test_pause_before_projection_publish),
+        };
+        let segment = seg_id.to_owned();
+        let vector_field = vector_field.to_owned();
+        let chunks_field = vector_chunks_field.map(ToOwned::to_owned);
+        let result = tokio::task::spawn_blocking(move || {
+            worker.run(&segment, &vector_field, chunks_field.as_deref(), deadline)
+        })
+        .await
+        .map_err(|error| {
+            EngineError::Common(xerj_common::XerjError::internal(format!(
+                "cold vector projection worker failed: {error}"
+            )))
+        })?;
+        cancel_on_drop.disarm();
+        result
+    }
+
+    /// Reconstruct only selected cold rows after exact global ranking.
+    async fn cold_v2_rows_for_async(
+        &self,
+        seg_id: &str,
+        ordinals: Vec<usize>,
+        deadline: std::time::Instant,
+    ) -> Result<ColdV2Rows> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut cancel_on_drop = ColdDecodeCancelOnDrop::new(Arc::clone(&cancelled));
+        let worker = ColdRowDecodeWorker {
+            store: Arc::clone(&self.store),
+            stored_slices_cache: Arc::clone(&self.stored_slices_cache),
+            decoded_stored_cache: Arc::clone(&self.decoded_stored_cache),
+            cancelled,
+            #[cfg(test)]
+            force_fallback: Arc::clone(&self.test_force_cold_row_fallback),
+            #[cfg(test)]
+            decode_delay_ms: Arc::clone(&self.test_cold_row_decode_delay_ms),
+        };
+        let segment = seg_id.to_owned();
+        let join = tokio::task::spawn_blocking(move || worker.run(&segment, &ordinals, deadline));
+        let result =
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), join).await {
+                Ok(joined) => joined.map_err(|error| {
+                    EngineError::Common(xerj_common::XerjError::internal(format!(
+                        "cold row hydration worker failed: {error}"
+                    )))
+                })?,
+                Err(_) => return Ok(cold_decode_cancelled(ColdV2Rows::Cancelled)),
+            };
+        cancel_on_drop.disarm();
+        result
     }
 
     /// Per-segment GHOST-position bitmap (b7 DEFECT 1c): bit `pos` set ⇔
@@ -26557,6 +26983,1573 @@ struct StoredSlices {
     /// `offsets[pos] = (start, end)` byte range of the doc at stored
     /// position `pos` inside `bytes`.
     offsets: Vec<(u32, u32)>,
+}
+
+struct ColdV2Row {
+    id: String,
+    #[allow(dead_code)]
+    seq_no: u64,
+    source: Value,
+}
+
+enum ColdV2Rows {
+    Hydrated(HashMap<u32, ColdV2Row>),
+    Fallback,
+    Cancelled,
+}
+
+enum ColdV2Knn {
+    Projected(Resident<xerj_storage::stored_codec::StoredV2KnnProjection>),
+    Fallback,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ColdProjectionKey {
+    segment_id: String,
+    vector_field: String,
+    vector_chunks_field: Option<String>,
+}
+
+struct ColdDecodeCancelOnDrop {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl ColdDecodeCancelOnDrop {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ColdDecodeCancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct ColdProjectionWorker {
+    store: Arc<IndexStore>,
+    build_locks: Arc<dashmap::DashMap<String, Arc<std::sync::Mutex<()>>>>,
+    stored_value_cache: Arc<dashmap::DashMap<String, Resident<Vec<Value>>>>,
+    stored_slices_cache: Arc<dashmap::DashMap<String, Resident<StoredSlices>>>,
+    decoded_stored_cache: Arc<dashmap::DashMap<String, Resident<Vec<u8>>>>,
+    projection_cache: Arc<
+        dashmap::DashMap<
+            ColdProjectionKey,
+            Resident<xerj_storage::stored_codec::StoredV2KnnProjection>,
+        >,
+    >,
+    lifecycle: Arc<parking_lot::RwLock<()>>,
+    budget: Arc<SegmentHydrationBudget>,
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    projection_ready: Arc<AtomicBool>,
+    #[cfg(test)]
+    projection_ready_to_publish: Arc<AtomicBool>,
+    #[cfg(test)]
+    pause_before_projection_publish: Arc<AtomicBool>,
+}
+
+fn projection_retained_bytes(
+    key: &ColdProjectionKey,
+    projection: &xerj_storage::stored_codec::StoredV2KnnProjection,
+) -> u64 {
+    // `common_entry_bytes` models a `String` key. Replace that inline/key-
+    // allocation component with the actual three-string projection key while
+    // retaining its Arc/DashMap container allowance.
+    let empty_key = String::new();
+    let mut bytes = cache_estimates::common_entry_bytes(
+        &empty_key,
+        std::mem::size_of::<CacheResident<xerj_storage::stored_codec::StoredV2KnnProjection>>(),
+    )
+    .saturating_sub(std::mem::size_of::<String>() as u64)
+    .saturating_add(std::mem::size_of::<ColdProjectionKey>() as u64)
+    .saturating_add(key.segment_id.capacity() as u64)
+    .saturating_add(key.vector_field.capacity() as u64)
+    .saturating_add(
+        key.vector_chunks_field
+            .as_ref()
+            .map_or(0, |field| field.capacity() as u64),
+    );
+    bytes = bytes
+        .saturating_add((projection.ids.capacity() * std::mem::size_of::<Option<String>>()) as u64)
+        .saturating_add((projection.seq_nos.capacity() * std::mem::size_of::<Option<u64>>()) as u64)
+        .saturating_add(
+            (projection.vectors.capacity() * std::mem::size_of::<Option<Vec<f32>>>()) as u64,
+        );
+    for id in projection.ids.iter().flatten() {
+        bytes = bytes.saturating_add(id.capacity() as u64);
+    }
+    for vector in projection.vectors.iter().flatten() {
+        bytes = bytes.saturating_add((vector.capacity() * std::mem::size_of::<f32>()) as u64);
+    }
+    if let Some(rows) = &projection.vector_chunks {
+        bytes = bytes.saturating_add(
+            (rows.capacity() * std::mem::size_of::<Option<Vec<Vec<f32>>>>()) as u64,
+        );
+        for chunks in rows.iter().flatten() {
+            bytes =
+                bytes.saturating_add((chunks.capacity() * std::mem::size_of::<Vec<f32>>()) as u64);
+            for vector in chunks {
+                bytes =
+                    bytes.saturating_add((vector.capacity() * std::mem::size_of::<f32>()) as u64);
+            }
+        }
+    }
+    bytes
+}
+
+impl ColdProjectionWorker {
+    fn should_cancel(&self, deadline: std::time::Instant) -> bool {
+        self.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline
+    }
+
+    fn run(
+        &self,
+        seg_id: &str,
+        vector_field: &str,
+        vector_chunks_field: Option<&str>,
+        deadline: std::time::Instant,
+    ) -> Result<ColdV2Knn> {
+        use xerj_storage::stored_codec::{
+            decode_stored_v2_knn_projection_controlled, StoredDecodeRun,
+            StoredV2KnnProjectionResult,
+        };
+        let key = ColdProjectionKey {
+            segment_id: seg_id.to_owned(),
+            vector_field: vector_field.to_owned(),
+            vector_chunks_field: vector_chunks_field.map(ToOwned::to_owned),
+        };
+        if let Some(entry) = self.projection_cache.get(&key) {
+            #[cfg(test)]
+            TEST_PROJECTION_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(ColdV2Knn::Projected(Arc::clone(entry.value())));
+        }
+        let flight = {
+            let entry = self.build_locks.entry(seg_id.to_owned()).or_default();
+            Arc::clone(entry.value())
+        };
+        let _guard = loop {
+            match flight.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if self.should_cancel(deadline) {
+                        return Ok(cold_decode_cancelled(ColdV2Knn::Cancelled));
+                    }
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(EngineError::Common(xerj_common::XerjError::internal(
+                        "cold vector projection singleflight lock poisoned",
+                    )));
+                }
+            }
+        };
+        if self.should_cancel(deadline) {
+            return Ok(cold_decode_cancelled(ColdV2Knn::Cancelled));
+        }
+        if let Some(entry) = self.projection_cache.get(&key) {
+            #[cfg(test)]
+            TEST_PROJECTION_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(ColdV2Knn::Projected(Arc::clone(entry.value())));
+        }
+        if self.stored_value_cache.contains_key(seg_id)
+            || self.stored_slices_cache.contains_key(seg_id)
+            || self.decoded_stored_cache.contains_key(seg_id)
+        {
+            return Ok(ColdV2Knn::Fallback);
+        }
+        let reader = self.store.open_segment_arc(seg_id)?;
+        let Some(raw) = reader.section(SectionType::Stored)? else {
+            return Ok(ColdV2Knn::Fallback);
+        };
+        let run = decode_stored_v2_knn_projection_controlled(
+            raw,
+            vector_field,
+            vector_chunks_field,
+            |_| {
+                if self.should_cancel(deadline) {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            },
+        )?;
+        #[cfg(test)]
+        {
+            TEST_PROJECTION_DECODES.fetch_add(1, Ordering::Relaxed);
+            self.projection_ready.store(true, Ordering::Release);
+        }
+        match run {
+            StoredDecodeRun::Cancelled => Ok(cold_decode_cancelled(ColdV2Knn::Cancelled)),
+            StoredDecodeRun::Complete(StoredV2KnnProjectionResult::Projected(projected)) => {
+                let bytes = projection_retained_bytes(&key, &projected);
+                #[cfg(test)]
+                {
+                    self.projection_ready_to_publish
+                        .store(true, Ordering::Release);
+                    while self.pause_before_projection_publish.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                }
+                let _publication = self.lifecycle.read();
+                if !self
+                    .store
+                    .snapshot()
+                    .segments
+                    .iter()
+                    .any(|meta| meta.id == seg_id)
+                {
+                    return Ok(ColdV2Knn::Fallback);
+                }
+                use dashmap::mapref::entry::Entry;
+                let resident = match self.projection_cache.entry(key) {
+                    Entry::Occupied(entry) => Arc::clone(entry.get()),
+                    Entry::Vacant(entry) => {
+                        let Some(charge) = self
+                            .budget
+                            .try_charge(SegmentCacheCategory::VectorProjection, bytes)
+                        else {
+                            return Ok(ColdV2Knn::Fallback);
+                        };
+                        let resident = CacheResident::admitted(
+                            projected,
+                            charge,
+                            SegmentCacheCategory::VectorProjection,
+                            bytes,
+                        );
+                        entry.insert(Arc::clone(&resident));
+                        #[cfg(test)]
+                        TEST_PROJECTION_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+                        resident
+                    }
+                };
+                Ok(ColdV2Knn::Projected(resident))
+            }
+            StoredDecodeRun::Complete(
+                StoredV2KnnProjectionResult::NotV2
+                | StoredV2KnnProjectionResult::MissingVectorColumn
+                | StoredV2KnnProjectionResult::UnsupportedVectorShape,
+            ) => Ok(ColdV2Knn::Fallback),
+        }
+    }
+}
+
+struct ColdRowDecodeWorker {
+    store: Arc<IndexStore>,
+    stored_slices_cache: Arc<dashmap::DashMap<String, Resident<StoredSlices>>>,
+    decoded_stored_cache: Arc<dashmap::DashMap<String, Resident<Vec<u8>>>>,
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    force_fallback: Arc<AtomicBool>,
+    #[cfg(test)]
+    decode_delay_ms: Arc<AtomicU64>,
+}
+
+impl ColdRowDecodeWorker {
+    fn should_cancel(&self, deadline: std::time::Instant) -> bool {
+        self.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline
+    }
+
+    fn run(
+        &self,
+        seg_id: &str,
+        ordinals: &[usize],
+        deadline: std::time::Instant,
+    ) -> Result<ColdV2Rows> {
+        use xerj_storage::stored_codec::{
+            decode_stored_v2_rows_controlled, StoredDecodeRun, StoredV2RowHydrationResult,
+        };
+        if self.should_cancel(deadline) {
+            return Ok(cold_decode_cancelled(ColdV2Rows::Cancelled));
+        }
+        #[cfg(test)]
+        let _active = {
+            struct Active;
+            impl Drop for Active {
+                fn drop(&mut self) {
+                    TEST_COLD_ROW_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let active = TEST_COLD_ROW_ACTIVE.fetch_add(1, Ordering::AcqRel) + 1;
+            TEST_COLD_ROW_MAX_ACTIVE.fetch_max(active, Ordering::AcqRel);
+            Active
+        };
+        #[cfg(test)]
+        {
+            if self.force_fallback.load(Ordering::Acquire) {
+                return Ok(ColdV2Rows::Fallback);
+            }
+            let delay_ms = self.decode_delay_ms.load(Ordering::Relaxed);
+            if delay_ms > 0 {
+                let delay_until = std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_millis(delay_ms))
+                    .unwrap_or(deadline);
+                while std::time::Instant::now() < delay_until {
+                    if self.should_cancel(deadline) {
+                        return Ok(cold_decode_cancelled(ColdV2Rows::Cancelled));
+                    }
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        if self.stored_slices_cache.contains_key(seg_id)
+            || self.decoded_stored_cache.contains_key(seg_id)
+        {
+            return Ok(ColdV2Rows::Fallback);
+        }
+        let reader = self.store.open_segment_arc(seg_id)?;
+        #[cfg(test)]
+        {
+            TEST_COLD_ROW_READER_OPEN.store(true, Ordering::Release);
+            while TEST_PAUSE_COLD_ROW_AFTER_OPEN.load(Ordering::Acquire) {
+                if self.should_cancel(deadline) {
+                    return Ok(cold_decode_cancelled(ColdV2Rows::Cancelled));
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(1));
+            }
+        }
+        let raw = reader.section(SectionType::Stored)?.ok_or_else(|| {
+            EngineError::Common(xerj_common::XerjError::storage(
+                "segment has no stored section",
+            ))
+        })?;
+        let run = decode_stored_v2_rows_controlled(raw, ordinals, |_| {
+            if self.should_cancel(deadline) {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })?;
+        match run {
+            StoredDecodeRun::Cancelled => Ok(cold_decode_cancelled(ColdV2Rows::Cancelled)),
+            StoredDecodeRun::Complete(StoredV2RowHydrationResult::NotV2)
+            | StoredDecodeRun::Complete(StoredV2RowHydrationResult::UnsupportedDependencyShape {
+                ..
+            }) => Ok(ColdV2Rows::Fallback),
+            StoredDecodeRun::Complete(StoredV2RowHydrationResult::Hydrated { rows, .. }) => {
+                if self.should_cancel(deadline) {
+                    return Ok(cold_decode_cancelled(ColdV2Rows::Cancelled));
+                }
+                #[cfg(test)]
+                TEST_SELECTIVE_KNN_HYDRATIONS.fetch_add(rows.len() as u64, Ordering::Relaxed);
+                let mut by_ordinal = HashMap::with_capacity(rows.len());
+                for row in rows {
+                    let Some(id) = row.id.as_str().map(ToOwned::to_owned) else {
+                        return Err(EngineError::Common(xerj_common::XerjError::storage(
+                            "ZBS2 selected row has non-string __id",
+                        )));
+                    };
+                    let Some(seq_no) = row.seq_no.as_u64() else {
+                        return Err(EngineError::Common(xerj_common::XerjError::storage(
+                            "ZBS2 selected row has non-u64 __seq_no",
+                        )));
+                    };
+                    by_ordinal.insert(
+                        row.ordinal as u32,
+                        ColdV2Row {
+                            id,
+                            seq_no,
+                            source: Value::Object(row.source),
+                        },
+                    );
+                }
+                Ok(ColdV2Rows::Hydrated(by_ordinal))
+            }
+        }
+    }
+}
+
+fn apply_cold_winner_hydration(
+    scored: &mut [(String, f32, Value, Option<u32>)],
+    cold_locations: &HashMap<String, (String, u32, u64)>,
+    hydrated: &mut HashMap<String, Value>,
+) -> Result<()> {
+    for (id, _, source, _) in scored {
+        if !cold_locations.contains_key(id) {
+            continue;
+        }
+        *source = hydrated.remove(id).ok_or_else(|| {
+            EngineError::Common(xerj_common::XerjError::internal(format!(
+                "selective source hydration omitted exact kNN winner `{id}`"
+            )))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod selective_knn_hydration_tests {
+    use super::*;
+
+    static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    fn config(dir: &tempfile::TempDir) -> Config {
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config
+    }
+
+    fn schema() -> Schema {
+        let mut schema = Schema::empty();
+        let mut vector = FieldConfig::new("embedding", FieldType::Vector);
+        vector.options.dimensions = Some(2);
+        vector.options.similarity = Some("cosine".to_owned());
+        schema.add_field(vector).unwrap();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    fn clear_full_source_caches(index: &Index) {
+        index.stored_value_cache.clear();
+        index.stored_slices_cache.clear();
+        index.decoded_stored_cache.clear();
+    }
+
+    async fn settle_and_clear_full_source_caches(index: &Index) {
+        // Publish-time warmers are detached from flush completion. Let any
+        // already-started warmer finish before establishing the cold fixture.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        clear_full_source_caches(index);
+    }
+
+    async fn wait_until(flag: &AtomicBool, what: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !flag.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    async fn two_segment_fixture(name: &str) -> (tempfile::TempDir, crate::Engine, Arc<Index>) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new(config(&dir)).unwrap();
+        engine.create_index(name, schema()).unwrap();
+        let index = engine.get_index(name).unwrap();
+        if let Some(task) = index.merge_task.lock().take() {
+            task.abort();
+        }
+        for generation in 0..2 {
+            // The first segment must cross the ZBS2 projection threshold; the
+            // second exists only to make retirement/merge deterministic.
+            let docs = if generation == 0 { 4096 } else { 256 };
+            for ordinal in 0..docs {
+                let id = format!("g{generation}-doc-{ordinal:03}");
+                index
+                    .index_document(
+                        Some(id),
+                        serde_json::json!({
+                            "body": format!("old-{generation}-{ordinal:03}"),
+                            "embedding": if ordinal == 0 { [0.0, 1.0] } else { [1.0, 0.0] },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            index.flush().await.unwrap();
+        }
+        settle_and_clear_full_source_caches(&index).await;
+        index.cold_knn_projection_cache.clear();
+        assert!(index.stored_value_cache.is_empty());
+        assert!(index.stored_slices_cache.is_empty());
+        assert!(index.decoded_stored_cache.is_empty());
+        assert!(index.store.snapshot().segments.len() >= 2);
+        (dir, engine, index)
+    }
+
+    fn request(size: usize) -> SearchRequest {
+        SearchRequest {
+            size,
+            fields: vec![PASSAGE_RESPONSE_FIELD.to_owned()],
+            ..SearchRequest::default()
+        }
+    }
+
+    #[test]
+    fn completed_selective_hydration_rejects_a_missing_winner() {
+        let mut scored = vec![("winner".to_owned(), 1.0, Value::Null, Some(0))];
+        let locations = HashMap::from([("winner".to_owned(), ("segment".to_owned(), 7, 11))]);
+        let error =
+            apply_cold_winner_hydration(&mut scored, &locations, &mut HashMap::new()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("omitted exact kNN winner `winner`"));
+    }
+
+    #[test]
+    fn caller_drop_arms_cooperative_decode_cancellation() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = ColdDecodeCancelOnDrop::new(Arc::clone(&cancelled));
+        }
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn typed_projection_selectively_hydrates_winners_and_preserves_fallback_restart_and_passage(
+    ) {
+        let _serial = TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new(config(&dir)).unwrap();
+        engine.create_index("selective-knn", schema()).unwrap();
+        let index = engine.get_index("selective-knn").unwrap();
+        let metadata = passage_metadata_field("embedding");
+        for ordinal in 0..4096 {
+            let mut source = serde_json::json!({
+                "body": "alpha beta",
+                "page": ordinal,
+                "embedding": if ordinal == 3071 { serde_json::json!([0.0, 1.0]) } else { serde_json::json!([1.0, 0.0]) },
+            });
+            if ordinal == 3071 {
+                source["embedding_chunks"] = serde_json::json!([[1.0, 0.0], [0.0, 1.0]]);
+                source[&metadata] =
+                    serde_json::json!({"field": "body", "chunks": [[0, 5], [6, 10]]});
+            }
+            index
+                .index_document(Some(format!("doc-{ordinal:03}")), source)
+                .await
+                .unwrap();
+        }
+        index.flush().await.unwrap();
+        settle_and_clear_full_source_caches(&index).await;
+        assert!(index.stored_value_cache.is_empty());
+        assert!(index.stored_slices_cache.is_empty());
+        assert!(index.decoded_stored_cache.is_empty());
+        let shared_segment = index.store.snapshot().segments[0].id.clone();
+        index.cold_knn_projection_cache.clear();
+        TEST_PROJECTION_DECODES.store(0, Ordering::Relaxed);
+        TEST_PROJECTION_PUBLICATIONS.store(0, Ordering::Relaxed);
+        TEST_PROJECTION_CACHE_HITS.store(0, Ordering::Relaxed);
+        let budget_before = index.segment_hydration_budget.snapshot();
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let index = Arc::clone(&index);
+                let segment = shared_segment.clone();
+                tokio::spawn(async move {
+                    index
+                        .cold_v2_knn_for_async(
+                            &segment,
+                            "embedding",
+                            Some("embedding_chunks"),
+                            std::time::Instant::now() + std::time::Duration::from_secs(30),
+                        )
+                        .await
+                })
+            })
+            .collect();
+        for call in calls {
+            assert!(matches!(
+                call.await.unwrap().unwrap(),
+                ColdV2Knn::Projected(_)
+            ));
+        }
+        assert_eq!(TEST_PROJECTION_DECODES.load(Ordering::Relaxed), 1);
+        assert_eq!(TEST_PROJECTION_PUBLICATIONS.load(Ordering::Relaxed), 1);
+        assert_eq!(TEST_PROJECTION_CACHE_HITS.load(Ordering::Relaxed), 7);
+        let budget_shared = index.segment_hydration_budget.snapshot();
+        let category = SegmentCacheCategory::VectorProjection as usize;
+        assert!(
+            budget_shared.category_current[category] > budget_before.category_current[category]
+        );
+        let projection_key = ColdProjectionKey {
+            segment_id: shared_segment.clone(),
+            vector_field: "embedding".to_owned(),
+            vector_chunks_field: Some("embedding_chunks".to_owned()),
+        };
+        let retained_bytes = {
+            let resident = index
+                .cold_knn_projection_cache
+                .get(&projection_key)
+                .expect("published projection");
+            projection_retained_bytes(&projection_key, resident.value())
+        };
+        index.cold_knn_projection_cache.clear();
+        assert_eq!(
+            index.segment_hydration_budget.snapshot().category_current[category],
+            budget_before.category_current[category]
+        );
+
+        let boundary_run = |budget: Arc<SegmentHydrationBudget>,
+                            cache: Arc<dashmap::DashMap<_, _>>| {
+            ColdProjectionWorker {
+                store: Arc::clone(&index.store),
+                build_locks: Arc::clone(&index.stored_slices_build_locks),
+                stored_value_cache: Arc::clone(&index.stored_value_cache),
+                stored_slices_cache: Arc::clone(&index.stored_slices_cache),
+                decoded_stored_cache: Arc::clone(&index.decoded_stored_cache),
+                projection_cache: cache,
+                lifecycle: Arc::clone(&index.segment_cache_lifecycle),
+                budget,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                projection_ready: Arc::new(AtomicBool::new(false)),
+                projection_ready_to_publish: Arc::new(AtomicBool::new(false)),
+                pause_before_projection_publish: Arc::new(AtomicBool::new(false)),
+            }
+            .run(
+                &shared_segment,
+                "embedding",
+                Some("embedding_chunks"),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap()
+        };
+        let exact_cache = Arc::new(dashmap::DashMap::new());
+        let exact_budget = SegmentHydrationBudget::new(retained_bytes);
+        let admitted = boundary_run(Arc::clone(&exact_budget), Arc::clone(&exact_cache));
+        assert!(matches!(admitted, ColdV2Knn::Projected(_)));
+        assert_eq!(exact_budget.snapshot().current, retained_bytes);
+        drop(admitted);
+        exact_cache.clear();
+        assert_eq!(exact_budget.snapshot().current, 0);
+
+        let short_cache = Arc::new(dashmap::DashMap::new());
+        let short_budget = SegmentHydrationBudget::new(retained_bytes - 1);
+        assert!(matches!(
+            boundary_run(Arc::clone(&short_budget), Arc::clone(&short_cache)),
+            ColdV2Knn::Fallback
+        ));
+        assert!(short_cache.is_empty());
+        assert_eq!(short_budget.snapshot().current, 0);
+        assert_eq!(short_budget.snapshot().refused, 1);
+
+        let denied_cache = Arc::new(dashmap::DashMap::new());
+        let denied = ColdProjectionWorker {
+            store: Arc::clone(&index.store),
+            build_locks: Arc::clone(&index.stored_slices_build_locks),
+            stored_value_cache: Arc::clone(&index.stored_value_cache),
+            stored_slices_cache: Arc::clone(&index.stored_slices_cache),
+            decoded_stored_cache: Arc::clone(&index.decoded_stored_cache),
+            projection_cache: Arc::clone(&denied_cache),
+            lifecycle: Arc::clone(&index.segment_cache_lifecycle),
+            budget: SegmentHydrationBudget::new(0),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            projection_ready: Arc::new(AtomicBool::new(false)),
+            projection_ready_to_publish: Arc::new(AtomicBool::new(false)),
+            pause_before_projection_publish: Arc::new(AtomicBool::new(false)),
+        }
+        .run(
+            &shared_segment,
+            "embedding",
+            Some("embedding_chunks"),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(matches!(denied, ColdV2Knn::Fallback));
+        assert!(denied_cache.is_empty());
+        let projected = index
+            .run_knn_brute_force(
+                &request(1),
+                "embedding",
+                &[0.0, 1.0],
+                1,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(projected.hits[0].id, "doc-3071");
+        assert_eq!(projected.hits[0].source["page"], 3071);
+        let passage = projected.hits[0].passage.as_ref().unwrap();
+        assert_eq!(passage.ordinal, 1);
+        assert_eq!(passage.text, "beta");
+        assert!(index.stored_value_cache.is_empty());
+        assert!(index.stored_slices_cache.is_empty());
+        assert!(index.decoded_stored_cache.is_empty());
+
+        // Selected-row hydration has no shared publication to single-flight:
+        // same-segment c8 callers must decode concurrently, not convoy on the
+        // full-source/projection segment build mutex.
+        let expected = match index
+            .cold_v2_rows_for_async(
+                &shared_segment,
+                vec![0],
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+        {
+            ColdV2Rows::Hydrated(mut rows) => rows.remove(&0).unwrap(),
+            _ => panic!("reference selected-row hydration did not complete"),
+        };
+        TEST_COLD_ROW_ACTIVE.store(0, Ordering::Release);
+        TEST_COLD_ROW_MAX_ACTIVE.store(0, Ordering::Release);
+        TEST_SELECTIVE_KNN_HYDRATIONS.store(0, Ordering::Release);
+        index
+            .test_cold_row_decode_delay_ms
+            .store(50, Ordering::Release);
+        let row_calls: Vec<_> = (0..8)
+            .map(|_| {
+                let index = Arc::clone(&index);
+                let segment = shared_segment.clone();
+                tokio::spawn(async move {
+                    index
+                        .cold_v2_rows_for_async(
+                            &segment,
+                            vec![0],
+                            std::time::Instant::now() + std::time::Duration::from_secs(30),
+                        )
+                        .await
+                })
+            })
+            .collect();
+        for call in row_calls {
+            let ColdV2Rows::Hydrated(mut rows) = call.await.unwrap().unwrap() else {
+                panic!("concurrent selected-row hydration did not complete")
+            };
+            let row = rows.remove(&0).unwrap();
+            assert_eq!(row.id, expected.id);
+            assert_eq!(row.seq_no, expected.seq_no);
+            assert_eq!(row.source, expected.source);
+        }
+        index
+            .test_cold_row_decode_delay_ms
+            .store(0, Ordering::Release);
+        assert!(TEST_COLD_ROW_MAX_ACTIVE.load(Ordering::Acquire) > 1);
+        assert_eq!(TEST_SELECTIVE_KNN_HYDRATIONS.load(Ordering::Acquire), 8);
+
+        // Delay the blocking decoder so it is known to be active when its
+        // async caller is aborted. Dropping the caller must arm cancellation
+        // and let the worker stop without relying on a shared flight lock.
+        let segment_id = index.store.snapshot().segments[0].id.clone();
+        TEST_COLD_DECODE_CANCELLATIONS.store(0, Ordering::Relaxed);
+        TEST_COLD_ROW_READER_OPEN.store(false, Ordering::Release);
+        TEST_PAUSE_COLD_ROW_AFTER_OPEN.store(true, Ordering::Release);
+        let cancelled_index = Arc::clone(&index);
+        let cancelled_segment = segment_id.clone();
+        let caller = tokio::spawn(async move {
+            cancelled_index
+                .cold_v2_rows_for_async(
+                    &cancelled_segment,
+                    vec![0],
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await
+        });
+        wait_until(&TEST_COLD_ROW_READER_OPEN, "active cold row decode").await;
+        caller.abort();
+        let _ = caller.await;
+        TEST_PAUSE_COLD_ROW_AFTER_OPEN.store(false, Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while TEST_COLD_DECODE_CANCELLATIONS.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("caller-dropped cold decoder did not stop cooperatively");
+
+        let fallback = index
+            .run_knn_brute_force(
+                &request(1),
+                "embedding",
+                &[0.0, 1.0],
+                1,
+                Some(Box::new(QueryNode::MatchAll)),
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback.hits[0].id, projected.hits[0].id);
+        assert_eq!(
+            fallback.hits[0].score.to_bits(),
+            projected.hits[0].score.to_bits()
+        );
+        assert_eq!(fallback.hits[0].source, projected.hits[0].source);
+        assert_eq!(fallback.hits[0].passage, projected.hits[0].passage);
+
+        drop(index);
+        drop(engine);
+        let reopened = crate::Engine::new(config(&dir)).unwrap();
+        let reopened_index = reopened.get_index("selective-knn").unwrap();
+        settle_and_clear_full_source_caches(&reopened_index).await;
+        let after_restart = reopened_index
+            .run_knn_brute_force(
+                &request(1),
+                "embedding",
+                &[0.0, 1.0],
+                1,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_restart.hits[0], projected.hits[0]);
+    }
+
+    #[tokio::test]
+    async fn typed_projection_respects_versions_tombstones_and_skips_hydration_after_timeout() {
+        let _serial = TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new(config(&dir)).unwrap();
+        engine.create_index("selective-version", schema()).unwrap();
+        let index = engine.get_index("selective-version").unwrap();
+        for ordinal in 0..256 {
+            index
+                .index_document(
+                    Some(format!("doc-{ordinal:03}")),
+                    serde_json::json!({
+                        "body": "value",
+                        "embedding": if ordinal < 2 { [0.0, 1.0] } else { [1.0, 0.0] },
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        index.flush().await.unwrap();
+        index
+            .index_document(
+                Some("doc-000".to_owned()),
+                serde_json::json!({"body": "updated", "embedding": [1.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        index.delete_document("doc-001").await.unwrap();
+        index.flush().await.unwrap();
+        settle_and_clear_full_source_caches(&index).await;
+
+        let result = index
+            .run_knn_brute_force(
+                &request(256),
+                "embedding",
+                &[0.0, 1.0],
+                256,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.hits.iter().all(|hit| hit.id != "doc-001"));
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .find(|hit| hit.id == "doc-000")
+                .unwrap()
+                .source["body"],
+            "updated"
+        );
+
+        clear_full_source_caches(&index);
+        TEST_SELECTIVE_KNN_HYDRATIONS.store(0, Ordering::Relaxed);
+        index
+            .test_scan_checkpoint_delay_ms
+            .store(20, Ordering::Relaxed);
+        index.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
+        let timed_out = index
+            .run_knn_brute_force_with_deadline(
+                &request(1),
+                std::time::Instant::now() + std::time::Duration::from_millis(15),
+                "embedding",
+                &[0.0, 1.0],
+                1,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(timed_out.timed_out);
+        assert!(index.test_scan_checkpoint_count.load(Ordering::Relaxed) >= 2);
+        assert_eq!(TEST_SELECTIVE_KNN_HYDRATIONS.load(Ordering::Relaxed), 0);
+        index
+            .test_scan_checkpoint_delay_ms
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn projection_retired_while_decode_paused_is_not_published_or_charged() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = two_segment_fixture("projection-retire").await;
+        let retired = index.store.snapshot().segments[0].id.clone();
+        let category = SegmentCacheCategory::VectorProjection as usize;
+        let before = index.segment_hydration_budget.snapshot().category_current[category];
+        index.test_projection_ready.store(false, Ordering::Release);
+        index
+            .test_projection_ready_to_publish
+            .store(false, Ordering::Release);
+        index
+            .test_pause_before_projection_publish
+            .store(true, Ordering::Release);
+        let query_index = Arc::clone(&index);
+        let query_segment = retired.clone();
+        let decode = tokio::spawn(async move {
+            query_index
+                .cold_v2_knn_for_async(
+                    &query_segment,
+                    "embedding",
+                    None,
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await
+        });
+        wait_until(
+            &index.test_projection_ready_to_publish,
+            "projected value ready to publish",
+        )
+        .await;
+        assert!(index.test_projection_ready.load(Ordering::Acquire));
+        assert!(
+            !decode.is_finished(),
+            "projection worker bypassed publication pause"
+        );
+        index.force_merge(1).await.unwrap();
+        assert!(!index
+            .store
+            .snapshot()
+            .segments
+            .iter()
+            .any(|segment| segment.id == retired));
+        index
+            .test_pause_before_projection_publish
+            .store(false, Ordering::Release);
+        assert!(matches!(
+            decode.await.unwrap().unwrap(),
+            ColdV2Knn::Fallback
+        ));
+        assert!(!index
+            .cold_knn_projection_cache
+            .iter()
+            .any(|entry| entry.key().segment_id == retired));
+        assert_eq!(
+            index.segment_hydration_budget.snapshot().category_current[category],
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn ranked_winner_keeps_exact_old_source_across_concurrent_update_and_delete() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = two_segment_fixture("winner-update-delete").await;
+        index.test_winners_ranked.store(false, Ordering::Release);
+        index
+            .test_pause_before_winner_hydration
+            .store(true, Ordering::Release);
+        let query_index = Arc::clone(&index);
+        let query = tokio::spawn(async move {
+            query_index
+                .run_knn_brute_force(
+                    &request(2),
+                    "embedding",
+                    &[0.0, 1.0],
+                    2,
+                    None,
+                    "cosine",
+                    None,
+                    None,
+                )
+                .await
+        });
+        wait_until(&index.test_winners_ranked, "winner ranking").await;
+        index
+            .index_document(
+                Some("g0-doc-000".to_owned()),
+                serde_json::json!({"body": "new-source", "embedding": [1.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        assert!(index.delete_document("g1-doc-000").await.unwrap());
+        index
+            .test_pause_before_winner_hydration
+            .store(false, Ordering::Release);
+        let response = query.await.unwrap().unwrap();
+        assert_eq!(response.hits.len(), 2);
+        assert_eq!(response.hits[0].id, "g0-doc-000");
+        assert_eq!(response.hits[0].source["body"], "old-0-000");
+        assert_ne!(response.hits[0].source["body"], "new-source");
+        assert_eq!(response.hits[1].id, "g1-doc-000");
+        assert_eq!(response.hits[1].source["body"], "old-1-000");
+    }
+
+    #[tokio::test]
+    async fn merge_at_winner_hydration_boundary_preserves_identity_or_fails_closed() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = two_segment_fixture("winner-merge").await;
+        TEST_COLD_ROW_READER_OPEN.store(false, Ordering::Release);
+        TEST_PAUSE_COLD_ROW_AFTER_OPEN.store(true, Ordering::Release);
+        let query_index = Arc::clone(&index);
+        let query = tokio::spawn(async move {
+            query_index
+                .run_knn_brute_force(
+                    &request(1),
+                    "embedding",
+                    &[0.0, 1.0],
+                    1,
+                    None,
+                    "cosine",
+                    None,
+                    None,
+                )
+                .await
+        });
+        wait_until(
+            &TEST_COLD_ROW_READER_OPEN,
+            "selected-row reader open before merge",
+        )
+        .await;
+        index.force_merge(1).await.unwrap();
+        TEST_PAUSE_COLD_ROW_AFTER_OPEN.store(false, Ordering::Release);
+        match query.await.unwrap() {
+            Ok(response) => {
+                assert_eq!(response.hits.len(), 1);
+                assert_eq!(response.hits[0].id, "g0-doc-000");
+                assert_eq!(response.hits[0].source["body"], "old-0-000");
+            }
+            Err(EngineError::Storage(_) | EngineError::Io(_)) => {}
+            Err(EngineError::Common(error)) => assert!(
+                error
+                    .to_string()
+                    .contains("selective source hydration identity mismatch for exact kNN winner"),
+                "unexpected fail-closed engine error: {error}"
+            ),
+            Err(error) => panic!("unexpected non-storage merge-boundary error: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_full_source_publication_does_not_corrupt_selected_rows() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = one_segment_fixture("winner-cache-race").await;
+        let segment = index.store.snapshot().segments[0].id.clone();
+        TEST_COLD_ROW_READER_OPEN.store(false, Ordering::Release);
+        TEST_PAUSE_COLD_ROW_AFTER_OPEN.store(true, Ordering::Release);
+        let row_index = Arc::clone(&index);
+        let row_segment = segment.clone();
+        let row_decode = tokio::spawn(async move {
+            row_index
+                .cold_v2_rows_for_async(
+                    &row_segment,
+                    vec![0],
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await
+        });
+        wait_until(
+            &TEST_COLD_ROW_READER_OPEN,
+            "selected-row reader open before full-source publication",
+        )
+        .await;
+        let full = index
+            .stored_values_for_async(&segment)
+            .await
+            .expect("full-source cache build");
+        let expected = full[0].clone();
+        assert!(index.stored_value_cache.contains_key(&segment));
+        TEST_PAUSE_COLD_ROW_AFTER_OPEN.store(false, Ordering::Release);
+        let ColdV2Rows::Hydrated(mut rows) = row_decode.await.unwrap().unwrap() else {
+            panic!("already-open selected-row decode unexpectedly fell back")
+        };
+        let row = rows.remove(&0).expect("selected ordinal");
+        assert_eq!(row.id, expected["_id"].as_str().unwrap());
+        assert_eq!(row.seq_no, expected["_seq_no"].as_u64().unwrap());
+        assert_eq!(row.source, expected["_source"]);
+        assert!(index
+            .store
+            .snapshot()
+            .segments
+            .iter()
+            .any(|meta| meta.id == segment));
+    }
+
+    async fn prime_all_projections(index: &Index) {
+        for segment in &index.store.snapshot().segments {
+            match index
+                .cold_v2_knn_for_async(
+                    &segment.id,
+                    "embedding",
+                    Some("embedding_chunks"),
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap()
+            {
+                ColdV2Knn::Projected(_) => {}
+                ColdV2Knn::Fallback => panic!(
+                    "projection fallback for {} with budget {:?}",
+                    segment.id,
+                    index.segment_hydration_budget.snapshot()
+                ),
+                ColdV2Knn::Cancelled => panic!("projection cancelled for {}", segment.id),
+            }
+        }
+    }
+
+    async fn one_segment_fixture(name: &str) -> (tempfile::TempDir, crate::Engine, Arc<Index>) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new(config(&dir)).unwrap();
+        engine.create_index(name, schema()).unwrap();
+        let index = engine.get_index(name).unwrap();
+        if let Some(task) = index.merge_task.lock().take() {
+            task.abort();
+        }
+        for ordinal in 0..4096 {
+            index
+                .index_document(
+                    Some(format!("doc-{ordinal:03}")),
+                    serde_json::json!({
+                        "body": format!("value-{ordinal:03}"),
+                        "embedding": if ordinal < 2 { [0.0, 1.0] } else { [1.0, 0.0] },
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        index.flush().await.unwrap();
+        settle_and_clear_full_source_caches(&index).await;
+        index.cold_knn_projection_cache.clear();
+        (dir, engine, index)
+    }
+
+    fn assert_no_null_sources(result: &SearchResult) {
+        assert!(result.hits.iter().all(|hit| !hit.source.is_null()));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn projection_stage_timeout_returns_integral_empty_partial() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = one_segment_fixture("projection-timeout-integrity").await;
+        let first = index.store.snapshot().segments[0].id.clone();
+        let flight = {
+            let entry = index.stored_slices_build_locks.entry(first).or_default();
+            Arc::clone(entry.value())
+        };
+        let _guard = flight.lock().unwrap();
+        let started = std::time::Instant::now();
+        let result = index
+            .run_knn_brute_force_with_deadline(
+                &request(2),
+                started + std::time::Duration::from_millis(10),
+                "embedding",
+                &[0.0, 1.0],
+                2,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert!(result.hits.is_empty());
+        assert_no_null_sources(&result);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn hydration_stage_timeout_has_one_grace_and_never_exposes_placeholders() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = one_segment_fixture("hydration-timeout-integrity").await;
+        prime_all_projections(&index).await;
+        index
+            .test_force_timeout_after_knn_ranking
+            .store(true, Ordering::Release);
+
+        // A completed bounded hydration inside the grace preserves exact hits.
+        let within = index
+            .run_knn_brute_force(
+                &request(2),
+                "embedding",
+                &[0.0, 1.0],
+                2,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(within.timed_out);
+        assert_eq!(within.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            within
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>(),
+            ["doc-000", "doc-001"]
+        );
+        assert_no_null_sources(&within);
+
+        index
+            .test_cold_row_decode_delay_ms
+            .store(100, Ordering::Release);
+        let cancellations_before = TEST_COLD_DECODE_CANCELLATIONS.load(Ordering::Acquire);
+        let started = std::time::Instant::now();
+        let expired = index
+            .run_knn_brute_force(
+                &request(2),
+                "embedding",
+                &[0.0, 1.0],
+                2,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(expired.timed_out);
+        assert_eq!(expired.total.relation, TotalHitsRelation::Gte);
+        assert!(expired.hits.is_empty());
+        assert_no_null_sources(&expired);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while TEST_COLD_DECODE_CANCELLATIONS.load(Ordering::Acquire) <= cancellations_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out row decoder did not exit cooperatively");
+        index
+            .test_cold_row_decode_delay_ms
+            .store(0, Ordering::Release);
+        index
+            .test_force_timeout_after_knn_ranking
+            .store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn natural_deadline_crossing_uses_one_captured_hydration_boundary() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = one_segment_fixture("natural-hydration-deadline").await;
+        prime_all_projections(&index).await;
+        index
+            .test_cold_row_decode_delay_ms
+            .store(250, Ordering::Release);
+        let cancellations_before = TEST_COLD_DECODE_CANCELLATIONS.load(Ordering::Acquire);
+        let started = std::time::Instant::now();
+        let original_deadline = started + std::time::Duration::from_millis(30);
+        let result = index
+            .run_knn_brute_force_with_deadline(
+                &request(2),
+                original_deadline,
+                "embedding",
+                &[0.0, 1.0],
+                2,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert!(result.hits.is_empty());
+        assert_no_null_sources(&result);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "{elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(110),
+            "captured ranking grace was renewed: {elapsed:?}"
+        );
+        assert!(TEST_COLD_DECODE_CANCELLATIONS.load(Ordering::Acquire) > cancellations_before);
+        index
+            .test_cold_row_decode_delay_ms
+            .store(0, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn fallback_hydration_timeout_obeys_the_same_single_grace() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = one_segment_fixture("fallback-timeout-integrity").await;
+        prime_all_projections(&index).await;
+        index
+            .test_force_timeout_after_knn_ranking
+            .store(true, Ordering::Release);
+        index
+            .test_force_cold_row_fallback
+            .store(true, Ordering::Release);
+        index
+            .test_stored_value_load_delay_ms
+            .store(200, Ordering::Release);
+        let mut req = request(2);
+        req.aggs = Some(serde_json::json!({"pages": {"terms": {"field": "body"}}}));
+        let started = std::time::Instant::now();
+        let result = index
+            .run_knn_brute_force(
+                &req,
+                "embedding",
+                &[0.0, 1.0],
+                2,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert!(result.hits.is_empty());
+        assert_no_null_sources(&result);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        let aggs = result.aggs.expect("aggregation response");
+        assert_eq!(aggs["pages"]["buckets"].as_array().unwrap().len(), 0);
+        index
+            .test_stored_value_load_delay_ms
+            .store(0, Ordering::Release);
+        index
+            .test_force_cold_row_fallback
+            .store(false, Ordering::Release);
+        index
+            .test_force_timeout_after_knn_ranking
+            .store(false, Ordering::Release);
+    }
+
+    async fn semantic_matrix_fixture() -> (tempfile::TempDir, crate::Engine, Arc<Index>) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new(config(&dir)).unwrap();
+        engine.create_index("semantic-matrix", schema()).unwrap();
+        let index = engine.get_index("semantic-matrix").unwrap();
+        if let Some(task) = index.merge_task.lock().take() {
+            task.abort();
+        }
+        let metadata = passage_metadata_field("embedding");
+        let docs = [
+            ("p", [0.0, 1.0], "gold", 5, true),
+            ("a", [1.0, 0.0], "gold", 10, false),
+            ("b", [0.8, 0.6], "silver", 20, false),
+            ("c", [0.1, 0.99], "bronze", 30, false),
+            ("d", [-0.8, 0.6], "bronze", 40, false),
+            ("e", [-1.0, 0.0], "iron", 50, false),
+        ];
+        for (position, (id, vector, category, amount, passage)) in docs.into_iter().enumerate() {
+            let mut source = serde_json::json!({
+                "body": "alpha beta",
+                "page": position + 1,
+                "category": category,
+                "amount": amount,
+                "embedding": vector,
+            });
+            if passage {
+                source["embedding_chunks"] = serde_json::json!([[0.0, 1.0], [1.0, 0.0]]);
+                source[&metadata] =
+                    serde_json::json!({"field": "body", "chunks": [[0, 5], [6, 10]]});
+            }
+            index
+                .index_document(Some(id.to_owned()), source)
+                .await
+                .unwrap();
+        }
+        for ordinal in 6..4096 {
+            index
+                .index_document(
+                    Some(format!("filler-{ordinal:04}")),
+                    serde_json::json!({
+                        "body": "filler",
+                        "page": ordinal + 1,
+                        "category": "filler",
+                        "amount": 0,
+                        "embedding": [-1.0, 0.0],
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        index.flush().await.unwrap();
+        settle_and_clear_full_source_caches(&index).await;
+        index.cold_knn_projection_cache.clear();
+        (dir, engine, index)
+    }
+
+    fn assert_semantic_equal(projected: &SearchResult, fallback: &SearchResult) {
+        assert_eq!(projected.timed_out, fallback.timed_out);
+        assert_eq!(projected.total.value, fallback.total.value);
+        assert_eq!(projected.total.relation, fallback.total.relation);
+        assert_eq!(projected.aggs, fallback.aggs);
+        assert_eq!(projected.hits.len(), fallback.hits.len());
+        for (left, right) in projected.hits.iter().zip(&fallback.hits) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.score.to_bits(), right.score.to_bits());
+            assert_eq!(left.source, right.source);
+            assert_eq!(left.passage, right.passage);
+        }
+    }
+
+    async fn projected_and_fallback(
+        index: &Index,
+        request: &SearchRequest,
+        k: usize,
+        boost: Option<f32>,
+        cutoff: Option<f32>,
+    ) -> (SearchResult, SearchResult) {
+        clear_full_source_caches(index);
+        index.cold_knn_projection_cache.clear();
+        let projected = index
+            .run_knn_brute_force(
+                request,
+                "embedding",
+                &[1.0, 0.0],
+                k,
+                None,
+                "cosine",
+                boost,
+                cutoff,
+            )
+            .await
+            .unwrap();
+        assert!(index.stored_value_cache.is_empty());
+        assert!(index.stored_slices_cache.is_empty());
+        assert!(index.decoded_stored_cache.is_empty());
+        let fallback = index
+            .run_knn_brute_force(
+                request,
+                "embedding",
+                &[1.0, 0.0],
+                k,
+                Some(Box::new(QueryNode::MatchAll)),
+                "cosine",
+                boost,
+                cutoff,
+            )
+            .await
+            .unwrap();
+        assert_semantic_equal(&projected, &fallback);
+        (projected, fallback)
+    }
+
+    #[tokio::test]
+    async fn projected_route_matches_fallback_for_pagination_size_zero_aggs_cutoff_boost_and_passage(
+    ) {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = semantic_matrix_fixture().await;
+
+        let mut paged_request = request(2);
+        paged_request.from = 1;
+        let (paged, _) = projected_and_fallback(&index, &paged_request, 4, None, None).await;
+        assert_eq!(paged.total.value, 4);
+        assert_eq!(
+            paged
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+
+        let mut aggregate_request = request(0);
+        aggregate_request.aggs = Some(serde_json::json!({
+            "categories": {"terms": {"field": "category"}},
+            "max_amount": {"max": {"field": "amount"}}
+        }));
+        let (aggregate, _) =
+            projected_and_fallback(&index, &aggregate_request, 3, None, None).await;
+        assert_eq!(aggregate.total.value, 3);
+        assert!(aggregate.hits.is_empty());
+        let aggs = aggregate.aggs.unwrap();
+        assert_eq!(aggs["max_amount"]["value"], 20.0);
+        assert_eq!(aggs["categories"]["buckets"][0]["key"], "gold");
+        assert_eq!(aggs["categories"]["buckets"][0]["doc_count"], 2);
+
+        let (cutoff, _) =
+            projected_and_fallback(&index, &request(6), 6, Some(2.0), Some(0.7)).await;
+        assert_eq!(cutoff.total.value, 3);
+        assert_eq!(
+            cutoff
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>(),
+            ["p", "a", "b"]
+        );
+        assert_eq!(cutoff.hits[0].score.to_bits(), 2.0_f32.to_bits());
+        assert_eq!(cutoff.hits[1].score.to_bits(), 2.0_f32.to_bits());
+        assert_eq!(cutoff.hits[2].score.to_bits(), 1.8_f32.to_bits());
+        let passage = cutoff.hits[0].passage.as_ref().unwrap();
+        assert_eq!(passage.ordinal, 1);
+        assert_eq!(passage.text, "beta");
+        assert_eq!(passage.page, Some(1));
+        assert!(!cutoff.hits[0]
+            .source
+            .as_object()
+            .unwrap()
+            .contains_key(&passage_metadata_field("embedding")));
+    }
+
+    #[tokio::test]
+    async fn hydrated_inside_fixed_grace_is_exact_but_reports_original_deadline_timeout() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_dir, _engine, index) = semantic_matrix_fixture().await;
+        prime_all_projections(&index).await;
+        index
+            .test_cold_row_decode_delay_ms
+            .store(35, Ordering::Release);
+        let mut req = request(1);
+        req.aggs = Some(serde_json::json!({
+            "categories": {"terms": {"field": "category"}}
+        }));
+        let started = std::time::Instant::now();
+        let result = index
+            .run_knn_brute_force_with_deadline(
+                &req,
+                started + std::time::Duration::from_millis(30),
+                "embedding",
+                &[0.0, 1.0],
+                1,
+                None,
+                "cosine",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.total.relation, TotalHitsRelation::Gte);
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.id, "p");
+        assert_eq!(hit.source["body"], "alpha beta");
+        assert_eq!(hit.source["category"], "gold");
+        assert!(!hit.source.is_null());
+        let passage = hit.passage.as_ref().expect("exact passage");
+        assert_eq!(passage.ordinal, 0);
+        assert_eq!(passage.text, "alpha");
+        assert_eq!(passage.page, Some(1));
+        let aggs = result.aggs.expect("exact aggregation response");
+        assert_eq!(aggs["categories"]["buckets"][0]["key"], "gold");
+        assert_eq!(aggs["categories"]["buckets"][0]["doc_count"], 1);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        index
+            .test_cold_row_decode_delay_ms
+            .store(0, Ordering::Release);
+    }
 }
 
 /// Segment sort-key shadow builder — shared by the query-path

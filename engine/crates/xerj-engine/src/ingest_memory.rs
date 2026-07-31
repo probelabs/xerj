@@ -120,10 +120,11 @@ pub enum Category {
     CacheIdPositions,
     CacheRowSequences,
     CacheDecodedStored,
+    CacheVectorProjection,
 }
 
 impl Category {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::HttpBody,
         Self::HttpRewriteBuffer,
         Self::RawSource,
@@ -145,6 +146,7 @@ impl Category {
         Self::CacheIdPositions,
         Self::CacheRowSequences,
         Self::CacheDecodedStored,
+        Self::CacheVectorProjection,
     ];
 
     const COUNT: usize = Self::ALL.len();
@@ -496,7 +498,8 @@ fn measurement(category: Category) -> Measurement {
         | Category::CacheSortShadow
         | Category::CacheIdPositions
         | Category::CacheRowSequences
-        | Category::CacheDecodedStored => Measurement::Estimated,
+        | Category::CacheDecodedStored
+        | Category::CacheVectorProjection => Measurement::Estimated,
         _ => Measurement::Unavailable,
     }
 }
