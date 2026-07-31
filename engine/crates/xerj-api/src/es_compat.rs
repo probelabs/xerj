@@ -26072,6 +26072,9 @@ fn painless_to_json(v: xerj_engine::painless::PainlessValue) -> Value {
         P::String(s) => Value::String(s),
         P::Array(a) => Value::Array(a.into_iter().map(painless_to_json).collect()),
         P::Object(o) => Value::Object(o),
+        // A function value has no JSON representation — same fail-closed
+        // treatment as the equivalent conversion in aggs.rs.
+        P::Closure(..) => Value::Null,
     }
 }
 

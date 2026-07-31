@@ -30,6 +30,16 @@
 //!   - `dotProduct(params.q, 'field')` over a numeric vector field
 //!   - `Math.max(a, b)`, `Math.min(a, b)`, `Math.abs(x)`, `Math.log(x)`,
 //!     `Math.sqrt(x)`, `Math.pow(a, b)`
+//! * Local functions and lambdas (needed by e.g. OpenSearch's UBI sample
+//!   dashboards, which filter via a `Supplier`-style boolean helper):
+//!   - top-level declarations `<type> name(<type> arg, ...) { ... }`
+//!   - no-arg-or-more lambda literals `(a, b) -> expr` / `(a, b) -> { ... }`,
+//!     stored as a closure value and invoked either by calling the
+//!     function/variable name directly (`compare(...)`) or via any
+//!     `.method(args)` call on a closure value (`s.get()`, `fn.apply(x)`,
+//!     ...) — the method name is ignored, only positional args matter,
+//!     which covers `Supplier`/`Function`/`BiFunction`/`Predicate` etc.
+//!     without hard-coding each functional interface.
 //!
 //! Anything outside that subset returns an error from `eval()`. Callers
 //! should fall back to a no-op score on script error.
@@ -48,6 +58,10 @@ pub enum PainlessValue {
     /// scripts. `.toString()` renders it in ES's HashMap-like format
     /// (`{key=value, key=value}`, keys alphabetically sorted).
     Object(serde_json::Map<String, Value>),
+    /// A local function or lambda value: parameter names + body statements.
+    /// Invoked either as a bare call (`name(args)`) or via any
+    /// `.method(args)` call on the value — see the module doc comment.
+    Closure(Vec<String>, Vec<Stmt>),
 }
 
 impl PainlessValue {
@@ -67,6 +81,9 @@ impl PainlessValue {
             PainlessValue::String(s) => !s.is_empty(),
             PainlessValue::Array(a) => !a.is_empty(),
             PainlessValue::Object(o) => !o.is_empty(),
+            // Never meaningfully compared in a valid script — a closure
+            // reference is truthy, matching "an object exists" semantics.
+            PainlessValue::Closure(..) => true,
         }
     }
     pub fn from_json(v: &Value) -> Self {
@@ -319,7 +336,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
 // ── AST ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-enum Expr {
+pub enum Expr {
     Number(f64),
     String(String),
     Bool(bool),
@@ -336,6 +353,8 @@ enum Expr {
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `var x = expr` (declare); `x = expr` (assign).
     Assign(String, Box<Expr>, bool /* is_decl */),
+    /// `(params) -> expr` / `(params) -> { stmts }` — a closure literal.
+    Lambda(Vec<String>, Vec<Stmt>),
 }
 
 /// Parser-only expression wrapper carrying the exact AST depth in O(1).
@@ -363,11 +382,15 @@ impl ParsedExpr {
 }
 
 #[derive(Debug, Clone)]
-enum Stmt {
+pub enum Stmt {
     Expr(Expr),
     Return(Option<Expr>),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     Block(Vec<Stmt>),
+    /// `<type> name(<type> param, ...) { body }` — a local function
+    /// declaration. Parameter/return types are parsed and discarded (the
+    /// interpreter is dynamically typed); only names and the body matter.
+    FnDecl(String, Vec<String>, Vec<Stmt>),
 }
 
 // ── Resource limits ──────────────────────────────────────────────────────────
@@ -523,6 +546,11 @@ impl<'a> Parser<'a> {
                     Some(Tok::Ident(n)) => n,
                     other => return Err(format!("expected identifier after type got {:?}", other)),
                 };
+                if self.match_punct('(') {
+                    let params = self.parse_fn_params()?;
+                    let body = self.parse_block_or_stmt()?;
+                    return Ok(Stmt::FnDecl(name, params, body));
+                }
                 if !self.match_punct('=') {
                     return Err(format!("expected '=' after var name '{}'", name));
                 }
@@ -783,7 +811,97 @@ impl<'a> Parser<'a> {
             other => Err(format!("expected '{}' got {:?}", end, other)),
         }
     }
+    /// Parameter list for a local function declaration: `(<type> name, ...)`,
+    /// with the opening `(` already consumed. Types are accepted (any
+    /// Ident or Keyword token) and discarded — only names are kept.
+    fn parse_fn_params(&mut self) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        if let Some(Tok::Punct(')')) = self.peek() {
+            self.pos += 1;
+            return Ok(names);
+        }
+        loop {
+            match self.eat() {
+                Some(Tok::Ident(_)) | Some(Tok::Keyword(_)) => {}
+                other => return Err(format!("expected parameter type, got {:?}", other)),
+            }
+            let name = match self.eat() {
+                Some(Tok::Ident(n)) => n,
+                other => return Err(format!("expected parameter name, got {:?}", other)),
+            };
+            names.push(name);
+            if self.match_punct(',') {
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        Ok(names)
+    }
+    /// Try to parse a lambda literal `(a, b, ...) -> expr` / `-> { stmts }`
+    /// starting at the current position (which must be at `(`). Backtracks
+    /// (restores `self.pos`) and returns `None` on any mismatch, so the
+    /// caller falls back to treating `(` as a parenthesized sub-expression —
+    /// the two forms share the same opening token and are only
+    /// distinguishable by what follows the matching `)`.
+    ///
+    /// The lambda's own body is depth-guarded independently (its statements
+    /// go through the normal `parse_stmt`/descend-ascend path), so the
+    /// resulting literal is a leaf from the enclosing expression's depth
+    /// budget — it does not consume any of the caller's `ParsedExpr` depth.
+    fn try_parse_lambda(&mut self) -> Option<ParsedExpr> {
+        let save = self.pos;
+        self.pos += 1; // consume '('
+        let mut params = Vec::new();
+        if let Some(Tok::Punct(')')) = self.peek() {
+            self.pos += 1;
+        } else {
+            loop {
+                match self.peek().cloned() {
+                    Some(Tok::Ident(n)) => {
+                        self.pos += 1;
+                        params.push(n);
+                    }
+                    _ => {
+                        self.pos = save;
+                        return None;
+                    }
+                }
+                if let Some(Tok::Punct(',')) = self.peek() {
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Some(Tok::Punct(')'))) {
+                self.pos = save;
+                return None;
+            }
+            self.pos += 1; // consume ')'
+        }
+        match self.peek() {
+            Some(Tok::PunctMulti(s)) if s == "->" => {
+                self.pos += 1;
+            }
+            _ => {
+                self.pos = save;
+                return None;
+            }
+        }
+        match self.parse_block_or_stmt() {
+            Ok(body) => Some(ParsedExpr::leaf(Expr::Lambda(params, body))),
+            Err(_) => {
+                self.pos = save;
+                None
+            }
+        }
+    }
     fn parse_primary(&mut self) -> Result<ParsedExpr, String> {
+        if matches!(self.peek(), Some(Tok::Punct('('))) {
+            if let Some(lambda) = self.try_parse_lambda() {
+                return Ok(lambda);
+            }
+        }
         match self.eat() {
             Some(Tok::Number(n)) => Ok(ParsedExpr::leaf(Expr::Number(n))),
             Some(Tok::String(s)) => Ok(ParsedExpr::leaf(Expr::String(s))),
@@ -879,20 +997,47 @@ pub fn eval_painless(src: &str, ctx: &PainlessCtx) -> Result<PainlessValue, Stri
     let mut p = Parser::new(&toks);
     let stmts = p.parse_program()?;
     let mut env: HashMap<String, PainlessValue> = HashMap::new();
-    let mut ret: Option<PainlessValue> = None;
+    exec_body(&stmts, ctx, &mut env)
+}
+
+/// Run a statement list with implicit-last-value return semantics: an
+/// explicit `return X;` short-circuits with `X`; otherwise the value of the
+/// last executed statement is returned. Shared by the top-level script body
+/// and by closure (local function / lambda) invocation.
+fn exec_body(
+    stmts: &[Stmt],
+    ctx: &PainlessCtx,
+    env: &mut HashMap<String, PainlessValue>,
+) -> Result<PainlessValue, String> {
     let mut last: PainlessValue = PainlessValue::Null;
-    for stmt in &stmts {
-        match exec_stmt(stmt, ctx, &mut env)? {
-            ExecOutcome::Return(v) => {
-                ret = Some(v);
-                break;
-            }
-            ExecOutcome::Value(v) => {
-                last = v;
-            }
+    for stmt in stmts {
+        match exec_stmt(stmt, ctx, env)? {
+            ExecOutcome::Return(v) => return Ok(v),
+            ExecOutcome::Value(v) => last = v,
         }
     }
-    Ok(ret.unwrap_or(last))
+    Ok(last)
+}
+
+/// Invoke a closure (local function or lambda) with the given positional
+/// arguments, in a fresh scope seeded only with the bound parameters — no
+/// access to the caller's locals, matching the target scripts' needs
+/// (functional-interface bodies only ever reference `doc`/`params`/`_score`,
+/// which come from `ctx`, not the enclosing `env`).
+fn call_closure(
+    params: &[String],
+    body: &[Stmt],
+    args: &[PainlessValue],
+    ctx: &PainlessCtx,
+) -> Result<PainlessValue, String> {
+    let mut local_env: HashMap<String, PainlessValue> = HashMap::new();
+    for (i, p) in params.iter().enumerate() {
+        local_env.insert(
+            p.clone(),
+            args.get(i).cloned().unwrap_or(PainlessValue::Null),
+        );
+    }
+    exec_body(body, ctx, &mut local_env)
 }
 
 enum ExecOutcome {
@@ -934,6 +1079,13 @@ fn exec_stmt(
             }
             Ok(ExecOutcome::Value(PainlessValue::Null))
         }
+        Stmt::FnDecl(name, params, body) => {
+            env.insert(
+                name.clone(),
+                PainlessValue::Closure(params.clone(), body.clone()),
+            );
+            Ok(ExecOutcome::Value(PainlessValue::Null))
+        }
     }
 }
 
@@ -964,6 +1116,7 @@ fn eval_expr(
             env.insert(name.clone(), v.clone());
             Ok(v)
         }
+        Expr::Lambda(params, body) => Ok(PainlessValue::Closure(params.clone(), body.clone())),
         Expr::Unary(op, x) => {
             let v = eval_expr(x, ctx, env)?;
             match op.as_str() {
@@ -987,6 +1140,11 @@ fn eval_expr(
                 .iter()
                 .map(|a| eval_expr(a, ctx, env))
                 .collect::<Result<_, _>>()?;
+            // A local function (or a variable bound to a lambda) shadows
+            // the builtin call table.
+            if let Some(PainlessValue::Closure(params, body)) = env.get(name) {
+                return call_closure(params, body, &argvs, ctx);
+            }
             global_call(name, &argvs, ctx)
         }
     }
@@ -1156,6 +1314,22 @@ fn eval_member_value(
     ctx: &PainlessCtx,
     env: &mut HashMap<String, PainlessValue>,
 ) -> Result<PainlessValue, String> {
+    // Functional-interface call on a closure value — `s.get()`,
+    // `fn.apply(x)`, `pred.test(x)`, ... The interface method name is
+    // irrelevant to a dynamically-typed interpreter; only the positional
+    // args matter, so any `.method(args)` call on a closure invokes it. A
+    // member access with no call parens (`s.get` without `()`) doesn't
+    // invoke anything real Painless functional interfaces expose, so it
+    // falls through to the error below same as today.
+    if let PainlessValue::Closure(params, body) = &value {
+        if let Some(args) = args {
+            let argvs: Vec<PainlessValue> = args
+                .iter()
+                .map(|a| eval_expr(a, ctx, env))
+                .collect::<Result<_, _>>()?;
+            return call_closure(params, body, &argvs, ctx);
+        }
+    }
     if let PainlessValue::String(text) = &value {
         if let Some(field) = text.strip_prefix("__docref__:") {
             return resolve_doc_member(ctx, field, member, args, env);
@@ -1679,6 +1853,93 @@ mod tests {
         let params = json!({});
         let v = eval_painless("Math.max(1.5, 2.5)", &ctx(&doc, &params, 0.0)).unwrap();
         assert!((v.as_f64().unwrap() - 2.5).abs() < 1e-9);
+    }
+
+    // ── Local functions and lambdas ───────────────────────────────────────────
+    // Needed by e.g. OpenSearch's UBI sample dashboards, which filter via a
+    // Supplier-style boolean helper (either a top-level local function or a
+    // lambda literal bound to a variable).
+
+    #[test]
+    fn local_function_declaration_and_call() {
+        let doc = json!({});
+        let params = json!({});
+        let src = "boolean isEven(int n) { return n % 2 == 0; } return isEven(4);";
+        let v = eval_painless(src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert!(v.as_bool());
+    }
+
+    #[test]
+    fn local_function_false_branch() {
+        let doc = json!({});
+        let params = json!({});
+        let src = "boolean isEven(int n) { return n % 2 == 0; } return isEven(3);";
+        let v = eval_painless(src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert!(!v.as_bool());
+    }
+
+    #[test]
+    fn lambda_literal_bare_call() {
+        let doc = json!({});
+        let params = json!({});
+        let v = eval_painless(
+            "def add = (a, b) -> a + b; return add(2, 3);",
+            &ctx(&doc, &params, 0.0),
+        )
+        .unwrap();
+        assert!((v.as_f64().unwrap() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lambda_block_body() {
+        let doc = json!({});
+        let params = json!({});
+        let src = "def f = (x) -> { double y = x * 2; return y + 1; }; return f(10);";
+        let v = eval_painless(src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert!((v.as_f64().unwrap() - 21.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lambda_invoked_via_functional_interface_method() {
+        // Any `.method(args)` call on a closure value invokes it regardless
+        // of the method name — covers Supplier::get, Function::apply,
+        // Predicate::test, etc. without hard-coding each interface.
+        let doc = json!({});
+        let params = json!({});
+        let v = eval_painless(
+            "def s = () -> true; return s.get();",
+            &ctx(&doc, &params, 0.0),
+        )
+        .unwrap();
+        assert!(v.as_bool());
+
+        let v2 = eval_painless(
+            "def doubler = (x) -> x * 2; return doubler.apply(21);",
+            &ctx(&doc, &params, 0.0),
+        )
+        .unwrap();
+        assert!((v2.as_f64().unwrap() - 42.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lambda_no_access_to_enclosing_locals() {
+        // Closures are invoked in a fresh scope seeded only with the bound
+        // parameters — they can't see the caller's other local variables.
+        let doc = json!({});
+        let params = json!({});
+        let src = "int secret = 99; def f = () -> secret; return f();";
+        let r = eval_painless(src, &ctx(&doc, &params, 0.0));
+        assert!(r.is_err(), "expected an error, got {:?}", r);
+    }
+
+    #[test]
+    fn closure_as_top_level_result_is_not_a_valid_value() {
+        // Returning a bare function value from a script (rather than
+        // invoking it) has no scalar/JSON representation.
+        let doc = json!({});
+        let params = json!({});
+        let v = eval_painless("def f = () -> 1; return f;", &ctx(&doc, &params, 0.0)).unwrap();
+        assert!(matches!(v, PainlessValue::Closure(..)));
     }
 
     // ── Resource-limit / stack-overflow guards ───────────────────────────────
