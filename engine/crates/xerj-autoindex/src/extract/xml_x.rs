@@ -1,7 +1,8 @@
 //! XML — pull-parsed (quick-xml), O(depth) memory.
 //! The record element is elected generically: the most frequent tag (in the
 //! first 4096 start events) that carries structure (attributes or element
-//! children). No repeating structured tag → the whole document is one record.
+//! children), ties going to the outermost then the lowest-named tag. No
+//! repeating structured tag → the whole document is one record.
 
 use super::{sanitize_field_name, ExtractStats, RawRecord, Sink, MAX_FIELDS_PER_RECORD};
 use anyhow::Result;
@@ -224,8 +225,8 @@ fn elect_record_tag(path: &Path, gzip: bool) -> Result<Option<String>> {
     let mut reader = Reader::from_reader(r);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
-    // tag -> (count, has_structure)
-    let mut counts: HashMap<String, (usize, bool)> = HashMap::new();
+    // tag -> (count, has_structure, shallowest depth seen)
+    let mut counts: HashMap<String, (usize, bool, usize)> = HashMap::new();
     let mut parents: Vec<String> = Vec::new();
     let mut seen = 0usize;
     loop {
@@ -254,9 +255,11 @@ fn elect_record_tag(path: &Path, gzip: bool) -> Result<Option<String>> {
             }
         };
         if !parents.is_empty() {
-            let entry = counts.entry(name.clone()).or_insert((0, false));
+            let depth = parents.len();
+            let entry = counts.entry(name.clone()).or_insert((0, false, depth));
             entry.0 += 1;
             entry.1 |= has_attr;
+            entry.2 = entry.2.min(depth);
             if let Some(p) = parents.last() {
                 if let Some(pe) = counts.get_mut(p) {
                     pe.1 = true;
@@ -272,10 +275,20 @@ fn elect_record_tag(path: &Path, gzip: bool) -> Result<Option<String>> {
         }
         buf.clear();
     }
+    // The ordering must be TOTAL: `counts` is a HashMap, so any candidate left
+    // tied would be settled by a per-map random hash seed and the same file
+    // would index to a different shape on every run. Most occurrences wins;
+    // a tie goes to the outermost tag (a wrapper that repeats as often as a
+    // child is the record, and the child is one of its fields); a tie at the
+    // same depth goes to the lowest name, which is arbitrary but stable.
     Ok(counts
         .into_iter()
-        .filter(|(_, (n, structured))| *n >= 3 && *structured)
-        .max_by_key(|(_, (n, _))| *n)
+        .filter(|(_, (n, structured, _))| *n >= 3 && *structured)
+        .min_by(|(a_tag, (a_n, _, a_depth)), (b_tag, (b_n, _, b_depth))| {
+            b_n.cmp(a_n)
+                .then_with(|| a_depth.cmp(b_depth))
+                .then_with(|| a_tag.cmp(b_tag))
+        })
         .map(|(k, _)| k))
 }
 
@@ -413,21 +426,15 @@ mod tests {
         assert!(recs.is_empty());
     }
 
-    /// DEFECT, pinned as CURRENT behaviour.
-    ///
-    /// `elect_record_tag` picks the winner with `max_by_key` over a `HashMap`,
-    /// which breaks ties by iteration order — and that order is randomly
-    /// seeded per map. When two structured tags occur the same number of times
-    /// (here the `item` wrapper and its `price` child, three each) the elected
-    /// record element differs BETWEEN RUNS on the same file: the records carry
-    /// different fields each time, so re-indexing an unchanged file rewrites
-    /// every document under the same locator.
-    ///
-    /// A deterministic tie-break (outermost tag, or lowest name) would fix it;
-    /// when it lands this test fails and should be replaced by the
-    /// stable-election assertion.
+    /// Each election builds a fresh `HashMap`, and every fresh map gets its own
+    /// random hash seed — so 200 in-process elections over one unchanged file
+    /// sample 200 different iteration orders. Before the tie-break was total,
+    /// this split the winner between `item` and its equally-frequent `price`
+    /// child; the record COUNT held at 3 but the fields changed run to run, so
+    /// re-indexing an unchanged file rewrote every document under the same
+    /// locator.
     #[test]
-    fn a_tied_record_tag_election_picks_an_arbitrary_winner_each_run() {
+    fn a_tied_record_tag_election_elects_the_outermost_tag_every_run() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tie.xml");
         std::fs::write(
@@ -442,6 +449,11 @@ mod tests {
 
         let mut shapes = std::collections::BTreeSet::new();
         for _ in 0..200 {
+            assert_eq!(
+                elect_record_tag(&path, false).unwrap().as_deref(),
+                Some("item"),
+                "the wrapper is the record; `price` is one of its fields"
+            );
             let mut n = 0usize;
             let mut first = String::new();
             extract(&path, false, &mut |r| {
@@ -454,16 +466,43 @@ mod tests {
                 true
             })
             .unwrap();
-            assert_eq!(n, 3, "the record COUNT is stable whichever tag wins");
+            assert_eq!(n, 3);
             shapes.insert(first);
         }
         assert_eq!(
             shapes,
-            ["cur,text", "id,price,price_cur"]
+            ["id,price,price_cur"]
                 .into_iter()
                 .map(String::from)
                 .collect::<std::collections::BTreeSet<_>>(),
-            "the tie-break became deterministic — replace this test"
+            "one input must yield exactly one record shape"
         );
+    }
+
+    /// Depth cannot separate sibling wrappers, so the last key has to.
+    #[test]
+    fn a_tie_at_the_same_depth_is_settled_by_the_lowest_tag_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("siblings.xml");
+        std::fs::write(
+            &path,
+            r#"<catalog>
+                 <beta id="1"><v>1</v></beta><alpha id="1"><v>1</v></alpha>
+                 <beta id="2"><v>2</v></beta><alpha id="2"><v>2</v></alpha>
+                 <beta id="3"><v>3</v></beta><alpha id="3"><v>3</v></alpha>
+               </catalog>"#,
+        )
+        .unwrap();
+
+        for _ in 0..200 {
+            assert_eq!(
+                elect_record_tag(&path, false).unwrap().as_deref(),
+                Some("alpha")
+            );
+        }
+        let (stats, recs) = run(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(stats.records, 3, "only the elected tag emits records");
+        assert_eq!(recs[0].fields["id"], serde_json::json!("1"));
+        assert_eq!(recs[0].fields["v"], serde_json::json!("1"));
     }
 }
