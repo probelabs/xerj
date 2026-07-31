@@ -148,7 +148,6 @@ fn parse(html: &str) -> Doc {
     let mut i = 0usize;
     let mut text_sink: Vec<&'static str> = Vec::new(); // element context stack (interned kinds)
     let mut cur_text = String::new();
-    let mut skip_until: Option<&'static str> = None; // script/style
 
     // table state
     let mut in_table = false;
@@ -234,20 +233,22 @@ fn parse(html: &str) -> Doc {
             }
             let tag_end = k.min(bytes.len());
 
-            if let Some(until) = skip_until {
-                if close && name == until {
-                    skip_until = None;
-                }
-                i = tag_end + 1;
+            flush_text(&mut cur_text, &text_sink, &mut doc, &mut cur_cell);
+
+            // Raw-text elements. Their contents are code, so jump the cursor
+            // straight to the literal close tag rather than tokenizing them:
+            // never buffered, never flushed, and a `<` in JS cannot be mistaken
+            // for a tag and eat the rest of the page. XHTML-style `<script/>`
+            // has no contents to skip.
+            if !close
+                && matches!(name.as_str(), "script" | "style")
+                && bytes.get(tag_end - 1) != Some(&b'/')
+            {
+                i = raw_text_end(bytes, tag_end + 1, name.as_bytes());
                 continue;
             }
 
-            flush_text(&mut cur_text, &text_sink, &mut doc, &mut cur_cell);
-
             match (close, name.as_str()) {
-                (false, "script") | (false, "style") => {
-                    skip_until = Some(if name == "script" { "script" } else { "style" });
-                }
                 (false, "title") => text_sink.push("title"),
                 (true, "title") => {
                     text_sink.pop();
@@ -322,6 +323,26 @@ fn parse(html: &str) -> Doc {
     }
     flush_text(&mut cur_text, &text_sink, &mut doc, &mut cur_cell);
     doc
+}
+
+/// Offset of the `<` opening `</name...>` at or after `from`, or EOF if there
+/// is none — an unterminated raw-text element runs to the end of the file, as
+/// it does in a browser.
+fn raw_text_end(bytes: &[u8], from: usize, name: &[u8]) -> usize {
+    let mut p = from.min(bytes.len());
+    while let Some(off) = memchr::memchr(b'<', &bytes[p..]) {
+        let at = p + off;
+        let after = at + 2 + name.len();
+        if bytes.get(at + 1) == Some(&b'/')
+            && after <= bytes.len()
+            && bytes[at + 2..after].eq_ignore_ascii_case(name)
+            && !bytes.get(after).is_some_and(u8::is_ascii_alphanumeric)
+        {
+            return at;
+        }
+        p = at + 1;
+    }
+    bytes.len()
 }
 
 fn normalize_ws(s: &str) -> String {
@@ -433,28 +454,82 @@ mod tests {
         assert!(!body.contains("&amp;") && !body.contains("&lt;"));
     }
 
-    /// DEFECT, pinned as CURRENT behaviour — not a contract worth keeping.
-    ///
-    /// `skip_until` suppresses the *tags* inside `<script>`/`<style>` but the
-    /// text branch of the tokenizer appends to `cur_text` unconditionally, and
-    /// the closing tag `continue`s without discarding it. The buffered CSS/JS
-    /// is therefore flushed into the body at the next tag boundary, so page
-    /// scripts and stylesheets are indexed as prose.
-    ///
-    /// When the tokenizer is fixed, this test fails: invert the assertion
-    /// rather than deleting it.
+    /// Inline scripts routinely carry API keys and endpoints; indexing them
+    /// would put those in `_source`. Prose on both sides of a skipped element
+    /// still has to survive.
     #[test]
-    fn script_and_style_text_still_reaches_the_body() {
+    fn script_and_style_text_never_reaches_the_body() {
         let (_, recs) = run(
             "skip.html",
-            "<html><head><style>.lede{color:#fff}</style>\
-             <script>var token=1;</script></head><body><p>visible</p></body></html>",
+            "<html><head><title>Doc</title><style>.lede{color:#fff}</style>\
+             <script>var token=1;</script></head><body><p>before</p>\
+             <script>cfg={api:'https://secret.example/v1',key:'abc123'}</script>\
+             <p>after</p></body></html>",
+        );
+        assert_eq!(recs[0].fields["title"], serde_json::json!("Doc"));
+        let body = body_of(&recs[0]);
+        assert!(
+            body.contains("before") && body.contains("after"),
+            "{body:?}"
+        );
+        for leak in ["lede", "color", "token", "secret.example", "abc123", "cfg"] {
+            assert!(
+                !body.contains(leak),
+                "{leak:?} was indexed as prose: {body:?}"
+            );
+        }
+    }
+
+    /// `<` inside JS/CSS is an operator, not a tag. Tokenizing it would run the
+    /// tag scan past `</script>` and drop the remainder of the page.
+    #[test]
+    fn a_less_than_inside_a_script_does_not_swallow_the_rest_of_the_page() {
+        let (_, recs) = run(
+            "lt.html",
+            "<html><body><p>alpha</p><script>if(a<b){s=\"x>y\";}</script>\
+             <style>@media (max-width:40em){.a{top:0}}</style>\
+             <p>omega</p></body></html>",
         );
         let body = body_of(&recs[0]);
-        assert!(body.contains("visible"));
+        assert!(body.contains("alpha") && body.contains("omega"), "{body:?}");
         assert!(
-            body.contains(".lede{color:#fff}") && body.contains("var token=1;"),
-            "script/style suppression now works — flip this assertion: {body:?}"
+            !body.contains("max-width") && !body.contains('{'),
+            "{body:?}"
+        );
+    }
+
+    /// `</SCRIPT >` is the same terminator; an XHTML-style `<script src=… />`
+    /// has no contents, so it must not put the tokenizer into raw-text mode.
+    #[test]
+    fn raw_text_ends_at_a_case_insensitive_or_spaced_close_and_self_closing_skips_nothing() {
+        let (_, recs) = run(
+            "case.html",
+            "<html><body><SCRIPT>hidden=1;</SCRIPT >kept one\
+             <script src=\"app.js\"/><p>kept two</p></body></html>",
+        );
+        let body = body_of(&recs[0]);
+        assert!(
+            body.contains("kept one") && body.contains("kept two"),
+            "{body:?}"
+        );
+        assert!(!body.contains("hidden"), "{body:?}");
+    }
+
+    /// An unclosed `<script>` swallows the rest of the file, as a real HTML
+    /// parser does — there is no terminator, so the tail is code. It is
+    /// bounded to the tail: text before the tag was already flushed.
+    #[test]
+    fn an_unclosed_script_drops_the_tail_but_keeps_the_text_before_it() {
+        let (stats, recs) = run(
+            "trunc.html",
+            "<html><body><h1>Head</h1><p>kept</p><script>var token=1;<p>lost</p>",
+        );
+        assert_eq!(stats.records, 1);
+        let body = body_of(&recs[0]);
+        assert!(body.contains("kept"), "{body:?}");
+        assert!(
+            !body.contains("token") && !body.contains("lost"),
+            "{body:?}"
         );
     }
 
