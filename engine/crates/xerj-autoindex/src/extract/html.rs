@@ -219,7 +219,19 @@ fn parse(html: &str) -> Doc {
             // never buffered, never flushed, and a `<` in JS cannot be mistaken
             // for a tag and eat the rest of the page. XHTML-style `<script/>`
             // has no contents to skip.
-            if !close && matches!(name.as_str(), "script" | "style") && !self_closing {
+            // The name scan above stops at any byte outside [A-Za-z0-9!], so
+            // `<script-loader>` yields the name `script`. Entering raw-text
+            // mode on that would skip to a `</script>` the document never
+            // contains — `raw_text_end` rightly refuses `</script-loader>` —
+            // and swallow everything after it. Custom element names are
+            // REQUIRED to contain a hyphen, so this is a live shape. Only
+            // treat the name as the raw-text element when it actually ended
+            // there: whitespace, `/`, or `>`.
+            let name_ended = bytes
+                .get(j)
+                .is_some_and(|&c| c.is_ascii_whitespace() || c == b'/' || c == b'>');
+            if !close && name_ended && matches!(name.as_str(), "script" | "style") && !self_closing
+            {
                 i = raw_text_end(bytes, tag_end + 1, name.as_bytes());
                 continue;
             }
@@ -600,6 +612,34 @@ mod tests {
             assert!(
                 !body.contains(leak),
                 "{leak:?} was indexed as prose: {body:?}"
+            );
+        }
+    }
+
+    /// A custom element whose name merely STARTS with a raw-text element's
+    /// name is an ordinary element. Custom element names are required to
+    /// contain a hyphen, so `<script-loader>` is a real shape — and reading
+    /// it as `script` would enter raw-text mode looking for a `</script>`
+    /// the document does not contain, discarding everything after it.
+    #[test]
+    fn a_custom_element_named_after_a_raw_text_element_does_not_swallow_the_page() {
+        for (tag, marker) in [("script-loader", "SLOAD"), ("style-sheet", "SSHEET")] {
+            let (_, recs) = run(
+                "custom.html",
+                &format!("<p>alpha</p><{tag} data-k=\"{marker}\">middle</{tag}><p>omega</p>"),
+            );
+            let body = body_of(&recs[0]);
+            assert!(
+                body.contains("alpha") && body.contains("omega"),
+                "<{tag}> swallowed the page: {body:?}"
+            );
+            assert!(
+                body.contains("middle"),
+                "<{tag}> content was dropped: {body:?}"
+            );
+            assert!(
+                !body.contains(marker),
+                "attribute leaked into body: {body:?}"
             );
         }
     }
