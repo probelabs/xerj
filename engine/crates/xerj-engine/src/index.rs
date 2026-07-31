@@ -27871,33 +27871,43 @@ mod selective_knn_hydration_tests {
         index
             .test_selective_knn_hydrations
             .store(0, Ordering::Relaxed);
+        index.test_winners_ranked.store(false, Ordering::Release);
         index
-            .test_scan_checkpoint_delay_ms
-            .store(20, Ordering::Relaxed);
-        index.test_scan_checkpoint_count.store(0, Ordering::Relaxed);
-        let timed_out = index
-            .run_knn_brute_force_with_deadline(
-                &request(1),
-                std::time::Instant::now() + std::time::Duration::from_millis(15),
-                "embedding",
-                &[0.0, 1.0],
-                1,
-                None,
-                "cosine",
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            .test_pause_before_winner_hydration
+            .store(true, Ordering::Release);
+        index
+            .test_force_timeout_after_knn_ranking
+            .store(true, Ordering::Release);
+        let query_index = Arc::clone(&index);
+        let query = tokio::spawn(async move {
+            query_index
+                .run_knn_brute_force(
+                    &request(1),
+                    "embedding",
+                    &[0.0, 1.0],
+                    1,
+                    None,
+                    "cosine",
+                    None,
+                    None,
+                )
+                .await
+        });
+        wait_until(&index.test_winners_ranked, "winner ranking").await;
+        tokio::time::sleep(SEMANTIC_TIMEOUT_HYDRATION_GRACE + std::time::Duration::from_millis(25))
+            .await;
+        index
+            .test_pause_before_winner_hydration
+            .store(false, Ordering::Release);
+        let timed_out = query.await.unwrap().unwrap();
         assert!(timed_out.timed_out);
-        assert!(index.test_scan_checkpoint_count.load(Ordering::Relaxed) >= 2);
         assert_eq!(
             index.test_selective_knn_hydrations.load(Ordering::Relaxed),
             0
         );
         index
-            .test_scan_checkpoint_delay_ms
-            .store(0, Ordering::Relaxed);
+            .test_force_timeout_after_knn_ranking
+            .store(false, Ordering::Release);
     }
 
     #[tokio::test]
