@@ -188,6 +188,15 @@ struct FileScan {
     pdf_spool_fallback: Option<String>,
 }
 
+fn take_pdf_spool_if_indexable<T>(spool: &mut Option<T>, is_junk: bool) -> Option<T> {
+    if is_junk {
+        spool.take();
+        None
+    } else {
+        spool.take()
+    }
+}
+
 fn scan_file(
     path: &Path,
     size: u64,
@@ -757,12 +766,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         let mut sketches = Vec::new();
         let mut junk_files = Vec::new();
         for (i, mut sc) in scans.into_iter().enumerate() {
-            pdf_spools[i] = sc.pdf_spool.take();
             let family = sc
                 .sniffed
                 .as_ref()
                 .map(|s| s.family)
                 .unwrap_or(Family::Binary);
+            pdf_spools[i] = take_pdf_spool_if_indexable(&mut sc.pdf_spool, sc.junk.is_some());
             if let Some((status, reason)) = sc.junk {
                 junk_files.push(JunkFile {
                     file_key: keys[i].clone(),

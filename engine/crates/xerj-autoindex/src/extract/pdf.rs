@@ -40,6 +40,11 @@ static REPLAY_OBSERVATION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static REPLAY_OBSERVATION_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static CORRUPT_REPLAY_SOURCE_SIZE: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(test)]
+static CORRUPTED_REPLAY_RESERVATION_DROPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 pub(crate) fn reset_replay_concurrency_observation(delay_ms: u64) {
@@ -60,6 +65,17 @@ pub(crate) fn reset_replay_concurrency_observation(delay_ms: u64) {
 #[cfg(test)]
 pub(crate) fn replay_concurrency_maximum() -> usize {
     REPLAY_OBSERVATION_MAXIMUM.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn corrupt_replay_for_source_size(source_size: u64) {
+    CORRUPTED_REPLAY_RESERVATION_DROPPED.store(false, Ordering::SeqCst);
+    CORRUPT_REPLAY_SOURCE_SIZE.store(source_size, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn corrupted_replay_reservation_was_dropped() -> bool {
+    CORRUPTED_REPLAY_RESERVATION_DROPPED.load(Ordering::SeqCst)
 }
 
 #[cfg(test)]
@@ -248,6 +264,8 @@ impl ExtractionSpoolBudget {
                     return Some(ExtractionSpoolReservation {
                         budget: Arc::clone(self),
                         bytes,
+                        #[cfg(test)]
+                        cleanup_probe: std::sync::atomic::AtomicBool::new(false),
                     });
                 }
                 Err(actual) => used = actual,
@@ -259,6 +277,8 @@ impl ExtractionSpoolBudget {
 struct ExtractionSpoolReservation {
     budget: Arc<ExtractionSpoolBudget>,
     bytes: u64,
+    #[cfg(test)]
+    cleanup_probe: std::sync::atomic::AtomicBool,
 }
 
 impl ExtractionSpoolReservation {
@@ -277,6 +297,10 @@ impl Drop for ExtractionSpoolReservation {
         debug_assert!(previous >= self.bytes);
         let previous_spools = self.budget.spools.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous_spools > 0);
+        #[cfg(test)]
+        if self.cleanup_probe.load(Ordering::SeqCst) {
+            CORRUPTED_REPLAY_RESERVATION_DROPPED.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -330,6 +354,17 @@ impl ExtractionSpool {
             .file
             .lock()
             .map_err(|_| anyhow!("PDF extraction spool lock was poisoned"))?;
+        #[cfg(test)]
+        if CORRUPT_REPLAY_SOURCE_SIZE
+            .compare_exchange(source_size, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self._reservation
+                .cleanup_probe
+                .store(true, Ordering::SeqCst);
+            file.set_len(8)
+                .context("inject PDF extraction spool truncation")?;
+        }
         let actual_bytes = file
             .metadata()
             .context("measure PDF extraction spool before replay")?
@@ -1033,6 +1068,93 @@ mod tests {
             .replay(123, "axf2-generation-b", &mut |_| true)
             .unwrap_err();
         assert!(error.to_string().contains("different source generation"));
+    }
+
+    #[test]
+    fn spool_replay_early_stop_matches_direct_delivery() {
+        let state = tempfile::tempdir().unwrap();
+        let records: Vec<_> = (0..5)
+            .map(|index| crate::extract::RawRecord {
+                fields: serde_json::Map::from_iter([(
+                    "ordinal".into(),
+                    serde_json::Value::from(index),
+                )]),
+                locator: format!("p1-s{index}"),
+                group: None,
+            })
+            .collect();
+        let expected = response(records.clone());
+        let mut direct = Vec::new();
+        let direct_stats = super::deliver(expected, &mut |record| {
+            direct.push(record);
+            direct.len() < 3
+        });
+
+        let budget = super::ExtractionSpoolBudget::new(super::MAX_WORKER_OUTPUT as u64, 1);
+        let spool = spool_response(
+            state.path(),
+            7,
+            "digest",
+            &response(records),
+            budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
+        )
+        .unwrap();
+        let mut replayed = Vec::new();
+        let replay_stats = spool
+            .replay(7, "digest", &mut |record| {
+                replayed.push(record);
+                replayed.len() < 3
+            })
+            .unwrap();
+
+        assert_eq!(replay_stats.records, direct_stats.records);
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(direct).unwrap()
+        );
+    }
+
+    #[test]
+    fn spool_budget_accepts_exact_limit_and_rejects_limit_plus_one() {
+        let budget = super::ExtractionSpoolBudget::new(1024, 2);
+        let exact = budget.try_reserve(1024).expect("exact limit must fit");
+        assert!(budget.try_reserve(1).is_none());
+        drop(exact);
+        assert!(budget.try_reserve(1025).is_none());
+        assert!(budget.try_reserve(1024).is_some());
+    }
+
+    #[test]
+    fn multi_megabyte_spool_replays_with_exact_integrity() {
+        const BODY_BYTES: usize = 2 * 1024 * 1024;
+        let state = tempfile::tempdir().unwrap();
+        let body = "quarterly-results ".repeat(BODY_BYTES / "quarterly-results ".len());
+        let record = crate::extract::RawRecord {
+            fields: serde_json::Map::from_iter([("body".into(), body.clone().into())]),
+            locator: "p1-s0".into(),
+            group: None,
+        };
+        let budget = super::ExtractionSpoolBudget::new(super::MAX_WORKER_OUTPUT as u64, 1);
+        let spool = spool_response(
+            state.path(),
+            7,
+            "digest",
+            &response(vec![record]),
+            budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
+        )
+        .unwrap();
+        assert!(spool.bytes >= BODY_BYTES as u64);
+        assert!(spool.bytes < super::MAX_WORKER_OUTPUT as u64);
+
+        let mut replayed_body = None;
+        let stats = spool
+            .replay(7, "digest", &mut |record| {
+                replayed_body = record.fields["body"].as_str().map(ToOwned::to_owned);
+                true
+            })
+            .unwrap();
+        assert_eq!(stats.records, 1);
+        assert_eq!(replayed_body.as_deref(), Some(body.as_str()));
     }
 
     #[test]
