@@ -20,9 +20,20 @@ pub fn extract(path: &Path, sink: Sink) -> Result<ExtractStats> {
             return Ok(stats);
         }
     };
-    let mut reader = Reader::from_reader(BufReader::new(entry));
+    // SECURITY: bound the DECOMPRESSED read. `word/document.xml` inflates from
+    // the zip at whatever ratio the author chose — a ~400 KB docx can expand to
+    // hundreds of MB, and a single 400 MB `<w:t>` text run makes quick-xml
+    // allocate that whole run for one event (measured 1.68 GB RSS from an 815 KB
+    // file). Reading through a `Take` caps peak memory no matter the ratio; a
+    // real document's document.xml is far below this. Past the cap the reader
+    // hits EOF and the loop ends (a truncated tag is handled as junk below).
+    const MAX_DECOMPRESSED_BYTES: u64 = 72 << 20;
+    let capped = std::io::Read::take(entry, MAX_DECOMPRESSED_BYTES);
+    let mut reader = Reader::from_reader(BufReader::new(capped));
     reader.config_mut().trim_text(false);
 
+    // Extraction body cap (also bounds any single paragraph — see the Text arm).
+    const MAX_BODY_BYTES: usize = 64 << 20;
     let mut body = String::new();
     let mut headings: Vec<String> = Vec::new();
     let mut para = String::new();
@@ -49,7 +60,16 @@ pub fn extract(path: &Path, sink: Sink) -> Result<ExtractStats> {
                 }
             }
             Ok(Event::Text(t)) => {
-                para.push_str(&t.unescape().unwrap_or_default());
+                // SECURITY: `para` only flushes into `body` (and gets length-
+                // checked) at `</w:p>`. A crafted docx with a single never-closed
+                // `<w:p>` — an 815 KB file whose document.xml inflates to
+                // hundreds of MB inside one paragraph — otherwise grows `para`
+                // without bound: measured 1.68 GB RSS from that 815 KB input.
+                // Stop appending once one paragraph reaches the body cap; the
+                // per-paragraph text a real document holds is far below it.
+                if para.len() < MAX_BODY_BYTES {
+                    para.push_str(&t.unescape().unwrap_or_default());
+                }
             }
             Ok(Event::End(e)) => {
                 if e.name().as_ref() == b"w:p" {
@@ -73,7 +93,7 @@ pub fn extract(path: &Path, sink: Sink) -> Result<ExtractStats> {
             }
         }
         buf.clear();
-        if body.len() > 64 << 20 {
+        if body.len() > MAX_BODY_BYTES {
             break;
         }
     }
