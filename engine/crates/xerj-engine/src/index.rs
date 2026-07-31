@@ -50,8 +50,6 @@ pub(crate) type DocValueMap = std::collections::BTreeMap<String, xerj_storage::d
 const SEMANTIC_TIMEOUT_HYDRATION_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[cfg(test)]
-static TEST_SELECTIVE_KNN_HYDRATIONS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
 static TEST_COLD_DECODE_CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static TEST_COLD_ROW_ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -2955,6 +2953,10 @@ pub struct Index {
     test_force_cold_row_fallback: Arc<AtomicBool>,
     #[cfg(test)]
     test_cold_row_decode_delay_ms: Arc<AtomicU64>,
+    /// Per-index so parallel crate tests cannot satisfy another fixture's
+    /// zero/quantity assertion with an unrelated selected-row decode.
+    #[cfg(test)]
+    test_selective_knn_hydrations: Arc<AtomicU64>,
     // ── Per-index enrich lookup tables ────────────────────────────────────────
     /// Named enrich tables: each table maps a key to a JSON object of extra
     /// fields to merge into matching documents at ingest time.
@@ -3474,6 +3476,8 @@ impl Index {
             test_force_cold_row_fallback: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_cold_row_decode_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_selective_knn_hydrations: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             hnsw: Arc::new(RwLock::new(None)),
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
@@ -3798,6 +3802,8 @@ impl Index {
             test_force_cold_row_fallback: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_cold_row_decode_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_selective_knn_hydrations: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             store,
             memtable: Arc::new(memtable),
@@ -19012,6 +19018,8 @@ impl Index {
             force_fallback: Arc::clone(&self.test_force_cold_row_fallback),
             #[cfg(test)]
             decode_delay_ms: Arc::clone(&self.test_cold_row_decode_delay_ms),
+            #[cfg(test)]
+            hydration_count: Arc::clone(&self.test_selective_knn_hydrations),
         };
         let segment = seg_id.to_owned();
         let join = tokio::task::spawn_blocking(move || worker.run(&segment, &ordinals, deadline));
@@ -27254,6 +27262,8 @@ struct ColdRowDecodeWorker {
     force_fallback: Arc<AtomicBool>,
     #[cfg(test)]
     decode_delay_ms: Arc<AtomicU64>,
+    #[cfg(test)]
+    hydration_count: Arc<AtomicU64>,
 }
 
 impl ColdRowDecodeWorker {
@@ -27342,7 +27352,8 @@ impl ColdRowDecodeWorker {
                     return Ok(cold_decode_cancelled(ColdV2Rows::Cancelled));
                 }
                 #[cfg(test)]
-                TEST_SELECTIVE_KNN_HYDRATIONS.fetch_add(rows.len() as u64, Ordering::Relaxed);
+                self.hydration_count
+                    .fetch_add(rows.len() as u64, Ordering::Relaxed);
                 let mut by_ordinal = HashMap::with_capacity(rows.len());
                 for row in rows {
                     let Some(id) = row.id.as_str().map(ToOwned::to_owned) else {
@@ -27690,7 +27701,9 @@ mod selective_knn_hydration_tests {
         };
         TEST_COLD_ROW_ACTIVE.store(0, Ordering::Release);
         TEST_COLD_ROW_MAX_ACTIVE.store(0, Ordering::Release);
-        TEST_SELECTIVE_KNN_HYDRATIONS.store(0, Ordering::Release);
+        index
+            .test_selective_knn_hydrations
+            .store(0, Ordering::Release);
         index
             .test_cold_row_decode_delay_ms
             .store(50, Ordering::Release);
@@ -27722,7 +27735,10 @@ mod selective_knn_hydration_tests {
             .test_cold_row_decode_delay_ms
             .store(0, Ordering::Release);
         assert!(TEST_COLD_ROW_MAX_ACTIVE.load(Ordering::Acquire) > 1);
-        assert_eq!(TEST_SELECTIVE_KNN_HYDRATIONS.load(Ordering::Acquire), 8);
+        assert_eq!(
+            index.test_selective_knn_hydrations.load(Ordering::Acquire),
+            8
+        );
 
         // Delay the blocking decoder so it is known to be active when its
         // async caller is aborted. Dropping the caller must arm cancellation
@@ -27852,7 +27868,9 @@ mod selective_knn_hydration_tests {
         );
 
         clear_full_source_caches(&index);
-        TEST_SELECTIVE_KNN_HYDRATIONS.store(0, Ordering::Relaxed);
+        index
+            .test_selective_knn_hydrations
+            .store(0, Ordering::Relaxed);
         index
             .test_scan_checkpoint_delay_ms
             .store(20, Ordering::Relaxed);
@@ -27873,7 +27891,10 @@ mod selective_knn_hydration_tests {
             .unwrap();
         assert!(timed_out.timed_out);
         assert!(index.test_scan_checkpoint_count.load(Ordering::Relaxed) >= 2);
-        assert_eq!(TEST_SELECTIVE_KNN_HYDRATIONS.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            index.test_selective_knn_hydrations.load(Ordering::Relaxed),
+            0
+        );
         index
             .test_scan_checkpoint_delay_ms
             .store(0, Ordering::Relaxed);
