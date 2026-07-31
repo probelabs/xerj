@@ -959,3 +959,65 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     );
     assert_eq!(endpoint.state.lock().unwrap().docs.len(), PDFS);
 }
+
+#[cfg(unix)]
+#[test]
+fn corrupted_pdf_replay_fails_closed_and_releases_spool_budget() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("report.pdf");
+    fs::write(&pdf, b"%PDF-1.4\ntest worker input\n").unwrap();
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let endpoint = MockEndpoint::start(0);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    let _env = PdfWorkerEnvGuard;
+    crate::extract::pdf::corrupt_replay_for_source_size(fs::metadata(&pdf).unwrap().len());
+
+    let error = run_index(config).unwrap_err();
+    assert!(format!("{error:#}").contains("spool length changed"));
+    assert!(endpoint.state.lock().unwrap().docs.is_empty());
+    assert_eq!(file_done_count(state_dir.path()), 0);
+    assert!(crate::extract::pdf::corrupted_replay_reservation_was_dropped());
+}
+
+#[test]
+fn junk_scan_drops_its_spool_before_indexable_spools_are_retained() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut junk = Some(DropProbe(Arc::clone(&drops)));
+    assert!(take_pdf_spool_if_indexable(&mut junk, true).is_none());
+    assert!(junk.is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    let mut indexable = Some(DropProbe(Arc::clone(&drops)));
+    let retained = take_pdf_spool_if_indexable(&mut indexable, false);
+    assert!(retained.is_some());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(retained);
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+}
