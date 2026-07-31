@@ -20,9 +20,26 @@ use std::path::Path;
 /// power loss. No-op errors are surfaced to the caller; on filesystems
 /// where directories cannot be fsynced (rare), callers may choose to
 /// ignore the error.
+#[cfg(not(windows))]
 pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     let d = std::fs::File::open(dir)?;
     d.sync_all()
+}
+
+/// Windows has no directory-flush primitive to call: `File::open` on a
+/// directory fails with `ERROR_ACCESS_DENIED` (os error 5) because std
+/// cannot pass `FILE_FLAG_BACKUP_SEMANTICS`, and `FlushFileBuffers` is
+/// not defined for directory handles. Durability here rests on the
+/// file-level `sync_all` the callers already perform plus NTFS metadata
+/// journalling of the rename.
+///
+/// This is not a cosmetic cfg: the Unix body returned `Err` for *every*
+/// call on Windows, and `save_snapshot` propagates that error, so the
+/// server could not create an index — it aborted at boot with
+/// `create .xerj_users: I/O error: Access is denied. (os error 5)`.
+#[cfg(windows)]
+pub fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Write `bytes` to `path` atomically **and durably**:

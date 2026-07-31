@@ -49,6 +49,24 @@ for _ in $(seq 1 160); do
 done
 [ "$up" = 1 ] || { echo "server never became healthy"; cat "$DATA/server.log"; exit 1; }
 
+# ── write/read round-trip on the platform's own filesystem ─────────────────
+# Index creation runs the durable-publish chain (write tmp → fsync → rename →
+# fsync parent dir), which is where per-platform filesystem semantics bite:
+# on Windows `fsync_dir` used to fail with ERROR_ACCESS_DENIED for every call,
+# so the server aborted at boot and no index could ever be created. Autoindex
+# below would catch that too, but only as a vague "server exited" — assert the
+# round-trip explicitly so the failure names itself.
+curl -fs -m10 -XPUT localhost:9200/smoke-crud -H 'content-type: application/json' \
+  -d '{"settings":{"number_of_shards":1}}' > "$DATA/crud.log" 2>&1 \
+  || { echo "::error::create index failed on $(uname -s)"; cat "$DATA/crud.log"; cat "$DATA/server.log"; exit 1; }
+curl -fs -m10 -XPOST 'localhost:9200/smoke-crud/_doc/1?refresh=true' -H 'content-type: application/json' \
+  -d '{"title":"windows durability round trip"}' >> "$DATA/crud.log" 2>&1 \
+  || { echo "::error::index doc failed on $(uname -s)"; cat "$DATA/crud.log"; cat "$DATA/server.log"; exit 1; }
+HITS="$(curl -s -m10 'localhost:9200/smoke-crud/_search?q=durability' | tr -d ' \n' | sed -n 's/.*"value":\([0-9]*\).*/\1/p' | head -1)"
+[ "${HITS:-0}" = "1" ] \
+  || { echo "::error::search round-trip returned '${HITS:-}' hits, expected 1"; cat "$DATA/server.log"; exit 1; }
+echo "write/read round-trip OK on $(uname -s)"
+
 # ── autoindex the corpus ───────────────────────────────────────────────────
 "$BIN" autoindex "$CORPUS" > "$DATA/ax.log" 2>&1
 RC=$?
