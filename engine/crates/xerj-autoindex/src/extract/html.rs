@@ -340,3 +340,216 @@ fn decode_entities(s: &str) -> String {
         .replace("&apos;", "'")
         .replace("&nbsp;", " ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(name: &str, html: &str) -> (ExtractStats, Vec<RawRecord>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, html).unwrap();
+        let mut recs = Vec::new();
+        let stats = extract(&path, false, &mut |r| {
+            recs.push(r);
+            true
+        })
+        .unwrap();
+        (stats, recs)
+    }
+
+    fn body_of(rec: &RawRecord) -> &str {
+        rec.fields["body"].as_str().unwrap()
+    }
+
+    fn table_html(header: Option<[&str; 2]>, data_rows: usize) -> String {
+        let mut h = String::from("<html><body><table>");
+        if let Some([a, b]) = header {
+            h.push_str(&format!("<tr><th>{a}</th><th>{b}</th></tr>"));
+        }
+        for i in 1..=data_rows {
+            h.push_str(&format!("<tr><td>item{i}</td><td>{i}</td></tr>"));
+        }
+        h.push_str("</table></body></html>");
+        h
+    }
+
+    #[test]
+    fn a_prose_page_becomes_one_document_of_title_headings_and_tag_free_body() {
+        let (stats, recs) = run(
+            "page.html",
+            "<html><head><title>Quarterly Report</title></head><body>\
+             <h1>Revenue</h1><p>Growth was steady.</p>\
+             <h2>Costs</h2><div>Cloud costs declined.</div></body></html>",
+        );
+        assert_eq!(stats.records, 1);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].locator, "s0");
+        assert_eq!(
+            recs[0].fields["title"],
+            serde_json::json!("Quarterly Report")
+        );
+        assert_eq!(
+            recs[0].fields["headings"],
+            serde_json::json!(["Revenue", "Costs"])
+        );
+        let body = body_of(&recs[0]);
+        assert!(body.contains("Growth was steady."));
+        assert!(body.contains("Cloud costs declined."));
+        assert!(
+            !body.contains('<') && !body.contains("div"),
+            "markup leaked into the body: {body:?}"
+        );
+    }
+
+    #[test]
+    fn attributes_and_comments_never_reach_the_body() {
+        let (_, recs) = run(
+            "attrs.html",
+            "<html><body><p class=\"lede\">visible</p><!-- hidden note -->\
+             <a href=\"https://example.com/hidden-path\" title=\"hidden title\">link text</a>\
+             </body></html>",
+        );
+        let body = body_of(&recs[0]);
+        assert!(body.contains("visible") && body.contains("link text"));
+        assert!(
+            !body.contains("hidden") && !body.contains("class") && !body.contains("href"),
+            "attribute or comment text was indexed: {body:?}"
+        );
+    }
+
+    #[test]
+    fn character_entities_are_unescaped_in_the_title_and_the_body() {
+        let (_, recs) = run(
+            "ents.html",
+            "<html><head><title>Q4 &amp; FY</title></head><body>\
+             <p>5 &lt; 10 &gt; 2, &quot;quoted&quot; &amp; &#39;single&#39;&nbsp;spaced</p>\
+             </body></html>",
+        );
+        assert_eq!(recs[0].fields["title"], serde_json::json!("Q4 & FY"));
+        let body = body_of(&recs[0]);
+        assert!(body.contains("5 < 10 > 2"), "{body:?}");
+        assert!(body.contains("\"quoted\" & 'single' spaced"), "{body:?}");
+        assert!(!body.contains("&amp;") && !body.contains("&lt;"));
+    }
+
+    /// DEFECT, pinned as CURRENT behaviour — not a contract worth keeping.
+    ///
+    /// `skip_until` suppresses the *tags* inside `<script>`/`<style>` but the
+    /// text branch of the tokenizer appends to `cur_text` unconditionally, and
+    /// the closing tag `continue`s without discarding it. The buffered CSS/JS
+    /// is therefore flushed into the body at the next tag boundary, so page
+    /// scripts and stylesheets are indexed as prose.
+    ///
+    /// When the tokenizer is fixed, this test fails: invert the assertion
+    /// rather than deleting it.
+    #[test]
+    fn script_and_style_text_still_reaches_the_body() {
+        let (_, recs) = run(
+            "skip.html",
+            "<html><head><style>.lede{color:#fff}</style>\
+             <script>var token=1;</script></head><body><p>visible</p></body></html>",
+        );
+        let body = body_of(&recs[0]);
+        assert!(body.contains("visible"));
+        assert!(
+            body.contains(".lede{color:#fff}") && body.contains("var token=1;"),
+            "script/style suppression now works — flip this assertion: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_dominant_table_becomes_one_record_per_row_named_from_its_header_cells() {
+        let (stats, recs) = run("t.html", &table_html(Some(["Product Name", "Qty"]), 5));
+        assert_eq!(stats.records, 5);
+        assert_eq!(recs.len(), 5);
+        assert_eq!(recs[0].fields["Product_Name"], serde_json::json!("item1"));
+        assert_eq!(recs[0].fields["Qty"], serde_json::json!("1"));
+        assert_eq!(recs[4].fields["Product_Name"], serde_json::json!("item5"));
+        assert!(
+            recs.iter().all(|r| r.fields.len() == 2),
+            "the header row must not become a record"
+        );
+        let locs: Vec<&str> = recs.iter().map(|r| r.locator.as_str()).collect();
+        assert_eq!(locs, ["row1", "row2", "row3", "row4", "row5"]);
+        assert!(recs.iter().all(|r| r.group.is_none()));
+    }
+
+    #[test]
+    fn a_headerless_table_gets_positional_column_names_and_keeps_its_first_row() {
+        let (stats, recs) = run("t.html", &table_html(None, 6));
+        assert_eq!(stats.records, 6, "no header row means no row is consumed");
+        assert_eq!(recs[0].locator, "row0");
+        assert_eq!(recs[0].fields["col_1"], serde_json::json!("item1"));
+        assert_eq!(recs[0].fields["col_2"], serde_json::json!("1"));
+    }
+
+    #[test]
+    fn empty_cells_are_omitted_rather_than_indexed_as_blank_values() {
+        let mut h = String::from("<html><body><table><tr><th>A &amp; B</th><th>Note</th></tr>");
+        for i in 1..=5 {
+            h.push_str(&format!("<tr><td>x&lt;{i}</td><td>  </td></tr>"));
+        }
+        h.push_str("</table></body></html>");
+        let (stats, recs) = run("cells.html", &h);
+        assert_eq!(stats.records, 5);
+        assert_eq!(recs[0].fields["A_B"], serde_json::json!("x<1"));
+        assert_eq!(
+            recs[0].fields.len(),
+            1,
+            "the blank Note cell must not be stored"
+        );
+    }
+
+    /// DEFECT, pinned as CURRENT behaviour.
+    ///
+    /// A table under the 5-row dominance threshold loses its content twice
+    /// over: it is not emitted as rows, and `flush_text` has already diverted
+    /// every cell into `cur_cell` instead of `doc.body`, so the cells are not
+    /// in the document record either. Small tables — the common case on a
+    /// documentation page — are silently unindexed.
+    #[test]
+    fn a_table_below_the_dominance_threshold_leaves_its_cells_unindexed() {
+        let (stats, recs) = run(
+            "small.html",
+            "<html><body><h1>Head</h1><p>prose</p>\
+             <table><tr><td>cellA</td><td>cellB</td></tr></table>\
+             <p>after</p></body></html>",
+        );
+        assert_eq!(stats.records, 1, "falls back to the document record");
+        let body = body_of(&recs[0]);
+        assert!(body.contains("prose") && body.contains("after"));
+        assert!(
+            !body.contains("cellA") && !body.contains("cellB"),
+            "small-table cells are now indexed — flip this assertion: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_page_without_a_title_falls_back_to_a_heading_then_to_the_file_stem() {
+        let (_, recs) = run(
+            "fallback.html",
+            "<html><body><h2>Only Heading</h2><p>x</p></body></html>",
+        );
+        assert_eq!(recs[0].fields["title"], serde_json::json!("Only Heading"));
+
+        let (_, recs) = run("stem-name.html", "<html><body><p>x</p></body></html>");
+        assert_eq!(recs[0].fields["title"], serde_json::json!("stem-name"));
+        assert!(recs[0].fields.get("headings").is_none());
+    }
+
+    #[test]
+    fn unclosed_and_nonsense_markup_is_never_fatal() {
+        let (stats, recs) = run(
+            "junk.html",
+            "<<<>>> <div class=\"unclosed <p>dangling &amp; text <script>x=1;",
+        );
+        assert_eq!(stats.junk, 0);
+        assert_eq!(stats.records, 1, "a broken page still yields a document");
+        assert_eq!(recs[0].fields["title"], serde_json::json!("junk"));
+
+        let (stats, recs) = run("empty.html", "");
+        assert_eq!(stats.records, 1);
+        assert_eq!(body_of(&recs[0]), "");
+    }
+}
