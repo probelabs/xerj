@@ -997,13 +997,7 @@ fn validate_runtime_fields(rt: &serde_json::Map<String, Value>) -> Result<(), St
             continue;
         };
         if let Some(t) = obj.get("type").and_then(Value::as_str) {
-            // `flattened`/`flat_object` are valid *mapping* property types
-            // but not valid *runtime field* types in real ES — runtime
-            // fields are restricted to a small scalar/composite set.
-            // is_supported_field_type is shared with the mapping-properties
-            // path (validate_properties), so this exclusion has to live
-            // here rather than narrowing that shared list.
-            if t == "flattened" || t == "flat_object" || !is_supported_field_type(t) {
+            if !is_supported_runtime_field_type(t) {
                 return Err(format!(
                     "Failed to parse mapping: The mapper type [{t}] declared on runtime field [{name}] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation."
                 ));
@@ -1011,6 +1005,46 @@ fn validate_runtime_fields(rt: &serde_json::Map<String, Value>) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// The runtime-field type allowlist.
+///
+/// Runtime fields have their OWN, much smaller type registry in ES than
+/// mapping properties do: `IndicesModule#getRuntimeFields` registers
+/// exactly `boolean`, `composite`, `date`, `double`, `geo_point`, `ip`,
+/// `keyword`, `long` and `lookup`, and `RuntimeField.parseRuntimeFields`
+/// rejects anything else with the same "mapper type […] does not exist"
+/// message this module emits. So a type being a perfectly valid *mapping
+/// property* type says nothing about whether it is legal under
+/// `mappings.runtime` — `text`, `nested`, `geo_shape`, `dense_vector`,
+/// `binary`, `percolator`, `flattened`/`flat_object` and the narrower
+/// numerics (`integer`, `float`, `scaled_float`, …, which collapse into
+/// `long`/`double` at runtime) are all rejected by real ES.
+///
+/// Deliberately NOT expressed as "is_supported_field_type minus
+/// exclusions": that shared list is the mapping-properties list, and
+/// every future addition to it would silently widen this one. The two
+/// registries are independent in ES and are kept independent here.
+fn is_supported_runtime_field_type(t: &str) -> bool {
+    matches!(
+        t,
+        "boolean"
+            | "composite"
+            | "date"
+            | "double"
+            | "geo_point"
+            | "ip"
+            | "keyword"
+            | "long"
+            // `lookup` runtime fields resolve each hit against another
+            // index; the search path implements them for search-body
+            // `runtime_mappings` (see the `type: lookup` branch in the
+            // fields-API fetch), and `search/390_lookup_fields.yml`
+            // exercises them. Neither `lookup` nor `composite` is a
+            // mapping-PROPERTY type, so validating `mappings.runtime`
+            // against the property list rejected both outright.
+            | "lookup"
+    )
 }
 
 fn is_supported_field_type(t: &str) -> bool {
@@ -1070,6 +1104,206 @@ fn is_supported_field_type(t: &str) -> bool {
             | "aggregate_metric_double"
             | "passthrough"
     )
+}
+
+#[cfg(test)]
+mod runtime_field_type_tests {
+    //! `mappings.runtime` used to be validated against the
+    //! MAPPING-PROPERTY type list with `flattened`/`flat_object` carved
+    //! out by hand, so the rule was half-enforced: `flat_object` was a
+    //! 400 while `text`, `nested`, `geo_shape`, `dense_vector`,
+    //! `binary`, `percolator` and the narrow numerics — all of which
+    //! real ES rejects just as hard — were a 200. Worse, the two types
+    //! that ARE runtime-only (`composite`, `lookup`) are absent from the
+    //! mapping-property list and were therefore rejected outright, so
+    //! the validator was wrong in both directions.
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn runtime(name: &str, ty: &str) -> serde_json::Map<String, Value> {
+        json!({name: {"type": ty}})
+            .as_object()
+            .expect("object")
+            .clone()
+    }
+
+    /// Every type real ES registers as a runtime field
+    /// (`IndicesModule#getRuntimeFields`) must be accepted.
+    #[test]
+    fn accepts_the_real_es_runtime_field_types() {
+        for ty in [
+            "boolean",
+            "composite",
+            "date",
+            "double",
+            "geo_point",
+            "ip",
+            "keyword",
+            "long",
+            "lookup",
+        ] {
+            assert!(
+                validate_runtime_fields(&runtime("rf", ty)).is_ok(),
+                "runtime field type [{ty}] is legal in ES and must be accepted"
+            );
+        }
+    }
+
+    /// `composite` and `lookup` are runtime-only — they are NOT mapping
+    /// property types, so validating against the shared property list
+    /// rejected them. `lookup` in particular is implemented by the
+    /// search path and covered by `search/390_lookup_fields.yml`.
+    #[test]
+    fn accepts_runtime_only_types_absent_from_the_property_list() {
+        for ty in ["composite", "lookup"] {
+            assert!(
+                !is_supported_field_type(ty),
+                "[{ty}] is not a mapping-property type — that is the point of this test"
+            );
+            assert!(
+                validate_runtime_fields(&runtime("rf", ty)).is_ok(),
+                "runtime-only type [{ty}] must be accepted under mappings.runtime"
+            );
+        }
+    }
+
+    /// Valid mapping-property types that ES nonetheless refuses under
+    /// `mappings.runtime`. `flat_object`/`flattened` were the only two
+    /// previously rejected; the rest are the half of the rule that was
+    /// missing.
+    #[test]
+    fn rejects_property_types_es_forbids_in_runtime_fields() {
+        for ty in [
+            "text",
+            "match_only_text",
+            "nested",
+            "object",
+            "geo_shape",
+            "shape",
+            "point",
+            "dense_vector",
+            "sparse_vector",
+            "binary",
+            "percolator",
+            "completion",
+            "histogram",
+            "alias",
+            "join",
+            "version",
+            "constant_keyword",
+            "wildcard",
+            "date_nanos",
+            "integer",
+            "short",
+            "byte",
+            "float",
+            "half_float",
+            "scaled_float",
+            "unsigned_long",
+            "ip_range",
+            "date_range",
+            "rank_feature",
+            "token_count",
+            "aggregate_metric_double",
+            "flattened",
+            "flat_object",
+        ] {
+            assert!(
+                is_supported_field_type(ty),
+                "[{ty}] must be a valid mapping-property type for this test to mean anything"
+            );
+            let err = validate_runtime_fields(&runtime("rf", ty)).expect_err(&format!(
+                "runtime field type [{ty}] is forbidden by ES and must be rejected"
+            ));
+            assert_eq!(
+                err,
+                format!(
+                    "Failed to parse mapping: The mapper type [{ty}] declared on runtime field [rf] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation."
+                ),
+                "rejection must carry ES's mapper-type-does-not-exist wording"
+            );
+        }
+    }
+
+    /// Unknown types stay rejected. A runtime field with no `type` at
+    /// all keeps passing — real ES rejects that too ("No type specified
+    /// for runtime field"), but that is a separate, pre-existing
+    /// divergence this patch deliberately does not change, and the test
+    /// pins the current behaviour so the difference stays visible.
+    #[test]
+    fn unknown_types_rejected_and_typeless_entries_still_pass() {
+        assert!(validate_runtime_fields(&runtime("rf", "invalid")).is_err());
+        let typeless = json!({"rf": {"script": {"source": "emit(1)"}}})
+            .as_object()
+            .expect("object")
+            .clone();
+        assert!(validate_runtime_fields(&typeless).is_ok());
+    }
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    async fn create_index_with_runtime_type(ty: &str) -> (StatusCode, Value) {
+        let router = crate::router::build_es_compat_router(test_state());
+        let response = router
+            .oneshot(
+                Request::put(format!("/rt-type-{ty}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"runtime": {"rf": {"type": ty}}}}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn create_index_rejects_a_text_runtime_field_over_http() {
+        let (status, body) = create_index_with_runtime_type("text").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "ES rejects text runtime fields; got {status} {body}"
+        );
+        assert_eq!(body["error"]["type"], "mapper_parsing_exception", "{body}");
+        assert_eq!(
+            body["error"]["reason"],
+            "Failed to parse mapping: The mapper type [text] declared on runtime field [rf] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation.",
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_index_accepts_a_lookup_runtime_field_over_http() {
+        let (status, body) = create_index_with_runtime_type("lookup").await;
+        assert!(
+            status.is_success(),
+            "lookup is a legal ES runtime field type; got {status} {body}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

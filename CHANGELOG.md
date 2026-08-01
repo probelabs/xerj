@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — runtime-field types (can break existing mappings)
+
+- **`mappings.runtime` is now validated against ES's runtime-field type
+  registry**, not against the mapping-property type list. Runtime fields
+  have their own, much smaller registry in ES: `boolean`, `composite`,
+  `date`, `double`, `geo_point`, `ip`, `keyword`, `long`, `lookup`.
+  Anything else is refused at index creation with the same
+  `mapper_parsing_exception` ES emits ("The mapper type [x] declared on
+  runtime field [f] does not exist…").
+
+  This cuts both ways, and both directions were wrong before:
+
+  - **Newly rejected.** Types that are perfectly valid *mapping
+    properties* but illegal under `runtime` — `text`, `match_only_text`,
+    `nested`, `object`, `geo_shape`, `shape`, `point`, `dense_vector`,
+    `sparse_vector`, `binary`, `percolator`, `completion`, `histogram`,
+    `alias`, `join`, `version`, `constant_keyword`, `wildcard`,
+    `date_nanos`, the range types, and the narrow numerics (`integer`,
+    `short`, `byte`, `float`, `half_float`, `scaled_float`,
+    `unsigned_long`, which collapse into `long`/`double` at runtime) —
+    used to be accepted with a `200`. **A mapping that declared any of
+    these under `mappings.runtime` will now fail to create.** Change the
+    entry to the runtime type ES would have required (usually `keyword`,
+    `long` or `double`), or move the field into `properties`.
+  - **Newly accepted.** `composite` and `lookup` are runtime-ONLY types
+    and are absent from the property list, so they were previously
+    rejected outright — even though `lookup` runtime fields are
+    implemented on the search path (via search-body `runtime_mappings`)
+    and covered by the conformance suite. Both are now accepted under
+    `mappings.runtime`.
+
+  Scope: this is `PUT /{index}` **validation** only. It does not change
+  evaluation: `mappings.runtime` is still stored and never evaluated —
+  runtime fields are only computed when supplied in the search body as
+  `runtime_mappings`. Search-body `runtime_mappings` and
+  `PUT /{index}/_mapping` still do not validate runtime types at all
+  (they never did) — unchanged here.
+
+  Prior to this, the rule was half-enforced: `flat_object`/`flattened`
+  were special-cased into a `400` while every other ES-forbidden type
+  passed.
+
 ## [1.0.0-rc.9] - 2026-08-01
 
 Ninth release candidate: the **cross-platform correctness release**.
