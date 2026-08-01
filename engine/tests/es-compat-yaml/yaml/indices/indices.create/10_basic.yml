@@ -285,6 +285,96 @@
   - match: { error.reason: "Failed to parse mapping: The mapper type [invalid] declared on runtime field [content] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation." }
 
 ---
+"Create index with a mapping-only type as a runtime field type":
+  # Runtime fields have their own, much smaller type registry than
+  # mapping properties: text/nested/geo_shape/dense_vector/binary/
+  # percolator/flattened and the narrow numerics are all valid property
+  # types and all rejected under `runtime`.
+  - do:
+      catch: bad_request
+      indices.create:
+        index: test_index
+        body:
+          mappings:
+            runtime:
+              content:
+                type: text
+
+  - match: { error.type: "mapper_parsing_exception" }
+  - match: { error.reason: "Failed to parse mapping: The mapper type [text] declared on runtime field [content] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation." }
+
+  - do:
+      catch: bad_request
+      indices.create:
+        index: test_index
+        body:
+          mappings:
+            runtime:
+              content:
+                type: integer
+
+  - match: { error.type: "mapper_parsing_exception" }
+  - match: { error.reason: "Failed to parse mapping: The mapper type [integer] declared on runtime field [content] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation." }
+
+  - do:
+      catch: bad_request
+      indices.create:
+        index: test_index
+        body:
+          mappings:
+            runtime:
+              content:
+                type: geo_shape
+
+  - match: { error.type: "mapper_parsing_exception" }
+  - match: { error.reason: "Failed to parse mapping: The mapper type [geo_shape] declared on runtime field [content] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation." }
+
+---
+"Create index with the supported runtime field types":
+  # The full registry: boolean, composite, date, double, geo_point, ip,
+  # keyword, long, lookup. `composite` and `lookup` are runtime-ONLY —
+  # they are not legal mapping property types.
+  - do:
+      indices.create:
+        index: test_index
+        body:
+          mappings:
+            runtime:
+              rt_boolean:
+                type: boolean
+              rt_composite:
+                type: composite
+                script:
+                  source: "emit('a', 1)"
+                fields:
+                  a:
+                    type: long
+              rt_date:
+                type: date
+              rt_double:
+                type: double
+              rt_geo_point:
+                type: geo_point
+              rt_ip:
+                type: ip
+              rt_keyword:
+                type: keyword
+              rt_long:
+                type: long
+              rt_lookup:
+                type: lookup
+                target_index: rt_lookup_target
+                input_field: rt_keyword
+                target_field: _id
+                fetch_fields: [ "city" ]
+
+  - do:
+      indices.get_mapping:
+        index: test_index
+
+  - is_true: test_index.mappings
+
+---
 "Create index with invalid multi-field type":
   - requires:
       cluster_features: [ "mapper.unknown_field_mapping_update_error_message" ]
