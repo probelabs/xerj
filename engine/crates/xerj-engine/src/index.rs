@@ -21458,7 +21458,8 @@ fn parse_passage_guard(ids: &Value) -> Option<HashSet<String>> {
 /// file descriptor instead of one per ingest shard — the ingest-shard count
 /// scales with CPU cores, so N indices held ~N×cores WAL fds open and exhausted
 /// the (low, ~256) macOS file-descriptor limit at a few hundred datasets.
-/// Absent => the global `engine.ingest_shards` default (backward compatible).
+/// Absent, or out of `1..=MAX_PER_INDEX_WAL_SHARDS` => the global
+/// `engine.ingest_shards` default (backward compatible).
 ///
 /// MUST be persisted at create and honored on open so the WAL *write* layout
 /// stays consistent (doc routing is `xxh3(id) & (num_shards-1)`). Replay itself
@@ -21469,9 +21470,18 @@ fn wal_shards_override_from_settings(settings: &Value) -> Option<usize> {
     settings
         .pointer("/index/xerj_ingest_shards")
         .and_then(Value::as_u64)
-        .filter(|&n| n >= 1)
+        .filter(|&n| (1..=MAX_PER_INDEX_WAL_SHARDS).contains(&n))
         .map(|n| n as usize)
 }
+
+/// Ceiling for the per-index override, mirroring the `engine.ingest_shards`
+/// limit enforced by `EngineConfig::validate`. The global setting is validated
+/// at startup; this one arrives in an index-create request body (es_compat
+/// threads `settings` through untouched) and `IndexStore::open` eagerly creates
+/// a directory and opens a WAL file descriptor per shard, so an unbounded value
+/// is a create-time fd exhaustion — the exact failure this setting exists to
+/// prevent.
+const MAX_PER_INDEX_WAL_SHARDS: u64 = 256;
 
 fn store_config_from(config: &Config, wal_shards_override: Option<usize>) -> IndexStoreConfig {
     let sync_mode = match config.storage.wal_sync {
@@ -32512,3 +32522,9 @@ mod flush_memory_integration_tests {
 // its own file (src/graph.rs) instead of growing this one.
 #[path = "graph.rs"]
 pub mod graph;
+
+// Child module (same `#[path]` reason as `graph`): the WAL-shard override
+// helpers are private free functions of this module.
+#[cfg(test)]
+#[path = "wal_shard_settings_tests.rs"]
+mod wal_shard_settings_tests;
