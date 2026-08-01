@@ -30,6 +30,16 @@
 //!   - `dotProduct(params.q, 'field')` over a numeric vector field
 //!   - `Math.max(a, b)`, `Math.min(a, b)`, `Math.abs(x)`, `Math.log(x)`,
 //!     `Math.sqrt(x)`, `Math.pow(a, b)`
+//! * Local functions and lambdas (needed by e.g. OpenSearch's UBI sample
+//!   dashboards, which filter via a `Supplier`-style boolean helper):
+//!   - top-level declarations `<type> name(<type> arg, ...) { ... }`
+//!   - no-arg-or-more lambda literals `(a, b) -> expr` / `(a, b) -> { ... }`,
+//!     stored as a closure value and invoked either by calling the
+//!     function/variable name directly (`compare(...)`) or via any
+//!     `.method(args)` call on a closure value (`s.get()`, `fn.apply(x)`,
+//!     ...) — the method name is ignored, only positional args matter,
+//!     which covers `Supplier`/`Function`/`BiFunction`/`Predicate` etc.
+//!     without hard-coding each functional interface.
 //!
 //! Anything outside that subset returns an error from `eval()`. Callers
 //! should fall back to a no-op score on script error.
@@ -48,6 +58,11 @@ pub enum PainlessValue {
     /// scripts. `.toString()` renders it in ES's HashMap-like format
     /// (`{key=value, key=value}`, keys alphabetically sorted).
     Object(serde_json::Map<String, Value>),
+    /// A local function or lambda value: parameter names + `Rc`-shared body
+    /// statements (cheap to clone — see [`Expr::Lambda`]). Invoked either
+    /// as a bare call (`name(args)`) or via any `.method(args)` call on the
+    /// value — see the module doc comment.
+    Closure(Vec<String>, std::rc::Rc<Vec<Stmt>>),
 }
 
 impl PainlessValue {
@@ -67,6 +82,9 @@ impl PainlessValue {
             PainlessValue::String(s) => !s.is_empty(),
             PainlessValue::Array(a) => !a.is_empty(),
             PainlessValue::Object(o) => !o.is_empty(),
+            // Never meaningfully compared in a valid script — a closure
+            // reference is truthy, matching "an object exists" semantics.
+            PainlessValue::Closure(..) => true,
         }
     }
     pub fn from_json(v: &Value) -> Self {
@@ -96,6 +114,19 @@ pub struct PainlessCtx<'a> {
     /// independently bounded by the parser, so it must not consume the exact
     /// [`MAX_EVAL_DEPTH`] expression budget.
     eval_depth: std::cell::Cell<usize>,
+    /// Current closure call-nesting depth (`call_closure` re-entering
+    /// `exec_stmt`/`eval_expr`). Bounded independently of `eval_depth`:
+    /// a closure's own statement nesting isn't charged against the
+    /// expression-eval budget at all (only the *call* that invoked it is),
+    /// so self-application recursion (`f(f, n)`) could otherwise re-enter
+    /// `exec_stmt` far past any native stack the eval-depth budget assumes.
+    call_depth: std::cell::Cell<usize>,
+    /// Total closure invocations across the whole script evaluation. Call
+    /// *depth* alone doesn't bound an exponential call *tree* — a script
+    /// like `g(g,n-1) + g(g,n-1) + g(g,n-1) + g(g,n-1)` never exceeds a
+    /// depth of ~n, but its invocation count is 4^n. This is the step
+    /// budget that catches that shape.
+    call_count: std::cell::Cell<usize>,
 }
 
 impl<'a> PainlessCtx<'a> {
@@ -106,6 +137,8 @@ impl<'a> PainlessCtx<'a> {
             score,
             emits: std::cell::RefCell::new(Vec::new()),
             eval_depth: std::cell::Cell::new(0),
+            call_depth: std::cell::Cell::new(0),
+            call_count: std::cell::Cell::new(0),
         }
     }
     pub fn take_emits(&self) -> Vec<PainlessValue> {
@@ -319,7 +352,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
 // ── AST ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-enum Expr {
+pub enum Expr {
     Number(f64),
     String(String),
     Bool(bool),
@@ -336,6 +369,13 @@ enum Expr {
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `var x = expr` (declare); `x = expr` (assign).
     Assign(String, Box<Expr>, bool /* is_decl */),
+    /// `(params) -> expr` / `(params) -> { stmts }` — a closure literal.
+    /// The body is `Rc`-shared (not owned `Vec<Stmt>`) so producing the
+    /// `PainlessValue::Closure` this evaluates to — which happens on every
+    /// evaluation of the literal, e.g. once per call when a closure is
+    /// itself an argument passed to a recursive call — is a cheap refcount
+    /// bump rather than a deep AST clone.
+    Lambda(Vec<String>, std::rc::Rc<Vec<Stmt>>),
 }
 
 /// Parser-only expression wrapper carrying the exact AST depth in O(1).
@@ -363,11 +403,16 @@ impl ParsedExpr {
 }
 
 #[derive(Debug, Clone)]
-enum Stmt {
+pub enum Stmt {
     Expr(Expr),
     Return(Option<Expr>),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     Block(Vec<Stmt>),
+    /// `<type> name(<type> param, ...) { body }` — a local function
+    /// declaration. Parameter/return types are parsed and discarded (the
+    /// interpreter is dynamically typed); only names and the body matter.
+    /// `Rc`-shared body for the same reason as [`Expr::Lambda`].
+    FnDecl(String, Vec<String>, std::rc::Rc<Vec<Stmt>>),
 }
 
 // ── Resource limits ──────────────────────────────────────────────────────────
@@ -401,6 +446,35 @@ pub(crate) const TOO_DEEP_MSG: &str = "compile error: script exceeds maximum nes
 /// cannot safely evaluate within [`MAX_EVAL_DEPTH`].
 pub(crate) const EVAL_TOO_DEEP_MSG: &str =
     "script evaluation exceeded maximum depth; split the expression into smaller statements";
+
+/// Maximum closure (local function / lambda) call-nesting depth.
+///
+/// Closure invocation re-enters `exec_stmt`/`eval_expr` from inside
+/// `eval_expr` itself (`call_closure` → `exec_body` → `exec_stmt`), and a
+/// closure body's own statement nesting is bounded by [`MAX_PARSE_DEPTH`]
+/// but NOT charged against [`MAX_EVAL_DEPTH`] at all — only the *call*
+/// expression that invoked the closure is. So self-application recursion
+/// (`def f = (g, n) -> g(g, n - 1); return f(f, 9);`) could otherwise
+/// re-enter `exec_stmt` up to `MAX_EVAL_DEPTH * MAX_PARSE_DEPTH` times
+/// (~50,000) before `eval_depth` ever objects, which is enough native
+/// stack frames to abort the process even in a release build. Kept small
+/// and independent of the expression budget.
+pub(crate) const MAX_CALL_DEPTH: usize = 32;
+
+/// Maximum total closure invocations across one script evaluation.
+///
+/// Call *depth* alone doesn't bound an exponential call *tree*: a script
+/// like `g(g,n-1) + g(g,n-1) + g(g,n-1) + g(g,n-1)` never exceeds a call
+/// depth of ~n (well under [`MAX_CALL_DEPTH`]), but its total invocation
+/// count is 4^n — measured at 262,144 invocations for n=9 in ~0.8s, with
+/// each unit of `n` multiplying the cost by 4. This is the step budget
+/// that bounds the call tree's total size rather than its depth.
+pub(crate) const MAX_CALL_COUNT: usize = 10_000;
+
+/// Sentinel returned when [`MAX_CALL_DEPTH`] or [`MAX_CALL_COUNT`] is
+/// exceeded.
+pub(crate) const TOO_MANY_CALLS_MSG: &str =
+    "script exceeded the maximum closure call depth or invocation count";
 
 // ── Parser ───────────────────────────────────────────────────────────────────
 
@@ -523,6 +597,11 @@ impl<'a> Parser<'a> {
                     Some(Tok::Ident(n)) => n,
                     other => return Err(format!("expected identifier after type got {:?}", other)),
                 };
+                if self.match_punct('(') {
+                    let params = self.parse_fn_params()?;
+                    let body = self.parse_block_or_stmt()?;
+                    return Ok(Stmt::FnDecl(name, params, std::rc::Rc::new(body)));
+                }
                 if !self.match_punct('=') {
                     return Err(format!("expected '=' after var name '{}'", name));
                 }
@@ -783,7 +862,103 @@ impl<'a> Parser<'a> {
             other => Err(format!("expected '{}' got {:?}", end, other)),
         }
     }
+    /// Parameter list for a local function declaration: `(<type> name, ...)`,
+    /// with the opening `(` already consumed. Types are accepted (any
+    /// Ident or Keyword token) and discarded — only names are kept.
+    fn parse_fn_params(&mut self) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        if let Some(Tok::Punct(')')) = self.peek() {
+            self.pos += 1;
+            return Ok(names);
+        }
+        loop {
+            match self.eat() {
+                Some(Tok::Ident(_)) | Some(Tok::Keyword(_)) => {}
+                other => return Err(format!("expected parameter type, got {:?}", other)),
+            }
+            let name = match self.eat() {
+                Some(Tok::Ident(n)) => n,
+                other => return Err(format!("expected parameter name, got {:?}", other)),
+            };
+            names.push(name);
+            if self.match_punct(',') {
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        Ok(names)
+    }
+    /// Try to parse a lambda literal `(a, b, ...) -> expr` / `-> { stmts }`
+    /// starting at the current position (which must be at `(`). Backtracks
+    /// (restores `self.pos`) and returns `None` on any mismatch, so the
+    /// caller falls back to treating `(` as a parenthesized sub-expression —
+    /// the two forms share the same opening token and are only
+    /// distinguishable by what follows the matching `)`.
+    ///
+    /// The lambda's own body is depth-guarded independently (its statements
+    /// go through the normal `parse_stmt`/descend-ascend path), so the
+    /// resulting literal is a leaf from the enclosing expression's depth
+    /// budget — it does not consume any of the caller's `ParsedExpr` depth.
+    fn try_parse_lambda(&mut self) -> Result<Option<ParsedExpr>, String> {
+        let save = self.pos;
+        self.pos += 1; // consume '('
+        let mut params = Vec::new();
+        if let Some(Tok::Punct(')')) = self.peek() {
+            self.pos += 1;
+        } else {
+            loop {
+                match self.peek().cloned() {
+                    Some(Tok::Ident(n)) => {
+                        self.pos += 1;
+                        params.push(n);
+                    }
+                    _ => {
+                        self.pos = save;
+                        return Ok(None);
+                    }
+                }
+                if let Some(Tok::Punct(',')) = self.peek() {
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Some(Tok::Punct(')'))) {
+                self.pos = save;
+                return Ok(None);
+            }
+            self.pos += 1; // consume ')'
+        }
+        match self.peek() {
+            Some(Tok::PunctMulti(s)) if s == "->" => {
+                self.pos += 1;
+            }
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        }
+        // Once `->` is consumed, this MUST be a lambda — there is no other
+        // valid parse of `(params) ->` in this grammar. So unlike the
+        // mismatches above, any error from here (including the parse-depth
+        // sentinel) is a genuine error to propagate, not a reason to
+        // backtrack and let the caller misparse `(` as a parenthesized
+        // expression instead — silently swallowing the depth-limit
+        // sentinel here would defeat `check_script_limits`'s up-front 400
+        // for a script whose lambda body is what makes it too deep.
+        let body = self.parse_block_or_stmt()?;
+        Ok(Some(ParsedExpr::leaf(Expr::Lambda(
+            params,
+            std::rc::Rc::new(body),
+        ))))
+    }
     fn parse_primary(&mut self) -> Result<ParsedExpr, String> {
+        if matches!(self.peek(), Some(Tok::Punct('('))) {
+            if let Some(lambda) = self.try_parse_lambda()? {
+                return Ok(lambda);
+            }
+        }
         match self.eat() {
             Some(Tok::Number(n)) => Ok(ParsedExpr::leaf(Expr::Number(n))),
             Some(Tok::String(s)) => Ok(ParsedExpr::leaf(Expr::String(s))),
@@ -838,6 +1013,32 @@ impl Drop for EvalDepthGuard<'_> {
     }
 }
 
+/// RAII guard bounding closure call nesting AND total invocation count,
+/// independent of [`EvalDepthGuard`] — see [`MAX_CALL_DEPTH`] and
+/// [`MAX_CALL_COUNT`] for why expression-eval depth alone doesn't cover
+/// either the call-tree depth or its total size.
+struct CallGuard<'a>(&'a std::cell::Cell<usize>);
+impl<'a> CallGuard<'a> {
+    fn enter(ctx: &'a PainlessCtx) -> Result<Self, String> {
+        let depth = ctx.call_depth.get();
+        if depth >= MAX_CALL_DEPTH {
+            return Err(TOO_MANY_CALLS_MSG.to_string());
+        }
+        let count = ctx.call_count.get();
+        if count >= MAX_CALL_COUNT {
+            return Err(TOO_MANY_CALLS_MSG.to_string());
+        }
+        ctx.call_depth.set(depth + 1);
+        ctx.call_count.set(count + 1);
+        Ok(CallGuard(&ctx.call_depth))
+    }
+}
+impl Drop for CallGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
 /// Validate a script against the parser/length resource limits WITHOUT running
 /// it, so the request layer can reject an abusive script with a 400 up front.
 ///
@@ -879,20 +1080,52 @@ pub fn eval_painless(src: &str, ctx: &PainlessCtx) -> Result<PainlessValue, Stri
     let mut p = Parser::new(&toks);
     let stmts = p.parse_program()?;
     let mut env: HashMap<String, PainlessValue> = HashMap::new();
-    let mut ret: Option<PainlessValue> = None;
+    exec_body(&stmts, ctx, &mut env)
+}
+
+/// Run a statement list with implicit-last-value return semantics: an
+/// explicit `return X;` short-circuits with `X`; otherwise the value of the
+/// last executed statement is returned. Shared by the top-level script body
+/// and by closure (local function / lambda) invocation.
+fn exec_body(
+    stmts: &[Stmt],
+    ctx: &PainlessCtx,
+    env: &mut HashMap<String, PainlessValue>,
+) -> Result<PainlessValue, String> {
     let mut last: PainlessValue = PainlessValue::Null;
-    for stmt in &stmts {
-        match exec_stmt(stmt, ctx, &mut env)? {
-            ExecOutcome::Return(v) => {
-                ret = Some(v);
-                break;
-            }
-            ExecOutcome::Value(v) => {
-                last = v;
-            }
+    for stmt in stmts {
+        match exec_stmt(stmt, ctx, env)? {
+            ExecOutcome::Return(v) => return Ok(v),
+            ExecOutcome::Value(v) => last = v,
         }
     }
-    Ok(ret.unwrap_or(last))
+    Ok(last)
+}
+
+/// Invoke a closure (local function or lambda) with the given positional
+/// arguments, in a fresh scope seeded only with the bound parameters — no
+/// access to the caller's locals, matching the target scripts' needs
+/// (functional-interface bodies only ever reference `doc`/`params`/`_score`,
+/// which come from `ctx`, not the enclosing `env`).
+fn call_closure(
+    params: &[String],
+    body: &[Stmt],
+    args: &[PainlessValue],
+    ctx: &PainlessCtx,
+) -> Result<PainlessValue, String> {
+    let _guard = CallGuard::enter(ctx)?;
+    if args.len() != params.len() {
+        return Err(format!(
+            "wrong number of arguments: expected {}, got {}",
+            params.len(),
+            args.len()
+        ));
+    }
+    let mut local_env: HashMap<String, PainlessValue> = HashMap::new();
+    for (p, a) in params.iter().zip(args.iter()) {
+        local_env.insert(p.clone(), a.clone());
+    }
+    exec_body(body, ctx, &mut local_env)
 }
 
 enum ExecOutcome {
@@ -934,6 +1167,13 @@ fn exec_stmt(
             }
             Ok(ExecOutcome::Value(PainlessValue::Null))
         }
+        Stmt::FnDecl(name, params, body) => {
+            env.insert(
+                name.clone(),
+                PainlessValue::Closure(params.clone(), body.clone()),
+            );
+            Ok(ExecOutcome::Value(PainlessValue::Null))
+        }
     }
 }
 
@@ -964,6 +1204,7 @@ fn eval_expr(
             env.insert(name.clone(), v.clone());
             Ok(v)
         }
+        Expr::Lambda(params, body) => Ok(PainlessValue::Closure(params.clone(), body.clone())),
         Expr::Unary(op, x) => {
             let v = eval_expr(x, ctx, env)?;
             match op.as_str() {
@@ -987,6 +1228,11 @@ fn eval_expr(
                 .iter()
                 .map(|a| eval_expr(a, ctx, env))
                 .collect::<Result<_, _>>()?;
+            // A local function (or a variable bound to a lambda) shadows
+            // the builtin call table.
+            if let Some(PainlessValue::Closure(params, body)) = env.get(name) {
+                return call_closure(params, body, &argvs, ctx);
+            }
             global_call(name, &argvs, ctx)
         }
     }
@@ -1156,6 +1402,22 @@ fn eval_member_value(
     ctx: &PainlessCtx,
     env: &mut HashMap<String, PainlessValue>,
 ) -> Result<PainlessValue, String> {
+    // Functional-interface call on a closure value — `s.get()`,
+    // `fn.apply(x)`, `pred.test(x)`, ... The interface method name is
+    // irrelevant to a dynamically-typed interpreter; only the positional
+    // args matter, so any `.method(args)` call on a closure invokes it. A
+    // member access with no call parens (`s.get` without `()`) doesn't
+    // invoke anything real Painless functional interfaces expose, so it
+    // falls through to the error below same as today.
+    if let PainlessValue::Closure(params, body) = &value {
+        if let Some(args) = args {
+            let argvs: Vec<PainlessValue> = args
+                .iter()
+                .map(|a| eval_expr(a, ctx, env))
+                .collect::<Result<_, _>>()?;
+            return call_closure(params, body, &argvs, ctx);
+        }
+    }
     if let PainlessValue::String(text) = &value {
         if let Some(field) = text.strip_prefix("__docref__:") {
             return resolve_doc_member(ctx, field, member, args, env);
@@ -1679,6 +1941,150 @@ mod tests {
         let params = json!({});
         let v = eval_painless("Math.max(1.5, 2.5)", &ctx(&doc, &params, 0.0)).unwrap();
         assert!((v.as_f64().unwrap() - 2.5).abs() < 1e-9);
+    }
+
+    // ── Local functions and lambdas ───────────────────────────────────────────
+    // Needed by e.g. OpenSearch's UBI sample dashboards, which filter via a
+    // Supplier-style boolean helper (either a top-level local function or a
+    // lambda literal bound to a variable).
+
+    #[test]
+    fn local_function_declaration_and_call() {
+        let doc = json!({});
+        let params = json!({});
+        let src = "boolean isEven(int n) { return n % 2 == 0; } return isEven(4);";
+        let v = eval_painless(src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert!(v.as_bool());
+    }
+
+    #[test]
+    fn local_function_false_branch() {
+        let doc = json!({});
+        let params = json!({});
+        let src = "boolean isEven(int n) { return n % 2 == 0; } return isEven(3);";
+        let v = eval_painless(src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert!(!v.as_bool());
+    }
+
+    #[test]
+    fn lambda_literal_bare_call() {
+        let doc = json!({});
+        let params = json!({});
+        let v = eval_painless(
+            "def add = (a, b) -> a + b; return add(2, 3);",
+            &ctx(&doc, &params, 0.0),
+        )
+        .unwrap();
+        assert!((v.as_f64().unwrap() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lambda_block_body() {
+        let doc = json!({});
+        let params = json!({});
+        let src = "def f = (x) -> { double y = x * 2; return y + 1; }; return f(10);";
+        let v = eval_painless(src, &ctx(&doc, &params, 0.0)).unwrap();
+        assert!((v.as_f64().unwrap() - 21.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lambda_invoked_via_functional_interface_method() {
+        // Any `.method(args)` call on a closure value invokes it regardless
+        // of the method name — covers Supplier::get, Function::apply,
+        // Predicate::test, etc. without hard-coding each interface.
+        let doc = json!({});
+        let params = json!({});
+        let v = eval_painless(
+            "def s = () -> true; return s.get();",
+            &ctx(&doc, &params, 0.0),
+        )
+        .unwrap();
+        assert!(v.as_bool());
+
+        let v2 = eval_painless(
+            "def doubler = (x) -> x * 2; return doubler.apply(21);",
+            &ctx(&doc, &params, 0.0),
+        )
+        .unwrap();
+        assert!((v2.as_f64().unwrap() - 42.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lambda_no_access_to_enclosing_locals() {
+        // Closures are invoked in a fresh scope seeded only with the bound
+        // parameters — they can't see the caller's other local variables.
+        let doc = json!({});
+        let params = json!({});
+        let src = "int secret = 99; def f = () -> secret; return f();";
+        let r = eval_painless(src, &ctx(&doc, &params, 0.0));
+        assert!(r.is_err(), "expected an error, got {:?}", r);
+    }
+
+    #[test]
+    fn closure_as_top_level_result_is_not_a_valid_value() {
+        // Returning a bare function value from a script (rather than
+        // invoking it) has no scalar/JSON representation.
+        let doc = json!({});
+        let params = json!({});
+        let v = eval_painless("def f = () -> 1; return f;", &ctx(&doc, &params, 0.0)).unwrap();
+        assert!(matches!(v, PainlessValue::Closure(..)));
+    }
+
+    #[test]
+    fn wrong_arity_call_errors_instead_of_defaulting_to_null() {
+        let doc = json!({});
+        let params = json!({});
+        let r = eval_painless(
+            "def f = (a, b) -> a + b; return f(1);",
+            &ctx(&doc, &params, 0.0),
+        );
+        assert!(r.is_err(), "expected an arity error, got {:?}", r);
+    }
+
+    // ── Closure call-depth / call-count guards ─────────────────────────────────
+    // Regression tests for a real crash: `EvalDepthGuard` only bounds
+    // expression-eval recursion, not closure *call* nesting or the total
+    // size of an exponential call tree. Both of these MUST return an `Err`
+    // — if the guard regresses, the test process itself stack-overflows (or
+    // takes minutes) and aborts/hangs, a hard failure either way.
+
+    #[test]
+    fn self_application_with_nested_statement_body_does_not_abort() {
+        // Mirrors the exact shape that stack-overflowed in release: a
+        // closure passed as its own argument (`f(f, n)`), with a body
+        // containing enough nested `if` blocks that MAX_PARSE_DEPTH's
+        // per-call statement-nesting cost, multiplied across many calls
+        // via MAX_EVAL_DEPTH, would otherwise blow the native stack before
+        // any depth guard fired.
+        let doc = json!({});
+        let params = json!({});
+        let nested_ifs = "if(true){".repeat(10) + "1" + &"}".repeat(10);
+        let src = format!(
+            "def f = (g, n) -> {{ if(true) {{ {nested_ifs} return g(g, n); }} return 0; }}; return f(f, 1);"
+        );
+        let r = eval_painless(&src, &ctx(&doc, &params, 0.0));
+        assert!(
+            r.is_err(),
+            "expected the call-depth guard to trip, got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn exponential_call_tree_is_bounded_not_a_hang() {
+        // Call depth here never exceeds ~9 (n counts down to 0), so
+        // MAX_CALL_DEPTH alone would never fire — it's the total
+        // invocation count (4^n) that must be bounded.
+        let doc = json!({});
+        let params = json!({});
+        let src =
+            "def f = (g, n) -> n <= 0 ? 1 : g(g,n-1) + g(g,n-1) + g(g,n-1) + g(g,n-1); return f(f, 9);";
+        let r = eval_painless(src, &ctx(&doc, &params, 0.0));
+        assert!(
+            r.is_err(),
+            "expected the call-count guard to trip, got {:?}",
+            r
+        );
     }
 
     // ── Resource-limit / stack-overflow guards ───────────────────────────────

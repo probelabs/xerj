@@ -7645,6 +7645,11 @@ fn painless_value_to_json(v: crate::painless::PainlessValue) -> Value {
         P::String(s) => Value::String(s),
         P::Array(a) => Value::Array(a.into_iter().map(painless_value_to_json).collect()),
         P::Object(o) => Value::Object(o),
+        // A script's top-level result is never meaningfully a function
+        // value (bucket keys / scripted_metric emits are always scalars,
+        // arrays, or objects) — fails closed like a script error, rather
+        // than panicking on a case ES itself never produces either.
+        P::Closure(..) => Value::Null,
     }
 }
 
