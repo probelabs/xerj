@@ -58,10 +58,11 @@ pub enum PainlessValue {
     /// scripts. `.toString()` renders it in ES's HashMap-like format
     /// (`{key=value, key=value}`, keys alphabetically sorted).
     Object(serde_json::Map<String, Value>),
-    /// A local function or lambda value: parameter names + body statements.
-    /// Invoked either as a bare call (`name(args)`) or via any
-    /// `.method(args)` call on the value — see the module doc comment.
-    Closure(Vec<String>, Vec<Stmt>),
+    /// A local function or lambda value: parameter names + `Rc`-shared body
+    /// statements (cheap to clone — see [`Expr::Lambda`]). Invoked either
+    /// as a bare call (`name(args)`) or via any `.method(args)` call on the
+    /// value — see the module doc comment.
+    Closure(Vec<String>, std::rc::Rc<Vec<Stmt>>),
 }
 
 impl PainlessValue {
@@ -113,6 +114,19 @@ pub struct PainlessCtx<'a> {
     /// independently bounded by the parser, so it must not consume the exact
     /// [`MAX_EVAL_DEPTH`] expression budget.
     eval_depth: std::cell::Cell<usize>,
+    /// Current closure call-nesting depth (`call_closure` re-entering
+    /// `exec_stmt`/`eval_expr`). Bounded independently of `eval_depth`:
+    /// a closure's own statement nesting isn't charged against the
+    /// expression-eval budget at all (only the *call* that invoked it is),
+    /// so self-application recursion (`f(f, n)`) could otherwise re-enter
+    /// `exec_stmt` far past any native stack the eval-depth budget assumes.
+    call_depth: std::cell::Cell<usize>,
+    /// Total closure invocations across the whole script evaluation. Call
+    /// *depth* alone doesn't bound an exponential call *tree* — a script
+    /// like `g(g,n-1) + g(g,n-1) + g(g,n-1) + g(g,n-1)` never exceeds a
+    /// depth of ~n, but its invocation count is 4^n. This is the step
+    /// budget that catches that shape.
+    call_count: std::cell::Cell<usize>,
 }
 
 impl<'a> PainlessCtx<'a> {
@@ -123,6 +137,8 @@ impl<'a> PainlessCtx<'a> {
             score,
             emits: std::cell::RefCell::new(Vec::new()),
             eval_depth: std::cell::Cell::new(0),
+            call_depth: std::cell::Cell::new(0),
+            call_count: std::cell::Cell::new(0),
         }
     }
     pub fn take_emits(&self) -> Vec<PainlessValue> {
@@ -354,7 +370,12 @@ pub enum Expr {
     /// `var x = expr` (declare); `x = expr` (assign).
     Assign(String, Box<Expr>, bool /* is_decl */),
     /// `(params) -> expr` / `(params) -> { stmts }` — a closure literal.
-    Lambda(Vec<String>, Vec<Stmt>),
+    /// The body is `Rc`-shared (not owned `Vec<Stmt>`) so producing the
+    /// `PainlessValue::Closure` this evaluates to — which happens on every
+    /// evaluation of the literal, e.g. once per call when a closure is
+    /// itself an argument passed to a recursive call — is a cheap refcount
+    /// bump rather than a deep AST clone.
+    Lambda(Vec<String>, std::rc::Rc<Vec<Stmt>>),
 }
 
 /// Parser-only expression wrapper carrying the exact AST depth in O(1).
@@ -390,7 +411,8 @@ pub enum Stmt {
     /// `<type> name(<type> param, ...) { body }` — a local function
     /// declaration. Parameter/return types are parsed and discarded (the
     /// interpreter is dynamically typed); only names and the body matter.
-    FnDecl(String, Vec<String>, Vec<Stmt>),
+    /// `Rc`-shared body for the same reason as [`Expr::Lambda`].
+    FnDecl(String, Vec<String>, std::rc::Rc<Vec<Stmt>>),
 }
 
 // ── Resource limits ──────────────────────────────────────────────────────────
@@ -424,6 +446,35 @@ pub(crate) const TOO_DEEP_MSG: &str = "compile error: script exceeds maximum nes
 /// cannot safely evaluate within [`MAX_EVAL_DEPTH`].
 pub(crate) const EVAL_TOO_DEEP_MSG: &str =
     "script evaluation exceeded maximum depth; split the expression into smaller statements";
+
+/// Maximum closure (local function / lambda) call-nesting depth.
+///
+/// Closure invocation re-enters `exec_stmt`/`eval_expr` from inside
+/// `eval_expr` itself (`call_closure` → `exec_body` → `exec_stmt`), and a
+/// closure body's own statement nesting is bounded by [`MAX_PARSE_DEPTH`]
+/// but NOT charged against [`MAX_EVAL_DEPTH`] at all — only the *call*
+/// expression that invoked the closure is. So self-application recursion
+/// (`def f = (g, n) -> g(g, n - 1); return f(f, 9);`) could otherwise
+/// re-enter `exec_stmt` up to `MAX_EVAL_DEPTH * MAX_PARSE_DEPTH` times
+/// (~50,000) before `eval_depth` ever objects, which is enough native
+/// stack frames to abort the process even in a release build. Kept small
+/// and independent of the expression budget.
+pub(crate) const MAX_CALL_DEPTH: usize = 32;
+
+/// Maximum total closure invocations across one script evaluation.
+///
+/// Call *depth* alone doesn't bound an exponential call *tree*: a script
+/// like `g(g,n-1) + g(g,n-1) + g(g,n-1) + g(g,n-1)` never exceeds a call
+/// depth of ~n (well under [`MAX_CALL_DEPTH`]), but its total invocation
+/// count is 4^n — measured at 262,144 invocations for n=9 in ~0.8s, with
+/// each unit of `n` multiplying the cost by 4. This is the step budget
+/// that bounds the call tree's total size rather than its depth.
+pub(crate) const MAX_CALL_COUNT: usize = 10_000;
+
+/// Sentinel returned when [`MAX_CALL_DEPTH`] or [`MAX_CALL_COUNT`] is
+/// exceeded.
+pub(crate) const TOO_MANY_CALLS_MSG: &str =
+    "script exceeded the maximum closure call depth or invocation count";
 
 // ── Parser ───────────────────────────────────────────────────────────────────
 
@@ -549,7 +600,7 @@ impl<'a> Parser<'a> {
                 if self.match_punct('(') {
                     let params = self.parse_fn_params()?;
                     let body = self.parse_block_or_stmt()?;
-                    return Ok(Stmt::FnDecl(name, params, body));
+                    return Ok(Stmt::FnDecl(name, params, std::rc::Rc::new(body)));
                 }
                 if !self.match_punct('=') {
                     return Err(format!("expected '=' after var name '{}'", name));
@@ -849,7 +900,7 @@ impl<'a> Parser<'a> {
     /// go through the normal `parse_stmt`/descend-ascend path), so the
     /// resulting literal is a leaf from the enclosing expression's depth
     /// budget — it does not consume any of the caller's `ParsedExpr` depth.
-    fn try_parse_lambda(&mut self) -> Option<ParsedExpr> {
+    fn try_parse_lambda(&mut self) -> Result<Option<ParsedExpr>, String> {
         let save = self.pos;
         self.pos += 1; // consume '('
         let mut params = Vec::new();
@@ -864,7 +915,7 @@ impl<'a> Parser<'a> {
                     }
                     _ => {
                         self.pos = save;
-                        return None;
+                        return Ok(None);
                     }
                 }
                 if let Some(Tok::Punct(',')) = self.peek() {
@@ -875,7 +926,7 @@ impl<'a> Parser<'a> {
             }
             if !matches!(self.peek(), Some(Tok::Punct(')'))) {
                 self.pos = save;
-                return None;
+                return Ok(None);
             }
             self.pos += 1; // consume ')'
         }
@@ -885,20 +936,26 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 self.pos = save;
-                return None;
+                return Ok(None);
             }
         }
-        match self.parse_block_or_stmt() {
-            Ok(body) => Some(ParsedExpr::leaf(Expr::Lambda(params, body))),
-            Err(_) => {
-                self.pos = save;
-                None
-            }
-        }
+        // Once `->` is consumed, this MUST be a lambda — there is no other
+        // valid parse of `(params) ->` in this grammar. So unlike the
+        // mismatches above, any error from here (including the parse-depth
+        // sentinel) is a genuine error to propagate, not a reason to
+        // backtrack and let the caller misparse `(` as a parenthesized
+        // expression instead — silently swallowing the depth-limit
+        // sentinel here would defeat `check_script_limits`'s up-front 400
+        // for a script whose lambda body is what makes it too deep.
+        let body = self.parse_block_or_stmt()?;
+        Ok(Some(ParsedExpr::leaf(Expr::Lambda(
+            params,
+            std::rc::Rc::new(body),
+        ))))
     }
     fn parse_primary(&mut self) -> Result<ParsedExpr, String> {
         if matches!(self.peek(), Some(Tok::Punct('('))) {
-            if let Some(lambda) = self.try_parse_lambda() {
+            if let Some(lambda) = self.try_parse_lambda()? {
                 return Ok(lambda);
             }
         }
@@ -951,6 +1008,32 @@ impl<'a> EvalDepthGuard<'a> {
     }
 }
 impl Drop for EvalDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
+/// RAII guard bounding closure call nesting AND total invocation count,
+/// independent of [`EvalDepthGuard`] — see [`MAX_CALL_DEPTH`] and
+/// [`MAX_CALL_COUNT`] for why expression-eval depth alone doesn't cover
+/// either the call-tree depth or its total size.
+struct CallGuard<'a>(&'a std::cell::Cell<usize>);
+impl<'a> CallGuard<'a> {
+    fn enter(ctx: &'a PainlessCtx) -> Result<Self, String> {
+        let depth = ctx.call_depth.get();
+        if depth >= MAX_CALL_DEPTH {
+            return Err(TOO_MANY_CALLS_MSG.to_string());
+        }
+        let count = ctx.call_count.get();
+        if count >= MAX_CALL_COUNT {
+            return Err(TOO_MANY_CALLS_MSG.to_string());
+        }
+        ctx.call_depth.set(depth + 1);
+        ctx.call_count.set(count + 1);
+        Ok(CallGuard(&ctx.call_depth))
+    }
+}
+impl Drop for CallGuard<'_> {
     fn drop(&mut self) {
         self.0.set(self.0.get().saturating_sub(1));
     }
@@ -1030,12 +1113,17 @@ fn call_closure(
     args: &[PainlessValue],
     ctx: &PainlessCtx,
 ) -> Result<PainlessValue, String> {
+    let _guard = CallGuard::enter(ctx)?;
+    if args.len() != params.len() {
+        return Err(format!(
+            "wrong number of arguments: expected {}, got {}",
+            params.len(),
+            args.len()
+        ));
+    }
     let mut local_env: HashMap<String, PainlessValue> = HashMap::new();
-    for (i, p) in params.iter().enumerate() {
-        local_env.insert(
-            p.clone(),
-            args.get(i).cloned().unwrap_or(PainlessValue::Null),
-        );
+    for (p, a) in params.iter().zip(args.iter()) {
+        local_env.insert(p.clone(), a.clone());
     }
     exec_body(body, ctx, &mut local_env)
 }
@@ -1940,6 +2028,63 @@ mod tests {
         let params = json!({});
         let v = eval_painless("def f = () -> 1; return f;", &ctx(&doc, &params, 0.0)).unwrap();
         assert!(matches!(v, PainlessValue::Closure(..)));
+    }
+
+    #[test]
+    fn wrong_arity_call_errors_instead_of_defaulting_to_null() {
+        let doc = json!({});
+        let params = json!({});
+        let r = eval_painless(
+            "def f = (a, b) -> a + b; return f(1);",
+            &ctx(&doc, &params, 0.0),
+        );
+        assert!(r.is_err(), "expected an arity error, got {:?}", r);
+    }
+
+    // ── Closure call-depth / call-count guards ─────────────────────────────────
+    // Regression tests for a real crash: `EvalDepthGuard` only bounds
+    // expression-eval recursion, not closure *call* nesting or the total
+    // size of an exponential call tree. Both of these MUST return an `Err`
+    // — if the guard regresses, the test process itself stack-overflows (or
+    // takes minutes) and aborts/hangs, a hard failure either way.
+
+    #[test]
+    fn self_application_with_nested_statement_body_does_not_abort() {
+        // Mirrors the exact shape that stack-overflowed in release: a
+        // closure passed as its own argument (`f(f, n)`), with a body
+        // containing enough nested `if` blocks that MAX_PARSE_DEPTH's
+        // per-call statement-nesting cost, multiplied across many calls
+        // via MAX_EVAL_DEPTH, would otherwise blow the native stack before
+        // any depth guard fired.
+        let doc = json!({});
+        let params = json!({});
+        let nested_ifs = "if(true){".repeat(10) + "1" + &"}".repeat(10);
+        let src = format!(
+            "def f = (g, n) -> {{ if(true) {{ {nested_ifs} return g(g, n); }} return 0; }}; return f(f, 1);"
+        );
+        let r = eval_painless(&src, &ctx(&doc, &params, 0.0));
+        assert!(
+            r.is_err(),
+            "expected the call-depth guard to trip, got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn exponential_call_tree_is_bounded_not_a_hang() {
+        // Call depth here never exceeds ~9 (n counts down to 0), so
+        // MAX_CALL_DEPTH alone would never fire — it's the total
+        // invocation count (4^n) that must be bounded.
+        let doc = json!({});
+        let params = json!({});
+        let src =
+            "def f = (g, n) -> n <= 0 ? 1 : g(g,n-1) + g(g,n-1) + g(g,n-1) + g(g,n-1); return f(f, 9);";
+        let r = eval_painless(src, &ctx(&doc, &params, 0.0));
+        assert!(
+            r.is_err(),
+            "expected the call-count guard to trip, got {:?}",
+            r
+        );
     }
 
     // ── Resource-limit / stack-overflow guards ───────────────────────────────
