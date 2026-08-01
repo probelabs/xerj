@@ -4237,6 +4237,152 @@ pub(crate) fn render_iso_date(
     dt_utc.format(&fmt).to_string()
 }
 
+/// Shortest prefix the `%Y-%m-%dT%H:%M:%S` part of the no-colon zone-offset
+/// pattern can consume.
+///
+/// chrono parses numeric fields greedily but with a *minimum* width of one
+/// digit, so the smallest input that pattern accepts is `5-1-2T3:4:5` — 11
+/// bytes. Nothing that can precede the offset (the optional `%.f`, the
+/// whitespace chrono skips before a numeric field, a signed or wider year)
+/// shortens that prefix; all of them only push the offset further right.
+const DATE_TIME_PREFIX_MIN_LEN: usize = 11;
+
+/// Bytes a `%z` offset needs after its sign: two for the hours and two for
+/// the minutes, both mandatory (`allow_missing_minutes` is off for `%z`).
+const ZONE_OFFSET_MIN_TAIL: usize = 4;
+
+/// Separator bytes the probe window budgets for between the offset's hours
+/// and its minutes — one, which is all the spellings `%z` accepts need.
+///
+/// chrono's separator scanner trims a *run* of colons and whitespace, so
+/// `+00:::00` and `+00 : 00` are legal too and put their sign further left
+/// than any constant window can reach. [`may_carry_zone_offset`] answers those
+/// by over-matching rather than by chasing the run, which is what keeps it
+/// O(1) — see there.
+const ZONE_OFFSET_MAX_SEPARATORS: usize = 1;
+
+/// Width of the fixed window at the end of a value that
+/// [`may_carry_zone_offset`] reads: the sign, `HH`, the separator budget, `MM`.
+///
+/// `%z` closes the pattern and `parse_from_str` insists the whole value be
+/// consumed, so a `%z` offset is pinned to the *end* of the value — which is
+/// what makes a constant-width window possible at all. Spellings it covers
+/// exactly, with where each puts its sign:
+///
+/// | spelling  | sign at   |
+/// |-----------|-----------|
+/// | `±HHMM`   | `len - 5` |
+/// | `±HH:MM`  | `len - 6` |
+/// | `±HH MM`  | `len - 6` |
+///
+/// `−` MINUS SIGN (U+2212) spells its sign in three bytes, of which only the
+/// last lands in the window; the high-bit test in [`is_zone_offset_sign`]
+/// catches it there. `±HH` on its own is *not* a spelling `%z` accepts —
+/// `allow_missing_minutes` is off, so chrono rejects a value that stops after
+/// the hours whatever this probe says.
+const ZONE_OFFSET_PROBE_BYTES: usize = 1 + 2 + ZONE_OFFSET_MAX_SEPARATORS + 2;
+
+/// The window is a constant, not a function of the value: that is the whole
+/// point of it, so pin it at compile time.
+const _: () = assert!(ZONE_OFFSET_PROBE_BYTES == 6);
+
+/// Could this byte be the sign that opens a `%z` zone offset?
+///
+/// chrono accepts `+` (U+002B), `-` (U+002D) and MINUS SIGN (U+2212). The
+/// subtraction also matches `,` (U+002C) and the high-bit test matches every
+/// non-ASCII byte rather than just U+2212's trailing byte — both over-match on
+/// purpose, see [`may_carry_zone_offset`].
+#[inline(always)]
+fn is_zone_offset_sign(c: u8) -> bool {
+    c.wrapping_sub(b'+') <= 2 || c >= 0x80
+}
+
+/// Could this byte sit between a `%z` offset's hours and its minutes?
+///
+/// chrono trims a run of `:` and *any* Unicode whitespace there, so the ASCII
+/// set is `:` plus `\t\n\x0b\x0c\r` and space. The high-bit test stands in for
+/// the non-ASCII whitespace (and for any other byte of a multi-byte char)
+/// instead of decoding it — over-matching on purpose, as above.
+#[inline(always)]
+fn is_zone_offset_separator(c: u8) -> bool {
+    matches!(c, b':' | b' ' | 0x09..=0x0d) || c >= 0x80
+}
+
+/// Cheap shape probe: could `s` possibly carry a trailing numeric zone offset
+/// that `%z` would accept?
+///
+/// Answering costs a length check and a look at the last
+/// [`ZONE_OFFSET_PROBE_BYTES`] bytes — no scan, and no dependence on how long
+/// `s` is. That matters because this runs per date field per document and
+/// field values are arbitrary strings: an earlier cut of this guard hunted for
+/// the sign across `[11, len - 5)`, which is O(len), and left a 64 KB value
+/// ~19x *slower* to reject than it had been with no guard at all.
+///
+/// A constant window is enough because `%z` ends the pattern and
+/// `parse_from_str` requires the whole value to be consumed, so an accepted
+/// value ends with the offset's two minute digits and everything the offset
+/// needs sits at a fixed distance from that end.
+///
+/// The probe is deliberately one-sided: a false positive only pays for the
+/// parse that would have run anyway, whereas a false negative would change
+/// results, so every judgement call here over-matches.
+fn may_carry_zone_offset(s: &str) -> bool {
+    let b = s.as_bytes();
+    // Shortest value the pattern can accept at all: the datetime prefix, the
+    // sign, and `HHMM`.
+    if b.len() < DATE_TIME_PREFIX_MIN_LEN + 1 + ZONE_OFFSET_MIN_TAIL {
+        return false;
+    }
+    // Take a fixed-width tail and nothing else. The bound is structural —
+    // below this line there are six bytes and no slice to walk — rather than
+    // an early exit that a hostile value could talk its way out of.
+    let &[w0, w1, w2, w3, m1, m2] = &b[b.len() - ZONE_OFFSET_PROBE_BYTES..] else {
+        // Unreachable: the length check above leaves at least the window.
+        return false;
+    };
+    // `±HHMM` — the spelling this whole branch exists for — puts its sign
+    // right here, and that case is worth answering in three instructions.
+    if is_zone_offset_sign(w1) {
+        return true;
+    }
+    // `±HH:MM` and `±HH MM` put it one byte further left, behind a separator.
+    // A longer separator run is legal too — `+00 : 00` really does parse — and
+    // walks the sign out of the window entirely; chasing that run would cost
+    // O(len) on a value that is nothing but separators, so it is over-matched
+    // from the separators it leaves behind instead.
+    //
+    // The leading `&&` is the one branch worth keeping: an index's date field
+    // is overwhelmingly all-offset or all-offsetless, so it predicts, and
+    // taking it is what makes `…T07:31:52.102` — the shape issue #96 is about
+    // — cost two byte compares. The rest are a couple of instructions each and
+    // do not predict, so they stay bitwise.
+    is_zone_offset_separator(w3)
+        && ((is_zone_offset_sign(w0) | is_zone_offset_separator(w2))
+            // `%z` needs two minute digits, they are the value's last two
+            // bytes, and chrono rejects a first minute digit above '5'.
+            & matches!(m1, b'0'..=b'5')
+            & m2.is_ascii_digit())
+}
+
+// Test-only tally of how many times the no-colon `%z` parse actually ran on
+// this thread. Which branch runs is a pure performance property — results are
+// identical either way — so `nocolon_offset_parse_is_guarded` asserts it by
+// counting attempts rather than by timing anything.
+#[cfg(test)]
+thread_local! {
+    static NOCOLON_OFFSET_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The no-colon zone-offset parse itself, behind [`may_carry_zone_offset`].
+#[inline]
+fn parse_nocolon_zone_offset_ms(s: &str) -> Option<i64> {
+    #[cfg(test)]
+    NOCOLON_OFFSET_ATTEMPTS.with(|c| c.set(c.get() + 1));
+    chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z")
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 /// Parse an ES date string or epoch-ms number to a Unix timestamp in milliseconds.
 pub(crate) fn parse_date_ms(val: &Value) -> Option<i64> {
     match val {
@@ -4254,8 +4400,19 @@ pub(crate) fn parse_date_ms(val: &Value) -> Option<i64> {
             // ingested date like "2025-01-24T07:31:52.102+0000" silently
             // drops out of every date aggregation/range query even though
             // it's neither malformed nor `_ignored`.
-            if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
-                return Some(dt.timestamp_millis());
+            //
+            // The parse is guarded (issue #96): `parse_date_ms` runs per date
+            // field per document on ingest, and unguarded this branch made
+            // every *offsetless* ISO value — the overwhelmingly common shape,
+            // and one no zone-offset pattern can ever match — pay for a
+            // failed offset parse before reaching the branch that does match
+            // it, roughly doubling that path. The guard is a necessary
+            // condition for the parse below, so gating on it cannot change
+            // any result; it only stops offsetless values from paying.
+            if may_carry_zone_offset(s) {
+                if let Some(ms) = parse_nocolon_zone_offset_ms(s) {
+                    return Some(ms);
+                }
             }
             // Try ISO-8601 without timezone (treat as UTC).
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
@@ -4361,6 +4518,447 @@ mod parse_date_ms_tests {
     fn colon_offset_still_works() {
         let ms = parse_date_ms(&Value::String("2025-01-24T07:31:52.102+00:00".to_string()));
         assert!(ms.is_some());
+    }
+
+    /// Reset the per-thread tally, then report how many no-colon `%z` parses
+    /// `parse_date_ms` actually ran for `input`.
+    fn zone_offset_parses_for(input: &str) -> u32 {
+        NOCOLON_OFFSET_ATTEMPTS.with(|c| c.set(0));
+        let _ = parse_date_ms(&Value::String(input.to_string()));
+        NOCOLON_OFFSET_ATTEMPTS.with(|c| c.get())
+    }
+
+    /// Issue #96: the no-colon `%z` parse must not run for values that cannot
+    /// possibly carry a zone offset.
+    ///
+    /// `parse_date_ms` runs per date field per document on ingest, and the
+    /// branch PR #91 added sits ahead of the offsetless fast paths — so before
+    /// the guard, *every* offsetless ISO value paid for a doomed offset parse
+    /// on the hottest shape there is, roughly doubling that path. Which branch
+    /// runs is invisible to results (`parse_date_ms_golden_matrix` is
+    /// byte-identical either way), so this asserts the work that was skipped
+    /// rather than the value that came out — no timing involved.
+    #[test]
+    fn nocolon_offset_parse_is_guarded() {
+        // Shapes with no offset at all: the parse must never be attempted.
+        for offsetless in [
+            "2025-01-24T07:31:52.102",
+            "2025-01-24T07:31:52.102456789",
+            "2025-01-24T07:31:52",
+            "2025-01-24T07:31",
+            "2025-01-24T07",
+            "2025-01-24",
+            "2025-01",
+            "2025/01/24",
+            "2025/01/24 07:31:52",
+            "2025-01-24 07:31:52.102",
+            "1737704312102",
+            "-1737704312102",
+            "not-a-date",
+            "",
+        ] {
+            assert_eq!(
+                zone_offset_parses_for(offsetless),
+                0,
+                "{offsetless:?} cannot carry a zone offset, yet the `%z` parse ran"
+            );
+        }
+        // A no-colon offset still reaches the parse, exactly once.
+        for with_offset in [
+            "2025-01-24T07:31:52.102+0000",
+            "2025-01-24T02:31:52.102-0500",
+            "2025-01-24T07:31:52+0000",
+            "2025-01-24T07:31:52.102 +0000",
+            "2025-01-24T07:31:52.102+00 : 00",
+            "5-1-2T3:4:5+0000",
+        ] {
+            assert_eq!(
+                zone_offset_parses_for(with_offset),
+                1,
+                "{with_offset:?} needs the `%z` parse and it did not run"
+            );
+        }
+        // Values the RFC3339 fast path already answers never get that far.
+        for rfc3339 in [
+            "2025-01-24T07:31:52.102Z",
+            "2025-01-24T07:31:52.102+00:00",
+            "2025-01-24T02:31:52.102-05:00",
+        ] {
+            assert_eq!(zone_offset_parses_for(rfc3339), 0, "{rfc3339:?}");
+        }
+    }
+
+    /// The guard is only allowed to be wrong in one direction. A false
+    /// positive costs a doomed parse; a false negative would silently drop a
+    /// parseable date back out of every aggregation — the exact bug PR #91
+    /// fixed. Assert that one-sidedness directly over a generated corpus:
+    /// wherever the guard says no, chrono must agree the parse fails.
+    #[test]
+    fn zone_offset_guard_never_false_negatives() {
+        let mut cases: Vec<String> = GOLDEN
+            .iter()
+            .map(|(input, _)| (*input).to_string())
+            .collect();
+
+        // Every combination of chrono-legal field widths, each with every
+        // offset spelling. The widths are the point: chrono accepts one-digit
+        // fields, which is what moves the earliest possible sign position and
+        // what both of the guard's lower bounds are derived from.
+        let tails = [
+            "",
+            "+0000",
+            "-0530",
+            "+00:00",
+            "-05:30",
+            "Z",
+            "z",
+            "+00:::00",
+            "+00  00",
+            "\u{2212}0500",
+            " +0000",
+            "\t-0530",
+            "+0",
+            "+00",
+            "+000",
+            "+00000",
+        ];
+        for y in ["1", "12", "123", "2025", "12025"] {
+            for mo in ["1", "01"] {
+                for d in ["2", "02"] {
+                    for h in ["3", "03"] {
+                        for mi in ["4", "04"] {
+                            for se in ["5", "05"] {
+                                for frac in ["", ".1", ".102", ".102456789"] {
+                                    for t in tails {
+                                        cases.push(format!("{y}-{mo}-{d}T{h}:{mi}:{se}{frac}{t}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Single-edit mutations of a few skeletons, so the boundaries the
+        // guard keys on get probed from both sides.
+        let interesting = [
+            '+', '-', 'Z', 'T', ':', '.', ' ', '0', '9', 'x', '/', '\u{2212}',
+        ];
+        for skeleton in [
+            "2025-01-24T07:31:52.102+0000",
+            "2025-01-24T07:31:52",
+            "5-1-2T3:4:5+0000",
+            "2025-01-24 07:31:52.102",
+        ] {
+            let chars: Vec<char> = skeleton.chars().collect();
+            for i in 0..=chars.len() {
+                for c in interesting {
+                    let mut ins = chars.clone();
+                    ins.insert(i, c);
+                    cases.push(ins.into_iter().collect());
+                    if i < chars.len() {
+                        let mut sub = chars.clone();
+                        sub[i] = c;
+                        cases.push(sub.into_iter().collect());
+                    }
+                }
+                if i < chars.len() {
+                    let mut del = chars.clone();
+                    del.remove(i);
+                    cases.push(del.into_iter().collect());
+                }
+            }
+        }
+
+        let mut rejected = 0usize;
+        let mut parseable = 0usize;
+        for s in &cases {
+            let parses = chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z").is_ok();
+            if parses {
+                parseable += 1;
+            }
+            if !may_carry_zone_offset(s) {
+                rejected += 1;
+                assert!(
+                    !parses,
+                    "guard rejected {s:?}, but the `%z` parse accepts it — that value \
+                     would silently stop parsing again (the bug PR #91 fixed)"
+                );
+            }
+        }
+        // Keep the corpus from quietly going vacuous.
+        assert!(
+            parseable > 1000 && rejected > 1000,
+            "corpus stopped exercising both sides: {parseable} parseable, {rejected} \
+             rejected out of {}",
+            cases.len()
+        );
+    }
+
+    #[test]
+    fn zone_offset_guard_bounds() {
+        // The shortest datetime chrono accepts in front of an offset is 11
+        // bytes, and `HHMM` behind it is another four, so nothing under 16
+        // bytes can carry one — including a bare negative epoch...
+        assert!(may_carry_zone_offset("5-1-2T3:4:5+0000"));
+        assert!(!may_carry_zone_offset("2025-01-24"));
+        assert!(!may_carry_zone_offset("-1737704312102"));
+        // ...and the offset ends the value, so a sign in the last four bytes
+        // has nowhere to put its minutes.
+        assert!(!may_carry_zone_offset("2025-01-24T07:31:52.102+"));
+        assert!(!may_carry_zone_offset("2025-01-24T07:31:52.1+000"));
+        // One separator between the hours and the minutes is in the window,
+        // and one-digit seconds in front of it are legal and really do parse.
+        assert!(may_carry_zone_offset("2025-01-02T03:04:5+00:00"));
+        assert_eq!(
+            parse_date_ms(&Value::String("2025-01-02T03:04:5+00:00".to_string())),
+            Some(1735787045000)
+        );
+        // A longer separator run walks the sign out of the window, and the
+        // probe answers "maybe" rather than chase it.
+        assert!(may_carry_zone_offset("2025-01-24T07:31:52.102+00 : 00"));
+        // Offsetless canonical values — the shape the guard exists to spare.
+        assert!(!may_carry_zone_offset("2025-01-24T07:31:52.102"));
+        assert!(!may_carry_zone_offset("2025-01-24T07:31:52"));
+        // MINUS SIGN U+2212 is a zone-offset sign for chrono too.
+        assert!(may_carry_zone_offset("2025-01-24T02:31:52.102\u{2212}0500"));
+    }
+
+    /// Issue #96, second cut: the probe has to cost the same on a 64 KB field
+    /// value as on a 20 byte one.
+    ///
+    /// The first cut scanned `[11, len - 5)` for a sign byte. That is O(len)
+    /// on the same per-document path this is all supposed to be making
+    /// cheaper, and it left long sign-free values several times *slower* than
+    /// they had been with no guard at all — 64 KB went 807.8 ns/op → 15617.7
+    /// ns/op. Cost is invisible to results, so pin the shape that makes it
+    /// O(1) instead of timing it: the answer is fixed by the last
+    /// [`ZONE_OFFSET_PROBE_BYTES`] bytes plus the length, so no amount of
+    /// filler in front of them can change it — not even filler made entirely
+    /// of the bytes a scan would have stopped on.
+    #[test]
+    fn zone_offset_probe_window_is_bounded() {
+        // Every tail shape that reaches a different branch of the probe.
+        let tails = [
+            "+0000",
+            "-0530",
+            "+00:00",
+            "-05:30",
+            "+00 00",
+            "+00:::00",
+            "+00",
+            "+000",
+            "Z",
+            "z",
+            "",
+            ".102",
+            ":52",
+            "00",
+            "0",
+            "x",
+            "\u{2212}0500",
+            "\u{2212}05:00",
+            "+0060",
+            "+9959",
+        ];
+        // Filler bytes chosen to be exactly what an unbounded scan hunts for.
+        let fillers = ["a", "+", "-", ":", ",", "\u{2212}", " ", "0", "-+,: "];
+        for tail in tails {
+            for filler in fillers {
+                let reps = 64 / filler.len();
+                let short = format!("{}{tail}", filler.repeat(reps));
+                let want = may_carry_zone_offset(&short);
+                for scale in [8usize, 64, 1024] {
+                    let long = format!("{}{tail}", filler.repeat(reps * scale));
+                    assert_eq!(
+                        may_carry_zone_offset(&long),
+                        want,
+                        "probe read past its window: {:?}+{tail:?} at {} bytes disagreed \
+                         with the same tail at {} bytes",
+                        filler,
+                        long.len(),
+                        short.len()
+                    );
+                }
+            }
+        }
+        // And the same property where it actually pays off: a long value must
+        // not reach the parse either.
+        assert_eq!(zone_offset_parses_for(&"lorem ipsum est ".repeat(4096)), 0);
+        assert_eq!(zone_offset_parses_for(&"0123456789".repeat(6554)), 0);
+    }
+
+    /// The scaling loop above is true but does not DISCRIMINATE: an unbounded
+    /// scan passes it. Growing a homogeneous filler cannot expose a scan,
+    /// because a `"+"` filler contains a `+` at every length and an `"a"`
+    /// filler contains none at every length, so the scan's answer is invariant
+    /// under exactly the transformation being applied. (Verified: replacing
+    /// this function's body with the previous O(len) scan leaves that test
+    /// green.)
+    ///
+    /// The property that actually characterises the fix is that the answer is
+    /// a function of `(len, last ZONE_OFFSET_PROBE_BYTES bytes)` and nothing
+    /// else. So hold BOTH the length and the window fixed and perturb a byte
+    /// strictly below `len - ZONE_OFFSET_PROBE_BYTES`. A windowed probe cannot
+    /// see the edit; a scan can, and does — the same sweep run against the old
+    /// scan violates this on 465 of 480 cases.
+    #[test]
+    fn zone_offset_probe_ignores_every_byte_below_its_window() {
+        let tails = [
+            "+0000", "-05:30", "+00 00", "+00:::00", "aaaaaa", "abc123", "Z12345", ".102Z0",
+        ];
+        // Single-byte edits only: a lone continuation byte is not valid UTF-8,
+        // so it could never reach this function through a `&str` anyway. The
+        // `>= 0x80` arm of `is_zone_offset_separator` is exercised by the
+        // golden matrix's real multi-byte separators instead.
+        let injected = *b"+-:,a0 T.";
+        let mut checks = 0usize;
+        for tail in tails {
+            for len in [12usize, 22, 40, 97, ZONE_OFFSET_PROBE_BYTES + 512] {
+                // Need room for the tail plus at least one byte in front of
+                // the window to perturb.
+                if len < tail.len() + 1 {
+                    continue;
+                }
+                // `base` pins the window (the last six bytes) and pads in
+                // front with bytes the probe must ignore.
+                let pad = len - tail.len();
+                let base: Vec<u8> = b"a".repeat(pad).into_iter().chain(tail.bytes()).collect();
+                assert_eq!(base.len(), len);
+                let want = may_carry_zone_offset(std::str::from_utf8(&base).unwrap());
+                for &inj in &injected {
+                    // Every position strictly below the window.
+                    for pos in 0..base.len().saturating_sub(ZONE_OFFSET_PROBE_BYTES) {
+                        let mut probe = base.clone();
+                        probe[pos] = inj;
+                        let s = std::str::from_utf8(&probe).expect("ascii edit stays utf8");
+                        checks += 1;
+                        assert_eq!(
+                            may_carry_zone_offset(s),
+                            want,
+                            "probe answered differently after editing byte {pos} of {} \
+                             (below the {ZONE_OFFSET_PROBE_BYTES}-byte window) to {inj:#04x}; \
+                             the window is unmoved, so it must have read past it",
+                            base.len()
+                        );
+                    }
+                }
+            }
+        }
+        // Guard against the sweep silently becoming empty and passing.
+        assert!(checks > 1000, "sweep only ran {checks} checks");
+    }
+
+    /// Golden matrix over every input class this function accepts, generated
+    /// from the implementation as it stood before the issue #96 guard went in.
+    /// Guarding the no-colon `%z` branch is a pure placement change, so every
+    /// one of these values must survive it unchanged.
+    const GOLDEN: &[(&str, Option<i64>)] = &[
+        // --- no-colon numeric offset, +HHMM ---
+        ("2025-01-24T07:31:52.102+0000", Some(1737703912102)),
+        ("2025-01-24T09:31:52.102+0200", Some(1737703912102)),
+        ("2025-01-24T07:31:52+0000", Some(1737703912000)),
+        ("2025-01-24T07:31:52.102456+0530", Some(1737684112102)),
+        ("2025-01-24T07:31:52.1+0900", Some(1737671512100)),
+        ("2025-01-24T07:31:52.102456789+0545", Some(1737683212102)),
+        // --- no-colon numeric offset, -HHMM ---
+        ("2025-01-24T02:31:52.102-0500", Some(1737703912102)),
+        ("2025-01-24T07:31:52-0000", Some(1737703912000)),
+        ("2025-06-30T23:59:59.999-1100", Some(1751367599999)),
+        ("2025-01-24T07:31:52.102-0330", Some(1737716512102)),
+        // --- colon offset, ±HH:MM ---
+        ("2025-01-24T07:31:52.102+00:00", Some(1737703912102)),
+        ("2025-01-24T09:31:52.102+02:00", Some(1737703912102)),
+        ("2025-01-24T02:31:52.102-05:00", Some(1737703912102)),
+        ("2025-01-24T07:31:52-05:30", Some(1737723712000)),
+        ("2025-01-24T07:31:52.000001+14:00", Some(1737653512000)),
+        // --- Z ---
+        ("2025-01-24T07:31:52.102Z", Some(1737703912102)),
+        ("2025-01-24T07:31:52Z", Some(1737703912000)),
+        ("2025-01-24T07:31:52.102456789Z", Some(1737703912102)),
+        ("2025-01-24T07:31:52.102z", Some(1737703912102)),
+        ("1970-01-01T00:00:00Z", Some(0)),
+        // --- offsetless ISO (the path issue #96 is about) ---
+        ("2025-01-24T07:31:52.102", Some(1737703912102)),
+        ("2025-01-24T07:31:52.102456", Some(1737703912102)),
+        ("2025-01-24T07:31:52", Some(1737703912000)),
+        ("2025-01-24T07:31", Some(1737703860000)),
+        ("2025-01-24T07", Some(1737702000000)),
+        ("2025-01-24", Some(1737676800000)),
+        ("2025-01", Some(1735689600000)),
+        ("2025-12-31T23:59:59.999", Some(1767225599999)),
+        ("1970-01-01T00:00:00.000", Some(0)),
+        // --- slash and space separated ---
+        ("2025/01/24", Some(1737676800000)),
+        ("2025/01/24 07:31:52", Some(1737703912000)),
+        ("2025-01-24 07:31:52.102", Some(1737703912102)),
+        ("2025-01-24 07:31:52", Some(1737703912000)),
+        // --- epoch integers as strings ---
+        ("1737704312102", Some(1737704312102)),
+        ("-1737704312102", Some(-1737704312102)),
+        ("0", Some(0)),
+        ("2025", Some(2025)),
+        ("9223372036854775807", Some(9223372036854775807)),
+        ("-9223372036854775808", Some(-9223372036854775808)),
+        ("9223372036854775808", None),
+        // --- garbage / edge ---
+        ("not-a-date", None),
+        ("", None),
+        ("2025-13-45T99:99:99Z", None),
+        ("+0000", Some(0)),
+        ("-0500", Some(-500)),
+        ("2025-01-24T07:31:52.102+00000", None),
+        ("2025-01-24T07:31:52.102 +0000", Some(1737703912102)),
+        ("2025-01-24T07:31:52.102+00:0", None),
+        ("T", None),
+        ("2025-01-24T", None),
+        ("2025-01-24T07:31:52.102+", None),
+        ("2025-01-24T07:31:52.102+25:00", None),
+        ("2025-01-24T07:31:52.102+0099", None),
+        // --- one-digit fields, which chrono accepts ---
+        ("5-1-2T3:4:5+0000", Some(-62009268955000)),
+        ("5-1-2T3:4:5.1+0000", Some(-62009268954900)),
+        ("2025-1-2T3:4:5-0530", Some(1735806845000)),
+        ("5-1-2T3:4:5", Some(-62009268955000)),
+        ("5-1-2T3:4:5+00:00", Some(-62009268955000)),
+        // --- whitespace chrono skips inside the pattern ---
+        (" 2025-01-24T07:31:52.102+0000", Some(1737703912102)),
+        ("2025-01-24T 7:31:52+0000", Some(1737703912000)),
+        ("2025-01-24T07:31:52.102\t+0000", Some(1737703912102)),
+        // --- MINUS SIGN U+2212, which chrono's %z accepts ---
+        ("2025-01-24T02:31:52.102\u{2212}0500", Some(1737703912102)),
+        ("2025-01-24T07:31:52\u{2212}0000", Some(1737703912000)),
+        ("5-1-2T3:4:5\u{2212}0500", Some(-62009250955000)),
+        // --- colon/space runs inside the offset ---
+        ("2025-01-24T07:31:52.102+00:::00", Some(1737703912102)),
+        ("2025-01-24T07:31:52.102+00   00", Some(1737703912102)),
+        ("2025-01-24T07:31:52.102+00 : 00", Some(1737703912102)),
+        // --- signed / wide years ---
+        ("+2025-01-24T07:31:52+0000", Some(1737703912000)),
+        ("-0044-03-15T12:00:00+0000", Some(-63549316800000)),
+        ("12025-01-24T07:31:52+0000", None),
+        ("+2025-01-24T07:31:52.102", Some(1737703912102)),
+        // --- trailing/leading junk around a valid offset ---
+        ("2025-01-24T07:31:52.102+0000x", None),
+        ("2025-01-24T07:31:52.102+0000 ", None),
+        ("x2025-01-24T07:31:52.102+0000", None),
+    ];
+
+    #[test]
+    fn parse_date_ms_golden_matrix() {
+        for (input, expected) in GOLDEN {
+            let got = parse_date_ms(&Value::String((*input).to_string()));
+            assert_eq!(got, *expected, "input {input:?}");
+        }
+        // Non-string JSON values.
+        assert_eq!(parse_date_ms(&json!(1737704312102i64)), Some(1737704312102));
+        assert_eq!(parse_date_ms(&json!(-42)), Some(-42));
+        assert_eq!(parse_date_ms(&json!(true)), None);
+        assert_eq!(parse_date_ms(&json!(1.5)), None);
+        assert_eq!(parse_date_ms(&Value::Null), None);
+        assert_eq!(parse_date_ms(&json!([1])), None);
+        assert_eq!(parse_date_ms(&json!({"a": 1})), None);
     }
 }
 
