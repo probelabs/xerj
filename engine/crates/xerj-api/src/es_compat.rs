@@ -27338,109 +27338,181 @@ fn filter_keyword_length(val: &Value, max: usize) -> (Value, bool) {
     }
 }
 
-/// Translate an ES date-format pattern to a chrono strftime string and
-/// check whether `v` parses under it.
+/// Check whether `v` parses under the declared ES date `fmt`.
+///
+/// Thin alias for [`xerj_query::dates::date_value_valid_with_format`] — the
+/// SINGLE ingest-time date predicate, shared with the `ignore_malformed:
+/// false` rejection path in `xerj_engine::bulk`. It must stay a delegation:
+/// when these two paths had separate implementations, the strict one was the
+/// laxer of the pair, so turning `ignore_malformed` off made the engine
+/// accept *more*.
+///
+/// The compiled format is memoised on the format string, so a bulk of N docs
+/// compiles a field's declared format once rather than N times.
 fn is_date_value_valid_with_format(v: &Value, fmt: &str) -> bool {
-    // Accept epoch numbers for epoch_millis / epoch_second formats.
-    if fmt.contains("epoch_millis") {
-        return matches!(v, Value::Number(_))
-            || matches!(v, Value::String(s) if s.parse::<i64>().is_ok());
-    }
-    if fmt.contains("epoch_second") {
-        return matches!(v, Value::Number(_))
-            || matches!(v, Value::String(s) if s.parse::<i64>().is_ok());
-    }
-    let Some(s) = v.as_str() else {
-        return matches!(v, Value::Number(_));
-    };
-    // Split combined format ("||") — ES allows multiple fallback formats.
-    for single_fmt in fmt.split("||") {
-        let pat = es_date_format_to_strftime(single_fmt.trim());
-        // ES validates declared date formats STRICTLY: the input must match
-        // the pattern exactly (e.g. `dd-MM-yyyy` requires a 4-digit year, so
-        // "19-12-90" is malformed). chrono's parsers are lenient about field
-        // widths, so we additionally require the parsed value to round-trip
-        // back to the original string under the same pattern.
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, &pat) {
-            if dt.format(&pat).to_string() == s {
-                return true;
-            }
-        }
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, &pat) {
-            if d.format(&pat).to_string() == s {
-                return true;
-            }
-        }
-        // Timezone-aware formats: accept a successful parse (round-tripping
-        // `%z`/`%:z` offset spellings is unreliable, so don't require it).
-        if chrono::DateTime::parse_from_str(s, &pat).is_ok() {
-            return true;
-        }
-    }
-    false
+    xerj_query::dates::date_value_valid_with_format(v, fmt)
 }
 
-/// Map common ES date-pattern tokens (yyyy/MM/dd/HH/mm/ss/SSS/Z) to chrono
-/// strftime directives. Preserves literal chars between tokens.
-fn es_date_format_to_strftime(es_fmt: &str) -> String {
-    let mut out = String::with_capacity(es_fmt.len() + 8);
-    let bytes = es_fmt.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Longest-match substitution for tokens we care about.
-        let rest = &es_fmt[i..];
-        if rest.starts_with("yyyy") {
-            out.push_str("%Y");
-            i += 4;
-        } else if rest.starts_with("yy") {
-            out.push_str("%y");
-            i += 2;
-        } else if rest.starts_with("MM") {
-            out.push_str("%m");
-            i += 2;
-        } else if rest.starts_with("dd") {
-            out.push_str("%d");
-            i += 2;
-        } else if rest.starts_with("HH") {
-            out.push_str("%H");
-            i += 2;
-        } else if rest.starts_with("mm") {
-            out.push_str("%M");
-            i += 2;
-        } else if rest.starts_with("ss") {
-            out.push_str("%S");
-            i += 2;
-        } else if rest.starts_with("SSSSSS") {
-            out.push_str("%6f");
-            i += 6;
-        } else if rest.starts_with("SSSSSSSSS") {
-            out.push_str("%9f");
-            i += 9;
-        } else if rest.starts_with("SSS") {
-            out.push_str("%3f");
-            i += 3;
-        } else if rest.starts_with("Z") {
-            out.push_str("%z");
-            i += 1;
-        } else if rest.starts_with("XXX") {
-            out.push_str("%:z");
-            i += 3;
-        } else if rest.starts_with("'") {
-            // Literal quoted text until next quote.
-            i += 1;
-            while i < bytes.len() && bytes[i] != b'\'' {
-                out.push(bytes[i] as char);
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 1;
-            }
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
+#[cfg(test)]
+mod ignore_malformed_date_format_tests {
+    //! Regression coverage for a real bug found live against OpenSearch's
+    //! UBI sample dashboards: `opensearch_dashboards_sample_ubi_events` maps
+    //! `timestamp` as `{"type":"date","format":"strict_date_time",
+    //! "ignore_malformed":true}`. Every document with a valid ISO timestamp
+    //! string was wrongly marked `_ignored` (the named format was matched as
+    //! literal text instead of being resolved to its real pattern), while
+    //! every document with a bare epoch-millis number was wrongly accepted
+    //! (any format treated a JSON number as valid) — exactly backwards from
+    //! real behavior. Confirmed by replaying the same mapping and documents
+    //! against a real OpenSearch 2.11.1 node.
+    use super::*;
+
+    #[test]
+    fn valid_iso_string_under_named_strict_format_is_not_ignored() {
+        assert!(is_date_value_valid_with_format(
+            &json!("2024-12-10T00:50:30.466Z"),
+            "strict_date_time"
+        ));
+    }
+
+    #[test]
+    fn bare_epoch_millis_number_under_non_epoch_format_is_ignored() {
+        assert!(!is_date_value_valid_with_format(
+            &json!(1717527762025i64),
+            "strict_date_time"
+        ));
+    }
+
+    #[test]
+    fn bare_epoch_millis_number_is_valid_when_format_allows_it() {
+        assert!(is_date_value_valid_with_format(
+            &json!(1717527762025i64),
+            "strict_date_time||epoch_millis"
+        ));
+    }
+
+    #[test]
+    fn number_under_numeric_shaped_non_epoch_format_is_valid() {
+        // basic_date is `yyyyMMdd`; ES stringifies a JSON number before
+        // formatting, so 20240101 must be accepted here too — this used to
+        // be silently dropped by gating numeric input on epoch formats.
+        assert!(is_date_value_valid_with_format(
+            &json!(20240101),
+            "basic_date"
+        ));
+    }
+
+    #[test]
+    fn real_named_formats_are_not_in_the_fail_closed_bucket() {
+        // The regression this replaces: `ordinal_date` and 27 other REAL ES
+        // formats were unresolvable, so fail-closed dropped every one of
+        // their values under `ignore_malformed: true` — including JSON
+        // numbers, which the previous release accepted. They resolve now,
+        // and validate for real.
+        assert!(is_date_value_valid_with_format(
+            &json!("2024-001"),
+            "ordinal_date"
+        ));
+        assert!(!is_date_value_valid_with_format(
+            &json!("literally anything"),
+            "ordinal_date"
+        ));
+        // The number shape that main accepted and the fix dropped.
+        assert!(is_date_value_valid_with_format(
+            &json!(2024001),
+            "basic_ordinal_date"
+        ));
+        assert!(is_date_value_valid_with_format(&json!(12), "hour"));
+        assert!(is_date_value_valid_with_format(&json!(2024), "weekyear"));
+        assert!(is_date_value_valid_with_format(
+            &json!("121030.123Z"),
+            "basic_time"
+        ));
+    }
+
+    #[test]
+    fn a_format_elasticsearch_rejects_still_fails_closed() {
+        // Fail-closed survives for what it was actually for: a format that
+        // is neither a named ES format nor a valid java.time pattern (ES
+        // rejects `banana` with `Unknown pattern letter: b` at mapping
+        // creation, so no document can legitimately arrive under one).
+        assert!(!is_date_value_valid_with_format(
+            &json!("2024-01-01"),
+            "banana"
+        ));
+        assert!(!is_date_value_valid_with_format(
+            &json!(1717527762025i64),
+            "banana"
+        ));
+    }
+
+    #[test]
+    fn no_es_named_format_drops_data_under_ignore_malformed() {
+        // Field-level guard on the whole shipped ES format set: a name that
+        // stops resolving silently empties the field, so assert none of them
+        // reject a value they should accept by construction — every format
+        // accepts JSON null, and no format may reject everything.
+        for name in xerj_query::dates::ES_NAMED_FORMATS {
+            assert!(
+                is_date_value_valid_with_format(&Value::Null, name),
+                "`{name}` treats null as malformed"
+            );
+            assert!(
+                xerj_query::dates::compile_formats(name).is_ok(),
+                "`{name}` is unresolvable — every value of a field declaring \
+                 it would be dropped from _source under ignore_malformed"
+            );
         }
     }
-    out
+
+    #[tokio::test]
+    async fn apply_ignore_malformed_end_to_end_matches_ubi_events_mapping() {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        let state = AppState::new(config, engine, metrics);
+
+        state.engine.index_mappings.insert(
+            "ubi-repro".to_string(),
+            json!({
+                "properties": {
+                    "timestamp": {
+                        "type": "date",
+                        "format": "strict_date_time",
+                        "ignore_malformed": true
+                    },
+                    "action_name": {"type": "keyword"}
+                }
+            }),
+        );
+
+        // A "click" event: valid ISO timestamp string — must NOT be ignored.
+        let click_doc = apply_ignore_malformed(
+            &state,
+            "ubi-repro",
+            json!({"timestamp": ["2024-12-10T00:50:30.466Z"], "action_name": "click"}),
+        );
+        assert!(
+            click_doc.get("_ignored").is_none(),
+            "valid ISO timestamp wrongly ignored: {click_doc:?}"
+        );
+
+        // An "on_search" event: bare epoch-millis number — MUST be ignored,
+        // since strict_date_time alone doesn't accept numeric input.
+        let on_search_doc = apply_ignore_malformed(
+            &state,
+            "ubi-repro",
+            json!({"timestamp": 1717527762025i64, "action_name": "on_search"}),
+        );
+        assert_eq!(
+            on_search_doc.get("_ignored"),
+            Some(&json!(["timestamp"])),
+            "epoch-millis number under a non-epoch format should be ignored: {on_search_doc:?}"
+        );
+    }
 }
 
 fn is_field_value_valid(ftype: &str, v: &Value) -> bool {
