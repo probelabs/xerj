@@ -997,7 +997,13 @@ fn validate_runtime_fields(rt: &serde_json::Map<String, Value>) -> Result<(), St
             continue;
         };
         if let Some(t) = obj.get("type").and_then(Value::as_str) {
-            if !is_supported_field_type(t) {
+            // `flattened`/`flat_object` are valid *mapping* property types
+            // but not valid *runtime field* types in real ES — runtime
+            // fields are restricted to a small scalar/composite set.
+            // is_supported_field_type is shared with the mapping-properties
+            // path (validate_properties), so this exclusion has to live
+            // here rather than narrowing that shared list.
+            if t == "flattened" || t == "flat_object" || !is_supported_field_type(t) {
                 return Err(format!(
                     "Failed to parse mapping: The mapper type [{t}] declared on runtime field [{name}] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation."
                 ));
@@ -17056,6 +17062,30 @@ pub async fn field_caps(
         };
         let schema = idx.schema().await;
 
+        // Resolved up front (not just for multi-fields below) so the
+        // per-field loop can consult the mapping's OWN declared type for
+        // fields the native schema collapses to a generic type — namely
+        // `flattened`/`flat_object`, both stored as `FieldType::Object`
+        // since xerj has no dedicated native variant for either. Without
+        // this, `_field_caps` — what OSD/Kibana actually use to discover
+        // index-pattern fields, not `GET _mapping` — reports every such
+        // field as a plain `object`, even though `GET _mapping` correctly
+        // round-trips the real declared type.
+        let stored_mapping = state
+            .engine
+            .index_mappings
+            .get(idx_name.as_str())
+            .map(|v| v.clone())
+            .unwrap_or(Value::Null);
+        let properties = if stored_mapping.is_null() {
+            Value::Object(schema_to_es_properties(&schema))
+        } else {
+            stored_mapping
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        };
+
         for field in &schema.fields {
             // Support comma-separated field list and wildcard suffix.
             if fields_filter != "*" {
@@ -17067,7 +17097,9 @@ pub async fn field_caps(
                 }
             }
 
-            let es_type = native_type_to_es_str(&field.field_type);
+            let native_es_type = native_type_to_es_str(&field.field_type);
+            let es_type =
+                declared_flattened_type(&properties, &field.name).unwrap_or(native_es_type);
             let searchable = field.is_searchable();
             let aggregatable = field.is_aggregatable();
 
@@ -17096,20 +17128,6 @@ pub async fn field_caps(
         // worked when queried directly. Walk the same mapping shape
         // `GET _mapping` already derives correctly and add each declared
         // multi-field as its own field-caps entry.
-        let stored_mapping = state
-            .engine
-            .index_mappings
-            .get(idx_name.as_str())
-            .map(|v| v.clone())
-            .unwrap_or(Value::Null);
-        let properties = if stored_mapping.is_null() {
-            Value::Object(schema_to_es_properties(&schema))
-        } else {
-            stored_mapping
-                .get("properties")
-                .cloned()
-                .unwrap_or_else(|| json!({}))
-        };
         let mut multi_fields = Vec::new();
         collect_multi_fields(&properties, "", &mut multi_fields);
         for (name, es_type) in multi_fields {
@@ -17191,6 +17209,26 @@ fn collect_multi_fields(properties: &Value, prefix: &str, out: &mut Vec<(String,
     }
 }
 
+/// Look up `field_name` (a possibly dotted path) in a mapping `properties`
+/// tree and return its declared ES type string ONLY if it's
+/// `flattened`/`flat_object` — both collapse to the generic
+/// `FieldType::Object` in the native schema (xerj has no dedicated native
+/// variant for either), so `_field_caps`/`global_field_caps` need this to
+/// report the real declared type instead of a plain `object`.
+fn declared_flattened_type<'a>(properties: &'a Value, field_name: &str) -> Option<&'a str> {
+    let mut current = properties;
+    let segments: Vec<&str> = field_name.split('.').collect();
+    for (i, seg) in segments.iter().enumerate() {
+        let def = current.as_object()?.get(*seg)?;
+        if i == segments.len() - 1 {
+            let t = def.get("type").and_then(Value::as_str)?;
+            return matches!(t, "flattened" | "flat_object").then_some(t);
+        }
+        current = def.get("properties")?;
+    }
+    None
+}
+
 fn native_type_to_es_str(ft: &FieldType) -> &'static str {
     match ft {
         FieldType::Text => "text",
@@ -17206,6 +17244,123 @@ fn native_type_to_es_str(ft: &FieldType) -> &'static str {
         FieldType::Binary => "binary",
         FieldType::Object => "object",
         FieldType::Nested => "nested",
+    }
+}
+
+#[cfg(test)]
+mod flat_object_field_caps_tests {
+    //! Regression coverage for a real gap found in review: OpenSearch
+    //! Dashboards discovers index-pattern fields via `_field_caps`, not
+    //! `GET _mapping` — but `flattened`/`flat_object` both collapse to the
+    //! generic native `FieldType::Object`, and `_field_caps` derived its
+    //! reported type purely from that native type, so a `flat_object`
+    //! field surfaced to Dashboards as a plain `object`. `GET _mapping`
+    //! round-tripped the declared type correctly (it returns the stored
+    //! mapping JSON verbatim) while `_field_caps` did not — the mismatch
+    //! was easy to miss testing only via `GET _mapping`.
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    #[test]
+    fn declared_flattened_type_finds_top_level_flat_object() {
+        let props = json!({"attrs": {"type": "flat_object"}});
+        assert_eq!(
+            declared_flattened_type(&props, "attrs"),
+            Some("flat_object")
+        );
+    }
+
+    #[test]
+    fn declared_flattened_type_finds_flattened_alias() {
+        let props = json!({"labels": {"type": "flattened"}});
+        assert_eq!(declared_flattened_type(&props, "labels"), Some("flattened"));
+    }
+
+    #[test]
+    fn declared_flattened_type_walks_dotted_nested_path() {
+        let props = json!({
+            "obj": {"type": "object", "properties": {"attrs": {"type": "flat_object"}}}
+        });
+        assert_eq!(
+            declared_flattened_type(&props, "obj.attrs"),
+            Some("flat_object")
+        );
+    }
+
+    #[test]
+    fn declared_flattened_type_returns_none_for_other_types() {
+        let props = json!({"name": {"type": "keyword"}});
+        assert_eq!(declared_flattened_type(&props, "name"), None);
+    }
+
+    #[test]
+    fn declared_flattened_type_returns_none_for_missing_field() {
+        let props = json!({"name": {"type": "keyword"}});
+        assert_eq!(declared_flattened_type(&props, "missing"), None);
+    }
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test]
+    async fn field_caps_reports_flat_object_not_generic_object() {
+        let router = crate::router::build_es_compat_router(test_state());
+
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::put("/flat-object-caps-e2e")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {"attrs": {"type": "flat_object"}}}})
+                            .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        assert!(create_response.status().is_success());
+
+        let caps_response = router
+            .oneshot(
+                Request::get("/flat-object-caps-e2e/_field_caps?fields=attrs")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("field_caps response");
+        assert!(caps_response.status().is_success());
+
+        let bytes = to_bytes(caps_response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: Value = serde_json::from_slice(&bytes).expect("JSON response");
+        assert!(
+            response["fields"]["attrs"]["flat_object"]["searchable"]
+                .as_bool()
+                .unwrap_or(false),
+            "expected _field_caps to report attrs as flat_object, got: {response}"
+        );
+        assert!(
+            response["fields"]["attrs"].get("object").is_none(),
+            "attrs should not ALSO be reported as a generic object: {response}"
+        );
     }
 }
 
@@ -25434,6 +25589,25 @@ pub async fn global_field_caps(
         };
         let schema = idx.schema().await;
 
+        // See the matching comment in `field_caps`: `flattened`/
+        // `flat_object` both collapse to `FieldType::Object` natively, so
+        // the mapping itself is the only place the real declared type
+        // still lives.
+        let stored_mapping = state
+            .engine
+            .index_mappings
+            .get(index_info.name.as_str())
+            .map(|v| v.clone())
+            .unwrap_or(Value::Null);
+        let properties = if stored_mapping.is_null() {
+            Value::Object(schema_to_es_properties(&schema))
+        } else {
+            stored_mapping
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        };
+
         for field in &schema.fields {
             if fields_filter != "*" {
                 // Support comma-separated field list and simple wildcard suffix.
@@ -25445,7 +25619,9 @@ pub async fn global_field_caps(
                 }
             }
 
-            let es_type = native_type_to_es_str(&field.field_type);
+            let native_es_type = native_type_to_es_str(&field.field_type);
+            let es_type =
+                declared_flattened_type(&properties, &field.name).unwrap_or(native_es_type);
             let searchable = field.is_searchable();
             let aggregatable = field.is_aggregatable();
 
@@ -25509,6 +25685,22 @@ pub async fn get_mapping_field(
 
     let schema = idx.schema().await;
     let properties = schema_to_es_properties(&schema);
+    // `flattened`/`flat_object` (and anything else that collapses to a
+    // generic native FieldType) only survive as their real declared name
+    // in the stored mapping — the native-schema-derived `properties` above
+    // has already lost that distinction. Used as a per-field override
+    // below so a dynamically-inferred field with no stored-mapping entry
+    // still falls back to the schema-derived type, same as before.
+    let stored_mapping = state
+        .engine
+        .index_mappings
+        .get(index.as_str())
+        .map(|v| v.clone())
+        .unwrap_or(Value::Null);
+    let stored_properties = stored_mapping
+        .get("properties")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     // Collect matching field entries. Supports comma-separated field names and wildcard `*`.
     let field_names: Vec<&str> = field.split(',').map(str::trim).collect();
@@ -25523,10 +25715,12 @@ pub async fn get_mapping_field(
             }
         });
         if matches {
-            let es_type = field_def
+            let native_es_type = field_def
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("object");
+            let es_type =
+                declared_flattened_type(&stored_properties, field_name).unwrap_or(native_es_type);
             mapping_result.insert(
                 field_name.clone(),
                 json!({
