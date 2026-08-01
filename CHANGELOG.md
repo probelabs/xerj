@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0-rc.9] - 2026-07-31
+## [1.0.0-rc.9] - 2026-08-01
 
 Ninth release candidate: the **cross-platform correctness release**.
 Headline for users, stated plainly because it is the most serious defect
