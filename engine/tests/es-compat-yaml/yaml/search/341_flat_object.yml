@@ -1,0 +1,141 @@
+---
+"Test exists query on flat_object field":
+  - do:
+      indices.create:
+        index:  flat_object_test
+        body:
+          mappings:
+            properties:
+              flat_object:
+                type: flat_object
+  - do:
+      index:
+        index:  flat_object_test
+        id:     "1"
+        body:
+          flat_object:
+            key: some_value
+        refresh: true
+
+  - do:
+      search:
+        index: flat_object_test
+        body:
+          query:
+            exists:
+              field: flat_object
+
+  - match: { hits.total.value: 1 }
+
+  - do:
+      search:
+        index: flat_object_test
+        body:
+          query:
+            exists:
+              field: flat_object.key
+
+  - match: { hits.total.value: 1 }
+
+  - do:
+      search:
+        index: flat_object_test
+        body:
+          query:
+            exists:
+              field: flat_object.nonexistent_key
+
+  - match: { hits.total.value: 0 }
+
+---
+"Test fields option on flat_object field":
+  - do:
+      indices.create:
+        index:  test
+        body:
+          mappings:
+            properties:
+              flat_object:
+                type: flat_object
+
+  - do:
+      index:
+        index:  test
+        id:     "1"
+        body:
+          flat_object:
+            some_field: some_value
+        refresh: true
+
+  - do:
+      search:
+        index: test
+        body:
+          fields: ["flat_object"]
+
+  - match:  { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - length: { hits.hits.0.fields: 1 }
+  - match:  { hits.hits.0.fields.flat_object: [ { "some_field": "some_value" } ] }
+
+  - do:
+      search:
+        index: test
+        body:
+          fields: [ "flat*" ]
+
+  - match:  { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - length: { hits.hits.0.fields: 1 }
+  - match:  { hits.hits.0.fields.flat_object: [ { "some_field": "some_value" } ] }
+
+---
+"flat_object ignore_above single-value field":
+  - do:
+      indices.create:
+        index: ignore_above_flat_object_test
+        body:
+          mappings:
+            properties:
+              name:
+                type: keyword
+              flat:
+                type: flat_object
+                ignore_above: 5
+
+  - do:
+      index:
+        index: ignore_above_flat_object_test
+        id: "1"
+        refresh: true
+        body:
+          name: "A"
+          flat: { "value": "foo", "key": "foo key" }
+
+  - do:
+      index:
+        index: ignore_above_flat_object_test
+        id: "2"
+        refresh: true
+        body:
+          name: "B"
+          flat: { "value": "foo bar", "key": "foo bar key" }
+
+  - do:
+      search:
+        index: ignore_above_flat_object_test
+        sort: name
+        body:
+          fields:
+            - flat
+          query:
+            match_all: {}
+
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._source.flat.value: "foo" }
+  - match: { hits.hits.0._source.flat.key: "foo key" }
+  - match: { hits.hits.1._source.flat.value: "foo bar" }
+  - match: { hits.hits.1._source.flat.key: "foo bar key" }
+
+  - match: { hits.hits.0.fields.flat.0.value: "foo" }
+  - match: { hits.hits.1.fields.flat.0.value: null }
