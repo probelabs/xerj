@@ -3969,6 +3969,17 @@ pub(crate) fn parse_date_ms(val: &Value) -> Option<i64> {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
                 return Some(dt.timestamp_millis());
             }
+            // RFC3339 requires a colon in the zone offset (`+00:00`); ES's
+            // own `strict_date_time`/`XX`-style formats also accept the
+            // no-colon numeric form (`+0000`), which real clients emit —
+            // e.g. Java's default `OffsetDateTime.toString()`-adjacent
+            // formatters. Without this, a validly-mapped, successfully
+            // ingested date like "2025-01-24T07:31:52.102+0000" silently
+            // drops out of every date aggregation/range query even though
+            // it's neither malformed nor `_ignored`.
+            if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
+                return Some(dt.timestamp_millis());
+            }
             // Try ISO-8601 without timezone (treat as UTC).
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
                 return Some(dt.and_utc().timestamp_millis());
@@ -4022,6 +4033,57 @@ pub(crate) fn parse_date_ms(val: &Value) -> Option<i64> {
             s.parse::<i64>().ok()
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod parse_date_ms_tests {
+    //! Regression coverage for a real bug found live: a validly-mapped,
+    //! successfully ingested date string with a no-colon numeric zone
+    //! offset ("+0000" instead of "+00:00") silently dropped out of every
+    //! aggregation and range query — min/max returned null, a dashboard
+    //! panel's time-range filter excluded the document — even though the
+    //! field was neither malformed nor `_ignored`. Root cause:
+    //! `chrono::DateTime::parse_from_rfc3339` requires the colon per the
+    //! RFC3339 spec, and no other branch here handled the no-colon form.
+    use super::*;
+
+    #[test]
+    fn numeric_offset_without_colon_parses() {
+        let ms = parse_date_ms(&Value::String("2025-01-24T07:31:52.102+0000".to_string()));
+        assert!(ms.is_some(), "expected a parsed value, got None");
+    }
+
+    #[test]
+    fn numeric_offset_without_colon_matches_with_colon() {
+        // Same instant, two valid spellings of the same offset — both must
+        // resolve to the identical epoch-ms value.
+        let with_colon = parse_date_ms(&Value::String("2025-01-24T07:31:52.102+00:00".to_string()));
+        let without_colon =
+            parse_date_ms(&Value::String("2025-01-24T07:31:52.102+0000".to_string()));
+        assert_eq!(with_colon, without_colon);
+        assert!(with_colon.is_some());
+    }
+
+    #[test]
+    fn numeric_offset_without_colon_nonzero() {
+        // A non-zero offset must actually shift the instant, not just parse
+        // and silently treat it as UTC.
+        let plus_two = parse_date_ms(&Value::String("2025-01-24T09:31:52.102+0200".to_string()));
+        let utc = parse_date_ms(&Value::String("2025-01-24T07:31:52.102Z".to_string()));
+        assert_eq!(plus_two, utc);
+    }
+
+    #[test]
+    fn z_suffix_still_works() {
+        let ms = parse_date_ms(&Value::String("2025-01-24T07:31:52.102Z".to_string()));
+        assert!(ms.is_some());
+    }
+
+    #[test]
+    fn colon_offset_still_works() {
+        let ms = parse_date_ms(&Value::String("2025-01-24T07:31:52.102+00:00".to_string()));
+        assert!(ms.is_some());
     }
 }
 
