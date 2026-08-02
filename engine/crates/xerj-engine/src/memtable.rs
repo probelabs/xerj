@@ -1191,6 +1191,45 @@ impl ShardedFtsMemtable {
             .insert_raw_bytes_with_seq(seq_no, doc_id, source_bytes);
     }
 
+    /// Restore documents drained by a flush whose pre-publication finalizer
+    /// failed. The caller supplies the exact text fields captured during the
+    /// original drain, avoiding schema re-inference on this rare recovery
+    /// path. Newer writes must be filtered by the caller before restoration.
+    pub(crate) fn restore_failed_flush(
+        &self,
+        entries: Vec<(u64, String, HashMap<String, String>, Arc<Value>)>,
+        version_map: &xerj_storage::version_map::VersionMap,
+    ) {
+        for (seq_no, doc_id, fields, source) in entries {
+            let shard_idx = self.shard_for_dynamic(&doc_id);
+            let mut shard = self.shards[shard_idx].write();
+            // This check deliberately happens while holding the owning shard
+            // lock. A concurrent PUT/DELETE publishes its version before it
+            // mutates this shard; checking outside the lock would allow a
+            // stale drained copy to overwrite the newer doc_id_index entry.
+            let Some(current) = version_map.get(&doc_id) else {
+                continue;
+            };
+            if current.seq_no != seq_no
+                || current.segment_id.as_ref() != xerj_storage::version_map::IN_MEMORY_SEGMENT_ID
+                || current.deleted
+            {
+                continue;
+            }
+            let analyzer = shard
+                .registry
+                .get_analyzer("default")
+                .or_else(|| shard.registry.get_analyzer("standard"))
+                .expect("standard analyzer always present");
+            let analyzed: Vec<(String, Vec<Token>)> = fields
+                .into_iter()
+                .map(|(field, text)| (field, analyzer.analyze(&text)))
+                .collect();
+            let size = (source.to_string().len() + doc_id.len()) * 3 + 64;
+            shard.insert_analyzed(seq_no, doc_id, source, &analyzed, size);
+        }
+    }
+
     /// Iterate every document in every shard as `(doc_id, Value)`.
     /// Clones each `Arc<Value>`'s inner so callers that expect an
     /// owned `Value` keep working.

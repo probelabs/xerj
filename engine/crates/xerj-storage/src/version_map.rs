@@ -430,6 +430,38 @@ impl VersionMap {
         }
     }
 
+    /// Roll back a physical repoint iff the entry still names the failed
+    /// segment and sequence. Concurrent newer writes are therefore never
+    /// overwritten. `prior=None` removes an entry created solely by the
+    /// failed publication; `Some` restores the exact logical version.
+    pub(crate) fn rollback_repoint(
+        &self,
+        doc_id: &str,
+        seq_no: SeqNo,
+        failed_segment: &str,
+        prior: Option<VersionEntry>,
+    ) {
+        use dashmap::mapref::entry::Entry;
+        let Entry::Occupied(mut occupied) = self.inner.entry(doc_id.to_owned()) else {
+            return;
+        };
+        if occupied.get().seq_no != seq_no || occupied.get().segment_id.as_ref() != failed_segment {
+            return;
+        }
+        let old_live = !occupied.get().deleted;
+        match prior {
+            Some(prior) => {
+                let new_live = !prior.deleted;
+                occupied.insert(prior);
+                self.live_delta(old_live, new_live);
+            }
+            None => {
+                occupied.remove();
+                self.live_delta(old_live, false);
+            }
+        }
+    }
+
     /// Bump the `_version` of an EXISTING tombstone and return the bumped
     /// value.  ES semantics for `DELETE` of an already-deleted document:
     /// the delete reports `result: not_found` (404) but still increments

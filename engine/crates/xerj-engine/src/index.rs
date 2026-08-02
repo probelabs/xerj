@@ -60,6 +60,514 @@ fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudge
     panic!("Index construction requires the process ResourceGovernor to be initialised");
 }
 
+#[cfg(test)]
+mod flush_publication_recovery_tests {
+    use super::*;
+    use serde_json::json;
+
+    static FLUSH_FAULT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn text_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    fn vector_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("embedding", FieldType::Vector))
+            .unwrap();
+        schema
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_flush_waiter_after_worker_start_still_restores() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("bm25-cancel-flush", text_schema())
+            .unwrap();
+        let idx = engine.get_index("bm25-cancel-flush").unwrap();
+        idx.abort_background_tasks();
+        idx.index_document(Some("winner".into()), json!({"body": "alpha"}))
+            .await
+            .unwrap();
+        let version_before_flush = idx.dataset_version.load(Ordering::Acquire);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                entered_tx.lock().take().unwrap().send(()).unwrap();
+                release_rx.lock().take().unwrap().recv().unwrap();
+                false
+            }),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
+        };
+        let flush = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        flush.abort();
+        assert!(flush.await.unwrap_err().is_cancelled());
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "alpha"}}, "size": 10
+        }))
+        .unwrap();
+        assert!(
+            idx.search(&request).await.unwrap().hits.is_empty(),
+            "blocked finalizer fixture must prime the transient empty response"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while idx.store.snapshot().segments.is_empty()
+                || idx.dataset_version.load(Ordering::Acquire) == version_before_flush
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached finalizer must publish after caller cancellation");
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.hits[0].id, "winner");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_vector_flush_completes_graph_before_wal_and_restarts_visible() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("cancel-vector-flush", vector_schema())
+            .unwrap();
+        let idx = engine.get_index("cancel-vector-flush").unwrap();
+        idx.abort_background_tasks();
+        idx.index_document(
+            Some("vector-winner".into()),
+            json!({"embedding": [1.0, 0.0, 0.0]}),
+        )
+        .await
+        .unwrap();
+        let version_before_flush = idx.dataset_version.load(Ordering::Acquire);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                entered_tx.lock().take().unwrap().send(()).unwrap();
+                release_rx.lock().take().unwrap().recv().unwrap();
+                false
+            }),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
+        };
+        let flush = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        flush.abort();
+        assert!(flush.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while idx.dataset_version.load(Ordering::Acquire) == version_before_flush {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached vector flush durability tail did not complete");
+        assert!(idx.hnsw_graph_path().exists());
+        assert!(idx.hnsw_ids_path().exists());
+        let segment_id = idx.store.snapshot().segments[0].id.clone();
+        let persisted_snapshot = std::fs::read_to_string(idx.data_dir.join("snapshot.json"))
+            .expect("forced WAL maintenance must persist the segment registry");
+        assert!(
+            persisted_snapshot.contains(segment_id.as_str()),
+            "WAL durability tail completed without persisting the segment"
+        );
+        assert!(idx.store.wal_dir().is_dir());
+        drop(idx);
+        drop(engine);
+
+        let restarted = crate::Engine::new(config).unwrap();
+        let idx = restarted.get_index("cancel-vector-flush").unwrap();
+        idx.abort_background_tasks();
+        let request = xerj_query::parse_request(&json!({
+            "knn": {
+                "field": "embedding",
+                "query_vector": [1.0, 0.0, 0.0],
+                "k": 1,
+                "num_candidates": 10
+            },
+            "size": 1
+        }))
+        .unwrap();
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.hits[0].id, "vector-winner");
+    }
+    #[test]
+    fn cancelling_waiter_while_blocking_worker_is_queued_still_restores() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+            let ledger: &'static crate::ingest_memory::Ledger =
+                Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(config).unwrap();
+            engine
+                .create_index("bm25-queued-cancel", text_schema())
+                .unwrap();
+            let idx = engine.get_index("bm25-queued-cancel").unwrap();
+            idx.abort_background_tasks();
+            idx.index_document(Some("winner".into()), json!({"body": "alpha"}))
+                .await
+                .unwrap();
+
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let blocker = tokio::task::spawn_blocking(move || release_rx.recv().unwrap());
+            let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+            let queued_tx = parking_lot::Mutex::new(Some(queued_tx));
+            let spawn_signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let callback_spawn_signals = Arc::clone(&spawn_signals);
+            let hook = FlushPublisherTestHook {
+                callback: Arc::new(|| true),
+                after_warm: None,
+                ledger,
+                target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+                bypass_finalize_gate: true,
+                before_blocking_spawn: Some(Arc::new(move || {
+                    callback_spawn_signals.fetch_add(1, Ordering::AcqRel);
+                    if let Some(sender) = queued_tx.lock().take() {
+                        let _ = sender.send(());
+                    }
+                })),
+            };
+            let flush = {
+                let idx = Arc::clone(&idx);
+                tokio::spawn(
+                    FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }),
+                )
+            };
+            while idx.memtable.doc_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+            queued_rx.await.unwrap();
+            // The sole blocking thread is occupied, so the finalizer closure
+            // (and its worker-owned guard/rollback payload) is queued.
+            flush.abort();
+            assert!(flush.await.unwrap_err().is_cancelled());
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while idx.memtable.doc_count() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("queued finalizer must run and restore after the blocking thread is released");
+            let request = xerj_query::parse_request(&json!({
+                "query": {"match": {"body": "alpha"}}, "size": 10
+            }))
+            .unwrap();
+            let result = idx.search(&request).await.unwrap();
+            assert_eq!(result.hits[0].id, "winner");
+            assert_eq!(idx.memtable.doc_count(), 1);
+            assert_eq!(
+                spawn_signals.load(Ordering::Acquire),
+                1,
+                "exactly one finalizer coordinator must enqueue a blocking worker"
+            );
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_prepublication_flush_restores_drained_documents() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("bm25-failed-publication", text_schema())
+            .unwrap();
+        let idx = engine.get_index("bm25-failed-publication").unwrap();
+        idx.abort_background_tasks();
+        idx.index_document(Some("survivor".into()), json!({"body": "alpha alpha"}))
+            .await
+            .unwrap();
+
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(|| true),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
+        };
+        let flush = FLUSH_PUBLISHER_TEST_HOOK
+            .scope(hook, async { idx.flush().await })
+            .await;
+        assert!(
+            flush.is_err(),
+            "the injected publisher failure must surface"
+        );
+        assert_eq!(
+            idx.memtable.doc_count(),
+            1,
+            "a failed publication must restore the drained live document"
+        );
+
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "alpha"}},
+            "size": 10,
+            "track_total_hits": true
+        }))
+        .unwrap();
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "survivor");
+        idx.flush().await.unwrap();
+        assert_eq!(idx.search(&request).await.unwrap().hits[0].id, "survivor");
+        drop(idx);
+        drop(engine);
+        let restarted = crate::Engine::new(config).unwrap();
+        let idx = restarted.get_index("bm25-failed-publication").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(idx.search(&request).await.unwrap().hits[0].id, "survivor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_post_sidecar_segment_has_no_recovery_marker() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("bm25-incomplete-orphan", text_schema())
+            .unwrap();
+        let idx = engine.get_index("bm25-incomplete-orphan").unwrap();
+        idx.abort_background_tasks();
+        idx.index_document(Some("survivor".into()), json!({"body": "alpha"}))
+            .await
+            .unwrap();
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(|| false),
+            after_warm: Some(Arc::new(|_| true)),
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
+        };
+        assert!(FLUSH_PUBLISHER_TEST_HOOK
+            .scope(hook, async { idx.flush().await })
+            .await
+            .is_err());
+        let segments_dir = idx.data_dir.join("segments");
+        let files: Vec<_> = std::fs::read_dir(&segments_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        assert!(
+            files.iter().all(|path| !matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("complete" | "ids")
+            )),
+            "failed pre-publication output must retain no recovery marker"
+        );
+        assert!(idx.store.snapshot().segments.is_empty());
+        drop(idx);
+        drop(engine);
+
+        let restarted = crate::Engine::new(config).unwrap();
+        let idx = restarted.get_index("bm25-incomplete-orphan").unwrap();
+        idx.abort_background_tasks();
+        assert!(idx.store.snapshot().segments.is_empty());
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "alpha"}}, "size": 10
+        }))
+        .unwrap();
+        assert_eq!(idx.search(&request).await.unwrap().hits[0].id, "survivor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_prepublication_finalizer_restores_drained_documents() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("bm25-panic", text_schema()).unwrap();
+        let idx = engine.get_index("bm25-panic").unwrap();
+        idx.abort_background_tasks();
+        idx.index_document(Some("survivor".into()), json!({"body": "alpha"}))
+            .await
+            .unwrap();
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(|| panic!("injected finalizer panic")),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
+        };
+        assert!(FLUSH_PUBLISHER_TEST_HOOK
+            .scope(hook, async { idx.flush().await })
+            .await
+            .is_err());
+        assert_eq!(idx.memtable.doc_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_flush_does_not_restore_over_a_concurrent_newer_put() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("bm25-newer-put", text_schema())
+            .unwrap();
+        let idx = engine.get_index("bm25-newer-put").unwrap();
+        idx.abort_background_tasks();
+        idx.index_document(Some("same".into()), json!({"body": "old alpha"}))
+            .await
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                entered_tx.lock().take().unwrap().send(()).unwrap();
+                release_rx.lock().take().unwrap().recv().unwrap();
+                true
+            }),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
+        };
+        let flush = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        idx.index_document(Some("same".into()), json!({"body": "new beta"}))
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert!(flush.await.unwrap().is_err());
+
+        let alpha = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "alpha"}}, "size": 10
+        }))
+        .unwrap();
+        let beta = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "beta"}}, "size": 10
+        }))
+        .unwrap();
+        assert!(idx.search(&alpha).await.unwrap().hits.is_empty());
+        assert_eq!(idx.search(&beta).await.unwrap().hits[0].id, "same");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_flush_does_not_restore_over_a_concurrent_delete() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("bm25-newer-delete", text_schema())
+            .unwrap();
+        let idx = engine.get_index("bm25-newer-delete").unwrap();
+        idx.abort_background_tasks();
+        idx.index_document(Some("same".into()), json!({"body": "alpha"}))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                entered_tx.lock().take().unwrap().send(()).unwrap();
+                release_rx.lock().take().unwrap().recv().unwrap();
+                true
+            }),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
+        };
+        let flush = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert!(idx.delete_document("same").await.unwrap());
+        release_tx.send(()).unwrap();
+        assert!(flush.await.unwrap().is_err());
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "alpha"}}, "size": 10
+        }))
+        .unwrap();
+        assert!(idx.search(&request).await.unwrap().hits.is_empty());
+    }
+}
+
 struct HnswPublicationGuard {
     in_flight: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
@@ -6795,7 +7303,21 @@ impl Index {
                         // parks the ids in a graveyard swept by the last
                         // lease drop — so deferral is bounded by the
                         // longest-running in-flight query, not a restart.
-                        let (rm_files, rm_bytes) = self.store.retire_segment_files(&batch_slice);
+                        let (rm_files, rm_bytes) =
+                            match self.store.retire_segment_files(&batch_slice) {
+                                Ok(removed) => removed,
+                                Err(error) => {
+                                    tracing::error!(
+                                        merged_id = merged_meta.id.as_str(),
+                                        inputs = batch_slice.len(),
+                                        %error,
+                                        "merge committed but durable input retirement failed"
+                                    );
+                                    failed_batches
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    (0, 0)
+                                }
+                            };
                         tracing::info!(
                             merged_id = merged_meta.id.as_str(),
                             inputs = batch_slice.len(),
@@ -14153,7 +14675,7 @@ impl Index {
     // ── Flush ─────────────────────────────────────────────────────────────────
 
     /// Flush the memtable to a new segment on disk, then build the FTS index.
-    pub async fn flush(&self) -> Result<()> {
+    pub async fn flush(self: &Arc<Self>) -> Result<()> {
         let (field_configs, excluded_fts_fields) = {
             let schema = self.schema.read().await;
             (
@@ -14180,94 +14702,97 @@ impl Index {
         let flush_test_hook = FLUSH_PUBLISHER_TEST_HOOK
             .try_with(FlushPublisherTestHook::clone)
             .ok();
-        let mut shard_futures = Vec::with_capacity(n_shards);
-        for shard_idx in 0..n_shards {
-            let sema = Arc::clone(&self.flush_sema);
-            let store = Arc::clone(&self.store);
-            let memtable = Arc::clone(&self.memtable);
-            let registry = Arc::clone(&self.registry);
-            let data_dir = self.data_dir.clone();
-            let field_configs = field_configs.clone();
-            let excluded_fts_fields = excluded_fts_fields.clone();
-            let warm_caches = self.publish_warm_caches();
-            #[cfg(test)]
-            let test_hook = flush_test_hook.clone();
-            shard_futures.push(tokio::spawn(async move {
-                let permit = sema.acquire_owned().await.ok();
-                let permit_cell = Arc::new(std::sync::Mutex::new(permit));
-                let permit_cell_cb = Arc::clone(&permit_cell);
-                let on_drained = move || {
-                    if let Ok(mut guard) = permit_cell_cb.lock() {
+        let flush_sema = Arc::clone(&self.flush_sema);
+        let store = Arc::clone(&self.store);
+        let memtable = Arc::clone(&self.memtable);
+        let registry = Arc::clone(&self.registry);
+        let data_dir = self.data_dir.clone();
+        let warm_caches = self.publish_warm_caches();
+        let index = Arc::clone(self);
+        // This coordinator is the cancellation boundary for the whole flush.
+        // If the request future is dropped, its JoinHandle detaches and the
+        // coordinator continues owning every shard publication transaction.
+        let coordinator = tokio::spawn(async move {
+            let mut shard_futures = Vec::with_capacity(n_shards);
+            for shard_idx in 0..n_shards {
+                let sema = Arc::clone(&flush_sema);
+                let store = Arc::clone(&store);
+                let memtable = Arc::clone(&memtable);
+                let registry = Arc::clone(&registry);
+                let data_dir = data_dir.clone();
+                let field_configs = field_configs.clone();
+                let excluded_fts_fields = excluded_fts_fields.clone();
+                let warm_caches = warm_caches.clone();
+                #[cfg(test)]
+                let test_hook = flush_test_hook.clone();
+                shard_futures.push(tokio::spawn(async move {
+                    let permit = sema.acquire_owned().await.ok();
+                    let permit_cell = Arc::new(std::sync::Mutex::new(permit));
+                    let permit_cell_cb = Arc::clone(&permit_cell);
+                    let on_drained = move || {
+                        if let Ok(mut guard) = permit_cell_cb.lock() {
+                            let _ = guard.take();
+                        }
+                    };
+                    let result = do_flush_shard(
+                        shard_idx,
+                        store,
+                        memtable,
+                        registry,
+                        data_dir,
+                        field_configs,
+                        excluded_fts_fields,
+                        on_drained,
+                        warm_caches,
+                        #[cfg(test)]
+                        test_hook,
+                    )
+                    .await;
+                    // Defensive: in case on_drained didn't fire.
+                    if let Ok(mut guard) = permit_cell.lock() {
                         let _ = guard.take();
                     }
-                };
-                let result = do_flush_shard(
-                    shard_idx,
-                    store,
-                    memtable,
-                    registry,
-                    data_dir,
-                    field_configs,
-                    excluded_fts_fields,
-                    on_drained,
-                    warm_caches,
-                    #[cfg(test)]
-                    test_hook,
-                )
-                .await;
-                // Defensive: in case on_drained didn't fire.
-                if let Ok(mut guard) = permit_cell.lock() {
-                    let _ = guard.take();
-                }
-                result
-            }));
-        }
-        let mut result: Result<()> = Ok(());
-        for fut in shard_futures {
-            match fut.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    result = Err(e);
-                }
-                Err(e) => {
-                    tracing::warn!("flush shard task panicked: {e}");
+                    result
+                }));
+            }
+            let mut result: Result<()> = Ok(());
+            for fut in shard_futures {
+                match fut.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => result = Err(e),
+                    Err(error) => {
+                        result = Err(EngineError::Common(xerj_common::XerjError::internal(
+                            format!("flush shard task failed: {error}"),
+                        )));
+                    }
                 }
             }
-        }
-        // Force a global WAL maintenance pass (verified checkpoint +
-        // rotate + prune) at the user-visible flush boundary.
-        // `finalize_flush_with_publisher` time-gates this work (1 s
-        // window) on the hot per-shard path; the final flush must bypass
-        // the gate so the CLI session's last segment is definitely
-        // checkpointed when the CLI exits.
-        //
-        // RC4 W1 #8 — this used to pass `current_seq_no() - 1` as the
-        // checkpoint watermark: the LIVE global counter, covering every
-        // acked-but-unflushed doc in existence (docs bulked into other
-        // shards, docs that landed between a shard's drain and this
-        // call).  Maintenance then rotated + pruned their WAL entries
-        // while the docs still lived only in memtables — kill -9 lost
-        // all of them (live repro: 50/50 acked docs gone).  The durable
-        // watermark is now derived inside the store from the persisted
-        // snapshot, and prune verifies every entry before destroying it.
-        let _ = self.store.force_wal_maintenance();
-        // Flushing moves data from memtable → segments, which changes
-        // what the shortcut count paths compute.  Bump the dataset
-        // version so the response cache invalidates. P3.2: the new
-        // segments are immutable and don't invalidate any EXISTING
-        // segment's cached doc-values / stored fields, so we no longer
-        // clear those per-segment caches here — the version bump alone
-        // makes the query_cache miss.
-        self.dataset_version.fetch_add(1, Ordering::Release);
-        // Persist the HNSW graph alongside the segment durability
-        // event. v0.6.2 — pre-flush the graph could be reconstructed
-        // from the WAL on restart (slow); post-flush the WAL has been
-        // checkpointed past those vector inserts, so without this save
-        // a crash would lose the graph entirely. Failures are logged
-        // (warn!) inside save_hnsw_to_disk and do not fail the flush
-        // — losing a graph snapshot is recoverable; failing the flush
-        // is not.
-        let _ = self.save_hnsw_to_disk().await;
+            // Publication completion must invalidate results even when the
+            // request that initiated the flush was cancelled. The coordinator
+            // owns this transition, so it cannot be skipped with the waiter.
+            // The detached coordinator owns the complete durability tail.
+            // Persist the graph before WAL maintenance can checkpoint vector
+            // writes past the point from which restart can rebuild it.
+            if result.is_ok() {
+                if let Err(error) = index.save_hnsw_to_disk().await {
+                    result = Err(error);
+                }
+            }
+            if result.is_ok() {
+                if let Err(error) = index.store.force_wal_maintenance() {
+                    result = Err(error.into());
+                }
+            }
+            index.dataset_version.fetch_add(1, Ordering::Release);
+            index.query_cache.clear();
+            result
+        });
+        let result = match coordinator.await {
+            Ok(result) => result,
+            Err(error) => Err(EngineError::Common(xerj_common::XerjError::internal(
+                format!("flush coordinator failed: {error}"),
+            ))),
+        };
         result
     }
 
@@ -19874,6 +20399,8 @@ struct FlushPublisherTestHook {
     after_warm: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     ledger: &'static crate::ingest_memory::Ledger,
     target_memtable: usize,
+    bypass_finalize_gate: bool,
+    before_blocking_spawn: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 #[cfg(test)]
 tokio::task_local! {
@@ -19899,6 +20426,20 @@ async fn do_flush_shard(
     warm_caches: PublishWarmCaches,
     #[cfg(test)] test_hook: Option<FlushPublisherTestHook>,
 ) -> Result<()> {
+    // Acquire admission before draining. Once the memtable has been drained
+    // there must be no cancellation point until a non-cancellable blocking
+    // worker owns both rollback data and the publication barrier.
+    #[cfg(test)]
+    let bypass_finalize_gate = test_hook
+        .as_ref()
+        .is_some_and(|hook| hook.bypass_finalize_gate);
+    #[cfg(not(test))]
+    let bypass_finalize_gate = false;
+    let fin_permit = if bypass_finalize_gate {
+        None
+    } else {
+        crate::flush_finalize_gate().acquire().await.ok()
+    };
     // V4 M4.5: no outer flush_lock — concurrent flushes are allowed.  The
     // memtable write lock below is the only atomicity point we need for
     // correctness (each concurrent flush drains a disjoint set of docs
@@ -20064,6 +20605,8 @@ async fn do_flush_shard(
         Some(pair) => pair,
         None => return Ok(()),
     };
+    let drained_fts = Arc::new(drained_fts);
+    let storage_drained = Arc::new(storage_drained);
 
     // RC4 W4 item 2: record flush latency. Armed only past the empty-drain
     // early-return above, so the histogram reflects real segment builds; fires
@@ -20081,6 +20624,7 @@ async fn do_flush_shard(
     let segments_dir = data_dir.join("segments");
     let registry_for_build = Arc::clone(&registry);
     let fts_doc_count = drained_fts.len();
+    let drained_fts_for_build = Arc::clone(&drained_fts);
     let segments_dir_for_dv = segments_dir.clone();
     let store_for_warm = Arc::clone(&store);
     // POV battery (B-3) caught that gating FTS+DV on the raw-bytes path
@@ -20095,6 +20639,11 @@ async fn do_flush_shard(
     let failed_warm_caches = warm_caches.clone();
     let warmed_segment_id = Arc::new(parking_lot::Mutex::new(None::<String>));
     let callback_warmed_segment_id = Arc::clone(&warmed_segment_id);
+    #[cfg(test)]
+    let before_blocking_spawn = test_hook
+        .as_ref()
+        .filter(|hook| hook.target_memtable == test_target)
+        .and_then(|hook| hook.before_blocking_spawn.as_ref().map(Arc::clone));
     let build_fts = move |meta: &xerj_storage::segment::SegmentMeta| -> xerj_storage::Result<()> {
         #[cfg(test)]
         let test_callback = test_hook
@@ -20120,16 +20669,17 @@ async fn do_flush_shard(
             let t_dv = std::time::Instant::now();
             {
                 let columns = build_doc_value_columns(
-                    drained_fts
+                    drained_fts_for_build
                         .iter()
                         .map(|(_id, _fields, src)| Some(src.as_ref())),
                 );
                 if !columns.is_empty() {
-                    if let Err(e) =
-                        write_doc_values_sidecar(&segments_dir_for_dv, meta.id.as_str(), &columns)
-                    {
-                        tracing::warn!("doc-values side-car write failed: {e}");
-                    }
+                    write_doc_values_sidecar(&segments_dir_for_dv, meta.id.as_str(), &columns)
+                        .map_err(|error| {
+                            xerj_storage::StorageError::Io(std::io::Error::other(format!(
+                                "doc-values side-car write failed: {error}"
+                            )))
+                        })?;
                 }
             }
             let dv_us = t_dv.elapsed().as_micros();
@@ -20146,12 +20696,14 @@ async fn do_flush_shard(
                     fts_writer.configure_field(field_name.clone(), cfg.clone());
                 }
                 let t_add = std::time::Instant::now();
-                fts_writer.add_documents_parallel(&drained_fts);
+                fts_writer.add_documents_parallel(&drained_fts_for_build);
                 fts_add_us = t_add.elapsed().as_micros();
                 let t_fin = std::time::Instant::now();
-                if let Err(e) = fts_writer.finish() {
-                    tracing::warn!("flush: FTS build failed: {e}");
-                }
+                fts_writer.finish().map_err(|error| {
+                    xerj_storage::StorageError::Io(std::io::Error::other(format!(
+                        "FTS side-car build failed: {error}"
+                    )))
+                })?;
                 fts_finish_us = t_fin.elapsed().as_micros();
             }
             if prof {
@@ -20187,7 +20739,7 @@ async fn do_flush_shard(
             Ok(())
         })?;
         let _ = &segments_dir;
-        let _ = &drained_fts;
+        let _ = &drained_fts_for_build;
 
         Ok(())
     };
@@ -20206,25 +20758,79 @@ async fn do_flush_shard(
     //      concurrent bulk clients' HTTP handling and the reader's search
     //      dispatch.
     let t_finalize = std::time::Instant::now();
-    let _fin_permit = crate::flush_finalize_gate().acquire().await.ok();
-    let finalize_join = tokio::task::spawn_blocking(move || {
-        // This lease lives in the blocking worker, not the async waiter:
-        // aborting an async task cannot cancel `spawn_blocking`.
-        let lease =
-            PrePublicationLease::tracked(failed_warm_caches, Arc::clone(&warmed_segment_id));
-        let result = crate::background_pool()
-            .install(|| store.finalize_flush_with_publisher(storage_drained, build_fts));
-        if matches!(result, Ok(Some(_))) {
-            // finalize_flush_with_publisher publishes the snapshot before it
-            // returns Some. Commit while still in the worker, with no await.
-            lease.commit();
+    let store_for_finalize = Arc::clone(&store);
+    let storage_drained_for_finalize = Arc::clone(&storage_drained);
+    let memtable_for_finalize = Arc::clone(&memtable);
+    let drained_fts_for_restore = Arc::clone(&drained_fts);
+    let version_map_for_restore = Arc::clone(&store.version_map);
+    // A dedicated async coordinator owns and awaits the queued blocking job.
+    // Dropping/cancelling the API caller merely detaches this coordinator;
+    // it continues to own the blocking JoinHandle and the worker-captured
+    // publication transaction until commit or rollback.
+    let finalize_coordinator = tokio::spawn(async move {
+        #[cfg(test)]
+        if let Some(callback) = before_blocking_spawn {
+            callback();
         }
-        result
-    })
-    .await;
+        tokio::task::spawn_blocking(move || {
+            let _fin_permit = fin_permit;
+            // This lease lives in the blocking worker, not either async waiter.
+            let lease =
+                PrePublicationLease::tracked(failed_warm_caches, Arc::clone(&warmed_segment_id));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::background_pool().install(|| {
+                    store_for_finalize
+                        .finalize_flush_with_publisher(&storage_drained_for_finalize, build_fts)
+                })
+            }));
+            if !matches!(
+                result,
+                Ok(Ok(
+                    xerj_storage::index_store::FlushFinalizeOutcome::Published { .. }
+                ))
+            ) {
+                let restore = storage_drained_for_finalize
+                    .entries
+                    .iter()
+                    .zip(drained_fts_for_restore.iter())
+                    .map(|(stored, (doc_id, fields, source))| {
+                        (
+                            stored.seq_no,
+                            doc_id.clone(),
+                            fields.clone(),
+                            Arc::clone(source),
+                        )
+                    })
+                    .collect();
+                memtable_for_finalize.restore_failed_flush(restore, &version_map_for_restore);
+            }
+            let result = match result {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+            if matches!(
+                result,
+                Ok(xerj_storage::index_store::FlushFinalizeOutcome::Published { .. })
+            ) {
+                // finalize_flush_with_publisher publishes the snapshot before it
+                // returns Some. Commit while still in the worker, with no await.
+                lease.commit();
+            }
+            result
+        })
+        .await
+    });
+    let finalize_join = match finalize_coordinator.await {
+        Ok(join) => join,
+        Err(join_e) => {
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                format!("flush coordinator task failed: {join_e}"),
+            )));
+        }
+    };
     let meta = match finalize_join {
-        Ok(Ok(Some(m))) => m,
-        Ok(Ok(None)) => {
+        Ok(Ok(xerj_storage::index_store::FlushFinalizeOutcome::Published { meta, .. })) => meta,
+        Ok(Ok(xerj_storage::index_store::FlushFinalizeOutcome::Empty)) => {
             tracing::warn!("storage finalize returned None — unexpected");
             return Ok(());
         }
@@ -20233,7 +20839,9 @@ async fn do_flush_shard(
         }
         Err(join_e) => {
             tracing::warn!("finalize spawn_blocking join failed: {join_e}");
-            return Ok(());
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                format!("flush finalizer task failed before publication: {join_e}"),
+            )));
         }
     };
     if prof {
@@ -32869,6 +33477,8 @@ mod flush_memory_integration_tests {
             after_warm: None,
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
         };
 
         let flush = {
@@ -32939,6 +33549,8 @@ mod flush_memory_integration_tests {
             })),
             ledger,
             target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
         };
 
         let result = do_flush_shard(
@@ -32954,11 +33566,15 @@ mod flush_memory_integration_tests {
             Some(hook),
         )
         .await;
-        if panic_after_warm {
-            assert!(result.is_ok(), "join panic is logged and kept non-fatal");
-        } else {
-            assert!(result.is_err());
-        }
+        assert!(
+            result.is_err(),
+            "publisher errors and panics must propagate to the flush caller"
+        );
+        assert_eq!(
+            idx.memtable.doc_count(),
+            1,
+            "pre-publication failure must restore the drained document"
+        );
         let segment_id = warmed_id.lock().clone().expect("warm hook did not run");
         assert!(!idx.stored_slices_cache.contains_key(&segment_id));
         assert!(!idx.dv_cache.contains_key(&segment_id));
