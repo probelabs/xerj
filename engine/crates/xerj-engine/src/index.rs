@@ -12156,6 +12156,17 @@ impl Index {
             // wasted work when the query is a stored-doc scan.
             let fts_query_probe = query_node_to_fts(query, &text_fields, &exact_fields);
             let needs_fts = fts_query_probe.is_some();
+            // A `query_string` whose projection DECLINED still has to be
+            // answered by the stored-doc scan — an over-cap `tokens × fields`
+            // cross-product returns `None`, and without the scan the segment
+            // would be skipped outright, dropping every match it holds.
+            //
+            // UNLESS it declined because the query analyses to zero tokens, in
+            // which case nothing can match and the scan is pure cost. See
+            // `query_string_has_no_tokens` for the measurement; hoisted out of
+            // the per-segment loop below because it re-tokenises the query.
+            let query_string_needs_doc_scan = matches!(query, QueryNode::QueryString { .. })
+                && !query_string_has_no_tokens(query, &exact_fields);
             // Open the FTS reader with every field the projected query
             // actually touches, ON TOP of the text fields.  Keyword-typed
             // fields have FTS side-cars too (whole-value keyword-analyzer
@@ -12243,7 +12254,14 @@ impl Index {
                 let fts_dir = segments_dir.clone();
 
                 let field_refs: Vec<&str> = fts_open_fields.iter().map(|s| s.as_str()).collect();
-                let scan_stored = matches!(query, QueryNode::MatchAll) || is_doc_scan_query(query);
+                // `QueryString` is steered by its own flag rather than added
+                // to `is_doc_scan_query` (which also steers the MEMTABLE
+                // branch, where `query_string` must keep its BM25 route), and
+                // that flag is false for the zero-token shape so a
+                // `query_string` that can match nothing costs nothing.
+                let scan_stored = matches!(query, QueryNode::MatchAll)
+                    || query_string_needs_doc_scan
+                    || is_doc_scan_query(query);
 
                 // Try FTS path first if we have an FTS query.
                 let mut fts_handled = false;
@@ -12308,6 +12326,20 @@ impl Index {
                         // report 0 matches for the segment. Require every
                         // referenced field to be present; if any is missing,
                         // fall through to the stored-doc scan.
+                        //
+                        // HETEROGENEOUS SEGMENTS: for a pure disjunction that
+                        // rule is far stricter than it needs to be. A
+                        // field-less `query_string` projects one `should`
+                        // clause per (token, text field), and any field first
+                        // indexed after a flush is missing from every older
+                        // segment — so a single late field pushed EVERY older
+                        // segment onto the stored-doc scan. Prune the clauses
+                        // naming fields this segment never indexed (they can
+                        // only match nothing here) and keep the postings path;
+                        // if nothing survives, fall through as before.
+                        let fq =
+                            prune_missing_should_fields(&fq, &|f| reader.field_stats(f).is_some())
+                                .unwrap_or(fq);
                         let fts_has_field = {
                             let mut qf: Vec<String> = Vec::new();
                             collect_fts_query_fields(&fq, &mut qf);
@@ -19644,22 +19676,34 @@ impl Index {
             // minimum the ~3 µs JSON parse below; the read is noise).
             //
             // The interval used to be 4 096, sized for that ~3 µs/doc floor.
-            // A `script` query breaks that assumption: even with the Painless
-            // AST cached (see `painless::compile_script_cached`), *executing*
-            // a script dominates the per-doc cost. Measured on a release
-            // build: a benign 64 KiB script runs 385 µs/doc, so 4 096 docs is
-            // a ~1.6 s stretch in which a `timeout` cannot take effect, and
-            // 256 brings that to ~98 ms.
+            // Two separate matcher shapes break that assumption:
             //
-            // 256 is an improvement, not a bound. A deliberately adversarial
-            // script of legal size — flat, no closure calls, tripping none of
-            // MAX_CALL_DEPTH / MAX_CALL_COUNT / MAX_EVAL_DEPTH /
-            // MAX_PARSE_DEPTH / MAX_PAINLESS_STRING_LEN — was measured at
-            // 1.27 s/doc, which is ~325 s per poll interval. Nothing here
-            // bounds that, because there is no per-evaluation CPU budget; the
-            // poll interval only decides how often an already-cheap document
-            // boundary is checked. Closing that needs a real time or
-            // instruction budget inside `eval_painless`, tracked separately.
+            //   - A `script` query: even with the Painless AST cached (see
+            //     `painless::compile_script_cached`), *executing* a script
+            //     dominates the per-doc cost. Measured on a release build, a
+            //     benign 64 KiB script runs 385 µs/doc, so 4 096 docs is a
+            //     ~1.6 s stretch in which a `timeout` cannot take effect, and
+            //     256 brings that to ~98 ms.
+            //   - A field-less `query_string` over a wide mapping: it
+            //     tokenises every text-bearing field of every document, so a
+            //     few hundred documents is already several times the
+            //     request's whole budget — and the scan would report
+            //     `timed_out: false` after blowing straight through it.
+            //
+            // 256 bounds the overshoot to a few hundred documents for every
+            // matcher shape, and 16× more clock reads on a million-doc scan is
+            // still a rounding error against the parse.
+            //
+            // For scripts, 256 is an improvement, not a bound. A deliberately
+            // adversarial script of legal size — flat, no closure calls,
+            // tripping none of MAX_CALL_DEPTH / MAX_CALL_COUNT /
+            // MAX_EVAL_DEPTH / MAX_PARSE_DEPTH / MAX_PAINLESS_STRING_LEN — was
+            // measured at 1.27 s/doc, which is ~325 s per poll interval.
+            // Nothing here bounds that, because there is no per-evaluation CPU
+            // budget; the poll interval only decides how often an
+            // already-cheap document boundary is checked. Closing that needs a
+            // real time or instruction budget inside `eval_painless`, tracked
+            // separately.
             if doc_pos & 0xFF == 0 {
                 if let Some(dl) = deadline {
                     if std::time::Instant::now() >= dl {
@@ -24937,6 +24981,103 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
 
         QueryNode::SimpleQueryString { .. } => false, // Converted to Bool at parse time
 
+        // `query_string` on the stored-doc path.
+        //
+        // Segments are HETEROGENEOUS: one flushed before a field first
+        // appeared carries no FTS side-car for that field, and a segment
+        // flushed under M5.4 may carry no side-cars at all. In both cases the
+        // FTS route declines the segment and this scan is the only thing that
+        // answers for its documents. Until this arm existed the catch-all
+        // `_ => false` below made every one of those documents a silent
+        // non-match: `hits.total` simply came back short, with nothing in the
+        // response saying so. Widening the field-less projection from
+        // `text_fields[0]` to every text field is what turned that decline
+        // from a corner case into the common one — any field added after a
+        // flush makes every older segment fail the "reader has every queried
+        // field" gate.
+        //
+        // An OR over the analyzed query tokens, restricted to `default_field`
+        // when one is given and otherwise run against the fields present in
+        // the scanned source (`index.query.default_field` defaults to `"*"`).
+        // Leading-underscore keys are skipped — `_id` is spliced into the
+        // scanned source and would over-count.
+        //
+        // This is CLOSE TO, but not byte-identical to, `query_node_to_fts`'s
+        // projection, and the difference is deliberate: the projection ORs
+        // over schema `FieldType::Text` fields only, whereas this scan arm
+        // walks every non-`_` key of the source, so a token living only in a
+        // KEYWORD (or other exact string) field matches here but not on the
+        // FTS route. Measured: with schema {code: Keyword, alpha: Text} and a
+        // token only in `code`, a field-less `query_string` returns it via the
+        // scan path. The scan arm is the more ES-correct of the two (ES's
+        // `default_field: "*"` includes keyword fields), but because a
+        // within-cap query takes the FTS route and an over-cap one takes the
+        // scan route, the answer can differ across the `tokens × fields` cap.
+        // Reconciling the two onto one field set is tracked separately; do not
+        // read this as "the two routes agree".
+        QueryNode::QueryString {
+            query,
+            default_field,
+            ..
+        } => {
+            // This runs PER DOCUMENT over every text-bearing field, so it has
+            // to be O(document tokens), not O(document tokens × query tokens):
+            // hash the query's tokens once and reuse a single lowercase buffer
+            // for the whole call, so scanning a document allocates nothing.
+            let terms: HashSet<String> = intervals_tokenise(query).into_iter().collect();
+            if terms.is_empty() {
+                return false;
+            }
+            /// Any analyzed token of `v` (recursing through arrays/objects)
+            /// equal to one of `terms`. Whole-value equality is also accepted
+            /// so a keyword-typed field — whose FST holds one un-analyzed
+            /// token per value — is not silently missed on this path, the
+            /// same exact-or-tokenized convention the `Terms` arm above uses.
+            fn any_token_hit(
+                v: &Value,
+                terms: &HashSet<String>,
+                raw: &str,
+                buf: &mut String,
+            ) -> bool {
+                match v {
+                    Value::String(s) => {
+                        if s.eq_ignore_ascii_case(raw) {
+                            return true;
+                        }
+                        for tok in s.split(|c: char| !c.is_alphanumeric()) {
+                            if tok.is_empty() {
+                                continue;
+                            }
+                            buf.clear();
+                            buf.extend(tok.chars().flat_map(char::to_lowercase));
+                            if terms.contains(buf.as_str()) {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    Value::Array(arr) => arr.iter().any(|e| any_token_hit(e, terms, raw, buf)),
+                    Value::Object(obj) => obj
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .any(|(_, e)| any_token_hit(e, terms, raw, buf)),
+                    _ => false,
+                }
+            }
+            let mut buf = String::new();
+            match default_field.as_deref() {
+                Some(f) if f != "*" && !f.is_empty() => get_field_value(source, f)
+                    .is_some_and(|v| any_token_hit(&v, &terms, query.as_str(), &mut buf)),
+                _ => match source {
+                    Value::Object(obj) => obj
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .any(|(_, v)| any_token_hit(v, &terms, query.as_str(), &mut buf)),
+                    other => any_token_hit(other, &terms, query.as_str(), &mut buf),
+                },
+            }
+        }
+
         QueryNode::FunctionScore { query, .. } => doc_matches_query(query, source),
 
         // Nested: extract the array at `path`, run the inner query against each element.
@@ -28203,6 +28344,55 @@ fn ip_matches_cidr(ip_str: &str, cidr: &str) -> Option<bool> {
     Some((ip & mask) == (network & mask))
 }
 
+/// Drop the `should` clauses of a pure disjunction that name a field this
+/// segment has no FTS data for, returning `None` when the shape isn't a pure
+/// disjunction or when nothing survives.
+///
+/// Segments are heterogeneous. A field first seen after a flush has no
+/// side-car in any older segment, so `field_stats` reports it missing there —
+/// and the caller's "reader has EVERY queried field" gate then refuses the
+/// whole segment. That gate is right for `must`/`must_not`, where a missing
+/// field changes what the clause means, but it is needlessly destructive for
+/// the disjunction a field-less `query_string` (or a `fields`-less
+/// `multi_match`) projects to: a clause naming a field the segment never
+/// indexed can only ever match nothing, so deleting it leaves the disjunction
+/// semantically identical over this segment's documents while keeping the
+/// whole thing on the postings path.
+///
+/// Deliberately narrow — only `should`-only bools whose every clause is a
+/// plain `Term`, which is exactly what the field-less projection emits.
+/// Anything else keeps the conservative all-fields-present gate.
+fn prune_missing_should_fields(q: &FtsQuery, has_field: &dyn Fn(&str) -> bool) -> Option<FtsQuery> {
+    let FtsQuery::Bool(b) = q else { return None };
+    if !b.must.is_empty() || !b.must_not.is_empty() || b.min_should_match.is_some() {
+        return None;
+    }
+    if b.should.is_empty() || !b.should.iter().all(|c| matches!(c, FtsQuery::Term(_))) {
+        return None;
+    }
+    let kept: Vec<FtsQuery> = b
+        .should
+        .iter()
+        .filter(|c| match c {
+            FtsQuery::Term(t) => has_field(t.field.as_str()),
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    // Nothing survived: the segment has FTS data for none of the queried
+    // fields, which is also what an FTS-less segment looks like. Let the
+    // caller fall through to the stored-doc scan rather than reporting an
+    // authoritative zero.
+    if kept.is_empty() || kept.len() == b.should.len() {
+        return None;
+    }
+    let mut pruned = FtsBool::new().boost(b.boost);
+    for c in kept {
+        pruned = pruned.should(c);
+    }
+    Some(FtsQuery::Bool(Box::new(pruned)))
+}
+
 /// Collect every field name referenced by an FTS query tree.
 ///
 /// Used to (a) extend the set of side-car fields `FtsIndexReader::open`
@@ -28258,6 +28448,69 @@ fn collect_fts_query_fields(q: &FtsQuery, out: &mut Vec<String>) {
         }
         FtsQuery::MatchAll => {}
     }
+}
+
+/// Does this `query_string` analyse to ZERO searchable tokens?
+///
+/// `query_node_to_fts` declines a `QueryString` (returns `None`) for two
+/// reasons that are indistinguishable to the caller and demand OPPOSITE
+/// handling:
+///
+///   * The analyzed query has no tokens at all — `"+++"`, `"---"`, anything
+///     the standard analyzer reduces to nothing. The projection would be a
+///     disjunction with zero clauses, which matches nothing, and the
+///     stored-doc scan agrees: `doc_matches_query`'s `QueryString` arm returns
+///     `false` the moment its token set is empty. The correct answer is the
+///     empty result, reached WITHOUT reading a single document.
+///   * The `tokens × fields` cross-product blew `MAX_QS_CROSS_PRODUCT`. The
+///     query is perfectly matchable there and the stored-doc scan is the only
+///     route left, so skipping the segment would drop every match it holds.
+///
+/// (The heterogeneous-segment case is NOT one of these: a segment missing a
+/// queried field still gets a `Some` projection, and it is the per-segment
+/// `fts_has_field` gate below that routes it to the scan via
+/// `needs_fts && !fts_handled`. That path is untouched here.)
+///
+/// Collapsing both into "scan the stored section" cost a full O(corpus) walk
+/// to produce an empty result. Measured by
+/// `tests/query_string_default_field.rs::zero_token_query_string_does_not_scan_the_corpus`
+/// — release, 20 000 documents in ONE segment, best of 5, query cache cleared
+/// before every run — a zero-token `query_string` cost:
+///
+///   * 0.399 ms before the field-less `query_string` work,
+///   * 26.412 ms with both declines collapsed into one `scan_stored`,
+///   * 0.457 ms with them separated here.
+///
+/// The middle number is a 66× regression on a shape that returns nothing, and
+/// it grows with the index: the comparator in that test — a query that really
+/// does walk all 20 000 documents — cost 10.7-16.9 ms on the same runs.
+///
+/// Mirrors the projection's own order of operations: an `exact_fields`
+/// `default_field` short-circuits to a whole-value term BEFORE any
+/// tokenisation, so an un-analyzable string is still a legitimate term there
+/// and this must report `false`.
+fn query_string_has_no_tokens(
+    q: &QueryNode,
+    exact_fields: &std::collections::HashSet<String>,
+) -> bool {
+    let QueryNode::QueryString {
+        query,
+        default_field,
+        ..
+    } = q
+    else {
+        return false;
+    };
+    if let Some(field) = default_field.as_deref() {
+        if exact_fields.contains(field) {
+            return false;
+        }
+    }
+    // No analyzer (never in practice — `standard` is always registered) is
+    // treated as "cannot prove it matches nothing", keeping the scan.
+    AnalyzerRegistry::default()
+        .get_analyzer("standard")
+        .is_some_and(|a| a.analyze(query).is_empty())
 }
 
 /// Convert a QueryNode to an FTS Query for segment search.
@@ -28564,23 +28817,83 @@ fn query_node_to_fts(
         } => {
             // Honor top-level `query_string.boost` like the Match arm above.
             let b = boost.unwrap_or(1.0);
-            let field = default_field
-                .as_deref()
-                .or_else(|| text_fields.first().map(|s| s.as_str()))
-                .unwrap_or("_all");
-            // Keyword default field: whole-value term (keyword analyzer).
-            if exact_fields.contains(field) {
-                return Some(FtsQuery::Term(FtsTerm::boosted(field, query.as_str(), b)));
+            // An explicit `default_field` searches exactly that one field —
+            // unchanged single-field behavior, including the keyword
+            // whole-value-term shortcut.
+            if let Some(field) = default_field.as_deref() {
+                if exact_fields.contains(field) {
+                    return Some(FtsQuery::Term(FtsTerm::boosted(field, query.as_str(), b)));
+                }
+                let registry = AnalyzerRegistry::default();
+                let analyzer = registry.get_analyzer("standard")?;
+                let tokens = analyzer.analyze(query);
+                if tokens.is_empty() {
+                    return None;
+                }
+                let mut bool_q = FtsBool::new().boost(b);
+                for token in &tokens {
+                    bool_q = bool_q.should(FtsQuery::Term(FtsTerm::new(field, &token.text)));
+                }
+                return Some(FtsQuery::Bool(Box::new(bool_q)));
             }
+            // No `default_field`: real ES/OpenSearch searches every mapped
+            // text field (`index.query.default_field` defaults to `"*"`).
+            // This used to fall back to `text_fields.first()` — an
+            // arbitrary single field picked by schema order — silently
+            // missing every match in every OTHER text field. Found live: a
+            // `query_string` with no field, run across a multi-index search
+            // spanning indices with different schemas, undercounted matches
+            // by two orders of magnitude (18 of ~14,074) because only one
+            // unrelated field was ever checked.
+            let fallback = ["_all".to_string()];
+            let fields: &[String] = if text_fields.is_empty() {
+                &fallback
+            } else {
+                text_fields
+            };
             let registry = AnalyzerRegistry::default();
             let analyzer = registry.get_analyzer("standard")?;
             let tokens = analyzer.analyze(query);
             if tokens.is_empty() {
                 return None;
             }
+            // Bound the `tokens × fields` cross-product. This is the SAME
+            // shape as the `more_like_this` `fields × like` blow-up capped
+            // in `xerj_query::parser` (MAX_MLT_CROSS_PRODUCT), and it is
+            // worse here on two counts: the product is rebuilt for EVERY
+            // segment of the scan, and `FtsSearcher::execute_bool`
+            // materialises a full `Vec<ScoredHit>` PER CLAUSE before
+            // combining — so a wide mapping crossed with a long query
+            // string is both an allocation bomb and an uninterruptible
+            // unit of work on the search hot path. Widening the field-less
+            // `query_string` from one field to every text field is exactly
+            // what makes the second dimension attacker-reachable.
+            //
+            // Over the cap we do NOT narrow the field set (that is the
+            // silent under-matching this arm exists to fix) and we do NOT
+            // drop the query: returning `None` routes the request to the
+            // stored-doc scan, which evaluates the same field-less
+            // semantics per document in `doc_matches_query` and polls the
+            // request deadline every 256 docs. Slower, bounded, correct.
+            //
+            // Only the PRODUCT is capped, unlike MLT's three limits. There
+            // both dimensions come from the request body, so bounding each
+            // one is meaningful; here the field count is the index's own
+            // mapping, and a standalone field cap would push a perfectly
+            // ordinary two-token query off the fast path on any schema with
+            // a lot of text fields. 4 096 is the MLT cross-product cap and
+            // also ES's default `indices.query.bool.max_clause_count` —
+            // where ES rejects the query outright, we degrade to the scan.
+            const MAX_QS_CROSS_PRODUCT: usize = 4_096;
+            if tokens.len().saturating_mul(fields.len()) > MAX_QS_CROSS_PRODUCT {
+                return None;
+            }
             let mut bool_q = FtsBool::new().boost(b);
             for token in &tokens {
-                bool_q = bool_q.should(FtsQuery::Term(FtsTerm::new(field, &token.text)));
+                for field in fields {
+                    bool_q =
+                        bool_q.should(FtsQuery::Term(FtsTerm::new(field.as_str(), &token.text)));
+                }
             }
             Some(FtsQuery::Bool(Box::new(bool_q)))
         }
@@ -31206,6 +31519,255 @@ mod fts_projection_tests {
             }
             other => panic!("expected bool, got {:?}", other),
         }
+    }
+
+    /// The two `None`s `query_node_to_fts` returns for a `QueryString` mean
+    /// opposite things, and `scan_stored` has to tell them apart: zero tokens
+    /// means nothing can match (skip the segment), an over-cap cross-product
+    /// means the query is matchable and the stored scan is the only route.
+    #[test]
+    fn zero_token_query_string_is_distinguished_from_an_over_cap_one() {
+        let punctuation = QueryNode::QueryString {
+            query: "+++".into(),
+            default_field: None,
+            default_operator: None,
+            boost: None,
+        };
+        let one_field = vec!["body".to_string()];
+        assert!(
+            query_node_to_fts(&punctuation, &one_field, &kw(&[])).is_none(),
+            "pure punctuation projects to nothing"
+        );
+        assert!(
+            query_string_has_no_tokens(&punctuation, &kw(&[])),
+            "…and that `None` must be reported as UNMATCHABLE, not as a \
+             decline that needs the stored-doc scan"
+        );
+
+        // The other `None`: a matchable query that blew the cross-product cap.
+        let many_fields: Vec<String> = (0..2_000).map(|i| format!("f{i}")).collect();
+        let over_cap = qs_tokens(3);
+        assert!(
+            query_node_to_fts(&over_cap, &many_fields, &kw(&[])).is_none(),
+            "3 × 2 000 is over the cap"
+        );
+        assert!(
+            !query_string_has_no_tokens(&over_cap, &kw(&[])),
+            "an over-cap query still matches documents and MUST keep the scan"
+        );
+
+        // An ordinary query is never mistaken for unmatchable.
+        assert!(!query_string_has_no_tokens(&qs_tokens(2), &kw(&[])));
+        // Non-`QueryString` nodes are not this function's business.
+        assert!(!query_string_has_no_tokens(&QueryNode::MatchAll, &kw(&[])));
+
+        // Keyword `default_field`: the projection short-circuits to a
+        // whole-value term BEFORE tokenising, so an un-analyzable string is a
+        // legitimate term there and must NOT be called unmatchable.
+        let on_keyword = QueryNode::QueryString {
+            query: "+++".into(),
+            default_field: Some("code".into()),
+            default_operator: None,
+            boost: None,
+        };
+        assert!(
+            query_node_to_fts(&on_keyword, &one_field, &kw(&["code"])).is_some(),
+            "a keyword default_field projects to a whole-value term"
+        );
+        assert!(!query_string_has_no_tokens(&on_keyword, &kw(&["code"])));
+        // Same string on a TEXT default_field does tokenise to nothing.
+        assert!(query_string_has_no_tokens(&on_keyword, &kw(&[])));
+    }
+
+    /// Regression: `query_string` with no `default_field` set (ES/OpenSearch
+    /// semantics — `index.query.default_field` defaults to `"*"`, i.e.
+    /// search every mapped text field) used to pick only `text_fields[0]`,
+    /// an arbitrary single field chosen by schema order. Any match in every
+    /// OTHER text field was silently missed. Found live: a Kibana/OSD
+    /// Timelion panel's `query_string` (used to select which index's docs
+    /// to count inside a `filters` aggregation) undercounted matches by two
+    /// orders of magnitude because the schema's first text field happened
+    /// not to be the one holding the searched value.
+    #[test]
+    fn query_string_with_no_default_field_searches_every_text_field() {
+        let q = QueryNode::QueryString {
+            query: "needle".into(),
+            default_field: None,
+            default_operator: None,
+            boost: None,
+        };
+        let text_fields = vec!["agent".to_string(), "message".to_string()];
+        let fq = query_node_to_fts(&q, &text_fields, &kw(&[])).expect("projects");
+        match fq {
+            FtsQuery::Bool(b) => {
+                let fields: Vec<&str> = b
+                    .should
+                    .iter()
+                    .map(|s| match s {
+                        FtsQuery::Term(t) => t.field.as_str(),
+                        other => panic!("expected term, got {:?}", other),
+                    })
+                    .collect();
+                assert!(
+                    fields.contains(&"message"),
+                    "must search every text field, not just the first — got {fields:?}"
+                );
+                assert!(fields.contains(&"agent"), "got {fields:?}");
+            }
+            other => panic!("expected bool, got {:?}", other),
+        }
+    }
+
+    /// Build a field-less `query_string` node over `n_tokens` tokens.
+    fn qs_tokens(n_tokens: usize) -> QueryNode {
+        QueryNode::QueryString {
+            query: (0..n_tokens)
+                .map(|i| format!("tok{i} "))
+                .collect::<String>(),
+            default_field: None,
+            default_operator: None,
+            boost: None,
+        }
+    }
+
+    /// BLOCKER: the field-less projection builds one `should` clause per
+    /// (token × field) and `execute_bool` then materialises a full hit vector
+    /// per clause, so the product must be capped exactly like the
+    /// `more_like_this` `fields × like` cross-product is capped at parse time.
+    /// Uncapped, 500 tokens × 80 fields is 40 000 clauses re-built for EVERY
+    /// segment of the scan.
+    #[test]
+    fn field_less_query_string_cross_product_is_capped() {
+        let text_fields: Vec<String> = (0..80).map(|i| format!("f{i}")).collect();
+        assert!(
+            query_node_to_fts(&qs_tokens(500), &text_fields, &kw(&[])).is_none(),
+            "500 × 80 = 40 000 clauses must not be projected; the request \
+             falls back to the stored-doc scan, which is deadline-polled"
+        );
+        // Either dimension can carry the product past the cap on its own.
+        let one_field = vec!["body".to_string()];
+        assert!(
+            query_node_to_fts(&qs_tokens(5_000), &one_field, &kw(&[])).is_none(),
+            "5 000 tokens × 1 field is still 5 000 clauses"
+        );
+        let many_fields: Vec<String> = (0..2_000).map(|i| format!("f{i}")).collect();
+        assert!(
+            query_node_to_fts(&qs_tokens(3), &many_fields, &kw(&[])).is_none(),
+            "3 tokens × 2 000 fields is 6 000 clauses"
+        );
+    }
+
+    /// The cap must not touch ordinary queries: a realistic mapping and a
+    /// realistic query still project to the postings path, with every clause
+    /// accounted for. A WIDE mapping with a short query especially — capping
+    /// the field count on its own would have pushed it off the fast path.
+    #[test]
+    fn field_less_query_string_within_the_cap_still_projects() {
+        let text_fields: Vec<String> = (0..8).map(|i| format!("f{i}")).collect();
+        let fq = query_node_to_fts(&qs_tokens(20), &text_fields, &kw(&[])).expect("projects");
+        match fq {
+            FtsQuery::Bool(b) => assert_eq!(
+                b.should.len(),
+                20 * 8,
+                "every (token × field) pair is a clause"
+            ),
+            other => panic!("expected bool, got {other:?}"),
+        }
+        let wide: Vec<String> = (0..300).map(|i| format!("f{i}")).collect();
+        let fq = query_node_to_fts(&qs_tokens(2), &wide, &kw(&[])).expect("wide mapping projects");
+        match fq {
+            FtsQuery::Bool(b) => assert_eq!(b.should.len(), 2 * 300),
+            other => panic!("expected bool, got {other:?}"),
+        }
+    }
+
+    /// HIGH: a segment that never indexed one of the queried fields must have
+    /// only THAT clause dropped, not the whole disjunction rejected. Rejecting
+    /// it sent the segment to a stored-doc scan that had no `query_string`
+    /// matcher, so its documents silently vanished from `hits.total`.
+    #[test]
+    fn prune_drops_only_the_clauses_a_segment_cannot_serve() {
+        let q = FtsQuery::Bool(Box::new(
+            FtsBool::new()
+                .should(FtsQuery::Term(FtsTerm::new("alpha", "needle")))
+                .should(FtsQuery::Term(FtsTerm::new("beta", "needle"))),
+        ));
+        let pruned =
+            prune_missing_should_fields(&q, &|f| f == "alpha").expect("prunes to the kept field");
+        match pruned {
+            FtsQuery::Bool(b) => {
+                assert_eq!(b.should.len(), 1);
+                match &b.should[0] {
+                    FtsQuery::Term(t) => assert_eq!(t.field, "alpha"),
+                    other => panic!("expected term, got {other:?}"),
+                }
+            }
+            other => panic!("expected bool, got {other:?}"),
+        }
+        // Every field present → nothing to prune, caller keeps the original.
+        assert!(prune_missing_should_fields(&q, &|_| true).is_none());
+        // No field present → indistinguishable from a segment with no FTS
+        // side-cars at all; the caller must fall through to the stored scan
+        // rather than report an authoritative zero.
+        assert!(prune_missing_should_fields(&q, &|_| false).is_none());
+        // Conjunctive shapes keep the conservative all-present gate: dropping
+        // a `must` clause would BROADEN the query.
+        let conj = FtsQuery::Bool(Box::new(
+            FtsBool::new()
+                .must(FtsQuery::Term(FtsTerm::new("alpha", "needle")))
+                .should(FtsQuery::Term(FtsTerm::new("beta", "needle"))),
+        ));
+        assert!(prune_missing_should_fields(&conj, &|f| f == "alpha").is_none());
+    }
+
+    /// HIGH: the stored-doc scan is the ONLY thing that answers for a segment
+    /// the FTS route declines, and it had no `query_string` arm — every such
+    /// document was a silent non-match.
+    #[test]
+    fn doc_scan_matches_field_less_query_string_on_any_text_field() {
+        let q = QueryNode::QueryString {
+            query: "needle".into(),
+            default_field: None,
+            default_operator: None,
+            boost: None,
+        };
+        assert!(doc_matches_query(
+            &q,
+            &serde_json::json!({"alpha": "a needle in here"})
+        ));
+        assert!(doc_matches_query(
+            &q,
+            &serde_json::json!({"alpha": "nope", "beta": "needle"})
+        ));
+        assert!(doc_matches_query(
+            &q,
+            &serde_json::json!({"alpha": ["nope", "needle"]})
+        ));
+        assert!(!doc_matches_query(
+            &q,
+            &serde_json::json!({"alpha": "haystack"})
+        ));
+        // `_id` is spliced into the scanned source but is not a mapped text
+        // field — matching it would over-count relative to the FTS route.
+        assert!(!doc_matches_query(
+            &q,
+            &serde_json::json!({"_id": "needle", "alpha": "haystack"})
+        ));
+        // An explicit default_field stays single-field.
+        let pinned = QueryNode::QueryString {
+            query: "needle".into(),
+            default_field: Some("alpha".into()),
+            default_operator: None,
+            boost: None,
+        };
+        assert!(doc_matches_query(
+            &pinned,
+            &serde_json::json!({"alpha": "needle"})
+        ));
+        assert!(!doc_matches_query(
+            &pinned,
+            &serde_json::json!({"beta": "needle"})
+        ));
     }
 
     /// Field collector walks every clause of a projected query.
