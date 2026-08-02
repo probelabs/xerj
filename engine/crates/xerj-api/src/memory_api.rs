@@ -58,18 +58,21 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::auth::Principal;
+use crate::authz;
 use crate::es_compat::{
     self, DeleteDocParams, DeleteIndexParams, EsSearchBody, EsSearchJson, EsSearchQueryParams,
     IndexDocParams,
 };
 use crate::extract::OptionalJson;
 use crate::state::AppState;
+use xerj_engine::rbac::Privilege;
 
 /// Reserved backing-index prefix. Real (user) indices can never collide: the
 /// ES-compat `create_index` handler rejects any index name that starts with
 /// `_`, `-`, or `+`, and a caller cannot address a `.`-leading system index
 /// through `/_memory/*`.
-const MEMORY_PREFIX: &str = ".xerj-memory-";
+const MEMORY_PREFIX: &str = crate::authz::RESERVED_INDEX_PREFIX;
 
 /// Default page size for the introspection (`GET`) endpoint when `size` is
 /// omitted. Callers page further with `from`/`size` (see [`ListParams`]).
@@ -306,10 +309,16 @@ async fn dedup_probe(
 pub async fn store(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
+    principal: Principal,
     body: OptionalJson<StoreBody>,
 ) -> Response {
     if let Err(reason) = validate_namespace(&namespace) {
         return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    if let Err(denied) =
+        authz::authorize_memory_namespace(&principal, &namespace, Privilege::WriteIndex)
+    {
+        return denied;
     }
     let body = match body.0 {
         Some(b) => b,
@@ -472,10 +481,16 @@ const MAX_RESTRICT_IDS: usize = 10_000;
 pub async fn recall(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
+    principal: Principal,
     body: OptionalJson<RecallBody>,
 ) -> Response {
     if let Err(reason) = validate_namespace(&namespace) {
         return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    if let Err(denied) =
+        authz::authorize_memory_namespace(&principal, &namespace, Privilege::ReadIndex)
+    {
+        return denied;
     }
     // Recall must say what to recall BY: exactly one of `vector` (a query
     // embedding) or `query` (text).  A missing body, both-at-once, or an
@@ -544,6 +559,17 @@ pub async fn recall(
     };
     let index = backing_index(&namespace);
     let edges_index_name = format!("{MEMORY_PREFIX}{namespace}-edges");
+    // Graph coupling reads the brain's EDGES, a different resource from the
+    // namespace itself — a credential granted only the notes must not read the
+    // link graph through `graph:` (issue #79). Authorized only when coupling is
+    // actually requested, so ungrouped recall is unaffected.
+    if graph_ctx.is_some() {
+        if let Err(denied) =
+            authz::authorize_index(&principal, &edges_index_name, Privilege::ReadIndex)
+        {
+            return denied;
+        }
+    }
     let caller_filter = body.filter.take();
 
     // Graph restrict: expand the seeds FIRST and fold the reachable set into
@@ -1112,10 +1138,16 @@ pub struct ListParams {
 pub async fn list(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
+    principal: Principal,
     axum::extract::Query(params): axum::extract::Query<ListParams>,
 ) -> Response {
     if let Err(reason) = validate_namespace(&namespace) {
         return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    if let Err(denied) =
+        authz::authorize_memory_namespace(&principal, &namespace, Privilege::ReadIndex)
+    {
+        return denied;
     }
     // `from`/`after` are aliases (offset cursor); `size` is clamped to
     // [1, MAX_LIST_SIZE] so a caller can neither page from a negative offset
@@ -1193,9 +1225,15 @@ pub async fn list(
 pub async fn forget_one(
     State(state): State<AppState>,
     Path((namespace, id)): Path<(String, String)>,
+    principal: Principal,
 ) -> Response {
     if let Err(reason) = validate_namespace(&namespace) {
         return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    if let Err(denied) =
+        authz::authorize_memory_namespace(&principal, &namespace, Privilege::WriteIndex)
+    {
+        return denied;
     }
     let index = backing_index(&namespace);
     if !index_exists(&state, &index) {
@@ -1231,9 +1269,15 @@ pub async fn forget_one(
 pub async fn forget_namespace(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
+    principal: Principal,
 ) -> Response {
     if let Err(reason) = validate_namespace(&namespace) {
         return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    if let Err(denied) =
+        authz::authorize_memory_namespace(&principal, &namespace, Privilege::AdminIndex)
+    {
+        return denied;
     }
     let index = backing_index(&namespace);
     if !index_exists(&state, &index) {
@@ -1286,6 +1330,7 @@ mod tests {
         let resp = store(
             State(state.clone()),
             Path(ns.to_string()),
+            Principal::Superuser,
             OptionalJson(Some(b)),
         )
         .await;
@@ -1297,6 +1342,7 @@ mod tests {
         let resp = recall(
             State(state.clone()),
             Path(ns.to_string()),
+            Principal::Superuser,
             OptionalJson(Some(b)),
         )
         .await;
@@ -1380,6 +1426,7 @@ mod tests {
         let resp = forget_one(
             State(state.clone()),
             Path(("agent1".to_string(), "m1".to_string())),
+            Principal::Superuser,
         )
         .await;
         let (s, _) = drain_json(resp).await;
@@ -1473,6 +1520,7 @@ mod tests {
         let resp = list(
             State(state.clone()),
             Path(ns.to_string()),
+            Principal::Superuser,
             axum::extract::Query(ListParams::default()),
         )
         .await;
@@ -1484,6 +1532,7 @@ mod tests {
         let resp = list(
             State(state.clone()),
             Path(ns.to_string()),
+            Principal::Superuser,
             axum::extract::Query(params),
         )
         .await;
@@ -1657,6 +1706,7 @@ mod tests {
         let resp = crate::graph_api::link(
             State(state.clone()),
             Path("notes".to_string()),
+            Principal::Superuser,
             OptionalJson(Some(b)),
         )
         .await;
@@ -1870,6 +1920,7 @@ mod tests {
         let resp = crate::graph_api::link(
             State(state.clone()),
             Path("ghost".to_string()),
+            Principal::Superuser,
             OptionalJson(Some(b)),
         )
         .await;

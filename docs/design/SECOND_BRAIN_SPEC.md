@@ -496,10 +496,29 @@ Shared conventions:
   are always numbers.
 - Error body shape (identical to memory_api but typed `graph_error`):
   `{"error": {"type": "graph_error", "reason": "<msg>"}, "status": <n>}`.
-- Auth: process-wide API-key middleware only, same caveat block as
-  memory_api's module docs (no per-brain authz; copy the warning).
-- Unknown brain on read endpoints → 404. `link` creates lazily (like
-  `ensure_backing_index`).
+- Auth: process-wide API-key middleware **plus** per-brain authorization
+  (issue #79). A brain authorizes against its edges index,
+  `.xerj-memory-{brain}-edges`, which sits in the reserved `.xerj-memory-*`
+  namespace that `xerj-api::authz` gates on every surface — the graph API,
+  `/_memory/*`, the raw ES-compat index routes and the native
+  `/v1/indices/{name}/…` routes alike. The decision is made against the index
+  the handler **actually touches**, not the one in the URL: a route that takes
+  its index from the body (`_bulk` action lines, `_msearch` headers, `_mget`
+  `docs[]._index`, `_aliases`, `_reindex`, `terms`/`lookup` joins) is
+  authorized against what the body names, aliases are resolved to their backing
+  index before the decision, and `xerj_engine::index_guard` re-checks at the
+  point a name becomes an index so a route nobody thought of still fails
+  closed. Reach: open mode (`--insecure`,
+  point-at-a-folder) and the admin key get every brain; a key minted with
+  `role_descriptors` naming the index gets that brain at the granted
+  privilege; a key minted without them gets **no** brain. `ego`/`overview`
+  need `read`, `link`/`unlink` need `write`, and reading node summaries
+  additionally needs `read` on the resolved nodes index.
+- Unknown brain on read endpoints → 404 **for a caller authorized for it**.
+  An unauthorized caller gets 403 whether or not the brain exists — the
+  authorization check runs before the existence probe, so the status code
+  cannot be used to enumerate brains. `link` creates lazily (like
+  `ensure_backing_index`), which is part of `write`, not a separate `manage`.
 
 ### 4.1 POST /_graph/{brain}/link — assert an edge
 

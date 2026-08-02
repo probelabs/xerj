@@ -8567,6 +8567,14 @@ async fn search_impl(
         // (for example when the client disconnects) aborts the child task;
         // awaiting its JoinHandle also converts executor panics into HTTP 500
         // instead of unwinding through axum.
+        //
+        // No `index_guard` rule is carried across this spawn, and does not need
+        // to be: the task closes over `idx`, an `Index` handle the guarded
+        // request already resolved and was authorized for, and an `Index` holds
+        // no `Engine`, so nothing inside can name a second index. The two ways
+        // a search body *does* name another index — a `terms` lookup and a
+        // `lookup` runtime field — are both resolved earlier in this function,
+        // on the request's own task (`resolve_terms_lookups`), under the guard.
         #[cfg(test)]
         let inject_task_panic = *idx_name == "test-panic-search-task";
         #[cfg(test)]
@@ -16403,16 +16411,76 @@ pub struct AliasActionsBody {
     pub actions: Vec<AliasAction>,
 }
 
+/// Is this alias-action `index` field a pattern rather than one concrete name?
+fn alias_target_is_pattern(spec: &str) -> bool {
+    spec.split(',')
+        .map(str::trim)
+        .any(|p| p == "_all" || p.contains('*'))
+}
+
 pub async fn post_aliases(
     State(state): State<AppState>,
     Json(body): Json<AliasActionsBody>,
 ) -> impl IntoResponse {
+    // An `add` whose `index` is a wildcard has to be expanded before the alias
+    // can point anywhere. Adding the pattern TEXT as the alias target — which
+    // is what the raw `add_alias` below used to do for every action — invents
+    // an alias resolving to an index name that cannot exist, and answers
+    // `acknowledged: true` for a write that did not happen. It read as a
+    // successful alias creation to a caller that had just been told, by the
+    // very same response, that it had reached the reserved namespace:
+    // `POST /_aliases {"actions":[{"add":{"index":".xerj-memory-*", …}}]}`
+    // returned 200 and left a dangling alias behind.
+    //
+    // ES resolves the wildcard and 404s `index_not_found_exception` when it
+    // matches nothing; so do we. A concrete name is left exactly as it was —
+    // ES lets an alias be attached to a name before the index exists, and
+    // clients rely on that ordering.
+    // Resolve every action first and refuse the whole request if any `add`
+    // resolved to nothing, so a rejected batch leaves no half-applied aliases
+    // behind.
+    enum Resolved<'a> {
+        Add(&'a AliasActionParams, Vec<String>),
+        Remove(&'a AliasActionParams, Vec<String>),
+    }
+    let mut plan: Vec<Resolved> = Vec::with_capacity(body.actions.len());
     for action in &body.actions {
         if let Some(add) = &action.add {
-            state.engine.add_alias(&add.alias, &add.index);
+            let targets = if alias_target_is_pattern(&add.index) {
+                let expanded = resolve_index_selector(&state, &add.index).await;
+                if expanded.is_empty() {
+                    let e = xerj_common::XerjError::index_not_found(&add.index);
+                    return ApiError::new(e).into_response();
+                }
+                expanded
+            } else {
+                vec![add.index.clone()]
+            };
+            plan.push(Resolved::Add(add, targets));
         }
         if let Some(remove) = &action.remove {
-            state.engine.remove_alias(&remove.alias, &remove.index);
+            // A `remove` that matches nothing removes nothing — idempotent,
+            // and it leaves no junk behind, so it is not refused.
+            let targets = if alias_target_is_pattern(&remove.index) {
+                resolve_index_selector(&state, &remove.index).await
+            } else {
+                vec![remove.index.clone()]
+            };
+            plan.push(Resolved::Remove(remove, targets));
+        }
+    }
+    for step in &plan {
+        match step {
+            Resolved::Add(add, targets) => {
+                for target in targets {
+                    state.engine.add_alias(&add.alias, target);
+                }
+            }
+            Resolved::Remove(remove, targets) => {
+                for target in targets {
+                    state.engine.remove_alias(&remove.alias, target);
+                }
+            }
         }
     }
     Json(json!({ "acknowledged": true })).into_response()
@@ -16600,11 +16668,19 @@ pub async fn put_alias(
     };
 
     if targets.is_empty() {
-        attach(&index);
-    } else {
-        for idx in &targets {
-            attach(idx);
-        }
+        // `resolve_index_selector` only ever comes back empty for a wildcard
+        // that matched nothing — a concrete name always resolves to itself.
+        // Attaching the alias to the pattern text in that case (what this used
+        // to do) fabricates an alias pointing at an index name that cannot
+        // exist and reports `acknowledged: true` for a write that did not
+        // happen; `PUT /.xerj-memory-*/_alias/X` was the case that made it
+        // look like the reserved namespace had just been aliased. Refuse, the
+        // way ES does.
+        let e = xerj_common::XerjError::index_not_found(&index);
+        return ApiError::new(e).into_response();
+    }
+    for idx in &targets {
+        attach(idx);
     }
     Json(json!({ "acknowledged": true })).into_response()
 }
@@ -20111,6 +20187,11 @@ pub async fn delete_by_query(
         let task_key = handle.key().to_string();
         let spawned_key = task_key.clone();
         let tasks = state.tasks.clone();
+        // Detached, so no `index_guard` rule — and none is needed: the task
+        // owns `idx`, the single already-authorized `Index` handle this request
+        // resolved, and an `Index` cannot name another index (it holds no
+        // `Engine`). See `xerj_engine::index_guard` for the contract a spawn
+        // that *can* reach `Engine::get_index` has to follow instead.
         tokio::spawn(async move {
             let response = run_delete_by_query(&idx, &search_req).await;
             tasks.complete(&spawned_key, response);
@@ -20246,6 +20327,8 @@ pub async fn update_by_query(
         let task_key = handle.key().to_string();
         let spawned_key = task_key.clone();
         let tasks = state.tasks.clone();
+        // Same reasoning as the `_delete_by_query` spawn above: the task owns
+        // one already-authorized `Index` handle and can reach no other index.
         tokio::spawn(async move {
             let response = run_update_by_query(&idx, &search_req, script).await;
             tasks.complete(&spawned_key, response);
@@ -25328,8 +25411,22 @@ pub async fn security_get_user_profile(
 
 pub async fn security_create_api_key(
     State(state): State<AppState>,
+    principal: crate::auth::Principal,
     body: Option<Json<Value>>,
 ) -> impl IntoResponse {
+    // Minting is how privilege is handed out, so it is also the obvious way to
+    // escalate: without this gate a caller with no brain access could simply
+    // mint itself a key that grants one (issue #79). Only the superuser may
+    // create a *scoped* key; a scoped caller may not mint at all (an unscoped
+    // key it minted would out-reach it on the general surface); an unscoped
+    // caller may mint, but only more unscoped keys.
+    if matches!(principal, crate::auth::Principal::Scoped { .. }) {
+        return crate::authz::forbidden(
+            &principal,
+            "<api keys>",
+            xerj_engine::rbac::Privilege::SecurityAdmin,
+        );
+    }
     let payload = body.map(|Json(v)| v);
     let name = payload
         .as_ref()
@@ -25349,21 +25446,43 @@ pub async fn security_create_api_key(
     // ES returns base64("id:api_key") as the `encoded` credential.
     let encoded = base64_encode(&format!("{key_id}:{api_key}"));
 
-    // Honest surface (item 6): `role_descriptors` are accepted for ES/Kibana
-    // wire-compatibility but NOT enforced — every key authenticates as the
-    // single superuser. Warn loudly so an operator relying on scoped keys is
-    // not silently over-privileged. (Full per-key RBAC is deferred.)
-    if payload
+    // `role_descriptors` are now parsed into the key's index grants and ARE
+    // enforced for the reserved `.xerj-memory-*` namespace (issue #79) — see
+    // `authz`. Two honest caveats remain, both warned about below:
+    //   * cluster privileges and FLS/DLS inside a descriptor are still
+    //     ignored, and
+    //   * a key minted with NO usable descriptor keeps its historical reach
+    //     over ordinary indices (it just holds nothing in the reserved
+    //     namespace), because broad RBAC over the general ES surface is still
+    //     deferred.
+    let requested_descriptors = payload
         .as_ref()
         .and_then(|b| b.get("role_descriptors"))
-        .is_some_and(|v| !v.is_null() && v != &json!({}))
-    {
-        tracing::warn!(
-            key = %name,
-            "POST /_security/api_key: role_descriptors are NOT enforced; the \
-             minted key has full superuser access. See rbac docs."
-        );
-    }
+        .filter(|v| !v.is_null() && *v != &json!({}));
+    let roles = match (&principal, requested_descriptors) {
+        (crate::auth::Principal::Superuser, Some(descriptors)) => {
+            let parsed = xerj_engine::rbac::roles_from_role_descriptors(descriptors);
+            if parsed.is_empty() {
+                tracing::warn!(
+                    key = %name,
+                    "POST /_security/api_key: role_descriptors granted nothing usable \
+                     (only index names + index privileges are enforced); the key is \
+                     unscoped and holds NO access to the reserved .xerj-memory-* namespace"
+                );
+            }
+            parsed
+        }
+        (_, Some(_)) => {
+            // A non-superuser cannot hand out grants it does not itself hold.
+            tracing::warn!(
+                key = %name,
+                "POST /_security/api_key: role_descriptors ignored — only the admin key \
+                 may mint a scoped key; the minted key is unscoped"
+            );
+            Vec::new()
+        }
+        (_, None) => Vec::new(),
+    };
 
     // Persist the key so the auth middleware can re-authenticate an inbound
     // `Authorization: ApiKey <encoded>` header. `encoded` decodes to
@@ -25379,6 +25498,7 @@ pub async fn security_create_api_key(
             creation_ms: now_ms,
             expiration_ms,
             invalidated: false,
+            roles,
         },
     );
 
@@ -29731,43 +29851,70 @@ async fn datafeed_score_pass(
 /// new anomaly records. Breaks cleanly when the datafeed is stopped/deleted or
 /// its job disappears. The first `interval` tick fires immediately and is
 /// consumed here (the synchronous start pass already covered "now").
+///
+/// ## Why this carries a visibility rule
+///
+/// The per-index boundary (issue #79) is enforced in part by a `tokio`
+/// task-local ([`xerj_engine::index_guard`]), and a task-local does not
+/// survive `tokio::spawn`. This was the one request path in the tree that
+/// detached, and it was a live cross-brain read: `_start` under a principal
+/// with no access to `.xerj-memory-bob-edges` returned an empty result set
+/// from the synchronous pass — correctly denied, because that pass runs inside
+/// the request's scope — and then this task ticked a couple of seconds later
+/// with no guard at all and appended the brain's field values to the job's
+/// results, where the same principal read them straight back out of
+/// `GET /_ml/anomaly_detectors/{job}/results/records`.
+///
+/// So the rule the *starting* request is running under is captured on that
+/// request's task and re-installed here. The scorer therefore sees exactly
+/// what its starter could see: a superuser's datafeed keeps working unchanged
+/// (a superuser has no guard installed, so `None` is carried and the task
+/// stays unrestricted), and a scoped one silently scores nothing on an index
+/// it was not granted, because `Engine::get_index` answers "not found" and
+/// `datafeed_score_pass` treats that as "no new records".
 fn spawn_datafeed_task(state: AppState, feed_id: String) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let freq = state
-            .ml_datafeeds
-            .get(&feed_id)
-            .map(|f| f.frequency_secs)
-            .unwrap_or(60)
-            .max(1);
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(freq));
-        ticker.tick().await; // consume the immediate first tick
-        loop {
-            ticker.tick().await;
-            // Snapshot the datafeed; stop when gone or no longer started.
-            let feed = match state.ml_datafeeds.get(&feed_id) {
-                Some(f) if f.state == "started" => f.value().clone(),
-                _ => break,
-            };
-            let detector = match state.ml_detectors.get(&feed.job_id) {
-                Some(d) => d.value().clone(),
-                None => break,
-            };
-            let (cursor, _appended) = datafeed_score_pass(
-                &state.engine,
-                &state.ml_results,
-                &detector,
-                &feed,
-                feed.last_scored_ms,
-            )
-            .await;
-            // Persist the cursor unless a concurrent _stop already flipped state.
-            if let Some(mut f) = state.ml_datafeeds.get_mut(&feed_id) {
-                if f.state == "started" {
-                    f.last_scored_ms = cursor;
+    // Captured HERE — on the request's own task, before the spawn. Reading it
+    // inside the spawned future would always find `None`.
+    let visibility = xerj_engine::index_guard::current();
+    tokio::spawn(xerj_engine::index_guard::scoped_opt(
+        visibility,
+        async move {
+            let freq = state
+                .ml_datafeeds
+                .get(&feed_id)
+                .map(|f| f.frequency_secs)
+                .unwrap_or(60)
+                .max(1);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(freq));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                // Snapshot the datafeed; stop when gone or no longer started.
+                let feed = match state.ml_datafeeds.get(&feed_id) {
+                    Some(f) if f.state == "started" => f.value().clone(),
+                    _ => break,
+                };
+                let detector = match state.ml_detectors.get(&feed.job_id) {
+                    Some(d) => d.value().clone(),
+                    None => break,
+                };
+                let (cursor, _appended) = datafeed_score_pass(
+                    &state.engine,
+                    &state.ml_results,
+                    &detector,
+                    &feed,
+                    feed.last_scored_ms,
+                )
+                .await;
+                // Persist the cursor unless a concurrent _stop already flipped state.
+                if let Some(mut f) = state.ml_datafeeds.get_mut(&feed_id) {
+                    if f.state == "started" {
+                        f.last_scored_ms = cursor;
+                    }
                 }
             }
-        }
-    })
+        },
+    ))
 }
 
 /// PUT /_ml/datafeeds/{feed_id} — create/replace a datafeed for a job.
