@@ -72,7 +72,7 @@ pub use analyzer::{
 
 pub use bm25::{Bm25Scorer, FieldStats, QueryExplanation, ScoreBreakdown, DEFAULT_B, DEFAULT_K1};
 
-pub use index::{FieldIndexConfig, FtsIndexReader, FtsIndexWriter};
+pub use index::{FieldIndexConfig, FtsIndexReader, FtsIndexWriter, NormsPresence};
 
 pub use postings::{
     DecodedPosting, PostingsReader, PostingsWriter, TermPostings, BLOCK_SIZE, SKIP_INTERVAL,

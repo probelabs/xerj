@@ -835,48 +835,76 @@ impl FtsIndexWriter {
         xerj_common::fsio::write_file_durable(&meta_path, &meta_bytes)
             .with_context(|| format!("writing meta to {:?}", meta_path))?;
 
-        // 5. Write norms file — V4 M4.7 compact format.
+        // 5. Write norms file — ZNM2 compact format.
         //
         // Old format was `(u32 doc_id, u16 norm)` pairs = 6 B per live
         // doc per field.  On 66.5 M nginx × 10 fields that was 3.99 GB
         // for norms alone (60 B/doc).  The new format stores ONE byte
         // per doc at the implicit index `doc_id`, using Lucene's
         // logarithmic quantisation: `byte ≈ norm_to_byte(field_len)`.
-        // Missing docs get byte 0 (norm = 0).  Sparse fields still benefit
-        // because the file is LZ4-compressed when > 1 KB of runs-of-zeros
-        // make it worthwhile.
+        // ZNM1 used byte 0 both for a missing field and for a one-token field.
+        // ZNM2 carries an explicit presence bitmap, so every quantised byte is
+        // available for field lengths and sparse/missing fields are unambiguous.
         //
         // Layout:
-        //   "ZNM1"     4 bytes magic
+        //   "ZNM2"     4 bytes magic
         //   u8         encoding: 0 = dense u8, 1 = dense u8 + LZ4
         //   u32        max_doc_id + 1   (size of implicit array)
         //   u32        payload_len
-        //   payload    dense array (u8 × max_doc_id+1) or LZ4(dense)
+        //   payload    presence bitmap followed by the dense norm array, raw
+        //              or LZ4-compressed as one bounded block
         let mut norms = field_data.norms;
         norms.sort_unstable_by_key(|(doc_id, _)| *doc_id);
-        let max_doc_id: u32 = norms.last().map(|(d, _)| *d).unwrap_or(0);
-        let dense_len = (max_doc_id as usize).saturating_add(1);
+        anyhow::ensure!(
+            norms.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "norms: document ids must be strictly increasing and unique"
+        );
+        let dense_len = match norms.last() {
+            Some((doc_id, _)) => usize::try_from(*doc_id)
+                .ok()
+                .and_then(|id| id.checked_add(1))
+                .ok_or_else(|| anyhow::anyhow!("norms: document span overflow"))?,
+            None => 0,
+        };
+        anyhow::ensure!(
+            dense_len <= MAX_NORMS_ENTRIES,
+            "norms: document span {dense_len} exceeds limit {MAX_NORMS_ENTRIES}"
+        );
+        let dense_len_u32 = u32::try_from(dense_len)
+            .map_err(|_| anyhow::anyhow!("norms: document span exceeds u32 framing"))?;
         let mut dense: Vec<u8> = vec![0u8; dense_len];
+        let presence_len = dense_len
+            .checked_add(7)
+            .ok_or_else(|| anyhow::anyhow!("norms: presence bitmap length overflow"))?
+            / 8;
+        let mut presence = vec![0u8; presence_len];
         for (doc_id, norm) in &norms {
-            dense[*doc_id as usize] = norm_u16_to_u8(*norm);
+            let doc_id = *doc_id as usize;
+            dense[doc_id] = norm_u16_to_u8(*norm);
+            presence[doc_id / 8] |= 1 << (doc_id % 8);
         }
+
+        let mut decoded = presence;
+        decoded.extend_from_slice(&dense);
 
         // Try LZ4 when the dense array is big enough for compression
         // to pay off (long runs of identical norms on low-entropy fields
         // like nginx `method` compress ~8×).
-        let lz4_try = lz4_flex::compress_prepend_size(&dense);
-        let (encoding, payload): (u8, &[u8]) = if dense.len() > 1024 && lz4_try.len() < dense.len()
-        {
-            (1, &lz4_try[..])
-        } else {
-            (0, &dense[..])
-        };
+        let lz4_try = lz4_flex::compress_prepend_size(&decoded);
+        let (encoding, payload): (u8, &[u8]) =
+            if decoded.len() > 1024 && lz4_try.len() < decoded.len() {
+                (1, &lz4_try[..])
+            } else {
+                (0, &decoded[..])
+            };
+        let payload_len_u32 = u32::try_from(payload.len())
+            .map_err(|_| anyhow::anyhow!("norms: payload exceeds u32 framing"))?;
 
         let mut norms_bytes: Vec<u8> = Vec::with_capacity(4 + 1 + 4 + 4 + payload.len());
-        norms_bytes.extend_from_slice(NORMS_MAGIC);
+        norms_bytes.extend_from_slice(NORMS_MAGIC_V2);
         norms_bytes.push(encoding);
-        norms_bytes.extend_from_slice(&(dense_len as u32).to_le_bytes());
-        norms_bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        norms_bytes.extend_from_slice(&dense_len_u32.to_le_bytes());
+        norms_bytes.extend_from_slice(&payload_len_u32.to_le_bytes());
         norms_bytes.extend_from_slice(payload);
         xerj_common::fsio::write_file_durable(&norms_path, &norms_bytes)
             .with_context(|| format!("writing norms to {:?}", norms_path))?;
@@ -885,7 +913,15 @@ impl FtsIndexWriter {
     }
 }
 
-const NORMS_MAGIC: &[u8; 4] = b"ZNM1";
+const NORMS_MAGIC_V1: &[u8; 4] = b"ZNM1";
+const NORMS_MAGIC_V2: &[u8; 4] = b"ZNM2";
+const NORMS_HEADER_LEN: usize = 4 + 1 + 4 + 4;
+// Segment norms are eagerly materialised today. Refuse corrupt declarations
+// large enough to cause an unbounded allocation before decompression.
+const MAX_NORMS_DECODED_BYTES: usize = 512 * 1024 * 1024;
+const MAX_NORMS_ENTRIES: usize = MAX_NORMS_DECODED_BYTES / std::mem::size_of::<(u32, u16)>();
+const MAX_NORMS_FILE_BYTES: u64 =
+    (MAX_NORMS_DECODED_BYTES + MAX_NORMS_DECODED_BYTES / 255 + 64 * 1024) as u64;
 
 /// Lucene-style logarithmic norm quantisation: maps a u16 field length
 /// onto a u8.  Exactly 256 values with finer resolution at short lengths
@@ -893,12 +929,10 @@ const NORMS_MAGIC: &[u8; 4] = b"ZNM1";
 /// lengths, same as Lucene's `SmallFloat`.
 #[inline]
 fn norm_u16_to_u8(len: u16) -> u8 {
-    if len == 0 {
-        return 0;
-    }
-    // Clamp short lengths [1..8] to direct encoding (0..7).
+    // ZNM2 has a separate presence bit, so byte zero can represent a present
+    // zero-token field and short lengths can retain their exact value.
     if len < 8 {
-        return (len - 1) as u8 & 0x07;
+        return len as u8;
     }
     // Logarithmic scale beyond 8.
     let l = (len as f64).log2();
@@ -910,11 +944,23 @@ fn norm_u16_to_u8(len: u16) -> u8 {
 #[allow(dead_code)]
 fn norm_u8_to_u16(b: u8) -> u16 {
     if b < 8 {
-        return (b + 1) as u16;
+        return b as u16;
     }
     let l = ((b - 8) as f64) / 32.0 + 3.0;
     let v = l.exp2();
     v.min(u16::MAX as f64) as u16
+}
+
+/// ZNM1's historical decoder. In that format byte zero meant either missing
+/// or a present one-token field; callers must treat the whole sidecar as
+/// ambiguous even though non-zero values remain readable.
+#[inline]
+fn norm_u8_to_u16_v1(b: u8) -> u16 {
+    if b < 8 {
+        return (b + 1) as u16;
+    }
+    let l = ((b - 8) as f64) / 32.0 + 3.0;
+    l.exp2().min(u16::MAX as f64) as u16
 }
 
 // ── FtsIndexReader ────────────────────────────────────────────────────────────
@@ -982,6 +1028,26 @@ struct LoadedField {
     meta: FieldMeta,
     /// doc_id → field_length lookup (sorted by doc_id).
     norms: Vec<(u32, u16)>,
+    norms_presence: NormsPresence,
+}
+
+/// Whether a norms sidecar can distinguish a missing field from every valid
+/// field length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormsPresence {
+    /// Raw pair norms and ZNM2 encode field presence exactly.
+    Explicit,
+    /// ZNM1 conflates a missing field with a one-token field at byte zero.
+    /// Exact collection-wide BM25 must use its compatibility fallback while
+    /// any such segment participates. Rebuilding through the current writer
+    /// rewrites the sidecar as ZNM2.
+    LegacyZnm1Ambiguous,
+}
+
+#[derive(Debug)]
+struct LoadedNorms {
+    values: Vec<(u32, u16)>,
+    presence: NormsPresence,
 }
 
 impl FtsIndexReader {
@@ -1119,7 +1185,8 @@ impl FtsIndexReader {
                     fst,
                     post_data,
                     meta,
-                    norms,
+                    norms: norms.values,
+                    norms_presence: norms.presence,
                 },
             );
         }
@@ -1149,53 +1216,175 @@ impl FtsIndexReader {
         Ok(mmap)
     }
 
-    fn load_norms(path: &Path) -> Result<Vec<(u32, u16)>> {
+    fn load_norms(path: &Path) -> Result<LoadedNorms> {
+        let file_len = fs::metadata(path)
+            .with_context(|| format!("stating norms {:?}", path))?
+            .len();
+        if file_len > MAX_NORMS_FILE_BYTES {
+            return Err(anyhow::anyhow!(
+                "norms: file length {file_len} exceeds limit {MAX_NORMS_FILE_BYTES}"
+            ));
+        }
         let bytes = fs::read(path).with_context(|| format!("opening norms {:?}", path))?;
-        // V4 M4.7 compact format starts with `NORMS_MAGIC`; legacy starts
-        // with a raw u32 count (whose first byte almost never matches 'Z').
-        if bytes.len() >= 4 && &bytes[..4] == NORMS_MAGIC {
-            if bytes.len() < 4 + 1 + 4 + 4 {
-                return Err(anyhow::anyhow!("norms: truncated ZNM1 header"));
-            }
-            let encoding = bytes[4];
-            let dense_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
-            let payload_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
-            let payload = &bytes[13..13 + payload_len];
-            let dense: Vec<u8> = match encoding {
-                0 => payload.to_vec(),
-                1 => lz4_flex::decompress_size_prepended(payload)
-                    .map_err(|e| anyhow::anyhow!("norms: lz4 decompress: {e}"))?,
-                _ => return Err(anyhow::anyhow!("norms: unknown encoding {}", encoding)),
-            };
-            if dense.len() != dense_len {
-                return Err(anyhow::anyhow!(
-                    "norms: dense length mismatch {} != {}",
-                    dense.len(),
-                    dense_len
-                ));
-            }
-            // Materialise (doc_id, norm) pairs only for live docs so the
-            // rest of the engine (which expects `Vec<(u32, u16)>`) is
-            // unchanged.  Zero bytes → missing.
-            let mut norms = Vec::new();
-            for (doc_id, &b) in dense.iter().enumerate() {
-                if b != 0 {
-                    norms.push((doc_id as u32, norm_u8_to_u16(b)));
-                }
-            }
-            Ok(norms)
+        if bytes.starts_with(NORMS_MAGIC_V2) {
+            Self::decode_compact_norms(&bytes, true)
+        } else if bytes.starts_with(NORMS_MAGIC_V1) {
+            Self::decode_compact_norms(&bytes, false)
         } else {
             // Legacy path (pre-M4.7): u32 count + count × (u32 doc_id, u16 norm).
+            if bytes.len() < 4 {
+                return Err(anyhow::anyhow!("norms: truncated legacy count"));
+            }
             let mut cur = std::io::Cursor::new(&bytes[..]);
             let count = cur.read_u32::<LittleEndian>()? as usize;
+            if count > MAX_NORMS_ENTRIES {
+                return Err(anyhow::anyhow!(
+                    "norms: legacy entry count {count} exceeds limit {MAX_NORMS_ENTRIES}"
+                ));
+            }
+            let expected_len = 4usize
+                .checked_add(count.checked_mul(6).ok_or_else(|| {
+                    anyhow::anyhow!("norms: legacy entry count overflows file size")
+                })?)
+                .ok_or_else(|| anyhow::anyhow!("norms: legacy file size overflow"))?;
+            if expected_len != bytes.len() {
+                return Err(anyhow::anyhow!(
+                    "norms: legacy length mismatch: declared {count} entries require {expected_len} bytes, file has {}",
+                    bytes.len()
+                ));
+            }
             let mut norms = Vec::with_capacity(count);
             for _ in 0..count {
                 let doc_id = cur.read_u32::<LittleEndian>()?;
                 let norm = cur.read_u16::<LittleEndian>()?;
                 norms.push((doc_id, norm));
             }
-            Ok(norms)
+            if !norms.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                return Err(anyhow::anyhow!(
+                    "norms: legacy doc ids must be strictly increasing"
+                ));
+            }
+            Ok(LoadedNorms {
+                values: norms,
+                presence: NormsPresence::Explicit,
+            })
         }
+    }
+
+    fn decode_compact_norms(bytes: &[u8], explicit_presence: bool) -> Result<LoadedNorms> {
+        let version = if explicit_presence { "ZNM2" } else { "ZNM1" };
+        if bytes.len() < NORMS_HEADER_LEN {
+            return Err(anyhow::anyhow!("norms: truncated {version} header"));
+        }
+        let encoding = bytes[4];
+        let dense_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+        if dense_len > MAX_NORMS_ENTRIES {
+            return Err(anyhow::anyhow!(
+                "norms: {version} document span {dense_len} exceeds limit {MAX_NORMS_ENTRIES}"
+            ));
+        }
+        let payload_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let end = NORMS_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or_else(|| anyhow::anyhow!("norms: {version} payload length overflow"))?;
+        if end != bytes.len() {
+            return Err(anyhow::anyhow!(
+                "norms: {version} payload length mismatch: declared {payload_len}, file has {} payload bytes",
+                bytes.len().saturating_sub(NORMS_HEADER_LEN)
+            ));
+        }
+
+        let presence_len = if explicit_presence {
+            dense_len
+                .checked_add(7)
+                .ok_or_else(|| anyhow::anyhow!("norms: {version} presence length overflow"))?
+                / 8
+        } else {
+            0
+        };
+        let decoded_len = dense_len
+            .checked_add(presence_len)
+            .ok_or_else(|| anyhow::anyhow!("norms: {version} decoded length overflow"))?;
+        if decoded_len > MAX_NORMS_DECODED_BYTES {
+            return Err(anyhow::anyhow!(
+                "norms: {version} decoded length {decoded_len} exceeds limit {MAX_NORMS_DECODED_BYTES}"
+            ));
+        }
+
+        let payload = &bytes[NORMS_HEADER_LEN..end];
+        let decoded = match encoding {
+            0 => {
+                if payload.len() != decoded_len {
+                    return Err(anyhow::anyhow!(
+                        "norms: {version} raw payload length {} != expected {decoded_len}",
+                        payload.len()
+                    ));
+                }
+                payload.to_vec()
+            }
+            1 => {
+                if payload.len() < 4 {
+                    return Err(anyhow::anyhow!(
+                        "norms: {version} truncated LZ4 size prefix"
+                    ));
+                }
+                let declared = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+                if declared != decoded_len {
+                    return Err(anyhow::anyhow!(
+                        "norms: {version} LZ4 decoded length {declared} != expected {decoded_len}"
+                    ));
+                }
+                lz4_flex::decompress_size_prepended(payload)
+                    .map_err(|e| anyhow::anyhow!("norms: {version} LZ4 decompress: {e}"))?
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "norms: {version} unknown encoding {encoding}"
+                ))
+            }
+        };
+        if decoded.len() != decoded_len {
+            return Err(anyhow::anyhow!(
+                "norms: {version} decoded length {} != expected {decoded_len}",
+                decoded.len()
+            ));
+        }
+
+        let (presence, dense) = decoded.split_at(presence_len);
+        if explicit_presence && !dense_len.is_multiple_of(8) {
+            let used_bits = dense_len % 8;
+            let unused_mask = !((1u8 << used_bits) - 1);
+            if presence.last().is_some_and(|byte| byte & unused_mask != 0) {
+                return Err(anyhow::anyhow!(
+                    "norms: ZNM2 presence bitmap has non-zero padding bits"
+                ));
+            }
+        }
+
+        let mut norms = Vec::new();
+        for (doc_id, &byte) in dense.iter().enumerate() {
+            let present = if explicit_presence {
+                presence[doc_id / 8] & (1 << (doc_id % 8)) != 0
+            } else {
+                byte != 0
+            };
+            if present {
+                let norm = if explicit_presence {
+                    norm_u8_to_u16(byte)
+                } else {
+                    norm_u8_to_u16_v1(byte)
+                };
+                norms.push((doc_id as u32, norm));
+            }
+        }
+        Ok(LoadedNorms {
+            values: norms,
+            presence: if explicit_presence {
+                NormsPresence::Explicit
+            } else {
+                NormsPresence::LegacyZnm1Ambiguous
+            },
+        })
     }
 
     /// Look up a term in a field.
@@ -1295,6 +1484,16 @@ impl FtsIndexReader {
             .map(|idx| loaded.norms[idx].1)
     }
 
+    /// Reports whether this field's norms encode field presence exactly.
+    ///
+    /// Exact collection-wide BM25 must fall back to the established
+    /// segment-local path when this returns [`NormsPresence::LegacyZnm1Ambiguous`].
+    /// Rebuilding through the current writer upgrades the sidecar to ZNM2 and
+    /// makes the field eligible again.
+    pub fn norms_presence(&self, field: &str) -> Option<NormsPresence> {
+        self.fields.get(field).map(|loaded| loaded.norms_presence)
+    }
+
     /// Stream every term of `field` through `f` in lexicographic order,
     /// stopping as soon as `f` returns `false`.
     ///
@@ -1384,6 +1583,33 @@ mod tests {
 
     fn make_registry() -> Arc<AnalyzerRegistry> {
         Arc::new(AnalyzerRegistry::default())
+    }
+
+    fn doc(fields: &[(&str, &str)]) -> HashMap<String, String> {
+        fields
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn write_znm1(path: &Path, dense: &[u8]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(NORMS_MAGIC_V1);
+        bytes.push(0);
+        bytes.extend_from_slice(&(dense.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(dense.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(dense);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_compact_norms(path: &Path, encoding: u8, dense_len: u32, payload: &[u8]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(NORMS_MAGIC_V2);
+        bytes.push(encoding);
+        bytes.extend_from_slice(&dense_len.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -1487,5 +1713,177 @@ mod tests {
         let tp = reader.lookup_term("title", "hello").unwrap();
         let data = reader.postings_data("title", &tp);
         assert!(data.is_some() && !data.unwrap().is_empty());
+    }
+
+    #[test]
+    fn znm2_distinguishes_one_token_from_missing_field() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "presence", make_registry());
+        writer.add_document(0, &doc(&[("body", "one")]));
+        writer.add_document(1, &doc(&[("other", "not body")]));
+        writer.add_document(2, &doc(&[("body", "two")]));
+        writer.finish().unwrap();
+
+        let norms_path = dir.path().join("presence.body.norms");
+        assert_eq!(&fs::read(&norms_path).unwrap()[..4], NORMS_MAGIC_V2);
+        let reader = FtsIndexReader::open(dir.path(), "presence", &["body"]).unwrap();
+        assert_eq!(reader.field_length("body", 0), Some(1));
+        assert_eq!(reader.field_length("body", 1), None);
+        assert_eq!(reader.field_length("body", 2), Some(1));
+        assert_eq!(reader.norms_presence("body"), Some(NormsPresence::Explicit));
+    }
+
+    #[test]
+    fn znm2_roundtrips_sparse_zero_short_and_saturated_lengths_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "sparse", make_registry());
+        writer.configure_field(
+            "body",
+            FieldIndexConfig {
+                analyzer: "whitespace".to_owned(),
+                ..Default::default()
+            },
+        );
+        writer.add_document(0, &doc(&[("body", "")]));
+        writer.add_document(1, &doc(&[("other", "missing")]));
+        writer.add_document(7, &doc(&[("body", "a b c d e f g")]));
+        let huge = std::iter::repeat_n("x", u16::MAX as usize + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        writer.add_document(255, &doc(&[("body", &huge)]));
+        writer.finish().unwrap();
+
+        assert_eq!(norm_u16_to_u8(0), 0);
+        assert_eq!(norm_u16_to_u8(1), 1);
+        assert_eq!(norm_u16_to_u8(7), 7);
+        assert_eq!(norm_u16_to_u8(u16::MAX), u8::MAX);
+
+        // Opening twice exercises the persisted/restart path rather than any
+        // writer-owned state.
+        for _ in 0..2 {
+            let reader = FtsIndexReader::open(dir.path(), "sparse", &["body"]).unwrap();
+            assert_eq!(reader.field_length("body", 0), Some(0));
+            assert_eq!(reader.field_length("body", 1), None);
+            assert_eq!(reader.field_length("body", 7), Some(7));
+            assert_eq!(reader.field_length("body", 255), Some(norm_u8_to_u16(255)));
+        }
+    }
+
+    #[test]
+    fn znm2_compressed_sparse_bitmap_roundtrips() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "compressed", make_registry());
+        writer.add_document(0, &doc(&[("body", "first")]));
+        writer.add_document(4095, &doc(&[("body", "last")]));
+        writer.finish().unwrap();
+
+        let bytes = fs::read(dir.path().join("compressed.body.norms")).unwrap();
+        assert_eq!(&bytes[..4], NORMS_MAGIC_V2);
+        assert_eq!(bytes[4], 1, "sparse payload should exercise LZ4 path");
+        let reader = FtsIndexReader::open(dir.path(), "compressed", &["body"]).unwrap();
+        assert_eq!(reader.field_length("body", 0), Some(1));
+        assert_eq!(reader.field_length("body", 1), None);
+        assert_eq!(reader.field_length("body", 4095), Some(1));
+    }
+
+    #[test]
+    fn mixed_znm1_and_znm2_segments_declare_exact_global_policy() {
+        let dir = TempDir::new().unwrap();
+        for segment in ["old", "new"] {
+            let mut writer = FtsIndexWriter::new(dir.path(), segment, make_registry());
+            writer.add_document(0, &doc(&[("body", "one")]));
+            writer.add_document(1, &doc(&[("body", "two words")]));
+            writer.finish().unwrap();
+        }
+        write_znm1(&dir.path().join("old.body.norms"), &[0, 1]);
+
+        let old = FtsIndexReader::open(dir.path(), "old", &["body"]).unwrap();
+        let new = FtsIndexReader::open(dir.path(), "new", &["body"]).unwrap();
+        assert_eq!(
+            old.norms_presence("body"),
+            Some(NormsPresence::LegacyZnm1Ambiguous)
+        );
+        assert_eq!(old.field_length("body", 0), None);
+        assert_eq!(old.field_length("body", 1), Some(2));
+        assert_eq!(new.norms_presence("body"), Some(NormsPresence::Explicit));
+        assert_eq!(new.field_length("body", 0), Some(1));
+
+        // Rebuilding through the current writer removes the ambiguity without
+        // an in-place sidecar edit.
+        let mut rewritten = FtsIndexWriter::new(dir.path(), "rewritten", make_registry());
+        rewritten.add_document(0, &doc(&[("body", "one")]));
+        rewritten.add_document(1, &doc(&[("body", "two words")]));
+        rewritten.finish().unwrap();
+        let rewritten = FtsIndexReader::open(dir.path(), "rewritten", &["body"]).unwrap();
+        assert_eq!(
+            rewritten.norms_presence("body"),
+            Some(NormsPresence::Explicit)
+        );
+        assert_eq!(rewritten.field_length("body", 0), Some(1));
+    }
+
+    #[test]
+    fn norms_parser_rejects_truncation_trailing_bytes_and_oversized_declarations() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.norms");
+
+        fs::write(&path, NORMS_MAGIC_V2).unwrap();
+        assert!(FtsIndexReader::load_norms(&path).is_err());
+
+        let mut trailing = Vec::new();
+        trailing.extend_from_slice(NORMS_MAGIC_V2);
+        trailing.push(0);
+        trailing.extend_from_slice(&1u32.to_le_bytes());
+        trailing.extend_from_slice(&2u32.to_le_bytes());
+        trailing.extend_from_slice(&[1, 0, 99]);
+        fs::write(&path, trailing).unwrap();
+        assert!(FtsIndexReader::load_norms(&path).is_err());
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(NORMS_MAGIC_V2);
+        oversized.push(0);
+        oversized.extend_from_slice(&u32::MAX.to_le_bytes());
+        oversized.extend_from_slice(&0u32.to_le_bytes());
+        fs::write(&path, oversized).unwrap();
+        let err = FtsIndexReader::load_norms(&path).unwrap_err().to_string();
+        assert!(err.contains("exceeds limit"), "unexpected error: {err}");
+
+        // One live row in a nine-row span needs two presence bytes. Only bit
+        // zero of the final byte is in range; every higher bit is padding.
+        write_compact_norms(&path, 0, 9, &[0, 0b0000_0010, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(FtsIndexReader::load_norms(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("padding bits"));
+
+        write_compact_norms(&path, 7, 1, &[1, 1]);
+        assert!(FtsIndexReader::load_norms(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown encoding"));
+
+        write_compact_norms(&path, 1, 1, &[2, 0, 0, 0, 0xff]);
+        assert!(FtsIndexReader::load_norms(&path).is_err());
+
+        let wrong_declared = lz4_flex::compress_prepend_size(&[1, 1]);
+        write_compact_norms(&path, 1, 2, &wrong_declared);
+        assert!(FtsIndexReader::load_norms(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("decoded length"));
+
+        let mut compressed_trailing = lz4_flex::compress_prepend_size(&[1, 1]);
+        compressed_trailing.push(0xff);
+        write_compact_norms(&path, 1, 1, &compressed_trailing);
+        assert!(FtsIndexReader::load_norms(&path).is_err());
+    }
+
+    #[test]
+    fn znm2_writer_rejects_oversized_sparse_span_before_allocation() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "sparse-overflow", make_registry());
+        writer.add_document(u32::MAX, &doc(&[("body", "")]));
+        let error = format!("{:#}", writer.finish().unwrap_err());
+        assert!(error.contains("document span") && error.contains("exceeds limit"));
     }
 }
