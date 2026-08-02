@@ -133,7 +133,7 @@ impl IndexSnapshot {
 
 // ── Memtable entry ────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemEntry {
     pub seq_no: SeqNo,
     pub doc_id: String,
@@ -153,6 +153,15 @@ pub struct MemEntry {
 /// expensive segment + side-car I/O — unblocking ingest during the flush.
 pub struct DrainedMemtable {
     pub entries: Vec<MemEntry>,
+}
+
+#[derive(Debug)]
+pub enum FlushFinalizeOutcome {
+    Empty,
+    Published {
+        meta: SegmentMeta,
+        maintenance_deferred: bool,
+    },
 }
 
 // ── Fsck report types ─────────────────────────────────────────────────────────
@@ -534,6 +543,14 @@ pub struct IndexStore {
     /// ticks re-check only its remaining unproven `(doc_id, seq)` pairs
     /// against the version map and prune once the list drains.
     wal_prune_cache: Mutex<std::collections::HashMap<(usize, u64), WalGenVerdict>>,
+    #[cfg(test)]
+    fail_next_snapshot_save: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_wal_maintenance: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    publication_failpoint: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    orphan_disarm_fail_after: std::sync::atomic::AtomicUsize,
 }
 
 /// Cached verification state of one rotated WAL generation.
@@ -617,6 +634,14 @@ impl IndexStore {
             retired_segments: Mutex::new(Vec::new()),
             pending_deletes: Mutex::new(std::collections::HashMap::new()),
             wal_prune_cache: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(test)]
+            fail_next_snapshot_save: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_wal_maintenance: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            publication_failpoint: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            orphan_disarm_fail_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         });
 
         // Rebuild version map from flushed segments first (so WAL replay can
@@ -742,14 +767,11 @@ impl IndexStore {
     /// that had been written to disk but hadn't yet reached the
     /// `save_snapshot()` step at line ~838 of `finalize_flush_with_publisher`.
     ///
-    /// Recovery strategy: read the `.ids` sidecar (`ZID1`/`ZID2`, written
-    /// at flush time as the very last side-car), which carries the
-    /// canonical (doc_count, min_seq, max_seq) the snapshot needs.  If
-    /// the sidecar is present and decodes cleanly, the segment was
-    /// fully flushed — the only thing missing is the snapshot pointer,
-    /// which we add here.  If the `.ids` sidecar is missing or corrupt,
-    /// the flush was genuinely incomplete and the file falls through to
-    /// `cleanup_orphaned_segment_files` for deletion.
+    /// Recovery strategy: legacy `ZID1`/`ZID2` flushes use their `.ids`
+    /// sidecar plus strict segment/header validation. New `ZID3` flushes
+    /// additionally require a valid `.complete` manifest that binds the
+    /// entire artifact family. If the applicable evidence is missing or
+    /// corrupt, cleanup removes the orphan instead of publishing it.
     ///
     /// Returns the number of segments recovered.
     fn recover_orphaned_segments(&self) -> Result<usize> {
@@ -826,8 +848,9 @@ impl IndexStore {
                 }
             }
 
-            // .ids sidecar must exist — it's the last write of the flush
-            // sequence, so its presence implies the segment is complete.
+            // Every generation needs a valid ids payload. For legacy ZID1/2
+            // it is recovery evidence only when the segment header agrees;
+            // ZID3 additionally requires its completion manifest below.
             let ids_bytes = match std::fs::read(&ids_path) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -836,7 +859,10 @@ impl IndexStore {
                 continue;
             }
             let magic = &ids_bytes[..4];
-            if magic != b"ZID1" && magic != b"ZID2" {
+            if magic != b"ZID1" && magic != b"ZID2" && magic != b"ZID3" {
+                continue;
+            }
+            if magic == b"ZID3" && !segments_dir.join(format!("{prefix}.complete")).exists() {
                 continue;
             }
             let num_docs =
@@ -844,7 +870,7 @@ impl IndexStore {
             if num_docs == 0 {
                 continue;
             }
-            let body: Vec<u8> = if magic == b"ZID2" {
+            let body: Vec<u8> = if magic == b"ZID2" || magic == b"ZID3" {
                 match lz4_flex::decompress_size_prepended(&ids_bytes[8..]) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -867,12 +893,15 @@ impl IndexStore {
                 if pos + id_len > body.len() {
                     break;
                 }
+                if std::str::from_utf8(&body[pos..pos + id_len]).is_err() {
+                    break;
+                }
                 pos += id_len;
                 min_seq = min_seq.min(seq);
                 max_seq = max_seq.max(seq);
                 parsed += 1;
             }
-            if parsed == 0 || min_seq == u64::MAX {
+            if parsed != num_docs || pos != body.len() || min_seq == u64::MAX {
                 continue;
             }
 
@@ -882,24 +911,35 @@ impl IndexStore {
             // rebuild applies its ZTB2 pairs and the deletes_present
             // gates stay on).
             let has_tombstones = match SegmentReader::open(&seg_path) {
-                Ok(r) => (r.header().flags & 0x0001) != 0,
+                Ok(r)
+                    if r.header().doc_count == num_docs
+                        && r.header().min_seq_no == min_seq
+                        && r.header().max_seq_no == max_seq =>
+                {
+                    let complete_path = segments_dir.join(format!("{prefix}.complete"));
+                    if complete_path.exists()
+                        && !self
+                            .validate_flush_completion_manifest(prefix, num_docs, min_seq, max_seq)
+                    {
+                        continue;
+                    }
+                    (r.header().flags & 0x0001) != 0
+                }
                 Err(_) => continue,
+                Ok(_) => continue,
             };
 
             let seg_meta = match std::fs::metadata(&seg_path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            let created_at_ms = seg_meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
+            let created_at_ms = SegmentReader::open(&seg_path)
+                .map(|reader| reader.header().created_at_ms)
                 .unwrap_or(0);
 
             recovered.push(SegmentMeta {
                 id: prefix.to_string(),
-                doc_count: parsed,
+                doc_count: num_docs,
                 size_bytes: seg_meta.len(),
                 min_seq_no: min_seq,
                 max_seq_no: max_seq,
@@ -1000,6 +1040,19 @@ impl IndexStore {
         segment_id: &str,
         pairs: &[(u64, &str)],
     ) -> std::io::Result<()> {
+        self.write_ids_sidecar_with_magic(segment_id, pairs, b"ZID2")
+    }
+
+    fn write_ids_sidecar_v3(&self, segment_id: &str, pairs: &[(u64, &str)]) -> std::io::Result<()> {
+        self.write_ids_sidecar_with_magic(segment_id, pairs, b"ZID3")
+    }
+
+    fn write_ids_sidecar_with_magic(
+        &self,
+        segment_id: &str,
+        pairs: &[(u64, &str)],
+        magic: &[u8; 4],
+    ) -> std::io::Result<()> {
         let mut body: Vec<u8> =
             Vec::with_capacity(pairs.iter().map(|(_, id)| 8 + 2 + id.len()).sum::<usize>());
         for (seq_no, id) in pairs {
@@ -1009,7 +1062,7 @@ impl IndexStore {
         }
         let compressed = lz4_flex::compress_prepend_size(&body);
         let mut buf: Vec<u8> = Vec::with_capacity(8 + compressed.len());
-        buf.extend_from_slice(b"ZID2");
+        buf.extend_from_slice(magic);
         buf.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
         buf.extend_from_slice(&compressed);
         let ids_path = self
@@ -1017,13 +1070,225 @@ impl IndexStore {
             .join("segments")
             .join(format!("{segment_id}.ids"));
         // RC4 W1 #10 — durable write (tmp + fsync + rename + dir fsync).
-        // The `.ids` side-car is the recovery marker
-        // `recover_orphaned_segments` relies on when a crash lands between
-        // the snapshot publish and the debounced `save_snapshot`; the WAL
-        // entries it supersedes are pruned within ~1 s of the flush.  A
-        // plain `fs::write` left it in the page cache — power loss after
-        // the prune GC'd the fully-flushed segment as an orphan.
+        // The `.ids` side-car carries the durable id/sequence payload used by
+        // recovery. ZID3 is not considered complete until the separately
+        // durable `.complete` manifest validates the full artifact family.
         xerj_common::fsio::write_file_durable(&ids_path, &buf)
+    }
+
+    /// Persist the flush completion manifest after every required artifact.
+    /// The manifest is an integrity envelope (IEEE CRC-32, not a cryptographic
+    /// identity): it binds the segment header coordinates and the exact set
+    /// of artifact names, sizes, and per-file CRCs visible at publication.
+    fn write_flush_completion_manifest(&self, meta: &SegmentMeta) -> std::io::Result<()> {
+        let segments_dir = self.data_dir.join("segments");
+        let prefix = format!("{}.", meta.id);
+        let mut artifacts = Vec::new();
+        for entry in std::fs::read_dir(&segments_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) || name.ends_with(".complete") {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            let crc = Self::stream_file_crc32(&entry.path())?;
+            artifacts.push((name, metadata.len(), crc));
+        }
+        artifacts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if !Self::valid_flush_artifact_set(&meta.id, &artifacts) {
+            return Err(std::io::Error::other(
+                "flush artifact set is incomplete or contains an unknown role",
+            ));
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(b"ZCM1");
+        body.extend_from_slice(&(meta.id.len() as u16).to_le_bytes());
+        body.extend_from_slice(meta.id.as_bytes());
+        body.extend_from_slice(&meta.doc_count.to_le_bytes());
+        body.extend_from_slice(&meta.min_seq_no.to_le_bytes());
+        body.extend_from_slice(&meta.max_seq_no.to_le_bytes());
+        body.extend_from_slice(&(artifacts.len() as u32).to_le_bytes());
+        for (name, size, crc) in artifacts {
+            body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(&crc.to_le_bytes());
+        }
+        let envelope_crc = crc32fast::hash(&body);
+        body.extend_from_slice(&envelope_crc.to_le_bytes());
+        xerj_common::fsio::write_file_durable(
+            &segments_dir.join(format!("{}.complete", meta.id)),
+            &body,
+        )
+    }
+
+    fn stream_file_crc32(path: &Path) -> std::io::Result<u32> {
+        Self::stream_crc32_from_reader(std::fs::File::open(path)?)
+    }
+
+    fn stream_crc32_from_reader(mut reader: impl std::io::Read) -> std::io::Result<u32> {
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hasher.finalize())
+    }
+
+    fn valid_flush_artifact_set(segment_id: &str, artifacts: &[(String, u64, u32)]) -> bool {
+        let prefix = format!("{segment_id}.");
+        let mut roles = std::collections::HashSet::new();
+        let mut fts: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+            std::collections::HashMap::new();
+        for (name, _, _) in artifacts {
+            if !name.starts_with(&prefix) || name.contains('/') || name.contains('\\') {
+                return false;
+            }
+            let rest = &name[prefix.len()..];
+            if matches!(rest, "seg" | "sidx" | "ids" | "dv") {
+                if !roles.insert(rest) {
+                    return false;
+                }
+                continue;
+            }
+            let Some((field, extension)) = rest.rsplit_once('.') else {
+                return false;
+            };
+            if field.is_empty()
+                || field.contains("..")
+                || !matches!(extension, "fst" | "post" | "meta" | "norms")
+                || !fts.entry(field).or_default().insert(extension)
+            {
+                return false;
+            }
+        }
+        roles.contains("seg")
+            && roles.contains("sidx")
+            && roles.contains("ids")
+            && fts.values().all(|extensions| {
+                ["fst", "post", "meta", "norms"]
+                    .iter()
+                    .all(|extension| extensions.contains(extension))
+            })
+    }
+
+    fn validate_flush_completion_manifest(
+        &self,
+        segment_id: &str,
+        doc_count: u64,
+        min_seq_no: u64,
+        max_seq_no: u64,
+    ) -> bool {
+        let dir = self.data_dir.join("segments");
+        const MAX_COMPLETION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+        let path = dir.join(format!("{segment_id}.complete"));
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return false;
+        };
+        if metadata.len() > MAX_COMPLETION_MANIFEST_BYTES {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        if bytes.len() < 4 + 2 + 8 * 3 + 4 + 4 || &bytes[..4] != b"ZCM1" {
+            return false;
+        }
+        let payload_len = bytes.len() - 4;
+        let expected_crc = u32::from_le_bytes(bytes[payload_len..].try_into().unwrap());
+        if crc32fast::hash(&bytes[..payload_len]) != expected_crc {
+            return false;
+        }
+        let mut pos = 4usize;
+        let take_u16 = |bytes: &[u8], pos: &mut usize| -> Option<u16> {
+            let value = u16::from_le_bytes(bytes.get(*pos..*pos + 2)?.try_into().ok()?);
+            *pos += 2;
+            Some(value)
+        };
+        let take_u32 = |bytes: &[u8], pos: &mut usize| -> Option<u32> {
+            let value = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?);
+            *pos += 4;
+            Some(value)
+        };
+        let take_u64 = |bytes: &[u8], pos: &mut usize| -> Option<u64> {
+            let value = u64::from_le_bytes(bytes.get(*pos..*pos + 8)?.try_into().ok()?);
+            *pos += 8;
+            Some(value)
+        };
+        let Some(id_len) = take_u16(&bytes, &mut pos).map(usize::from) else {
+            return false;
+        };
+        let Some(id_bytes) = bytes.get(pos..pos + id_len) else {
+            return false;
+        };
+        pos += id_len;
+        if id_bytes != segment_id.as_bytes()
+            || take_u64(&bytes, &mut pos) != Some(doc_count)
+            || take_u64(&bytes, &mut pos) != Some(min_seq_no)
+            || take_u64(&bytes, &mut pos) != Some(max_seq_no)
+        {
+            return false;
+        }
+        let Some(count) = take_u32(&bytes, &mut pos) else {
+            return false;
+        };
+        const MAX_MANIFEST_ARTIFACTS: u32 = 4096;
+        if count > MAX_MANIFEST_ARTIFACTS || count as usize > payload_len.saturating_sub(pos) / 14 {
+            return false;
+        }
+        let mut declared = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let Some(name_len) = take_u16(&bytes, &mut pos).map(usize::from) else {
+                return false;
+            };
+            if name_len == 0 || name_len > 512 {
+                return false;
+            }
+            let Some(name_end) = pos.checked_add(name_len) else {
+                return false;
+            };
+            let Some(name) = bytes.get(pos..name_end) else {
+                return false;
+            };
+            pos = name_end;
+            let Ok(name) = std::str::from_utf8(name) else {
+                return false;
+            };
+            let Some(size) = take_u64(&bytes, &mut pos) else {
+                return false;
+            };
+            let Some(crc) = take_u32(&bytes, &mut pos) else {
+                return false;
+            };
+            declared.push((name.to_owned(), size, crc));
+        }
+        if pos != payload_len {
+            return false;
+        }
+        let prefix = format!("{segment_id}.");
+        let mut actual = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) || name.ends_with(".complete") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                return false;
+            };
+            let Ok(crc) = Self::stream_file_crc32(&entry.path()) else {
+                return false;
+            };
+            actual.push((name, metadata.len(), crc));
+        }
+        actual.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Self::valid_flush_artifact_set(segment_id, &declared) && declared == actual
     }
 
     /// Unlink every on-disk file belonging to the given segment ids — the
@@ -1077,6 +1342,101 @@ impl IndexStore {
         (removed_files, removed_bytes)
     }
 
+    /// Durably disarm ZID3 orphan recovery for snapshot-listed merge inputs
+    /// before the replacement snapshot is committed.
+    ///
+    /// Completion markers are removed before ids payloads. Removing ids is
+    /// required for legacy ZID1/ZID2 inputs, where ids alone are recovery
+    /// evidence. Snapshot-listed readers and restart rebuilds retain their
+    /// exact stored-section fallback when ids are absent.
+    pub fn disarm_orphan_recovery_for_segments(&self, segment_ids: &[SegmentId]) -> Result<()> {
+        // The hot flush path may debounce snapshot persistence. Persist the
+        // currently authoritative input set before removing its recovery
+        // markers; otherwise an aborted merge could make a recently flushed
+        // input neither snapshot-listed nor recoverable after restart.
+        self.save_snapshot()?;
+        self.unlink_recovery_markers(segment_ids, true)
+    }
+
+    /// Durably disarm every orphan-recovery generation for unpublished output.
+    ///
+    /// Completion markers are always attempted before ids. All requested
+    /// removals are attempted even after an error, and the directory is
+    /// fsynced before returning.
+    fn disarm_unpublished_segments(&self, segment_ids: &[SegmentId]) -> Result<()> {
+        self.unlink_recovery_markers(segment_ids, true)
+    }
+
+    fn rollback_unpublished_segment(&self, segment_id: &SegmentId) -> Result<()> {
+        let disarm = self.disarm_unpublished_segments(std::slice::from_ref(segment_id));
+        // Marker removal is the durability boundary. Remaining segment and
+        // sidecar files are unreachable cleanup and can be removed afterward.
+        self.delete_segment_files(std::slice::from_ref(segment_id));
+        disarm
+    }
+
+    fn abandon_unpublished_segment(
+        &self,
+        segment_id: &SegmentId,
+        publication_error: StorageError,
+    ) -> StorageError {
+        match self.rollback_unpublished_segment(segment_id) {
+            Ok(()) => publication_error,
+            Err(cleanup_error) => StorageError::Io(std::io::Error::other(format!(
+                "publication failed ({publication_error}); orphan-recovery disarm also failed ({cleanup_error})"
+            ))),
+        }
+    }
+
+    fn unlink_recovery_markers(
+        &self,
+        segment_ids: &[SegmentId],
+        remove_legacy_ids: bool,
+    ) -> Result<()> {
+        if segment_ids.is_empty() {
+            return Ok(());
+        }
+        let segments_dir = self.data_dir.join("segments");
+        let mut first_error: Option<std::io::Error> = None;
+        let mut operation = 0usize;
+        let suffixes: &[&str] = if remove_legacy_ids {
+            &["complete", "ids"]
+        } else {
+            &["complete"]
+        };
+        for suffix in suffixes {
+            for id in segment_ids {
+                let path = segments_dir.join(format!("{}.{suffix}", id.as_str()));
+                if let Err(error) = std::fs::remove_file(&path) {
+                    if error.kind() != std::io::ErrorKind::NotFound && first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                #[cfg(test)]
+                if self.orphan_disarm_fail_after.load(Ordering::Acquire) == operation
+                    && first_error.is_none()
+                {
+                    first_error = Some(std::io::Error::other(format!(
+                        "injected orphan-recovery disarm failure after {}",
+                        path.display()
+                    )));
+                }
+                operation = operation.saturating_add(1);
+            }
+        }
+        if let Err(error) = xerj_common::fsio::fsync_dir(&segments_dir) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(StorageError::Io(std::io::Error::other(format!(
+                "orphan-recovery disarm incomplete: {error}"
+            )))),
+            None => Ok(()),
+        }
+    }
+
     /// Retire merged-away segments: delete their files **as soon as it is
     /// safe**, i.e. once no in-flight reader can still be holding a
     /// pre-merge segment list that references them.
@@ -1091,33 +1451,28 @@ impl IndexStore {
     /// [`SnapshotReadGuard`] lease; if any lease is outstanding the ids
     /// are parked in `retired_segments` and swept by the last lease drop.
     ///
-    /// The `.ids` side-car is unlinked IMMEDIATELY regardless of leases:
-    /// it is only read at open/recovery time (never on the query path),
-    /// and removing it up front keeps the disk-fix invariant that a crash
-    /// while deletions are deferred cannot let
-    /// `recover_orphaned_segments` resurrect the merged-away inputs as
-    /// duplicates on restart (recovery requires a valid `.ids`).  Any
-    /// other leftover files are removed by the on-open
-    /// `cleanup_orphaned_segment_files`.
+    /// Recovery evidence is unlinked IMMEDIATELY regardless of leases:
+    /// `.complete` first, then `.ids`. The segments directory is fsynced
+    /// before the ids enter the in-memory graveyard, so a crash while data
+    /// deletion is deferred cannot resurrect merged-away inputs. Any other
+    /// leftover files are removed by on-open orphan cleanup.
     ///
     /// Returns `(files_removed, bytes_removed)` — `(0, 0)` when deletion
     /// was deferred to the graveyard.
-    pub fn retire_segment_files(&self, segment_ids: &[SegmentId]) -> (usize, u64) {
+    pub fn retire_segment_files(&self, segment_ids: &[SegmentId]) -> Result<(usize, u64)> {
         if segment_ids.is_empty() {
-            return (0, 0);
+            return Ok((0, 0));
         }
-        // Kill the resurrection marker first (crash safety, see above).
-        let segments_dir = self.data_dir.join("segments");
-        for id in segment_ids {
-            let _ = std::fs::remove_file(segments_dir.join(format!("{}.ids", id.as_str())));
-        }
+        // Merge publication already removed completion markers before
+        // apply_merge. Remove ids as well before entering the graveyard.
+        self.disarm_unpublished_segments(segment_ids)?;
         {
             let mut graveyard = self.retired_segments.lock().unwrap();
             graveyard.extend_from_slice(segment_ids);
         }
         // Opportunistic sweep: deletes right away when no reader is active
         // (the common case), otherwise the last lease drop sweeps.
-        self.sweep_retired_segments()
+        Ok(self.sweep_retired_segments())
     }
 
     /// Delete the files of every graveyard segment, provided no read
@@ -1384,6 +1739,37 @@ impl IndexStore {
         Some(DrainedMemtable { entries })
     }
 
+    fn restore_internal_drain(&self, drained: &DrainedMemtable) {
+        let mut restored_bytes = 0u64;
+        for entry in &drained.entries {
+            let Some(current) = self.version_map.get(&entry.doc_id) else {
+                continue;
+            };
+            if current.seq_no != entry.seq_no || current.segment_id.as_ref() != IN_MEMORY_SEGMENT_ID
+            {
+                continue;
+            }
+            let shard = self.shard_for(&entry.doc_id);
+            let mut mem = self.memtable_shards[shard].lock().unwrap();
+            if mem.iter().any(|candidate| {
+                candidate.doc_id == entry.doc_id && candidate.seq_no == entry.seq_no
+            }) {
+                continue;
+            }
+            restored_bytes = restored_bytes.saturating_add(if !entry.source_bytes.is_empty() {
+                entry.source_bytes.len() as u64
+            } else {
+                entry
+                    .source
+                    .as_ref()
+                    .map_or(0, |source| source.to_string().len() as u64)
+            });
+            mem.push(entry.clone());
+        }
+        self.memtable_bytes
+            .fetch_add(restored_bytes, Ordering::Relaxed);
+    }
+
     /// Flush the memtable, but call `post_finish` with the fresh `SegmentMeta`
     /// BEFORE the in-memory snapshot is swapped.  This lets the caller write
     /// side-car files (e.g. the FTS index) that must be present *before*
@@ -1400,7 +1786,19 @@ impl IndexStore {
             Some(e) => e,
             None => return Ok(None),
         };
-        self.finalize_flush_with_publisher(drained, post_finish)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.finalize_flush_with_publisher(&drained, post_finish)
+        }));
+        if !matches!(result, Ok(Ok(FlushFinalizeOutcome::Published { .. }))) {
+            self.restore_internal_drain(&drained);
+        }
+        match result {
+            Ok(result) => result.map(|outcome| match outcome {
+                FlushFinalizeOutcome::Empty => None,
+                FlushFinalizeOutcome::Published { meta, .. } => Some(meta),
+            }),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Finalise a flush using caller-supplied pre-drained memtable entries.
@@ -1411,15 +1809,15 @@ impl IndexStore {
     /// callers can release higher-level locks before calling this method.
     pub fn finalize_flush_with_publisher<F>(
         &self,
-        drained: DrainedMemtable,
+        drained: &DrainedMemtable,
         post_finish: F,
-    ) -> Result<Option<SegmentMeta>>
+    ) -> Result<FlushFinalizeOutcome>
     where
         F: FnOnce(&SegmentMeta) -> Result<()>,
     {
-        let entries = drained.entries;
+        let entries = &drained.entries;
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(FlushFinalizeOutcome::Empty);
         }
 
         // THROWAWAY prof (XERJ_PROF): finalize phase breakdown.
@@ -1609,52 +2007,45 @@ impl IndexStore {
             info!(segment_id, object_key, "segment uploaded to object store");
         }
 
-        // V4 M4.8 — write a tiny `seg.ids` sidecar at flush time so
-        // `rebuild_version_map_from_segments` on reopen can pull
-        // `(doc_id, seq_no)` pairs directly without decoding the
-        // stored section + parsing JSON for every doc.  On the
-        // 66.5 M / 2 291-segment workload this drops cold restart
-        // from ~302 s to ~5 s and 15 GB peak RSS to ~500 MB.
-        //
-        // Format (V1, uncompressed):
-        //   "ZID1"            4 bytes magic
-        //   u32  num_docs
-        //   per doc:
-        //     u64  seq_no
-        //     u16  id_len
-        //     id_len bytes (UTF-8 doc_id)
-        //
-        // Format (V2, M5.18, LZ4-compressed):
-        //   "ZID2"            4 bytes magic
-        //   u32  num_docs
-        //   lz4_flex::compress_prepend_size(V1-body-sans-magic-and-numdocs)
-        //
-        // V2 compression ratio on real nginx ingest with synthetic
-        // doc_ids (`c0d0`, `c0d1`, …) runs 7-10× because the id
-        // stream has huge prefix repetition.  With real UUID-shaped
-        // ids LZ4 still gets ~2× because the u64 seq_nos step
-        // monotonically.  Reading V1 still works for old data dirs.
+        // Run the caller-supplied "build side-car files" step.  This must
+        // succeed BEFORE we publish the segment to the snapshot — otherwise
+        // a racing query could open the segment and find the side-cars
+        // (e.g. FTS index) missing, returning wrong results.
+        let t_pf = std::time::Instant::now();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| post_finish(&meta))) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(self.abandon_unpublished_segment(&segment_id, error));
+            }
+            Err(payload) => {
+                if let Err(cleanup_error) = self.rollback_unpublished_segment(&segment_id) {
+                    return Err(StorageError::Io(std::io::Error::other(format!(
+                        "publisher panicked; orphan-recovery disarm also failed ({cleanup_error})"
+                    ))));
+                }
+                std::panic::resume_unwind(payload);
+            }
+        }
+        let prof_pf_us = t_pf.elapsed().as_micros();
+
+        // Write the ZID3 document-ID sidecar only after every required caller
+        // sidecar succeeded. ZID3 itself is not evidence of completion:
+        // orphan recovery requires the completion manifest written
+        // immediately afterward. Keeping it after FTS/DV also avoids a
+        // misleading near-complete family when sidecar construction fails.
         {
             let pairs: Vec<(u64, &str)> = entries
                 .iter()
                 .filter(|e| e.source.is_some())
                 .map(|e| (e.seq_no, e.doc_id.as_str()))
                 .collect();
-            if let Err(e) = self.write_ids_sidecar(meta.id.as_str(), &pairs) {
-                tracing::warn!(
-                    segment_id = meta.id.as_str(),
-                    "failed to write seg.ids sidecar: {e}"
-                );
+            if let Err(error) = self.write_ids_sidecar_v3(meta.id.as_str(), &pairs) {
+                return Err(self.abandon_unpublished_segment(&segment_id, error.into()));
             }
         }
-
-        // Run the caller-supplied "build side-car files" step.  This must
-        // succeed BEFORE we publish the segment to the snapshot — otherwise
-        // a racing query could open the segment and find the side-cars
-        // (e.g. FTS index) missing, returning wrong results.
-        let t_pf = std::time::Instant::now();
-        post_finish(&meta)?;
-        let prof_pf_us = t_pf.elapsed().as_micros();
+        if let Err(error) = self.write_flush_completion_manifest(&meta) {
+            return Err(self.abandon_unpublished_segment(&segment_id, error.into()));
+        }
 
         // Update version map: point live docs at the new segment.
         //
@@ -1670,31 +2061,109 @@ impl IndexStore {
         // updates/deletes are left untouched.
         let t_vm = std::time::Instant::now();
         let segment_id_arc: std::sync::Arc<str> = std::sync::Arc::from(segment_id.as_str());
-        for entry in &entries {
-            if entry.source.is_some() {
-                self.version_map.repoint(
-                    &entry.doc_id,
-                    entry.seq_no,
-                    std::sync::Arc::clone(&segment_id_arc),
-                );
-            } else {
-                // RC4 W2 #14 — repoint the delete's tombstone off
-                // `__memtable__` onto the segment that now durably
-                // carries it (the ZTB2 section written above; the
-                // segment + section were fsynced by `writer.finish`).
-                // Guarded (`set_if_latest`): a doc re-indexed while this
-                // flush ran has a strictly newer live entry that must
-                // not be clobbered back to deleted.  Once
-                // segment-resident, `sweep_pending_deletes` unpins the
-                // WAL shard and `wal_pair_durable` lets the Delete
-                // entry prune.
-                self.version_map.set_if_latest(
-                    &entry.doc_id,
-                    entry.seq_no,
-                    std::sync::Arc::clone(&segment_id_arc),
-                    true,
-                );
+        let rollback_journal: Vec<(String, u64, Option<crate::version_map::VersionEntry>)> =
+            entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.doc_id.clone(),
+                        entry.seq_no,
+                        self.version_map.get(&entry.doc_id),
+                    )
+                })
+                .collect();
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if self.publication_failpoint.load(Ordering::Acquire) == 1 {
+                panic!("injected failure before version-map publication");
             }
+            for entry in entries {
+                if entry.source.is_some() {
+                    self.version_map.repoint(
+                        &entry.doc_id,
+                        entry.seq_no,
+                        std::sync::Arc::clone(&segment_id_arc),
+                    );
+                } else {
+                    // RC4 W2 #14 — repoint the delete's tombstone off
+                    // `__memtable__` onto the segment that now durably
+                    // carries it (the ZTB2 section written above; the
+                    // segment + section were fsynced by `writer.finish`).
+                    // Guarded (`set_if_latest`): a doc re-indexed while this
+                    // flush ran has a strictly newer live entry that must
+                    // not be clobbered back to deleted.  Once
+                    // segment-resident, `sweep_pending_deletes` unpins the
+                    // WAL shard and `wal_pair_durable` lets the Delete
+                    // entry prune.
+                    self.version_map.set_if_latest(
+                        &entry.doc_id,
+                        entry.seq_no,
+                        std::sync::Arc::clone(&segment_id_arc),
+                        true,
+                    );
+                }
+                #[cfg(test)]
+                if self.publication_failpoint.load(Ordering::Acquire) == 2 {
+                    panic!("injected failure during version-map publication");
+                }
+                #[cfg(test)]
+                if self.publication_failpoint.load(Ordering::Acquire) == 5 {
+                    self.version_map.set(
+                        &entry.doc_id,
+                        entry.seq_no + 1,
+                        crate::version_map::IN_MEMORY_SEGMENT_ID,
+                        false,
+                    );
+                    panic!("injected newer PUT during publication rollback");
+                }
+                #[cfg(test)]
+                if self.publication_failpoint.load(Ordering::Acquire) == 6 {
+                    self.version_map
+                        .delete(
+                            &entry.doc_id,
+                            entry.seq_no + 1,
+                            crate::version_map::IN_MEMORY_SEGMENT_ID,
+                        )
+                        .unwrap();
+                    panic!("injected newer DELETE during publication rollback");
+                }
+            }
+            #[cfg(test)]
+            if self.publication_failpoint.load(Ordering::Acquire) == 3 {
+                panic!("injected failure immediately before snapshot publication");
+            }
+            self.snapshot
+                .rcu(|old| Arc::new(old.with_new_segment(meta.clone())));
+            #[cfg(test)]
+            if self.publication_failpoint.load(Ordering::Acquire) == 4 {
+                panic!("injected failure immediately after snapshot publication");
+            }
+        }));
+        if publication.is_err() {
+            let published = self
+                .snapshot
+                .load()
+                .segments
+                .iter()
+                .any(|candidate| candidate.id == segment_id);
+            if published {
+                warn!(
+                    segment_id,
+                    "post-publication panic caught; maintenance deferred"
+                );
+                return Ok(FlushFinalizeOutcome::Published {
+                    meta,
+                    maintenance_deferred: true,
+                });
+            }
+            for (doc_id, seq_no, prior) in rollback_journal.into_iter().rev() {
+                self.version_map
+                    .rollback_repoint(&doc_id, seq_no, &segment_id, prior);
+            }
+            let publication_error = StorageError::Io(std::io::Error::other(
+                "segment publication failed before snapshot commit",
+            ));
+            return Err(self.abandon_unpublished_segment(&segment_id, publication_error));
         }
         if prof {
             eprintln!(
@@ -1722,9 +2191,6 @@ impl IndexStore {
         // ~30 % of `_refresh` calls losing 1-2 docs after 6-doc
         // sequential PUTs in the YAML suite (110_field_collapsing
         // setup, et al.).
-        self.snapshot
-            .rcu(|old| Arc::new(old.with_new_segment(meta.clone())));
-
         // V4 M4 — checkpoint + rotate + prune, NOW time-gated.
         //
         // Pre-gate: this loop ran for ALL 16 WAL shards on EVERY
@@ -1782,7 +2248,17 @@ impl IndexStore {
             if let Err(e) = self.persist_pending_tombstones() {
                 warn!(error = %e, "tombstone persistence failed — deletes stay WAL-pinned");
             }
-            self.save_snapshot()?;
+            if let Err(error) = self.save_snapshot() {
+                warn!(error = %error, segment_id, "snapshot persistence deferred after in-memory publication; WAL remains authoritative");
+                info!(
+                    segment_id,
+                    doc_count, min_seq, max_seq, "segment published with deferred maintenance"
+                );
+                return Ok(FlushFinalizeOutcome::Published {
+                    meta,
+                    maintenance_deferred: true,
+                });
+            }
             // RC4 W1 #8 — verified maintenance (see
             // `wal_maintain_all_verified`).  The pre-fix loop here
             // checkpointed EVERY shard with THIS segment's `max_seq` and
@@ -1800,11 +2276,16 @@ impl IndexStore {
             // holding unproven entries are retained (that retention IS the
             // fix) and reclaimed on a later tick once their docs flush.
             let durable_max = self.snapshot.load().max_seq_no;
-            self.wal_maintain_all_verified(durable_max)?;
+            if let Err(error) = self.wal_maintain_all_verified(durable_max) {
+                warn!(error = %error, segment_id, "WAL maintenance deferred after segment publication");
+            }
         }
 
         info!(segment_id, doc_count, min_seq, max_seq, "segment flushed");
-        Ok(Some(meta))
+        Ok(FlushFinalizeOutcome::Published {
+            meta,
+            maintenance_deferred: false,
+        })
     }
 
     /// Flush if the memtable is over the configured threshold.
@@ -2075,6 +2556,12 @@ impl IndexStore {
     /// The caller must persist the snapshot (`save_snapshot`) BEFORE this
     /// runs so every segment the proofs point at is registered on disk.
     fn wal_maintain_all_verified(&self, durable_max_seq: SeqNo) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_wal_maintenance.swap(false, Ordering::AcqRel) {
+            return Err(StorageError::Io(std::io::Error::other(
+                "injected post-publication WAL maintenance failure",
+            )));
+        }
         self.sweep_pending_deletes();
         for (ws_idx, ws) in self.wal_shards.iter().enumerate() {
             let mut wal = ws.lock().unwrap();
@@ -2388,6 +2875,12 @@ impl IndexStore {
     }
 
     fn save_snapshot(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_snapshot_save.swap(false, Ordering::AcqRel) {
+            return Err(StorageError::Io(std::io::Error::other(
+                "injected post-publication snapshot save failure",
+            )));
+        }
         let snap = self.snapshot.load();
         // P2.3 — `to_vec` (compact) not `to_vec_pretty`: the snapshot is a
         // machine-read manifest (loaded via `from_slice`), never
@@ -2559,10 +3052,12 @@ impl IndexStore {
             // decode path for legacy segments without the sidecar.
             let ids_path = segments_dir.join(format!("{}.ids", meta.id.as_str()));
             if let Ok(bytes) = std::fs::read(&ids_path) {
-                if bytes.len() >= 8 && (&bytes[..4] == b"ZID1" || &bytes[..4] == b"ZID2") {
+                if bytes.len() >= 8
+                    && (&bytes[..4] == b"ZID1" || &bytes[..4] == b"ZID2" || &bytes[..4] == b"ZID3")
+                {
                     let num = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
                     // V2 = LZ4-compressed body after the 8-byte header.
-                    let body: Vec<u8> = if &bytes[..4] == b"ZID2" {
+                    let body: Vec<u8> = if &bytes[..4] == b"ZID2" || &bytes[..4] == b"ZID3" {
                         match lz4_flex::decompress_size_prepended(&bytes[8..]) {
                             Ok(v) => v,
                             Err(e) => {
@@ -2837,6 +3332,12 @@ impl IndexStore {
     /// atomically replace merged segments with the merged result and update
     /// the version map.
     pub fn apply_merge(&self, merged_ids: &[SegmentId], new_meta: SegmentMeta) -> Result<()> {
+        // Inputs still belong to the authoritative snapshot at this point.
+        // Durably remove their ZID3 completion markers before committing the
+        // replacement, so no crash after snapshot publication can resurrect
+        // a partially retired input. The ids sidecars stay readable if this
+        // step fails and the merge is aborted.
+        self.disarm_orphan_recovery_for_segments(merged_ids)?;
         // Sum the doc counts of the segments we're about to replace, so we can
         // tell whether this merge actually dropped any documents.
         let merged_total: u64 = {
@@ -3389,6 +3890,644 @@ mod tests {
     }
 
     #[test]
+    fn completion_manifest_rejects_corruption_and_noncanonical_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let segment_id = "12345678-1234-1234-1234-123456789abc";
+        let segments = dir.path().join("segments");
+        let seg_name = format!("{segment_id}.seg");
+        let sidx_name = format!("{segment_id}.sidx");
+        let ids_name = format!("{segment_id}.ids");
+        std::fs::write(segments.join(&seg_name), b"segment").unwrap();
+        std::fs::write(segments.join(&sidx_name), b"sidx").unwrap();
+        std::fs::write(segments.join(&ids_name), b"ids").unwrap();
+        let meta = SegmentMeta {
+            id: segment_id.to_owned(),
+            doc_count: 2,
+            size_bytes: 7,
+            min_seq_no: 10,
+            max_seq_no: 11,
+            created_at_ms: 0,
+            has_tombstones: false,
+            seg_path: seg_name.clone(),
+            sidx_path: format!("{segment_id}.sidx"),
+        };
+        store.write_flush_completion_manifest(&meta).unwrap();
+        assert!(store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+
+        let complete = segments.join(format!("{segment_id}.complete"));
+        let canonical = std::fs::read(&complete).unwrap();
+        let write_records = |records: &[(&str, u64, u32)]| {
+            let mut body = Vec::new();
+            body.extend_from_slice(b"ZCM1");
+            body.extend_from_slice(&(segment_id.len() as u16).to_le_bytes());
+            body.extend_from_slice(segment_id.as_bytes());
+            body.extend_from_slice(&2u64.to_le_bytes());
+            body.extend_from_slice(&10u64.to_le_bytes());
+            body.extend_from_slice(&11u64.to_le_bytes());
+            body.extend_from_slice(&(records.len() as u32).to_le_bytes());
+            for (name, size, crc) in records {
+                body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                body.extend_from_slice(name.as_bytes());
+                body.extend_from_slice(&size.to_le_bytes());
+                body.extend_from_slice(&crc.to_le_bytes());
+            }
+            body.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+            std::fs::write(&complete, body).unwrap();
+        };
+        let seg_record = (seg_name.as_str(), 7, crc32fast::hash(b"segment"));
+        let sidx_record = (sidx_name.as_str(), 4, crc32fast::hash(b"sidx"));
+        let ids_record = (ids_name.as_str(), 3, crc32fast::hash(b"ids"));
+
+        let rewrite_crc = |bytes: &mut Vec<u8>| {
+            let payload_len = bytes.len() - 4;
+            let crc = crc32fast::hash(&bytes[..payload_len]);
+            bytes[payload_len..].copy_from_slice(&crc.to_le_bytes());
+        };
+        let mut unknown_version = canonical.clone();
+        unknown_version[..4].copy_from_slice(b"ZCM9");
+        rewrite_crc(&mut unknown_version);
+        std::fs::write(&complete, unknown_version).unwrap();
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+
+        let mut huge_count = canonical.clone();
+        let count_offset = 4 + 2 + segment_id.len() + 8 * 3;
+        huge_count[count_offset..count_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        rewrite_crc(&mut huge_count);
+        std::fs::write(&complete, huge_count).unwrap();
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+
+        let mut corrupt_envelope = canonical.clone();
+        *corrupt_envelope.last_mut().unwrap() ^= 1;
+        std::fs::write(&complete, corrupt_envelope).unwrap();
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+
+        let mut corrupt_payload = canonical.clone();
+        corrupt_payload[6] ^= 1;
+        std::fs::write(&complete, corrupt_payload).unwrap();
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+
+        write_records(&[seg_record, sidx_record]);
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+        write_records(&[
+            (seg_name.as_str(), 8, seg_record.2),
+            sidx_record,
+            ids_record,
+        ]);
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+        write_records(&[(seg_name.as_str(), 7, 0), sidx_record, ids_record]);
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+        write_records(&[seg_record, sidx_record, ids_record]);
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+        write_records(&[seg_record, seg_record, sidx_record, ids_record]);
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+        write_records(&[("../escape", 7, seg_record.2), sidx_record, ids_record]);
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+
+        std::fs::write(&complete, canonical).unwrap();
+        std::fs::remove_file(segments.join(&ids_name)).unwrap();
+        assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
+        store.cleanup_orphaned_segment_files().unwrap();
+        assert!(!complete.exists(), "orphan cleanup must remove `.complete`");
+    }
+
+    #[test]
+    fn artifact_crc_streams_large_inputs_in_bounded_chunks() {
+        struct TrackingReader {
+            remaining: usize,
+            max_request: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl std::io::Read for TrackingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.max_request.fetch_max(buffer.len(), Ordering::Relaxed);
+                let count = self.remaining.min(buffer.len());
+                buffer[..count].fill(0x5a);
+                self.remaining -= count;
+                Ok(count)
+            }
+        }
+        let max_request = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let total = 8 * 1024 * 1024 + 17;
+        let crc = IndexStore::stream_crc32_from_reader(TrackingReader {
+            remaining: total,
+            max_request: Arc::clone(&max_request),
+        })
+        .unwrap();
+        let mut expected = crc32fast::Hasher::new();
+        for _ in 0..128 {
+            expected.update(&[0x5a; 64 * 1024]);
+        }
+        expected.update(&[0x5a; 17]);
+        assert_eq!(crc, expected.finalize());
+        assert_eq!(max_request.load(Ordering::Relaxed), 64 * 1024);
+    }
+
+    #[test]
+    fn orphan_recovery_rejects_incomplete_v3_and_malformed_legacy_ids() {
+        enum Mutation {
+            V3WithoutComplete,
+            OversizedComplete,
+            LegacyPartial,
+            LegacyTrailing,
+            LegacyHeaderMismatch,
+            LegacyInvalidUtf8,
+        }
+        for mutation in [
+            Mutation::V3WithoutComplete,
+            Mutation::OversizedComplete,
+            Mutation::LegacyPartial,
+            Mutation::LegacyTrailing,
+            Mutation::LegacyHeaderMismatch,
+            Mutation::LegacyInvalidUtf8,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let segment_id;
+            {
+                let store = open_test_store(dir.path());
+                store.save_snapshot().unwrap();
+                let empty_snapshot = std::fs::read(dir.path().join("snapshot.json")).unwrap();
+                store.index("doc", serde_json::json!({"v": 1})).unwrap();
+                segment_id = store.flush().unwrap().unwrap().id;
+                std::fs::write(dir.path().join("snapshot.json"), empty_snapshot).unwrap();
+                let segments = dir.path().join("segments");
+                let ids = segments.join(format!("{segment_id}.ids"));
+                let complete = segments.join(format!("{segment_id}.complete"));
+                if !matches!(mutation, Mutation::OversizedComplete) {
+                    std::fs::remove_file(&complete).unwrap();
+                }
+                match mutation {
+                    Mutation::V3WithoutComplete => {}
+                    Mutation::OversizedComplete => {
+                        std::fs::write(complete, vec![0u8; 4 * 1024 * 1024 + 1]).unwrap();
+                    }
+                    Mutation::LegacyPartial => {
+                        let mut bytes = Vec::from(&b"ZID1"[..]);
+                        bytes.extend_from_slice(&1u32.to_le_bytes());
+                        bytes.extend_from_slice(&1u64.to_le_bytes());
+                        bytes.extend_from_slice(&4u16.to_le_bytes());
+                        bytes.extend_from_slice(b"do");
+                        std::fs::write(ids, bytes).unwrap();
+                    }
+                    Mutation::LegacyTrailing => {
+                        let mut bytes = Vec::from(&b"ZID1"[..]);
+                        bytes.extend_from_slice(&1u32.to_le_bytes());
+                        bytes.extend_from_slice(&1u64.to_le_bytes());
+                        bytes.extend_from_slice(&3u16.to_le_bytes());
+                        bytes.extend_from_slice(b"doc");
+                        bytes.push(0xff);
+                        std::fs::write(ids, bytes).unwrap();
+                    }
+                    Mutation::LegacyHeaderMismatch => {
+                        store
+                            .write_ids_sidecar(&segment_id, &[(999, "doc")])
+                            .unwrap();
+                    }
+                    Mutation::LegacyInvalidUtf8 => {
+                        let mut bytes = Vec::from(&b"ZID1"[..]);
+                        bytes.extend_from_slice(&1u32.to_le_bytes());
+                        bytes.extend_from_slice(&1u64.to_le_bytes());
+                        bytes.extend_from_slice(&1u16.to_le_bytes());
+                        bytes.push(0xff);
+                        std::fs::write(ids, bytes).unwrap();
+                    }
+                }
+                drop(store);
+            }
+            let reopened = open_test_store(dir.path());
+            assert!(
+                reopened
+                    .snapshot()
+                    .segments
+                    .iter()
+                    .all(|segment| segment.id != segment_id),
+                "malformed/incomplete orphan was recovered"
+            );
+            assert!(
+                !dir.path()
+                    .join("segments")
+                    .join(format!("{segment_id}.seg"))
+                    .exists(),
+                "rejected orphan family must be cleaned"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_zid3_orphan_recovers_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_snapshot;
+        let segment_id;
+        {
+            let store = open_test_store(dir.path());
+            store.save_snapshot().unwrap();
+            empty_snapshot = std::fs::read(dir.path().join("snapshot.json")).unwrap();
+            store.index("doc", serde_json::json!({"v": 1})).unwrap();
+            segment_id = store.flush().unwrap().unwrap().id;
+            assert!(dir
+                .path()
+                .join("segments")
+                .join(format!("{segment_id}.complete"))
+                .exists());
+        }
+        std::fs::write(dir.path().join("snapshot.json"), empty_snapshot).unwrap();
+        let reopened = open_test_store(dir.path());
+        assert_eq!(reopened.snapshot().segments.len(), 1);
+        assert_eq!(reopened.snapshot().segments[0].id, segment_id);
+        assert_eq!(
+            reopened.version_map.get("doc").unwrap().segment_id.as_ref(),
+            segment_id
+        );
+        drop(reopened);
+        let reopened_again = open_test_store(dir.path());
+        assert_eq!(reopened_again.snapshot().segments.len(), 1);
+        assert_eq!(reopened_again.snapshot().segments[0].id, segment_id);
+    }
+
+    #[test]
+    fn direct_flush_failure_restores_for_retry_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("direct-survivor", serde_json::json!({"value": 7}))
+            .unwrap();
+        let failed = store.flush_with_publisher(|_| {
+            Err(StorageError::Io(std::io::Error::other(
+                "injected direct publisher failure",
+            )))
+        });
+        assert!(failed.is_err());
+        assert!(store.snapshot().segments.is_empty());
+        assert_eq!(
+            store
+                .memtable_shards
+                .iter()
+                .map(|shard| shard.lock().unwrap().len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            store
+                .version_map
+                .get("direct-survivor")
+                .unwrap()
+                .segment_id
+                .as_ref(),
+            IN_MEMORY_SEGMENT_ID
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.flush_with_publisher(|_| -> Result<()> {
+                panic!("injected direct publisher panic")
+            });
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            store
+                .memtable_shards
+                .iter()
+                .map(|shard| shard.lock().unwrap().len())
+                .sum::<usize>(),
+            1,
+            "direct panic must restore exactly one retry owner"
+        );
+
+        let meta = store.flush().unwrap().expect("restored drain must retry");
+        assert_eq!(meta.doc_count, 1);
+        drop(store);
+
+        let reopened = open_test_store(dir.path());
+        assert_eq!(reopened.snapshot().segments.len(), 1);
+        assert_eq!(
+            reopened
+                .version_map
+                .get("direct-survivor")
+                .unwrap()
+                .segment_id
+                .as_ref(),
+            meta.id
+        );
+    }
+
+    #[test]
+    fn prepublication_rollback_cannot_recover_restored_nonmarker_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("rollback-doc", serde_json::json!({"v": 1}))
+            .unwrap();
+        let drained = store.take_memtable_for_flush().unwrap();
+        store.publication_failpoint.store(1, Ordering::Release);
+        assert!(store
+            .finalize_flush_with_publisher(&drained, |_| Ok(()))
+            .is_err());
+        store.publication_failpoint.store(0, Ordering::Release);
+
+        let segments = dir.path().join("segments");
+        let segment_id = std::fs::read_dir(&segments)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_suffix(".seg").map(str::to_owned)
+            });
+        assert!(segment_id.is_none(), "ordinary cleanup should remove data");
+
+        // Model a crash image that retained non-marker files after the
+        // directory fsync. No complete/ids evidence may accompany them.
+        let fake_id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(segments.join(format!("{fake_id}.seg")), b"leftover").unwrap();
+        std::fs::write(segments.join(format!("{fake_id}.sidx")), b"leftover").unwrap();
+        assert!(!segments.join(format!("{fake_id}.complete")).exists());
+        assert!(!segments.join(format!("{fake_id}.ids")).exists());
+        drop(store);
+
+        let reopened = open_test_store(dir.path());
+        assert!(reopened
+            .snapshot()
+            .segments
+            .iter()
+            .all(|segment| segment.id != fake_id));
+        assert!(!segments.join(format!("{fake_id}.seg")).exists());
+    }
+
+    #[test]
+    fn partial_multi_input_disarm_aborts_merge_and_restarts_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store.index("merge-a", serde_json::json!({"v": 1})).unwrap();
+        store.flush().unwrap();
+        store.index("merge-b", serde_json::json!({"v": 2})).unwrap();
+        store.flush().unwrap();
+        let ids: Vec<_> = store
+            .snapshot()
+            .segments
+            .iter()
+            .map(|segment| segment.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        store.orphan_disarm_fail_after.store(0, Ordering::Release);
+        let executor = crate::merge::MergeExecutor::new(
+            Arc::clone(&store),
+            crate::merge::MergeConfig {
+                io_rate_mb_per_sec: 0,
+                ..Default::default()
+            },
+        );
+        assert!(executor.execute_merge(&ids).is_err());
+        assert_eq!(store.snapshot().segments.len(), 2);
+        for id in &ids {
+            assert!(!dir
+                .path()
+                .join("segments")
+                .join(format!("{id}.complete"))
+                .exists());
+            assert!(store.open_segment(id).is_ok());
+        }
+        store
+            .orphan_disarm_fail_after
+            .store(usize::MAX, Ordering::Release);
+        assert_eq!(
+            IndexStore::load_snapshot(dir.path())
+                .unwrap()
+                .unwrap()
+                .segments
+                .len(),
+            2,
+            "failed merge must not change the persisted snapshot"
+        );
+        drop(store);
+
+        let reopened = open_test_store(dir.path());
+        assert_eq!(reopened.snapshot().segments.len(), 2);
+        for id in &ids {
+            assert!(reopened.open_segment(id).is_ok());
+        }
+        assert!(reopened.version_map.get("merge-a").is_some());
+        assert!(reopened.version_map.get("merge-b").is_some());
+    }
+
+    fn rewrite_ids_as_legacy(segments: &Path, segment_id: &str, magic: &[u8; 4]) {
+        let path = segments.join(format!("{segment_id}.ids"));
+        let current = std::fs::read(&path).unwrap();
+        assert_eq!(&current[..4], b"ZID3");
+        let mut legacy = Vec::from(&magic[..]);
+        legacy.extend_from_slice(&current[4..8]);
+        if magic == b"ZID1" {
+            legacy.extend_from_slice(&lz4_flex::decompress_size_prepended(&current[8..]).unwrap());
+        } else {
+            legacy.extend_from_slice(&current[8..]);
+        }
+        std::fs::write(path, legacy).unwrap();
+        std::fs::remove_file(segments.join(format!("{segment_id}.complete"))).unwrap();
+    }
+
+    #[test]
+    fn valid_zid1_and_zid2_orphans_recover_exactly_once() {
+        for magic in [b"ZID1", b"ZID2"] {
+            let dir = tempfile::tempdir().unwrap();
+            let empty_snapshot;
+            let segment_id;
+            {
+                let store = open_test_store(dir.path());
+                store.save_snapshot().unwrap();
+                empty_snapshot = std::fs::read(dir.path().join("snapshot.json")).unwrap();
+                store
+                    .index("legacy-doc", serde_json::json!({"v": 1}))
+                    .unwrap();
+                segment_id = store.flush().unwrap().unwrap().id;
+            }
+            rewrite_ids_as_legacy(&dir.path().join("segments"), &segment_id, magic);
+            std::fs::write(dir.path().join("snapshot.json"), &empty_snapshot).unwrap();
+
+            let reopened = open_test_store(dir.path());
+            assert_eq!(reopened.snapshot().segments.len(), 1);
+            assert_eq!(reopened.snapshot().segments[0].id, segment_id);
+            assert_eq!(
+                reopened
+                    .version_map
+                    .get("legacy-doc")
+                    .unwrap()
+                    .segment_id
+                    .as_ref(),
+                segment_id
+            );
+            drop(reopened);
+
+            let reopened_again = open_test_store(dir.path());
+            assert_eq!(reopened_again.snapshot().segments.len(), 1);
+            assert_eq!(reopened_again.snapshot().segments[0].id, segment_id);
+        }
+    }
+
+    #[test]
+    fn snapshot_listed_legacy_segments_open_after_upgrade_without_complete_manifest() {
+        for magic in [b"ZID1", b"ZID2"] {
+            let dir = tempfile::tempdir().unwrap();
+            let segment_id;
+            {
+                let store = open_test_store(dir.path());
+                store
+                    .index("legacy-doc", serde_json::json!({"v": 1}))
+                    .unwrap();
+                segment_id = store.flush().unwrap().unwrap().id;
+            }
+            rewrite_ids_as_legacy(&dir.path().join("segments"), &segment_id, magic);
+
+            let reopened = open_test_store(dir.path());
+            assert_eq!(reopened.snapshot().segments.len(), 1);
+            assert_eq!(reopened.snapshot().segments[0].id, segment_id);
+            assert_eq!(
+                reopened
+                    .open_segment(&segment_id)
+                    .unwrap()
+                    .header()
+                    .doc_count,
+                1
+            );
+            assert_eq!(
+                reopened
+                    .version_map
+                    .get("legacy-doc")
+                    .unwrap()
+                    .segment_id
+                    .as_ref(),
+                segment_id
+            );
+        }
+    }
+
+    #[test]
+    fn postpublication_maintenance_failures_retain_wal_and_never_duplicate() {
+        for fail_snapshot in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let segment_id;
+            {
+                let store = open_test_store(dir.path());
+                store.index("only", serde_json::json!({"v": 1})).unwrap();
+                if fail_snapshot {
+                    store.fail_next_snapshot_save.store(true, Ordering::Release);
+                } else {
+                    store
+                        .fail_next_wal_maintenance
+                        .store(true, Ordering::Release);
+                }
+                let meta = store
+                    .flush()
+                    .expect("post-publication maintenance is deferred, not a flush error")
+                    .expect("one segment published");
+                segment_id = meta.id;
+                assert_eq!(store.snapshot().segments.len(), 1);
+                assert_eq!(
+                    store.version_map.get("only").unwrap().segment_id.as_ref(),
+                    segment_id
+                );
+                assert!(
+                    wal_bytes(&store).iter().any(|(_, bytes)| !bytes.is_empty()),
+                    "deferred maintenance must retain a replayable WAL"
+                );
+                assert!(store.flush().unwrap().is_none(), "retry must not duplicate");
+                assert_eq!(store.snapshot().segments.len(), 1);
+            }
+
+            let reopened = open_test_store(dir.path());
+            let snap = reopened.snapshot();
+            assert_eq!(snap.segments.len(), 1, "restart must recover exactly once");
+            assert_eq!(snap.segments[0].id, segment_id);
+            let live = reopened.version_map.get("only").unwrap();
+            assert!(!live.deleted);
+            assert_eq!(live.segment_id.as_ref(), segment_id);
+            drop(snap);
+            assert!(reopened.flush().unwrap().is_none());
+            assert_eq!(reopened.snapshot().segments.len(), 1);
+        }
+    }
+
+    #[test]
+    fn publication_journal_rolls_back_before_rcu_and_commits_after_rcu() {
+        for stage in 1u8..=4 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_test_store(dir.path());
+            store.index("only", serde_json::json!({"v": 1})).unwrap();
+            let drained = store.take_memtable_for_flush().unwrap();
+            store.publication_failpoint.store(stage, Ordering::Release);
+            let outcome = store.finalize_flush_with_publisher(&drained, |_| Ok(()));
+
+            if stage <= 3 {
+                assert!(outcome.is_err(), "stage {stage} is pre-publication");
+                assert!(store.snapshot().segments.is_empty());
+                let current = store.version_map.get("only").unwrap();
+                assert_eq!(
+                    current.segment_id.as_ref(),
+                    crate::version_map::IN_MEMORY_SEGMENT_ID
+                );
+                assert!(
+                    std::fs::read_dir(dir.path().join("segments"))
+                        .unwrap()
+                        .flatten()
+                        .next()
+                        .is_none(),
+                    "precommit rollback must remove the complete artifact family"
+                );
+            } else {
+                let FlushFinalizeOutcome::Published {
+                    meta,
+                    maintenance_deferred,
+                } = outcome.unwrap()
+                else {
+                    panic!("post-RCU panic must return Published")
+                };
+                assert!(maintenance_deferred);
+                assert_eq!(store.snapshot().segments.len(), 1);
+                assert_eq!(store.snapshot().segments[0].id, meta.id);
+                assert_eq!(
+                    store.version_map.get("only").unwrap().segment_id.as_ref(),
+                    meta.id
+                );
+            }
+            assert!(
+                wal_bytes(&store).iter().any(|(_, bytes)| !bytes.is_empty()),
+                "publication failpoint must retain WAL"
+            );
+            drop(store);
+            let reopened = open_test_store(dir.path());
+            assert!(reopened
+                .version_map
+                .get("only")
+                .filter(|entry| !entry.deleted)
+                .is_some());
+            assert!(reopened.snapshot().segments.len() <= 1);
+        }
+    }
+
+    #[test]
+    fn publication_rollback_never_overwrites_newer_put_or_delete() {
+        for stage in [5u8, 6u8] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_test_store(dir.path());
+            store.index("same", serde_json::json!({"v": 1})).unwrap();
+            let drained = store.take_memtable_for_flush().unwrap();
+            let old_seq = drained.entries[0].seq_no;
+            store.publication_failpoint.store(stage, Ordering::Release);
+            assert!(store
+                .finalize_flush_with_publisher(&drained, |_| Ok(()))
+                .is_err());
+            let current = store.version_map.get("same").unwrap();
+            assert_eq!(current.seq_no, old_seq + 1);
+            assert_eq!(current.deleted, stage == 6);
+            assert_eq!(
+                current.segment_id.as_ref(),
+                crate::version_map::IN_MEMORY_SEGMENT_ID
+            );
+            assert!(store.snapshot().segments.is_empty());
+            assert!(std::fs::read_dir(dir.path().join("segments"))
+                .unwrap()
+                .flatten()
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
     fn raw_wal_batch_rejects_entire_invalid_batch_without_side_effects() {
         let invalid_payloads: &[&[u8]] = &[
             br#"{"truncated":"#,
@@ -3531,7 +4670,7 @@ mod tests {
             // (pre-fix: checkpoint covering B + rotate + prune = B's WAL
             // destroyed).
             store
-                .finalize_flush_with_publisher(drained, |_| Ok(()))
+                .finalize_flush_with_publisher(&drained, |_| Ok(()))
                 .unwrap();
             // The user-visible flush boundary forces maintenance again
             // (pre-fix with `current_seq_no() - 1`).
@@ -3623,7 +4762,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .finalize_flush_with_publisher(drained, |_| Ok(()))
+            .finalize_flush_with_publisher(&drained, |_| Ok(()))
             .unwrap();
         store.force_wal_maintenance().unwrap();
 
@@ -4101,7 +5240,7 @@ mod tests {
         for id in &ids {
             assert!(segments_dir.join(format!("{id}.seg")).exists());
         }
-        let (files, _bytes) = store.retire_segment_files(&ids);
+        let (files, _bytes) = store.retire_segment_files(&ids).unwrap();
         assert!(
             files >= 2,
             "expected immediate deletion, removed {files} files"
@@ -4142,7 +5281,7 @@ mod tests {
         for id in &ids {
             store.evict_segment_reader_cache(id.as_str());
         }
-        let (files, _bytes) = store.retire_segment_files(&ids);
+        let (files, _bytes) = store.retire_segment_files(&ids).unwrap();
         assert_eq!(files, 0, "deletion must be deferred while a lease is held");
 
         let segments_dir = dir.path().join("segments");
@@ -4176,23 +5315,37 @@ mod tests {
     fn crash_with_deferred_retire_does_not_resurrect_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let (store, ids, merged) = two_segments_merged(dir.path());
+        let segments_dir = dir.path().join("segments");
 
         // Hold a lease so retire defers, then "crash" (leak the lease and
-        // drop the store) — the input .seg files stay on disk, .ids gone.
+        // drop the store). apply_merge already persisted the post-merge
+        // snapshot and durably disarmed every recovery marker before commit.
         let leaked = store.snapshot();
-        let (files, _bytes) = store.retire_segment_files(&ids);
+        let (files, _bytes) = store.retire_segment_files(&ids).unwrap();
         assert_eq!(files, 0);
+        for id in &ids {
+            assert!(!segments_dir.join(format!("{id}.complete")).exists());
+            assert!(!segments_dir.join(format!("{id}.ids")).exists());
+        }
+
+        // The leased readers keep non-marker segment data alive. Model a crash
+        // at exactly this deferred-retirement point: data remains, while both
+        // recovery marker families are durably absent.
+        for id in &ids {
+            assert!(segments_dir.join(format!("{id}.seg")).exists());
+            assert!(!segments_dir.join(format!("{id}.complete")).exists());
+            assert!(!segments_dir.join(format!("{id}.ids")).exists());
+        }
         std::mem::forget(leaked);
         drop(store);
 
         // Reopen: recover_orphaned_segments must NOT resurrect the
-        // merged-away inputs (no .ids side-car), and the on-open cleanup
-        // must reclaim their leftover files.
+        // merged-away inputs, and on-open cleanup must reclaim their leftover
+        // non-marker files.
         let store2 = open_test_store(dir.path());
         let snap = store2.snapshot();
         assert_eq!(snap.segments.len(), 1, "only the merged segment survives");
         assert_eq!(snap.segments[0].id, merged.id);
-        let segments_dir = dir.path().join("segments");
         for id in &ids {
             assert!(
                 !segments_dir.join(format!("{id}.seg")).exists(),
