@@ -15830,6 +15830,17 @@ impl Index {
                 .collect();
             let snap_bg = self.store.snapshot();
             for seg in &snap_bg.segments {
+                // A tombstone-only segment is an intentional delete journal:
+                // it has `doc_count == 0` and no Stored section to hydrate.
+                // Its deletions are already represented in the version map,
+                // while this pass only assembles source documents for the
+                // aggregation corpus. Trying to load it makes the valid
+                // absence of Stored look like an unreadable segment and turns
+                // every fallback aggregation after a persisted delete into a
+                // 500 response.
+                if seg.doc_count == 0 {
+                    continue;
+                }
                 // Cooperative deadline: the full-corpus assembly is the
                 // most expensive path in the engine (decompress + parse
                 // EVERY stored doc).  Stop pulling further segments once
