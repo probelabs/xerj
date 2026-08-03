@@ -140,8 +140,16 @@ destabilize the server.
   xerj autoindex map      [--url U] [--json] [--dataset SLUG]
   xerj autoindex status   [--url U] [--state-dir P]
 
+--fresh starts without resume state only when the selected state directory has
+no durable plan. It never removes stale destination records. An independent
+rebuild requires a new --state-dir, new --prefix, and new --brain when graph
+detection is enabled (or --no-graph), followed by validation before switching
+readers. The shared autoindex-catalog and old target require explicit,
+validated cleanup. Added or removed content groups are refused; same-path
+replacement remains supported.
+
 Exit codes: 0 complete · 3 completed-with-junk (junk recorded, never fatal) ·
-2 usage · 1 endpoint unreachable / journal-config mismatch.
+2 usage · 1 endpoint/journal error or refused unsafe corpus-state transition.
 
 Pipeline: walk → sniff → sample → infer → map → extract → bulk → correlate →
 catalog → verify.
