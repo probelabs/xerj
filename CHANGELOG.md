@@ -529,6 +529,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/v1/embedding/identity` reports `lexical` — the backend the server will
   really use — rather than `proxy`.
 
+### Changed — fail-closed autoindex restart semantics
+
+- **`autoindex --fresh` no longer discards a durable resume plan.** A durable
+  plan contains the alias, path, graph, and stale-record knowledge needed for
+  safe reconciliation. `--fresh` is accepted only when the selected state
+  directory has no durable plan and never cleans the destination. An
+  independent rebuild must use a new state directory, new prefix, and new brain
+  namespace when graph detection is enabled (or disable graph writes), be
+  validated, and only then replace the old reader target. The shared catalog
+  and old target require explicit, validated cleanup. Membership additions and
+  removals are refused; same-path replacement remains supported.
+- **`xerj brain` no longer turns an absent or zero node-count probe into an
+  automatic reset.** Journal/server disagreement now fails with the journal,
+  URL, prefix, and brain identity plus recovery instructions. Probe transport
+  and malformed-response failures remain errors instead of being reported as
+  an empty destination.
+
 ## [1.0.0-rc.10] - 2026-08-03
 
 ### Security
@@ -604,7 +621,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaching the HNSW graph. Each arrived with a standalone harness and honest
   caveats. They are tracked for the following release rather than rushed into
   this one.
-
 
 ### Changed — runtime-field types (can break existing mappings)
 

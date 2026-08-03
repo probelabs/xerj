@@ -178,6 +178,21 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn preflight_holds_the_same_exclusive_lock_through_authoritative_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let preflight = Journal::preflight(dir.path(), "root", "url", "prefix").unwrap();
+        let error = Journal::open(dir.path(), "root", "url", "prefix", 300, false)
+            .err()
+            .expect("a second opener must not pass the held preflight lock");
+        assert!(format!("{error:#}").contains("already in use"));
+
+        let journal =
+            Journal::open_after_preflight(preflight, "root", "url", "prefix", 300, false).unwrap();
+        drop(journal);
+        assert!(Journal::open(dir.path(), "root", "url", "prefix", 300, false).is_ok());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,15 +295,97 @@ pub fn default_state_dir(root: &str, url: &str, prefix: &str) -> PathBuf {
         .join(crate::ids::state_key(root, url, prefix))
 }
 
+/// Read the last durable plan without locking, repairing, truncating or
+/// appending to the journal. This is a preflight hint only: `Journal::open`
+/// remains the authority after the caller passes its fail-closed inventory
+/// gate and acquires the state lock.
+fn read_plan_for_preflight(
+    path: &Path,
+    root: &str,
+    url: &str,
+    prefix: &str,
+) -> Result<Option<Plan>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut plan = None;
+    let mut offset = 0u64;
+    loop {
+        let record_start = offset;
+        let mut bytes = Vec::new();
+        let read = reader.read_until(b'\n', &mut bytes)?;
+        if read == 0 {
+            break;
+        }
+        offset += read as u64;
+        if bytes.last() != Some(&b'\n') {
+            // `Journal::open` will repair this torn final record after the
+            // preflight accepts. It cannot be treated as durable here.
+            break;
+        }
+        let value: Value =
+            serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice()))
+                .with_context(|| {
+                    format!(
+                        "journal corruption at byte {record_start} in {}: malformed \
+                         newline-terminated record. Refusing to discard later records. Restore \
+                         the journal from a backup, or truncate it to exactly {record_start} \
+                         bytes to keep every completion recorded before the corruption. For an \
+                         isolated rebuild use a new --state-dir, new --prefix, and new --brain \
+                         when graph detection is enabled (or --no-graph); explicitly validate \
+                         and clean the shared catalog and old target",
+                        path.display()
+                    )
+                })?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("run") => {
+                let recorded_root = value.get("root").and_then(Value::as_str).unwrap_or("");
+                let recorded_url = value.get("url").and_then(Value::as_str).unwrap_or("");
+                let recorded_prefix = value.get("prefix").and_then(Value::as_str).unwrap_or("");
+                anyhow::ensure!(
+                    recorded_root == root && recorded_url == url && recorded_prefix == prefix,
+                    "journal at {} was created for root={} url={} prefix={}; current run has \
+                     root={} url={} prefix={}",
+                    path.display(),
+                    recorded_root,
+                    recorded_url,
+                    recorded_prefix,
+                    root,
+                    url,
+                    prefix
+                );
+            }
+            Some("plan") => {
+                if let Some(encoded) = value.get("plan") {
+                    plan =
+                        Some(serde_json::from_value(encoded.clone()).with_context(|| {
+                            format!("decode durable plan in {}", path.display())
+                        })?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(plan)
+}
+
+pub struct JournalPreflight {
+    state_dir: PathBuf,
+    state_lock: std::fs::File,
+    pub plan: Option<Plan>,
+    pub journal_exists: bool,
+}
+
 impl Journal {
-    pub fn open(
+    pub fn preflight(
         state_dir: &Path,
         root: &str,
         url: &str,
         prefix: &str,
-        bulk_timeout_secs: u64,
-        fresh: bool,
-    ) -> Result<Journal> {
+    ) -> Result<JournalPreflight> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
         let lock_path = state_dir.join(".autoindex.lock");
@@ -305,10 +402,46 @@ impl Journal {
                 state_dir.display()
             )
         })?;
+        let journal_path = state_dir.join("journal.ndjson");
+        let journal_exists = journal_path.exists();
+        let plan = read_plan_for_preflight(&journal_path, root, url, prefix)?;
+        Ok(JournalPreflight {
+            state_dir: state_dir.to_owned(),
+            state_lock,
+            plan,
+            journal_exists,
+        })
+    }
+
+    pub fn open(
+        state_dir: &Path,
+        root: &str,
+        url: &str,
+        prefix: &str,
+        bulk_timeout_secs: u64,
+        fresh: bool,
+    ) -> Result<Journal> {
+        let preflight = Self::preflight(state_dir, root, url, prefix)?;
+        Self::open_after_preflight(preflight, root, url, prefix, bulk_timeout_secs, fresh)
+    }
+
+    pub fn open_after_preflight(
+        preflight: JournalPreflight,
+        root: &str,
+        url: &str,
+        prefix: &str,
+        bulk_timeout_secs: u64,
+        fresh: bool,
+    ) -> Result<Journal> {
+        let JournalPreflight {
+            state_dir,
+            state_lock,
+            ..
+        } = preflight;
         // Hard kills cannot run NamedTempFile::drop. Stages are owned by this
         // journal directory and use a reserved prefix, so removing only
         // regular files with that prefix is deterministic and scope-safe.
-        for entry in std::fs::read_dir(state_dir)? {
+        for entry in std::fs::read_dir(&state_dir)? {
             let entry = entry?;
             if entry
                 .file_name()
@@ -361,7 +494,10 @@ impl Journal {
                                     anyhow::bail!(
                                 "journal at {} was created for root={jr} url={ju} prefix={jp}; \
                                  current run has root={root} url={url} prefix={prefix}. \
-                                 Use --fresh to discard it or --state-dir for a separate state.",
+                                 Refusing to discard history under the same destination. For an \
+                                 isolated rebuild use a new --state-dir, new --prefix, and new \
+                                 --brain when graph detection is enabled (or --no-graph); \
+                                 explicitly validate and clean the shared catalog and old target.",
                                 jpath.display()
                             );
                                 }
@@ -470,9 +606,10 @@ impl Journal {
                              after corruption. Restore the journal from a backup, or truncate it \
                              to exactly {record_start} bytes to keep every completion recorded \
                              before the corruption (files journaled after that point are \
-                             re-verified, re-indexed and re-embedded on the next run). Deleting \
-                             the whole journal (or rerunning with --fresh) also recovers, but \
-                             re-extracts and re-embeds the entire corpus",
+                             re-verified, re-indexed and re-embedded on the next run). For an \
+                             isolated rebuild use a new --state-dir, new --prefix, and new --brain \
+                             when graph detection is enabled (or --no-graph); explicitly validate \
+                             and clean the shared catalog and old target",
                             jpath.display()
                         );
                     }
@@ -902,9 +1039,10 @@ mod compatibility_tests {
         let message = format!("{error:#}");
         assert!(message.contains("journal corruption"));
         // Recovery guidance must stay scoped and honest: byte-exact truncation
-        // keeps prior completions; discarding the journal re-embeds everything.
+        // keeps prior completions; an exact rebuild needs isolated state and
+        // destination identities.
         assert!(message.contains("truncate it to exactly"));
-        assert!(message.contains("re-extracts and re-embeds the entire corpus"));
+        assert!(message.contains("new --state-dir, new --prefix, and new --brain"));
     }
 
     #[test]

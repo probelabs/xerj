@@ -228,7 +228,13 @@ live indices at http://localhost:9280:
   autoindex-catalog                                 9 docs
 ```
 
-`--fresh` ignores the journal and restarts (ids stay idempotent).
+`--fresh` starts without resume state only when the selected state directory
+has no durable plan; it never removes stale destination records. For an
+independent rebuild, use a new `--state-dir`, new `--prefix`, and new
+`--brain` when graph detection is enabled (or add `--no-graph`). Validate
+before switching readers. The shared `autoindex-catalog` and old target require
+explicit, validated cleanup. Added or removed content groups are refused;
+same-path replacement remains supported.
 
 ## Reproduce it yourself
 
