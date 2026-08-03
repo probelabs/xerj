@@ -313,37 +313,6 @@ impl std::fmt::Debug for OnnxConfig {
 }
 
 #[cfg(feature = "onnx-experimental")]
-impl PartialEq for OnnxConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.model_sha256 == other.model_sha256
-            && self.tokenizer_sha256 == other.tokenizer_sha256
-            && self.intra_threads == other.intra_threads
-            && self.session_pool_size == other.session_pool_size
-            && self.microbatch == other.microbatch
-            && self.max_inflight_calls == other.max_inflight_calls
-            && self.max_input_bytes_per_call == other.max_input_bytes_per_call
-            && self.max_inflight_input_bytes == other.max_inflight_input_bytes
-    }
-}
-
-#[cfg(feature = "onnx-experimental")]
-impl Eq for OnnxConfig {}
-
-#[cfg(feature = "onnx-experimental")]
-impl std::hash::Hash for OnnxConfig {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.model_sha256.hash(state);
-        self.tokenizer_sha256.hash(state);
-        self.intra_threads.hash(state);
-        self.session_pool_size.hash(state);
-        self.microbatch.hash(state);
-        self.max_inflight_calls.hash(state);
-        self.max_input_bytes_per_call.hash(state);
-        self.max_inflight_input_bytes.hash(state);
-    }
-}
-
-#[cfg(feature = "onnx-experimental")]
 #[derive(Debug, thiserror::Error)]
 #[error("{reason}")]
 pub struct OnnxAdmissionError {
@@ -540,7 +509,7 @@ mod onnx_handle_tests {
 
     fn cfg(model_sha256: &str) -> OnnxConfig {
         OnnxConfig {
-            model_bytes: Arc::from(b"model bytes".as_slice()),
+            model_bytes: Arc::from(format!("model bytes for {model_sha256}").into_bytes()),
             tokenizer_bytes: Arc::from(b"tokenizer bytes".as_slice()),
             model_sha256: model_sha256.into(),
             tokenizer_sha256: "tokenizer-hash".into(),
@@ -554,10 +523,24 @@ mod onnx_handle_tests {
     }
 
     #[test]
-    fn same_paths_with_different_content_hashes_never_share_session_cell() {
-        let first = OnnxHandle::new(cfg("model-a"));
-        let second = OnnxHandle::new(cfg("model-b"));
+    fn different_actual_bytes_never_share_session_cell() {
+        let first = cfg("model-a");
+        let mut second = cfg("model-b");
+        second.model_bytes = Arc::from(b"different model bytes".as_slice());
+        let first = OnnxHandle::new(first);
+        let second = OnnxHandle::new(second);
         assert!(!Arc::ptr_eq(&first.shared, &second.shared));
+    }
+
+    #[test]
+    fn identical_bytes_share_even_when_descriptive_hash_fields_differ() {
+        let first_cfg = cfg("descriptive-a");
+        let mut second_cfg = cfg("descriptive-b");
+        second_cfg.model_bytes = first_cfg.model_bytes.clone();
+        second_cfg.tokenizer_bytes = first_cfg.tokenizer_bytes.clone();
+        let first = OnnxHandle::new(first_cfg);
+        let second = OnnxHandle::new(second_cfg);
+        assert!(Arc::ptr_eq(&first.shared, &second.shared));
     }
 
     #[test]
