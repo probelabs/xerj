@@ -98,7 +98,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("refusing to mix vector spaces"), "{error}");
+        assert!(error.contains("Restore the original"), "{error}");
         assert!(error.contains("--fresh"), "{error}");
+        assert!(error.contains("--prefix"), "{error}");
+        assert!(error.contains("delete and recreate"), "{error}");
     }
 
     #[test]
@@ -116,6 +119,8 @@ mod tests {
             .to_string();
         assert!(error.contains("remote alias can drift"), "{error}");
         assert!(error.contains("--fresh"), "{error}");
+        assert!(error.contains("--prefix"), "{error}");
+        assert!(error.contains("delete and recreate"), "{error}");
     }
 
     #[test]
@@ -141,6 +146,8 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("--fresh"), "{error}");
+        assert!(error.contains("--prefix"), "{error}");
+        assert!(error.contains("delete and recreate"), "{error}");
     }
 
     #[test]
@@ -525,7 +532,9 @@ impl Journal {
         if self.resumed && (!resumable || self.embedding_identity_resumable == Some(false)) {
             anyhow::bail!(
                 "server embedding backend cannot safely resume semantic indexing: {}. \
-                 Re-run with --fresh after selecting a content-addressed backend",
+                 Restore the exact original embedding identity, or rebuild all vectors with \
+                 --fresh and a new --prefix. Before reusing the old prefix, delete and recreate \
+                 its prior autoindex indices",
                 non_resumable_reason.unwrap_or("embedding identity is not immutable")
             );
         }
@@ -534,7 +543,8 @@ impl Journal {
                 anyhow::bail!(
                     "embedding execution identity changed since this autoindex journal was \
                      created; refusing to mix vector spaces. Restore the original embedding \
-                     backend or re-run with --fresh"
+                     identity, or rebuild all vectors with --fresh and a new --prefix. Before \
+                     reusing the old prefix, delete and recreate its prior autoindex indices"
                 );
             }
             return Ok(());
@@ -542,7 +552,8 @@ impl Journal {
         if self.resumed && !self.done.is_empty() {
             anyhow::bail!(
                 "this semantic autoindex journal predates embedding identity pinning and cannot \
-                 be resumed safely. Re-run with --fresh to rebuild its vectors"
+                 be resumed safely. Rebuild all vectors with --fresh and a new --prefix. Before \
+                 reusing the old prefix, delete and recreate its prior autoindex indices"
             );
         }
         self.append_transaction(

@@ -283,12 +283,12 @@ impl Embedder {
 }
 
 #[cfg(feature = "onnx-experimental")]
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct OnnxConfig {
-    pub model_path: std::path::PathBuf,
-    pub tokenizer_path: std::path::PathBuf,
-    /// Content fingerprints are part of the shared-session cache key and are
-    /// rechecked immediately before load, preventing same-path asset swaps.
+    /// Immutable byte snapshots are shared by identity reporting and lazy
+    /// loading. A later same-path replacement cannot change the loaded space.
+    pub model_bytes: std::sync::Arc<[u8]>,
+    pub tokenizer_bytes: std::sync::Arc<[u8]>,
     pub model_sha256: String,
     pub tokenizer_sha256: String,
     pub intra_threads: usize,
@@ -298,6 +298,49 @@ pub struct OnnxConfig {
     pub max_inflight_calls: usize,
     pub max_input_bytes_per_call: usize,
     pub max_inflight_input_bytes: usize,
+}
+
+#[cfg(feature = "onnx-experimental")]
+impl std::fmt::Debug for OnnxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxConfig")
+            .field("model_sha256", &self.model_sha256)
+            .field("tokenizer_sha256", &self.tokenizer_sha256)
+            .field("intra_threads", &self.intra_threads)
+            .field("session_pool_size", &self.session_pool_size)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "onnx-experimental")]
+impl PartialEq for OnnxConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.model_sha256 == other.model_sha256
+            && self.tokenizer_sha256 == other.tokenizer_sha256
+            && self.intra_threads == other.intra_threads
+            && self.session_pool_size == other.session_pool_size
+            && self.microbatch == other.microbatch
+            && self.max_inflight_calls == other.max_inflight_calls
+            && self.max_input_bytes_per_call == other.max_input_bytes_per_call
+            && self.max_inflight_input_bytes == other.max_inflight_input_bytes
+    }
+}
+
+#[cfg(feature = "onnx-experimental")]
+impl Eq for OnnxConfig {}
+
+#[cfg(feature = "onnx-experimental")]
+impl std::hash::Hash for OnnxConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.model_sha256.hash(state);
+        self.tokenizer_sha256.hash(state);
+        self.intra_threads.hash(state);
+        self.session_pool_size.hash(state);
+        self.microbatch.hash(state);
+        self.max_inflight_calls.hash(state);
+        self.max_input_bytes_per_call.hash(state);
+        self.max_inflight_input_bytes.hash(state);
+    }
 }
 
 #[cfg(feature = "onnx-experimental")]
@@ -343,30 +386,9 @@ impl OnnxHandle {
         self.shared
             .init
             .get_or_spawn("xerj-onnx-init", move || {
-                    let model_bytes = std::fs::read(&cfg.model_path).map_err(|e| {
-                        anyhow!("read ONNX model {}: {e}", cfg.model_path.display())
-                    })?;
-                    let tokenizer_bytes = std::fs::read(&cfg.tokenizer_path).map_err(|e| {
-                        anyhow!("read ONNX tokenizer {}: {e}", cfg.tokenizer_path.display())
-                    })?;
-                    let actual_model = sha256_bytes(&model_bytes);
-                    let actual_tokenizer = sha256_bytes(&tokenizer_bytes);
-                    if actual_model != cfg.model_sha256 || actual_tokenizer != cfg.tokenizer_sha256
-                    {
-                        return Err(anyhow!(
-                            "ONNX assets changed after configuration; refusing to load a \
-                             different vector space from the same path (model expected {}, \
-                             actual {}; tokenizer expected {}, actual {}). Restart with the \
-                             intended assets or reindex under a new prefix",
-                            cfg.model_sha256,
-                            actual_model,
-                            cfg.tokenizer_sha256,
-                            actual_tokenizer
-                        ));
-                    }
                     let embedder = crate::onnx::OnnxPool::load_bytes(
-                        &model_bytes,
-                        &tokenizer_bytes,
+                        &cfg.model_bytes,
+                        &cfg.tokenizer_bytes,
                         cfg.intra_threads,
                         cfg.session_pool_size,
                     )?;
@@ -474,26 +496,17 @@ impl OnnxHandle {
     }
 }
 
-#[cfg(feature = "onnx-experimental")]
-fn sha256_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
 #[cfg(all(test, feature = "onnx-experimental"))]
 mod onnx_handle_tests {
     use super::{CancellationSafeInit, OnnxConfig, OnnxHandle};
     use crate::onnx::MicrobatchConfig;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn cfg(model_sha256: &str) -> OnnxConfig {
         OnnxConfig {
-            model_path: PathBuf::from("/tmp/model.onnx"),
-            tokenizer_path: PathBuf::from("/tmp/tokenizer.json"),
+            model_bytes: Arc::from(b"model bytes".as_slice()),
+            tokenizer_bytes: Arc::from(b"tokenizer bytes".as_slice()),
             model_sha256: model_sha256.into(),
             tokenizer_sha256: "tokenizer-hash".into(),
             intra_threads: 4,

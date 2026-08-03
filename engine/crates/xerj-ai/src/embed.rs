@@ -139,6 +139,13 @@ pub struct EmbeddingProxy {
 impl EmbeddingProxy {
     /// Create a new proxy with the given config.
     pub fn new(config: EmbeddingProxyConfig) -> Result<Self> {
+        let endpoint = reqwest::Url::parse(&config.endpoint)
+            .map_err(|e| XerjError::embedding(format!("invalid embedding endpoint: {e}")))?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            return Err(XerjError::embedding(
+                "embedding endpoint must use http or https",
+            ));
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()
@@ -311,6 +318,14 @@ mod tests {
     fn config_with_api_key() {
         let cfg = EmbeddingProxyConfig::new("http://localhost", "model").with_api_key("sk-test");
         assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn proxy_rejects_invalid_or_non_http_endpoints_at_construction() {
+        for endpoint in ["not a url", "file:///private/model"] {
+            let cfg = EmbeddingProxyConfig::new(endpoint, "model");
+            assert!(EmbeddingProxy::new(cfg).is_err(), "{endpoint} was accepted");
+        }
     }
 
     #[tokio::test]
