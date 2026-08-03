@@ -20,6 +20,7 @@ pub mod resources;
 pub mod sniff;
 pub mod state;
 mod sync;
+mod sync_executor;
 pub mod walk;
 
 use anyhow::{Context, Result};
@@ -950,6 +951,7 @@ fn build_phase_a(
                 .or_insert_with(|| FileAssignment {
                     rel: files[m].rel.clone(),
                     path_id: files[m].rel_id.clone(),
+                    is_symlink: Some(files[m].is_symlink),
                     family: family.as_str().to_string(),
                     gzip,
                     content_digest: Some(digests[m].clone()),
@@ -1471,6 +1473,30 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // must never classify a path snapshot taken while another owner was
     // publishing or replacing the durable plan.
     let preflight = state::Journal::preflight(&state_dir, &root_str, &cfg.url, &cfg.prefix)?;
+    // A durable sync_begin owns the desired generation. Never rediscover and
+    // replan from a mutable source tree while that transaction is pending.
+    // Operation handlers are deliberately not enabled by this foundation
+    // slice; fail with the exact durable transaction rather than accidentally
+    // executing a different folder snapshot.
+    if preflight.pending_sync.is_some() {
+        let mut journal = state::Journal::open_after_preflight(
+            preflight,
+            &root_str,
+            &cfg.url,
+            &cfg.prefix,
+            cfg.bulk_timeout_secs,
+            cfg.fresh,
+        )?;
+        pr.phase("replay", 0, 0);
+        let mut backend = sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20);
+        sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
+        // Through the progress surface, never a bare `eprintln!`: stderr
+        // belongs to that surface, so `--progress none` stays silent and
+        // `--progress json` stays one parseable stream (#241).
+        pr.note("autoindex: resumed and committed pending corpus generation from durable source");
+        pr.finish(true, 0, "completed", &[]);
+        return Ok((0, None));
+    }
     // Totals are unknown until the walk returns, so this phase honestly
     // reports `pct=unknown` and proves liveness with the clock alone.
     pr.phase("walk", 0, 0);
@@ -3662,6 +3688,7 @@ mod inventory_delta_tests {
         FileAssignment {
             rel: path.to_owned(),
             path_id: format!("id:{path}"),
+            is_symlink: Some(false),
             family: "csv".into(),
             gzip: false,
             content_digest: Some(format!("digest:{path}")),
@@ -3762,6 +3789,7 @@ mod duplicate_integration_tests {
         FileAssignment {
             rel: rel.to_string(),
             path_id: String::new(),
+            is_symlink: None,
             family: "txt".to_string(),
             gzip: false,
             content_digest: None,
@@ -3852,6 +3880,7 @@ mod duplicate_integration_tests {
             file_key: file_key.to_string(),
             rel: rel.to_string(),
             path_id: format!("id:{rel}"),
+            is_symlink: Some(false),
             duplicate_of: format!("{file_key}.txt"),
             bytes: 10,
         };
