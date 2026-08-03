@@ -23408,62 +23408,34 @@ fn validate_onnx_dimensions(fields: &[FieldConfig]) -> Result<()> {
 }
 
 #[cfg(feature = "onnx-experimental")]
-#[derive(Clone)]
-struct OnnxAssetSnapshot {
-    model_bytes: Arc<[u8]>,
-    tokenizer_bytes: Arc<[u8]>,
-    model_sha256: String,
-    tokenizer_sha256: String,
-}
-
-#[cfg(feature = "onnx-experimental")]
-fn configured_onnx_assets(cfg: &xerj_common::config::EmbeddingConfig) -> Result<OnnxAssetSnapshot> {
+fn configured_onnx_assets(
+    cfg: &xerj_common::config::EmbeddingConfig,
+) -> Result<xerj_common::config::EmbeddingAssetSnapshot> {
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
 
-    static SNAPSHOTS: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), OnnxAssetSnapshot>>> =
-        OnceLock::new();
-    let model = Path::new(&cfg.onnx_model_path)
-        .canonicalize()
-        .map_err(|e| {
-            EngineError::Common(xerj_common::XerjError::embedding(format!(
-                "cannot resolve embedding model asset: {e}"
-            )))
-        })?;
-    let tokenizer = Path::new(&cfg.onnx_tokenizer_path)
-        .canonicalize()
-        .map_err(|e| {
-            EngineError::Common(xerj_common::XerjError::embedding(format!(
-                "cannot resolve embedding tokenizer asset: {e}"
-            )))
-        })?;
-    let key = (model.clone(), tokenizer.clone());
-    let mut snapshots = SNAPSHOTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(snapshot) = snapshots.get(&key) {
-        return Ok(snapshot.clone());
-    }
-    let model_bytes: Arc<[u8]> = std::fs::read(&model).map(Into::into).map_err(|e| {
-        EngineError::Common(xerj_common::XerjError::embedding(format!(
-            "cannot read embedding model asset: {e}"
-        )))
-    })?;
-    let tokenizer_bytes: Arc<[u8]> = std::fs::read(&tokenizer).map(Into::into).map_err(|e| {
-        EngineError::Common(xerj_common::XerjError::embedding(format!(
-            "cannot read embedding tokenizer asset: {e}"
-        )))
-    })?;
-    let snapshot = OnnxAssetSnapshot {
-        model_sha256: format!("{:x}", Sha256::digest(&model_bytes)),
-        tokenizer_sha256: format!("{:x}", Sha256::digest(&tokenizer_bytes)),
-        model_bytes,
-        tokenizer_bytes,
-    };
-    snapshots.insert(key, snapshot.clone());
-    Ok(snapshot)
+    cfg.runtime_onnx_assets
+        .get_or_init(|| {
+            let model = Path::new(&cfg.onnx_model_path)
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve embedding model asset: {e}"))?;
+            let tokenizer = Path::new(&cfg.onnx_tokenizer_path)
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve embedding tokenizer asset: {e}"))?;
+            let model_bytes: Arc<[u8]> = std::fs::read(&model)
+                .map(Into::into)
+                .map_err(|e| format!("cannot read embedding model asset: {e}"))?;
+            let tokenizer_bytes: Arc<[u8]> = std::fs::read(&tokenizer)
+                .map(Into::into)
+                .map_err(|e| format!("cannot read embedding tokenizer asset: {e}"))?;
+            Ok(xerj_common::config::EmbeddingAssetSnapshot {
+                model_sha256: format!("{:x}", Sha256::digest(&model_bytes)),
+                tokenizer_sha256: format!("{:x}", Sha256::digest(&tokenizer_bytes)),
+                model_bytes,
+                tokenizer_bytes,
+            })
+        })
+        .clone()
+        .map_err(|reason| EngineError::Common(xerj_common::XerjError::embedding(reason)))
 }
 
 fn configured_onnx_identity(
@@ -23830,6 +23802,76 @@ mod embedding_identity_tests {
             snapshot_for_loader.tokenizer_bytes.as_ref(),
             replacement_tokenizer
         );
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[test]
+    fn onnx_snapshot_is_scoped_to_one_runtime_config_and_released_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_cfg = onnx_config(dir.path(), "runtime-scope");
+        let first = configured_onnx_assets(&first_cfg).unwrap();
+        let weak_model = Arc::downgrade(&first.model_bytes);
+        let first_identity = embedding_execution_identity(&first_cfg).unwrap();
+
+        let replacement_model = vec![b'z'; first.model_bytes.len()];
+        std::fs::write(&first_cfg.onnx_model_path, &replacement_model).unwrap();
+        drop(first);
+        drop(first_cfg);
+        assert!(
+            weak_model.upgrade().is_none(),
+            "dropping the runtime config must release its immutable asset snapshot"
+        );
+
+        let second_cfg = xerj_common::config::EmbeddingConfig {
+            mode: "onnx-experimental".into(),
+            onnx_model_path: dir
+                .path()
+                .join("model-runtime-scope.onnx")
+                .to_string_lossy()
+                .into_owned(),
+            onnx_tokenizer_path: dir
+                .path()
+                .join("tokenizer-runtime-scope.json")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        let second = configured_onnx_assets(&second_cfg).unwrap();
+        let second_identity = embedding_execution_identity(&second_cfg).unwrap();
+        assert_eq!(second.model_bytes.as_ref(), replacement_model);
+        assert_ne!(
+            first_identity.identity_sha256,
+            second_identity.identity_sha256
+        );
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[test]
+    fn concurrent_identity_and_loader_access_share_one_runtime_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = onnx_config(dir.path(), "concurrent");
+        let identity_cfg = cfg.clone();
+        let identity_thread =
+            std::thread::spawn(move || embedding_execution_identity(&identity_cfg).unwrap());
+        let loader_cfg = cfg.clone();
+        let loader_thread =
+            std::thread::spawn(move || configured_onnx_assets(&loader_cfg).unwrap());
+
+        let identity = identity_thread.join().unwrap();
+        let loader_snapshot = loader_thread.join().unwrap();
+        let owner_snapshot = configured_onnx_assets(&cfg).unwrap();
+        assert_eq!(
+            identity.identity_sha256,
+            embedding_execution_identity(&cfg).unwrap().identity_sha256
+        );
+        assert!(Arc::ptr_eq(
+            &loader_snapshot.model_bytes,
+            &owner_snapshot.model_bytes
+        ));
+        assert!(Arc::ptr_eq(
+            &loader_snapshot.tokenizer_bytes,
+            &owner_snapshot.tokenizer_bytes
+        ));
     }
 
     #[cfg(feature = "onnx-experimental")]

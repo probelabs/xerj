@@ -894,6 +894,20 @@ pub struct EmbeddingConfig {
     pub onnx_max_input_bytes_per_call: usize,
     /// Aggregate UTF-8 bytes admitted globally per shared ONNX model/session.
     pub onnx_max_inflight_input_bytes: usize,
+    /// Engine-lifetime immutable ONNX assets. Cloned configurations share this
+    /// cell, so identity reporting and lazy loading consume the same bytes.
+    /// It is runtime state, never configuration input or serialized output.
+    #[serde(skip)]
+    pub runtime_onnx_assets:
+        std::sync::Arc<std::sync::OnceLock<Result<EmbeddingAssetSnapshot, String>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingAssetSnapshot {
+    pub model_bytes: std::sync::Arc<[u8]>,
+    pub tokenizer_bytes: std::sync::Arc<[u8]>,
+    pub model_sha256: String,
+    pub tokenizer_sha256: String,
 }
 
 impl Default for EmbeddingConfig {
@@ -920,6 +934,7 @@ impl Default for EmbeddingConfig {
             onnx_max_inflight_calls: 8,
             onnx_max_input_bytes_per_call: 8 * 1024 * 1024,
             onnx_max_inflight_input_bytes: 32 * 1024 * 1024,
+            runtime_onnx_assets: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
