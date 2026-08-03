@@ -48,6 +48,13 @@ Confirm the three required input names, a supported output name, and width 384.
 Export tools can change their file layout or output names; XERJ deliberately
 fails instead of guessing.
 
+For the checksum-pinned transformer-fused FP32 graph used by the measured
+FB20 optimizer-regression screen, use the repository's
+[offline reproduction recipe](../demo/playbooks/onnx-model-optimization/README.md).
+The recipe does not download or bundle a model. It accepts only the recorded
+source model and tokenizer identities, pins the optimizer environment, and
+publishes only the exact checked graph plus its manifest.
+
 Build the opt-in server:
 
 ```bash
@@ -146,6 +153,13 @@ The error tells the operator to restore the original assets or re-run
 autoindex with `--fresh` and a new prefix. XERJ never silently mixes vector
 spaces.
 
+The transformer-fused graph produced by the offline recipe is a different
+model identity from its source graph. Although measured vector differences
+were small, they were not bit-zero. Do not replace a source model in place.
+Start with the fused model and run `autoindex --fresh` under a new prefix, or
+retain the source model for the existing index. The identity check must not be
+bypassed.
+
 ## Throughput controls
 
 The default remains one ONNX Runtime session and a 64-passage caller window:
@@ -216,6 +230,13 @@ This is not a 12.90x end-to-end indexing claim. It excludes extraction, HTTP,
 lexical indexing, persistence, HNSW construction, and contention. Full
 FinanceBench autoindex time must be measured, not projected.
 
+The transformer-fused recipe came from a promising private
+optimizer-regression screen, but this branch contains no sanitized benchmark
+ledger suitable for a public number. The recipe therefore makes no public
+speed or quality claim. See the
+[evidence boundary](../demo/playbooks/onnx-model-optimization/README.md#evidence-boundary)
+and run the repository's full comparison contract before publishing one.
+
 Measured stripped server binaries:
 
 - Candle: 36.06 MiB;
@@ -226,3 +247,10 @@ The approximately 90 MiB model is a separate runtime asset. Bundled `ort`
 binaries do not cover XERJ's musl release targets, so standard musl releases
 remain Candle-only. ONNX production adoption still needs a supported target
 matrix, end-to-end quality gates, and full-corpus throughput/resource results.
+
+The fused recipe uses ONNX Runtime transformer optimizer 1.22.1 for offline
+generation. Consumption is proven with XERJ's `ort`/`ort-sys` 2.0.0-rc.12
+API-24 CPU path on GNU/Linux glibc x86-64. Its `com.microsoft` contrib
+operators make other runtime/API lines and providers explicit validation
+tasks. It is not a hardware-specific optimized-session cache, but neither
+portability nor bit-identical output across CPUs or runtimes should be assumed.
