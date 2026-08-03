@@ -206,7 +206,11 @@ other note tools. No such numbers are claimed.
 - **YAML-frontmatter markdown can sniff as YAML:** one `SKILL.md` with
   frontmatter landed in junk/skipped instead of being indexed.
 - **Stale resume journals can pollute links** after a wiped data dir;
-  `--fresh` re-walks everything and is the mitigation.
+  `--fresh` cannot discard a durable plan and is not stale-journal recovery.
+  Restore the server data directory used by the journal. For an explicitly
+  isolated rebuild, use a new state directory, prefix, and brain namespace,
+  validate it, then switch readers. The shared `autoindex-catalog` and old
+  target require explicit, validated cleanup.
 - **Wikilink detection was not exercised on this corpus** (real docs use
   markdown links); it is covered by the demo-corpus run (30 wikilinks) and
   the autoindex test suite.
