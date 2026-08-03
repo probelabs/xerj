@@ -372,9 +372,14 @@ struct OnnxCacheKey {
 #[cfg(feature = "onnx-experimental")]
 impl From<&OnnxConfig> for OnnxCacheKey {
     fn from(cfg: &OnnxConfig) -> Self {
+        use sha2::{Digest, Sha256};
+
         Self {
-            model_sha256: cfg.model_sha256.clone(),
-            tokenizer_sha256: cfg.tokenizer_sha256.clone(),
+            // OnnxConfig is public, so its descriptive hash fields are not a
+            // construction invariant. Session sharing must be keyed from the
+            // bytes the runtime will actually load.
+            model_sha256: format!("{:x}", Sha256::digest(&cfg.model_bytes)),
+            tokenizer_sha256: format!("{:x}", Sha256::digest(&cfg.tokenizer_bytes)),
             intra_threads: cfg.intra_threads,
             session_pool_size: cfg.session_pool_size,
             microbatch: cfg.microbatch,
@@ -552,6 +557,17 @@ mod onnx_handle_tests {
     fn same_paths_with_different_content_hashes_never_share_session_cell() {
         let first = OnnxHandle::new(cfg("model-a"));
         let second = OnnxHandle::new(cfg("model-b"));
+        assert!(!Arc::ptr_eq(&first.shared, &second.shared));
+    }
+
+    #[test]
+    fn forged_equal_hash_fields_cannot_share_sessions_for_different_bytes() {
+        let first = cfg("forged");
+        let mut second = cfg("forged");
+        second.model_bytes = Arc::from(b"different model bytes".as_slice());
+        second.tokenizer_bytes = Arc::from(b"different tokenizer bytes".as_slice());
+        let first = OnnxHandle::new(first);
+        let second = OnnxHandle::new(second);
         assert!(!Arc::ptr_eq(&first.shared, &second.shared));
     }
 
