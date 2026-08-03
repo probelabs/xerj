@@ -381,7 +381,11 @@ impl Engine {
     }
 
     /// Create a new engine, opening any existing indices from disk.
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(mut config: Config) -> Result<Self> {
+        // Runtime asset ownership belongs to this Engine, not to the caller's
+        // clone lineage. This ensures a later Engine re-reads same-path ONNX
+        // assets while all Index config clones within one Engine share bytes.
+        config.embedding.runtime_onnx_assets = Arc::new(std::sync::OnceLock::new());
         let data_dir = PathBuf::from(&config.server.data_dir);
         std::fs::create_dir_all(&data_dir)?;
 
