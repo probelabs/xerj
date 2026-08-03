@@ -504,8 +504,9 @@ pub struct IndexStore {
     /// is still its `WalEntry::Delete` in the WAL.
     ///
     /// Background: a delete is expressed as (a) a WAL entry, (b) an
-    /// in-RAM version-map tombstone, and (c) the FTS/storage memtables
-    /// dropping the doc.  Segment flushes carry NO tombstones the
+    /// in-RAM version-map tombstone, and (c) the engine FTS memtable
+    /// dropping the doc. Direct storage users also update the legacy storage
+    /// memtable. Segment flushes carry NO tombstones the
     /// reopen path can see (`rebuild_version_map_from_segments` loads
     /// every segment-resident doc as live), so until a background merge
     /// physically drops the doc from all segments, the WAL entry is the
@@ -1609,6 +1610,89 @@ impl IndexStore {
 
         debug!(seq_no, "document indexed");
         Ok(seq_no)
+    }
+
+    /// Publish an engine-owned document to the WAL and version map only.
+    ///
+    /// The engine's sharded FTS memtable is the authoritative unflushed
+    /// source owner: its flush path derives the stored-field entries directly
+    /// from that same drain. Retaining another source in this store's legacy
+    /// memtable would therefore keep an undrained duplicate alive. Direct
+    /// storage-layer users must continue to use [`Self::index`].
+    ///
+    /// The version map is updated only after the WAL frame has been written
+    /// successfully, matching [`Self::index`] and the batch WAL publication
+    /// path.
+    #[doc(hidden)]
+    pub fn wal_append_index_version_only(
+        &self,
+        doc_id: &str,
+        source: &serde_json::Value,
+    ) -> Result<SeqNo> {
+        let seq_no = {
+            let ws = self.wal_shard_for(doc_id);
+            let mut wal = self.wal_lock_shard(ws);
+            wal.append_index_value(doc_id, source)?
+        };
+        self.version_map
+            .set(doc_id, seq_no, IN_MEMORY_SEGMENT_ID, false);
+        Ok(seq_no)
+    }
+
+    /// Bytes retained by the storage layer's legacy memtable.
+    ///
+    /// Engine-owned publication intentionally leaves this unchanged because
+    /// the engine drains its own FTS memtable into storage segments.
+    #[doc(hidden)]
+    pub fn legacy_memtable_bytes(&self) -> u64 {
+        self.memtable_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Number of live-source entries retained by the legacy storage memtable.
+    ///
+    /// Unlike the approximate byte counter, this is authoritative.
+    #[doc(hidden)]
+    pub fn legacy_live_source_entries(&self) -> usize {
+        self.memtable_shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| entry.source.is_some())
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Discard live sources reconstructed by storage WAL replay after the
+    /// engine has successfully rebuilt its authoritative FTS memtable.
+    ///
+    /// Tombstone entries are retained: they participate in delete durability.
+    /// This method does not touch the version map, pending-delete pins, or WAL.
+    /// Direct storage users never call it and retain the ordinary
+    /// [`Self::index`] / [`Self::open`] lifecycle.
+    #[doc(hidden)]
+    pub fn discard_replayed_live_sources_for_engine_open(&self) -> usize {
+        let mut removed = 0usize;
+        let mut retained_bytes = 0u64;
+        for shard in &self.memtable_shards {
+            let mut entries = shard.lock().unwrap();
+            let old = std::mem::take(&mut *entries);
+            let mut retained = Vec::with_capacity(old.len());
+            for entry in old {
+                if entry.source.is_some() {
+                    removed += 1;
+                } else {
+                    retained_bytes = retained_bytes.saturating_add(entry.source_bytes.len() as u64);
+                    retained.push(entry);
+                }
+            }
+            *entries = retained;
+        }
+        self.memtable_bytes.store(retained_bytes, Ordering::Relaxed);
+        removed
     }
 
     /// Batch-index multiple documents in a single WAL lock acquisition.
@@ -3576,10 +3660,8 @@ impl IndexStore {
     /// Batch-append to WAL using `Arc<Value>` sources shared with the caller.
     ///
     /// The caller typically owns an `Arc<Value>` already (from the turbo
-    /// ingest pipeline).  Passing an Arc instead of `&Value` means the
-    /// memtable push at the end of this method is a pointer bump — not a
-    /// deep clone of the JSON tree — and the WAL bytes are written from
-    /// the same allocation.  Three per-doc deep clones become zero.
+    /// ingest pipeline). Passing it here lets WAL serialization borrow the
+    /// same allocation that the engine later retains in its FTS memtable.
     ///
     /// Each tuple also carries `source_bytes: Arc<[u8]>` — the
     /// **already-serialized** JSON bytes that came in over the wire on
@@ -3595,8 +3677,9 @@ impl IndexStore {
     /// allocate a full `Vec<(String, Arc<Value>, Arc<[u8]>)>` per batch,
     /// which at 400 batches/s × 5k docs = 2 M allocs/s of pure overhead.
     ///
-    /// All on-disk framing is byte-identical to `wal_append_batch`; the
-    /// two entries interleave freely in the WAL.
+    /// Frames are replay-compatible with `wal_append_batch`; physical bytes
+    /// may differ for small payloads because compression policies differ.
+    /// Both entry forms interleave freely in the WAL.
     /// Validate raw JSON without materializing a DOM.  The returned sealed
     /// value is the only input accepted by [`Self::wal_append_batch_raw`].
     pub fn validate_raw_batch(docs: Vec<RawJsonDoc>) -> Result<ValidatedRawBatch> {
@@ -3931,26 +4014,11 @@ impl IndexStore {
             sync_result?;
         }
 
-        // Populate the storage memtable so `flush()` has data to drain —
-        // otherwise the memtable would be empty at flush time and the segment
-        // would contain no stored fields.  This is the critical link between
-        // turbo ingest and durable storage.
+        // `wal_append_batch` is WAL-only. The engine's sharded FTS memtable
+        // is the authoritative source owner and supplies both stored fields
+        // and search sidecars during flush.
         //
-        // V4 M4.7 — dropped the per-doc `source.to_string().len()` call.
-        // It was a full JSON re-serialisation **per document** whose only
-        // purpose was computing the memtable byte accounting.  On the
-        // 60 k-doc/s hot path that was burning ~40 % of per-doc CPU
-        // allocating JSON strings and then throwing them away.  The
-        // `memtable_bytes` counter only drives back-pressure, which
-        // needs a ballpark — 500 bytes/doc is a fine approximation for
-        // log data and keeps the back-pressure math within 2× of truth.
-        // M5.2 — `wal_append_batch` is now WAL-ONLY.  The engine
-        // memtable (sharded, authoritative) is populated by the
-        // caller under its own shard lock; the storage memtable is
-        // no longer pushed to on the live ingest path so the two
-        // memtables can't desync at flush time.
-        //
-        // The version_map still needs to learn about the new docs so
+        // The version map still needs to learn about the new docs so
         // lookups before flush resolve to `IN_MEMORY_SEGMENT_ID`.
         // This is the only per-doc side effect this method has
         // outside the WAL itself.
@@ -5709,6 +5777,66 @@ mod tests {
         // And ingest still works on the fresh store.
         store.index("x", serde_json::json!({"a": 1})).unwrap();
         assert!(store.version_map.get("x").is_some());
+    }
+
+    #[test]
+    fn engine_wal_publication_updates_version_map_without_legacy_memtable_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let source = serde_json::json!({
+            "body": "engine-owned",
+            "nested": {"values": [1, 2, 3]}
+        });
+
+        let seq_no = store
+            .wal_append_index_version_only("engine-doc", &source)
+            .unwrap();
+        let version = store.version_map.get("engine-doc").unwrap();
+        assert_eq!(version.seq_no, seq_no);
+        assert!(!version.deleted);
+        assert_eq!(version.segment_id.as_ref(), IN_MEMORY_SEGMENT_ID);
+        assert_eq!(store.legacy_memtable_bytes(), 0);
+        assert!(store.take_memtable_for_flush().is_none());
+
+        drop(store);
+        let reopened = open_test_store(dir.path());
+        let replayed = reopened.version_map.get("engine-doc").unwrap();
+        assert_eq!(replayed.seq_no, seq_no);
+        assert!(!replayed.deleted);
+        assert_eq!(reopened.legacy_live_source_entries(), 1);
+        assert!(
+            reopened.take_memtable_for_flush().is_some(),
+            "direct IndexStore::open must preserve its replay memtable"
+        );
+    }
+
+    #[test]
+    fn engine_open_discard_removes_only_replayed_live_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store
+            .index("live", serde_json::json!({"body": "live"}))
+            .unwrap();
+        store
+            .index("deleted", serde_json::json!({"body": "deleted"}))
+            .unwrap();
+        store.delete("deleted").unwrap().unwrap();
+        drop(store);
+
+        let reopened = open_test_store(dir.path());
+        assert_eq!(reopened.legacy_live_source_entries(), 2);
+        assert_eq!(reopened.discard_replayed_live_sources_for_engine_open(), 2);
+        assert_eq!(reopened.legacy_live_source_entries(), 0);
+        let remaining = reopened.take_memtable_for_flush().unwrap();
+        assert!(
+            remaining
+                .entries
+                .iter()
+                .any(|entry| entry.doc_id == "deleted" && entry.source.is_none()),
+            "engine-open cleanup must retain replayed tombstones"
+        );
+        assert!(reopened.version_map.get("live").is_some());
+        assert!(reopened.version_map.get("deleted").unwrap().deleted);
     }
 
     #[test]

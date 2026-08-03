@@ -110,12 +110,9 @@ mod ingest_memory_drain_tests {
 /// struct plus one `Arc::clone` of the pre-parsed source.
 ///
 /// Post-M5.0 the struct carries `seq_no` so that `drain_with_sources`
-/// can SORT the drained docs by global sequence number — this lets us
-/// lift the WAL append OUT of the engine memtable write lock.  Pre-M5.0
-/// the lock spanned WAL append + memtable push so both memtables saw
-/// docs in identical order; now the WAL and engine memtable can be
-/// advanced independently under different locks, and flush drains
-/// recover the global order by seq_no sort.
+/// can sort drained documents by global sequence number. This preserves
+/// deterministic WAL publication order even when multiple engine memtable
+/// shards advance concurrently.
 #[derive(Debug, Clone)]
 struct MemEntry {
     /// Global WAL sequence number assigned by the storage layer.
@@ -1167,6 +1164,14 @@ impl ShardedFtsMemtable {
             .insert(doc_id, source, schema, seq_no);
     }
 
+    /// Insert an engine-owned source without cloning its JSON tree.
+    pub fn insert_shared(&self, doc_id: String, source: Arc<Value>, schema: &Schema, seq_no: u64) {
+        let s = self.shard_for_dynamic(&doc_id);
+        self.shards[s]
+            .write()
+            .insert_shared(doc_id, source, schema, seq_no);
+    }
+
     /// Drop-in for `insert_pretokenized_with_seq` — picks a shard by
     /// doc_id so delete / re-insert on the same doc collide under
     /// the same shard lock.
@@ -1970,6 +1975,29 @@ impl FtsMemtable {
         let size = raw_size * 3 + 64;
 
         self.insert_analyzed(seq_no, doc_id, Arc::new(source.clone()), &analyzed, size);
+    }
+
+    /// Insert a source already owned by the engine.
+    ///
+    /// Analysis and accounting are identical to [`Self::insert`]; only source
+    /// ownership differs. The caller's Arc is retained directly instead of
+    /// deep-cloning the JSON tree under the shard lock.
+    pub fn insert_shared(
+        &mut self,
+        doc_id: String,
+        source: Arc<Value>,
+        schema: &Schema,
+        seq_no: u64,
+    ) {
+        let analyzer = self
+            .registry
+            .get_analyzer("default")
+            .or_else(|| self.registry.get_analyzer("standard"))
+            .expect("standard analyzer always present");
+        let analyzed = analyze_doc(source.as_ref(), schema, &analyzer);
+        let raw_size = source.to_string().len() + doc_id.len();
+        let size = raw_size * 3 + 64;
+        self.insert_analyzed(seq_no, doc_id, source, &analyzed, size);
     }
 
     /// Back half of [`insert`] — everything that MUST run under the
@@ -3818,5 +3846,22 @@ mod filtered_docs_arc_tests {
             mem.filtered_docs_arc(&preds).is_none(),
             "array-valued predicate field must force the full-corpus fallback"
         );
+    }
+
+    #[test]
+    fn shared_insert_retains_the_callers_source_allocation() {
+        let mem = ShardedFtsMemtable::new();
+        let schema = Schema::default();
+        let source = Arc::new(json!({
+            "body": "shared semantic source",
+            "rank": 7,
+            "nested": {"flag": true}
+        }));
+        mem.insert_shared("shared".into(), Arc::clone(&source), &schema, 42);
+
+        let retained = mem.get_doc_source_arc("shared").unwrap();
+        assert!(Arc::ptr_eq(&source, &retained));
+        assert_eq!(retained.as_ref(), source.as_ref());
+        assert!(mem.size_bytes() > 0);
     }
 }

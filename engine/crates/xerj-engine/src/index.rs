@@ -5470,10 +5470,11 @@ impl Index {
         let passage_scored_fields_at_open = passage_scored_vector_fields(&schema.schema);
         let mut wal_passage_chunk_fields = HashSet::new();
 
-        // Replay WAL entries into the FTS memtable.  The IndexStore already
-        // replays the WAL into its own storage memtable (for future flushes);
-        // we do a second pass here to rebuild the BM25 in-memory index so that
-        // queries against un-flushed documents work correctly after a restart.
+        // Replay WAL entries into the authoritative FTS memtable so queries
+        // against unflushed documents work correctly after a restart.
+        // `IndexStore::open` also reconstructs its legacy source memtable for
+        // direct storage users; the engine discards those duplicate live
+        // sources below only after this replay succeeds.
         let memtable = {
             let mem = crate::memtable::ShardedFtsMemtable::with_registry_and_shards(
                 Arc::clone(&registry),
@@ -5538,6 +5539,12 @@ impl Index {
             }
             mem
         };
+        // IndexStore replay reconstructs live documents for direct storage
+        // users. The engine has now rebuilt the authoritative FTS memtable
+        // successfully, so retaining those same live sources in the legacy
+        // storage memtable would create an undrained second owner. Preserve
+        // replayed tombstones and every durability structure.
+        store.discard_replayed_live_sources_for_engine_open();
 
         let memtable_doc_count = memtable.doc_count() as u64;
         let total_doc_count = segment_doc_count + memtable_doc_count;
@@ -5913,6 +5920,11 @@ impl Index {
             let schema_guard = self.schema.read().await;
             apply_copy_to(&source, &schema_guard.schema)
         };
+        // Standard single-document publication keeps exactly one parsed
+        // source tree. The FTS memtable retains this allocation, WAL
+        // serialization borrows it, and flush later derives stored fields
+        // from the same FTS drain.
+        let source = Arc::new(source);
 
         // Preprocessing above is independent and can run concurrently.
         // Everything from CAS/liveness through WAL, VM, FTS, HNSW, and the
@@ -5993,7 +6005,8 @@ impl Index {
         // query checks the guard both before and after ANN candidate work, so
         // it either linearizes before this write or falls back to the exact
         // passage scorer.
-        self.observe_passage_chunks(std::iter::once(&source)).await;
+        self.observe_passage_chunks(std::iter::once(source.as_ref()))
+            .await;
 
         // Invalidate the response cache only after admission and CAS succeed.
         self.dataset_version.fetch_add(1, Ordering::Release);
@@ -6038,7 +6051,10 @@ impl Index {
             collection_publication.cancel();
             return Err(e.into());
         }
-        let seq_no = match self.store.index(&doc_id, source.clone()) {
+        let seq_no = match self
+            .store
+            .wal_append_index_version_only(&doc_id, source.as_ref())
+        {
             Ok(seq_no) => seq_no,
             Err(e) => {
                 collection_publication.cancel();
@@ -6046,8 +6062,8 @@ impl Index {
             }
         };
         // External-version admission becomes durable only after the WAL write
-        // succeeds. Publishing it before `store.index` would poison an exact
-        // retry when WAL append fails.
+        // succeeds. Publishing it before WAL-backed version publication would
+        // poison an exact retry when WAL append fails.
         if let Some((external_version, _)) = external_version {
             self.external_versions
                 .insert(doc_id.clone(), external_version);
@@ -6060,7 +6076,12 @@ impl Index {
         {
             let mem = &*self.memtable;
             mem.remove(&doc_id);
-            mem.insert(doc_id.clone(), &source, &schema_guard.schema, seq_no);
+            mem.insert_shared(
+                doc_id.clone(),
+                Arc::clone(&source),
+                &schema_guard.schema,
+                seq_no,
+            );
         }
         drop(schema_guard);
         #[cfg(test)]
@@ -6070,12 +6091,12 @@ impl Index {
         // response `_version`, which is per-doc).
         self.doc_count.fetch_add(1, Ordering::Relaxed);
 
-        // Real per-doc `_version`: `store.index` just recorded this write
-        // in the version map (1 on first index, +1 per overwrite, deletes
-        // included). The previous code reported the index-global doc_count
-        // here, so any write to doc B inflated the next reported version
-        // of doc A (live-verified: three PUTs to the same id after other
-        // writes reported 4, 5, 6).
+        // Real per-doc `_version`: WAL-backed publication just recorded this
+        // write in the version map (1 on first index, +1 per overwrite,
+        // deletes included). The previous code reported the index-global
+        // doc_count here, so any write to doc B inflated the next reported
+        // version of doc A (live-verified: three PUTs to the same id after
+        // other writes reported 4, 5, 6).
         let version = self
             .store
             .version_map
@@ -6114,13 +6135,13 @@ impl Index {
             }
         };
         if should_evolve {
-            self.evolve_schema_from_doc(&source).await;
+            self.evolve_schema_from_doc(source.as_ref()).await;
         }
 
         // Auto-detect log format on the first few documents and log it.
         let current_count = self.doc_count.load(Ordering::Relaxed);
         if current_count <= 5 {
-            if let Some(fmt) = detect_log_format(&source) {
+            if let Some(fmt) = detect_log_format(source.as_ref()) {
                 debug!(
                     index = self.name.as_str(),
                     doc_count = current_count,
@@ -6131,7 +6152,7 @@ impl Index {
         }
 
         // Index any vector fields into the HNSW index.
-        self.index_vectors(&doc_id, &source).await;
+        self.index_vectors(&doc_id, source.as_ref()).await;
         #[cfg(test)]
         self.publication_test_point(&doc_id, PublicationTestPoint::AfterHnsw);
 
@@ -6324,20 +6345,16 @@ impl Index {
         // ── Step 3+4: WAL append + FTS memtable insert under one lock ─────
         //
         // The engine memtable write lock spans BOTH the WAL append and
-        // the FTS memtable push so that (a) the engine memtable and
-        // the storage memtable (inside `wal_append_batch`) see docs
-        // in identical order — flush relies on that for FTS-ordinal /
-        // stored-section alignment — and (b) no other concurrent bulk
-        // batch can race the drain-vs-push interleaving.
+        // the authoritative FTS memtable push so that their publication
+        // order stays aligned and no concurrent bulk batch can race the
+        // drain-vs-push interleaving.
         //
         // A previous M5.0 attempt lifted the WAL out of this lock to
         // let concurrent clients pipeline.  It regressed throughput
-        // because the two memtables DESYNCED (storage mem had the
-        // docs a batch just pushed, engine mem still had fewer) and
-        // the periodic flush would pick up a tiny storage drain and
-        // a mismatched engine drain — producing 20 k-doc flush
-        // segments where 150 k were expected, thrashing the flush
-        // path and triggering back-pressure 429s.  Rolled back.
+        // because WAL publication and the engine memtable desynchronized;
+        // periodic flushes then observed tiny or mismatched drains, producing
+        // 20 k-doc segments where 150 k were expected, thrashing the flush
+        // path and triggering back-pressure 429s. Rolled back.
         let t3 = std::time::Instant::now();
         let wal_refs: Vec<(String, Arc<Value>)> = processed
             .iter()
@@ -6737,8 +6754,8 @@ impl Index {
         // doc-values for search + aggregations.  `wal_append_batch`
         // above already wrote the WAL frames and set the version_map
         // (so `_count`/`hits.total` via `version_map.live_count()` and
-        // GET visibility are correct), exactly like `self.store.index`
-        // does on the per-doc path.
+        // GET visibility are correct), exactly like the WAL-only standard
+        // publication path.
         // ── P2.1: intra-request shard fan-out (the DWPT equivalent). ──
         //
         // The pre-P2.1 shape indexed serially, doc-by-doc, so a single
@@ -22034,20 +22051,17 @@ async fn do_flush_shard(
     // correctness (each concurrent flush drains a disjoint set of docs
     // and writes an independent segment).
 
-    // ── Phase 1: atomic drain of BOTH memtables under the FTS write lock ──
+    // ── Phase 1: atomic drain of the authoritative FTS memtable ──
     //
     // Ingest blocks only for the duration of this drain — which is fast
     // (memory move, no I/O).  Once we drop `mem`, new ingests can proceed
     // immediately against a fresh memtable while we do the expensive
     // segment + FTS side-car write.
     //
-    // Correctness: the ingest path takes the FTS RwLock write BEFORE
-    // pushing to both the FTS memtable and the storage memtable (via
-    // `wal_append_batch` → storage mutex).  So while we hold the FTS write
-    // lock, neither memtable can receive new entries.  Draining them both
-    // under this single lock guarantees the FTS drain set == storage drain
-    // set — and therefore the ordinals we encode in FTS side-cars match
-    // the row positions in the stored section.
+    // Correctness: publication holds this memtable's write lock across WAL
+    // append and FTS insertion. While this lock is held, no live entry can
+    // race this drain. The one drained set supplies both the stored section
+    // and FTS sidecar, so their row ordinals remain aligned.
     // Peek BEFORE drain to determine if docs came from raw-bytes or FTS insert.
     let is_raw_bytes_path = memtable.peek_shard_has_raw_bytes(shard_idx);
     #[cfg(test)]
@@ -35553,6 +35567,517 @@ mod write_publication_integration_tests {
         assert_eq!(aggs["max_revision"]["value"], 2.0);
         assert_eq!(aggs["tags"]["buckets"].as_array().unwrap().len(), 1);
         assert_eq!(aggs["tags"]["buckets"][0]["key"], "current");
+    }
+
+    #[tokio::test]
+    async fn standard_publication_uses_fts_as_sole_unflushed_source_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("shared-standard-source", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("shared-standard-source").unwrap();
+
+        let first = idx
+            .index_document(
+                Some("doc".into()),
+                json!({"body": "first revision", "revision": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(
+            idx.get_document("doc").await.unwrap(),
+            Some(json!({"body": "first revision", "revision": 1}))
+        );
+
+        let second = idx
+            .index_document_with_version(
+                Some("doc".into()),
+                json!({"body": "second revision", "revision": 2}),
+                Some(first.seq_no),
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert!(second.seq_no > first.seq_no);
+        assert_eq!(idx.memtable.doc_count(), 1);
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+
+        idx.flush().await.unwrap();
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        drop(idx);
+        drop(engine);
+
+        let reopened = crate::Engine::new(config.clone()).unwrap();
+        let idx = reopened.get_index("shared-standard-source").unwrap();
+        assert_eq!(
+            idx.get_document("doc").await.unwrap(),
+            Some(json!({"body": "second revision", "revision": 2}))
+        );
+        let deleted = idx
+            .delete_document_versioned("doc", Some(second.seq_no), Some(1))
+            .await
+            .unwrap();
+        assert!(deleted.found);
+        assert!(idx.get_document("doc").await.unwrap().is_none());
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+
+        idx.index_document_external(
+            Some("doc".into()),
+            json!({"body": "external revision", "revision": 3}),
+            10,
+            "external",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            idx.get_document("doc").await.unwrap(),
+            Some(json!({"body": "external revision", "revision": 3}))
+        );
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(reopened);
+
+        let final_reopen = crate::Engine::new(config).unwrap();
+        let idx = final_reopen.get_index("shared-standard-source").unwrap();
+        assert_eq!(
+            idx.get_document("doc").await.unwrap(),
+            Some(json!({"body": "external revision", "revision": 3}))
+        );
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_segment_and_multishard_wal_tail_keep_exact_live_state_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 4;
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("mixed-segment-wal-source-owner", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("mixed-segment-wal-source-owner").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(idx.store.num_memtable_shards(), 4);
+
+        // Select ids from the store's actual runtime routing function. This
+        // makes the recovery fixture deterministic without copying the shard
+        // hash implementation into the test.
+        let mut ids_by_shard = vec![None; 4];
+        for candidate in 0..10_000 {
+            let id = format!("routed-{candidate}");
+            let shard = idx.store.shard_for(&id);
+            if ids_by_shard[shard].is_none() {
+                ids_by_shard[shard] = Some(id);
+            }
+            if ids_by_shard.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let [a, b, c, d]: [String; 4] = ids_by_shard
+            .into_iter()
+            .map(|id| id.expect("fixture must find an id for every WAL shard"))
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            [a.as_str(), b.as_str(), c.as_str(), d.as_str()]
+                .into_iter()
+                .map(|id| idx.store.shard_for(id))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4,
+            "fixture ids must exercise all four configured WAL shards"
+        );
+
+        let a_initial = idx
+            .index_document(
+                Some(a.clone()),
+                json!({"body": "alphaobsolete", "revision": 1}),
+            )
+            .await
+            .unwrap();
+        let b_initial = idx
+            .index_document(
+                Some(b.clone()),
+                json!({"body": "bravodeleted", "revision": 1}),
+            )
+            .await
+            .unwrap();
+        let c_initial = idx
+            .index_document(
+                Some(c.clone()),
+                json!({"body": "charliesegment", "revision": 1}),
+            )
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        assert!(!idx.store.snapshot().segments.is_empty());
+
+        // These mutations remain only in the WAL/FTS tail when the process is
+        // dropped: overwrite a segment id, delete another, and add a new id.
+        let a_current = idx
+            .index_document_with_version(
+                Some(a.clone()),
+                json!({"body": "alphacurrent", "revision": 2}),
+                Some(a_initial.seq_no),
+                Some(a_initial.version),
+            )
+            .await
+            .unwrap();
+        let b_deleted = idx
+            .delete_document_versioned(&b, Some(b_initial.seq_no), Some(b_initial.version))
+            .await
+            .unwrap();
+        let d_current = idx
+            .index_document(
+                Some(d.clone()),
+                json!({"body": "deltawaltail", "revision": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        drop(idx);
+        drop(engine);
+
+        async fn assert_hit_count(idx: &Index, term: &str, expected: u64) {
+            let request = SearchRequest {
+                query: QueryNode::Match {
+                    field: "body".into(),
+                    query: term.into(),
+                    operator: Default::default(),
+                    analyzer: None,
+                    boost: None,
+                    minimum_should_match: None,
+                },
+                ..SearchRequest::default()
+            };
+            assert_eq!(
+                idx.search(&request).await.unwrap().total.value,
+                expected,
+                "unexpected hit count for {term}"
+            );
+        }
+
+        let reopened = crate::Engine::new(config.clone()).unwrap();
+        let idx = reopened
+            .get_index("mixed-segment-wal-source-owner")
+            .unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(idx.store.version_map.live_count(), 3);
+        assert_eq!(
+            idx.get_document(&a).await.unwrap(),
+            Some(json!({"body": "alphacurrent", "revision": 2}))
+        );
+        assert!(idx.get_document(&b).await.unwrap().is_none());
+        assert_eq!(
+            idx.get_document(&c).await.unwrap(),
+            Some(json!({"body": "charliesegment", "revision": 1}))
+        );
+        assert_eq!(
+            idx.get_document(&d).await.unwrap(),
+            Some(json!({"body": "deltawaltail", "revision": 1}))
+        );
+        assert_hit_count(&idx, "alphaobsolete", 0).await;
+        assert_hit_count(&idx, "bravodeleted", 0).await;
+        assert_hit_count(&idx, "alphacurrent", 1).await;
+        assert_hit_count(&idx, "charliesegment", 1).await;
+        assert_hit_count(&idx, "deltawaltail", 1).await;
+
+        let a_replayed = idx.store.version_map.get(&a).unwrap();
+        assert_eq!(a_replayed.seq_no, a_current.seq_no);
+        assert_eq!(a_replayed.version, a_current.version);
+        let b_replayed = idx.store.version_map.get(&b).unwrap();
+        assert_eq!(b_replayed.seq_no, b_deleted.seq_no);
+        assert_eq!(b_replayed.version, b_deleted.version);
+        assert!(b_replayed.deleted);
+        let c_replayed = idx.store.version_map.get(&c).unwrap();
+        assert_eq!(c_replayed.seq_no, c_initial.seq_no);
+        assert_eq!(c_replayed.version, c_initial.version);
+        let d_replayed = idx.store.version_map.get(&d).unwrap();
+        assert_eq!(d_replayed.seq_no, d_current.seq_no);
+        assert_eq!(d_replayed.version, d_current.version);
+
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(reopened);
+
+        let second = crate::Engine::new(config).unwrap();
+        let idx = second.get_index("mixed-segment-wal-source-owner").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(idx.store.version_map.live_count(), 3);
+        assert_eq!(
+            idx.get_document(&a).await.unwrap(),
+            Some(json!({"body": "alphacurrent", "revision": 2}))
+        );
+        assert!(idx.get_document(&b).await.unwrap().is_none());
+        assert_eq!(
+            idx.get_document(&c).await.unwrap(),
+            Some(json!({"body": "charliesegment", "revision": 1}))
+        );
+        assert_eq!(
+            idx.get_document(&d).await.unwrap(),
+            Some(json!({"body": "deltawaltail", "revision": 1}))
+        );
+        assert_hit_count(&idx, "alphaobsolete", 0).await;
+        assert_hit_count(&idx, "bravodeleted", 0).await;
+        assert_hit_count(&idx, "alphacurrent", 1).await;
+        assert_hit_count(&idx, "charliesegment", 1).await;
+        assert_hit_count(&idx, "deltawaltail", 1).await;
+        // Deliberately do not assert versions after this segment-only reopen:
+        // base 76d does not persist version history in the segment format.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_flush_retry_preserves_the_sole_fts_source_owner() {
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("failed-flush-source-owner", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("failed-flush-source-owner").unwrap();
+        idx.abort_background_tasks();
+        let expected = json!({"body": "rollbacksurvivor", "revision": 1});
+        idx.index_document(Some("doc".into()), expected.clone())
+            .await
+            .unwrap();
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(|| true),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            bypass_finalize_gate: false,
+            before_blocking_spawn: None,
+        };
+        assert!(
+            FLUSH_PUBLISHER_TEST_HOOK
+                .scope(hook, async { idx.flush().await })
+                .await
+                .is_err(),
+            "injected pre-publication failure must reach the caller"
+        );
+
+        let request = SearchRequest {
+            query: QueryNode::Match {
+                field: "body".into(),
+                query: "rollbacksurvivor".into(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            ..SearchRequest::default()
+        };
+        assert_eq!(idx.memtable.doc_count(), 1);
+        assert_eq!(
+            idx.get_document("doc").await.unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        assert_eq!(idx.live_doc_count(), 1);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+
+        idx.flush().await.unwrap();
+        assert_eq!(idx.memtable.doc_count(), 0);
+        assert_eq!(
+            idx.get_document("doc").await.unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        assert_eq!(idx.live_doc_count(), 1);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+        drop(idx);
+        drop(engine);
+
+        let reopened = crate::Engine::new(config).unwrap();
+        let idx = reopened.get_index("failed-flush-source-owner").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(idx.get_document("doc").await.unwrap(), Some(expected));
+        assert_eq!(idx.search(&request).await.unwrap().total.value, 1);
+        assert_eq!(idx.live_doc_count(), 1);
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(idx.store.legacy_memtable_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn wal_only_restart_discards_storage_sources_without_resurrection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("wal-only-source-owner", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("wal-only-source-owner").unwrap();
+
+        idx.index_document(
+            Some("live".into()),
+            json!({"body": "livetoken", "nested": {"rank": 1}}),
+        )
+        .await
+        .unwrap();
+        let old = idx
+            .index_document(
+                Some("overwritten".into()),
+                json!({"body": "obsoletetoken", "revision": 1}),
+            )
+            .await
+            .unwrap();
+        let current = idx
+            .index_document_with_version(
+                Some("overwritten".into()),
+                json!({"body": "currenttoken", "revision": 2}),
+                Some(old.seq_no),
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let doomed = idx
+            .index_document(
+                Some("deleted".into()),
+                json!({"body": "deletedtoken", "revision": 1}),
+            )
+            .await
+            .unwrap();
+        idx.delete_document_versioned("deleted", Some(doomed.seq_no), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(idx.store.snapshot().segments.len(), 0);
+        drop(idx);
+        drop(engine);
+
+        let reopened = crate::Engine::new(config.clone()).unwrap();
+        let idx = reopened.get_index("wal-only-source-owner").unwrap();
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(idx.store.snapshot().segments.len(), 0);
+        assert_eq!(idx.store.version_map.live_count(), 2);
+        assert_eq!(
+            idx.get_document("live").await.unwrap(),
+            Some(json!({"body": "livetoken", "nested": {"rank": 1}}))
+        );
+        assert_eq!(
+            idx.get_document("overwritten").await.unwrap(),
+            Some(json!({"body": "currenttoken", "revision": 2}))
+        );
+        assert!(idx.get_document("deleted").await.unwrap().is_none());
+        assert_eq!(idx.store.version_map.get("live").unwrap().version, 1);
+        assert_eq!(idx.store.version_map.get("overwritten").unwrap().version, 2);
+        assert_eq!(idx.store.version_map.get("deleted").unwrap().version, 2);
+        assert_eq!(
+            idx.store.version_map.get("overwritten").unwrap().seq_no,
+            current.seq_no
+        );
+
+        let match_body = |term: &str| SearchRequest {
+            query: QueryNode::Match {
+                field: "body".into(),
+                query: term.into(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            ..SearchRequest::default()
+        };
+        assert_eq!(
+            idx.search(&match_body("livetoken"))
+                .await
+                .unwrap()
+                .total
+                .value,
+            1
+        );
+        assert_eq!(
+            idx.search(&match_body("currenttoken"))
+                .await
+                .unwrap()
+                .total
+                .value,
+            1
+        );
+        assert_eq!(
+            idx.search(&match_body("obsoletetoken"))
+                .await
+                .unwrap()
+                .total
+                .value,
+            0
+        );
+        assert_eq!(
+            idx.search(&match_body("deletedtoken"))
+                .await
+                .unwrap()
+                .total
+                .value,
+            0
+        );
+
+        idx.flush().await.unwrap();
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        drop(idx);
+        drop(reopened);
+
+        let second = crate::Engine::new(config).unwrap();
+        let idx = second.get_index("wal-only-source-owner").unwrap();
+        assert_eq!(idx.store.legacy_live_source_entries(), 0);
+        assert_eq!(idx.store.version_map.live_count(), 2);
+        assert_eq!(
+            idx.get_document("overwritten").await.unwrap(),
+            Some(json!({"body": "currenttoken", "revision": 2}))
+        );
+        assert!(idx.get_document("deleted").await.unwrap().is_none());
+        assert_eq!(
+            idx.search(&match_body("currenttoken"))
+                .await
+                .unwrap()
+                .total
+                .value,
+            1
+        );
+        assert_eq!(
+            idx.search(&match_body("obsoletetoken"))
+                .await
+                .unwrap()
+                .total
+                .value,
+            0
+        );
+        assert_eq!(
+            idx.search(&match_body("deletedtoken"))
+                .await
+                .unwrap()
+                .total
+                .value,
+            0
+        );
+        // Do not assert `_version` after WAL maintenance has made this a
+        // segment-only reopen. Base 76d reconstructs each segment-resident
+        // id as version 1 because the segment format persists seq_no but not
+        // version history. That independent defect is documented separately;
+        // this test's contract is source ownership, visibility, exact lexical
+        // state, live count, and absence of resurrection.
     }
 }
 

@@ -498,6 +498,25 @@ impl WalWriter {
         Ok(seq_no)
     }
 
+    /// Append an index operation by borrowing its source value.
+    ///
+    /// This preserves the `append(WalEntry::Index { .. })` durability and
+    /// decoded replay contract without requiring the caller to deep-clone the
+    /// JSON tree merely to construct an owned [`WalEntry`]. The temporary
+    /// serialized source bytes are consumed by the existing raw-index frame
+    /// writer, which applies the same sequence allocation, torn-frame
+    /// recovery, and sync policy. Its small-frame compression choice may
+    /// differ from the owned-entry path, so physical WAL bytes are not
+    /// promised to match.
+    pub(crate) fn append_index_value(
+        &mut self,
+        doc_id: &str,
+        source: &serde_json::Value,
+    ) -> Result<SeqNo> {
+        let source_bytes = serde_json::to_vec(source)?;
+        self.append_index_raw(doc_id, &source_bytes)
+    }
+
     /// Frame-write core shared by `append` / `append_index_raw`: CRC +
     /// framing + drain, wrapped in torn-frame recovery (RC4 W2 #13).  On
     /// error the WAL is restored to the frame boundary captured at entry
@@ -558,8 +577,10 @@ impl WalWriter {
     ///
     /// Skips the `serde_json::to_vec(entry)` round-trip by assembling the
     /// on-disk JSON envelope directly from the caller's pre-formed source
-    /// bytes.  Output is byte-identical to the legacy `append(Index { .. })`
-    /// path, so replay code is unchanged.
+    /// bytes. Output is replay-compatible with the legacy
+    /// `append(Index { .. })` path, so decoded operations are identical.
+    /// Physical frames may differ because the raw path's small-payload
+    /// compression policy is not the owned-entry policy.
     ///
     /// `source_bytes` MUST be a valid JSON object value (typically the raw
     /// bytes of one NDJSON line from an HTTP bulk body).  `doc_id` must be
@@ -2314,5 +2335,93 @@ mod tests {
             assert_eq!(reopened.buffer_capacity(), WAL_BUF_CAP);
         }
         assert_eq!(total, 200);
+    }
+
+    #[test]
+    fn borrowed_value_index_append_replays_exact_source_and_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let seq = Arc::new(AtomicU64::new(1));
+        let mut writer =
+            WalWriter::open(dir.path(), 64 * 1024 * 1024, SyncMode::Batched, seq).unwrap();
+        let source = serde_json::json!({
+            "nested": {"message": "quoted \" text\nand slash \\\\"},
+            "values": [1, 2, 3],
+            "padding": "compressible ".repeat(128)
+        });
+        let seq_no = writer
+            .append_index_value("id\"with\\escapes", &source)
+            .unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let replayed: Vec<_> = WalReader::new(dir.path())
+            .replay()
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].seq_no, seq_no);
+        match &replayed[0].entry {
+            WalEntry::Index {
+                doc_id,
+                source: actual,
+            } => {
+                assert_eq!(doc_id, "id\"with\\escapes");
+                assert_eq!(actual, &source);
+            }
+            other => panic!("unexpected replay entry: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn borrowed_and_owned_index_append_have_decoded_replay_parity() {
+        let root = tempfile::tempdir().unwrap();
+        let source = serde_json::json!({
+            "body": "same logical operation",
+            "nested": {"items": [true, null, 3.5]},
+            "padding": "repeat ".repeat(96)
+        });
+        let read_one = |path: &std::path::Path| match WalReader::new(path)
+            .replay()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .entry
+        {
+            WalEntry::Index { doc_id, source } => (doc_id, source),
+            other => panic!("unexpected replay entry: {other:?}"),
+        };
+
+        let owned_dir = root.path().join("owned");
+        let mut owned = WalWriter::open(
+            &owned_dir,
+            64 * 1024 * 1024,
+            SyncMode::Batched,
+            Arc::new(AtomicU64::new(1)),
+        )
+        .unwrap();
+        owned
+            .append(&WalEntry::Index {
+                doc_id: "same-id".into(),
+                source: source.clone(),
+            })
+            .unwrap();
+        owned.sync().unwrap();
+        drop(owned);
+
+        let borrowed_dir = root.path().join("borrowed");
+        let mut borrowed = WalWriter::open(
+            &borrowed_dir,
+            64 * 1024 * 1024,
+            SyncMode::Batched,
+            Arc::new(AtomicU64::new(1)),
+        )
+        .unwrap();
+        borrowed.append_index_value("same-id", &source).unwrap();
+        borrowed.sync().unwrap();
+        drop(borrowed);
+
+        assert_eq!(read_one(&owned_dir), read_one(&borrowed_dir));
     }
 }
