@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce XERJ's measured transformer-fused MiniLM FP32 ONNX artifact."""
+"""Transform XERJ's exact pinned MiniLM export into its fused FP32 artifact."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import importlib.metadata
 import json
 import os
 import pathlib
+import platform
+import re
 import shutil
 import sys
 import tempfile
@@ -42,6 +44,16 @@ EXPECTED_OUTPUTS = CONTRACT["graph"]["outputs"]
 EXPECTED_CANDIDATE_OPERATORS = CONTRACT["graph"]["operators"]
 EXPECTED_OPSETS = CONTRACT["graph"]["opsets"]
 EXPECTED_IR_VERSION = CONTRACT["graph"]["ir_version"]
+OPTIMIZER_ARGUMENT_SCHEMA = {
+    "hidden_size": int,
+    "model_type": str,
+    "num_heads": int,
+    "only_onnxruntime": bool,
+    "opt_level": int,
+    "use_external_data_format": bool,
+    "use_gpu": bool,
+}
+OPTIMIZER_ENTRYPOINT = "onnxruntime.transformers.optimizer.optimize_model"
 
 
 class RecipeError(RuntimeError):
@@ -75,10 +87,90 @@ def verify_file(
         )
 
 
-def verify_toolchain() -> dict[str, str]:
-    if sys.version_info[:3] != (3, 13, 5):
+def _checked_value_type(name: str, value: Any, expected: type) -> None:
+    # bool is a subclass of int, but is not a valid integer optimizer setting.
+    if type(value) is not expected:
         raise RecipeError(
-            "this byte-reproduction recipe requires CPython 3.13.5; create the "
+            f"optimizer.arguments.{name} must be {expected.__name__}, "
+            f"got {type(value).__name__}"
+        )
+
+
+def optimizer_configuration(
+    contract: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Return the strictly validated optimizer and serializer configuration."""
+    selected = CONTRACT if contract is None else contract
+    optimizer = selected.get("optimizer")
+    if not isinstance(optimizer, dict):
+        raise RecipeError("contract optimizer must be an object")
+    if optimizer.get("entrypoint") != OPTIMIZER_ENTRYPOINT:
+        raise RecipeError(
+            f"optimizer.entrypoint must be {OPTIMIZER_ENTRYPOINT!r}"
+        )
+    arguments = optimizer.get("arguments")
+    if not isinstance(arguments, dict):
+        raise RecipeError("optimizer.arguments must be an object")
+    expected_names = set(OPTIMIZER_ARGUMENT_SCHEMA)
+    actual_names = set(arguments)
+    if actual_names != expected_names:
+        raise RecipeError(
+            "optimizer.arguments keys mismatch: expected "
+            f"{sorted(expected_names)!r}, got {sorted(actual_names)!r}"
+        )
+    for name, expected_type in OPTIMIZER_ARGUMENT_SCHEMA.items():
+        _checked_value_type(name, arguments[name], expected_type)
+    if arguments["hidden_size"] <= 0 or arguments["num_heads"] <= 0:
+        raise RecipeError("optimizer hidden_size and num_heads must be positive")
+    if arguments["hidden_size"] % arguments["num_heads"] != 0:
+        raise RecipeError("optimizer hidden_size must be divisible by num_heads")
+    if not arguments["model_type"]:
+        raise RecipeError("optimizer model_type must not be empty")
+    optimize_arguments = dict(arguments)
+    external_data = optimize_arguments.pop("use_external_data_format")
+    return optimize_arguments, external_data
+
+
+def required_python(
+    contract: dict[str, Any] | None = None,
+) -> tuple[str, tuple[int, int, int]]:
+    selected = CONTRACT if contract is None else contract
+    optimizer = selected.get("optimizer")
+    if not isinstance(optimizer, dict):
+        raise RecipeError("contract optimizer must be an object")
+    value = optimizer.get("python")
+    if not isinstance(value, str):
+        raise RecipeError("optimizer.python must be a string")
+    match = re.fullmatch(r"(CPython) ([0-9]+)\.([0-9]+)\.([0-9]+)", value)
+    if match is None:
+        raise RecipeError(
+            "optimizer.python must have the form 'CPython <major>.<minor>.<patch>'"
+        )
+    return match.group(1), tuple(int(part) for part in match.groups()[1:])
+
+
+def current_toolchain_matches_contract() -> bool:
+    try:
+        implementation, version = required_python()
+        if platform.python_implementation() != implementation:
+            return False
+        if sys.version_info[:3] != version:
+            return False
+        return all(
+            importlib.metadata.version(package) == expected
+            for package, expected in PACKAGE_VERSIONS.items()
+        )
+    except (RecipeError, importlib.metadata.PackageNotFoundError):
+        return False
+
+
+def verify_toolchain() -> dict[str, str]:
+    implementation, version = required_python()
+    required = f"{implementation} {'.'.join(str(part) for part in version)}"
+    actual_implementation = platform.python_implementation()
+    if actual_implementation != implementation or sys.version_info[:3] != version:
+        raise RecipeError(
+            f"this byte-reproduction recipe requires {required}; create the "
             "documented locked environment instead of using another interpreter"
         )
     actual: dict[str, str] = {}
@@ -91,7 +183,7 @@ def verify_toolchain() -> dict[str, str]:
         if version != expected:
             raise RecipeError(
                 f"package version mismatch for {package}: expected {expected}, "
-                f"got {version}; refusing a non-reproducible optimization"
+                f"got {version}; refusing a non-locked optimization"
             )
     return dict(sorted(actual.items()))
 
@@ -377,16 +469,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         staged_candidate = staged_directory / MODEL_FILENAME
         staged_report = staged_directory / MANIFEST_FILENAME
 
-        optimized = optimize_model(
-            str(source),
-            model_type="bert",
-            num_heads=12,
-            hidden_size=384,
-            opt_level=0,
-            use_gpu=False,
-            only_onnxruntime=False,
+        optimize_arguments, use_external_data_format = optimizer_configuration()
+        optimized = optimize_model(str(source), **optimize_arguments)
+        optimized.save_model_to_file(
+            str(staged_candidate),
+            use_external_data_format=use_external_data_format,
         )
-        optimized.save_model_to_file(str(staged_candidate), use_external_data_format=False)
         verify_file(
             staged_candidate,
             label="optimized candidate",
@@ -422,7 +510,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Reproduce the checksum-pinned transformer-fused FP32 MiniLM model. "
+            "Transform the exact checksum-pinned MiniLM source into the expected "
+            "fused FP32 model. "
             "Unknown inputs, tools, topology, or existing outputs fail closed."
         )
     )

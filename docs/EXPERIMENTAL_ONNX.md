@@ -48,12 +48,15 @@ Confirm the three required input names, a supported output name, and width 384.
 Export tools can change their file layout or output names; XERJ deliberately
 fails instead of guessing.
 
-For the checksum-pinned transformer-fused FP32 graph used by the measured
-FB20 optimizer-regression screen, use the repository's
-[offline reproduction recipe](../demo/playbooks/onnx-model-optimization/README.md).
-The recipe does not download or bundle a model. It accepts only the recorded
-source model and tokenizer identities, pins the optimizer environment, and
-publishes only the exact checked graph plus its manifest.
+For the checksum-pinned transformer-fused FP32 graph created during an
+internal optimizer screen whose evidence is not published here, see the
+repository's
+[offline transformation recipe](../demo/playbooks/onnx-model-optimization/README.md).
+The recipe does not download, bundle, or recreate its source model. It works
+only when the operator already has the exact recorded source model and
+tokenizer bytes, pins the optimizer environment, and publishes only the exact
+checked graph plus its manifest. The generic export above is not an acquisition
+path for those checksum-pinned inputs.
 
 Build the opt-in server:
 
@@ -154,11 +157,10 @@ autoindex with `--fresh` and a new prefix. XERJ never silently mixes vector
 spaces.
 
 The transformer-fused graph produced by the offline recipe is a different
-model identity from its source graph. Although measured vector differences
-were small, they were not bit-zero. Do not replace a source model in place.
-Start with the fused model and run `autoindex --fresh` under a new prefix, or
-retain the source model for the existing index. The identity check must not be
-bypassed.
+model identity from its source graph because its model hash differs. Do not
+replace a source model in place. Start with the fused model and run `autoindex
+--fresh` under a new prefix, or retain the source model for the existing index.
+The identity check must not be bypassed.
 
 ## Throughput controls
 
@@ -230,12 +232,12 @@ This is not a 12.90x end-to-end indexing claim. It excludes extraction, HTTP,
 lexical indexing, persistence, HNSW construction, and contention. Full
 FinanceBench autoindex time must be measured, not projected.
 
-The transformer-fused recipe came from a promising private
-optimizer-regression screen, but this branch contains no sanitized benchmark
-ledger suitable for a public number. The recipe therefore makes no public
+The transformer-fused recipe came from an internal optimizer screen whose
+evidence is not published in this repository. It therefore makes no public
 speed or quality claim. See the
 [evidence boundary](../demo/playbooks/onnx-model-optimization/README.md#evidence-boundary)
-and run the repository's full comparison contract before publishing one.
+and run the applicable repository quality and performance gates before
+publishing one.
 
 Measured stripped server binaries:
 
@@ -254,3 +256,8 @@ API-24 CPU path on GNU/Linux glibc x86-64. Its `com.microsoft` contrib
 operators make other runtime/API lines and providers explicit validation
 tasks. It is not a hardware-specific optimized-session cache, but neither
 portability nor bit-identical output across CPUs or runtimes should be assumed.
+XERJ already requests ONNX Runtime Level3 optimization at session creation for
+both source and fused graphs. No published evidence currently shows an
+incremental cold-start, steady-state throughput, or retrieval-quality benefit
+from supplying the offline-fused graph. These require separate measurements;
+the fresh-index identity cost applies regardless.

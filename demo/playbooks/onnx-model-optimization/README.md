@@ -1,10 +1,16 @@
-# Reproduce the measured fused FP32 MiniLM graph
+# Transform the exact pinned MiniLM export into a fused FP32 graph
 
-This offline recipe transforms one exact
-`sentence-transformers/all-MiniLM-L6-v2`-compatible ONNX export into the
-transformer-fused FP32 graph measured by XERJ's FB20 optimizer-regression
-screen. It does **not** download, commit, install, or select a model. The
-approximately 90 MB source and output remain external runtime assets.
+This offline recipe transforms one exact, previously recorded
+`sentence-transformers/all-MiniLM-L6-v2`-compatible ONNX export into one exact
+transformer-fused FP32 graph. It does **not** download, commit, install, select,
+or recreate the source model. The approximately 90 MB source and output remain
+external runtime assets.
+
+This is a checksum-locked transformation recipe, not a from-upstream
+reproduction recipe. You must already possess the exact source model and
+tokenizer bytes listed below. The repository does not publish those assets or
+an immutable exporter revision, and a fresh generic `optimum-cli export` is not
+expected to reproduce them.
 
 The recipe is intentionally narrow and fail-closed:
 
@@ -40,7 +46,7 @@ python3.13 -m venv /path/to/xerj-onnx-recipe-venv
   -r demo/playbooks/onnx-model-optimization/requirements-linux-x86_64-cp313.lock
 ```
 
-## Reproduce
+## Transform the pinned source
 
 ```bash
 /path/to/xerj-onnx-recipe-venv/bin/python \
@@ -67,12 +73,17 @@ Required result:
 | fused model | 90,276,689 | `d45c738311abe1488b6d9e2862e1db08267fc31d6f301d8f26163e2fb4956b9c` |
 
 The manifest embeds the complete checked-in artifact contract and records the
-observed source and candidate graph inventories plus the exact toolchain. The
-recipe compares the complete normalized observation to the contract before it
-publishes anything. The contract also records that the
-original experiment did not preserve an immutable upstream export revision:
-the exact source bytes are pinned, but a stronger upstream provenance claim
-would be dishonest.
+observed source and candidate graph inventories plus the exact toolchain.
+Before publication, the recipe enforces the observed source and tokenizer
+bytes and hashes, candidate bytes, hash and complete graph inventory, package
+versions, interpreter, and the optimizer arguments that it actually executes.
+
+Other contract fields are recorded metadata, not observations made by this
+script: artifact name/version, source license and provenance, the XERJ
+embedding contract, and the compatibility support boundary. In particular,
+the original experiment did not preserve an immutable upstream export
+revision. Exact source bytes are pinned, but a stronger upstream provenance
+claim would be dishonest.
 
 [`artifact-contract.json`](artifact-contract.json) is the checked-in expected
 contract. The generated manifest adds the complete inspected source and
@@ -99,10 +110,10 @@ target/release/xerj autoindex /path/to/corpus \
 ```
 
 The fused graph is a **new embedding identity**. Its output is numerically
-close to the source graph but not bit-identical. Never resume an index created
-with the source model under the fused model. Retain the old asset for the old
-index, or use `autoindex --fresh` with a new prefix. Do not bypass
-`embedding_identity.json`.
+distinct from the source graph for XERJ because the model hashes differ. Never
+resume an index created with the source model under the fused model. Retain the
+old asset for the old index, or use `autoindex --fresh` with a new prefix. Do
+not bypass `embedding_identity.json`.
 
 ## Compatibility boundary
 
@@ -118,14 +129,22 @@ provider, musl build, or non-ORT consumer. Even where the graph loads,
 different kernels or CPUs can change floating-point output. Run the
 asset/runtime and retrieval gates before expanding the support matrix.
 
+XERJ already requests ONNX Runtime Level3 graph optimization when it creates a
+session, including for an unfused source graph. This repository contains no
+published measurement showing that the offline-fused asset improves session
+initialization time, steady-state throughput, or retrieval quality beyond that
+runtime optimization. Those are separate measurements: a cold-start result
+cannot establish a steady-state benefit. The recipe currently provides a
+byte-pinned fused artifact and inspection trail, not a public performance
+claim. Adopting it also creates a new model identity and therefore requires a
+fresh index, as described above.
+
 ## Evidence boundary
 
-This recipe was extracted from a promising private optimizer-regression
-screen, but the branch intentionally contains neither that corpus nor its raw
-evidence. Therefore this playbook makes no public speed or retrieval-quality
-claim. A publication-grade claim still requires the repository's ten-arm
-comparison contract, checked-in sanitized evidence, the full quality gate, and
-the sealed 368-PDF North Star.
+This recipe was extracted from an internal optimizer screen whose evidence is
+not published in this repository. Therefore this playbook makes no public
+speed or retrieval-quality claim. Any future claim needs checked-in sanitized
+evidence and the repository's applicable quality and performance gates.
 
 Run focused tests without invoking the 90 MB optimizer:
 
