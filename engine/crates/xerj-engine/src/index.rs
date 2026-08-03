@@ -23454,6 +23454,77 @@ fn configured_onnx_identity(
     }))
 }
 
+pub(crate) fn embedding_execution_identity(
+    cfg: &xerj_common::config::EmbeddingConfig,
+) -> Result<crate::engine::EmbeddingExecutionIdentity> {
+    use sha2::{Digest, Sha256};
+
+    const CONTRACT: &str = "semantic_text-derived-vector.v1";
+    let requested = cfg.mode.trim().to_ascii_lowercase();
+    let backend = match requested.as_str() {
+        "neural" => "neural",
+        "onnx-experimental" => "onnx-experimental",
+        "lexical" => "lexical",
+        "proxy" if cfg.default_endpoint.is_empty() => "lexical",
+        "proxy" => "proxy",
+        _ if cfg.default_endpoint.is_empty() => "lexical",
+        _ => "proxy",
+    };
+    let (material, resumable, reason) = match backend {
+        "lexical" => (
+            "lexical-feature-hash.v1;dimensions=384".to_string(),
+            true,
+            None,
+        ),
+        "onnx-experimental" => {
+            let identity = configured_onnx_identity(cfg)?.ok_or_else(|| {
+                EngineError::Common(xerj_common::XerjError::embedding(
+                    "ONNX embedding identity is unavailable",
+                ))
+            })?;
+            (
+                format!(
+                    "onnx-experimental.v1;model={};tokenizer={};dimensions={};pooling={};max_tokens={}",
+                    identity.model_sha256,
+                    identity.tokenizer_sha256,
+                    identity.dimensions,
+                    identity.pooling,
+                    identity.max_tokens
+                ),
+                true,
+                None,
+            )
+        }
+        "neural" => (
+            format!("neural-unpinned.v1;configured-model={}", cfg.neural_model),
+            false,
+            Some(
+                "the neural model is not content-addressed; use a fresh autoindex state after changing it"
+                    .to_string(),
+            ),
+        ),
+        "proxy" => (
+            format!("proxy-unpinned.v1;configured-model={}", cfg.default_model),
+            false,
+            Some(
+                "the remote provider does not attest immutable model assets; semantic resume is unsafe"
+                    .to_string(),
+            ),
+        ),
+        _ => unreachable!(),
+    };
+    let canonical = format!("{CONTRACT};backend={backend};{material}");
+    Ok(crate::engine::EmbeddingExecutionIdentity {
+        version: 1,
+        backend: backend.to_string(),
+        identity_sha256: format!("{:x}", Sha256::digest(canonical.as_bytes())),
+        dimensions: xerj_ai::local::DEFAULT_DIMS,
+        semantic_contract: CONTRACT.to_string(),
+        resumable,
+        non_resumable_reason: reason,
+    })
+}
+
 /// Fail closed rather than mixing vectors produced by different model,
 /// tokenizer, pooling, or backend configurations after a restart/resume.
 fn validate_embedding_identity(
@@ -23576,6 +23647,51 @@ mod embedding_identity_tests {
             ))
             .unwrap();
         schema
+    }
+
+    #[test]
+    fn lexical_execution_identity_is_stable_and_sanitized() {
+        let cfg = xerj_common::config::EmbeddingConfig::default();
+        let identity = embedding_execution_identity(&cfg).unwrap();
+        assert_eq!(identity.backend, "lexical");
+        assert!(identity.resumable);
+        assert_eq!(
+            identity.identity_sha256,
+            "177b14d1bdff634335a99d558343ce506f39d758942f24a6455830e5a36ddda6"
+        );
+        let encoded = serde_json::to_string(&identity).unwrap();
+        assert!(!encoded.contains("endpoint"));
+        assert!(!encoded.contains("path"));
+    }
+
+    #[test]
+    fn neural_and_proxy_are_honestly_non_resumable() {
+        let neural = xerj_common::config::EmbeddingConfig {
+            mode: "neural".into(),
+            ..Default::default()
+        };
+        assert!(!embedding_execution_identity(&neural).unwrap().resumable);
+        let proxy = xerj_common::config::EmbeddingConfig {
+            mode: "proxy".into(),
+            default_endpoint: "https://secret.example/v1".into(),
+            default_model: "private-alias".into(),
+            ..Default::default()
+        };
+        let identity = embedding_execution_identity(&proxy).unwrap();
+        assert!(!identity.resumable);
+        let encoded = serde_json::to_string(&identity).unwrap();
+        assert!(!encoded.contains("secret.example"));
+        assert!(!encoded.contains("private-alias"));
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[test]
+    fn onnx_execution_identity_changes_with_asset_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = embedding_execution_identity(&onnx_config(dir.path(), "a")).unwrap();
+        let second = embedding_execution_identity(&onnx_config(dir.path(), "b")).unwrap();
+        assert!(first.resumable);
+        assert_ne!(first.identity_sha256, second.identity_sha256);
     }
 
     #[cfg(feature = "onnx-experimental")]

@@ -15,6 +15,21 @@ use xerj_common::types::{IndexName, Schema};
 use crate::index::{Index, IndexStats};
 use crate::{EngineError, Result};
 
+/// Privacy-safe identity of the embedding execution contract exposed to
+/// remote ingestion clients. The digest is opaque: model paths, provider URLs,
+/// credentials, and model names never cross the API boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingExecutionIdentity {
+    pub version: u32,
+    pub backend: String,
+    pub identity_sha256: String,
+    pub dimensions: usize,
+    pub semantic_contract: String,
+    pub resumable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_resumable_reason: Option<String>,
+}
+
 // ── Clustering types ─────────────────────────────────────────────────────────
 
 /// Node identity and cluster membership configuration.
@@ -1492,6 +1507,12 @@ impl Engine {
     /// coupling to the full engine internals.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Return the effective embedding identity without exposing configuration
+    /// secrets or local asset paths.
+    pub fn embedding_execution_identity(&self) -> Result<EmbeddingExecutionIdentity> {
+        crate::index::embedding_execution_identity(&self.config.embedding)
     }
 
     /// Sum of every open index's live memtable footprint, in bytes. This is
