@@ -1190,6 +1190,7 @@ mod tests {
                 .unwrap();
             let encoded = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(encoded.contains("verify the configured embedding backend"));
+            assert!(encoded.contains("restart the server after fixing the assets"));
             for private in [
                 MODEL,
                 TOKENIZER,

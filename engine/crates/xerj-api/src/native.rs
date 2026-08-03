@@ -659,19 +659,34 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn embedding_execution_identity(State(state): State<AppState>) -> impl IntoResponse {
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
-    match state.engine.embedding_execution_identity() {
-        Ok(identity) => Json(NativeResponse::new(
+    let engine = state.engine.clone();
+    let result = tokio::task::spawn_blocking(move || engine.embedding_execution_identity()).await;
+    match result {
+        Ok(Ok(identity)) => Json(NativeResponse::new(
             identity,
             started.elapsed().as_millis() as u64,
             &request_id,
         ))
         .into_response(),
-        Err(error) => {
+        Ok(Err(error)) => {
             tracing::warn!(error = %error, "embedding execution identity is unavailable");
             native_error(
                 xerj_common::XerjError::embedding(
                     "embedding execution identity is unavailable; verify the configured embedding \
-                 backend and local assets in the server logs",
+                     backend and local assets in the server logs. Asset-read failures are cached \
+                     for this server lifetime; restart the server after fixing the assets",
+                ),
+                Some(&request_id),
+                started.elapsed().as_millis() as u64,
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "embedding identity worker failed");
+            native_error(
+                xerj_common::XerjError::embedding(
+                    "embedding execution identity worker failed; inspect the server logs and \
+                     restart the server before retrying",
                 ),
                 Some(&request_id),
                 started.elapsed().as_millis() as u64,

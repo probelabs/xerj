@@ -23901,6 +23901,55 @@ mod embedding_identity_tests {
         ));
     }
 
+    /// Run with matching production assets:
+    ///
+    /// `XERJ_ONNX_TEST_MODEL=/abs/model.onnx
+    ///  XERJ_ONNX_TEST_TOKENIZER=/abs/tokenizer.json
+    ///  cargo test -p xerj-engine --features onnx-experimental
+    ///  concurrent_identity_and_real_lazy_pool_share_snapshot -- --ignored`
+    #[cfg(feature = "onnx-experimental")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires explicit matching ONNX model and tokenizer assets"]
+    async fn concurrent_identity_and_real_lazy_pool_share_snapshot() {
+        let cfg = xerj_common::config::EmbeddingConfig {
+            mode: "onnx-experimental".into(),
+            onnx_model_path: std::env::var("XERJ_ONNX_TEST_MODEL")
+                .expect("XERJ_ONNX_TEST_MODEL is required"),
+            onnx_tokenizer_path: std::env::var("XERJ_ONNX_TEST_TOKENIZER")
+                .expect("XERJ_ONNX_TEST_TOKENIZER is required"),
+            ..Default::default()
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let identity_cfg = cfg.clone();
+        let identity_barrier = barrier.clone();
+        let identity = tokio::task::spawn_blocking(move || {
+            identity_barrier.wait();
+            embedding_execution_identity(&identity_cfg).unwrap()
+        });
+        let embedder = make_embedder(&cfg).unwrap();
+        barrier.wait();
+        let vectors = embedder
+            .embed_batch(vec!["quarterly revenue increased".into()])
+            .await
+            .unwrap();
+        let identity = identity.await.unwrap();
+        assert_eq!(identity.backend, "onnx-experimental");
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].len(), identity.dimensions);
+        let snapshot = configured_onnx_assets(&cfg).unwrap();
+        assert_eq!(
+            identity.identity_sha256,
+            embedding_execution_identity(&cfg).unwrap().identity_sha256
+        );
+        assert_eq!(
+            snapshot.model_sha256,
+            format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(&snapshot.model_bytes)
+            )
+        );
+    }
+
     #[cfg(feature = "onnx-experimental")]
     fn onnx_config(dir: &Path, suffix: &str) -> xerj_common::config::EmbeddingConfig {
         let model = dir.join(format!("model-{suffix}.onnx"));
