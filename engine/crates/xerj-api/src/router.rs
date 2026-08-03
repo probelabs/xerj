@@ -1056,11 +1056,19 @@ mod tests {
     }
 
     fn test_state(distribution: &str) -> AppState {
+        test_state_with(distribution, |_| {})
+    }
+
+    fn test_state_with(
+        distribution: &str,
+        configure: impl FnOnce(&mut xerj_common::config::Config),
+    ) -> AppState {
         let dir = tempfile::tempdir().expect("tempdir").keep();
         let mut config = xerj_common::config::Config::default();
         config.server.data_dir = dir.to_string_lossy().into_owned();
         config.storage.wal_sync = xerj_common::config::WalSync::Async;
         config.compat.distribution = distribution.to_string();
+        configure(&mut config);
         let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
         let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
         AppState::new(config, engine, metrics)
@@ -1146,6 +1154,51 @@ mod tests {
             let encoded = String::from_utf8(bytes.to_vec()).unwrap();
             for secret_field in ["api_key", "endpoint", "model_path", "tokenizer_path"] {
                 assert!(!encoded.contains(secret_field), "{secret_field} leaked");
+            }
+        }
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[tokio::test]
+    async fn embedding_identity_asset_failures_do_not_leak_local_paths() {
+        const MODEL: &str = "/private/customer-a/models/missing-model.onnx";
+        const TOKENIZER: &str = "/private/customer-a/models/missing-tokenizer.json";
+        for app in [
+            build_native_router(test_state_with("elasticsearch", |config| {
+                config.embedding.mode = "onnx-experimental".into();
+                config.embedding.onnx_model_path = MODEL.into();
+                config.embedding.onnx_tokenizer_path = TOKENIZER.into();
+            })),
+            build_es_compat_router(test_state_with("elasticsearch", |config| {
+                config.embedding.mode = "onnx-experimental".into();
+                config.embedding.onnx_model_path = MODEL.into();
+                config.embedding.onnx_tokenizer_path = TOKENIZER.into();
+            })),
+        ] {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/embedding/identity")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(!response.status().is_success());
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let encoded = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(encoded.contains("verify the configured embedding backend"));
+            for private in [
+                MODEL,
+                TOKENIZER,
+                "missing-model.onnx",
+                "missing-tokenizer.json",
+                "No such file",
+                "os error",
+            ] {
+                assert!(!encoded.contains(private), "{private} leaked: {encoded}");
             }
         }
     }

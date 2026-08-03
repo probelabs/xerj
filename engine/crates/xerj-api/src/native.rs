@@ -666,12 +666,18 @@ pub async fn embedding_execution_identity(State(state): State<AppState>) -> impl
             &request_id,
         ))
         .into_response(),
-        Err(error) => native_error(
-            error.into(),
-            Some(&request_id),
-            started.elapsed().as_millis() as u64,
-        )
-        .into_response(),
+        Err(error) => {
+            tracing::warn!(error = %error, "embedding execution identity is unavailable");
+            native_error(
+                xerj_common::XerjError::embedding(
+                    "embedding execution identity is unavailable; verify the configured embedding \
+                 backend and local assets in the server logs",
+                ),
+                Some(&request_id),
+                started.elapsed().as_millis() as u64,
+            )
+            .into_response()
+        }
     }
 }
 

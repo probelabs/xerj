@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+onnx-experimental = ["xerj-engine/onnx-experimental"]
+
 [dependencies]
 xerj-common  = { path = "../xerj-common" }
 xerj-engine  = { path = "../xerj-engine" }
