@@ -357,16 +357,46 @@ pub struct OnnxHandle {
 }
 
 #[cfg(feature = "onnx-experimental")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct OnnxCacheKey {
+    model_sha256: String,
+    tokenizer_sha256: String,
+    intra_threads: usize,
+    session_pool_size: usize,
+    microbatch: crate::onnx::MicrobatchConfig,
+    max_inflight_calls: usize,
+    max_input_bytes_per_call: usize,
+    max_inflight_input_bytes: usize,
+}
+
+#[cfg(feature = "onnx-experimental")]
+impl From<&OnnxConfig> for OnnxCacheKey {
+    fn from(cfg: &OnnxConfig) -> Self {
+        Self {
+            model_sha256: cfg.model_sha256.clone(),
+            tokenizer_sha256: cfg.tokenizer_sha256.clone(),
+            intra_threads: cfg.intra_threads,
+            session_pool_size: cfg.session_pool_size,
+            microbatch: cfg.microbatch,
+            max_inflight_calls: cfg.max_inflight_calls,
+            max_input_bytes_per_call: cfg.max_input_bytes_per_call,
+            max_inflight_input_bytes: cfg.max_inflight_input_bytes,
+        }
+    }
+}
+
+#[cfg(feature = "onnx-experimental")]
 impl OnnxHandle {
     fn new(cfg: OnnxConfig) -> Self {
         use std::collections::HashMap;
         use std::sync::{Mutex, OnceLock, Weak};
-        static CELLS: OnceLock<Mutex<HashMap<OnnxConfig, Weak<OnnxShared>>>> = OnceLock::new();
+        static CELLS: OnceLock<Mutex<HashMap<OnnxCacheKey, Weak<OnnxShared>>>> = OnceLock::new();
+        let key = OnnxCacheKey::from(&cfg);
         let mut cells = CELLS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(shared) = cells.get(&cfg).and_then(Weak::upgrade) {
+        if let Some(shared) = cells.get(&key).and_then(Weak::upgrade) {
             return Self { cfg, shared };
         }
         cells.retain(|_, shared| shared.strong_count() > 0);
@@ -377,7 +407,7 @@ impl OnnxHandle {
                 cfg.max_inflight_input_bytes.max(1),
             )),
         });
-        cells.insert(cfg.clone(), std::sync::Arc::downgrade(&shared));
+        cells.insert(key, std::sync::Arc::downgrade(&shared));
         Self { cfg, shared }
     }
 
@@ -523,6 +553,17 @@ mod onnx_handle_tests {
         let first = OnnxHandle::new(cfg("model-a"));
         let second = OnnxHandle::new(cfg("model-b"));
         assert!(!Arc::ptr_eq(&first.shared, &second.shared));
+    }
+
+    #[test]
+    fn session_registry_key_does_not_retain_asset_bytes_after_handle_drop() {
+        let config = cfg("releasable-assets");
+        let weak_model = Arc::downgrade(&config.model_bytes);
+        let weak_tokenizer = Arc::downgrade(&config.tokenizer_bytes);
+        let handle = OnnxHandle::new(config);
+        drop(handle);
+        assert!(weak_model.upgrade().is_none());
+        assert!(weak_tokenizer.upgrade().is_none());
     }
 
     #[test]

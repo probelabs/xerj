@@ -23820,6 +23820,33 @@ mod embedding_identity_tests {
     }
 
     #[cfg(feature = "onnx-experimental")]
+    #[tokio::test]
+    async fn sequential_engines_from_one_caller_config_refresh_same_path_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller_config = xerj_common::config::Config::default();
+        caller_config.server.data_dir = dir
+            .path()
+            .join("engine-data")
+            .to_string_lossy()
+            .into_owned();
+        caller_config.embedding = onnx_config(dir.path(), "engine-lifetime");
+
+        let first_engine = crate::Engine::new(caller_config.clone()).unwrap();
+        let first_identity = first_engine.embedding_execution_identity().unwrap();
+        let model_path = caller_config.embedding.onnx_model_path.clone();
+        let original_len = std::fs::metadata(&model_path).unwrap().len() as usize;
+        drop(first_engine);
+
+        std::fs::write(&model_path, vec![b'q'; original_len]).unwrap();
+        let second_engine = crate::Engine::new(caller_config).unwrap();
+        let second_identity = second_engine.embedding_execution_identity().unwrap();
+        assert_ne!(
+            first_identity.identity_sha256,
+            second_identity.identity_sha256
+        );
+    }
+
+    #[cfg(feature = "onnx-experimental")]
     #[test]
     fn concurrent_identity_and_loader_access_share_one_runtime_snapshot() {
         let dir = tempfile::tempdir().unwrap();
