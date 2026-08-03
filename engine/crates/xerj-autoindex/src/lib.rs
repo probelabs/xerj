@@ -89,38 +89,9 @@ fn replacement_failpoint(_boundary: u8) -> Result<()> {
     Ok(())
 }
 
-fn record_bulk_outcome(
-    es: &Es,
-    body: Vec<u8>,
-    junk_records: &AtomicU64,
-    bulk_errors: &Mutex<Vec<String>>,
-    send_err: &mut Option<String>,
-) -> bool {
+fn record_bulk_outcome(es: &Es, body: Vec<u8>, send_err: &mut Option<String>) -> bool {
     match es.bulk(body) {
-        Ok(outcome) => {
-            if outcome.server_errors > 0 {
-                *send_err = Some(format!(
-                    "bulk backend failed for {} item(s): {}. Source file was not journaled \
-                     complete; fix the server/embedding configuration and rerun autoindex",
-                    outcome.server_errors,
-                    outcome
-                        .first_server_error
-                        .as_deref()
-                        .unwrap_or("unknown server error")
-                ));
-                return true;
-            }
-            if outcome.item_errors > 0 {
-                junk_records.fetch_add(outcome.item_errors, Ordering::Relaxed);
-                if let Some(error) = outcome.first_error {
-                    let mut errors = bulk_errors.lock().unwrap();
-                    if errors.len() < 5 {
-                        errors.push(error);
-                    }
-                }
-            }
-            false
-        }
+        Ok(_) => false,
         Err(error) => {
             *send_err = Some(format!("{error:#}"));
             true
@@ -1007,19 +978,13 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 buf.extend_from_slice(&edge.ndjson);
                 *written.entry(edge.detector).or_default() += 1;
                 if buf.len() >= bulk_cut
-                    && record_bulk_outcome(
-                        &es,
-                        std::mem::take(&mut buf),
-                        &junk_records,
-                        &bulk_errors,
-                        &mut send_err,
-                    )
+                    && record_bulk_outcome(&es, std::mem::take(&mut buf), &mut send_err)
                 {
                     break;
                 }
             }
             if send_err.is_none() && !buf.is_empty() {
-                record_bulk_outcome(&es, buf, &junk_records, &bulk_errors, &mut send_err);
+                record_bulk_outcome(&es, buf, &mut send_err);
             }
             if let Some(e) = send_err {
                 anyhow::bail!("write structural graph edges to {edges_index}: {e}");
@@ -1394,13 +1359,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             buf.extend_from_slice(&document);
                             docs += 1;
                             if (buf.len() >= bulk_cut || docs >= 5000)
-                                && record_bulk_outcome(
-                                    &es,
-                                    std::mem::take(&mut buf),
-                                    &junk_records,
-                                    &bulk_errors,
-                                    &mut send_err,
-                                )
+                                && record_bulk_outcome(&es, std::mem::take(&mut buf), &mut send_err)
                             {
                                 break;
                             }
@@ -1410,13 +1369,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             }
                         }
                         if !buf.is_empty() && send_err.is_none() {
-                            record_bulk_outcome(
-                                &es,
-                                buf,
-                                &junk_records,
-                                &bulk_errors,
-                                &mut send_err,
-                            );
+                            record_bulk_outcome(&es, buf, &mut send_err);
                         }
                     }
                     // Second-brain edges for this file (§6.7): only after the
@@ -1438,8 +1391,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                     && record_bulk_outcome(
                                         &es,
                                         std::mem::take(&mut ebuf),
-                                        &junk_records,
-                                        &bulk_errors,
                                         &mut send_err,
                                     )
                                 {
@@ -1447,13 +1398,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                 }
                             }
                             if send_err.is_none() && !ebuf.is_empty() {
-                                record_bulk_outcome(
-                                    &es,
-                                    ebuf,
-                                    &junk_records,
-                                    &bulk_errors,
-                                    &mut send_err,
-                                );
+                                record_bulk_outcome(&es, ebuf, &mut send_err);
                             }
                             if send_err.is_none() {
                                 let mut written = gr.written.lock().unwrap();
@@ -1530,8 +1475,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     if !bulk_errs.is_empty() {
         anyhow::bail!(
             "autoindex stopped with bulk/backend failures: {}. Failed source files were not \
-             journaled complete; fix the reported server or embedding configuration and rerun \
-             the same command to resume safely",
+             journaled complete; fix the reported mapping, version conflict, admission, malformed \
+             response, server, or embedding error and rerun the same command to resume safely",
             bulk_errs.join(" | ")
         );
     }
@@ -1840,7 +1785,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     push_doc(&format!("run:{run_id}"), &run_doc, &mut cat_buf);
 
     if !cat_buf.is_empty() {
-        es.bulk(cat_buf).context("write catalog")?;
+        es.bulk(cat_buf).context(
+            "write catalog; source files remain durably journaled, but the run is not finished",
+        )?;
     }
     es.refresh(catalog::CATALOG_INDEX).ok();
     journal_mx.lock().unwrap().finish(&run_doc)?;

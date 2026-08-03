@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
+use std::io::Read;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -15,13 +16,194 @@ pub struct Es {
     retry_max_delay: Duration,
 }
 
+#[derive(Debug)]
 pub struct BulkOutcome {
     pub item_errors: u64,
-    /// Per-item 5xx/429 failures are backend/admission failures, not bad source
-    /// records. Callers must not journal the source file complete.
-    pub server_errors: u64,
     pub first_error: Option<String>,
-    pub first_server_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BulkOperation {
+    Index,
+    Create,
+    Update,
+    Delete,
+}
+
+impl BulkOperation {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "index" => Some(Self::Index),
+            "create" => Some(Self::Create),
+            "update" => Some(Self::Update),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+
+    fn has_source_line(self) -> bool {
+        !matches!(self, Self::Delete)
+    }
+
+    fn accepts_status(self, status: u64) -> bool {
+        (200..300).contains(&status) || self == Self::Delete && status == 404
+    }
+}
+
+fn bulk_operations(body: &[u8]) -> Result<Vec<BulkOperation>> {
+    anyhow::ensure!(
+        body.last() == Some(&b'\n'),
+        "generated bulk request is not newline terminated"
+    );
+    let lines: Vec<&[u8]> = body
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut operations = Vec::new();
+    let mut line = 0usize;
+    while line < lines.len() {
+        let action: Value = serde_json::from_slice(lines[line])
+            .with_context(|| format!("parse generated bulk action line {}", line + 1))?;
+        let object = action.as_object().ok_or_else(|| {
+            anyhow!(
+                "generated bulk action line {} is not a JSON object",
+                line + 1
+            )
+        })?;
+        anyhow::ensure!(
+            object.len() == 1,
+            "generated bulk action line {} must contain exactly one operation",
+            line + 1
+        );
+        let name = object.keys().next().expect("one operation");
+        let operation = BulkOperation::parse(name).ok_or_else(|| {
+            anyhow!(
+                "generated bulk action line {} uses unsupported operation {name}",
+                line + 1
+            )
+        })?;
+        operations.push(operation);
+        line += 1;
+        if operation.has_source_line() {
+            anyhow::ensure!(
+                line < lines.len(),
+                "generated bulk {} action {} is missing its source line",
+                operation.name(),
+                operations.len()
+            );
+            line += 1;
+        }
+    }
+    Ok(operations)
+}
+
+fn parse_bulk_response(
+    mut response: reqwest::blocking::Response,
+    expected: &[BulkOperation],
+) -> Result<BulkOutcome> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = bounded_response_excerpt(&mut response);
+        let detail = if body.is_empty() {
+            String::new()
+        } else {
+            format!(": {body}")
+        };
+        return Err(anyhow!("bulk HTTP {status}{detail}"));
+    }
+    let value: Value = response.json().context("parse bulk response")?;
+    let errors = value
+        .get("errors")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("bulk response is missing boolean `errors`"))?;
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("bulk response is missing array `items`"))?;
+    anyhow::ensure!(
+        items.len() == expected.len(),
+        "bulk response item count mismatch: sent {} action(s), received {} item(s)",
+        expected.len(),
+        items.len()
+    );
+
+    let mut item_errors = 0u64;
+    let mut first_error = None;
+    for (ordinal, (item, expected_operation)) in items.iter().zip(expected).enumerate() {
+        let object = item
+            .as_object()
+            .ok_or_else(|| anyhow!("bulk response item {} is not an object", ordinal + 1))?;
+        anyhow::ensure!(
+            object.len() == 1,
+            "bulk response item {} must contain exactly one operation",
+            ordinal + 1
+        );
+        let (name, result) = object.iter().next().expect("one operation");
+        anyhow::ensure!(
+            name == expected_operation.name(),
+            "bulk response item {} operation mismatch: sent {}, received {}",
+            ordinal + 1,
+            expected_operation.name(),
+            name
+        );
+        let result = result.as_object().ok_or_else(|| {
+            anyhow!(
+                "bulk response item {} operation result is not an object",
+                ordinal + 1
+            )
+        })?;
+        let item_status = result
+            .get("status")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("bulk response item {} is missing status", ordinal + 1))?;
+        let error = result.get("error").filter(|error| !error.is_null());
+        if !expected_operation.accepts_status(item_status) || error.is_some() {
+            item_errors += 1;
+            let detail = format!(
+                "item {} {} returned status {}{}",
+                ordinal + 1,
+                expected_operation.name(),
+                item_status,
+                error
+                    .map(|value| format!(
+                        ": {}",
+                        value.to_string().chars().take(300).collect::<String>()
+                    ))
+                    .unwrap_or_default()
+            );
+            if first_error.is_none() {
+                first_error = Some(detail);
+            }
+        }
+    }
+    anyhow::ensure!(
+        errors == (item_errors > 0),
+        "bulk response `errors` flag ({errors}) disagrees with {} rejected item(s)",
+        item_errors
+    );
+    Ok(BulkOutcome {
+        item_errors,
+        first_error,
+    })
+}
+
+fn bounded_response_excerpt(response: &mut reqwest::blocking::Response) -> String {
+    const LIMIT: u64 = 4 * 1024;
+    let mut bytes = Vec::with_capacity(LIMIT as usize);
+    let _ = response.take(LIMIT).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Ensure an autoindex index-create body pins the index to a single WAL shard.
@@ -136,7 +318,14 @@ impl Es {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.as_u16() == 429 || status.is_server_error() {
-                        last_err = Some(anyhow!("{what}: HTTP {status}"));
+                        let mut resp = resp;
+                        let body = bounded_response_excerpt(&mut resp);
+                        let detail = if body.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {body}")
+                        };
+                        last_err = Some(anyhow!("{what}: HTTP {status}{detail}"));
                     } else {
                         return parse(resp);
                     }
@@ -188,56 +377,30 @@ impl Es {
     }
 
     pub fn bulk(&self, body: Vec<u8>) -> Result<BulkOutcome> {
+        let outcome = self.bulk_allow_item_rejections(body)?;
+        anyhow::ensure!(
+            outcome.item_errors == 0,
+            "bulk rejected {} item(s): {}",
+            outcome.item_errors,
+            outcome
+                .first_error
+                .as_deref()
+                .unwrap_or("unknown bulk item rejection")
+        );
+        Ok(outcome)
+    }
+
+    /// Execute a bulk while returning item rejections to the caller.
+    ///
+    /// Only the create-if-absent metadata path uses this escape hatch because
+    /// it can prove that a 409 race established the desired document. Every
+    /// ordinary publication must use `bulk`, whose default is fail-closed.
+    pub(crate) fn bulk_allow_item_rejections(&self, body: Vec<u8>) -> Result<BulkOutcome> {
+        let expected = bulk_operations(&body)?;
         self.with_retry(
             "_bulk",
             || self.send_bulk(body.clone()),
-            |resp| {
-                let status = resp.status();
-                if !status.is_success() {
-                    return Err(anyhow!("bulk HTTP {status}"));
-                }
-                let v: Value = resp.json().context("parse bulk response")?;
-                let mut item_errors = 0u64;
-                let mut server_errors = 0u64;
-                let mut first_error = None;
-                let mut first_server_error = None;
-                if v.get("errors").and_then(|e| e.as_bool()).unwrap_or(false) {
-                    if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
-                        for it in items {
-                            let op = it
-                                .get("index")
-                                .or_else(|| it.get("create"))
-                                .or_else(|| it.get("update"));
-                            if let Some(op) = op {
-                                if op.get("error").is_some() {
-                                    item_errors += 1;
-                                    let item_status =
-                                        op.get("status").and_then(Value::as_u64).unwrap_or(500);
-                                    if item_status == 429 || item_status >= 500 {
-                                        server_errors += 1;
-                                        if first_server_error.is_none() {
-                                            first_server_error = Some(
-                                                op["error"].to_string().chars().take(500).collect(),
-                                            );
-                                        }
-                                    }
-                                    if first_error.is_none() {
-                                        first_error = Some(
-                                            op["error"].to_string().chars().take(300).collect(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(BulkOutcome {
-                    item_errors,
-                    server_errors,
-                    first_error,
-                    first_server_error,
-                })
-            },
+            |response| parse_bulk_response(response, &expected),
         )
     }
 
@@ -472,17 +635,135 @@ mod tests {
     }
 
     fn success(stream: &mut std::net::TcpStream) {
-        respond_json(stream, br#"{"errors":false,"items":[]}"#);
+        respond_json(
+            stream,
+            br#"{"errors":false,"items":[{"index":{"status":201}}]}"#,
+        );
     }
 
     fn respond_json(stream: &mut std::net::TcpStream, body: &[u8]) {
+        respond(stream, "200 OK", body);
+    }
+
+    fn respond(stream: &mut std::net::TcpStream, status: &str, body: &[u8]) {
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .unwrap();
         stream.write_all(body).unwrap();
+    }
+
+    fn bulk_against_one_response(
+        body: Vec<u8>,
+        response: &'static [u8],
+    ) -> anyhow::Result<super::BulkOutcome> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            respond_json(&mut stream, response);
+        });
+        let es = Es::with_bulk_policy(
+            &format!("http://{address}"),
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .unwrap();
+        let result = es.bulk(body);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn bulk_response_requires_exact_well_formed_item_accounting() {
+        let request = b"{\"index\":{}}\n{}\n".to_vec();
+        let cases: &[(&[u8], &str)] = &[
+            (b"not-json", "parse bulk response"),
+            (
+                br#"{"items":[{"index":{"status":201}}]}"#,
+                "boolean `errors`",
+            ),
+            (br#"{"errors":false}"#, "array `items`"),
+            (br#"{"errors":false,"items":[]}"#, "item count mismatch"),
+            (
+                br#"{"errors":false,"items":[{"index":{"status":201}},{"index":{"status":201}}]}"#,
+                "item count mismatch",
+            ),
+            (
+                br#"{"errors":false,"items":["malformed"]}"#,
+                "item 1 is not an object",
+            ),
+            (
+                br#"{"errors":false,"items":[{"delete":{"status":200}}]}"#,
+                "operation mismatch",
+            ),
+            (
+                br#"{"errors":false,"items":[{"index":{"result":"created"}}]}"#,
+                "missing status",
+            ),
+            (
+                br#"{"errors":true,"items":[{"index":{"status":201}}]}"#,
+                "disagrees with 0 rejected",
+            ),
+            (
+                br#"{"errors":false,"items":[{"index":{"status":400,"error":{"type":"bad"}}}]}"#,
+                "disagrees with 1 rejected",
+            ),
+        ];
+        for (response, expected) in cases {
+            let error = bulk_against_one_response(request.clone(), response).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{expected}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_response_matches_mixed_operations_and_accepts_absent_delete() {
+        let request =
+            b"{\"index\":{\"_id\":\"a\"}}\n{\"v\":1}\n{\"delete\":{\"_id\":\"b\"}}\n".to_vec();
+        let outcome = bulk_against_one_response(
+            request,
+            br#"{"errors":false,"items":[{"index":{"status":201}},{"delete":{"status":404}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(outcome.item_errors, 0);
+    }
+
+    #[test]
+    fn terminal_retry_error_keeps_a_bounded_backend_reason() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_request(&mut stream);
+                let body = format!("admission queue full {}", "x".repeat(8 * 1024));
+                respond(&mut stream, "503 Service Unavailable", body.as_bytes());
+            }
+        });
+        let es = Es::with_bulk_policy(
+            &format!("http://{address}"),
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .unwrap();
+        let error = es
+            .bulk(b"{\"index\":{}}\n{}\n".to_vec())
+            .expect_err("six retryable responses must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("HTTP 503"), "{message}");
+        assert!(message.contains("admission queue full"), "{message}");
+        assert!(message.len() < 4_300, "backend excerpt was not bounded");
+        server.join().unwrap();
     }
 
     #[test]
@@ -543,7 +824,7 @@ mod tests {
         )
         .unwrap();
         let started = Instant::now();
-        let error = match es.bulk(b"{}\n".to_vec()) {
+        let error = match es.bulk(b"{\"index\":{}}\n{}\n".to_vec()) {
             Ok(_) => panic!("all six delayed responses unexpectedly succeeded"),
             Err(error) => error,
         };

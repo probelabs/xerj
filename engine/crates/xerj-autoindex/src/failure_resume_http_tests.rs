@@ -23,7 +23,22 @@ struct MockState {
     fail_data_bulk: usize,
     failed_once: bool,
     delete_calls: usize,
+    injection: Option<BulkInjection>,
+    catalog_injection: Option<BulkInjection>,
+    brain_bulk_status: Option<u16>,
+    brain_meta_present: bool,
+    brain_materialize_on_reject: bool,
     stop: bool,
+}
+
+#[derive(Clone, Debug)]
+enum BulkInjection {
+    Reject { ordinal: usize, status: u16 },
+    MissingItems { returned: usize },
+    ExtraItem,
+    MalformedItem { ordinal: usize },
+    MissingStatus { ordinal: usize },
+    WrongOperation { ordinal: usize },
 }
 
 struct MockEndpoint {
@@ -34,11 +49,39 @@ struct MockEndpoint {
 
 impl MockEndpoint {
     fn start(fail_data_bulk: usize) -> Self {
+        Self::start_with_injection(fail_data_bulk, None)
+    }
+
+    fn start_with_injection(fail_data_bulk: usize, injection: Option<BulkInjection>) -> Self {
+        Self::start_with_injections(fail_data_bulk, injection, None)
+    }
+
+    fn start_with_catalog_injection(injection: BulkInjection) -> Self {
+        Self::start_with_injections(0, None, Some(injection))
+    }
+
+    fn start_with_brain_rejection(status: u16, materialize: bool) -> Self {
+        let endpoint = Self::start_with_injections(0, None, None);
+        {
+            let mut state = endpoint.state.lock().unwrap();
+            state.brain_bulk_status = Some(status);
+            state.brain_materialize_on_reject = materialize;
+        }
+        endpoint
+    }
+
+    fn start_with_injections(
+        fail_data_bulk: usize,
+        injection: Option<BulkInjection>,
+        catalog_injection: Option<BulkInjection>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(MockState {
             fail_data_bulk,
+            injection,
+            catalog_injection,
             ..MockState::default()
         }));
         let server_state = Arc::clone(&state);
@@ -101,6 +144,12 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
 
     let response = if method == "POST" && path == "/_bulk" {
         bulk_response(&body, state)
+    } else if method == "GET" && path.contains("/_doc/__xerj-brain-meta") {
+        if state.lock().unwrap().brain_meta_present {
+            json!({"found": true, "_source": {"meta_version": 1}})
+        } else {
+            json!({"found": false})
+        }
     } else if method == "POST" && path.contains("/_delete_by_query") {
         let query: Value = serde_json::from_slice(&body).unwrap();
         let ax_file = query
@@ -138,6 +187,24 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .collect();
+    let is_brain_meta = lines
+        .first()
+        .and_then(|line| serde_json::from_slice::<Value>(line).ok())
+        .and_then(|action| action.pointer("/create/_id").cloned())
+        .and_then(|id| id.as_str().map(str::to_owned))
+        .is_some_and(|id| id == detect::BRAIN_META_ID);
+    if is_brain_meta {
+        let mut locked = state.lock().unwrap();
+        if let Some(status) = locked.brain_bulk_status.take() {
+            locked.brain_meta_present = locked.brain_materialize_on_reject;
+            return json!({"errors": true, "items": [{"create": {
+                "status": status,
+                "error": {"type": "injected_rejection", "reason": "brain meta rejected"}
+            }}]});
+        }
+        locked.brain_meta_present = true;
+        return json!({"errors": false, "items": [{"create": {"status": 201}}]});
+    }
     let is_data = lines
         .first()
         .and_then(|line| serde_json::from_slice::<Value>(line).ok())
@@ -145,11 +212,18 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         .and_then(|index| index.as_str().map(str::to_owned))
         .is_some_and(|index| index != catalog::CATALOG_INDEX);
     if !is_data {
-        return json!({"errors": false, "items": []});
+        let mut locked = state.lock().unwrap();
+        if let Some(injection) = locked.catalog_injection.take() {
+            return injected_bulk_response(&lines, &mut locked, injection, false);
+        }
+        return json!({"errors": false, "items": successful_items(&lines)});
     }
 
     let mut locked = state.lock().unwrap();
     locked.data_bulk_number += 1;
+    if let Some(injection) = locked.injection.take() {
+        return injected_bulk_response(&lines, &mut locked, injection, true);
+    }
     let fail = !locked.failed_once && locked.data_bulk_number == locked.fail_data_bulk;
     let pairs = lines.chunks_exact(2);
     let visible = if fail { pairs.len() / 2 } else { pairs.len() };
@@ -169,8 +243,80 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
             }}]
         })
     } else {
-        json!({"errors": false, "items": []})
+        json!({"errors": false, "items": successful_items(&lines)})
     }
+}
+
+fn injected_bulk_response(
+    lines: &[&[u8]],
+    state: &mut MockState,
+    injection: BulkInjection,
+    apply_docs: bool,
+) -> Value {
+    let pairs: Vec<(&[u8], &[u8])> = lines
+        .chunks_exact(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect();
+    let applied: Vec<usize> = match &injection {
+        BulkInjection::Reject { ordinal, .. } => (0..pairs.len())
+            .filter(|candidate| candidate != ordinal)
+            .collect(),
+        BulkInjection::MissingItems { returned } => (0..(*returned).min(pairs.len())).collect(),
+        _ => (0..pairs.len()).collect(),
+    };
+    if apply_docs {
+        for ordinal in applied {
+            let action: Value = serde_json::from_slice(pairs[ordinal].0).unwrap();
+            let doc: Value = serde_json::from_slice(pairs[ordinal].1).unwrap();
+            let id = action.pointer("/index/_id").unwrap().as_str().unwrap();
+            state.docs.insert(id.to_owned(), doc);
+        }
+    }
+
+    let mut items = successful_items(lines);
+    let mut errors = false;
+    match injection {
+        BulkInjection::Reject { ordinal, status } => {
+            errors = true;
+            items[ordinal] = json!({"index": {
+                "status": status,
+                "error": {
+                    "type": "injected_item_rejection",
+                    "reason": format!("rejected item {ordinal}")
+                }
+            }});
+        }
+        BulkInjection::MissingItems { returned } => items.truncate(returned),
+        BulkInjection::ExtraItem => items.push(json!({"index": {"status": 201}})),
+        BulkInjection::MalformedItem { ordinal } => items[ordinal] = json!("malformed"),
+        BulkInjection::MissingStatus { ordinal } => {
+            items[ordinal] = json!({"index": {"result": "created"}});
+        }
+        BulkInjection::WrongOperation { ordinal } => {
+            items[ordinal] = json!({"delete": {"status": 200}});
+        }
+    }
+    json!({"errors": errors, "items": items})
+}
+
+fn successful_items(lines: &[&[u8]]) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut line = 0usize;
+    while line < lines.len() {
+        let action: Value = serde_json::from_slice(lines[line]).unwrap();
+        let operation = action.as_object().unwrap().keys().next().unwrap();
+        let status = if operation == "index" || operation == "create" {
+            201
+        } else {
+            200
+        };
+        items.push(json!({(operation): {"status": status}}));
+        line += 1;
+        if operation != "delete" {
+            line += 1;
+        }
+    }
+    items
 }
 
 fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
@@ -223,6 +369,191 @@ fn event_count(state_dir: &Path, kind: &str) -> usize {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|value| value.get("kind").and_then(Value::as_str) == Some(kind))
         .count()
+}
+
+#[test]
+fn every_partial_or_malformed_bulk_response_blocks_completion_and_retry_converges() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    const ROWS: usize = 7;
+    let cases = [
+        (
+            "first-400",
+            BulkInjection::Reject {
+                ordinal: 0,
+                status: 400,
+            },
+        ),
+        (
+            "middle-409",
+            BulkInjection::Reject {
+                ordinal: ROWS / 2,
+                status: 409,
+            },
+        ),
+        (
+            "last-429",
+            BulkInjection::Reject {
+                ordinal: ROWS - 1,
+                status: 429,
+            },
+        ),
+        (
+            "middle-500",
+            BulkInjection::Reject {
+                ordinal: ROWS / 2,
+                status: 500,
+            },
+        ),
+        (
+            "missing-first-subset",
+            BulkInjection::MissingItems { returned: 1 },
+        ),
+        (
+            "missing-middle-subset",
+            BulkInjection::MissingItems { returned: ROWS / 2 },
+        ),
+        (
+            "missing-last-subset",
+            BulkInjection::MissingItems { returned: ROWS - 1 },
+        ),
+        ("extra-item", BulkInjection::ExtraItem),
+        (
+            "malformed-item",
+            BulkInjection::MalformedItem { ordinal: ROWS / 2 },
+        ),
+        (
+            "missing-status",
+            BulkInjection::MissingStatus { ordinal: ROWS / 2 },
+        ),
+        (
+            "wrong-operation",
+            BulkInjection::WrongOperation { ordinal: ROWS / 2 },
+        ),
+    ];
+
+    for (name, injection) in cases {
+        let corpus = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut csv = String::from("id,value\n");
+        for row in 0..ROWS {
+            csv.push_str(&format!("{row},value-{row}\n"));
+        }
+        fs::write(corpus.path().join("records.csv"), csv).unwrap();
+        let endpoint = MockEndpoint::start_with_injection(usize::MAX, Some(injection.clone()));
+        let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+        let error = run_index(config.clone()).expect_err(name);
+        assert!(
+            format!("{error:#}").contains("bulk/backend failures"),
+            "{name}: {error:#}"
+        );
+        assert_eq!(
+            file_done_count(state_dir.path()),
+            0,
+            "{name}: a rejected or unverifiable response cannot complete the file"
+        );
+        let replay = state::Journal::open(
+            state_dir.path(),
+            &config.root.to_string_lossy(),
+            &config.url,
+            &config.prefix,
+            config.bulk_timeout_secs,
+            false,
+        )
+        .unwrap();
+        assert!(replay.done.is_empty(), "{name}");
+        assert_eq!(replay.pending_replacements.len(), 1, "{name}");
+        drop(replay);
+
+        assert_eq!(run_index(config).unwrap(), 0, "{name}");
+        assert_eq!(file_done_count(state_dir.path()), 1, "{name}");
+        let state = endpoint.state.lock().unwrap();
+        assert_eq!(state.docs.len(), ROWS, "{name}");
+        let mut locators: Vec<usize> = state
+            .docs
+            .values()
+            .map(|doc| {
+                doc["ax_locator"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches('r')
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        locators.sort_unstable();
+        assert_eq!(locators, (0..ROWS).collect::<Vec<_>>(), "{name}");
+        assert!(
+            state.docs.values().all(|doc| doc["value"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("value-"))),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn catalog_rejection_preserves_file_completion_but_blocks_run_finish() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("records.csv"),
+        "id,value\n1,one\n2,two\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start_with_catalog_injection(BulkInjection::Reject {
+        ordinal: 0,
+        status: 400,
+    });
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    let error = run_index(config.clone()).expect_err("catalog item rejection must fail the run");
+    assert!(format!("{error:#}").contains("write catalog"), "{error:#}");
+    assert_eq!(file_done_count(state_dir.path()), 1);
+    assert_eq!(event_count(state_dir.path(), "finish"), 0);
+    let replay = state::Journal::open(
+        state_dir.path(),
+        &config.root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    assert_eq!(replay.done.len(), 1);
+    assert!(replay.pending_replacements.is_empty());
+    drop(replay);
+    let data_bulks = endpoint.state.lock().unwrap().data_bulk_number;
+
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(event_count(state_dir.path(), "finish"), 1);
+    assert_eq!(
+        endpoint.state.lock().unwrap().data_bulk_number,
+        data_bulks,
+        "catalog-only retry must not republish completed file data"
+    );
+}
+
+#[test]
+fn brain_meta_conflict_is_accepted_only_when_a_document_now_exists() {
+    let endpoint = MockEndpoint::start_with_brain_rejection(409, true);
+    let es = Es::new(&endpoint.url, None).unwrap();
+    detect::ensure_brain_meta(&es, "edges", "brain", "nodes", 1).unwrap();
+    assert!(endpoint.state.lock().unwrap().brain_meta_present);
+}
+
+#[test]
+fn brain_meta_arbitrary_rejection_without_document_is_an_error() {
+    let endpoint = MockEndpoint::start_with_brain_rejection(400, false);
+    let es = Es::new(&endpoint.url, None).unwrap();
+    let error = detect::ensure_brain_meta(&es, "edges", "brain", "nodes", 1)
+        .expect_err("a rejected create without an existing document is not success");
+    let message = format!("{error:#}");
+    assert!(message.contains("status 400"), "{message}");
+    assert!(message.contains("brain meta rejected"), "{message}");
 }
 
 #[test]

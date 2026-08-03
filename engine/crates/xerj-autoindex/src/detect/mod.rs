@@ -624,18 +624,24 @@ pub fn ensure_brain_meta(
     body.push(b'\n');
     body.extend_from_slice(doc.to_string().as_bytes());
     body.push(b'\n');
-    let outcome = es.bulk(body).context("write brain meta doc")?;
-    if outcome.server_errors > 0 {
+    let outcome = es
+        .bulk_allow_item_rejections(body)
+        .context("write brain meta doc")?;
+    if outcome.item_errors > 0 {
+        // A concurrent creator is the only expected item rejection. Verify
+        // that it actually established the desired identity; never treat an
+        // arbitrary 4xx rejection as a successful metadata write.
+        if es.get_doc(edges_index, BRAIN_META_ID)?.is_some() {
+            return Ok(());
+        }
         return Err(anyhow!(
             "brain meta write failed: {}",
             outcome
-                .first_server_error
+                .first_error
                 .as_deref()
-                .unwrap_or("unknown server error")
+                .unwrap_or("unknown bulk item rejection")
         ));
     }
-    // item_errors here can only be the create-conflict race — the doc exists,
-    // which is exactly the state we want.
     Ok(())
 }
 
@@ -688,17 +694,7 @@ pub fn invalidate_prior_edges(es: &Es, edges_index: &str, rel: &str, now_ms: i64
             body.extend_from_slice(Value::Object(source).to_string().as_bytes());
             body.push(b'\n');
         }
-        let outcome = es.bulk(body).context("invalidate prior edges")?;
-        if outcome.server_errors > 0 || outcome.item_errors > 0 {
-            return Err(anyhow!(
-                "edge invalidation for {} was partial: {}",
-                rel,
-                outcome
-                    .first_server_error
-                    .or(outcome.first_error)
-                    .unwrap_or_else(|| "unknown bulk error".into())
-            ));
-        }
+        es.bulk(body).context("invalidate prior edges")?;
         total += hits.len() as u64;
         es.refresh(edges_index)?;
     }
