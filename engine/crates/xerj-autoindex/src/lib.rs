@@ -16,6 +16,7 @@ pub mod ids;
 pub mod infer;
 pub mod sniff;
 pub mod state;
+mod sync;
 pub mod walk;
 
 use anyhow::{Context, Result};
