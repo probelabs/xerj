@@ -2,6 +2,7 @@
 //! backoff on 429/5xx/transport errors; parses per-item bulk errors.
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -22,6 +23,18 @@ pub struct BulkOutcome {
     pub server_errors: u64,
     pub first_error: Option<String>,
     pub first_server_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingExecutionIdentity {
+    pub version: u32,
+    pub backend: String,
+    pub identity_sha256: String,
+    pub dimensions: usize,
+    pub semantic_contract: String,
+    pub resumable: bool,
+    #[serde(default)]
+    pub non_resumable_reason: Option<String>,
 }
 
 /// Ensure an autoindex index-create body pins the index to a single WAL shard.
@@ -104,6 +117,46 @@ impl Es {
             .send()
             .with_context(|| format!("endpoint unreachable: {}", self.base))?;
         Ok(resp.json().unwrap_or(Value::Null))
+    }
+
+    pub fn embedding_execution_identity(&self) -> Result<EmbeddingExecutionIdentity> {
+        let response = self
+            .req(reqwest::Method::GET, "/v1/embedding/identity")
+            .send()
+            .context("GET /v1/embedding/identity")?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "GET /v1/embedding/identity failed: HTTP {status}; semantic autoindex requires \
+                 a XERJ server that exposes a resumable embedding identity"
+            );
+        }
+        let value: Value = response
+            .json()
+            .context("parse embedding identity response")?;
+        let identity: EmbeddingExecutionIdentity = serde_json::from_value(
+            value
+                .get("data")
+                .cloned()
+                .ok_or_else(|| anyhow!("embedding identity response has no data object"))?,
+        )
+        .context("parse embedding identity")?;
+        if identity.version != 1
+            || identity.identity_sha256.len() != 64
+            || !identity
+                .identity_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || identity.dimensions == 0
+            || identity.semantic_contract != "semantic_text-derived-vector.v1"
+            || !matches!(
+                identity.backend.as_str(),
+                "lexical" | "neural" | "proxy" | "onnx-experimental"
+            )
+        {
+            anyhow::bail!("server returned an unsupported embedding execution identity");
+        }
+        Ok(identity)
     }
 
     /// GET an arbitrary path and return only the HTTP status code.
@@ -483,6 +536,32 @@ mod tests {
         )
         .unwrap();
         stream.write_all(body).unwrap();
+    }
+
+    #[test]
+    fn embedding_identity_uses_native_endpoint_and_parses_sanitized_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .starts_with("GET /v1/embedding/identity HTTP/1.1"),
+                "{}",
+                String::from_utf8_lossy(&request)
+            );
+            respond_json(
+                &mut stream,
+                br#"{"data":{"version":1,"backend":"lexical","identity_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","dimensions":384,"semantic_contract":"semantic_text-derived-vector.v1","resumable":true},"took_ms":0,"request_id":"test"}"#,
+            );
+        });
+        let es = Es::new(&format!("http://{address}"), None).unwrap();
+        let identity = es.embedding_execution_identity().unwrap();
+        assert_eq!(identity.backend, "lexical");
+        assert!(identity.resumable);
+        assert_eq!(identity.dimensions, 384);
+        server.join().unwrap();
     }
 
     #[test]

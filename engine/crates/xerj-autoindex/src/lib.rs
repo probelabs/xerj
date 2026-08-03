@@ -765,6 +765,21 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         return Ok((0, None));
     }
 
+    if plan
+        .datasets
+        .iter()
+        .any(|dataset| dataset.semantic_field.is_some())
+    {
+        let identity = es
+            .embedding_execution_identity()
+            .context("semantic autoindex could not pin the server embedding execution identity")?;
+        journal.pin_embedding_identity(
+            &identity.identity_sha256,
+            identity.resumable,
+            identity.non_resumable_reason.as_deref(),
+        )?;
+    }
+
     // ── create indices with explicit mappings ────────────────────────────
     for d in &plan.datasets {
         es.ensure_index(&d.index, &build_mapping(&d.specs))

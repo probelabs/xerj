@@ -655,6 +655,26 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(resp).into_response()
 }
 
+/// Machine-readable, privacy-safe embedding identity for resumable ingestion.
+pub async fn embedding_execution_identity(State(state): State<AppState>) -> impl IntoResponse {
+    let started = Instant::now();
+    let request_id = Uuid::new_v4().to_string();
+    match state.engine.embedding_execution_identity() {
+        Ok(identity) => Json(NativeResponse::new(
+            identity,
+            started.elapsed().as_millis() as u64,
+            &request_id,
+        ))
+        .into_response(),
+        Err(error) => native_error(
+            error.into(),
+            Some(&request_id),
+            started.elapsed().as_millis() as u64,
+        )
+        .into_response(),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // k8s probes — v0.8 8-P4
 //

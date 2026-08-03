@@ -40,7 +40,7 @@ mod bounded_ingest_resources_tests;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
-pub use engine::{Engine, HealthStatus, IndexInfo};
+pub use engine::{EmbeddingExecutionIdentity, Engine, HealthStatus, IndexInfo};
 pub use index::{
     detect_log_format, resolve_date_math, resolve_field_alias, EnrichTable, FieldEncodingInfo,
     Index, IndexResponse, IndexStats, LogFormat,

@@ -104,6 +104,10 @@ pub fn build_native_router(state: AppState) -> Router {
         .route("/v1/health", get(native::health))
         .route("/v1/health/ready", get(native::readiness))
         .route("/v1/cluster/health", get(native::cluster_health))
+        .route(
+            "/v1/embedding/identity",
+            get(native::embedding_execution_identity),
+        )
         // k8s probes — v0.8 8-P4 — see comment in `native.rs::liveness`.
         .route("/health/live", get(native::liveness))
         .route("/health/ready", get(native::readiness))
@@ -225,6 +229,13 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         // firewalled off) can still scrape metrics. Same handler as the native
         // router; gated by the optional read-only `auth.metrics_token`.
         .route("/v1/metrics", get(native::metrics))
+        // Autoindex defaults to the ES-compatible listener, so the native
+        // embedding identity contract must be available here as well as on
+        // the dedicated native listener.
+        .route(
+            "/v1/embedding/identity",
+            get(native::embedding_execution_identity),
+        )
         // ── Cluster-level ──────────────────────────────────────────────────
         .route("/", get(es_compat::es_info))
         .route("/_cluster/health", get(es_compat::cluster_health))
@@ -1105,5 +1116,37 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("Elasticsearch")
         );
+    }
+
+    #[tokio::test]
+    async fn embedding_identity_is_sanitized_machine_readable_native_data() {
+        for app in [
+            build_native_router(test_state("elasticsearch")),
+            build_es_compat_router(test_state("elasticsearch")),
+        ] {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/embedding/identity")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let data = value["data"].as_object().unwrap();
+            assert_eq!(data["backend"], "lexical");
+            assert_eq!(data["dimensions"], 384);
+            assert_eq!(data["resumable"], true);
+            assert_eq!(data["identity_sha256"].as_str().unwrap().len(), 64);
+            let encoded = String::from_utf8(bytes.to_vec()).unwrap();
+            for secret_field in ["api_key", "endpoint", "model_path", "tokenizer_path"] {
+                assert!(!encoded.contains(secret_field), "{secret_field} leaked");
+            }
+        }
     }
 }

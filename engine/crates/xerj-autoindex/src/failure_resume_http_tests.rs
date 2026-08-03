@@ -24,6 +24,7 @@ struct MockState {
     failed_once: bool,
     delete_calls: usize,
     stop: bool,
+    embedding_identity_sha256: String,
 }
 
 struct MockEndpoint {
@@ -39,6 +40,7 @@ impl MockEndpoint {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(MockState {
             fail_data_bulk,
+            embedding_identity_sha256: "a".repeat(64),
             ..MockState::default()
         }));
         let server_state = Arc::clone(&state);
@@ -99,7 +101,17 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
 
-    let response = if method == "POST" && path == "/_bulk" {
+    let response = if method == "GET" && path == "/v1/embedding/identity" {
+        let identity = state.lock().unwrap().embedding_identity_sha256.clone();
+        json!({"data": {
+            "version": 1,
+            "backend": "lexical",
+            "identity_sha256": identity,
+            "dimensions": 384,
+            "semantic_contract": "semantic_text-derived-vector.v1",
+            "resumable": true
+        }, "took_ms": 0, "request_id": "test"})
+    } else if method == "POST" && path == "/_bulk" {
         bulk_response(&body, state)
     } else if method == "POST" && path.contains("/_delete_by_query") {
         let query: Value = serde_json::from_slice(&body).unwrap();
@@ -223,6 +235,35 @@ fn event_count(state_dir: &Path, kind: &str) -> usize {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|value| value.get("kind").and_then(Value::as_str) == Some(kind))
         .count()
+}
+
+#[test]
+fn semantic_resume_rejects_embedding_identity_drift_before_another_bulk() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("report.txt"),
+        "Quarterly operating income improved materially after stronger subscription renewals. \
+         Management expects durable demand across the next reporting period.",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    config.no_semantic = false;
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    assert_eq!(event_count(state_dir.path(), "embedding_identity"), 1);
+    let bulks_before = endpoint.state.lock().unwrap().data_bulk_number;
+    endpoint.state.lock().unwrap().embedding_identity_sha256 = "b".repeat(64);
+    let error = run_index(config).unwrap_err().to_string();
+    assert!(error.contains("refusing to mix vector spaces"), "{error}");
+    assert!(error.contains("--fresh"), "{error}");
+    assert_eq!(
+        endpoint.state.lock().unwrap().data_bulk_number,
+        bulks_before,
+        "identity drift must fail before another data bulk"
+    );
 }
 
 #[test]
