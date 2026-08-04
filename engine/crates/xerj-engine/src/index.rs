@@ -13020,16 +13020,20 @@ impl Index {
 
         // Determine whether we need hit *sources* at all.
         // - size > 0          → sources for hits output
-        // - rescore/highlight → mutate source after collection
+        // - rescore           → mutates source after collection
         // - collapse          → needs source field
         // - sort on a field   → needs source
         // - aggs without DV fast path → needs sources
         // When none of these apply (classic `size:0 + match_all + track_total_hits`
         // counting query), we skip materialisation entirely and just count.
+        //
+        // `highlight` is deliberately NOT in this list (#177): it is a pure
+        // post-pass over the rendered page (`apply_highlight`), so at `size: 0`
+        // — where there is no page — it has nothing to do, and a `size: 0` body
+        // must execute identically with and without it.
         let need_hits_output: bool = size > 0;
         let need_sources_for_post: bool = need_hits_output
             || !request.rescore.is_empty()
-            || request.highlight.is_some()
             || request.collapse.is_some()
             || request
                 .sort
@@ -14088,11 +14092,20 @@ impl Index {
         // `from+size` stored-doc parses (live: the 256-doc floor was ~60% of
         // the range/term page cost).  Every excluded shape (sorts, aggs —
         // the brute agg fallback aggregates the materialised sources —
-        // rescore/collapse/highlight/explain, min_score, count-only,
+        // rescore/collapse/explain, min_score, count-only,
         // pinned's phase-4 overlay headroom) keeps the original slack
         // byte-for-byte.  Shadowed AFTER the memtable snapshot: the gate
         // requires the memtable be empty, so the earlier `fetch_limit` uses
         // are untouched.
+        //
+        // `highlight` was in the excluded list until #177.  It never belonged
+        // there — highlighting is a post-pass over the rendered page — and
+        // while the segment merge was arrival-order it made this cap
+        // observable: a body with `highlight` got 256 candidates, the same
+        // body without it got `from+size`, and the two pages carried
+        // different `_id`s and different `_score`s.  The merge now selects the
+        // global top-k by score (see the FTS admission below), so the cap
+        // controls only how much work is done, never which hits win.
         let materialisation_limit: usize = if mem_doc_count == 0
             && !deletes_present
             && size > 0
@@ -14101,7 +14114,6 @@ impl Index {
             && request.aggs.is_none()
             && request.rescore.is_empty()
             && request.collapse.is_none()
-            && request.highlight.is_none()
             && request.min_score.is_none()
             && !request.explain
             && !matches!(query, QueryNode::Pinned { .. })
@@ -14562,13 +14574,53 @@ impl Index {
                                     }
                                 }
                                 // Materialise sources for the top hits only.
-                                // `seg_hits` is score-sorted descending, so taking
-                                // the prefix that fits under `materialisation_limit`
-                                // preserves top-k ordering/scoring.
+                                // `seg_hits` is score-sorted descending, so the
+                                // prefix we take is this SEGMENT's top-k.
+                                //
+                                // #177 — across segments the collector used to be
+                                // a plain FIFO capped at `materialisation_limit`:
+                                // the first segments visited filled it and every
+                                // later segment was dropped whole, however well
+                                // its documents scored.  The page was therefore
+                                // "the best hits of whichever segments happened to
+                                // fit", not the global top-k, and it moved
+                                // whenever the cap moved — which is what made a
+                                // `highlight` block (which only widened the cap)
+                                // rewrite every `_score` and `_id`.
+                                //
+                                // `page_worst` is the lowest score currently kept,
+                                // defined only once the collector is at its cap
+                                // (below the cap nothing has to be displaced).  A
+                                // segment is opened when it can beat that, and its
+                                // descending run is walked until it can't; the
+                                // overflow is trimmed back to the cap by score
+                                // right after.  Bounded by 2×cap in the worst case.
+                                let page_worst: Option<f32> = if sort_topk.is_none()
+                                    && !count_only
+                                    && all_hits.len() >= materialisation_limit
+                                {
+                                    all_hits.iter().map(|h| h.score).fold(
+                                        None,
+                                        |acc: Option<f32>, s| {
+                                            Some(match acc {
+                                                Some(a) if a <= s => a,
+                                                _ => s,
+                                            })
+                                        },
+                                    )
+                                } else {
+                                    None
+                                };
+                                let seg_can_enter = sort_topk.is_some()
+                                    || all_hits.len() < materialisation_limit
+                                    || seg_hits
+                                        .first()
+                                        .zip(page_worst)
+                                        .is_some_and(|(sh, worst)| sh.score > worst);
                                 if !fts_sorted_handled
                                     && !count_only
                                     && !seg_hits.is_empty()
-                                    && all_hits.len() < materialisation_limit
+                                    && seg_can_enter
                                 {
                                     // F2 RANDOM-ACCESS source hydration.  The
                                     // scored FTS page needs `_source` for only
@@ -14647,17 +14699,24 @@ impl Index {
                                             }
                                         };
                                         for sh in &seg_hits {
-                                            // Page full — the rest are already
-                                            // counted in `total_count`, so stop
-                                            // decoding sources.  When a field
-                                            // sort is active we must NOT stop:
-                                            // every match has to be offered to
-                                            // the bounded top-N heap so the
-                                            // survivors are the GLOBAL top-N by
-                                            // the sort key, not the highest-
-                                            // scoring prefix.
+                                            // `seg_hits` descends by score, so once
+                                            // a hit cannot displace the worst kept
+                                            // one neither can any hit after it —
+                                            // the rest are already counted in
+                                            // `total_count`, so stop decoding
+                                            // sources.  While the collector is
+                                            // still below its cap `page_worst` is
+                                            // `None` and everything this segment
+                                            // offers is taken (at most one cap's
+                                            // worth; the trim below restores the
+                                            // bound).  When a field sort is active
+                                            // we must NOT stop: every match has to
+                                            // be offered to the bounded top-N heap
+                                            // so the survivors are the GLOBAL top-N
+                                            // by the sort key, not the
+                                            // highest-scoring prefix.
                                             if sort_topk.is_none()
-                                                && all_hits.len() >= materialisation_limit
+                                                && page_worst.is_some_and(|worst| sh.score <= worst)
                                             {
                                                 break;
                                             }
@@ -14718,6 +14777,42 @@ impl Index {
                                             } else {
                                                 all_hits.push(hit);
                                             }
+                                        }
+                                        // #177 — trim the overflow back to the cap
+                                        // by SCORE, so what survives into the next
+                                        // segment is the best `materialisation_limit`
+                                        // seen so far rather than the oldest.  The
+                                        // comparator is the one the post-loop page
+                                        // sort uses (score DESC, seq_no ASC, `_id`
+                                        // ASC), so admission and final ordering
+                                        // agree and the page is stable under any
+                                        // cap: `size:1` and `size:200` return the
+                                        // same top hit, and adding `highlight`
+                                        // returns the same page.
+                                        if sort_topk.is_none()
+                                            && all_hits.len() > materialisation_limit
+                                        {
+                                            let mut decorated: Vec<(u64, Hit)> =
+                                                std::mem::take(&mut all_hits)
+                                                    .into_iter()
+                                                    .map(|h| {
+                                                        (
+                                                            self.lookup_seq_no(&h.id)
+                                                                .unwrap_or(u64::MAX),
+                                                            h,
+                                                        )
+                                                    })
+                                                    .collect();
+                                            decorated.sort_by(|a, b| {
+                                                b.1.score
+                                                    .partial_cmp(&a.1.score)
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                                    .then_with(|| a.0.cmp(&b.0))
+                                                    .then_with(|| a.1.id.cmp(&b.1.id))
+                                            });
+                                            decorated.truncate(materialisation_limit);
+                                            all_hits =
+                                                decorated.into_iter().map(|(_, h)| h).collect();
                                         }
                                     }
                                 }
@@ -31853,8 +31948,15 @@ fn compute_field_value_factor(fvf: &FieldValueFactor, source: &Value) -> f32 {
 /// `script_score`/`script`/`distance_feature`/`rank_feature`/`_name` — any of
 /// which would need `_source` or the doc id beyond the scored field), on a
 /// "plain" request (`size > 0`, and no aggs/min_score/sort/rescore/collapse/
-/// search_after/highlight/explain/script_fields/fields). Every other shape
+/// search_after/explain/script_fields/fields). Every other shape
 /// returns `None` so the caller runs the unchanged brute stored-scan path.
+///
+/// `highlight` is ADMITTED (#177), on the same argument `scored_fast_plan`
+/// already makes for it: `function_score_columnar` hydrates `_source` for the
+/// winners, and `apply_highlight` runs over the final rendered page from that
+/// `_source` plus the query AST — no scan-time state. Bailing on it sent an
+/// otherwise identical body down the brute path, and the two paths select
+/// their pages differently, so `highlight` changed `_score` and `_id`.
 fn function_score_fast_fvf<'q>(
     query: &'q QueryNode,
     request: &SearchRequest,
@@ -31869,7 +31971,6 @@ fn function_score_fast_fvf<'q>(
         || !request.rescore.is_empty()
         || request.collapse.is_some()
         || request.search_after.is_some()
-        || request.highlight.is_some()
         || request.explain
         || request.script_fields.is_some()
         || !request.fields.is_empty()
