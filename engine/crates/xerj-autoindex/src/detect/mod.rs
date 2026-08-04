@@ -22,6 +22,7 @@ pub mod mdlink;
 pub mod pathcite;
 pub mod samedir;
 pub mod sequence;
+pub mod sharedterm;
 pub mod wikilink;
 
 #[cfg(test)]
@@ -358,6 +359,10 @@ pub struct DetectorCounters {
     pub unresolved: u64,
     /// Link targets with >1 candidate; the lexicographically smallest rel won.
     pub ambiguous: u64,
+    /// Candidate edges a density budget refused to draw (sharedterm's
+    /// per-document cap). The map's "what it did not show" is a fact about the
+    /// corpus too, and swallowing it would make a sparse map look complete.
+    pub capped: u64,
 }
 
 /// Deterministic, versioned edge detector. NO network, NO LLM, NO clock reads
@@ -368,8 +373,17 @@ pub trait EdgeDetector: Sync {
     fn tag(&self) -> &'static str;
     /// Per-section textual detection. Default: no-op.
     fn detect_text(&self, _ctx: &SectionCtx<'_>, _out: &mut Vec<EdgeDraft>) {}
-    /// Corpus-structural detection, called once after Phase A. Default: no-op.
+    /// Corpus-structural detection, called once after Phase A — before any
+    /// file is read, so it sees identities and paths only. Default: no-op.
     fn detect_structure(&self, _corpus: &CorpusIndex, _out: &mut Vec<EdgeDraft>) {}
+    /// Corpus-wide detection over the text of the whole run, called ONCE after
+    /// Phase B. This is where a detector emits edges that cannot be judged one
+    /// section at a time — sharedterm cannot know a term is distinctive until
+    /// every document's terms are in. Such a detector accumulates in
+    /// `detect_text` behind interior mutability and emits here; determinism is
+    /// its own responsibility, since Phase B's worker interleaving is not.
+    /// Default: no-op.
+    fn detect_corpus(&self, _corpus: &CorpusIndex, _out: &mut Vec<EdgeDraft>) {}
     /// Run-summary honesty counters (default: nothing to report). Detectors
     /// that resolve link targets keep these in atomics so the counts survive
     /// the shared `&self` the parallel Phase B workers hold.
@@ -389,6 +403,7 @@ pub fn default_detectors() -> Vec<Box<dyn EdgeDetector>> {
         Box::new(cratecite::Cratecite::default()),
         Box::new(sequence::Sequence),
         Box::new(samedir::SameDir),
+        Box::new(sharedterm::SharedTerm::default()),
     ]
 }
 
@@ -404,6 +419,7 @@ pub fn detector_tag_for(edge_type: &str) -> &'static str {
         cratecite::EDGE_TYPE => cratecite::TAG,
         sequence::EDGE_TYPE => sequence::TAG,
         samedir::EDGE_TYPE => samedir::TAG,
+        sharedterm::EDGE_TYPE => sharedterm::TAG,
         _ => "unknown@0",
     }
 }

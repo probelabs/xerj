@@ -329,13 +329,16 @@ the section text. The quote is the full trimmed line containing that offset,
 clipped to 240 characters (`detect::line_at`, `detect/mod.rs:416`). The same
 path is mirrored into the top-level `src_file` field.
 
-Two of the seven detectors do not have an author's sentence to quote, because
-they fire on file layout rather than on text. They record a generated rationale
-in the same field instead, with offset 0:
+Three of the eight detectors do not have an author's sentence to quote, because
+they fire on file layout or on statistics rather than on a sentence someone
+wrote. They record a generated rationale in the same field instead, with
+offset 0:
 
 - `samedir` writes `"<a> and <b> share directory <dir>"` (`detect/samedir.rs:54`)
 - `sequence` writes `"<label> precedes <label> of <file>"`, or
   `"<label> opens <file>"` for the first section (`detect/sequence.rs:40`)
+- `sharedterm` writes `"<a> and <b> share N distinctive terms: …"`, naming the
+  words that produced the link, rarest first (`detect/sharedterm.rs`)
 
 The console reads that distinction back out and renders it differently: a quote
 is shown in quotation marks, a structural rationale is shown prefixed with
@@ -352,11 +355,11 @@ fill the gap.
 The honest claim is "every link shows its evidence", not "every link has a
 quote".
 
-## The seven detectors, and what they do not do
+## The eight detectors, and what they do not do
 
-Seven detectors ship. They are the complete contents of
+Eight detectors ship. They are the complete contents of
 `engine/crates/xerj-autoindex/src/detect/`, registered in
-`detect::default_detectors` (`detect/mod.rs:383`):
+`detect::default_detectors` (`detect/mod.rs`):
 
 | Detector | Edge `type` | `detector` tag | Weight | Confidence | Fires on |
 |---|---|---|---|---|---|
@@ -367,6 +370,7 @@ Seven detectors ship. They are the complete contents of
 | `cratecite` | `cratecite` | `cratecite@1` | 0.5 | 0.6 | a crate directory name in prose, linking to that directory's `Cargo.toml` |
 | `sequence` | `sequence` | `sequence@2` | 0.8 | 0.99 | the file card, then each section preceding the next within one file |
 | `samedir` | `same_dir` | `samedir@2` | 0.3 | 0.4 | files sharing a directory, chained in path order, never a clique |
+| `sharedterm` | `shared_term` | `sharedterm@1` | 0.45 | 0.5 | two documents using the same distinctive words, capped at 5 links per document |
 
 The `@N` suffix on the tag is the detector version. It is bumped on any
 behaviour change, so old edges stay attributable to the rules that produced
@@ -378,20 +382,46 @@ file mtimes, because edge identity is a hash of `(src, type, dst, valid_at)` and
 `valid_at` is the source file's mtime rather than the wall clock
 (`detect/mod.rs:316`).
 
-**All seven detectors are structural. They find explicit citations and file
-layout. None of them looks at what a document is about.** If two documents cover
-the same topic but neither links to nor names the other, no detector will
-connect them. Point XERJ at a folder of recipes and sourdough will not connect
-to kimchi, even though both are fermentation. A corpus of plain-text notes that
-do not cross-reference each other produces a graph whose only edges are
-`sequence` within each file and `same_dir` between neighbouring files.
+**Seven of the eight are structural: they find explicit citations and file
+layout.** `sharedterm` is the only one that reads what a document says, and it
+reads it as WORDS, not as meaning. It links two documents when both use the same
+distinctive terms, and the edge carries those terms so the link can be checked.
+Sourdough connects to kimchi when both pages actually say "ferments" and
+"lactobacillus". It does not connect them when one says "cultured" and the other
+says "fermented" — and note there is no stemming either, so "ferment",
+"ferments" and "fermentation" are three unrelated terms to this detector.
+Nothing in this path is a model: XERJ's built-in embedder is lexical feature
+hashing and `sharedterm` does not use even that, it compares words as strings.
+Describe it as shared vocabulary, never as semantic understanding.
 
-This is a known gap, not a bug, and it is tracked as
-[issue #164](https://github.com/xerj-org/xerj/issues/164), "Second brain cannot
-connect documents by topic, only by explicit citation". A shared-term detector
-is proposed there. Until it lands, do not expect topic linking, and read
-`same_dir` for what it is: directory co-location, weighted 0.3, the floor of the
-detector set, standing in for a topic signal that does not exist yet.
+Two limits follow from how it decides what "distinctive" means:
+
+- A term in more than 10% of the corpus is that corpus's own vocabulary and is
+  ignored — which means a folder of **ten documents or fewer produces no
+  `shared_term` edges at all**, because a term in two of ten documents is in 20%
+  of them. Small folders are still connected by `same_dir` and `sequence`.
+- A link needs at least two shared word families. One word in common is a
+  coincidence, and without stemming "trajectory" and "trajectories" are two
+  terms but one word, so they are counted as one.
+- Each document takes at most 5 `shared_term` links, so a folder where
+  everything resembles everything cannot become a hairball. Candidate links the
+  cap refused are counted and reported by the indexing run as `edges_capped`,
+  rather than disappearing.
+
+Measured on a library of 240 arXiv PDFs filed in 24 topic folders: the seven
+structural detectors produced 11,854 edges, of which 11,642 joined sections of
+one document and 212 chained directory neighbours — no edge crossed a folder,
+because nothing in that corpus cites anything. `sharedterm` added 462 edges,
+377 of them across folders. Against the corpus's own filing, a random pair of
+those documents shares a top-level topic 17.0% of the time and `shared_term`
+links do so 35.9% of the time: about twice chance. Read that as the honest
+strength of the signal — useful, and no substitute for reading the evidence on
+the edge.
+
+This closes [issue #164](https://github.com/xerj-org/xerj/issues/164), "Second
+brain cannot connect documents by topic, only by explicit citation" — for
+documents that share wording. Documents that share a subject without sharing
+words remain unlinked, and that gap is real.
 
 ## The hop cap
 

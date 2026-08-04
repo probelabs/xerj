@@ -149,6 +149,7 @@ impl EdgeDetector for Href {
         DetectorCounters {
             unresolved: self.unresolved.load(Ordering::Relaxed),
             ambiguous: 0,
+            capped: 0,
         }
     }
 }

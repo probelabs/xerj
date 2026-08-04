@@ -117,6 +117,7 @@ impl EdgeDetector for Wikilink {
         DetectorCounters {
             unresolved: self.unresolved.load(Ordering::Relaxed),
             ambiguous: self.ambiguous.load(Ordering::Relaxed),
+            capped: 0,
         }
     }
 }

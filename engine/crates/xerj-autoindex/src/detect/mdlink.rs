@@ -91,6 +91,7 @@ impl EdgeDetector for Mdlink {
         DetectorCounters {
             unresolved: self.unresolved.load(Ordering::Relaxed),
             ambiguous: 0,
+            capped: 0,
         }
     }
 }

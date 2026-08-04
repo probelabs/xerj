@@ -106,6 +106,7 @@ impl EdgeDetector for Cratecite {
         DetectorCounters {
             unresolved: 0,
             ambiguous: self.ambiguous.load(Ordering::Relaxed),
+            capped: 0,
         }
     }
 }
