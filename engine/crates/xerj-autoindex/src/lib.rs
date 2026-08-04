@@ -198,9 +198,6 @@ fn take_pdf_spool_if_indexable<T>(
         spool.take();
         None
     } else {
-        if spool.is_some() {
-            budget.record_phase_b_eligible();
-        }
         spool.take()
     }
 }
@@ -291,23 +288,30 @@ fn scan_file(
                 // The inventory digest was computed before Phase A. Only hand
                 // bytes to Phase B when the source still matches that exact
                 // generation after the parser has finished reading it.
-                match content::verify(path, size, digest) {
-                    Ok(()) => {
-                        out.pdf_spool = spool;
-                        out.pdf_spool_fallbacks.extend(fallback);
-                    }
-                    Err(error) => {
-                        if spool.is_some() {
-                            pdf_spool_budget.record_discarded_before_replay();
+                // If no reusable artifact exists, avoid a second full-file
+                // read: Phase B performs the authoritative generation check
+                // immediately before its ordinary reparse.
+                if spool.is_none() {
+                    out.pdf_spool_fallbacks.extend(fallback);
+                } else {
+                    match content::verify(path, size, digest) {
+                        Ok(()) => {
+                            out.pdf_spool = spool;
+                            out.pdf_spool_fallbacks.extend(fallback);
                         }
-                        pdf_spool_budget.record_source_generation_changed();
-                        out.pdf_spool_fallbacks.extend(fallback);
-                        out.pdf_spool_fallbacks.push(extract::pdf::SpoolFallback {
-                            category: "source_generation_changed",
-                            message: format!(
-                                "source generation changed after extraction: {error:#}"
-                            ),
-                        });
+                        Err(error) => {
+                            if spool.is_some() {
+                                pdf_spool_budget.record_discarded_before_replay();
+                            }
+                            pdf_spool_budget.record_source_generation_changed();
+                            out.pdf_spool_fallbacks.extend(fallback);
+                            out.pdf_spool_fallbacks.push(extract::pdf::SpoolFallback {
+                                category: "source_generation_changed",
+                                message: format!(
+                                    "source generation changed after extraction: {error:#}"
+                                ),
+                            });
+                        }
                     }
                 }
                 Ok(stats)
@@ -769,7 +773,15 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         for (path, fallback) in &pdf_reparse_reasons {
             pdf_spool_budget.record_fallback_example(path, fallback.category, &fallback.message);
         }
-        if !pdf_reparse_reasons.is_empty() && !cfg.quiet {
+        if !pdf_reparse_reasons.is_empty()
+            && !cfg.quiet
+            && pdf_spool_budget.platform_reuse_is_unavailable()
+        {
+            eprintln!(
+                "phase A: run-local PDF extraction reuse is unavailable on this platform; \
+                 phase B will use the normal parser"
+            );
+        } else if !pdf_reparse_reasons.is_empty() && !cfg.quiet {
             eprintln!(
                 "phase A: {} PDF extraction(s) could not retain a bounded run-local artifact; \
                  phase B will parse them again safely",
@@ -1011,6 +1023,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         // created in this process can prove that its first publication is
         // genuinely fresh and skip the delete round trip.
         cleanup_required.extend(todo.iter().map(|&i| keys[i].clone()));
+    }
+    let todo_set: std::collections::HashSet<usize> = todo.iter().copied().collect();
+    for (index, spool) in pdf_spools.iter_mut().enumerate() {
+        if spool.is_none() {
+            continue;
+        }
+        if todo_set.contains(&index) {
+            pdf_spool_budget.record_phase_b_eligible();
+        } else {
+            pdf_spool_budget.record_discarded_before_replay();
+            spool.take();
+        }
     }
     // Every publication, including a fresh one, receives durable intent
     // before its first bulk. A failed fresh publication therefore skips the
@@ -1422,7 +1446,29 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                         };
                         let res = if sn.family == Family::Pdf {
                             match pdf_spool {
-                                Some(spool) => spool.replay(f.size, expected_digest, &mut sink),
+                                Some(spool) => {
+                                    match spool.replay(f.size, expected_digest, &mut sink) {
+                                        Ok(stats) => Ok(stats),
+                                        Err(replay_error) => {
+                                            // Replay verifies the complete
+                                            // artifact before `deliver`
+                                            // invokes the sink, so falling
+                                            // back here cannot duplicate a
+                                            // partially staged record stream.
+                                            pdf_spool_budget
+                                                .record_replay_fallback(&f.rel, &replay_error);
+                                            pdf_spool_budget.record_reparse();
+                                            extract::extract(&f.path, &sn, None, &mut sink)
+                                                .with_context(|| {
+                                                    format!(
+                                                        "reparse {} after run-local PDF artifact \
+                                                         verification failed: {replay_error:#}",
+                                                        f.rel
+                                                    )
+                                                })
+                                        }
+                                    }
+                                }
                                 None => {
                                     pdf_spool_budget.record_reparse();
                                     extract::extract(&f.path, &sn, None, &mut sink)

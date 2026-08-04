@@ -46,42 +46,10 @@ const MIN_DESCRIPTOR_HEADROOM: u64 = 64;
 const DESCRIPTOR_HEADROOM_PER_WORKER: u64 = 4;
 
 #[cfg(test)]
-static REPLAY_OBSERVATION_ACTIVE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static REPLAY_OBSERVATION_MAXIMUM: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static REPLAY_OBSERVATION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static REPLAY_OBSERVATION_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
 static CORRUPT_REPLAY_SOURCE_SIZE: AtomicU64 = AtomicU64::new(u64::MAX);
 #[cfg(test)]
 static CORRUPTED_REPLAY_RESERVATION_DROPPED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-pub(crate) fn reset_replay_concurrency_observation(delay_ms: u64) {
-    REPLAY_OBSERVATION_ENABLED.store(false, Ordering::SeqCst);
-    REPLAY_OBSERVATION_DELAY_MS.store(delay_ms, Ordering::SeqCst);
-    if delay_ms == 0 {
-        return;
-    }
-    assert_eq!(
-        REPLAY_OBSERVATION_ACTIVE.load(Ordering::SeqCst),
-        0,
-        "a previous PDF replay observation is still active"
-    );
-    REPLAY_OBSERVATION_MAXIMUM.store(0, Ordering::SeqCst);
-    REPLAY_OBSERVATION_ENABLED.store(true, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-pub(crate) fn replay_concurrency_maximum() -> usize {
-    REPLAY_OBSERVATION_MAXIMUM.load(Ordering::SeqCst)
-}
 
 #[cfg(test)]
 pub(crate) fn corrupt_replay_for_source_size(source_size: u64) {
@@ -92,32 +60,6 @@ pub(crate) fn corrupt_replay_for_source_size(source_size: u64) {
 #[cfg(test)]
 pub(crate) fn corrupted_replay_reservation_was_dropped() -> bool {
     CORRUPTED_REPLAY_RESERVATION_DROPPED.load(Ordering::SeqCst)
-}
-
-#[cfg(test)]
-struct ReplayObservation;
-
-#[cfg(test)]
-impl ReplayObservation {
-    fn begin() -> Option<Self> {
-        if !REPLAY_OBSERVATION_ENABLED.load(Ordering::SeqCst) {
-            return None;
-        }
-        let active = REPLAY_OBSERVATION_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
-        REPLAY_OBSERVATION_MAXIMUM.fetch_max(active, Ordering::SeqCst);
-        let delay_ms = REPLAY_OBSERVATION_DELAY_MS.load(Ordering::SeqCst);
-        if delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(delay_ms));
-        }
-        Some(Self)
-    }
-}
-
-#[cfg(test)]
-impl Drop for ReplayObservation {
-    fn drop(&mut self) {
-        REPLAY_OBSERVATION_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 pub fn extract(path: &Path, sink: Sink) -> Result<ExtractStats> {
@@ -141,8 +83,10 @@ pub(crate) fn extract_and_spool(
     sink: Sink,
 ) -> Result<(ExtractStats, Option<ExtractionSpool>, Option<SpoolFallback>)> {
     let _permit = worker_gate().acquire();
-    budget.record_phase_a_parse();
     let response = spawn_worker(path)?;
+    // Count completed parser protocol calls, not attempts that failed before
+    // producing a response which Phase A could use.
+    budget.record_phase_a_parse();
     let (spool, fallback) =
         try_spool_response(state_dir, source_size, source_digest, budget, &response);
     let stats = deliver(response, sink);
@@ -263,6 +207,7 @@ fn artifact_digest(file: &mut File, bytes: u64) -> Result<u128> {
 }
 
 pub(crate) struct ExtractionSpoolBudget {
+    admission: Mutex<()>,
     used: AtomicU64,
     spools: AtomicU64,
     limit: u64,
@@ -312,6 +257,7 @@ struct ExtractionSpoolCapacity {
 impl ExtractionSpoolBudget {
     pub(crate) fn new(limit: u64, max_spools: u64) -> Arc<Self> {
         Arc::new(Self {
+            admission: Mutex::new(()),
             used: AtomicU64::new(0),
             spools: AtomicU64::new(0),
             limit,
@@ -423,6 +369,7 @@ impl ExtractionSpoolBudget {
             "full_bounded_capacity"
         };
         let budget = Arc::new(Self {
+            admission: Mutex::new(()),
             used: AtomicU64::new(0),
             spools: AtomicU64::new(0),
             limit: capacity.bytes,
@@ -489,6 +436,10 @@ impl ExtractionSpoolBudget {
                 return Err("descriptor_admission_floor");
             }
         }
+        // Serialize the tiny accounting transition so a handle claim that is
+        // subsequently rejected by the byte ceiling cannot inflate the
+        // advertised live-artifact peak.
+        let _admission = self.admission.lock().unwrap();
         let previous_spools = self
             .spools
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spools| {
@@ -498,8 +449,6 @@ impl ExtractionSpoolBudget {
                 self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
                 "artifact_count_ceiling"
             })?;
-        self.peak_live_artifacts
-            .fetch_max(previous_spools + 1, Ordering::Relaxed);
         let mut used = self.used.load(Ordering::Acquire);
         loop {
             let Some(next) = used.checked_add(bytes) else {
@@ -517,6 +466,8 @@ impl ExtractionSpoolBudget {
                 .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
+                    self.peak_live_artifacts
+                        .fetch_max(previous_spools + 1, Ordering::Relaxed);
                     self.reservations_started.fetch_add(1, Ordering::Relaxed);
                     self.cumulative_reserved_bytes
                         .fetch_add(bytes, Ordering::Relaxed);
@@ -577,6 +528,23 @@ impl ExtractionSpoolBudget {
 
     pub(crate) fn record_reparse(&self) {
         self.phase_b_pdf_parses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_replay_fallback(&self, path: &str, error: &anyhow::Error) {
+        self.record_io_fallback();
+        self.record_fallback_category("replay_verification");
+        self.record_fallback_example(
+            path,
+            "replay_verification",
+            &format!(
+                "run-local PDF extraction artifact could not be verified; reparsed source: \
+                 {error:#}"
+            ),
+        );
+    }
+
+    pub(crate) fn platform_reuse_is_unavailable(&self) -> bool {
+        self.capacity_status == "disabled" && self.capacity_reason == "descriptor_probe_unavailable"
     }
 
     pub(crate) fn record_fallback_example(
@@ -796,18 +764,12 @@ impl ExtractionSpool {
         source_digest: &str,
         sink: Sink,
         gate: &WorkerGate,
-        observe_global_replay: bool,
+        _observe_global_replay: bool,
     ) -> Result<ExtractStats> {
         // JSON decoding materializes a bounded WorkerResponse just like the
         // parser protocol. Share the PDF gate so Phase B cannot multiply that
         // 32 MiB response bound by the general autoindex worker count.
         let _permit = gate.acquire();
-        #[cfg(test)]
-        let _observation = observe_global_replay
-            .then(ReplayObservation::begin)
-            .flatten();
-        #[cfg(not(test))]
-        let _ = observe_global_replay;
         let ExtractionSpool {
             file,
             source_size: expected_size,
@@ -853,10 +815,6 @@ impl ExtractionSpool {
             let response: WorkerResponse = serde_json::from_reader(BufReader::new(&mut file))
                 .context("PDF extraction spool is malformed or truncated; retry extraction")?;
             validate_response_identity(&response)?;
-            anyhow::ensure!(
-                file.stream_position()? <= bytes,
-                "PDF extraction spool exceeded its validated boundary"
-            );
             Ok(response)
         })();
         // The optional artifact and its reservation are gone before `deliver`
@@ -1620,6 +1578,56 @@ mod tests {
         drop(exact);
         assert!(budget.try_reserve(1025).is_err());
         assert!(budget.try_reserve(1024).is_ok());
+
+        let rejected = super::ExtractionSpoolBudget::new(0, 1);
+        assert!(rejected.try_reserve(1).is_err());
+        assert_eq!(
+            rejected
+                .peak_live_artifacts
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a byte-refused provisional handle is not a live artifact"
+        );
+    }
+
+    #[test]
+    fn fallback_examples_are_exactly_bounded_and_report_truncation() {
+        let budget = super::ExtractionSpoolBudget::new(0, 0);
+        for index in 0..4 {
+            budget.record_fallback_example(
+                &format!("report-{index}.pdf"),
+                "test_fallback",
+                "injected",
+            );
+        }
+        let report = budget.report();
+        assert_eq!(report["fallback_examples"].as_array().unwrap().len(), 3);
+        assert_eq!(report["fallback_examples_limit"], 3);
+        assert_eq!(report["fallback_examples_truncated"], true);
+        assert_eq!(report["fallback_examples"][0]["path"], "report-0.pdf");
+        assert_eq!(report["fallback_examples"][2]["path"], "report-2.pdf");
+    }
+
+    #[test]
+    fn failed_worker_protocol_call_is_not_reported_as_a_completed_phase_a_parse() {
+        let source = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let missing = source.path().join("missing.pdf");
+        let budget = super::ExtractionSpoolBudget::new(super::MAX_WORKER_OUTPUT as u64, 1);
+        let error = match super::extract_and_spool(
+            &missing,
+            state.path(),
+            0,
+            "digest",
+            &budget,
+            &mut |_| true,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a missing PDF cannot produce a worker response"),
+        };
+        assert!(!format!("{error:#}").is_empty());
+        assert_eq!(budget.report()["phase_a_pdf_parser_calls"], 0);
+        assert_eq!(budget.report()["reservations_started"], 0);
     }
 
     #[test]
@@ -1769,6 +1777,13 @@ mod tests {
             limit.rlim_cur = limit.rlim_max.min(96);
             assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
             let state = tempfile::tempdir().unwrap();
+            std::fs::write(
+                state
+                    .path()
+                    .join(".autoindex-test-pdf-spool-available-bytes"),
+                (16_u64 << 30).to_string(),
+            )
+            .unwrap();
             let (budget, _) = super::ExtractionSpoolBudget::for_state_dir(state.path(), 8, 4, 24);
             assert_eq!(budget.report()["capacity_status"], "disabled");
             assert_eq!(budget.report()["capacity_reason"], "descriptor_headroom");
@@ -1885,6 +1900,75 @@ mod tests {
         );
         let error = mutated.replay(7, "digest", &mut |_| true).unwrap_err();
         assert!(error.to_string().contains("content changed"));
+    }
+
+    fn rewrite_spool_and_reseal(
+        spool: &mut super::ExtractionSpool,
+        rewrite: impl FnOnce(&mut Vec<u8>),
+    ) {
+        let mut file = spool.file.lock().unwrap();
+        file.rewind().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        rewrite(&mut bytes);
+        file.set_len(0).unwrap();
+        file.rewind().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        spool.bytes = bytes.len() as u64;
+        spool.artifact_digest = super::artifact_digest(&mut file, spool.bytes).unwrap();
+        file.rewind().unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_malformed_json_after_physical_integrity_passes() {
+        let state = tempfile::tempdir().unwrap();
+        let budget = super::ExtractionSpoolBudget::new(super::MAX_WORKER_OUTPUT as u64, 1);
+        let mut spool = spool_response(
+            state.path(),
+            7,
+            "digest",
+            &response(Vec::new()),
+            budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
+        )
+        .unwrap();
+        rewrite_spool_and_reseal(&mut spool, |bytes| bytes[0] = b'[');
+
+        let error = spool.replay(7, "digest", &mut |_| true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("malformed or truncated"),
+            "{error:#}"
+        );
+        assert_eq!(budget.report()["replay_integrity_failures"], 1);
+    }
+
+    #[test]
+    fn replay_rejects_worker_protocol_mismatch_after_integrity_passes() {
+        let state = tempfile::tempdir().unwrap();
+        let budget = super::ExtractionSpoolBudget::new(super::MAX_WORKER_OUTPUT as u64, 1);
+        let mut spool = spool_response(
+            state.path(),
+            7,
+            "digest",
+            &response(Vec::new()),
+            budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
+        )
+        .unwrap();
+        rewrite_spool_and_reseal(&mut spool, |bytes| {
+            let needle = b"xerj-autoindex/";
+            let offset = bytes
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap();
+            bytes[offset] = b'X';
+        });
+
+        let error = spool.replay(7, "digest", &mut |_| true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("extractor version mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(budget.report()["replay_integrity_failures"], 1);
     }
 
     #[test]

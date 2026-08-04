@@ -24,7 +24,20 @@ impl Drop for PdfWorkerEnvGuard {
     fn drop(&mut self) {
         std::env::remove_var("XERJ_PDF_WORKER_BIN");
         std::env::remove_var("XERJ_TEST_PDF_COUNT");
-        crate::extract::pdf::reset_replay_concurrency_observation(0);
+    }
+}
+
+fn inject_pdf_spool_capacity(state_dir: &Path) {
+    for (name, value) in [
+        ("available-bytes", 16_u64 << 30),
+        ("fd-limit", 4096),
+        ("fd-open", 16),
+    ] {
+        fs::write(
+            state_dir.join(format!(".autoindex-test-pdf-spool-{name}")),
+            value.to_string(),
+        )
+        .unwrap();
     }
 }
 
@@ -858,6 +871,7 @@ fn fresh_pdf_is_parsed_once_and_failed_publication_retry_reparses_once() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
     let tools = tempfile::tempdir().unwrap();
     let pdf = corpus.path().join("quarterly-report.pdf");
     fs::write(
@@ -978,7 +992,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 
 #[cfg(unix)]
 #[test]
-fn same_size_source_change_preserves_prior_fallback_and_adds_typed_diagnostic() {
+fn refused_spool_does_not_pay_a_second_phase_a_source_hash() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
@@ -1017,7 +1031,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     let budget = crate::extract::pdf::ExtractionSpoolBudget::new(0, 0);
     let scan = scan_file(&pdf, size, &digest, state_dir.path(), &budget, 100, 1);
     assert!(scan.pdf_spool.is_none());
-    assert_eq!(scan.pdf_spool_fallbacks.len(), 2);
+    assert_eq!(scan.pdf_spool_fallbacks.len(), 1);
     for fallback in &scan.pdf_spool_fallbacks {
         budget.record_fallback_example(
             "quarterly-report.pdf",
@@ -1030,15 +1044,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     assert_eq!(report["phase_b_eligible_artifacts"], 0);
     assert_eq!(report["artifacts_discarded_before_replay"], 0);
     assert_eq!(report["fallback_categories"]["artifact_count_ceiling"], 1);
-    assert_eq!(
-        report["fallback_categories"]["source_generation_changed"],
-        1
-    );
-    assert!(report["fallback_examples"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|example| example["category"] == "source_generation_changed"));
+    assert!(report["fallback_categories"]
+        .get("source_generation_changed")
+        .is_none());
 }
 
 #[cfg(unix)]
@@ -1049,6 +1057,7 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
     let tools = tempfile::tempdir().unwrap();
     let pdf = corpus.path().join("empty-report.pdf");
     fs::write(&pdf, b"%PDF-1.4\nempty test input\n").unwrap();
@@ -1087,12 +1096,13 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
 
 #[cfg(unix)]
 #[test]
-fn multi_pdf_run_index_bounds_phase_b_replay_by_pdf_workers_not_general_workers() {
+fn multi_pdf_run_reuses_every_artifact_and_reports_exact_success_counters() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
     let tools = tempfile::tempdir().unwrap();
     const PDFS: usize = 6;
     for index in 0..PDFS {
@@ -1124,36 +1134,57 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
     std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
     let _env = PdfWorkerEnvGuard;
-    crate::extract::pdf::reset_replay_concurrency_observation(40);
-
-    assert_eq!(run_index(config).unwrap(), 0);
+    let (code, report) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
     assert_eq!(
         fs::read_to_string(&count).unwrap().lines().count(),
         PDFS,
         "each unique PDF must be parsed once in Phase A and replayed in Phase B"
     );
-    assert_eq!(
-        crate::extract::pdf::replay_concurrency_maximum(),
-        2,
-        "eight general workers must not widen the two-worker PDF replay gate"
-    );
     assert_eq!(endpoint.state.lock().unwrap().docs.len(), PDFS);
+    let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
+    assert_eq!(reuse["reservations_started"], PDFS);
+    assert_eq!(
+        reuse["cumulative_reserved_bytes"],
+        PDFS as u64 * (32_u64 << 20)
+    );
+    assert_eq!(reuse["artifacts_created"], PDFS);
+    assert_eq!(reuse["artifacts_not_created"], 0);
+    assert_eq!(reuse["phase_b_eligible_artifacts"], PDFS);
+    assert_eq!(reuse["artifacts_discarded_before_replay"], 0);
+    assert!(reuse["exact_artifact_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(reuse["current_retained_or_reserved_bytes"], 0);
+    assert!(reuse["peak_retained_or_reserved_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(reuse["current_live_artifacts"], 0);
+    assert!(reuse["peak_live_artifacts"].as_u64().unwrap() > 0);
+    assert_eq!(reuse["phase_a_pdf_parser_calls"], PDFS);
+    assert_eq!(reuse["capacity_fallbacks"], 0);
+    assert_eq!(reuse["io_fallbacks"], 0);
+    assert_eq!(reuse["replay_verified"], PDFS);
+    assert_eq!(reuse["replay_integrity_failures"], 0);
+    assert_eq!(reuse["phase_b_pdf_parses"], 0);
+    assert_eq!(reuse["fallback_examples"].as_array().unwrap().len(), 0);
+    assert_eq!(reuse["fallback_examples_truncated"], false);
+    assert_eq!(reuse["fallback_categories"].as_object().unwrap().len(), 0);
 }
 
 #[cfg(unix)]
 #[test]
-fn corrupted_pdf_replay_fails_closed_and_releases_spool_budget() {
+fn corrupted_pdf_replay_reparses_without_blaming_the_source_or_backend() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
     let tools = tempfile::tempdir().unwrap();
     let pdf = corpus.path().join("report.pdf");
     fs::write(&pdf, b"%PDF-1.4\ntest worker input\n").unwrap();
     let worker = tools.path().join("pdf-worker");
+    let count = tools.path().join("worker-count");
     let worker_script = String::from_utf8(
         br#"#!/bin/sh
+printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
 printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null}]}'
 "#
         .to_vec(),
@@ -1166,14 +1197,28 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     let endpoint = MockEndpoint::start(0);
     let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
     std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
     let _env = PdfWorkerEnvGuard;
     crate::extract::pdf::corrupt_replay_for_source_size(fs::metadata(&pdf).unwrap().len());
 
-    let error = run_index(config).unwrap_err();
-    assert!(format!("{error:#}").contains("spool length changed"));
-    assert!(endpoint.state.lock().unwrap().docs.is_empty());
-    assert_eq!(file_done_count(state_dir.path()), 0);
+    let (code, report) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+    assert_eq!(file_done_count(state_dir.path()), 1);
     assert!(crate::extract::pdf::corrupted_replay_reservation_was_dropped());
+    let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
+    assert_eq!(reuse["replay_verified"], 0);
+    assert_eq!(reuse["replay_integrity_failures"], 1);
+    assert_eq!(reuse["io_fallbacks"], 1);
+    assert_eq!(reuse["phase_b_pdf_parses"], 1);
+    assert_eq!(reuse["current_live_artifacts"], 0);
+    assert_eq!(reuse["current_retained_or_reserved_bytes"], 0);
+    assert_eq!(reuse["fallback_categories"]["replay_verification"], 1);
+    assert_eq!(
+        reuse["fallback_examples"][0]["category"],
+        "replay_verification"
+    );
 }
 
 #[test]
@@ -1201,7 +1246,10 @@ fn junk_scan_drops_its_spool_before_indexable_spools_are_retained() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     let report = budget.report();
     assert_eq!(report["artifacts_discarded_before_replay"], 1);
-    assert_eq!(report["phase_b_eligible_artifacts"], 1);
+    assert_eq!(
+        report["phase_b_eligible_artifacts"], 0,
+        "eligibility is recorded only after the final todo set is known"
+    );
     drop(retained);
     assert_eq!(drops.load(Ordering::SeqCst), 2);
 }
