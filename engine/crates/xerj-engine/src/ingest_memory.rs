@@ -7,9 +7,10 @@
 //!
 //! `summary` is the only enabled mode in v1: it emits bounded periodic
 //! start/snapshot/stop NDJSON. Lifecycle `EventKind` variants and merge/cache
-//! categories are reserved schema vocabulary; until their owners are wired,
-//! their measurements are `unavailable` and their gauges must not be treated
-//! as measured zero.
+//! categories are reserved schema vocabulary. Merge materialization categories
+//! are wired at their owning allocations; builder-internal FTS and doc-value
+//! memory remains outside this schema and must not be inferred from the merge
+//! gauges.
 //!
 //! `MemtableActive` is sampled from the engine while `FlushDrained` is owned at
 //! the authoritative drain boundary. Those authorities cannot be sampled
@@ -490,6 +491,9 @@ fn measurement(category: Category) -> Measurement {
         | Category::ParsedSource
         | Category::PreparedDocument
         | Category::FlushDrained
+        | Category::MergeDecoded
+        | Category::MergeSurvivor
+        | Category::MergeParsed
         | Category::CacheStoredSlices
         | Category::CacheDocValues
         | Category::CacheStoredValues
@@ -497,7 +501,7 @@ fn measurement(category: Category) -> Measurement {
         | Category::CacheIdPositions
         | Category::CacheRowSequences
         | Category::CacheDecodedStored => Measurement::Estimated,
-        _ => Measurement::Unavailable,
+        Category::MergeJsonBuffer | Category::MergeEncoded => Measurement::ExactCapacity,
     }
 }
 
@@ -532,6 +536,18 @@ impl Retained<'static> {
             category: Category::HttpBody,
             bytes: 0,
             active: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn for_optional_ledger(
+        ledger: Option<&'static Ledger>,
+        category: Category,
+        bytes: usize,
+    ) -> Self {
+        match ledger {
+            Some(ledger) => Self::for_ledger(ledger, category, bytes),
+            None => Self::disabled(),
         }
     }
 }
@@ -769,6 +785,20 @@ mod tests {
         );
         assert_eq!(TraceConfig::parse("summary", "1").sample_ms, 25);
         assert_eq!(TraceConfig::parse("summary", "999999").sample_ms, 60_000);
+    }
+
+    #[test]
+    fn wired_merge_categories_report_their_measurement_authority() {
+        for category in [
+            Category::MergeDecoded,
+            Category::MergeSurvivor,
+            Category::MergeParsed,
+        ] {
+            assert_eq!(measurement(category), Measurement::Estimated);
+        }
+        for category in [Category::MergeJsonBuffer, Category::MergeEncoded] {
+            assert_eq!(measurement(category), Measurement::ExactCapacity);
+        }
     }
 
     #[test]

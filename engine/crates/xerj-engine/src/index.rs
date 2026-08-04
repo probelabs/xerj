@@ -1754,6 +1754,36 @@ impl<'a> Drop for MergeFlagClear<'a> {
     }
 }
 
+fn merge_survivor_retained_capacity(survivors: &[(u64, String, String)], capacity: usize) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<(u64, String, String)>())
+        .saturating_add(
+            survivors
+                .iter()
+                .map(|(_, id, raw)| id.capacity().saturating_add(raw.capacity()))
+                .sum::<usize>(),
+        )
+}
+
+fn merge_parsed_entry_retained_estimate(
+    id: &String,
+    fields: &HashMap<String, String>,
+    source: &Value,
+) -> usize {
+    let field_slots = fields
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(String, String)>() + std::mem::size_of::<usize>());
+    id.capacity()
+        .saturating_add(field_slots)
+        .saturating_add(
+            fields
+                .iter()
+                .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        )
+        .saturating_add(crate::ingest_memory::estimated_json_heap(source))
+}
+
 #[cfg(test)]
 mod merge_publication_transaction_tests {
     use super::*;
@@ -1802,6 +1832,145 @@ mod merge_publication_transaction_tests {
         index.flush().await.unwrap();
         assert_eq!(index.store.snapshot().segments.len(), 2);
         (engine, index)
+    }
+
+    fn attribution_config(dir: &TempDir) -> xerj_common::config::Config {
+        let mut config = config(dir);
+        config.merge.min_segments = 5;
+        config.merge.min_merge_count = 5;
+        config.merge.max_merge_count = 5;
+        config
+    }
+
+    async fn attribution_fixture(dir: &TempDir) -> (Engine, Arc<Index>) {
+        let engine = Engine::new(attribution_config(dir)).unwrap();
+        engine
+            .create_index("merge-attribution", Schema::empty())
+            .unwrap();
+        let index = engine.get_index("merge-attribution").unwrap();
+        for segment in 0..4 {
+            let id = format!("doc-{segment:02}-00");
+            let body = format!(
+                "segment {segment} {}",
+                (0..1024)
+                    .map(|token| format!("s{segment}t{token}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            index
+                .index_document(
+                    Some(id),
+                    serde_json::json!({
+                        "body": body,
+                        "company": format!("company-{segment}"),
+                        "year": 2020 + segment,
+                        "quarter": segment + 1,
+                        "page": 1,
+                        "path": format!("report-{segment}.pdf"),
+                    }),
+                )
+                .await
+                .unwrap();
+            index.flush().await.unwrap();
+        }
+        assert!(index.delete_document("doc-00-00").await.unwrap());
+        index.flush().await.unwrap();
+        assert_eq!(index.store.snapshot().segments.len(), 5);
+        (engine, index)
+    }
+
+    fn assert_merge_attribution_balanced(ledger: &crate::ingest_memory::Ledger) {
+        use crate::ingest_memory::{Category, Measurement};
+
+        for (category, measurement) in [
+            (Category::MergeDecoded, Measurement::Estimated),
+            (Category::MergeSurvivor, Measurement::Estimated),
+            (Category::MergeJsonBuffer, Measurement::ExactCapacity),
+            (Category::MergeParsed, Measurement::Estimated),
+            (Category::MergeEncoded, Measurement::ExactCapacity),
+        ] {
+            let gauge = ledger.gauge(category, measurement);
+            assert_eq!(
+                gauge.current, 0,
+                "{category:?} must release its owner on every exit"
+            );
+            assert!(
+                gauge.peak > 0,
+                "{category:?} must observe its real merge owner"
+            );
+        }
+        assert_eq!(ledger.accounting_errors(), 0);
+    }
+
+    async fn assert_attribution_documents(index: &Index) {
+        assert!(index.get_document("doc-00-00").await.unwrap().is_none());
+        for id in ["doc-01-00", "doc-02-00", "doc-03-00"] {
+            assert!(index.get_document(id).await.unwrap().is_some(), "{id}");
+        }
+        assert_eq!(
+            index
+                .search(&SearchRequest::default())
+                .await
+                .unwrap()
+                .total
+                .value,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_memory_categories_peak_and_balance_on_success_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let (engine, index) = attribution_fixture(&dir).await;
+        let ledger = Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let merged = crate::ingest_memory::with_test_ledger(ledger, index.run_merge_once()).await;
+        assert_eq!(merged.unwrap(), 1);
+        assert_merge_attribution_balanced(ledger);
+        assert_eq!(index.store.snapshot().segments.len(), 1);
+        assert_attribution_documents(&index).await;
+        drop(index);
+        drop(engine);
+
+        let reopened = Engine::new(attribution_config(&dir)).unwrap();
+        let reopened_index = reopened.get_index("merge-attribution").unwrap();
+        assert_eq!(reopened_index.store.snapshot().segments.len(), 1);
+        assert_attribution_documents(&reopened_index).await;
+    }
+
+    #[tokio::test]
+    async fn merge_memory_categories_balance_on_injected_build_failure() {
+        let dir = TempDir::new().unwrap();
+        let (engine, index) = attribution_fixture(&dir).await;
+        let input_ids: std::collections::HashSet<_> = index
+            .store
+            .snapshot()
+            .segments
+            .iter()
+            .map(|meta| meta.id.clone())
+            .collect();
+        index
+            .test_fail_merge_after_attribution
+            .store(true, Ordering::Release);
+        let ledger = Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        let result = crate::ingest_memory::with_test_ledger(ledger, index.run_merge_once()).await;
+        assert!(result.is_err());
+        assert_merge_attribution_balanced(ledger);
+        let after_ids: std::collections::HashSet<_> = index
+            .store
+            .snapshot()
+            .segments
+            .iter()
+            .map(|meta| meta.id.clone())
+            .collect();
+        assert_eq!(after_ids, input_ids);
+        assert_attribution_documents(&index).await;
+        drop(index);
+        drop(engine);
+
+        let reopened = Engine::new(attribution_config(&dir)).unwrap();
+        let reopened_index = reopened.get_index("merge-attribution").unwrap();
+        assert_eq!(reopened_index.store.snapshot().segments.len(), 5);
+        assert_attribution_documents(&reopened_index).await;
     }
 
     async fn wait_for_repoint(index: &Index) {
@@ -4657,6 +4826,8 @@ pub struct Index {
     #[cfg(test)]
     test_fail_merge_before_apply: Arc<AtomicBool>,
     #[cfg(test)]
+    test_fail_merge_after_attribution: Arc<AtomicBool>,
+    #[cfg(test)]
     test_pause_merge_before_apply: Arc<AtomicBool>,
     #[cfg(test)]
     test_merge_repoint_ready: Arc<AtomicBool>,
@@ -5325,6 +5496,8 @@ impl Index {
             #[cfg(test)]
             test_fail_merge_before_apply: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
+            test_fail_merge_after_attribution: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             test_pause_merge_before_apply: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_merge_repoint_ready: Arc::new(AtomicBool::new(false)),
@@ -5706,6 +5879,8 @@ impl Index {
             test_panic_after_merge_publish: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_fail_merge_before_apply: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_fail_merge_after_attribution: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_pause_merge_before_apply: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -7999,6 +8174,9 @@ impl Index {
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
+            let ingest_memory_ledger = crate::ingest_memory::active_ledger();
+            #[cfg(test)]
+            let fail_after_attribution = Arc::clone(&self.test_fail_merge_after_attribution);
 
             tokio::task::spawn_blocking(move || -> Option<MergeOutput> {
                 // Entire merge encode runs on the dedicated SMALL merge
@@ -8052,6 +8230,13 @@ impl Index {
 
                     let mut merged_json_buf: Vec<u8> = Vec::with_capacity(60 * 1024 * 1024);
                     merged_json_buf.push(b'[');
+                    let mut merged_json_retained =
+                        crate::ingest_memory::Retained::for_optional_ledger(
+                            ingest_memory_ledger,
+                            crate::ingest_memory::Category::MergeJsonBuffer,
+                            merged_json_buf.capacity(),
+                        );
+                    let mut tracked_json_capacity = merged_json_buf.capacity();
                     let mut first_doc = true;
                     let mut live_doc_count: u64 = 0;
 
@@ -8073,6 +8258,12 @@ impl Index {
                     // Halves merge working memory and frees the Arc<Value>
                     // immediately after both passes complete.
                     let mut fts_input: Vec<(String, HashMap<String, String>, Value)> = Vec::new();
+                    let mut parsed_retained = crate::ingest_memory::Retained::for_optional_ledger(
+                        ingest_memory_ledger,
+                        crate::ingest_memory::Category::MergeParsed,
+                        0,
+                    );
+                    let mut parsed_entries_retained = 0usize;
                     // (seq_no, doc_id) for every surviving doc — kept exactly
                     // aligned with the stored-section byte copy (pushed right
                     // after `live_doc_count += 1`, BEFORE the per-doc Value
@@ -8097,6 +8288,13 @@ impl Index {
                     // stays ~1× stored size + the fts_input Values, unchanged
                     // from the M5.22 profile.
                     let mut survivors: Vec<(u64, String, String)> = Vec::new();
+                    let mut survivors_retained =
+                        crate::ingest_memory::Retained::for_optional_ledger(
+                            ingest_memory_ledger,
+                            crate::ingest_memory::Category::MergeSurvivor,
+                            0,
+                        );
+                    let mut survivor_retained_bytes = 0usize;
 
                     // RC4 W2 #14 — union of the inputs' SEQ-AWARE tombstone
                     // sections (ZTB2), max seq per doc.  A load-bearing
@@ -8245,6 +8443,20 @@ impl Index {
                                     return None;
                                 }
                             };
+                        let decoded_retained = crate::ingest_memory::Retained::for_optional_ledger(
+                            ingest_memory_ledger,
+                            crate::ingest_memory::Category::MergeDecoded,
+                            stored_bytes
+                                .capacity()
+                                .saturating_add(
+                                    raw_docs
+                                        .capacity()
+                                        .saturating_mul(std::mem::size_of::<Box<RawValue>>()),
+                                )
+                                .saturating_add(
+                                    raw_docs.iter().map(|raw| raw.get().len()).sum::<usize>(),
+                                ),
+                        );
 
                         for raw in &raw_docs {
                             let raw_str = raw.get();
@@ -8282,7 +8494,16 @@ impl Index {
                                 raw_str.to_string(),
                             ));
                         }
+                        if ingest_memory_ledger.is_some() {
+                            survivor_retained_bytes =
+                                merge_survivor_retained_capacity(&survivors, survivors.capacity());
+                            survivors_retained = survivors_retained.replace(
+                                crate::ingest_memory::Category::MergeSurvivor,
+                                survivor_retained_bytes,
+                            );
+                        }
                         // raw_docs + stored_bytes drop here — segment RAM reclaimed.
+                        drop(decoded_retained);
                     }
 
                     // Global insertion-order (_seq_no) sort — see the B1 note
@@ -8294,11 +8515,20 @@ impl Index {
                     // frees each raw String right after its bytes are copied
                     // into `merged_json_buf`, keeping peak memory ~1× stored.
                     for (seq_no, id_str, raw_str) in survivors {
+                        let drained_string_capacity =
+                            id_str.capacity().saturating_add(raw_str.capacity());
                         if !first_doc {
                             merged_json_buf.push(b',');
                         }
                         first_doc = false;
                         merged_json_buf.extend_from_slice(raw_str.as_bytes());
+                        if merged_json_buf.capacity() != tracked_json_capacity {
+                            tracked_json_capacity = merged_json_buf.capacity();
+                            merged_json_retained = merged_json_retained.replace(
+                                crate::ingest_memory::Category::MergeJsonBuffer,
+                                tracked_json_capacity,
+                            );
+                        }
                         live_doc_count += 1;
                         // Pushed BEFORE the per-doc Value parse that can
                         // `continue` — the .ids side-car must cover every
@@ -8308,13 +8538,49 @@ impl Index {
                         // Per-doc Value parse for FTS / DV builders.
                         let doc_value: Value = match serde_json::from_str(&raw_str) {
                             Ok(v) => v,
-                            Err(_) => continue,
+                            Err(_) => {
+                                if ingest_memory_ledger.is_some() {
+                                    survivor_retained_bytes = survivor_retained_bytes
+                                        .saturating_sub(drained_string_capacity);
+                                    survivors_retained = survivors_retained.replace(
+                                        crate::ingest_memory::Category::MergeSurvivor,
+                                        survivor_retained_bytes,
+                                    );
+                                }
+                                continue;
+                            }
                         };
                         let source = doc_value.get("_source").cloned().unwrap_or(Value::Null);
                         let fields =
                             extract_fts_fields_excluding(&source, &excluded_fts_fields_for_task);
                         fts_input.push((id_str, fields, source));
+                        if ingest_memory_ledger.is_some() {
+                            survivor_retained_bytes =
+                                survivor_retained_bytes.saturating_sub(drained_string_capacity);
+                            survivors_retained = survivors_retained.replace(
+                                crate::ingest_memory::Category::MergeSurvivor,
+                                survivor_retained_bytes,
+                            );
+                            if let Some((id, fields, source)) = fts_input.last() {
+                                parsed_entries_retained = parsed_entries_retained.saturating_add(
+                                    merge_parsed_entry_retained_estimate(id, fields, source),
+                                );
+                            }
+                            let parsed_capacity = fts_input
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(
+                                    String,
+                                    HashMap<String, String>,
+                                    Value,
+                                )>())
+                                .saturating_add(parsed_entries_retained);
+                            parsed_retained = parsed_retained.replace(
+                                crate::ingest_memory::Category::MergeParsed,
+                                parsed_capacity,
+                            );
+                        }
                     }
+                    drop(survivors_retained);
 
                     if live_doc_count == 0 {
                         return None;
@@ -8332,6 +8598,12 @@ impl Index {
                     };
                     let encoded = xerj_storage::stored_codec::encode_stored_v2(&merged_json_buf);
                     drop(merged_json_buf);
+                    drop(merged_json_retained);
+                    let encoded_retained = crate::ingest_memory::Retained::for_optional_ledger(
+                        ingest_memory_ledger,
+                        crate::ingest_memory::Category::MergeEncoded,
+                        encoded.capacity(),
+                    );
                     if let Err(e) = writer.add_section(SectionType::Stored, &encoded) {
                         tracing::error!("merge ABORTED: failed to add section: {e}");
                         failed_for_task.fetch_add(1, Ordering::Relaxed);
@@ -8458,6 +8730,17 @@ impl Index {
                             }
                         }
                     }
+
+                    #[cfg(test)]
+                    if fail_after_attribution.swap(false, Ordering::AcqRel) {
+                        failed_for_task.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+
+                    drop(encoded);
+                    drop(encoded_retained);
+                    drop(fts_input);
+                    drop(parsed_retained);
 
                     Some((
                         batch_for_task,
