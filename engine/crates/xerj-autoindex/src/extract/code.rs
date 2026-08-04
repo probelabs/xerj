@@ -330,14 +330,67 @@ const JAVA_Q: &str = r#"
 // preprocessor form (`preproc_ifdef`, `preproc_if`, nesting) is unbounded and
 // each extra level re-admits in-function declarations, so it is left alone:
 // missing a symbol is recoverable, filling `defs` with locals is not.
+//
+// ── #172: the header API surface. Measured over valkey + memcached at
+// /home/claude/.xerj-code/corpora/kv-oss (547 .c, 360 .h). "in-body" below
+// counts captures with a `compound_statement` ancestor, i.e. the locals trap.
+//
+// Prototypes (`int do_thing(int);`) are `declaration` + `function_declarator`,
+// a different node from `function_definition`, so none were captured — a C
+// library's whole callable API was missing from `defs`. These two patterns are
+// deliberately NOT anchored to `translation_unit`, against the shape of the
+// rest of this query, because real headers are guarded: anchored, the prototype
+// pattern captures 689 names (176 in headers); unanchored it captures 3871
+// (3285 in headers). Unanchoring is safe HERE and nowhere else in C, because
+// the pattern demands a `function_declarator` — declaring a function inside a
+// function body is legal but vanishingly rare: 14 of 3871 (0.4%) were in-body,
+// and of those 9 are a macro misparse (`JEMALLOC_CC_SILENCE_INIT`) and the rest
+// are genuine local prototypes. Contrast the bare `(declaration declarator:
+// (identifier))` that #170 measured: 6666 captures, 6033 (90%) in-body.
+// The `pointer_declarator` variant is separate because `char *f(void);` wraps
+// the `function_declarator` one level deeper: 652 more (546 in headers), 0
+// in-body. Two levels (`char **f(void);`) is 10 captures corpus-wide and is not
+// worth a third pattern. The same wrapper gap existed on `function_definition`,
+// where it was costing 1477 pointer-returning function definitions (4 in-body,
+// all macro misparses of real top-level functions).
+//
+// `extern int global_counter;` has no initialiser, so the `init_declarator`
+// patterns above never saw it. The `extern` keyword itself is the precision
+// filter — it is an anonymous token inside `storage_class_specifier`, and
+// matching it lets these three stay unanchored (so guarded headers work) at
+// 153 + 28 + 20 = 201 captures with 2 in-body, both genuine `extern` statements
+// declaring globals inside a function. Without the keyword the same shape is
+// the 90%-locals trap above. `static int x;` at file scope (no initialiser) is
+// still missed; it needs an anchored pattern and is not this bug.
+//
+// `preproc_def` now requires a `value:` — an include guard's `#define FOO_H`
+// has an EMPTY replacement list and so no `value` child, while `#define
+// MAX_ITEMS 128` has `value: (preproc_arg)` (verified in the grammar, not
+// assumed). That drops 564 of 5255 `#define` captures: 284 are `_H`-suffixed
+// guard names, the rest are valueless build knobs (`LUA_CORE`, `_GNU_SOURCE`,
+// `LTTNG_UST_TRACEPOINT_DEFINE`). The cost is real and was measured: 21 files
+// lose their last symbol and go back to zero-symbol (#170's failure mode), but
+// in 14 of them the lost symbol was the file's own include guard and in the
+// other 7 a build knob, so no file lost a constant anyone would search for.
+// Whole-corpus zero-symbol files still improve on the pre-#172 query for
+// headers via the prototype patterns: .c 9→17, .h 10→17 zero, against 6201
+// newly captured API names. A name-shape regex (`#not-match?` on `FOO_H`) was
+// the alternative; it would keep the build knobs but it is a heuristic on
+// spelling, and it misses guards like `MATH_C_`, so the grammar-level rule won.
 const C_Q: &str = r#"
 (function_definition declarator: (function_declarator declarator: (identifier) @function))
+(function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @function)))
+(declaration declarator: (function_declarator declarator: (identifier) @function))
+(declaration declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @function)))
 (struct_specifier name: (type_identifier) @struct)
 (enum_specifier name: (type_identifier) @enum)
 (type_definition declarator: (type_identifier) @type)
-(preproc_def name: (identifier) @const)
+(preproc_def name: (identifier) @const value: (preproc_arg))
 (translation_unit (declaration declarator: (init_declarator declarator: (identifier) @static)))
 (translation_unit (declaration declarator: (init_declarator declarator: (array_declarator declarator: (identifier) @static))))
+(declaration (storage_class_specifier "extern") declarator: (identifier) @static)
+(declaration (storage_class_specifier "extern") declarator: (pointer_declarator declarator: (identifier) @static))
+(declaration (storage_class_specifier "extern") declarator: (array_declarator declarator: (identifier) @static))
 "#;
 
 const CPP_Q: &str = r#"
@@ -544,6 +597,101 @@ mod tests {
         let s = syms("c", "#define MIN(a,b) ((a)<(b)?(a):(b))\n#define LIMIT 4\n");
         assert!(has(&s, "LIMIT", "const"), "got {s:?}");
         assert!(!has(&s, "MIN", "const"), "captured a function macro: {s:?}");
+    }
+
+    /// The header probe from #172, unguarded. A header is prototypes and
+    /// `extern`s; before this both were invisible, so a C library's callable
+    /// API never reached `defs` and `do_thing` could not be found.
+    #[test]
+    fn c_header_api_surface() {
+        let s = syms(
+            "c",
+            "#define MAX_ITEMS 128\n\
+             extern int global_counter;\n\
+             extern char *global_name;\n\
+             extern struct thing global_table[];\n\
+             struct thing { int x; };\n\
+             int do_thing(int a);\n\
+             char *dup_thing(const char *s);\n",
+        );
+        assert!(has(&s, "do_thing", "function"), "got {s:?}");
+        assert!(has(&s, "dup_thing", "function"), "got {s:?}");
+        assert!(has(&s, "global_counter", "static"), "got {s:?}");
+        assert!(has(&s, "global_name", "static"), "got {s:?}");
+        assert!(has(&s, "global_table", "static"), "got {s:?}");
+        assert!(has(&s, "MAX_ITEMS", "const"), "got {s:?}");
+        assert!(has(&s, "thing", "struct"), "got {s:?}");
+    }
+
+    /// The same header behind an include guard. Everything sits one level
+    /// deeper (`translation_unit > preproc_ifdef > …`), which is why the
+    /// prototype and `extern` patterns are unanchored — and the guard's own
+    /// `#define` must NOT become a constant, which is what it used to do.
+    #[test]
+    fn c_include_guard_is_not_a_constant() {
+        let s = syms(
+            "c",
+            "#ifndef GUARDED_H\n\
+             #define GUARDED_H\n\
+             #define MAX_ITEMS 128\n\
+             extern int global_counter;\n\
+             struct thing { int x; };\n\
+             int do_thing(int a);\n\
+             #endif\n",
+        );
+        assert!(!has(&s, "GUARDED_H", "const"), "captured a guard: {s:?}");
+        assert!(has(&s, "MAX_ITEMS", "const"), "got {s:?}");
+        assert!(has(&s, "do_thing", "function"), "got {s:?}");
+        assert!(has(&s, "global_counter", "static"), "got {s:?}");
+        assert!(has(&s, "thing", "struct"), "got {s:?}");
+    }
+
+    /// The precision half of the prototype/`extern` patterns. Unanchoring them
+    /// is only safe because each demands a shape a local cannot have; a bare
+    /// declaration inside a function body must stay out of `defs` (measured at
+    /// 90% locals if it does not — #170).
+    #[test]
+    fn c_locals_still_excluded() {
+        let s = syms(
+            "c",
+            "int do_thing(int a);\n\
+             void f(void) {\n\
+                 int local;\n\
+                 char *ptr;\n\
+                 int table[4];\n\
+                 struct thing *node;\n\
+                 (void)local; (void)ptr; (void)table; (void)node;\n\
+             }\n",
+        );
+        assert!(has(&s, "do_thing", "function"), "got {s:?}");
+        assert!(has(&s, "f", "function"), "got {s:?}");
+        assert!(!has(&s, "local", "static"), "captured a local: {s:?}");
+        assert!(!has(&s, "ptr", "static"), "captured a local: {s:?}");
+        assert!(!has(&s, "table", "static"), "captured a local: {s:?}");
+        assert!(!has(&s, "node", "static"), "captured a local: {s:?}");
+    }
+
+    /// A pointer-returning function wraps its `function_declarator` in a
+    /// `pointer_declarator`, so it needs its own pattern — 1477 definitions and
+    /// 652 prototypes in the measured corpus went missing without it.
+    #[test]
+    fn c_pointer_returning_functions() {
+        let s = syms(
+            "c",
+            "char *sdsnew(const char *init);\nchar *sdsdup(char *s) { return s; }\n",
+        );
+        assert!(has(&s, "sdsnew", "function"), "got {s:?}");
+        assert!(has(&s, "sdsdup", "function"), "got {s:?}");
+    }
+
+    /// The deliberate cost of the empty-replacement-list rule: a valueless
+    /// build knob is dropped along with the guards. Documented as a test so a
+    /// future reader sees it was a choice, not an oversight.
+    #[test]
+    fn c_valueless_define_is_dropped() {
+        let s = syms("c", "#define LUA_CORE\n#define LIMIT 4\n");
+        assert!(has(&s, "LIMIT", "const"), "got {s:?}");
+        assert!(!has(&s, "LUA_CORE", "const"), "got {s:?}");
     }
     #[test]
     fn cpp() {
