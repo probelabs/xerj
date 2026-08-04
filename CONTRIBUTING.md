@@ -75,6 +75,8 @@ git push origin <type>/<short-slug>        # open a PR against main
 
 ## Pull requests
 
+For non-trivial changes, use the repository's [contribution review protocol](./docs/CONTRIBUTION_REVIEW.md) before submission. It covers stateful changes, recovery behavior, legacy data, feature-gated CI, deterministic tests, and evidence for performance or resource claims.
+
 Before opening a PR, please make sure:
 
 - [ ] `cargo build --release` succeeds.

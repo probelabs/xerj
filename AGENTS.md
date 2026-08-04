@@ -10,6 +10,7 @@
 - **Builds are scoped:** `cd engine && cargo build --release -j 32 -p <crate>` — never workspace-wide, never `cargo clean`.
 - **The hard gate:** the ES-YAML conformance suite must stay at 1360 passed / 0 failed / 3 skipped before any engine change lands (see "Running the conformance tests" in the README).
 - **Git discipline:** non-trivial changes land with full commit bodies (motivation, before/after numbers, root cause, file pointers) — the git history is the project's engineering log; read it before re-deriving decisions.
+- **Review discipline:** before submitting or updating a non-trivial change, run the applicable audit in [docs/CONTRIBUTION_REVIEW.md](./docs/CONTRIBUTION_REVIEW.md). In particular, audit the effective diff and ancestry, preserve existing workflows and recovery paths, test failure atomicity and durable-state transitions, and support user-visible or performance claims with repository-visible evidence.
 
 ## Where to look
 
@@ -21,6 +22,7 @@
 | The flagship feature's evaluation | [demo/usecases/autoindex/](./demo/usecases/autoindex/) (80/81 adversarial ground-truth exam, agent-vs-grep scorecard, scale report) |
 | Benchmark methodology & per-cell results | [demo/playbooks/](./demo/playbooks/) |
 | Architecture map | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) |
+| Pre-submission and review protocol | [docs/CONTRIBUTION_REVIEW.md](./docs/CONTRIBUTION_REVIEW.md) |
 
 ## How to evaluate this project fairly
 
