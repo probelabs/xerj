@@ -23466,9 +23466,14 @@ pub(crate) fn embedding_execution_identity(
     if backend == "proxy" && !proxy_initializes(cfg) {
         backend = "lexical";
     }
-    let (material, resumable, reason) = match backend {
+    let (material, dimensions, resumable, reason) = match backend {
         "lexical" => (
-            "lexical-feature-hash.v1;dimensions=384".to_string(),
+            format!(
+                "lexical-feature-hash.v1;dimensions={};algorithm-probe={}",
+                xerj_ai::local::DEFAULT_DIMS,
+                lexical_algorithm_probe_sha256()
+            ),
+            Some(xerj_ai::local::DEFAULT_DIMS),
             true,
             None,
         ),
@@ -23487,12 +23492,14 @@ pub(crate) fn embedding_execution_identity(
                     identity.pooling,
                     identity.max_tokens
                 ),
+                Some(identity.dimensions),
                 true,
                 None,
             )
         }
         "neural" => (
             format!("neural-unpinned.v1;configured-model={}", cfg.neural_model),
+            None,
             false,
             Some(
                 "the neural model is not content-addressed; use a fresh autoindex state after changing it"
@@ -23501,6 +23508,7 @@ pub(crate) fn embedding_execution_identity(
         ),
         "proxy" => (
             format!("proxy-unpinned.v1;configured-model={}", cfg.default_model),
+            None,
             false,
             Some(
                 "the remote provider does not attest immutable model assets; semantic resume is unsafe"
@@ -23514,11 +23522,38 @@ pub(crate) fn embedding_execution_identity(
         version: 1,
         backend: backend.to_string(),
         identity_sha256: format!("{:x}", Sha256::digest(canonical.as_bytes())),
-        dimensions: xerj_ai::local::DEFAULT_DIMS,
+        dimensions,
         semantic_contract: CONTRACT.to_string(),
         resumable,
         non_resumable_reason: reason,
     })
+}
+
+/// Fingerprint representative output from the zero-config embedder.
+///
+/// The lexical backend has no model asset to hash, so its identity must be
+/// bound to executable behaviour instead. Encoding each `f32` as little-endian
+/// bytes makes the material stable across host endianness. If tokenisation,
+/// feature weights, hashing, normalisation, or the default width changes, this
+/// digest (and therefore the resume identity) changes automatically.
+fn lexical_algorithm_probe_sha256() -> String {
+    use sha2::{Digest, Sha256};
+
+    const PROBES: &[&str] = &[
+        "",
+        "The quick brown fox jumps over the lazy dog.",
+        "Revenue grew 12.5% in Q4 2025; naïve café 東京.",
+        "snake_case/path-like:value + punctuation!",
+    ];
+    let mut digest = Sha256::new();
+    for probe in PROBES {
+        digest.update((probe.len() as u64).to_le_bytes());
+        digest.update(probe.as_bytes());
+        for value in xerj_ai::local::local_embed(probe, xerj_ai::local::DEFAULT_DIMS) {
+            digest.update(value.to_le_bytes());
+        }
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn proxy_config(
@@ -23669,8 +23704,12 @@ mod embedding_identity_tests {
         assert_eq!(identity.backend, "lexical");
         assert!(identity.resumable);
         assert_eq!(
+            lexical_algorithm_probe_sha256(),
+            "e6240f3d323831d621fd69a62b39ad70b7efba72e58e949362fdb7f5d53eea53"
+        );
+        assert_eq!(
             identity.identity_sha256,
-            "177b14d1bdff634335a99d558343ce506f39d758942f24a6455830e5a36ddda6"
+            "58a7576ccc1497ee471418bb6e8918c7e5a837161792992e1e213a2dcb2ebdbe"
         );
         let encoded = serde_json::to_string(&identity).unwrap();
         assert!(!encoded.contains("endpoint"));
@@ -23687,6 +23726,7 @@ mod embedding_identity_tests {
         #[cfg(feature = "neural")]
         {
             assert_eq!(neural_identity.backend, "neural");
+            assert_eq!(neural_identity.dimensions, None);
             assert!(!neural_identity.resumable);
         }
         #[cfg(not(feature = "neural"))]
@@ -23702,8 +23742,10 @@ mod embedding_identity_tests {
         };
         let identity = embedding_execution_identity(&proxy).unwrap();
         assert_eq!(identity.backend, "proxy");
+        assert_eq!(identity.dimensions, None);
         assert!(!identity.resumable);
         let encoded = serde_json::to_string(&identity).unwrap();
+        assert!(!encoded.contains("dimensions"));
         assert!(!encoded.contains("secret.example"));
         assert!(!encoded.contains("private-alias"));
 
@@ -23909,7 +23951,7 @@ mod embedding_identity_tests {
         let identity = identity.await.unwrap();
         assert_eq!(identity.backend, "onnx-experimental");
         assert_eq!(vectors.len(), 1);
-        assert_eq!(vectors[0].len(), identity.dimensions);
+        assert_eq!(Some(vectors[0].len()), identity.dimensions);
         let snapshot = configured_onnx_assets(&cfg).unwrap();
         assert_eq!(
             identity.identity_sha256,

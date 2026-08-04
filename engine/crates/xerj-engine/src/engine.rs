@@ -23,7 +23,13 @@ pub struct EmbeddingExecutionIdentity {
     pub version: u32,
     pub backend: String,
     pub identity_sha256: String,
-    pub dimensions: usize,
+    /// Output width when it is part of the pinned execution contract.
+    ///
+    /// Neural and proxy identities deliberately omit this: the configured
+    /// name/endpoint does not prove the width of the model that will load or
+    /// answer later.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
     pub semantic_contract: String,
     pub resumable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -30,7 +30,8 @@ pub struct EmbeddingExecutionIdentity {
     pub version: u32,
     pub backend: String,
     pub identity_sha256: String,
-    pub dimensions: usize,
+    #[serde(default)]
+    pub dimensions: Option<usize>,
     pub semantic_contract: String,
     pub resumable: bool,
     #[serde(default)]
@@ -147,7 +148,9 @@ impl Es {
                 .identity_sha256
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            || identity.dimensions == 0
+            || identity.dimensions == Some(0)
+            || (matches!(identity.backend.as_str(), "lexical" | "onnx-experimental")
+                && identity.dimensions.is_none())
             || identity.semantic_contract != "semantic_text-derived-vector.v1"
             || !matches!(
                 identity.backend.as_str(),
@@ -560,7 +563,31 @@ mod tests {
         let identity = es.embedding_execution_identity().unwrap();
         assert_eq!(identity.backend, "lexical");
         assert!(identity.resumable);
-        assert_eq!(identity.dimensions, 384);
+        assert_eq!(identity.dimensions, Some(384));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unpinned_embedding_identity_may_honestly_omit_dimensions() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with("GET /v1/embedding/identity HTTP/1.1"));
+            respond_json(
+                &mut stream,
+                br#"{"data":{"version":1,"backend":"proxy","identity_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","semantic_contract":"semantic_text-derived-vector.v1","resumable":false,"non_resumable_reason":"remote assets are not pinned"},"took_ms":0,"request_id":"test"}"#,
+            );
+        });
+        let identity = Es::new(&format!("http://{address}"), None)
+            .unwrap()
+            .embedding_execution_identity()
+            .unwrap();
+        assert_eq!(identity.backend, "proxy");
+        assert_eq!(identity.dimensions, None);
+        assert!(!identity.resumable);
         server.join().unwrap();
     }
 

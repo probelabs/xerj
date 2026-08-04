@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Semantic autoindex resume now pins the server's embedding execution
+  identity.** Existing state directories that already contain completed
+  semantic files predate that identity marker and therefore fail closed rather
+  than risk mixing incompatible vector spaces. Rebuild with `--fresh` and a new
+  `--prefix`; restoring the exact original server identity is sufficient only
+  for state that already contains a marker. Neural and proxy backends remain
+  usable for fresh runs but are not resumable because their loaded assets are
+  not yet content-addressed. The identity endpoint omits `dimensions` for those
+  unpinned backends instead of guessing a model width.
+
 ## [1.0.0-rc.10] - 2026-08-03
 
 ### Security
