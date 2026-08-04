@@ -56,11 +56,11 @@ pub fn catalog_mapping() -> Value {
         .expect("catalog mapping properties");
     properties.insert(
         "started".into(),
-        json!({"type": "date", "format": "strict_date_optional_time"}),
+        json!({"type": "date", "format": "strict_date_optional_time||epoch_millis"}),
     );
     properties.insert(
         "summary_generated_at".into(),
-        json!({"type": "date", "format": "strict_date_optional_time"}),
+        json!({"type": "date", "format": "strict_date_optional_time||epoch_millis"}),
     );
     properties.insert(
         "invocation_telemetry_scope".into(),

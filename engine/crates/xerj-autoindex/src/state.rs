@@ -142,6 +142,10 @@ pub struct FileDone {
     pub records: u64,
     pub junk: u64,
     pub bytes: u64,
+    /// Field values dropped by coercion, grouped by the dataset whose
+    /// inferred schema rejected them. Older journals predate this accounting.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub dropped_by_dataset: HashMap<String, u64>,
     /// Content generation committed by this record. Legacy completions have
     /// no generation and cannot commit a newer pending replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -556,6 +560,7 @@ mod compatibility_tests {
             records: 6_001,
             junk: 0,
             bytes: 100,
+            dropped_by_dataset: HashMap::new(),
             generation: Some("old-generation".into()),
         };
         journal.file_done(&old).unwrap();
@@ -628,6 +633,7 @@ mod compatibility_tests {
                 records: 2,
                 junk: 0,
                 bytes: 20,
+                dropped_by_dataset: HashMap::new(),
                 generation: Some("generation-2".into()),
             })
             .unwrap();
@@ -708,6 +714,7 @@ mod compatibility_tests {
                 records: 10,
                 junk: 0,
                 bytes: 10,
+                dropped_by_dataset: HashMap::new(),
                 generation: Some("old".into()),
             })
             .unwrap_err();
@@ -732,6 +739,7 @@ mod compatibility_tests {
                     records: 2,
                     junk: 0,
                     bytes: 20,
+                    dropped_by_dataset: HashMap::new(),
                     generation: Some("new".into()),
                 })
                 .unwrap_err();
@@ -769,6 +777,7 @@ mod compatibility_tests {
                 records: 2,
                 junk: 0,
                 bytes: 20,
+                dropped_by_dataset: HashMap::new(),
                 generation: Some("generation-c".into()),
             })
             .unwrap_err();
@@ -783,6 +792,7 @@ mod compatibility_tests {
                 records: 3,
                 junk: 0,
                 bytes: 30,
+                dropped_by_dataset: HashMap::new(),
                 generation: Some("generation-d".into()),
             })
             .unwrap();
@@ -800,6 +810,7 @@ mod compatibility_tests {
                 records: 2,
                 junk: 0,
                 bytes: 20,
+                dropped_by_dataset: HashMap::new(),
                 generation: Some("generation-c".into()),
             })
             .unwrap();

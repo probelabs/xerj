@@ -440,15 +440,28 @@ pub fn derive_brain_name(root: &Path) -> String {
     }
 }
 
-/// Source bytes durably represented by each dataset.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DurableDatasetStats {
+    bytes: u64,
+    junk: u64,
+    dropped: u64,
+}
+
+/// Source metadata durably represented by each dataset.
 ///
 /// `FileDone` is the commit record for a successfully published canonical
 /// source. A source can feed more than one inferred dataset (for example, a
 /// workbook or database with multiple tables), so each distinct assigned
 /// dataset reports the complete source bytes it depends on. Repeated groups
-/// within the same dataset count the source only once.
-fn durable_dataset_bytes(plan: &Plan, done: &HashMap<String, FileDone>) -> HashMap<String, u64> {
-    let mut bytes_by_dataset = HashMap::new();
+/// within the same dataset count the source only once. Parser-level junk has
+/// no group after extraction rejects it, so it retains the historical
+/// attribution to the file's first assigned dataset. Coercion drops retain
+/// their exact dataset captured in the completion record.
+fn durable_dataset_stats(
+    plan: &Plan,
+    done: &HashMap<String, FileDone>,
+) -> HashMap<String, DurableDatasetStats> {
+    let mut stats_by_dataset: HashMap<String, DurableDatasetStats> = HashMap::new();
     for (file_key, completed) in done {
         let Some(assignment) = plan.files.get(file_key) else {
             continue;
@@ -459,11 +472,25 @@ fn durable_dataset_bytes(plan: &Plan, done: &HashMap<String, FileDone>) -> HashM
             .map(|(_, slug)| slug.as_str())
             .collect();
         for slug in assigned_datasets {
-            let bytes = bytes_by_dataset.entry(slug.to_string()).or_insert(0u64);
-            *bytes = bytes.saturating_add(completed.bytes);
+            let stats = stats_by_dataset.entry(slug.to_string()).or_default();
+            stats.bytes = stats.bytes.saturating_add(completed.bytes);
+        }
+        if let Some((_, slug)) = assignment.assignments.first() {
+            let stats = stats_by_dataset.entry(slug.clone()).or_default();
+            stats.junk = stats.junk.saturating_add(completed.junk);
+        }
+        for (slug, dropped) in &completed.dropped_by_dataset {
+            if assignment
+                .assignments
+                .iter()
+                .any(|(_, assigned)| assigned == slug)
+            {
+                let stats = stats_by_dataset.entry(slug.clone()).or_default();
+                stats.dropped = stats.dropped.saturating_add(*dropped);
+            }
         }
     }
-    bytes_by_dataset
+    stats_by_dataset
 }
 
 fn invocation_report_timestamps(
@@ -814,8 +841,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         catalog::CATALOG_INDEX,
         &json!({"properties": {
             "duplicate_of": {"type": "keyword"},
-            "started": {"type": "date", "format": "strict_date_optional_time"},
-            "summary_generated_at": {"type": "date", "format": "strict_date_optional_time"},
+            // `started` intentionally stays out of this additive upgrade.
+            // Older catalogs dynamically mapped it as text, and asking the
+            // engine to change that existing field to date aborts every run.
+            "summary_generated_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
             "invocation_telemetry_scope": {"type": "keyword"}
         }}),
     )
@@ -871,8 +900,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         index: String,
         plan: HashMap<String, coerce::Coerce>,
         records: AtomicU64,
-        junk: AtomicU64,
-        dropped: AtomicU64,
     }
     let mut ds_rt: HashMap<String, DsRt> = HashMap::new();
     for d in &plan.datasets {
@@ -882,8 +909,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 index: d.index.clone(),
                 plan: coerce::plan_from_specs(&d.specs),
                 records: AtomicU64::new(0),
-                junk: AtomicU64::new(0),
-                dropped: AtomicU64::new(0),
             },
         );
     }
@@ -1146,6 +1171,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     };
                     let mut file_records = 0u64;
                     let mut file_junk = 0u64;
+                    let mut file_dropped_by_dataset: HashMap<String, u64> = HashMap::new();
                     let mut send_err: Option<String> = None;
                     // Edges this file teaches — buffered apart from the node
                     // staging file (different target index) and sent only
@@ -1248,7 +1274,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             let mut fields = rec.fields;
                             let dropped = coerce::coerce_record(&mut fields, &rt.plan);
                             if dropped > 0 {
-                                rt.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+                                let durable =
+                                    file_dropped_by_dataset.entry(slug.clone()).or_default();
+                                *durable = durable.saturating_add(dropped as u64);
                             }
                             fields.insert("ax_path".into(), Value::String(f.rel.clone()));
                             fields.insert(
@@ -1517,11 +1545,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     }
                     records_total.fetch_add(file_records, Ordering::Relaxed);
                     junk_records.fetch_add(file_junk, Ordering::Relaxed);
-                    if let Some(rt) = fa.assignments.first().and_then(|(_, slug)| ds_rt.get(slug)) {
-                        if file_junk > 0 {
-                            rt.junk.fetch_add(file_junk, Ordering::Relaxed);
-                        }
-                    }
                     let (commit_result, journal_path) = {
                         let mut journal = journal_mx.lock().unwrap();
                         let path = journal.path().display().to_string();
@@ -1531,6 +1554,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             records: file_records,
                             junk: file_junk,
                             bytes: f.size,
+                            dropped_by_dataset: file_dropped_by_dataset,
                             generation: Some(expected_digest.clone()),
                         });
                         (result, path)
@@ -1685,15 +1709,15 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     // dataset docs
     let mut junk_records_by_run: u64 = junk_records.load(Ordering::Relaxed);
-    let dataset_bytes = {
+    let dataset_stats = {
         let journal = journal_mx.lock().unwrap();
-        durable_dataset_bytes(&plan, &journal.done)
+        durable_dataset_stats(&plan, &journal.done)
     };
     for d in &plan.datasets {
-        let rt = &ds_rt[&d.slug];
         let sample_queries = catalog::build_sample_queries(d, &key_corrs);
         let mut notes = Vec::new();
-        let dropped = rt.dropped.load(Ordering::Relaxed);
+        let durable = dataset_stats.get(&d.slug).copied().unwrap_or_default();
+        let dropped = durable.dropped;
         if dropped > 0 {
             notes.push(format!(
                 "{dropped} field values could not be coerced to the inferred types and were dropped (records still indexed)"
@@ -1726,8 +1750,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         let (id, doc) = catalog::dataset_doc(&catalog::DatasetDocInput {
             pd: d,
             record_count: *ds_counts.get(&d.slug).unwrap_or(&0),
-            junk_records: rt.junk.load(Ordering::Relaxed),
-            bytes: dataset_bytes.get(&d.slug).copied().unwrap_or(0),
+            junk_records: durable.junk,
+            bytes: durable.bytes,
             file_count: d.file_count,
             formats,
             time_min: tmin,
@@ -2370,6 +2394,7 @@ mod duplicate_integration_tests {
                 records,
                 junk: 0,
                 bytes: inventory.files[0].size,
+                dropped_by_dataset: HashMap::new(),
                 generation: Some(inventory.digests[0].clone()),
             })
             .unwrap();
@@ -2498,8 +2523,9 @@ mod map_metadata_tests {
                 file_key: "shared".into(),
                 path: "report.dat".into(),
                 records: 10,
-                junk: 0,
+                junk: 5,
                 bytes: 100,
+                dropped_by_dataset: HashMap::from([("quarterly".into(), 7), ("annual".into(), 3)]),
                 generation: Some("digest".into()),
             })
             .unwrap();
@@ -2508,12 +2534,13 @@ mod map_metadata_tests {
                 file_key: "quarterly-only".into(),
                 path: "quarterly.json".into(),
                 records: 2,
-                junk: 0,
+                junk: 2,
                 bytes: 23,
+                dropped_by_dataset: HashMap::from([("quarterly".into(), 11)]),
                 generation: Some("digest-2".into()),
             })
             .unwrap();
-        let before_resume = durable_dataset_bytes(&plan, &initial.done);
+        let before_resume = durable_dataset_stats(&plan, &initial.done);
         drop(initial);
 
         // Opening the same durable run appends only an invocation-level
@@ -2528,11 +2555,15 @@ mod map_metadata_tests {
         )
         .unwrap();
         let after_unchanged_resume =
-            durable_dataset_bytes(resumed.plan.as_ref().unwrap(), &resumed.done);
+            durable_dataset_stats(resumed.plan.as_ref().unwrap(), &resumed.done);
 
         assert_eq!(before_resume, after_unchanged_resume);
-        assert_eq!(after_unchanged_resume["quarterly"], 123);
-        assert_eq!(after_unchanged_resume["annual"], 100);
+        assert_eq!(after_unchanged_resume["quarterly"].bytes, 123);
+        assert_eq!(after_unchanged_resume["annual"].bytes, 100);
+        assert_eq!(after_unchanged_resume["quarterly"].junk, 7);
+        assert_eq!(after_unchanged_resume["annual"].junk, 0);
+        assert_eq!(after_unchanged_resume["quarterly"].dropped, 18);
+        assert_eq!(after_unchanged_resume["annual"].dropped, 3);
     }
 
     #[test]
@@ -2570,6 +2601,14 @@ mod map_metadata_tests {
         assert_eq!(
             mapping.pointer("/mappings/properties/invocation_telemetry_scope/type"),
             Some(&json!("keyword"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/started/format"),
+            Some(&json!("strict_date_optional_time||epoch_millis"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/summary_generated_at/format"),
+            Some(&json!("strict_date_optional_time||epoch_millis"))
         );
     }
 }

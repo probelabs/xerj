@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Repeated `autoindex` scans keep agent-facing map metadata durable.**
+  Dataset source bytes, parser-junk counts and coercion-drop notes now derive
+  from committed per-file journal records instead of invocation-local worker
+  counters, so an unchanged resume does not overwrite them with zero. Run
+  timestamps now distinguish invocation start from summary generation.
+  Existing catalogs whose historical `started` field was dynamically mapped
+  as text remain usable: the additive mapping upgrade no longer attempts an
+  incompatible text-to-date type change.
+
 ## [1.0.0-rc.10] - 2026-08-03
 
 ### Security

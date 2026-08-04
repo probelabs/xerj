@@ -130,19 +130,27 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
         }
     } else if method == "PUT" && path == "/autoindex-catalog/_mapping" {
         let mapping: Value = serde_json::from_slice(&body).unwrap();
-        let required = [
-            "started",
-            "summary_generated_at",
-            "invocation_telemetry_scope",
-        ];
+        let started_requested = mapping.pointer("/properties/started").is_some();
+        let required = ["summary_generated_at", "invocation_telemetry_scope"];
         let upgraded = required.iter().all(|field| {
             mapping
                 .pointer(&format!("/properties/{field}/type"))
                 .and_then(Value::as_str)
                 .is_some()
         });
-        state.lock().unwrap().catalog_mapping_upgraded = upgraded;
-        (200, json!({"acknowledged": true}))
+        let mut locked = state.lock().unwrap();
+        if locked.catalog_preexists && started_requested {
+            (
+                400,
+                json!({"error": {
+                    "type": "mapper_parsing_exception",
+                    "reason": "field [started] already exists as [text], cannot add [date]"
+                }}),
+            )
+        } else {
+            locked.catalog_mapping_upgraded = upgraded;
+            (200, json!({"acknowledged": true}))
+        }
     } else if method == "POST" && path == "/_bulk" {
         (200, bulk_response(&body, state))
     } else if method == "POST" && path.contains("/_delete_by_query") {
@@ -197,16 +205,25 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         if locked.catalog_preexists && !locked.catalog_mapping_upgraded {
             locked.catalog_bulk_before_upgrade = true;
         }
-        for pair in lines.chunks_exact(2) {
-            let action: Value = serde_json::from_slice(pair[0]).unwrap();
-            if action.pointer("/index/_index").and_then(Value::as_str)
-                != Some(catalog::CATALOG_INDEX)
-            {
-                continue;
+        let mut line = 0;
+        while line < lines.len() {
+            let action: Value = serde_json::from_slice(lines[line]).unwrap();
+            line += 1;
+            if let Some(index) = action.pointer("/index/_index").and_then(Value::as_str) {
+                let doc: Value = serde_json::from_slice(
+                    lines
+                        .get(line)
+                        .expect("index action must have a source line"),
+                )
+                .unwrap();
+                line += 1;
+                if index == catalog::CATALOG_INDEX {
+                    let id = action.pointer("/index/_id").unwrap().as_str().unwrap();
+                    locked.catalog_docs.insert(id.to_owned(), doc);
+                }
+            } else if action.pointer("/delete/_index").is_none() {
+                panic!("unexpected catalog bulk action: {action}");
             }
-            let id = action.pointer("/index/_id").unwrap().as_str().unwrap();
-            let doc: Value = serde_json::from_slice(pair[1]).unwrap();
-            locked.catalog_docs.insert(id.to_owned(), doc);
         }
         return json!({"errors": false, "items": []});
     }
@@ -557,6 +574,46 @@ fn existing_catalog_is_upgraded_before_new_run_metadata_is_written() {
         !state.catalog_bulk_before_upgrade,
         "new run metadata must not reach a legacy catalog before its additive mapping upgrade"
     );
+}
+
+#[test]
+fn unchanged_resume_keeps_durable_dataset_junk_and_coercion_notes() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("records.csv"), "id,value\n0,one\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let root = config.root.canonicalize().unwrap();
+    let mut journal = state::Journal::open(
+        state_dir.path(),
+        &root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    let plan = journal.plan.clone().unwrap();
+    let slug = plan.datasets[0].slug.clone();
+    let mut completion = journal.done.values().next().unwrap().clone();
+    completion.junk = 7;
+    completion.dropped_by_dataset.insert(slug.clone(), 3);
+    journal.file_done(&completion).unwrap();
+    drop(journal);
+
+    assert_eq!(run_index(config).unwrap(), 0);
+    let dataset = dataset_catalog_docs(&endpoint)
+        .into_iter()
+        .find(|doc| doc["slug"] == slug)
+        .unwrap();
+    assert_eq!(dataset["junk_records"], 7);
+    assert!(dataset["notes"].as_array().unwrap().iter().any(|note| note
+        .as_str()
+        .is_some_and(|text| { text.contains("3 field values could not be coerced") })));
 }
 
 #[test]
