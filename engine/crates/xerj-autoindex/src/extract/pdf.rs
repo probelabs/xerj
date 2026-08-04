@@ -28,6 +28,22 @@ const MAX_EXTRACTED_TEXT: usize = 64 << 20;
 const MAX_WORKER_OUTPUT: usize = 32 << 20;
 const MAX_WORKER_STDERR: u64 = 64 << 10;
 const WORKER_ADDRESS_SPACE: u64 = 1536 << 20;
+// The spool is an optional accelerator on the same filesystem and descriptor
+// table as correctness-critical state. The byte ceiling includes pessimistic
+// 32 MiB reservations held by concurrently serializing PDF responses, not only
+// completed artifact lengths. Hundreds of small retained artifacts plus four
+// in-flight maximum-sized reservations fit while optional pressure stays below
+// the fixed ceiling.
+const MAX_SPOOL_BYTES: u64 = 384 << 20;
+const MAX_SPOOL_HANDLES: u64 = 512;
+// This is an admission-time floor, not a guarantee against other processes
+// consuming filesystem space after the snapshot.
+const MIN_FILESYSTEM_HEADROOM: u64 = 4 << 30;
+const JOURNAL_FILESYSTEM_HEADROOM: u64 = 64 << 20;
+// Preserve a base allowance for the journal/lock/model/runtime plus four
+// descriptors per general and PDF worker for staging, sockets, and pipes.
+const MIN_DESCRIPTOR_HEADROOM: u64 = 64;
+const DESCRIPTOR_HEADROOM_PER_WORKER: u64 = 4;
 
 #[cfg(test)]
 static REPLAY_OBSERVATION_ACTIVE: std::sync::atomic::AtomicUsize =
@@ -123,13 +139,19 @@ pub(crate) fn extract_and_spool(
     source_digest: &str,
     budget: &Arc<ExtractionSpoolBudget>,
     sink: Sink,
-) -> Result<(ExtractStats, Option<ExtractionSpool>, Option<String>)> {
+) -> Result<(ExtractStats, Option<ExtractionSpool>, Option<SpoolFallback>)> {
     let _permit = worker_gate().acquire();
+    budget.record_phase_a_parse();
     let response = spawn_worker(path)?;
     let (spool, fallback) =
         try_spool_response(state_dir, source_size, source_digest, budget, &response);
     let stats = deliver(response, sink);
     Ok((stats, spool, fallback))
+}
+
+pub(crate) struct SpoolFallback {
+    pub(crate) category: &'static str,
+    pub(crate) message: String,
 }
 
 fn try_spool_response(
@@ -138,27 +160,44 @@ fn try_spool_response(
     source_digest: &str,
     budget: &Arc<ExtractionSpoolBudget>,
     response: &WorkerResponse,
-) -> (Option<ExtractionSpool>, Option<String>) {
+) -> (Option<ExtractionSpool>, Option<SpoolFallback>) {
     let reservation = budget.try_reserve(MAX_WORKER_OUTPUT as u64);
     match reservation {
-        Some(reservation) => {
+        Ok(reservation) => {
             match spool_response(state_dir, source_size, source_digest, response, reservation) {
-                Ok(spool) => (Some(spool), None),
-                Err(error) => (
-                    None,
-                    Some(format!(
-                        "could not retain the run-local extraction artifact: {error:#}"
-                    )),
-                ),
+                Ok(spool) => {
+                    budget.record_artifact_accepted(spool.bytes);
+                    (Some(spool), None)
+                }
+                Err(error) => {
+                    budget.record_io_fallback();
+                    budget.record_fallback_category("artifact_io");
+                    budget.record_artifact_rejected();
+                    (
+                        None,
+                        Some(SpoolFallback {
+                            category: "artifact_io",
+                            message: format!(
+                                "could not retain the run-local extraction artifact: {error:#}"
+                            ),
+                        }),
+                    )
+                }
             }
         }
-        None => (
-            None,
-            Some(format!(
-                "the run-local extraction budget is full ({} MiB or {} artifacts)",
-                budget.limit >> 20,
-                budget.max_spools
-            )),
+        Err(category) => (
+            {
+                budget.record_artifact_rejected();
+                budget.record_fallback_category(category);
+                None
+            },
+            Some(SpoolFallback {
+                category,
+                message: format!(
+                    "admission refused ({category}); snapshot headroom or the bounded {} MiB/{}-artifact ceiling would be exceeded",
+                    budget.limit >> 20, budget.max_spools
+                ),
+            }),
         ),
     }
 }
@@ -228,6 +267,46 @@ pub(crate) struct ExtractionSpoolBudget {
     spools: AtomicU64,
     limit: u64,
     max_spools: u64,
+    live_capacity: Option<LiveCapacity>,
+    reservations_started: AtomicU64,
+    cumulative_reserved_bytes: AtomicU64,
+    artifacts_created: AtomicU64,
+    artifacts_not_created: AtomicU64,
+    phase_b_eligible_artifacts: AtomicU64,
+    artifacts_discarded_before_replay: AtomicU64,
+    exact_artifact_bytes: AtomicU64,
+    peak_retained_or_reserved_bytes: AtomicU64,
+    peak_live_artifacts: AtomicU64,
+    phase_a_pdf_parser_calls: AtomicU64,
+    capacity_status: &'static str,
+    capacity_reason: &'static str,
+    fallback_examples: Mutex<Vec<serde_json::Value>>,
+    fallback_examples_total: AtomicU64,
+    fallback_categories: Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    initial_available_bytes: Option<u64>,
+    initial_descriptor_limit: Option<u64>,
+    initial_open_descriptors: Option<u64>,
+    filesystem_headroom: Option<u64>,
+    descriptor_headroom: Option<u64>,
+    capacity_fallbacks: AtomicU64,
+    io_fallbacks: AtomicU64,
+    replay_verified: AtomicU64,
+    replay_integrity_failures: AtomicU64,
+    phase_b_pdf_parses: AtomicU64,
+}
+
+struct LiveCapacity {
+    state_dir: PathBuf,
+    filesystem_headroom: u64,
+    descriptor_headroom: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExtractionSpoolCapacity {
+    bytes: u64,
+    handles: u64,
+    filesystem_headroom: u64,
+    descriptor_headroom: u64,
 }
 
 impl ExtractionSpoolBudget {
@@ -237,31 +316,213 @@ impl ExtractionSpoolBudget {
             spools: AtomicU64::new(0),
             limit,
             max_spools,
+            live_capacity: None,
+            reservations_started: AtomicU64::new(0),
+            cumulative_reserved_bytes: AtomicU64::new(0),
+            artifacts_created: AtomicU64::new(0),
+            artifacts_not_created: AtomicU64::new(0),
+            phase_b_eligible_artifacts: AtomicU64::new(0),
+            artifacts_discarded_before_replay: AtomicU64::new(0),
+            exact_artifact_bytes: AtomicU64::new(0),
+            peak_retained_or_reserved_bytes: AtomicU64::new(0),
+            peak_live_artifacts: AtomicU64::new(0),
+            phase_a_pdf_parser_calls: AtomicU64::new(0),
+            capacity_status: "enabled",
+            capacity_reason: "explicit_budget",
+            fallback_examples: Mutex::new(Vec::new()),
+            fallback_examples_total: AtomicU64::new(0),
+            fallback_categories: Mutex::new(std::collections::BTreeMap::new()),
+            initial_available_bytes: None,
+            initial_descriptor_limit: None,
+            initial_open_descriptors: None,
+            filesystem_headroom: None,
+            descriptor_headroom: None,
+            capacity_fallbacks: AtomicU64::new(0),
+            io_fallbacks: AtomicU64::new(0),
+            replay_verified: AtomicU64::new(0),
+            replay_integrity_failures: AtomicU64::new(0),
+            phase_b_pdf_parses: AtomicU64::new(0),
         })
     }
 
-    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<ExtractionSpoolReservation> {
-        self.spools
+    /// Derive an optimization budget from the resources shared with the
+    /// correctness-critical journal, Phase-B staging files, HTTP sockets, and
+    /// worker pipes. If either resource cannot preserve explicit headroom,
+    /// admission is disabled and Phase B uses the existing safe reparse path.
+    pub(crate) fn for_state_dir(
+        state_dir: &Path,
+        workers: usize,
+        pdf_workers: usize,
+        bulk_mb: usize,
+    ) -> (Arc<Self>, Option<String>) {
+        let available_bytes = match available_space_for(state_dir) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let mut budget = Self::new(0, 0);
+                let inner = Arc::get_mut(&mut budget).expect("new budget has one owner");
+                inner.capacity_status = "disabled";
+                inner.capacity_reason = "free_space_probe_unavailable";
+                return (
+                    budget,
+                    Some(format!(
+                        "disabled because free space under {} could not be measured: {error}",
+                        state_dir.display()
+                    )),
+                );
+            }
+        };
+        let (descriptor_limit, open_descriptors) = descriptor_snapshot_for(state_dir);
+        let capacity = derive_spool_capacity(
+            available_bytes,
+            descriptor_limit,
+            open_descriptors,
+            workers,
+            pdf_workers,
+            bulk_mb,
+        );
+        let warning = if capacity.bytes < MAX_WORKER_OUTPUT as u64 || capacity.handles == 0 {
+            Some(format!(
+                "disabled to preserve {} MiB filesystem and {} descriptor headroom \
+                 ({} MiB free, descriptor limit {})",
+                capacity.filesystem_headroom >> 20,
+                capacity.descriptor_headroom,
+                available_bytes >> 20,
+                descriptor_limit
+                    .map(|limit| limit.to_string())
+                    .unwrap_or_else(|| "unavailable".into())
+            ))
+        } else if capacity.bytes < MAX_SPOOL_BYTES || capacity.handles < MAX_SPOOL_HANDLES {
+            Some(format!(
+                "limited to {} MiB and {} artifacts to preserve {} MiB filesystem and {} \
+                 descriptor headroom",
+                capacity.bytes >> 20,
+                capacity.handles,
+                capacity.filesystem_headroom >> 20,
+                capacity.descriptor_headroom
+            ))
+        } else {
+            None
+        };
+        let capacity_status = if capacity.bytes < MAX_WORKER_OUTPUT as u64 || capacity.handles == 0
+        {
+            "disabled"
+        } else if capacity.bytes < MAX_SPOOL_BYTES || capacity.handles < MAX_SPOOL_HANDLES {
+            "limited"
+        } else {
+            "enabled"
+        };
+        let capacity_reason = if descriptor_limit.is_none() || open_descriptors.is_none() {
+            "descriptor_probe_unavailable"
+        } else if capacity.bytes < MAX_WORKER_OUTPUT as u64 {
+            "filesystem_headroom"
+        } else if capacity.handles == 0 {
+            "descriptor_headroom"
+        } else if capacity_status == "limited" {
+            "resource_share_limited"
+        } else {
+            "full_bounded_capacity"
+        };
+        let budget = Arc::new(Self {
+            used: AtomicU64::new(0),
+            spools: AtomicU64::new(0),
+            limit: capacity.bytes,
+            max_spools: capacity.handles,
+            live_capacity: Some(LiveCapacity {
+                state_dir: state_dir.to_owned(),
+                filesystem_headroom: capacity.filesystem_headroom,
+                descriptor_headroom: capacity.descriptor_headroom,
+            }),
+            reservations_started: AtomicU64::new(0),
+            cumulative_reserved_bytes: AtomicU64::new(0),
+            artifacts_created: AtomicU64::new(0),
+            artifacts_not_created: AtomicU64::new(0),
+            phase_b_eligible_artifacts: AtomicU64::new(0),
+            artifacts_discarded_before_replay: AtomicU64::new(0),
+            exact_artifact_bytes: AtomicU64::new(0),
+            peak_retained_or_reserved_bytes: AtomicU64::new(0),
+            peak_live_artifacts: AtomicU64::new(0),
+            phase_a_pdf_parser_calls: AtomicU64::new(0),
+            capacity_status,
+            capacity_reason,
+            fallback_examples: Mutex::new(Vec::new()),
+            fallback_examples_total: AtomicU64::new(0),
+            fallback_categories: Mutex::new(std::collections::BTreeMap::new()),
+            initial_available_bytes: Some(available_bytes),
+            initial_descriptor_limit: descriptor_limit,
+            initial_open_descriptors: open_descriptors,
+            filesystem_headroom: Some(capacity.filesystem_headroom),
+            descriptor_headroom: Some(capacity.descriptor_headroom),
+            capacity_fallbacks: AtomicU64::new(0),
+            io_fallbacks: AtomicU64::new(0),
+            replay_verified: AtomicU64::new(0),
+            replay_integrity_failures: AtomicU64::new(0),
+            phase_b_pdf_parses: AtomicU64::new(0),
+        });
+        (budget, warning)
+    }
+
+    fn try_reserve(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> std::result::Result<ExtractionSpoolReservation, &'static str> {
+        if let Some(live) = &self.live_capacity {
+            let available = available_space_for(&live.state_dir).map_err(|_| {
+                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                "free_space_probe_failed"
+            })?;
+            // `available` already excludes bytes occupied by retained spool
+            // files; adding `used` again would double-count them.
+            if available < live.filesystem_headroom.saturating_add(bytes) {
+                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                return Err("filesystem_admission_floor");
+            }
+            let (Some(limit), Some(open)) = descriptor_snapshot_for(&live.state_dir) else {
+                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                return Err("descriptor_probe_failed");
+            };
+            if open
+                .saturating_add(live.descriptor_headroom)
+                .saturating_add(1)
+                > limit
+            {
+                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                return Err("descriptor_admission_floor");
+            }
+        }
+        let previous_spools = self
+            .spools
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spools| {
                 (spools < self.max_spools).then_some(spools + 1)
             })
-            .ok()?;
+            .map_err(|_| {
+                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                "artifact_count_ceiling"
+            })?;
+        self.peak_live_artifacts
+            .fetch_max(previous_spools + 1, Ordering::Relaxed);
         let mut used = self.used.load(Ordering::Acquire);
         loop {
             let Some(next) = used.checked_add(bytes) else {
                 self.spools.fetch_sub(1, Ordering::AcqRel);
-                return None;
+                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                return Err("byte_accounting_overflow");
             };
             if next > self.limit {
                 self.spools.fetch_sub(1, Ordering::AcqRel);
-                return None;
+                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                return Err("byte_ceiling");
             }
             match self
                 .used
                 .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    return Some(ExtractionSpoolReservation {
+                    self.reservations_started.fetch_add(1, Ordering::Relaxed);
+                    self.cumulative_reserved_bytes
+                        .fetch_add(bytes, Ordering::Relaxed);
+                    self.peak_retained_or_reserved_bytes
+                        .fetch_max(next, Ordering::Relaxed);
+                    return Ok(ExtractionSpoolReservation {
                         budget: Arc::clone(self),
                         bytes,
                         #[cfg(test)]
@@ -272,6 +533,207 @@ impl ExtractionSpoolBudget {
             }
         }
     }
+
+    pub(crate) fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reservations_started": self.reservations_started.load(Ordering::Relaxed),
+            "cumulative_reserved_bytes": self.cumulative_reserved_bytes.load(Ordering::Relaxed),
+            "artifacts_created": self.artifacts_created.load(Ordering::Relaxed),
+            "artifacts_not_created": self.artifacts_not_created.load(Ordering::Relaxed),
+            "phase_b_eligible_artifacts": self.phase_b_eligible_artifacts.load(Ordering::Relaxed),
+            "artifacts_discarded_before_replay": self.artifacts_discarded_before_replay.load(Ordering::Relaxed),
+            "exact_artifact_bytes": self.exact_artifact_bytes.load(Ordering::Relaxed),
+            "current_retained_or_reserved_bytes": self.used.load(Ordering::Relaxed),
+            "peak_retained_or_reserved_bytes": self.peak_retained_or_reserved_bytes.load(Ordering::Relaxed),
+            "current_live_artifacts": self.spools.load(Ordering::Relaxed),
+            "peak_live_artifacts": self.peak_live_artifacts.load(Ordering::Relaxed),
+            "phase_a_pdf_parser_calls": self.phase_a_pdf_parser_calls.load(Ordering::Relaxed),
+            "capacity_fallbacks": self.capacity_fallbacks.load(Ordering::Relaxed),
+            "io_fallbacks": self.io_fallbacks.load(Ordering::Relaxed),
+            "replay_verified": self.replay_verified.load(Ordering::Relaxed),
+            "replay_integrity_failures": self.replay_integrity_failures.load(Ordering::Relaxed),
+            "phase_b_pdf_parses": self.phase_b_pdf_parses.load(Ordering::Relaxed),
+            "byte_ceiling": self.limit,
+            "artifact_ceiling": self.max_spools,
+            "capacity_status": self.capacity_status,
+            "capacity_reason": self.capacity_reason,
+            "fallback_examples": self.fallback_examples.lock().unwrap().clone(),
+            "fallback_examples_limit": 3,
+            "fallback_examples_truncated": self.fallback_examples_total.load(Ordering::Relaxed) > 3,
+            "fallback_categories": self.fallback_categories.lock().unwrap().clone(),
+            "capacity": {
+                "initial_available_bytes": self.initial_available_bytes,
+                "initial_descriptor_limit": self.initial_descriptor_limit,
+                "initial_open_descriptors": self.initial_open_descriptors,
+                "filesystem_headroom": self.filesystem_headroom,
+                "descriptor_headroom": self.descriptor_headroom,
+            },
+        })
+    }
+
+    pub(crate) fn record_io_fallback(&self) {
+        self.io_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_reparse(&self) {
+        self.phase_b_pdf_parses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fallback_example(
+        &self,
+        path: &str,
+        category: &'static str,
+        message: &str,
+    ) {
+        self.fallback_examples_total.fetch_add(1, Ordering::Relaxed);
+        let mut examples = self.fallback_examples.lock().unwrap();
+        if examples.len() < 3 {
+            examples.push(serde_json::json!({
+                "path": path,
+                "category": category,
+                "message": message,
+            }));
+        }
+    }
+
+    fn record_fallback_category(&self, category: &'static str) {
+        *self
+            .fallback_categories
+            .lock()
+            .unwrap()
+            .entry(category)
+            .or_default() += 1;
+    }
+
+    fn record_phase_a_parse(&self) {
+        self.phase_a_pdf_parser_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_artifact_accepted(&self, bytes: u64) {
+        self.artifacts_created.fetch_add(1, Ordering::Relaxed);
+        self.exact_artifact_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn record_artifact_rejected(&self) {
+        self.artifacts_not_created.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_phase_b_eligible(&self) {
+        self.phase_b_eligible_artifacts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_discarded_before_replay(&self) {
+        self.artifacts_discarded_before_replay
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_source_generation_changed(&self) {
+        self.record_fallback_category("source_generation_changed");
+    }
+}
+
+fn available_space_for(state_dir: &Path) -> std::io::Result<u64> {
+    #[cfg(test)]
+    if let Some(value) = injected_probe_value(state_dir, "available-bytes") {
+        return Ok(value);
+    }
+    fs2::available_space(state_dir)
+}
+
+fn descriptor_snapshot_for(state_dir: &Path) -> (Option<u64>, Option<u64>) {
+    #[cfg(test)]
+    {
+        let limit = injected_probe_value(state_dir, "fd-limit");
+        let open = injected_probe_value(state_dir, "fd-open");
+        if limit.is_some() || open.is_some() {
+            return (limit, open);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = state_dir;
+    (descriptor_soft_limit(), open_descriptor_count())
+}
+
+#[cfg(test)]
+fn injected_probe_value(state_dir: &Path, name: &str) -> Option<u64> {
+    std::fs::read_to_string(state_dir.join(format!(".autoindex-test-pdf-spool-{name}")))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn derive_spool_capacity(
+    available_bytes: u64,
+    descriptor_limit: Option<u64>,
+    open_descriptors: Option<u64>,
+    workers: usize,
+    pdf_workers: usize,
+    bulk_mb: usize,
+) -> ExtractionSpoolCapacity {
+    let workers = workers as u64;
+    let pdf_workers = pdf_workers as u64;
+    let bulk_bytes = (bulk_mb as u64).saturating_mul(1 << 20);
+    let filesystem_headroom = MIN_FILESYSTEM_HEADROOM
+        .max(available_bytes / 2)
+        .max(JOURNAL_FILESYSTEM_HEADROOM.saturating_add(workers.saturating_mul(bulk_bytes)));
+    let bytes = MAX_SPOOL_BYTES.min(available_bytes.saturating_sub(filesystem_headroom));
+
+    let descriptor_headroom = MIN_DESCRIPTOR_HEADROOM
+        .saturating_add(workers.saturating_mul(DESCRIPTOR_HEADROOM_PER_WORKER))
+        .saturating_add(pdf_workers.saturating_mul(DESCRIPTOR_HEADROOM_PER_WORKER));
+    let handles = descriptor_limit
+        .zip(open_descriptors)
+        .map(|(limit, open)| {
+            let live_cap = limit.saturating_sub(open.saturating_add(descriptor_headroom));
+            MAX_SPOOL_HANDLES.min(live_cap)
+        })
+        .unwrap_or(0);
+
+    ExtractionSpoolCapacity {
+        bytes,
+        handles,
+        filesystem_headroom,
+        descriptor_headroom,
+    }
+}
+
+#[cfg(unix)]
+fn descriptor_soft_limit() -> Option<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        Some(u64::MAX)
+    } else {
+        Some(limit.rlim_cur)
+    }
+}
+
+#[cfg(not(unix))]
+fn descriptor_soft_limit() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn open_descriptor_count() -> Option<u64> {
+    // Reading this directory temporarily owns one descriptor, so the count is
+    // conservatively one higher than the steady state after this function.
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .and_then(|entries| u64::try_from(entries.count()).ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_descriptor_count() -> Option<u64> {
+    None
 }
 
 struct ExtractionSpoolReservation {
@@ -320,7 +782,7 @@ pub(crate) struct ExtractionSpool {
 
 impl ExtractionSpool {
     pub(crate) fn replay(
-        &self,
+        self,
         source_size: u64,
         source_digest: &str,
         sink: Sink,
@@ -329,17 +791,13 @@ impl ExtractionSpool {
     }
 
     fn replay_with_gate(
-        &self,
+        self,
         source_size: u64,
         source_digest: &str,
         sink: Sink,
         gate: &WorkerGate,
         observe_global_replay: bool,
     ) -> Result<ExtractStats> {
-        anyhow::ensure!(
-            source_size == self.source_size && source_digest == self.source_digest,
-            "PDF extraction spool belongs to a different source generation; retry extraction"
-        );
         // JSON decoding materializes a bounded WorkerResponse just like the
         // parser protocol. Share the PDF gate so Phase B cannot multiply that
         // 32 MiB response bound by the general autoindex worker count.
@@ -350,45 +808,73 @@ impl ExtractionSpool {
             .flatten();
         #[cfg(not(test))]
         let _ = observe_global_replay;
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| anyhow!("PDF extraction spool lock was poisoned"))?;
-        #[cfg(test)]
-        if CORRUPT_REPLAY_SOURCE_SIZE
-            .compare_exchange(source_size, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            self._reservation
-                .cleanup_probe
-                .store(true, Ordering::SeqCst);
-            file.set_len(8)
-                .context("inject PDF extraction spool truncation")?;
+        let ExtractionSpool {
+            file,
+            source_size: expected_size,
+            source_digest: expected_digest,
+            bytes,
+            artifact_digest: expected_artifact_digest,
+            _reservation: reservation,
+        } = self;
+        let budget = Arc::clone(&reservation.budget);
+        let decoded = (|| -> Result<WorkerResponse> {
+            anyhow::ensure!(
+                source_size == expected_size && source_digest == expected_digest,
+                "PDF extraction spool belongs to a different source generation; retry extraction"
+            );
+            let mut file = file
+                .into_inner()
+                .map_err(|_| anyhow!("PDF extraction spool lock was poisoned"))?;
+            #[cfg(test)]
+            if CORRUPT_REPLAY_SOURCE_SIZE
+                .compare_exchange(source_size, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                reservation.cleanup_probe.store(true, Ordering::SeqCst);
+                file.set_len(8)
+                    .context("inject PDF extraction spool truncation")?;
+            }
+            let actual_bytes = file
+                .metadata()
+                .context("measure PDF extraction spool before replay")?
+                .len();
+            anyhow::ensure!(
+                actual_bytes == bytes,
+                "PDF extraction spool length changed (expected {}, found {}); retry extraction",
+                bytes,
+                actual_bytes
+            );
+            let actual_digest = artifact_digest(&mut file, bytes)?;
+            anyhow::ensure!(
+                actual_digest == expected_artifact_digest,
+                "PDF extraction spool content changed; retry extraction"
+            );
+            file.rewind().context("rewind PDF extraction spool")?;
+            let response: WorkerResponse = serde_json::from_reader(BufReader::new(&mut file))
+                .context("PDF extraction spool is malformed or truncated; retry extraction")?;
+            validate_response_identity(&response)?;
+            anyhow::ensure!(
+                file.stream_position()? <= bytes,
+                "PDF extraction spool exceeded its validated boundary"
+            );
+            Ok(response)
+        })();
+        // The optional artifact and its reservation are gone before `deliver`
+        // can expand records into the unbounded correctness-critical stage.
+        // Replay is deliberately one-shot.
+        drop(reservation);
+        match decoded {
+            Ok(response) => {
+                budget.replay_verified.fetch_add(1, Ordering::Relaxed);
+                Ok(deliver(response, sink))
+            }
+            Err(error) => {
+                budget
+                    .replay_integrity_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
         }
-        let actual_bytes = file
-            .metadata()
-            .context("measure PDF extraction spool before replay")?
-            .len();
-        anyhow::ensure!(
-            actual_bytes == self.bytes,
-            "PDF extraction spool length changed (expected {}, found {}); retry extraction",
-            self.bytes,
-            actual_bytes
-        );
-        let actual_digest = artifact_digest(&mut file, self.bytes)?;
-        anyhow::ensure!(
-            actual_digest == self.artifact_digest,
-            "PDF extraction spool content changed; retry extraction"
-        );
-        file.rewind().context("rewind PDF extraction spool")?;
-        let response: WorkerResponse = serde_json::from_reader(BufReader::new(&mut *file))
-            .context("PDF extraction spool is malformed or truncated; retry extraction")?;
-        validate_response_identity(&response)?;
-        anyhow::ensure!(
-            file.stream_position()? <= self.bytes,
-            "PDF extraction spool exceeded its validated boundary"
-        );
-        Ok(deliver(response, sink))
     }
 }
 
@@ -911,8 +1397,10 @@ fn validate_text_quality(text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        containment_description, extract_in_process, normalize_legacy_symbol_glyphs,
-        spool_response, try_spool_response, validate_text_quality, WorkerResponse,
+        containment_description, derive_spool_capacity, extract_in_process,
+        normalize_legacy_symbol_glyphs, spool_response, try_spool_response, validate_text_quality,
+        WorkerResponse, JOURNAL_FILESYSTEM_HEADROOM, MAX_SPOOL_BYTES, MAX_SPOOL_HANDLES,
+        MAX_WORKER_OUTPUT, MIN_DESCRIPTOR_HEADROOM, MIN_FILESYSTEM_HEADROOM,
     };
     use crate::infer::{infer_fields, FieldAcc};
     use serde_json::Value;
@@ -1037,8 +1525,16 @@ mod tests {
         let path = source.path().join("quarterly-report.pdf");
         write_prose_pdf(&path);
         let expected = extract_in_process(&path).unwrap();
-        let budget = super::ExtractionSpoolBudget::new(super::MAX_WORKER_OUTPUT as u64, 1);
+        let budget = super::ExtractionSpoolBudget::new(2 * super::MAX_WORKER_OUTPUT as u64, 2);
         let spool = spool_response(
+            state.path(),
+            123,
+            "axf2-generation-a",
+            &response(expected.clone()),
+            budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
+        )
+        .unwrap();
+        let wrong_generation = spool_response(
             state.path(),
             123,
             "axf2-generation-a",
@@ -1064,7 +1560,7 @@ mod tests {
             serde_json::to_value(&expected).unwrap()
         );
 
-        let error = spool
+        let error = wrong_generation
             .replay(123, "axf2-generation-b", &mut |_| true)
             .unwrap_err();
         assert!(error.to_string().contains("different source generation"));
@@ -1102,6 +1598,8 @@ mod tests {
         let mut replayed = Vec::new();
         let replay_stats = spool
             .replay(7, "digest", &mut |record| {
+                assert_eq!(budget.used.load(Ordering::Acquire), 0);
+                assert_eq!(budget.spools.load(Ordering::Acquire), 0);
                 replayed.push(record);
                 replayed.len() < 3
             })
@@ -1118,10 +1616,178 @@ mod tests {
     fn spool_budget_accepts_exact_limit_and_rejects_limit_plus_one() {
         let budget = super::ExtractionSpoolBudget::new(1024, 2);
         let exact = budget.try_reserve(1024).expect("exact limit must fit");
-        assert!(budget.try_reserve(1).is_none());
+        assert!(budget.try_reserve(1).is_err());
         drop(exact);
-        assert!(budget.try_reserve(1025).is_none());
-        assert!(budget.try_reserve(1024).is_some());
+        assert!(budget.try_reserve(1025).is_err());
+        assert!(budget.try_reserve(1024).is_ok());
+    }
+
+    #[test]
+    fn spool_handle_cap_retains_more_than_twelve_small_artifacts() {
+        let budget = super::ExtractionSpoolBudget::new(MAX_SPOOL_BYTES, MAX_SPOOL_HANDLES);
+        let mut retained = Vec::new();
+        for _ in 0..20 {
+            let mut reservation = budget.try_reserve(MAX_WORKER_OUTPUT as u64).unwrap();
+            reservation.shrink_to(1 << 20);
+            retained.push(reservation);
+        }
+        assert_eq!(budget.spools.load(Ordering::Acquire), 20);
+        assert_eq!(budget.used.load(Ordering::Acquire), 20 << 20);
+        drop(retained);
+        assert_eq!(budget.spools.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn many_small_artifacts_plus_four_transient_reservations_fit_384_mib() {
+        const ARTIFACTS: u64 = 360;
+        const EXACT_ARTIFACT_BYTES: u64 = 220 << 20;
+        let budget = super::ExtractionSpoolBudget::new(MAX_SPOOL_BYTES, MAX_SPOOL_HANDLES);
+        let base = EXACT_ARTIFACT_BYTES / ARTIFACTS;
+        let remainder = EXACT_ARTIFACT_BYTES % ARTIFACTS;
+        let mut retained = Vec::new();
+        for index in 0..ARTIFACTS {
+            let mut reservation = budget.try_reserve(MAX_WORKER_OUTPUT as u64).unwrap();
+            reservation.shrink_to(base + u64::from(index < remainder));
+            retained.push(reservation);
+        }
+        let transient: Vec<_> = (0..4)
+            .map(|_| budget.try_reserve(MAX_WORKER_OUTPUT as u64).unwrap())
+            .collect();
+        assert_eq!(
+            budget.used.load(Ordering::Acquire),
+            EXACT_ARTIFACT_BYTES + 4 * MAX_WORKER_OUTPUT as u64
+        );
+        assert!(budget.used.load(Ordering::Acquire) < MAX_SPOOL_BYTES);
+        drop(transient);
+        drop(retained);
+    }
+
+    #[test]
+    fn shared_capacity_preserves_disk_and_descriptor_headroom() {
+        let capacity = derive_spool_capacity(8 << 30, Some(4096), Some(32), 8, 4, 24);
+        assert_eq!(capacity.bytes, MAX_SPOOL_BYTES);
+        assert_eq!(capacity.handles, MAX_SPOOL_HANDLES);
+        assert_eq!(capacity.filesystem_headroom, 4 << 30);
+        assert_eq!(
+            capacity.descriptor_headroom,
+            MIN_DESCRIPTOR_HEADROOM + 8 * 4 + 4 * 4
+        );
+
+        let constrained = derive_spool_capacity(1536 << 20, Some(512), Some(32), 8, 4, 24);
+        assert_eq!(constrained.filesystem_headroom, MIN_FILESYSTEM_HEADROOM);
+        assert_eq!(constrained.bytes, 0);
+        assert_eq!(
+            constrained.handles,
+            512 - 32 - (MIN_DESCRIPTOR_HEADROOM + 8 * 4 + 4 * 4)
+        );
+    }
+
+    #[test]
+    fn shared_capacity_refuses_low_disk_before_staging_headroom_is_spent() {
+        let just_too_small = MIN_FILESYSTEM_HEADROOM + MAX_WORKER_OUTPUT as u64 - 1;
+        let capacity = derive_spool_capacity(just_too_small, Some(4096), Some(16), 8, 4, 24);
+        assert!(capacity.bytes < MAX_WORKER_OUTPUT as u64);
+
+        let exact = derive_spool_capacity(
+            MIN_FILESYSTEM_HEADROOM + MAX_WORKER_OUTPUT as u64,
+            Some(4096),
+            Some(16),
+            8,
+            4,
+            24,
+        );
+        assert_eq!(exact.bytes, MAX_WORKER_OUTPUT as u64);
+
+        let worker_bound = derive_spool_capacity(8 << 30, Some(4096), Some(16), 200, 4, 24);
+        assert_eq!(
+            worker_bound.filesystem_headroom,
+            JOURNAL_FILESYSTEM_HEADROOM + 200 * (24 << 20)
+        );
+    }
+
+    #[test]
+    fn shared_capacity_refuses_low_or_unmeasurable_descriptor_capacity() {
+        let low_limit = derive_spool_capacity(8 << 30, Some(128), Some(16), 8, 4, 24);
+        assert_eq!(low_limit.handles, 0);
+
+        let unknown_limit = derive_spool_capacity(8 << 30, None, Some(16), 8, 4, 24);
+        assert_eq!(unknown_limit.handles, 0);
+
+        let unknown_usage = derive_spool_capacity(8 << 30, Some(4096), None, 8, 4, 24);
+        assert_eq!(unknown_usage.handles, 0);
+    }
+
+    #[test]
+    fn live_admission_uses_injected_disk_and_descriptor_probe_values() {
+        let state = tempfile::tempdir().unwrap();
+        let write_probe = |name: &str, value: u64| {
+            std::fs::write(
+                state
+                    .path()
+                    .join(format!(".autoindex-test-pdf-spool-{name}")),
+                value.to_string(),
+            )
+            .unwrap();
+        };
+        write_probe("available-bytes", 16 << 30);
+        write_probe("fd-limit", 4096);
+        write_probe("fd-open", 16);
+        let (budget, warning) = super::ExtractionSpoolBudget::for_state_dir(state.path(), 8, 4, 24);
+        assert!(warning.is_none());
+
+        write_probe(
+            "available-bytes",
+            MIN_FILESYSTEM_HEADROOM + MAX_WORKER_OUTPUT as u64 - 1,
+        );
+        assert_eq!(
+            budget.try_reserve(MAX_WORKER_OUTPUT as u64).err().unwrap(),
+            "filesystem_admission_floor"
+        );
+
+        write_probe("available-bytes", 16 << 30);
+        write_probe("fd-limit", 128);
+        write_probe("fd-open", 16);
+        assert_eq!(
+            budget.try_reserve(MAX_WORKER_OUTPUT as u64).err().unwrap(),
+            "descriptor_admission_floor"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn low_rlimit_subprocess_disables_optional_spooling() {
+        const CHILD: &str = "XERJ_TEST_LOW_RLIMIT_PDF_SPOOL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit.rlim_cur = limit.rlim_max.min(96);
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            let state = tempfile::tempdir().unwrap();
+            let (budget, _) = super::ExtractionSpoolBudget::for_state_dir(state.path(), 8, 4, 24);
+            assert_eq!(budget.report()["capacity_status"], "disabled");
+            assert_eq!(budget.report()["capacity_reason"], "descriptor_headroom");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "extract::pdf::tests::low_rlimit_subprocess_disables_optional_spooling",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "low-RLIMIT child failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1237,16 +1903,14 @@ mod tests {
         }];
         let spools: Vec<_> = (0..REPLAYS)
             .map(|_| {
-                Arc::new(
-                    spool_response(
-                        state.path(),
-                        7,
-                        "digest",
-                        &response(records.clone()),
-                        budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
-                    )
-                    .unwrap(),
+                spool_response(
+                    state.path(),
+                    7,
+                    "digest",
+                    &response(records.clone()),
+                    budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).unwrap(),
                 )
+                .unwrap()
             })
             .collect();
         let gate = Arc::new(super::WorkerGate::new(LIMIT));
@@ -1287,19 +1951,46 @@ mod tests {
     fn spool_budget_is_atomic_and_refunded_on_physical_drop() {
         let budget = super::ExtractionSpoolBudget::new(100, 2);
         let mut first = budget.try_reserve(80).unwrap();
-        assert!(budget.try_reserve(21).is_none());
+        assert!(budget.try_reserve(21).is_err());
         first.shrink_to(40);
         let second = budget.try_reserve(60).unwrap();
-        assert!(budget.try_reserve(1).is_none());
+        assert!(budget.try_reserve(1).is_err());
         drop(second);
-        assert!(budget.try_reserve(60).is_some());
+        assert!(budget.try_reserve(60).is_ok());
         drop(first);
 
         let count_budget = super::ExtractionSpoolBudget::new(1_000, 1);
         let only = count_budget.try_reserve(1).unwrap();
-        assert!(count_budget.try_reserve(1).is_none());
+        assert!(count_budget.try_reserve(1).is_err());
         drop(only);
-        assert!(count_budget.try_reserve(1).is_some());
+        assert!(count_budget.try_reserve(1).is_ok());
+    }
+
+    #[test]
+    fn concurrent_reservations_report_exact_peak_live_artifacts() {
+        const RESERVATIONS: usize = 32;
+        let budget = super::ExtractionSpoolBudget::new(RESERVATIONS as u64, RESERVATIONS as u64);
+        let barrier = Arc::new(Barrier::new(RESERVATIONS + 1));
+        std::thread::scope(|scope| {
+            for _ in 0..RESERVATIONS {
+                let budget = Arc::clone(&budget);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let reservation = budget.try_reserve(1).unwrap();
+                    barrier.wait();
+                    barrier.wait();
+                    drop(reservation);
+                });
+            }
+            barrier.wait();
+            assert_eq!(
+                budget.peak_live_artifacts.load(Ordering::Acquire),
+                RESERVATIONS as u64
+            );
+            assert_eq!(budget.spools.load(Ordering::Acquire), RESERVATIONS as u64);
+            barrier.wait();
+        });
+        assert_eq!(budget.spools.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1314,12 +2005,11 @@ mod tests {
             try_spool_response(&not_a_directory, 7, "digest", &budget, &response);
         assert!(spool.is_none());
         let fallback = fallback.unwrap();
-        assert!(fallback.contains("could not retain"));
-        assert!(fallback.contains("anonymous PDF extraction spool"));
+        assert_eq!(fallback.category, "artifact_io");
+        assert!(fallback.message.contains("could not retain"));
+        assert!(fallback.message.contains("anonymous PDF extraction spool"));
 
         // The failed attempt must not strand either the byte or handle charge.
-        assert!(budget
-            .try_reserve(super::MAX_WORKER_OUTPUT as u64)
-            .is_some());
+        assert!(budget.try_reserve(super::MAX_WORKER_OUTPUT as u64).is_ok());
     }
 }

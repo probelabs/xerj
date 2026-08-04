@@ -907,6 +907,186 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 
 #[cfg(unix)]
 #[test]
+fn refused_pdf_spool_reparses_and_reports_fallback_without_weakening_publication() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("quarterly-report.pdf"),
+        b"%PDF-1.4\nfake bytes consumed by the isolated test worker\n",
+    )
+    .unwrap();
+    fs::write(
+        state_dir
+            .path()
+            .join(".autoindex-test-pdf-spool-available-bytes"),
+        ((4_u64 << 30) + (32 << 20) - 1).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        state_dir.path().join(".autoindex-test-pdf-spool-fd-limit"),
+        "4096",
+    )
+    .unwrap();
+    fs::write(
+        state_dir.path().join(".autoindex-test-pdf-spool-fd-open"),
+        "16",
+    )
+    .unwrap();
+
+    let count = tools.path().join("worker-count");
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let endpoint = MockEndpoint::start(0);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
+    let _env = PdfWorkerEnvGuard;
+
+    let (code, report) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
+    assert_eq!(file_done_count(state_dir.path()), 1);
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+    let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
+    assert_eq!(reuse["reservations_started"], 0);
+    assert_eq!(reuse["capacity_fallbacks"], 1);
+    assert_eq!(reuse["phase_b_pdf_parses"], 1);
+    assert_eq!(reuse["replay_verified"], 0);
+    assert_eq!(reuse["artifacts_not_created"], 1);
+    assert_eq!(reuse["phase_a_pdf_parser_calls"], 1);
+    assert_eq!(reuse["capacity_status"], "disabled");
+    assert_eq!(
+        reuse["fallback_examples"][0]["path"],
+        "quarterly-report.pdf"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn same_size_source_change_preserves_prior_fallback_and_adds_typed_diagnostic() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("quarterly-report.pdf");
+    fs::write(&pdf, b"%PDF-1.4\nsame-size-source-generation\n").unwrap();
+    let size = fs::metadata(&pdf).unwrap().len();
+    let digest = content::resolve(vec![crate::walk::FileEntry {
+        path: pdf.clone(),
+        rel: "quarterly-report.pdf".into(),
+        rel_id: "quarterly-report.pdf".into(),
+        is_symlink: false,
+        size,
+    }])
+    .unwrap()
+    .digests
+    .remove(0);
+
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'Z' | dd of="$2" bs=1 seek=10 conv=notrunc 2>/dev/null
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    let _env = PdfWorkerEnvGuard;
+
+    let budget = crate::extract::pdf::ExtractionSpoolBudget::new(0, 0);
+    let scan = scan_file(&pdf, size, &digest, state_dir.path(), &budget, 100, 1);
+    assert!(scan.pdf_spool.is_none());
+    assert_eq!(scan.pdf_spool_fallbacks.len(), 2);
+    for fallback in &scan.pdf_spool_fallbacks {
+        budget.record_fallback_example(
+            "quarterly-report.pdf",
+            fallback.category,
+            &fallback.message,
+        );
+    }
+    let report = budget.report();
+    assert_eq!(report["artifacts_created"], 0);
+    assert_eq!(report["phase_b_eligible_artifacts"], 0);
+    assert_eq!(report["artifacts_discarded_before_replay"], 0);
+    assert_eq!(report["fallback_categories"]["artifact_count_ceiling"], 1);
+    assert_eq!(
+        report["fallback_categories"]["source_generation_changed"],
+        1
+    );
+    assert!(report["fallback_examples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|example| example["category"] == "source_generation_changed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("empty-report.pdf");
+    fs::write(&pdf, b"%PDF-1.4\nempty test input\n").unwrap();
+    let size = fs::metadata(&pdf).unwrap().len();
+    let digest = content::resolve(vec![crate::walk::FileEntry {
+        path: pdf.clone(),
+        rel: "empty-report.pdf".into(),
+        rel_id: "empty-report.pdf".into(),
+        is_symlink: false,
+        size,
+    }])
+    .unwrap()
+    .digests
+    .remove(0);
+    let worker = tools.path().join("pdf-worker");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' '{{\"schema\":1,\"extractor\":\"xerj-autoindex/{}\",\"parser\":\"pdf_oxide/0.3.75\",\"containment\":\"test worker\",\"records\":[]}}'\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    fs::write(&worker, script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    let _env = PdfWorkerEnvGuard;
+
+    let (budget, _) =
+        crate::extract::pdf::ExtractionSpoolBudget::for_state_dir(state_dir.path(), 1, 1, 8);
+    let mut scan = scan_file(&pdf, size, &digest, state_dir.path(), &budget, 100, 1);
+    assert!(scan.junk.is_some());
+    assert!(scan.pdf_spool.is_some());
+    assert!(take_pdf_spool_if_indexable(&mut scan.pdf_spool, true, &budget).is_none());
+    let report = budget.report();
+    assert_eq!(report["artifacts_created"], 1);
+    assert_eq!(report["artifacts_discarded_before_replay"], 1);
+    assert_eq!(report["phase_b_eligible_artifacts"], 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn multi_pdf_run_index_bounds_phase_b_replay_by_pdf_workers_not_general_workers() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1009,15 +1189,19 @@ fn junk_scan_drops_its_spool_before_indexable_spools_are_retained() {
     }
 
     let drops = Arc::new(AtomicUsize::new(0));
+    let budget = crate::extract::pdf::ExtractionSpoolBudget::new(1, 1);
     let mut junk = Some(DropProbe(Arc::clone(&drops)));
-    assert!(take_pdf_spool_if_indexable(&mut junk, true).is_none());
+    assert!(take_pdf_spool_if_indexable(&mut junk, true, &budget).is_none());
     assert!(junk.is_none());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 
     let mut indexable = Some(DropProbe(Arc::clone(&drops)));
-    let retained = take_pdf_spool_if_indexable(&mut indexable, false);
+    let retained = take_pdf_spool_if_indexable(&mut indexable, false, &budget);
     assert!(retained.is_some());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let report = budget.report();
+    assert_eq!(report["artifacts_discarded_before_replay"], 1);
+    assert_eq!(report["phase_b_eligible_artifacts"], 1);
     drop(retained);
     assert_eq!(drops.load(Ordering::SeqCst), 2);
 }

@@ -68,8 +68,6 @@ pub fn run_cli() -> i32 {
 const GB: u64 = 1 << 30;
 const SAMPLE_LIMIT_BYTES: u64 = 4 << 20;
 const SQLDUMP_SAMPLE_LIMIT: u64 = 64 << 20;
-const PDF_EXTRACTION_SPOOL_BUDGET: u64 = 2 << 30;
-const PDF_EXTRACTION_SPOOL_COUNT: u64 = 512;
 
 #[cfg(test)]
 static REPLACEMENT_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -185,14 +183,24 @@ struct FileScan {
     /// Run-local PDF extraction produced during sampling. This is consumed by
     /// Phase B only when it is bound to the same full-content generation.
     pdf_spool: Option<extract::pdf::ExtractionSpool>,
-    pdf_spool_fallback: Option<String>,
+    pdf_spool_fallbacks: Vec<extract::pdf::SpoolFallback>,
 }
 
-fn take_pdf_spool_if_indexable<T>(spool: &mut Option<T>, is_junk: bool) -> Option<T> {
+fn take_pdf_spool_if_indexable<T>(
+    spool: &mut Option<T>,
+    is_junk: bool,
+    budget: &extract::pdf::ExtractionSpoolBudget,
+) -> Option<T> {
     if is_junk {
+        if spool.is_some() {
+            budget.record_discarded_before_replay();
+        }
         spool.take();
         None
     } else {
+        if spool.is_some() {
+            budget.record_phase_b_eligible();
+        }
         spool.take()
     }
 }
@@ -211,7 +219,7 @@ fn scan_file(
         sketches: Vec::new(),
         junk: None,
         pdf_spool: None,
-        pdf_spool_fallback: None,
+        pdf_spool_fallbacks: Vec::new(),
     };
     let sn = match sniff::sniff(path) {
         Ok(s) => s,
@@ -286,12 +294,20 @@ fn scan_file(
                 match content::verify(path, size, digest) {
                     Ok(()) => {
                         out.pdf_spool = spool;
-                        out.pdf_spool_fallback = fallback;
+                        out.pdf_spool_fallbacks.extend(fallback);
                     }
                     Err(error) => {
-                        out.pdf_spool_fallback = Some(format!(
-                            "source generation changed after extraction: {error:#}"
-                        ));
+                        if spool.is_some() {
+                            pdf_spool_budget.record_discarded_before_replay();
+                        }
+                        pdf_spool_budget.record_source_generation_changed();
+                        out.pdf_spool_fallbacks.extend(fallback);
+                        out.pdf_spool_fallbacks.push(extract::pdf::SpoolFallback {
+                            category: "source_generation_changed",
+                            message: format!(
+                                "source generation changed after extraction: {error:#}"
+                            ),
+                        });
                     }
                 }
                 Ok(stats)
@@ -715,10 +731,13 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     let mut clusters_rt: Option<Vec<dataset::Cluster>> = None;
     let mut pdf_spools: Vec<Option<extract::pdf::ExtractionSpool>> =
         (0..files.len()).map(|_| None).collect();
-    let pdf_spool_budget = extract::pdf::ExtractionSpoolBudget::new(
-        PDF_EXTRACTION_SPOOL_BUDGET,
-        PDF_EXTRACTION_SPOOL_COUNT,
-    );
+    let (pdf_spool_budget, pdf_spool_capacity_warning) =
+        extract::pdf::ExtractionSpoolBudget::for_state_dir(
+            &state_dir,
+            cfg.workers,
+            cfg.pdf_workers,
+            cfg.bulk_mb,
+        );
     let plan: Plan = if let Some(p) = journal.plan.clone() {
         p
     } else {
@@ -741,18 +760,26 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             })
             .collect();
 
-        let pdf_reparse_reasons: Vec<&str> = scans
-            .iter()
-            .filter_map(|scan| scan.pdf_spool_fallback.as_deref())
-            .collect();
+        let mut pdf_reparse_reasons: Vec<(&str, &extract::pdf::SpoolFallback)> = Vec::new();
+        for (index, scan) in scans.iter().enumerate() {
+            for fallback in &scan.pdf_spool_fallbacks {
+                pdf_reparse_reasons.push((files[index].rel.as_str(), fallback));
+            }
+        }
+        for (path, fallback) in &pdf_reparse_reasons {
+            pdf_spool_budget.record_fallback_example(path, fallback.category, &fallback.message);
+        }
         if !pdf_reparse_reasons.is_empty() && !cfg.quiet {
             eprintln!(
                 "phase A: {} PDF extraction(s) could not retain a bounded run-local artifact; \
                  phase B will parse them again safely",
                 pdf_reparse_reasons.len()
             );
-            for reason in pdf_reparse_reasons.iter().take(3) {
-                eprintln!("  PDF reuse fallback: {reason}");
+            if let Some(warning) = pdf_spool_capacity_warning.as_deref() {
+                eprintln!("  PDF reuse capacity: {warning}");
+            }
+            for (path, fallback) in pdf_reparse_reasons.iter().take(3) {
+                eprintln!("  PDF reuse fallback for {path}: {}", fallback.message);
             }
             if pdf_reparse_reasons.len() > 3 {
                 eprintln!(
@@ -771,7 +798,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 .as_ref()
                 .map(|s| s.family)
                 .unwrap_or(Family::Binary);
-            pdf_spools[i] = take_pdf_spool_if_indexable(&mut sc.pdf_spool, sc.junk.is_some());
+            pdf_spools[i] = take_pdf_spool_if_indexable(
+                &mut sc.pdf_spool,
+                sc.junk.is_some(),
+                &pdf_spool_budget,
+            );
             if let Some((status, reason)) = sc.junk {
                 junk_files.push(JunkFile {
                     file_key: keys[i].clone(),
@@ -1163,7 +1194,16 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
     }
 
-    let queue = Mutex::new(todo);
+    // Move each optional artifact into its sole Phase-B job. A replay cannot
+    // be retried or retained accidentally after staging begins.
+    let queue = Mutex::new(
+        todo.into_iter()
+            .map(|index| {
+                let spool = pdf_spools[index].take();
+                (index, spool)
+            })
+            .collect::<Vec<_>>(),
+    );
     let mut paths_by_key: HashMap<String, Vec<String>> = files
         .iter()
         .zip(keys.iter())
@@ -1188,8 +1228,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         for _ in 0..cfg.workers.min(n_todo.max(1)) {
             scope.spawn(|| {
                 loop {
-                    let i = match queue.lock().unwrap().pop() {
-                        Some(i) => i,
+                    let (i, pdf_spool) = match queue.lock().unwrap().pop() {
+                        Some(job) => job,
                         None => break,
                     };
                     let f = &files[i];
@@ -1381,9 +1421,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             true
                         };
                         let res = if sn.family == Family::Pdf {
-                            match pdf_spools[i].as_ref() {
+                            match pdf_spool {
                                 Some(spool) => spool.replay(f.size, expected_digest, &mut sink),
-                                None => extract::extract(&f.path, &sn, None, &mut sink),
+                                None => {
+                                    pdf_spool_budget.record_reparse();
+                                    extract::extract(&f.path, &sn, None, &mut sink)
+                                }
                             }
                         } else {
                             extract::extract(&f.path, &sn, None, &mut sink)
@@ -1945,6 +1988,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "wall_seconds": (wall * 10.0).round() / 10.0,
         "workers": cfg.workers,
         "semantic": !cfg.no_semantic,
+        "pdf_extraction_reuse": pdf_spool_budget.report(),
     });
     if let Some(g) = &graph_summary {
         run_doc["graph"] = g.clone();
