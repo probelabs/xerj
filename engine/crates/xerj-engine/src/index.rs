@@ -23408,53 +23408,34 @@ fn validate_onnx_dimensions(fields: &[FieldConfig]) -> Result<()> {
 }
 
 #[cfg(feature = "onnx-experimental")]
-fn sha256_file(path: &Path) -> Result<String> {
+fn configured_onnx_assets(
+    cfg: &xerj_common::config::EmbeddingConfig,
+) -> Result<xerj_common::config::EmbeddingAssetSnapshot> {
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
-    use std::io::Read;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::UNIX_EPOCH;
 
-    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, u64, u128), String>>> = OnceLock::new();
-    let canonical = path.canonicalize().map_err(|e| {
-        EngineError::Common(xerj_common::XerjError::embedding(format!(
-            "cannot resolve embedding asset {}: {e}",
-            path.display()
-        )))
-    })?;
-    let metadata = std::fs::metadata(&canonical)?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let key = (canonical.clone(), metadata.len(), modified);
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(hash) = cache.get(&key).cloned() {
-        return Ok(hash);
-    }
-    let mut file = std::fs::File::open(&canonical).map_err(|e| {
-        EngineError::Common(xerj_common::XerjError::embedding(format!(
-            "cannot fingerprint embedding asset {}: {e}",
-            path.display()
-        )))
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0_u8; 1024 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let hash = format!("{:x}", hasher.finalize());
-    cache.insert(key, hash.clone());
-    Ok(hash)
+    cfg.runtime_onnx_assets
+        .get_or_init(|| {
+            let model = Path::new(&cfg.onnx_model_path)
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve embedding model asset: {e}"))?;
+            let tokenizer = Path::new(&cfg.onnx_tokenizer_path)
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve embedding tokenizer asset: {e}"))?;
+            let model_bytes: Arc<[u8]> = std::fs::read(&model)
+                .map(Into::into)
+                .map_err(|e| format!("cannot read embedding model asset: {e}"))?;
+            let tokenizer_bytes: Arc<[u8]> = std::fs::read(&tokenizer)
+                .map(Into::into)
+                .map_err(|e| format!("cannot read embedding tokenizer asset: {e}"))?;
+            Ok(xerj_common::config::EmbeddingAssetSnapshot {
+                model_sha256: format!("{:x}", Sha256::digest(&model_bytes)),
+                tokenizer_sha256: format!("{:x}", Sha256::digest(&tokenizer_bytes)),
+                model_bytes,
+                tokenizer_bytes,
+            })
+        })
+        .clone()
+        .map_err(|reason| EngineError::Common(xerj_common::XerjError::embedding(reason)))
 }
 
 fn configured_onnx_identity(
@@ -23469,15 +23450,158 @@ fn configured_onnx_identity(
          onnx-experimental feature; no embedding identity marker was written",
     )));
     #[cfg(feature = "onnx-experimental")]
-    Ok(Some(PersistedEmbeddingIdentity {
+    {
+        let assets = configured_onnx_assets(cfg)?;
+        Ok(Some(PersistedEmbeddingIdentity {
+            version: 1,
+            backend: "onnx-experimental".into(),
+            model_sha256: assets.model_sha256,
+            tokenizer_sha256: assets.tokenizer_sha256,
+            dimensions: 384,
+            pooling: "attention-mask-mean+l2-normalize".into(),
+            max_tokens: 512,
+        }))
+    }
+}
+
+pub(crate) fn embedding_execution_identity(
+    cfg: &xerj_common::config::EmbeddingConfig,
+) -> Result<crate::engine::EmbeddingExecutionIdentity> {
+    use sha2::{Digest, Sha256};
+
+    const CONTRACT: &str = "semantic_text-derived-vector.v1";
+    let requested = cfg.mode.trim().to_ascii_lowercase();
+    let mut backend = match requested.as_str() {
+        "neural" => {
+            #[cfg(feature = "neural")]
+            {
+                "neural"
+            }
+            #[cfg(not(feature = "neural"))]
+            {
+                "lexical"
+            }
+        }
+        "onnx-experimental" => "onnx-experimental",
+        "lexical" => "lexical",
+        "proxy" if cfg.default_endpoint.is_empty() => "lexical",
+        "proxy" => "proxy",
+        _ if cfg.default_endpoint.is_empty() => "lexical",
+        _ => "proxy",
+    };
+    if backend == "proxy" && !proxy_initializes(cfg) {
+        backend = "lexical";
+    }
+    // Only report a width for the backends whose width this server actually
+    // pins. `neural` reads it from the loaded model's `hidden_size` and
+    // `proxy` gets whatever the remote returns, so both are omitted rather
+    // than reported as 384.
+    let (material, resumable, reason, dimensions) = match backend {
+        "lexical" => (
+            format!(
+                "lexical-feature-hash.v1;dimensions={};algorithm-probe={}",
+                xerj_ai::local::DEFAULT_DIMS,
+                lexical_algorithm_probe_sha256()
+            ),
+            true,
+            None,
+            Some(xerj_ai::local::DEFAULT_DIMS),
+        ),
+        "onnx-experimental" => {
+            let identity = configured_onnx_identity(cfg)?.ok_or_else(|| {
+                EngineError::Common(xerj_common::XerjError::embedding(
+                    "ONNX embedding identity is unavailable",
+                ))
+            })?;
+            let onnx_dimensions = identity.dimensions;
+            (
+                format!(
+                    "onnx-experimental.v1;model={};tokenizer={};dimensions={};pooling={};max_tokens={}",
+                    identity.model_sha256,
+                    identity.tokenizer_sha256,
+                    identity.dimensions,
+                    identity.pooling,
+                    identity.max_tokens
+                ),
+                true,
+                None,
+                Some(onnx_dimensions),
+            )
+        }
+        "neural" => (
+            format!("neural-unpinned.v1;configured-model={}", cfg.neural_model),
+            false,
+            Some(
+                "the neural model is not content-addressed; use a fresh autoindex state after changing it"
+                    .to_string(),
+            ),
+            None,
+        ),
+        "proxy" => (
+            format!("proxy-unpinned.v1;configured-model={}", cfg.default_model),
+            false,
+            Some(
+                "the remote provider does not attest immutable model assets; semantic resume is unsafe"
+                    .to_string(),
+            ),
+            None,
+        ),
+        _ => unreachable!(),
+    };
+    let canonical = format!("{CONTRACT};backend={backend};{material}");
+    Ok(crate::engine::EmbeddingExecutionIdentity {
         version: 1,
-        backend: "onnx-experimental".into(),
-        model_sha256: sha256_file(Path::new(&cfg.onnx_model_path))?,
-        tokenizer_sha256: sha256_file(Path::new(&cfg.onnx_tokenizer_path))?,
-        dimensions: 384,
-        pooling: "attention-mask-mean+l2-normalize".into(),
-        max_tokens: 512,
-    }))
+        backend: backend.to_string(),
+        identity_sha256: format!("{:x}", Sha256::digest(canonical.as_bytes())),
+        dimensions,
+        semantic_contract: CONTRACT.to_string(),
+        resumable,
+        non_resumable_reason: reason,
+    })
+}
+
+/// Fingerprint representative output from the zero-config embedder.
+///
+/// The lexical backend has no model asset to hash, so its identity must be
+/// bound to executable behaviour instead. Encoding each `f32` as little-endian
+/// bytes makes the material stable across host endianness. If tokenisation,
+/// feature weights, hashing, normalisation, or the default width changes, this
+/// digest (and therefore the resume identity) changes automatically.
+fn lexical_algorithm_probe_sha256() -> String {
+    use sha2::{Digest, Sha256};
+
+    const PROBES: &[&str] = &[
+        "",
+        "The quick brown fox jumps over the lazy dog.",
+        "Revenue grew 12.5% in Q4 2025; naïve café 東京.",
+        "snake_case/path-like:value + punctuation!",
+    ];
+    let mut digest = Sha256::new();
+    for probe in PROBES {
+        digest.update((probe.len() as u64).to_le_bytes());
+        digest.update(probe.as_bytes());
+        for value in xerj_ai::local::local_embed(probe, xerj_ai::local::DEFAULT_DIMS) {
+            digest.update(value.to_le_bytes());
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn proxy_config(
+    cfg: &xerj_common::config::EmbeddingConfig,
+) -> xerj_ai::embed::EmbeddingProxyConfig {
+    xerj_ai::embed::EmbeddingProxyConfig {
+        endpoint: cfg.default_endpoint.clone(),
+        api_key: std::env::var("XERJ_EMBEDDING_API_KEY").ok(),
+        model: cfg.default_model.clone(),
+        timeout_secs: cfg.timeout_ms / 1000,
+        max_concurrent: 4,
+        max_retries: 3,
+    }
+}
+
+fn proxy_initializes(cfg: &xerj_common::config::EmbeddingConfig) -> bool {
+    xerj_ai::embed::EmbeddingProxy::new(proxy_config(cfg)).is_ok()
 }
 
 /// Fail closed rather than mixing vectors produced by different model,
@@ -23602,6 +23726,303 @@ mod embedding_identity_tests {
             ))
             .unwrap();
         schema
+    }
+
+    #[test]
+    fn lexical_execution_identity_is_stable_and_sanitized() {
+        let cfg = xerj_common::config::EmbeddingConfig::default();
+        let identity = embedding_execution_identity(&cfg).unwrap();
+        assert_eq!(identity.backend, "lexical");
+        assert!(identity.resumable);
+        // `Embedder::Lexical` always embeds at DEFAULT_DIMS, so this width is
+        // the one the server will really produce.
+        assert_eq!(identity.dimensions, Some(xerj_ai::local::DEFAULT_DIMS));
+        // The lexical identity has no model asset behind it, so it is bound to
+        // the embedder's actual output instead. If this digest moves, every
+        // lexical vector moved with it and the resume identity below must move
+        // too — see `lexical_algorithm_probe_sha256`.
+        assert_eq!(
+            lexical_algorithm_probe_sha256(),
+            "e6240f3d323831d621fd69a62b39ad70b7efba72e58e949362fdb7f5d53eea53"
+        );
+        assert_eq!(
+            identity.identity_sha256,
+            "58a7576ccc1497ee471418bb6e8918c7e5a837161792992e1e213a2dcb2ebdbe"
+        );
+        let encoded = serde_json::to_string(&identity).unwrap();
+        assert!(!encoded.contains("endpoint"));
+        assert!(!encoded.contains("path"));
+    }
+
+    #[test]
+    fn configured_backends_report_the_effective_runtime_backend() {
+        let neural = xerj_common::config::EmbeddingConfig {
+            mode: "neural".into(),
+            ..Default::default()
+        };
+        let neural_identity = embedding_execution_identity(&neural).unwrap();
+        #[cfg(feature = "neural")]
+        {
+            assert_eq!(neural_identity.backend, "neural");
+            assert!(!neural_identity.resumable);
+            // The neural width is the loaded model's `hidden_size`, which is
+            // not known until the model loads — reporting 384 here would be a
+            // false statement for any encoder that is not 384-wide.
+            assert_eq!(neural_identity.dimensions, None);
+            let encoded = serde_json::to_string(&neural_identity).unwrap();
+            assert!(!encoded.contains("dimensions"), "{encoded}");
+        }
+        #[cfg(not(feature = "neural"))]
+        {
+            assert_eq!(neural_identity.backend, "lexical");
+            assert!(neural_identity.resumable);
+            assert_eq!(
+                neural_identity.dimensions,
+                Some(xerj_ai::local::DEFAULT_DIMS)
+            );
+        }
+        let proxy = xerj_common::config::EmbeddingConfig {
+            mode: "proxy".into(),
+            default_endpoint: "https://secret.example/v1".into(),
+            default_model: "private-alias".into(),
+            ..Default::default()
+        };
+        let identity = embedding_execution_identity(&proxy).unwrap();
+        assert_eq!(identity.backend, "proxy");
+        assert!(!identity.resumable);
+        // A remote provider returns whatever width its model has; this server
+        // never sees it, so it is omitted rather than asserted.
+        assert_eq!(identity.dimensions, None);
+        let encoded = serde_json::to_string(&identity).unwrap();
+        assert!(!encoded.contains("secret.example"));
+        assert!(!encoded.contains("private-alias"));
+        assert!(!encoded.contains("dimensions"), "{encoded}");
+
+        for endpoint in ["", "not a url", "file:///private/model"] {
+            let fallback = xerj_common::config::EmbeddingConfig {
+                mode: "proxy".into(),
+                default_endpoint: endpoint.into(),
+                ..Default::default()
+            };
+            let identity = embedding_execution_identity(&fallback).unwrap();
+            assert_eq!(identity.backend, "lexical", "{endpoint}");
+            assert!(identity.resumable, "{endpoint}");
+            // The fallback really did become lexical, so the pinned lexical
+            // width is the truthful answer here.
+            assert_eq!(
+                identity.dimensions,
+                Some(xerj_ai::local::DEFAULT_DIMS),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[test]
+    fn onnx_execution_identity_changes_with_asset_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = embedding_execution_identity(&onnx_config(dir.path(), "a")).unwrap();
+        let second = embedding_execution_identity(&onnx_config(dir.path(), "b")).unwrap();
+        assert!(first.resumable);
+        // ONNX is the one non-lexical backend whose width the server does pin:
+        // `validate_onnx_dimensions` refuses any mapping that is not 384.
+        assert_eq!(first.dimensions, Some(384));
+        assert_ne!(first.identity_sha256, second.identity_sha256);
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[test]
+    fn onnx_identity_and_lazy_loader_share_one_immutable_byte_snapshot() {
+        use std::fs::{File, FileTimes, OpenOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = onnx_config(dir.path(), "stable-path");
+        let model_path = Path::new(&cfg.onnx_model_path);
+        let tokenizer_path = Path::new(&cfg.onnx_tokenizer_path);
+        let model_modified = model_path.metadata().unwrap().modified().unwrap();
+        let tokenizer_modified = tokenizer_path.metadata().unwrap().modified().unwrap();
+
+        let identity_before = embedding_execution_identity(&cfg).unwrap();
+        let snapshot_before = configured_onnx_assets(&cfg).unwrap();
+        let replacement_model = vec![b'x'; snapshot_before.model_bytes.len()];
+        let replacement_tokenizer = vec![b'y'; snapshot_before.tokenizer_bytes.len()];
+        std::fs::write(model_path, &replacement_model).unwrap();
+        std::fs::write(tokenizer_path, &replacement_tokenizer).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(model_path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(model_modified))
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(tokenizer_path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(tokenizer_modified))
+            .unwrap();
+
+        let snapshot_for_loader = configured_onnx_assets(&cfg).unwrap();
+        let identity_after = embedding_execution_identity(&cfg).unwrap();
+        assert_eq!(identity_before, identity_after);
+        assert_eq!(
+            snapshot_for_loader.model_bytes.as_ref(),
+            snapshot_before.model_bytes.as_ref()
+        );
+        assert_eq!(
+            snapshot_for_loader.tokenizer_bytes.as_ref(),
+            snapshot_before.tokenizer_bytes.as_ref()
+        );
+        assert_ne!(snapshot_for_loader.model_bytes.as_ref(), replacement_model);
+        assert_ne!(
+            snapshot_for_loader.tokenizer_bytes.as_ref(),
+            replacement_tokenizer
+        );
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[test]
+    fn onnx_snapshot_is_scoped_to_one_runtime_config_and_released_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_cfg = onnx_config(dir.path(), "runtime-scope");
+        let first = configured_onnx_assets(&first_cfg).unwrap();
+        let weak_model = Arc::downgrade(&first.model_bytes);
+        let first_identity = embedding_execution_identity(&first_cfg).unwrap();
+
+        let replacement_model = vec![b'z'; first.model_bytes.len()];
+        std::fs::write(&first_cfg.onnx_model_path, &replacement_model).unwrap();
+        drop(first);
+        drop(first_cfg);
+        assert!(
+            weak_model.upgrade().is_none(),
+            "dropping the runtime config must release its immutable asset snapshot"
+        );
+
+        let second_cfg = xerj_common::config::EmbeddingConfig {
+            mode: "onnx-experimental".into(),
+            onnx_model_path: dir
+                .path()
+                .join("model-runtime-scope.onnx")
+                .to_string_lossy()
+                .into_owned(),
+            onnx_tokenizer_path: dir
+                .path()
+                .join("tokenizer-runtime-scope.json")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        let second = configured_onnx_assets(&second_cfg).unwrap();
+        let second_identity = embedding_execution_identity(&second_cfg).unwrap();
+        assert_eq!(second.model_bytes.as_ref(), replacement_model);
+        assert_ne!(
+            first_identity.identity_sha256,
+            second_identity.identity_sha256
+        );
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[tokio::test]
+    async fn sequential_engines_from_one_caller_config_refresh_same_path_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller_config = xerj_common::config::Config::default();
+        caller_config.server.data_dir = dir
+            .path()
+            .join("engine-data")
+            .to_string_lossy()
+            .into_owned();
+        caller_config.embedding = onnx_config(dir.path(), "engine-lifetime");
+
+        let first_engine = crate::Engine::new(caller_config.clone()).unwrap();
+        let first_identity = first_engine.embedding_execution_identity().unwrap();
+        let model_path = caller_config.embedding.onnx_model_path.clone();
+        let original_len = std::fs::metadata(&model_path).unwrap().len() as usize;
+        drop(first_engine);
+
+        std::fs::write(&model_path, vec![b'q'; original_len]).unwrap();
+        let second_engine = crate::Engine::new(caller_config).unwrap();
+        let second_identity = second_engine.embedding_execution_identity().unwrap();
+        assert_ne!(
+            first_identity.identity_sha256,
+            second_identity.identity_sha256
+        );
+    }
+
+    #[cfg(feature = "onnx-experimental")]
+    #[test]
+    fn concurrent_identity_and_loader_access_share_one_runtime_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = onnx_config(dir.path(), "concurrent");
+        let identity_cfg = cfg.clone();
+        let identity_thread =
+            std::thread::spawn(move || embedding_execution_identity(&identity_cfg).unwrap());
+        let loader_cfg = cfg.clone();
+        let loader_thread =
+            std::thread::spawn(move || configured_onnx_assets(&loader_cfg).unwrap());
+
+        let identity = identity_thread.join().unwrap();
+        let loader_snapshot = loader_thread.join().unwrap();
+        let owner_snapshot = configured_onnx_assets(&cfg).unwrap();
+        assert_eq!(
+            identity.identity_sha256,
+            embedding_execution_identity(&cfg).unwrap().identity_sha256
+        );
+        assert!(Arc::ptr_eq(
+            &loader_snapshot.model_bytes,
+            &owner_snapshot.model_bytes
+        ));
+        assert!(Arc::ptr_eq(
+            &loader_snapshot.tokenizer_bytes,
+            &owner_snapshot.tokenizer_bytes
+        ));
+    }
+
+    /// Run with matching production assets:
+    ///
+    /// `XERJ_ONNX_TEST_MODEL=/abs/model.onnx
+    ///  XERJ_ONNX_TEST_TOKENIZER=/abs/tokenizer.json
+    ///  cargo test -p xerj-engine --features onnx-experimental
+    ///  concurrent_identity_and_real_lazy_pool_share_snapshot -- --ignored`
+    #[cfg(feature = "onnx-experimental")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires explicit matching ONNX model and tokenizer assets"]
+    async fn concurrent_identity_and_real_lazy_pool_share_snapshot() {
+        let cfg = xerj_common::config::EmbeddingConfig {
+            mode: "onnx-experimental".into(),
+            onnx_model_path: std::env::var("XERJ_ONNX_TEST_MODEL")
+                .expect("XERJ_ONNX_TEST_MODEL is required"),
+            onnx_tokenizer_path: std::env::var("XERJ_ONNX_TEST_TOKENIZER")
+                .expect("XERJ_ONNX_TEST_TOKENIZER is required"),
+            ..Default::default()
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let identity_cfg = cfg.clone();
+        let identity_barrier = barrier.clone();
+        let identity = tokio::task::spawn_blocking(move || {
+            identity_barrier.wait();
+            embedding_execution_identity(&identity_cfg).unwrap()
+        });
+        let embedder = make_embedder(&cfg).unwrap();
+        barrier.wait();
+        let vectors = embedder
+            .embed_batch(vec!["quarterly revenue increased".into()])
+            .await
+            .unwrap();
+        let identity = identity.await.unwrap();
+        assert_eq!(identity.backend, "onnx-experimental");
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(Some(vectors[0].len()), identity.dimensions);
+        let snapshot = configured_onnx_assets(&cfg).unwrap();
+        assert_eq!(
+            identity.identity_sha256,
+            embedding_execution_identity(&cfg).unwrap().identity_sha256
+        );
+        assert_eq!(
+            snapshot.model_sha256,
+            format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(&snapshot.model_bytes)
+            )
+        );
     }
 
     #[cfg(feature = "onnx-experimental")]
@@ -23761,24 +24182,18 @@ fn make_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xerj_ai::
             warn!("embedding.mode=proxy but embedding.default_endpoint is empty — falling back to lexical");
             return Ok(xerj_ai::Embedder::lexical());
         }
-        let proxy_cfg = xerj_ai::embed::EmbeddingProxyConfig {
-            endpoint: cfg.default_endpoint.clone(),
-            api_key: std::env::var("XERJ_EMBEDDING_API_KEY").ok(),
-            model: cfg.default_model.clone(),
-            timeout_secs: cfg.timeout_ms / 1000,
-            max_concurrent: 4,
-            max_retries: 3,
-        };
-        return Ok(match xerj_ai::embed::EmbeddingProxy::new(proxy_cfg) {
-            Ok(p) => {
-                info!(endpoint = %cfg.default_endpoint, "embedding backend: external proxy");
-                xerj_ai::Embedder::proxy(p)
-            }
-            Err(e) => {
-                warn!(error = %e, "embedding proxy init failed — falling back to lexical");
-                xerj_ai::Embedder::lexical()
-            }
-        });
+        return Ok(
+            match xerj_ai::embed::EmbeddingProxy::new(proxy_config(cfg)) {
+                Ok(p) => {
+                    info!(endpoint = %cfg.default_endpoint, "embedding backend: external proxy");
+                    xerj_ai::Embedder::proxy(p)
+                }
+                Err(e) => {
+                    warn!(error = %e, "embedding proxy init failed — falling back to lexical");
+                    xerj_ai::Embedder::lexical()
+                }
+            },
+        );
     }
 
     Ok(xerj_ai::Embedder::lexical())
@@ -23842,11 +24257,12 @@ fn make_onnx_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xerj
             ),
         )));
     }
+    let assets = configured_onnx_assets(cfg)?;
     let onnx_cfg = xerj_ai::embedder::OnnxConfig {
-        model_sha256: sha256_file(&model_path)?,
-        tokenizer_sha256: sha256_file(&tokenizer_path)?,
-        model_path,
-        tokenizer_path,
+        model_sha256: assets.model_sha256,
+        tokenizer_sha256: assets.tokenizer_sha256,
+        model_bytes: assets.model_bytes,
+        tokenizer_bytes: assets.tokenizer_bytes,
         intra_threads: cfg.onnx_intra_threads.max(1),
         session_pool_size: cfg.onnx_session_pool_size,
         microbatch: xerj_ai::onnx::MicrobatchConfig {
@@ -23859,8 +24275,8 @@ fn make_onnx_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xerj
         max_inflight_input_bytes: cfg.onnx_max_inflight_input_bytes,
     };
     info!(
-        model = %onnx_cfg.model_path.display(),
-        tokenizer = %onnx_cfg.tokenizer_path.display(),
+        model_sha256 = %onnx_cfg.model_sha256,
+        tokenizer_sha256 = %onnx_cfg.tokenizer_sha256,
         scheduling_window = cfg.onnx_scheduling_window,
         session_pool_size = onnx_cfg.session_pool_size,
         "embedding backend: experimental ONNX Runtime (loads on first use)"

@@ -15,6 +15,29 @@ use xerj_common::types::{IndexName, Schema};
 use crate::index::{Index, IndexStats};
 use crate::{EngineError, Result};
 
+/// Privacy-safe identity of the embedding execution contract exposed to
+/// remote ingestion clients. The digest is opaque: model paths, provider URLs,
+/// credentials, and model names never cross the API boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingExecutionIdentity {
+    pub version: u32,
+    pub backend: String,
+    pub identity_sha256: String,
+    /// Vector width, but only for the backends where the server actually
+    /// pins it: `lexical` always emits [`xerj_ai::local::DEFAULT_DIMS`], and
+    /// `onnx-experimental` is constrained to 384 by `validate_onnx_dimensions`.
+    /// `neural` takes its width from the loaded model's `hidden_size` and
+    /// `proxy` from whatever the remote returns, so neither is known here and
+    /// the field is omitted rather than guessed — a reader must not treat an
+    /// absent width as 384.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
+    pub semantic_contract: String,
+    pub resumable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_resumable_reason: Option<String>,
+}
+
 // ── Clustering types ─────────────────────────────────────────────────────────
 
 /// Node identity and cluster membership configuration.
@@ -366,7 +389,11 @@ impl Engine {
     }
 
     /// Create a new engine, opening any existing indices from disk.
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(mut config: Config) -> Result<Self> {
+        // Runtime asset ownership belongs to this Engine, not to the caller's
+        // clone lineage. This ensures a later Engine re-reads same-path ONNX
+        // assets while all Index config clones within one Engine share bytes.
+        config.embedding.runtime_onnx_assets = Arc::new(std::sync::OnceLock::new());
         let data_dir = PathBuf::from(&config.server.data_dir);
         std::fs::create_dir_all(&data_dir)?;
 
@@ -1492,6 +1519,12 @@ impl Engine {
     /// coupling to the full engine internals.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Return the effective embedding identity without exposing configuration
+    /// secrets or local asset paths.
+    pub fn embedding_execution_identity(&self) -> Result<EmbeddingExecutionIdentity> {
+        crate::index::embedding_execution_identity(&self.config.embedding)
     }
 
     /// Sum of every open index's live memtable footprint, in bytes. This is

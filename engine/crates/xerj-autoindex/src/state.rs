@@ -79,6 +79,105 @@ mod tests {
         assert!(text.contains("\"kind\":\"resume\""));
         assert!(text.contains("\"bulk_timeout_secs\":900"));
     }
+
+    #[test]
+    fn semantic_identity_is_durable_and_drift_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = Journal::open(dir.path(), "root", "url", "prefix", 300, true).unwrap();
+        first
+            .pin_embedding_identity(&"a".repeat(64), true, None)
+            .unwrap();
+        drop(first);
+
+        let mut resumed = Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
+        resumed
+            .pin_embedding_identity(&"a".repeat(64), true, None)
+            .unwrap();
+        let error = resumed
+            .pin_embedding_identity(&"b".repeat(64), true, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to mix vector spaces"), "{error}");
+        assert!(error.contains("Restore the original"), "{error}");
+        assert!(error.contains("--fresh"), "{error}");
+        assert!(error.contains("--prefix"), "{error}");
+        assert!(error.contains("delete and recreate"), "{error}");
+    }
+
+    #[test]
+    fn unpinned_backend_allows_fresh_run_but_not_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), "root", "url", "prefix", 300, true).unwrap();
+        journal
+            .pin_embedding_identity(&"a".repeat(64), false, Some("remote alias can drift"))
+            .unwrap();
+        drop(journal);
+        let mut resumed = Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
+        let error = resumed
+            .pin_embedding_identity(&"a".repeat(64), false, Some("remote alias can drift"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("remote alias can drift"), "{error}");
+        assert!(error.contains("--fresh"), "{error}");
+        assert!(error.contains("--prefix"), "{error}");
+        assert!(error.contains("delete and recreate"), "{error}");
+    }
+
+    #[test]
+    fn completed_legacy_semantic_journal_requires_fresh_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("journal.ndjson"),
+            concat!(
+                "{\"v\":1,\"kind\":\"run\",\"root\":\"root\",\"url\":\"url\",",
+                "\"prefix\":\"prefix\",\"run_id\":\"legacy\"}\n",
+                "{\"kind\":\"file_done\",\"file_key\":\"f\",\"path\":\"report.txt\",",
+                "\"records\":1,\"junk\":0,\"bytes\":10}\n"
+            ),
+        )
+        .unwrap();
+        let mut journal = Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
+        let error = journal
+            .pin_embedding_identity(&"a".repeat(64), true, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("predates embedding identity pinning"),
+            "{error}"
+        );
+        assert!(error.contains("--fresh"), "{error}");
+        assert!(error.contains("--prefix"), "{error}");
+        assert!(error.contains("delete and recreate"), "{error}");
+    }
+
+    #[test]
+    fn malformed_or_conflicting_identity_records_fail_during_replay() {
+        for tail in [
+            "{\"v\":1,\"kind\":\"embedding_identity\",\"identity_sha256\":\"bad\",\"resumable\":true}\n",
+            concat!(
+                "{\"v\":1,\"kind\":\"embedding_identity\",\"identity_sha256\":\"",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "\",\"resumable\":true}\n",
+                "{\"v\":1,\"kind\":\"embedding_identity\",\"identity_sha256\":\"",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "\",\"resumable\":true}\n"
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("journal.ndjson"),
+                format!(
+                    "{{\"v\":1,\"kind\":\"run\",\"root\":\"root\",\"url\":\"url\",\
+                     \"prefix\":\"prefix\",\"run_id\":\"legacy\"}}\n{tail}"
+                ),
+            )
+            .unwrap();
+            assert!(
+                Journal::open(dir.path(), "root", "url", "prefix", 300, false).is_err(),
+                "{tail}"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +259,8 @@ pub struct Journal {
     /// publication can never make resume skip a zero/partial generation.
     pub pending_replacements: HashMap<String, String>,
     pub plan: Option<Plan>,
+    pub embedding_identity_sha256: Option<String>,
+    pub embedding_identity_resumable: Option<bool>,
 }
 
 pub fn default_state_dir(root: &str, url: &str, prefix: &str) -> PathBuf {
@@ -218,6 +319,8 @@ impl Journal {
         let mut done = HashMap::new();
         let mut pending_replacements: HashMap<String, String> = HashMap::new();
         let mut plan = None;
+        let mut embedding_identity_sha256 = None;
+        let mut embedding_identity_resumable = None;
         let mut run_id = None;
         let mut resumed = false;
         if jpath.exists() {
@@ -267,6 +370,49 @@ impl Journal {
                                         plan = Some(p);
                                     }
                                 }
+                            }
+                            Some("embedding_identity") => {
+                                let digest = v
+                                    .get("identity_sha256")
+                                    .and_then(Value::as_str)
+                                    .filter(|digest| {
+                                        digest.len() == 64
+                                            && digest.bytes().all(|byte| {
+                                                byte.is_ascii_hexdigit()
+                                                    && !byte.is_ascii_uppercase()
+                                            })
+                                    });
+                                let resumable = v.get("resumable").and_then(Value::as_bool);
+                                if v.get("v").and_then(Value::as_u64) != Some(1)
+                                    || digest.is_none()
+                                    || resumable.is_none()
+                                    || v.as_object().is_none_or(|object| {
+                                        object.len() != 4
+                                            || !["v", "kind", "identity_sha256", "resumable"]
+                                                .iter()
+                                                .all(|key| object.contains_key(*key))
+                                    })
+                                {
+                                    anyhow::bail!(
+                                        "journal at {} contains a malformed embedding identity; \
+                                         restore it from backup or re-run with --fresh",
+                                        jpath.display()
+                                    );
+                                }
+                                if embedding_identity_sha256
+                                    .as_deref()
+                                    .is_some_and(|existing| existing != digest.unwrap())
+                                    || embedding_identity_resumable
+                                        .is_some_and(|existing| existing != resumable.unwrap())
+                                {
+                                    anyhow::bail!(
+                                        "journal at {} contains conflicting embedding identities; \
+                                         restore it from backup or re-run with --fresh",
+                                        jpath.display()
+                                    );
+                                }
+                                embedding_identity_sha256 = digest.map(str::to_owned);
+                                embedding_identity_resumable = resumable;
                             }
                             Some("file_done") => {
                                 if let Ok(fd) = serde_json::from_value::<FileDone>(v.clone()) {
@@ -345,6 +491,8 @@ impl Journal {
             done,
             pending_replacements,
             plan,
+            embedding_identity_sha256,
+            embedding_identity_resumable,
         };
         if is_new {
             j.append_transaction(
@@ -365,6 +513,61 @@ impl Journal {
             )?;
         }
         Ok(j)
+    }
+
+    /// Pin the server-side vector-space identity before any semantic write.
+    pub fn pin_embedding_identity(
+        &mut self,
+        identity_sha256: &str,
+        resumable: bool,
+        non_resumable_reason: Option<&str>,
+    ) -> Result<()> {
+        if identity_sha256.len() != 64
+            || !identity_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            anyhow::bail!("server returned an invalid embedding identity digest");
+        }
+        if self.resumed && (!resumable || self.embedding_identity_resumable == Some(false)) {
+            anyhow::bail!(
+                "server embedding backend cannot safely resume semantic indexing: {}. \
+                 Restore the exact original embedding identity, or rebuild all vectors with \
+                 --fresh and a new --prefix. Before reusing the old prefix, delete and recreate \
+                 its prior autoindex indices",
+                non_resumable_reason.unwrap_or("embedding identity is not immutable")
+            );
+        }
+        if let Some(existing) = &self.embedding_identity_sha256 {
+            if existing != identity_sha256 {
+                anyhow::bail!(
+                    "embedding execution identity changed since this autoindex journal was \
+                     created; refusing to mix vector spaces. Restore the original embedding \
+                     identity, or rebuild all vectors with --fresh and a new --prefix. Before \
+                     reusing the old prefix, delete and recreate its prior autoindex indices"
+                );
+            }
+            return Ok(());
+        }
+        if self.resumed && !self.done.is_empty() {
+            anyhow::bail!(
+                "this semantic autoindex journal predates embedding identity pinning and cannot \
+                 be resumed safely. Rebuild all vectors with --fresh and a new --prefix. Before \
+                 reusing the old prefix, delete and recreate its prior autoindex indices"
+            );
+        }
+        self.append_transaction(
+            &serde_json::json!({
+                "v": 1,
+                "kind": "embedding_identity",
+                "identity_sha256": identity_sha256,
+                "resumable": resumable,
+            }),
+            "embedding_identity",
+        )?;
+        self.embedding_identity_sha256 = Some(identity_sha256.to_owned());
+        self.embedding_identity_resumable = Some(resumable);
+        Ok(())
     }
 
     fn append_transaction(&mut self, v: &Value, what: &str) -> Result<()> {

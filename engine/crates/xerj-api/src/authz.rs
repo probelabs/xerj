@@ -2418,6 +2418,10 @@ mod tests {
             assert!(check(p, Method::GET, "/_cat/indices", ""), "cat");
             assert!(check(p, Method::GET, "/v1/health", ""), "native health");
             assert!(
+                check(p, Method::GET, "/v1/embedding/identity", ""),
+                "embedding identity"
+            );
+            assert!(
                 check(p, Method::GET, "/_resolve/index/logs-*", ""),
                 "resolve"
             );

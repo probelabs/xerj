@@ -283,12 +283,12 @@ impl Embedder {
 }
 
 #[cfg(feature = "onnx-experimental")]
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct OnnxConfig {
-    pub model_path: std::path::PathBuf,
-    pub tokenizer_path: std::path::PathBuf,
-    /// Content fingerprints are part of the shared-session cache key and are
-    /// rechecked immediately before load, preventing same-path asset swaps.
+    /// Immutable byte snapshots are shared by identity reporting and lazy
+    /// loading. A later same-path replacement cannot change the loaded space.
+    pub model_bytes: std::sync::Arc<[u8]>,
+    pub tokenizer_bytes: std::sync::Arc<[u8]>,
     pub model_sha256: String,
     pub tokenizer_sha256: String,
     pub intra_threads: usize,
@@ -298,6 +298,18 @@ pub struct OnnxConfig {
     pub max_inflight_calls: usize,
     pub max_input_bytes_per_call: usize,
     pub max_inflight_input_bytes: usize,
+}
+
+#[cfg(feature = "onnx-experimental")]
+impl std::fmt::Debug for OnnxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxConfig")
+            .field("model_sha256", &self.model_sha256)
+            .field("tokenizer_sha256", &self.tokenizer_sha256)
+            .field("intra_threads", &self.intra_threads)
+            .field("session_pool_size", &self.session_pool_size)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "onnx-experimental")]
@@ -314,16 +326,51 @@ pub struct OnnxHandle {
 }
 
 #[cfg(feature = "onnx-experimental")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct OnnxCacheKey {
+    model_sha256: String,
+    tokenizer_sha256: String,
+    intra_threads: usize,
+    session_pool_size: usize,
+    microbatch: crate::onnx::MicrobatchConfig,
+    max_inflight_calls: usize,
+    max_input_bytes_per_call: usize,
+    max_inflight_input_bytes: usize,
+}
+
+#[cfg(feature = "onnx-experimental")]
+impl From<&OnnxConfig> for OnnxCacheKey {
+    fn from(cfg: &OnnxConfig) -> Self {
+        use sha2::{Digest, Sha256};
+
+        Self {
+            // OnnxConfig is public, so its descriptive hash fields are not a
+            // construction invariant. Session sharing must be keyed from the
+            // bytes the runtime will actually load.
+            model_sha256: format!("{:x}", Sha256::digest(&cfg.model_bytes)),
+            tokenizer_sha256: format!("{:x}", Sha256::digest(&cfg.tokenizer_bytes)),
+            intra_threads: cfg.intra_threads,
+            session_pool_size: cfg.session_pool_size,
+            microbatch: cfg.microbatch,
+            max_inflight_calls: cfg.max_inflight_calls,
+            max_input_bytes_per_call: cfg.max_input_bytes_per_call,
+            max_inflight_input_bytes: cfg.max_inflight_input_bytes,
+        }
+    }
+}
+
+#[cfg(feature = "onnx-experimental")]
 impl OnnxHandle {
     fn new(cfg: OnnxConfig) -> Self {
         use std::collections::HashMap;
         use std::sync::{Mutex, OnceLock, Weak};
-        static CELLS: OnceLock<Mutex<HashMap<OnnxConfig, Weak<OnnxShared>>>> = OnceLock::new();
+        static CELLS: OnceLock<Mutex<HashMap<OnnxCacheKey, Weak<OnnxShared>>>> = OnceLock::new();
+        let key = OnnxCacheKey::from(&cfg);
         let mut cells = CELLS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(shared) = cells.get(&cfg).and_then(Weak::upgrade) {
+        if let Some(shared) = cells.get(&key).and_then(Weak::upgrade) {
             return Self { cfg, shared };
         }
         cells.retain(|_, shared| shared.strong_count() > 0);
@@ -334,7 +381,7 @@ impl OnnxHandle {
                 cfg.max_inflight_input_bytes.max(1),
             )),
         });
-        cells.insert(cfg.clone(), std::sync::Arc::downgrade(&shared));
+        cells.insert(key, std::sync::Arc::downgrade(&shared));
         Self { cfg, shared }
     }
 
@@ -343,30 +390,9 @@ impl OnnxHandle {
         self.shared
             .init
             .get_or_spawn("xerj-onnx-init", move || {
-                    let model_bytes = std::fs::read(&cfg.model_path).map_err(|e| {
-                        anyhow!("read ONNX model {}: {e}", cfg.model_path.display())
-                    })?;
-                    let tokenizer_bytes = std::fs::read(&cfg.tokenizer_path).map_err(|e| {
-                        anyhow!("read ONNX tokenizer {}: {e}", cfg.tokenizer_path.display())
-                    })?;
-                    let actual_model = sha256_bytes(&model_bytes);
-                    let actual_tokenizer = sha256_bytes(&tokenizer_bytes);
-                    if actual_model != cfg.model_sha256 || actual_tokenizer != cfg.tokenizer_sha256
-                    {
-                        return Err(anyhow!(
-                            "ONNX assets changed after configuration; refusing to load a \
-                             different vector space from the same path (model expected {}, \
-                             actual {}; tokenizer expected {}, actual {}). Restart with the \
-                             intended assets or reindex under a new prefix",
-                            cfg.model_sha256,
-                            actual_model,
-                            cfg.tokenizer_sha256,
-                            actual_tokenizer
-                        ));
-                    }
                     let embedder = crate::onnx::OnnxPool::load_bytes(
-                        &model_bytes,
-                        &tokenizer_bytes,
+                        &cfg.model_bytes,
+                        &cfg.tokenizer_bytes,
                         cfg.intra_threads,
                         cfg.session_pool_size,
                     )?;
@@ -474,26 +500,17 @@ impl OnnxHandle {
     }
 }
 
-#[cfg(feature = "onnx-experimental")]
-fn sha256_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
 #[cfg(all(test, feature = "onnx-experimental"))]
 mod onnx_handle_tests {
     use super::{CancellationSafeInit, OnnxConfig, OnnxHandle};
     use crate::onnx::MicrobatchConfig;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn cfg(model_sha256: &str) -> OnnxConfig {
         OnnxConfig {
-            model_path: PathBuf::from("/tmp/model.onnx"),
-            tokenizer_path: PathBuf::from("/tmp/tokenizer.json"),
+            model_bytes: Arc::from(format!("model bytes for {model_sha256}").into_bytes()),
+            tokenizer_bytes: Arc::from(b"tokenizer bytes".as_slice()),
             model_sha256: model_sha256.into(),
             tokenizer_sha256: "tokenizer-hash".into(),
             intra_threads: 4,
@@ -506,10 +523,46 @@ mod onnx_handle_tests {
     }
 
     #[test]
-    fn same_paths_with_different_content_hashes_never_share_session_cell() {
-        let first = OnnxHandle::new(cfg("model-a"));
-        let second = OnnxHandle::new(cfg("model-b"));
+    fn different_actual_bytes_never_share_session_cell() {
+        let first = cfg("model-a");
+        let mut second = cfg("model-b");
+        second.model_bytes = Arc::from(b"different model bytes".as_slice());
+        let first = OnnxHandle::new(first);
+        let second = OnnxHandle::new(second);
         assert!(!Arc::ptr_eq(&first.shared, &second.shared));
+    }
+
+    #[test]
+    fn identical_bytes_share_even_when_descriptive_hash_fields_differ() {
+        let first_cfg = cfg("descriptive-a");
+        let mut second_cfg = cfg("descriptive-b");
+        second_cfg.model_bytes = first_cfg.model_bytes.clone();
+        second_cfg.tokenizer_bytes = first_cfg.tokenizer_bytes.clone();
+        let first = OnnxHandle::new(first_cfg);
+        let second = OnnxHandle::new(second_cfg);
+        assert!(Arc::ptr_eq(&first.shared, &second.shared));
+    }
+
+    #[test]
+    fn forged_equal_hash_fields_cannot_share_sessions_for_different_bytes() {
+        let first = cfg("forged");
+        let mut second = cfg("forged");
+        second.model_bytes = Arc::from(b"different model bytes".as_slice());
+        second.tokenizer_bytes = Arc::from(b"different tokenizer bytes".as_slice());
+        let first = OnnxHandle::new(first);
+        let second = OnnxHandle::new(second);
+        assert!(!Arc::ptr_eq(&first.shared, &second.shared));
+    }
+
+    #[test]
+    fn session_registry_key_does_not_retain_asset_bytes_after_handle_drop() {
+        let config = cfg("releasable-assets");
+        let weak_model = Arc::downgrade(&config.model_bytes);
+        let weak_tokenizer = Arc::downgrade(&config.tokenizer_bytes);
+        let handle = OnnxHandle::new(config);
+        drop(handle);
+        assert!(weak_model.upgrade().is_none());
+        assert!(weak_tokenizer.upgrade().is_none());
     }
 
     #[test]

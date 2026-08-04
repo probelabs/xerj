@@ -78,6 +78,44 @@ jobs:
         working-directory: engine
         run: cargo test --release --workspace -- --test-threads=2
 
+  onnx-feature:
+    name: ONNX feature compile + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            engine/target
+          key: ci-onnx-cargo-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: ci-onnx-cargo-
+
+      - name: Compile the server ONNX feature path
+        working-directory: engine
+        run: cargo check -p xerj-server --no-default-features --features onnx-experimental
+
+      - name: Test the ONNX embedder
+        working-directory: engine
+        run: cargo test -p xerj-ai --features onnx-experimental --lib -- --test-threads=2
+
+      - name: Test engine embedding identity with ONNX
+        working-directory: engine
+        run: cargo test -p xerj-engine --features onnx-experimental --lib index::embedding_identity_tests -- --test-threads=2
+
+      - name: Clippy the ONNX implementation
+        working-directory: engine
+        run: cargo clippy -p xerj-ai -p xerj-engine --all-targets --features onnx-experimental -- -D warnings
+
   api-checks:
     name: API smoke + liveness + benchmark
     runs-on: ubuntu-latest
