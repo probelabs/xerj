@@ -23466,16 +23466,19 @@ pub(crate) fn embedding_execution_identity(
     if backend == "proxy" && !proxy_initializes(cfg) {
         backend = "lexical";
     }
-    let (material, dimensions, resumable, reason) = match backend {
+    // Only report a width for the backends whose width this server actually
+    // pins. `neural` reads it from the loaded model's `hidden_size` and
+    // `proxy` gets whatever the remote returns, so both are omitted rather
+    // than reported as 384.
+    let (material, resumable, reason, dimensions) = match backend {
         "lexical" => (
             format!(
-                "lexical-feature-hash.v1;dimensions={};algorithm-probe={}",
-                xerj_ai::local::DEFAULT_DIMS,
-                lexical_algorithm_probe_sha256()
+                "lexical-feature-hash.v1;dimensions={}",
+                xerj_ai::local::DEFAULT_DIMS
             ),
-            Some(xerj_ai::local::DEFAULT_DIMS),
             true,
             None,
+            Some(xerj_ai::local::DEFAULT_DIMS),
         ),
         "onnx-experimental" => {
             let identity = configured_onnx_identity(cfg)?.ok_or_else(|| {
@@ -23483,6 +23486,7 @@ pub(crate) fn embedding_execution_identity(
                     "ONNX embedding identity is unavailable",
                 ))
             })?;
+            let onnx_dimensions = identity.dimensions;
             (
                 format!(
                     "onnx-experimental.v1;model={};tokenizer={};dimensions={};pooling={};max_tokens={}",
@@ -23492,28 +23496,28 @@ pub(crate) fn embedding_execution_identity(
                     identity.pooling,
                     identity.max_tokens
                 ),
-                Some(identity.dimensions),
                 true,
                 None,
+                Some(onnx_dimensions),
             )
         }
         "neural" => (
             format!("neural-unpinned.v1;configured-model={}", cfg.neural_model),
-            None,
             false,
             Some(
                 "the neural model is not content-addressed; use a fresh autoindex state after changing it"
                     .to_string(),
             ),
+            None,
         ),
         "proxy" => (
             format!("proxy-unpinned.v1;configured-model={}", cfg.default_model),
-            None,
             false,
             Some(
                 "the remote provider does not attest immutable model assets; semantic resume is unsafe"
                     .to_string(),
             ),
+            None,
         ),
         _ => unreachable!(),
     };
@@ -23527,33 +23531,6 @@ pub(crate) fn embedding_execution_identity(
         resumable,
         non_resumable_reason: reason,
     })
-}
-
-/// Fingerprint representative output from the zero-config embedder.
-///
-/// The lexical backend has no model asset to hash, so its identity must be
-/// bound to executable behaviour instead. Encoding each `f32` as little-endian
-/// bytes makes the material stable across host endianness. If tokenisation,
-/// feature weights, hashing, normalisation, or the default width changes, this
-/// digest (and therefore the resume identity) changes automatically.
-fn lexical_algorithm_probe_sha256() -> String {
-    use sha2::{Digest, Sha256};
-
-    const PROBES: &[&str] = &[
-        "",
-        "The quick brown fox jumps over the lazy dog.",
-        "Revenue grew 12.5% in Q4 2025; naïve café 東京.",
-        "snake_case/path-like:value + punctuation!",
-    ];
-    let mut digest = Sha256::new();
-    for probe in PROBES {
-        digest.update((probe.len() as u64).to_le_bytes());
-        digest.update(probe.as_bytes());
-        for value in xerj_ai::local::local_embed(probe, xerj_ai::local::DEFAULT_DIMS) {
-            digest.update(value.to_le_bytes());
-        }
-    }
-    format!("{:x}", digest.finalize())
 }
 
 fn proxy_config(
@@ -23703,13 +23680,12 @@ mod embedding_identity_tests {
         let identity = embedding_execution_identity(&cfg).unwrap();
         assert_eq!(identity.backend, "lexical");
         assert!(identity.resumable);
-        assert_eq!(
-            lexical_algorithm_probe_sha256(),
-            "e6240f3d323831d621fd69a62b39ad70b7efba72e58e949362fdb7f5d53eea53"
-        );
+        // `Embedder::Lexical` always embeds at DEFAULT_DIMS, so this width is
+        // the one the server will really produce.
+        assert_eq!(identity.dimensions, Some(xerj_ai::local::DEFAULT_DIMS));
         assert_eq!(
             identity.identity_sha256,
-            "58a7576ccc1497ee471418bb6e8918c7e5a837161792992e1e213a2dcb2ebdbe"
+            "177b14d1bdff634335a99d558343ce506f39d758942f24a6455830e5a36ddda6"
         );
         let encoded = serde_json::to_string(&identity).unwrap();
         assert!(!encoded.contains("endpoint"));
@@ -23726,13 +23702,22 @@ mod embedding_identity_tests {
         #[cfg(feature = "neural")]
         {
             assert_eq!(neural_identity.backend, "neural");
-            assert_eq!(neural_identity.dimensions, None);
             assert!(!neural_identity.resumable);
+            // The neural width is the loaded model's `hidden_size`, which is
+            // not known until the model loads — reporting 384 here would be a
+            // false statement for any encoder that is not 384-wide.
+            assert_eq!(neural_identity.dimensions, None);
+            let encoded = serde_json::to_string(&neural_identity).unwrap();
+            assert!(!encoded.contains("dimensions"), "{encoded}");
         }
         #[cfg(not(feature = "neural"))]
         {
             assert_eq!(neural_identity.backend, "lexical");
             assert!(neural_identity.resumable);
+            assert_eq!(
+                neural_identity.dimensions,
+                Some(xerj_ai::local::DEFAULT_DIMS)
+            );
         }
         let proxy = xerj_common::config::EmbeddingConfig {
             mode: "proxy".into(),
@@ -23742,12 +23727,14 @@ mod embedding_identity_tests {
         };
         let identity = embedding_execution_identity(&proxy).unwrap();
         assert_eq!(identity.backend, "proxy");
-        assert_eq!(identity.dimensions, None);
         assert!(!identity.resumable);
+        // A remote provider returns whatever width its model has; this server
+        // never sees it, so it is omitted rather than asserted.
+        assert_eq!(identity.dimensions, None);
         let encoded = serde_json::to_string(&identity).unwrap();
-        assert!(!encoded.contains("dimensions"));
         assert!(!encoded.contains("secret.example"));
         assert!(!encoded.contains("private-alias"));
+        assert!(!encoded.contains("dimensions"), "{encoded}");
 
         for endpoint in ["", "not a url", "file:///private/model"] {
             let fallback = xerj_common::config::EmbeddingConfig {
@@ -23758,6 +23745,13 @@ mod embedding_identity_tests {
             let identity = embedding_execution_identity(&fallback).unwrap();
             assert_eq!(identity.backend, "lexical", "{endpoint}");
             assert!(identity.resumable, "{endpoint}");
+            // The fallback really did become lexical, so the pinned lexical
+            // width is the truthful answer here.
+            assert_eq!(
+                identity.dimensions,
+                Some(xerj_ai::local::DEFAULT_DIMS),
+                "{endpoint}"
+            );
         }
     }
 
@@ -23768,6 +23762,9 @@ mod embedding_identity_tests {
         let first = embedding_execution_identity(&onnx_config(dir.path(), "a")).unwrap();
         let second = embedding_execution_identity(&onnx_config(dir.path(), "b")).unwrap();
         assert!(first.resumable);
+        // ONNX is the one non-lexical backend whose width the server does pin:
+        // `validate_onnx_dimensions` refuses any mapping that is not 384.
+        assert_eq!(first.dimensions, Some(384));
         assert_ne!(first.identity_sha256, second.identity_sha256);
     }
 
