@@ -252,17 +252,31 @@ fn classify_new(
     candidates.sort_by(|(left, li, lu), (right, ri, ru)| {
         ratio_cmp(*ri, *ru, *li, *lu).then_with(|| left.slug.cmp(&right.slug))
     });
-    candidates
-        .first()
-        .map(|(dataset, _, _)| dataset.slug.clone())
-        .with_context(|| {
-            format!(
-                "no frozen dataset accepts family {family}, group {:?}, and fields {:?}; \
-                 this requires unsupported dataset/schema evolution (use a new prefix)",
-                group,
-                sorted_field_names(fields)
-            )
-        })
+    let Some((winner, winner_intersection, winner_union)) = candidates.first() else {
+        anyhow::bail!(
+            "no frozen dataset accepts family {family}, group {:?}, and fields {:?}; \
+             this requires unsupported dataset/schema evolution (use a new prefix)",
+            group,
+            sorted_field_names(fields)
+        );
+    };
+    if let Some((runner_up, runner_up_intersection, runner_up_union)) = candidates.get(1) {
+        anyhow::ensure!(
+            ratio_cmp(
+                *winner_intersection,
+                *winner_union,
+                *runner_up_intersection,
+                *runner_up_union
+            ) != Ordering::Equal,
+            "new file matches frozen datasets {} and {} equally for family {family}, group {:?}, \
+             and fields {:?}; refusing ambiguous assignment (use a new prefix)",
+            winner.slug,
+            runner_up.slug,
+            group,
+            sorted_field_names(fields)
+        );
+    }
+    Ok(winner.slug.clone())
 }
 
 fn field_overlap(fields: &HashMap<String, FieldAcc>, specs: &[FieldSpec]) -> (usize, usize) {
@@ -457,11 +471,10 @@ mod tests {
     }
 
     #[test]
-    fn new_file_uses_highest_jaccard_then_stable_slug_tie_break() {
+    fn new_file_uses_unique_highest_jaccard_match() {
         let previous = Plan {
             datasets: vec![
-                dataset("z-tie", vec![spec("id", "long"), spec("body", "text")]),
-                dataset("a-tie", vec![spec("id", "long"), spec("body", "text")]),
+                dataset("winner", vec![spec("id", "long"), spec("body", "text")]),
                 dataset(
                     "lower",
                     vec![
@@ -483,9 +496,37 @@ mod tests {
             vec![scan(fields)],
         )
         .unwrap();
-        assert_eq!(plan.files["new"].assignments, vec![(None, "a-tie".into())]);
-        assert_eq!(plan.datasets[0].file_count, 0);
-        assert_eq!(plan.datasets[1].file_count, 1);
+        assert_eq!(plan.files["new"].assignments, vec![(None, "winner".into())]);
+        assert_eq!(plan.datasets[0].file_count, 1);
+        assert_eq!(plan.datasets[1].file_count, 0);
+    }
+
+    #[test]
+    fn new_file_with_equal_best_schema_matches_fails_closed() {
+        let previous = Plan {
+            datasets: vec![
+                dataset("z-tie", vec![spec("id", "long"), spec("body", "text")]),
+                dataset("a-tie", vec![spec("id", "long"), spec("body", "text")]),
+            ],
+            ..Plan::default()
+        };
+        let fields = HashMap::from([
+            ("id".into(), acc(&[json!(7)])),
+            ("body".into(), acc(&[json!("hello")])),
+        ]);
+        let error = reconcile_plan(
+            &inventory("new.jsonl", "unix:6e", "new"),
+            &previous,
+            vec![scan(fields)],
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("refusing ambiguous assignment"),
+            "{message}"
+        );
+        assert!(message.contains("a-tie"), "{message}");
+        assert!(message.contains("z-tie"), "{message}");
     }
 
     #[test]
