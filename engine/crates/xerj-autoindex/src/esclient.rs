@@ -151,6 +151,12 @@ impl Es {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             || identity.dimensions == Some(0)
+            // `lexical` and `onnx-experimental` are the backends whose width
+            // the server does pin, so an absent width from one of them means
+            // the response did not come from a server that pins it. Only the
+            // explicitly unpinned backends may omit it.
+            || (matches!(identity.backend.as_str(), "lexical" | "onnx-experimental")
+                && identity.dimensions.is_none())
             || identity.semantic_contract != "semantic_text-derived-vector.v1"
             || !matches!(
                 identity.backend.as_str(),
@@ -569,7 +575,9 @@ mod tests {
 
     /// `neural` and `proxy` omit the width entirely, so the client must accept
     /// a response without a `dimensions` key rather than failing to parse it.
-    /// It still rejects an explicit zero, which no backend should ever send.
+    /// It still rejects an explicit zero, which no backend should ever send,
+    /// and it rejects an omitted width from `lexical`/`onnx-experimental`,
+    /// whose widths a real XERJ server always reports.
     #[test]
     fn embedding_identity_accepts_an_omitted_width_and_rejects_a_zero_one() {
         for (body, expect_ok) in [
@@ -579,6 +587,14 @@ mod tests {
             ),
             (
                 br#"{"data":{"version":1,"backend":"lexical","identity_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","dimensions":0,"semantic_contract":"semantic_text-derived-vector.v1","resumable":true},"took_ms":0,"request_id":"test"}"#.to_vec(),
+                false,
+            ),
+            (
+                br#"{"data":{"version":1,"backend":"lexical","identity_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","semantic_contract":"semantic_text-derived-vector.v1","resumable":true},"took_ms":0,"request_id":"test"}"#.to_vec(),
+                false,
+            ),
+            (
+                br#"{"data":{"version":1,"backend":"onnx-experimental","identity_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","semantic_contract":"semantic_text-derived-vector.v1","resumable":true},"took_ms":0,"request_id":"test"}"#.to_vec(),
                 false,
             ),
         ] {
