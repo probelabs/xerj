@@ -279,7 +279,7 @@ fn run(cfg: BrainCfg) -> Result<i32> {
     };
     // `records_total` is run-scoped: a resumed re-run over an already-indexed
     // folder legitimately reports 0. Server truth decides what that means.
-    if run_u64(&run_doc, "records_total") == 0 {
+    if needs_live_node_probe(run_u64(&run_doc, "records_total")) {
         let live_nodes = live_node_docs(&es, &brain)?;
         if journal_server_disagrees(run_u64(&run_doc, "files_indexed"), live_nodes, cfg.fresh) {
             bail!("{}", journal_server_disagreement(&cfg, &brain));
@@ -439,6 +439,10 @@ fn journal_server_disagreement(cfg: &BrainCfg, brain: &str) -> String {
 
 fn journal_server_disagrees(files_indexed: u64, live_nodes: Option<u64>, fresh: bool) -> bool {
     files_indexed > 0 && matches!(live_nodes, None | Some(0)) && !fresh
+}
+
+fn needs_live_node_probe(records_total: u64) -> bool {
+    records_total == 0
 }
 
 fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
@@ -720,6 +724,11 @@ mod tests {
 
     #[test]
     fn disagreement_decision_refuses_absent_and_zero_but_not_positive_server_truth() {
+        assert!(
+            !needs_live_node_probe(1),
+            "a run that indexed a new note must not enter resume probing"
+        );
+        assert!(needs_live_node_probe(0));
         assert!(journal_server_disagrees(1, None, false));
         assert!(journal_server_disagrees(1, Some(0), false));
         assert!(!journal_server_disagrees(1, Some(7), false));
