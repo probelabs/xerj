@@ -17887,8 +17887,9 @@ pub async fn field_caps(
             }
 
             let native_es_type = native_type_to_es_str(&field.field_type);
-            let es_type =
-                declared_flattened_type(&properties, &field.name).unwrap_or(native_es_type);
+            let es_type = declared_flattened_type(&properties, &field.name)
+                .or_else(|| declared_numeric_type(&properties, &field.name))
+                .unwrap_or(native_es_type);
             let searchable = field.is_searchable();
             let aggregatable = field.is_aggregatable();
 
@@ -18018,6 +18019,46 @@ fn declared_flattened_type<'a>(properties: &'a Value, field_name: &str) -> Optio
     None
 }
 
+/// Look up `field_name` (a possibly dotted path) in a mapping `properties`
+/// tree and return its declared ES type string ONLY if it's one of the
+/// numeric aliases that collapse onto a coarser native `FieldType` — the
+/// engine schema has only `Long`/`Double`, so `byte`/`short`/`integer`/
+/// `unsigned_long` all become `FieldType::Long`, and `float`/`half_float`/
+/// `scaled_float` all become `FieldType::Double` (see the ES-type-string →
+/// `FieldType` mapping in `engine.rs`). `GET _mapping` reads the stored
+/// mapping directly and round-trips the declared type correctly; before
+/// this, `_field_caps`/`_mapping/field` derived their type from the
+/// native schema instead and always reported `long`/`double` regardless
+/// of what was actually declared — a client that looked up
+/// `field_caps[name][mapped_type]` (a reasonable pattern, and what ES/OS's
+/// own docs show) got a silently empty result for every non-`long`/
+/// non-`double` numeric field, with no error.
+fn declared_numeric_type<'a>(properties: &'a Value, field_name: &str) -> Option<&'a str> {
+    let mut current = properties;
+    let segments: Vec<&str> = field_name.split('.').collect();
+    for (i, seg) in segments.iter().enumerate() {
+        let def = current.as_object()?.get(*seg)?;
+        if i == segments.len() - 1 {
+            let t = def.get("type").and_then(Value::as_str)?;
+            return matches!(
+                t,
+                "byte"
+                    | "short"
+                    | "integer"
+                    | "long"
+                    | "unsigned_long"
+                    | "half_float"
+                    | "float"
+                    | "scaled_float"
+                    | "double"
+            )
+            .then_some(t);
+        }
+        current = def.get("properties")?;
+    }
+    None
+}
+
 fn native_type_to_es_str(ft: &FieldType) -> &'static str {
     match ft {
         FieldType::Text => "text",
@@ -18097,6 +18138,44 @@ mod flat_object_field_caps_tests {
         assert_eq!(declared_flattened_type(&props, "missing"), None);
     }
 
+    #[test]
+    fn declared_numeric_type_finds_every_integer_and_float_alias() {
+        for t in [
+            "byte",
+            "short",
+            "integer",
+            "long",
+            "unsigned_long",
+            "half_float",
+            "float",
+            "scaled_float",
+            "double",
+        ] {
+            let props = json!({"n": {"type": t}});
+            assert_eq!(declared_numeric_type(&props, "n"), Some(t));
+        }
+    }
+
+    #[test]
+    fn declared_numeric_type_walks_dotted_nested_path() {
+        let props = json!({
+            "obj": {"type": "object", "properties": {"price": {"type": "float"}}}
+        });
+        assert_eq!(declared_numeric_type(&props, "obj.price"), Some("float"));
+    }
+
+    #[test]
+    fn declared_numeric_type_returns_none_for_non_numeric_types() {
+        let props = json!({"name": {"type": "keyword"}});
+        assert_eq!(declared_numeric_type(&props, "name"), None);
+    }
+
+    #[test]
+    fn declared_numeric_type_returns_none_for_missing_field() {
+        let props = json!({"price": {"type": "float"}});
+        assert_eq!(declared_numeric_type(&props, "missing"), None);
+    }
+
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().expect("tempdir").keep();
         let mut config = Config::default();
@@ -18150,6 +18229,71 @@ mod flat_object_field_caps_tests {
             response["fields"]["attrs"].get("object").is_none(),
             "attrs should not ALSO be reported as a generic object: {response}"
         );
+    }
+
+    /// Regression test for a real bug found live: `GET _mapping` correctly
+    /// round-trips `float`/`integer` (it returns the stored mapping JSON
+    /// verbatim), but `_field_caps` derived its reported type from the
+    /// native schema — which has only `Long`/`Double` — so every `float`
+    /// field was keyed `double` and every `integer` field was keyed `long`.
+    /// A client doing `field_caps[name][mapped_type]` (a reasonable
+    /// pattern) got a silently empty result for both, with no error.
+    #[tokio::test]
+    async fn field_caps_reports_declared_numeric_type_not_native_storage_type() {
+        let router = crate::router::build_es_compat_router(test_state());
+
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::put("/numeric-caps-e2e")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {
+                            "price": {"type": "float"},
+                            "quantity": {"type": "integer"},
+                            "big_count": {"type": "long"},
+                            "score": {"type": "double"},
+                        }}})
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        assert!(create_response.status().is_success());
+
+        let caps_response = router
+            .oneshot(
+                Request::get("/numeric-caps-e2e/_field_caps?fields=price,quantity,big_count,score")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("field_caps response");
+        assert!(caps_response.status().is_success());
+
+        let bytes = to_bytes(caps_response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: Value = serde_json::from_slice(&bytes).expect("JSON response");
+
+        for (field, mapped_type) in [
+            ("price", "float"),
+            ("quantity", "integer"),
+            ("big_count", "long"),
+            ("score", "double"),
+        ] {
+            assert!(
+                response["fields"][field][mapped_type]["searchable"]
+                    .as_bool()
+                    .unwrap_or(false),
+                "expected _field_caps[{field}][{mapped_type}] to exist, got: {response}"
+            );
+        }
+        // The pre-fix behavior: both price and quantity collapsed onto the
+        // native storage type instead of the declared one.
+        assert!(response["fields"]["price"].get("double").is_none());
+        assert!(response["fields"]["quantity"].get("long").is_none());
     }
 }
 
@@ -26638,8 +26782,9 @@ pub async fn global_field_caps(
             }
 
             let native_es_type = native_type_to_es_str(&field.field_type);
-            let es_type =
-                declared_flattened_type(&properties, &field.name).unwrap_or(native_es_type);
+            let es_type = declared_flattened_type(&properties, &field.name)
+                .or_else(|| declared_numeric_type(&properties, &field.name))
+                .unwrap_or(native_es_type);
             let searchable = field.is_searchable();
             let aggregatable = field.is_aggregatable();
 
@@ -26737,8 +26882,9 @@ pub async fn get_mapping_field(
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("object");
-            let es_type =
-                declared_flattened_type(&stored_properties, field_name).unwrap_or(native_es_type);
+            let es_type = declared_flattened_type(&stored_properties, field_name)
+                .or_else(|| declared_numeric_type(&stored_properties, field_name))
+                .unwrap_or(native_es_type);
             mapping_result.insert(
                 field_name.clone(),
                 json!({
