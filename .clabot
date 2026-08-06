@@ -1,0 +1,6 @@
+{
+  "contributors": "https://api.github.com/repos/xerj-org/xerj/contents/.contributors",
+  "label": "cla-signed",
+  "message": "Thanks for this contribution — we'd like to merge it.\n\nBefore we can, we need a signed Contributor License Agreement from: {{usersWithoutCLA}}\n\nIt is a one-time thing per contributor, not per pull request. Read [CLA.md](https://github.com/xerj-org/xerj/blob/main/CLA.md), then open a small pull request adding your GitHub username to [`.contributors`](https://github.com/xerj-org/xerj/blob/main/.contributors) — that pull request is your signature, since it is made from your own account.\n\nOnce it is merged, comment `@cla-bot check` here and this check will go green. If you believe you are already covered, comment `@cla-bot check` and it will re-verify.",
+  "recheckComment": "Re-checking the CLA status for every commit author on this pull request…"
+}
