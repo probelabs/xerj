@@ -4,37 +4,45 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XERJ.ai — Reference-coding: the same Claude Code, a fraction of the tokens</title>
-<meta name="description" content="On code the model has not memorised, giving Claude Code a XERJ-retrieved reference makes the SAME model correct where memory fails — 15/15 vs 1/15, 1.5–2.7× fewer output tokens than native Claude Code, across 5 languages. Measured with real tokens; honest about where it doesn't help.">
+<meta name="description" content="Paste one prompt and Claude Code stops re-deriving APIs it could look up. Measured across 13 purpose-built libraries in 5 languages: on code the model has not memorised, XERJ-retrieval makes the SAME model correct where memory fails (15/15 vs 1/15) at 1.5–2.7× fewer output tokens than native Claude Code. Every number verifiable; honest about where it doesn't help.">
 <meta property="og:title" content="XERJ.ai — Reference-coding vs plain Claude Code">
-<meta property="og:description" content="Same model, one hidden-test verdict, real tokens. Unfamiliar code: bare 1/21 solved, XERJ-assisted 21/21 at 6.5× lower cost. Five languages. Memorised code: retrieval is honest overhead — and we say so.">
+<meta property="og:description" content="One copy-paste prompt. 13 libraries, 5 languages, one hidden-test verdict, real tokens. Unfamiliar code: bare 1/21, XERJ-assisted 21/21 at 6.5× lower cost. Memorised code: honest overhead — and we say so.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
 <link rel="stylesheet" href="/style.css?v=cs0728">
 <style>
-  /* page-local: three-arm comparison bars (bare / native / xerj), robust to the
-     shared 2-column .cmp grid — self-contained inline layout. */
-  .arm3 { margin: 18px 0 6px; }
-  .arm3 .metric { font-family: var(--font-data); font-size: 12px; letter-spacing:.06em;
-    color: var(--z-mute); text-transform: uppercase; margin: 16px 0 8px; }
-  .arm3 .row { display: grid; grid-template-columns: 128px 1fr auto; align-items: center;
-    gap: 12px; margin: 6px 0; }
+  /* three-arm bars — self-contained, robust to the shared 2-col grid */
+  .arm3 { margin: 12px 0 6px; }
+  .arm3 .metric { font-family: var(--font-data); font-size: 12px; letter-spacing:.06em; color: var(--z-mute); text-transform: uppercase; margin: 18px 0 8px; }
+  .arm3 .row { display: grid; grid-template-columns: 118px 1fr auto; align-items: center; gap: 12px; margin: 6px 0; }
   .arm3 .nm { font-family: var(--font-data); font-size: 13px; letter-spacing:.04em; }
-  .arm3 .track { height: 14px; border-radius: 3px; background: var(--z-track, rgba(255,255,255,.07)); overflow: hidden; }
+  .arm3 .track { height: 14px; border-radius: 3px; background: rgba(255,255,255,.07); overflow: hidden; }
   .arm3 .fill { height: 100%; border-radius: 3px; display:block; }
   .arm3 .val { font-family: var(--font-data); font-size: 13px; font-weight: 700; white-space: nowrap; }
-  .arm3 .bare .fill  { background: #e8536b; }
-  .arm3 .native .fill{ background: var(--z-cmp, #6aa3ff); }
-  .arm3 .xerj .fill  { background: var(--accent, #ffc400); }
+  .arm3 .bare .fill  { background: #e8536b; } .arm3 .native .fill{ background: var(--z-cmp, #6aa3ff); } .arm3 .xerj .fill  { background: var(--accent, #ffc400); }
   .arm3 .xerj .nm, .arm3 .xerj .val { color: var(--accent, #ffc400); }
   .fail { color:#e8536b; font-weight:700; }
-  @media (max-width: 640px){ .arm3 .row{ grid-template-columns: 84px 1fr auto; gap:8px; } }
+  /* opener prompt block */
+  .opener { margin: 8px 0 4px; border:1px solid rgba(255,196,0,.35); border-radius:12px; background:rgba(255,196,0,.04); padding:20px 22px; }
+  .opener .lbl { font-family:var(--font-data); font-size:12px; letter-spacing:.08em; color:var(--accent); text-transform:uppercase; margin-bottom:10px; }
+  .opener pre { margin:0; white-space:pre-wrap; font-family:var(--font-data); font-size:13.5px; line-height:1.6; color:var(--z-fg, #e9e9ec); }
+  .opener .hint { margin-top:12px; font-size:12px; color:var(--z-mute); font-family:var(--font-data); letter-spacing:.03em; }
+  /* built-table */
+  .built { width:100%; border-collapse:collapse; margin-top:var(--sp-6); font-family:var(--font-data); font-size:12.5px; }
+  .built th, .built td { text-align:left; padding:9px 10px; border-bottom:1px solid rgba(255,255,255,.08); vertical-align:top; }
+  .built th { color:var(--z-mute); text-transform:uppercase; letter-spacing:.05em; font-size:11px; font-weight:600; }
+  .built .ok { color:var(--accent); font-weight:700; } .built .no { color:#e8536b; font-weight:700; }
+  .built .mut { color:var(--z-mute); }
+  .built-wrap { overflow-x:auto; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; } @media(max-width:760px){ .grid2{grid-template-columns:1fr;} .arm3 .row{grid-template-columns:80px 1fr auto;gap:8px;} }
+  pre.code { overflow:auto; background:rgba(255,255,255,.03); padding:14px; border-radius:8px; font-family:var(--font-data); font-size:12.5px; line-height:1.5; }
+  ol.steps { font-family:var(--font-data); font-size:13.5px; line-height:1.7; } ol.steps code { font-size:12.5px; }
 </style>
 </head>
 <body>
 
-<!-- nav -->
 <nav class="nav" aria-label="Primary">
   <a href="/index.html" class="brand">XERJ.AI</a>
   <a href="/index.html">HOME</a>
@@ -47,89 +55,171 @@
   <a href="/docs/recipes/index.html">RECIPES</a>
   <a href="/playground.html">DASHBOARDS</a>
   <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
-  <span class="theme">
-    <button type="button" data-theme="day">DAY</button>
-    <span class="dash">·</span>
-    <button type="button" data-theme="night" class="active">NIGHT</button>
-  </span>
+  <span class="theme"><button type="button" data-theme="day">DAY</button><span class="dash">·</span><button type="button" data-theme="night" class="active">NIGHT</button></span>
 </nav>
 
 <div class="uc-hero">
   <div class="uc-eyebrow">CASE STUDY · REFERENCE-CODING</div>
-  <h1>THE SAME CLAUDE CODE.<br><span class="accent">A FRACTION OF THE TOKENS.</span></h1>
-  <p class="uc-lead">When an agent meets an API it does not know, it guesses, fails, and guesses again — each lap burning the expensive kind of token. We measured whether handing that same Claude Code a <strong>XERJ-retrieved reference</strong> changes the outcome. It does: on code the model has not memorised, retrieval makes the model <strong>correct where memory fails outright</strong> — <strong>15/15 vs 1/15</strong> — at <strong>1.5–2.7× fewer output tokens than native Claude Code</strong> grepping the source itself, across <strong>five languages</strong>. And where the model already knows the code, retrieval is honest overhead — which we also measured, and say plainly.</p>
-  <div class="kicker"><span>FOR</span><span class="dash">·</span><span>AI-AGENT BUILDERS</span><span class="dash">·</span><span>PLATFORM &amp; DX TEAMS</span><span class="dash">·</span><span>ANYONE PAYING FOR OUTPUT TOKENS</span></div>
+  <h1>STOP RE-DERIVING APIs.<br><span class="accent">START LOOKING THEM UP.</span></h1>
+  <p class="uc-lead">When a coding agent meets an API it does not know, it guesses, fails, and guesses again — each lap burning the expensive kind of token. Reference-coding fixes that: clone the libraries that already solved your problem, index them with XERJ, and retrieve the real implementation before writing code. We measured it across <strong>13 purpose-built libraries in 5 languages</strong> against the <em>same</em> Claude Code. Below is the one prompt that turns it on — and every number behind it.</p>
 </div>
 
-<!-- Hero chart: five-language token cost -->
+<!-- OPENER PROMPT -->
 <section class="scene-section" style="border-top:0; padding-top:0;">
+  <div class="opener">
+    <div class="lbl">◆ Paste this into Claude Code to turn it on</div>
+    <pre>Set me up for reference-coding with XERJ and then use it automatically for the
+rest of our work, so I stop burning output tokens re-deriving APIs I could just
+look up.
+
+1. Make sure a local XERJ instance is running and the `xerj-code` skill is
+   available. If XERJ isn't installed, get it from https://xerj.org/get
+   (curl -fsSL https://xerj.org/get | sh) and start it.
+2. Look at this project — its dependencies, the domains its code touches — and
+   decide which well-known open-source libraries already solve those problems.
+   Clone them into a reference corpus with the skill's xc-corpus.sh, grouped by
+   problem domain, not by language.
+3. Index that corpus with xc-index.sh (it runs `xerj autoindex`).
+4. From now on, for every coding task this session: before writing non-trivial
+   code against an unfamiliar or external API, first run
+   xc.py &lt;corpus&gt; "&lt;what you need&gt;" to retrieve the real implementation, read the
+   returned definition, and adapt it — cite file:line, check the licence. If
+   retrieval returns nothing relevant, say so and fall back to normal work.
+5. Re-index whenever the references change.
+
+Do this proactively for the rest of the session without me asking again.</pre>
+    <div class="hint">We tested this exact prompt end-to-end — see <a href="#verified" style="color:var(--accent);">Verified: the prompt works</a> below. Full text: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/OPENER_PROMPT.md" rel="external" style="color:var(--accent);">OPENER_PROMPT.md &rarr;</a></div>
+  </div>
+</section>
+
+<!-- Headline chart -->
+<section class="scene-section" style="padding-top:0;">
   <div class="viz-block">
     <div class="kicker"><span>MEASURED · 8 TASKS × PYTHON / JS / C / JAVA · 16 RUNS PER ARM · REAL OUTPUT TOKENS FROM claude -p</span></div>
     <div class="arm3">
       <div class="metric">Output tokens to solve — lower is better</div>
-      <div class="row bare"><span class="nm">bare</span><span class="track"><span class="fill" style="width:90%"></span></span><span class="val">260,916</span></div>
+      <div class="row bare"><span class="nm">bare (memory)</span><span class="track"><span class="fill" style="width:90%"></span></span><span class="val">260,916</span></div>
       <div class="row native"><span class="nm">native CC</span><span class="track"><span class="fill" style="width:9.1%"></span></span><span class="val">26,477</span></div>
-      <div class="row xerj"><span class="nm">XERJ</span><span class="track"><span class="fill" style="width:3.4%"></span></span><span class="val">9,982 &nbsp;·&nbsp; 2.7× &lt; native</span></div>
+      <div class="row xerj"><span class="nm">XERJ</span><span class="track"><span class="fill" style="width:3.4%"></span></span><span class="val">9,982 · 2.7× &lt; native</span></div>
       <div class="metric">Tasks solved (compiles + passes a hidden test) — higher is better</div>
       <div class="row bare"><span class="nm">bare</span><span class="track"><span class="fill" style="width:61.9%"></span></span><span class="val">11 / 16</span></div>
       <div class="row native"><span class="nm">native CC</span><span class="track"><span class="fill" style="width:90%"></span></span><span class="val">16 / 16</span></div>
       <div class="row xerj"><span class="nm">XERJ</span><span class="track"><span class="fill" style="width:90%"></span></span><span class="val">16 / 16</span></div>
     </div>
-    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">bare = Claude Code with tools off (memory only) · native CC = Claude Code as-is, greps the source itself · XERJ = the SAME agent, reference retrieved by XERJ and injected · cost $11.18 / $3.27 / $1.58 · NOT A LATENCY BENCHMARK · SOURCES IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/reference-coding" rel="external">docs/case-studies/reference-coding &rarr;</a></p>
+    <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">bare = Claude Code with tools off (memory only) · native CC = Claude Code as-is, greps the source · XERJ = the SAME agent, reference retrieved and injected · cost $11.18 / $3.27 / $1.58 · NOT A LATENCY BENCHMARK</p>
   </div>
 </section>
 
+<!-- How it works -->
 <div class="pain-solve">
   <div class="pain">
     <h3>THE MEMORISATION WALL</h3>
     <ul>
-      <li><strong>Unknown API → retry loops.</strong> Faced with a library it cannot recall, the model invents method names, fails to compile, and loops — spending <em>output</em> tokens, the 5×-priced kind, on every lap.</li>
-      <li><strong>grep is not free either.</strong> Native Claude Code can search the source, but that pulls files into context (on one corpus, <strong>1.06M input tokens</strong>) and costs agent turns.</li>
+      <li><strong>Unknown API → retry loops.</strong> The model invents method names, fails to compile, loops — spending <em>output</em> tokens, the 5×-priced kind, on every lap.</li>
+      <li><strong>grep is not free either.</strong> Native Claude Code can search the source, but that pulls files into context (up to <strong>1.06M input tokens</strong> on one corpus) and burns agent turns.</li>
       <li><strong>A compiler leaks names, never contracts.</strong> `rustc`'s "did you mean" can recover a method name — at 20–25× the tokens — but never a runtime rule like "seal before you read".</li>
     </ul>
   </div>
   <div class="solve">
-    <h3>THE XERJ ANSWER</h3>
+    <h3>THE THREE-STEP LOOP</h3>
     <ul>
-      <li><strong>Index the references once.</strong> Point <code class="inline">xerj autoindex</code> at the libraries that already solved the problem; retrieval is O(1) regardless of tree size.</li>
-      <li><strong>Retrieve, then write.</strong> The exact definition — with the contract in its doc — lands in the prompt. The model reads a passage instead of re-deriving an algorithm.</li>
-      <li><strong>Same agent, fewer laps.</strong> The retrieval replaces the grep <em>and</em> the guessing: correct on the first shot, at a fraction of native Claude Code's tokens.</li>
+      <li><strong>Clone</strong> — <code class="inline">xc-corpus.sh</code> shallow-clones the reference repos, grouped by problem domain.</li>
+      <li><strong>Index</strong> — <code class="inline">xc-index.sh</code> runs <code class="inline">xerj autoindex</code>; retrieval is O(1) regardless of tree size.</li>
+      <li><strong>Retrieve</strong> — <code class="inline">xc.py &lt;corpus&gt; "…"</code> returns the exact definition with its contract; the model reads a passage instead of re-deriving.</li>
     </ul>
   </div>
 </div>
 
-<div class="proof-row">
-  <div class="stat">
-    <div class="num">15 / 15</div>
-    <div class="label">SOLVED vs BARE's 1 / 15</div>
-    <div class="ctx">7 unrecallable-contract domains, 21 runs · bare $21.9 flailing · XERJ 21/21 at $3.38</div>
+<!-- Everything we built -->
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">EVERYTHING WE BUILT <span class="accent">TO TEST IT.</span></h2>
+  <p class="wide">You cannot measure retrieval on code the model has memorised — it reproduces even a 256-value table from memory. So the unfamiliar corpus is <strong>13 real libraries written for this study</strong> (each compiles and passes its own tests), each carrying a runtime <em>contract the compiler cannot warn about</em>. Each task returns the library's own type, so a hand-rolled workaround cannot pass. <strong>bare</strong> = from memory; <strong>XERJ</strong> = same model, reference retrieved.</p>
+  <div class="built-wrap">
+  <table class="built">
+    <thead><tr><th>Library</th><th>Lang</th><th>Domain</th><th>The contract you can't guess</th><th>bare</th><th>XERJ</th><th>tokens bare→XERJ</th></tr></thead>
+    <tbody>
+      <tr><td>sift</td><td>Rust</td><td>streaming sketch</td><td>conservative-update count-min; <em>seal</em> before any read</td><td class="no">0/9</td><td class="ok">9/9</td><td>17,350 → <span class="ok">796</span></td></tr>
+      <tr><td>grove</td><td>Rust</td><td>arena allocator</td><td>generational handles — freed handle stays stale after reuse</td><td class="no">0/2</td><td class="ok">2/2</td><td>15,233 → <span class="ok">1,236</span></td></tr>
+      <tr><td>weft</td><td>Rust</td><td>lexer</td><td>builder → <em>weave</em> → scanner; maximal munch</td><td class="no">1/2</td><td class="ok">2/2</td><td>16,112 → <span class="ok">610</span></td></tr>
+      <tr><td>tally</td><td>Rust</td><td>fixed-point decimal</td><td>banker's rounding (round half to even)</td><td class="no">0/2</td><td class="ok">2/2</td><td>15,599 → <span class="ok">892</span></td></tr>
+      <tr><td>spool</td><td>Rust</td><td>ring buffer</td><td>push returns the evicted item; power-of-two capacity via <em>shift</em></td><td class="mut">2/2*</td><td class="ok">2/2</td><td>15,974 → <span class="ok">656</span></td></tr>
+      <tr><td>cadence</td><td>Rust</td><td>rate limiter</td><td>token bucket, lazy refill only on <em>advance</em></td><td class="no">0/2</td><td class="ok">2/2</td><td>18,162 → <span class="ok">744</span></td></tr>
+      <tr><td>quill</td><td>Rust</td><td>varint codec</td><td>zig-zag + LEB128 <span class="mut">(a memorised convention)</span></td><td class="mut">2/2</td><td class="mut">2/2</td><td class="mut">1,355 → 999</td></tr>
+      <tr><td>trellis</td><td>Rust</td><td>topological sort</td><td>smallest-index tie-break; exact cycle-node set on failure</td><td class="no">0/2</td><td class="ok">2/2</td><td>21,317 → <span class="ok">782</span></td></tr>
+      <tr><td>sieve</td><td>Rust</td><td>bloom filter</td><td>Kirsch–Mitzenmacher double hashing; <em>settle</em> before sense</td><td class="no">0/2</td><td class="ok">2/2</td><td>13,817 → <span class="ok">669</span></td></tr>
+      <tr><td>warden</td><td>Python</td><td>LRU cache</td><td>fetch <em>promotes</em> to most-recent; overflow evicts LRU</td><td class="mut">3/4*</td><td class="ok">4/4</td><td>15,370 → <span class="ok">240</span></td></tr>
+      <tr><td>garner</td><td>JavaScript</td><td>prefix trie</td><td>stored word vs bare prefix <span class="mut">(a known structure)</span></td><td class="mut">4/4</td><td class="mut">4/4</td><td class="mut">4,360 → 667</td></tr>
+      <tr><td>arena</td><td>C</td><td>generational allocator</td><td>opaque handle; stale after slot reuse</td><td class="no">2/4*</td><td class="ok">4/4</td><td>18,730 → <span class="ok">1,489</span></td></tr>
+      <tr><td>ledger</td><td>Java</td><td>append-only log</td><td>must <em>seal</em> before replay; checkpoint truncation</td><td class="no">2/4</td><td class="ok">4/4</td><td>26,767 → <span class="ok">97</span></td></tr>
+    </tbody>
+  </table>
   </div>
-  <div class="stat">
-    <div class="num">6.5×</div>
-    <div class="label">CHEAPER THAN MEMORY</div>
-    <div class="ctx">and 1.3× cheaper than native Claude Code searching the source itself</div>
-  </div>
-  <div class="stat">
-    <div class="num">5</div>
-    <div class="label">LANGUAGES, SAME RESULT</div>
-    <div class="ctx">Rust · Python · JavaScript · C · Java · one objective hidden-test verdict</div>
-  </div>
-</div>
+  <p style="margin-top:12px; font-size:12px; letter-spacing:.03em; color:var(--z-mute); font-family:var(--font-data);">* bare "passes" some cases by recovering an API <em>name</em> from a compiler/runtime error at 20–150× XERJ's tokens, or because the task spec necessarily stated the one non-obvious rule — never by recalling a genuine runtime contract. On the two memorised cases (quill varint, garner trie) the model already knows the algorithm and retrieval saves nothing — which is the point of including them. Source for every library: <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/reference-coding" rel="external">docs/case-studies/reference-coding &rarr;</a></p>
+</section>
 
-<!-- The concrete code -->
+<!-- The contrast: unfamiliar vs memorised -->
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">THE LINE IS <span class="accent">SHARP.</span></h2>
+  <p class="wide">Two controls on real, public code the model <em>has</em> trained on — valkey + memcached (a KV server), and tantivy (a search engine) — pin down exactly where retrieval stops paying. The value is gated by memorization.</p>
+  <div class="grid2" style="margin-top:var(--sp-6);">
+    <div class="viz-block">
+      <div class="kicker"><span>UNFAMILIAR · 7 CONTRACT DOMAINS · 21 RUNS · TOTAL COST</span></div>
+      <div class="arm3">
+        <div class="row bare"><span class="nm">bare · 1/21</span><span class="track"><span class="fill" style="width:90%"></span></span><span class="val">$21.90</span></div>
+        <div class="row native"><span class="nm">native · 21/21</span><span class="track"><span class="fill" style="width:17.5%"></span></span><span class="val">$4.26</span></div>
+        <div class="row xerj"><span class="nm">XERJ · 21/21</span><span class="track"><span class="fill" style="width:13.9%"></span></span><span class="val">$3.38</span></div>
+      </div>
+      <p style="margin-top:10px; font-size:11.5px; color:var(--z-mute); font-family:var(--font-data);">RETRIEVAL WINS: correct where memory fails, 6.5× cheaper than bare, 1.3× cheaper than native.</p>
+    </div>
+    <div class="viz-block">
+      <div class="kicker"><span>MEMORISED · valkey + memcached · 6 RUNS · TOTAL COST</span></div>
+      <div class="arm3">
+        <div class="row bare"><span class="nm">bare · 6/6</span><span class="track"><span class="fill" style="width:16.3%"></span></span><span class="val">$1.49</span></div>
+        <div class="row native"><span class="nm">native · 6/6</span><span class="track"><span class="fill" style="width:90%"></span></span><span class="val">$9.14</span></div>
+        <div class="row xerj"><span class="nm">XERJ · 5/6</span><span class="track"><span class="fill" style="width:43.3%"></span></span><span class="val">$4.40</span></div>
+      </div>
+      <p style="margin-top:10px; font-size:11.5px; color:var(--z-mute); font-family:var(--font-data);">RETRIEVAL LOSES: the model knows the protocol, so pure memory is cheapest; searching or injecting a reference is overhead.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Per-language savings -->
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">EVERY LANGUAGE, <span class="accent">SAME SHAPE.</span></h2>
+  <p class="wide">Median output tokens to solve, XERJ vs answering from memory. Verdict is the real toolchain in each language (<code class="inline">python3</code>, <code class="inline">node</code>, <code class="inline">cc</code>, <code class="inline">javac</code>).</p>
+  <div class="viz-block" style="margin-top:var(--sp-6);">
+    <div class="arm3">
+      <div class="metric">Python — LRU cache (warden)</div>
+      <div class="row bare"><span class="nm">bare</span><span class="track"><span class="fill" style="width:54%"></span></span><span class="val">14,752</span></div>
+      <div class="row xerj"><span class="nm">XERJ</span><span class="track"><span class="fill" style="width:0.8%"></span></span><span class="val">214 · 69× fewer</span></div>
+      <div class="metric">JavaScript — prefix trie (garner)</div>
+      <div class="row bare"><span class="nm">bare</span><span class="track"><span class="fill" style="width:16%"></span></span><span class="val">4,300</span></div>
+      <div class="row xerj"><span class="nm">XERJ</span><span class="track"><span class="fill" style="width:2.4%"></span></span><span class="val">646 · 6.7× fewer</span></div>
+      <div class="metric">C — generational allocator (arena)</div>
+      <div class="row bare"><span class="nm">bare</span><span class="track"><span class="fill" style="width:69%"></span></span><span class="val">18,792</span></div>
+      <div class="row xerj"><span class="nm">XERJ</span><span class="track"><span class="fill" style="width:3.6%"></span></span><span class="val">988 · 19× fewer</span></div>
+      <div class="metric">Java — append-only log (ledger)</div>
+      <div class="row bare"><span class="nm">bare</span><span class="track"><span class="fill" style="width:90%"></span></span><span class="val">27,108</span></div>
+      <div class="row xerj"><span class="nm">XERJ</span><span class="track"><span class="fill" style="width:0.3%"></span></span><span class="val">98 · 278× fewer</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- Concrete code -->
 <section class="scene-section">
   <h2 class="scene" style="font-size:var(--fs-56);">THE SAME TASK, <span class="accent">TWO WAYS.</span></h2>
-  <p class="wide">One Java task: build an append-only ledger that must be sealed before it can be replayed, truncated to a checkpoint. <strong>bare</strong> cannot read the library, so it reinvents the whole thing — <span class="fail">503 lines</span> — and still fails the seal contract. <strong>XERJ</strong>, handed the reference, writes it in four lines and cites the rule it learned:</p>
-  <div class="viz-block" style="margin-top:var(--sp-6); display:grid; grid-template-columns:1fr; gap:18px;">
+  <p class="wide">One Java task: build an append-only ledger that must be sealed before replay, truncated to a checkpoint. <strong>bare</strong> cannot read the library, so it reinvents the whole thing — <span class="fail">503 lines</span> — and still fails the seal contract. <strong>XERJ</strong>, handed the reference, writes it in four lines and cites the rule it learned:</p>
+  <div class="grid2" style="margin-top:var(--sp-6);">
     <div>
-      <div class="kicker"><span class="fail">bare · 503 LINES · ~36,000 OUTPUT TOKENS · STILL FAILED</span></div>
-      <pre style="overflow:auto; background:rgba(255,255,255,.03); padding:14px; border-radius:8px; font-family:var(--font-data); font-size:12.5px; line-height:1.5; color:var(--z-mute);">// reinvented an entire append-log + checkpoint + seal state machine from
-// memory, guessing the API surface … 503 lines … wrong truncation semantics
+      <div class="kicker"><span class="fail">bare · 503 LINES · ~36,000 TOKENS · FAILED</span></div>
+      <pre class="code" style="color:var(--z-mute);">// reinvented an entire append-log + checkpoint + seal
+// state machine from memory, guessing the API surface …
+// 503 lines … wrong truncation semantics
 // → hidden test FAILED.</pre>
     </div>
     <div>
-      <div class="kicker"><span class="accent">XERJ · 4 LINES · 103 OUTPUT TOKENS · PASSED</span></div>
-      <pre style="overflow:auto; background:rgba(255,196,0,.05); padding:14px; border-radius:8px; font-family:var(--font-data); font-size:12.5px; line-height:1.5;">public static Ledger upTo(long[] vals, long seq) {
+      <div class="kicker"><span class="accent">XERJ · 4 LINES · 103 TOKENS · PASSED</span></div>
+      <pre class="code" style="background:rgba(255,196,0,.05);">public static Ledger upTo(long[] vals, long seq) {
     Ledger l = Ledger.open();
     for (long v : vals) l.append(v);
     l.checkpoint(seq);   // keep 0..seq
@@ -138,23 +228,42 @@
 }</pre>
     </div>
   </div>
-  <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">CAPTURED VERBATIM · FULL PROGRAMS IN <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/reference-coding/generated" rel="external">docs/case-studies/reference-coding/generated &rarr;</a></p>
+  <p style="margin-top:14px; font-size:12px; letter-spacing:.04em; color:var(--z-mute); font-family:var(--font-data);">CAPTURED VERBATIM · <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/reference-coding/generated" rel="external">docs/case-studies/reference-coding/generated &rarr;</a></p>
+</section>
+
+<!-- Verified opener -->
+<section class="scene-section" id="verified">
+  <h2 class="scene" style="font-size:var(--fs-56);">VERIFIED: <span class="accent">THE PROMPT WORKS.</span></h2>
+  <p class="wide">We ran the opener above verbatim on a fresh task — implement a top-3 heavy-hitters function using the unfamiliar <code class="inline">sift</code> crate (whose API is <em>not</em> <code class="inline">new()/push()/top_k()</code>). Following the prompt, Claude Code indexed the reference, retrieved sift's real API, and wrote code that compiles and passes a hidden test — using <code class="inline">furnish</code> / <code class="inline">absorb</code> / <code class="inline">seal</code> / <code class="inline">crest</code>, the seal-before-read contract a from-memory attempt cannot recover. The full transcript and the generated program are in the repo.</p>
+  <p style="margin-top:8px; font-size:12px; color:var(--z-mute); font-family:var(--font-data);">REPRODUCE THE VERIFICATION ITSELF · <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/reference-coding" rel="external">docs/case-studies/reference-coding &rarr;</a></p>
+</section>
+
+<!-- Reproduce guide -->
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">DO IT <span class="accent">YOURSELF.</span></h2>
+  <p class="wide">The whole study reproduces from the repo. The method works on any repository — including your own private code, which is the real use case.</p>
+  <ol class="steps" style="margin-top:var(--sp-6); max-width:820px;">
+    <li><strong>Start XERJ.</strong> <code class="inline">xerj -d ./.xerj-data --insecure</code> — the ES-compatible API comes up on <code class="inline">:9200</code>.</li>
+    <li><strong>Build a corpus.</strong> <code class="inline">xc-corpus.sh async-rust https://github.com/tokio-rs/tokio https://github.com/hyperium/hyper</code> — group by problem domain, not language.</li>
+    <li><strong>Index it.</strong> <code class="inline">xc-index.sh async-rust</code> — runs <code class="inline">xerj autoindex</code>; a 100k-record tree indexes in ~10 s.</li>
+    <li><strong>Retrieve before you write.</strong> <code class="inline">xc.py async-rust "graceful shutdown with a broadcast channel"</code> — returns the matching definition with <code class="inline">file:line</code>.</li>
+    <li><strong>Measure it honestly.</strong> The 3-arm harness (<code class="inline">csrun.py</code>, <code class="inline">csmulti.py</code>) runs bare / native / XERJ, one hidden-test verdict, real tokens from <code class="inline">claude -p --output-format json</code> — no API key. Full recipe in <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/CASE_STUDY.md" rel="external" style="color:var(--accent);">MEASURE / CASE_STUDY.md</a>.</li>
+  </ol>
 </section>
 
 <!-- Honest laws -->
 <section class="scene-section">
   <h2 class="scene" style="font-size:var(--fs-56);">WHAT WE WON'T <span class="accent">OVERCLAIM.</span></h2>
   <div class="laws" style="margin-top:var(--sp-6);">
-    <div class="n">01</div><div class="law"><div class="t">ON MEMORISED CODE, RETRIEVAL IS <span class="accent">OVERHEAD.</span></div><div class="b">On popular public code the model has trained on — even a 256-value quantization table it reproduces from memory — bare is <em>cheapest</em>, and injecting a large reference can be the worst arm. Reference-coding's value is gated by memorization; it pays on your <em>private, proprietary, or unfamiliar</em> code, not on library references the model already knows.</div></div>
+    <div class="n">01</div><div class="law"><div class="t">ON MEMORISED CODE, RETRIEVAL IS <span class="accent">OVERHEAD.</span></div><div class="b">On popular public code the model has trained on — even a 256-value quantization table it reproduces from memory — bare is <em>cheapest</em>. Reference-coding pays on your <em>private, proprietary, or genuinely unfamiliar</em> code, not on library references the model already knows.</div></div>
     <div class="n">02</div><div class="law"><div class="t">THE WIN IS MEASURED ON <span class="accent">SYNTHETIC LIBRARIES.</span></div><div class="b">The unfamiliar corpus is 13 libraries written for this study — unfamiliar by construction, so the model cannot bluff. A genuinely large private codebase is the honest end-state we have not yet measured; the native-vs-XERJ gap should <em>grow</em> there, because grep cost scales with the tree while retrieval stays flat.</div></div>
-    <div class="n">03</div><div class="law"><div class="t">WE TRIED TO IMPROVE THE SERVER AND <span class="accent">IT DIDN'T HELP — YET.</span></div><div class="b">We enriched XERJ's index (richer symbols + identifier sub-word splitting) and measured it against the old server on the same corpus. On realistic queries it did <em>not</em> improve ranking, because the reference libraries carry enough prose for lexical BM25 to already saturate. The robust win is retrieval-vs-none, which both server versions deliver equally. Full scorecard published.</div></div>
+    <div class="n">03</div><div class="law"><div class="t">WE TRIED TO IMPROVE THE SERVER AND <span class="accent">MEASURED A NEAR-NULL.</span></div><div class="b">We enriched XERJ's index (richer symbols + identifier sub-word splitting) and measured it against the old server. On realistic queries it barely moved ranking, because the references carry enough prose for lexical BM25 to saturate. The robust win is retrieval-vs-none, which both server versions deliver equally. Full scorecard published.</div></div>
   </div>
 </section>
 
 <!-- CTA -->
 <section class="scene-section" style="text-align:center;">
   <h2 class="scene" style="font-size:var(--fs-56);">POINT IT AT <span class="accent">YOUR</span> CODE.</h2>
-  <p class="wide" style="margin:0 auto;">The whole study is reproducible — three arms, one hidden-test verdict, real tokens — and the method works on any repository. Clone the references that already solved your problem, index them, retrieve before you write.</p>
   <div style="margin-top:var(--sp-6); display:flex; gap:14px; justify-content:center; flex-wrap:wrap;">
     <a class="btn btn-primary" href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/CASE_STUDY.md" rel="external">READ THE FULL CASE STUDY &rarr;</a>
     <a class="btn" href="/get/index.html">GET XERJ</a>
@@ -162,10 +271,8 @@
 </section>
 
 <footer class="footer">
-  <div class="foot-links">
-    <a href="/index.html">HOME</a><a href="/case-studies.html">CASE STUDIES</a><a href="/for-agents.html">FOR AGENTS</a><a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
-  </div>
-  <p class="foot-fine">Every figure on this page was produced by <code class="inline">claude -p --output-format json</code> and an objective hidden-test verdict on this machine. Sources, raw per-run data, and the honest scorecards live in <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/reference-coding" rel="external">docs/case-studies/reference-coding</a>.</p>
+  <div class="foot-links"><a href="/index.html">HOME</a><a href="/case-studies.html">CASE STUDIES</a><a href="/for-agents.html">FOR AGENTS</a><a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a></div>
+  <p class="foot-fine">Every figure was produced by <code class="inline">claude -p --output-format json</code> and an objective hidden-test verdict on this machine. Sources, raw per-run data, and the honest scorecards live in <a href="https://github.com/xerj-org/xerj/tree/main/docs/case-studies/reference-coding" rel="external">docs/case-studies/reference-coding</a>.</p>
 </footer>
 
 <script src="/interact.js" defer></script>
