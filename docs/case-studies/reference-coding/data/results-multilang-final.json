@@ -1,0 +1,1152 @@
+[
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 12,
+   "output": 16047,
+   "cache_create": 35282,
+   "cache_read": 96393,
+   "cost": 0.8049745
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 38.8,
+    "out_tokens": 2524
+   },
+   {
+    "round": 2,
+    "verdict": "test-fail",
+    "seconds": 173.9,
+    "out_tokens": 13523
+   }
+  ],
+  "task": "warden-run",
+  "lang": "python",
+  "arm": "bare",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 12,
+   "output": 1499,
+   "cache_create": 8629,
+   "cache_read": 127103,
+   "cost": 0.1882405
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "warden-run",
+  "lang": "python",
+  "arm": "native",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 139,
+   "cache_create": 6179,
+   "cache_read": 12014,
+   "cost": 0.07283099999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 6.0,
+    "out_tokens": 139
+   }
+  ],
+  "task": "warden-run",
+  "lang": "python",
+  "arm": "xerj",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 14,
+   "output": 23897,
+   "cache_create": 25119,
+   "cache_read": 140081,
+   "cost": 0.9214304999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 38.0,
+    "out_tokens": 2774
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 272.8,
+    "out_tokens": 21123
+   }
+  ],
+  "task": "warden-run",
+  "lang": "python",
+  "arm": "bare",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 12,
+   "output": 1542,
+   "cache_create": 8682,
+   "cache_read": 127154,
+   "cost": 0.18988600000000003
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "warden-run",
+  "lang": "python",
+  "arm": "native",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 139,
+   "cache_create": 6183,
+   "cache_read": 12014,
+   "cost": 0.07287099999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 5.0,
+    "out_tokens": 139
+   }
+  ],
+  "task": "warden-run",
+  "lang": "python",
+  "arm": "xerj",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 14,
+   "output": 13456,
+   "cache_create": 25918,
+   "cache_read": 136416,
+   "cost": 0.6673370000000001
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 70.5,
+    "out_tokens": 4964
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 104.1,
+    "out_tokens": 8492
+   }
+  ],
+  "task": "warden-evict",
+  "lang": "python",
+  "arm": "bare",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 14,
+   "output": 1377,
+   "cache_create": 8310,
+   "cache_read": 149864,
+   "cost": 0.193394
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "warden-evict",
+  "lang": "python",
+  "arm": "native",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 288,
+   "cache_create": 6194,
+   "cache_read": 12014,
+   "cost": 0.076713
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 8.1,
+    "out_tokens": 288
+   }
+  ],
+  "task": "warden-evict",
+  "lang": "python",
+  "arm": "xerj",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 18,
+   "output": 8083,
+   "cache_create": 19129,
+   "cache_read": 225400,
+   "cost": 0.5069359999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 108.7,
+    "out_tokens": 8083
+   }
+  ],
+  "task": "warden-evict",
+  "lang": "python",
+  "arm": "bare",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 12,
+   "output": 1381,
+   "cache_create": 8553,
+   "cache_read": 126734,
+   "cost": 0.184354
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "warden-evict",
+  "lang": "python",
+  "arm": "native",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 396,
+   "cache_create": 6190,
+   "cache_read": 12014,
+   "cost": 0.079383
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 8.0,
+    "out_tokens": 396
+   }
+  ],
+  "task": "warden-evict",
+  "lang": "python",
+  "arm": "xerj",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 6,
+   "output": 4569,
+   "cache_create": 18289,
+   "cache_read": 46665,
+   "cost": 0.32125349999999997
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 63.5,
+    "out_tokens": 4569
+   }
+  ],
+  "task": "garner-seek",
+  "lang": "js",
+  "arm": "bare",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 10,
+   "output": 1229,
+   "cache_create": 8412,
+   "cache_read": 104597,
+   "cost": 0.1680545
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "garner-seek",
+  "lang": "js",
+  "arm": "native",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 211,
+   "cache_create": 6126,
+   "cache_read": 12014,
+   "cost": 0.074089
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 7.4,
+    "out_tokens": 211
+   }
+  ],
+  "task": "garner-seek",
+  "lang": "js",
+  "arm": "xerj",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 6,
+   "output": 4031,
+   "cache_create": 18267,
+   "cache_read": 46663,
+   "cost": 0.3075775
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 55.4,
+    "out_tokens": 4031
+   }
+  ],
+  "task": "garner-seek",
+  "lang": "js",
+  "arm": "bare",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 12,
+   "output": 1230,
+   "cache_create": 8347,
+   "cache_read": 126286,
+   "cost": 0.178284
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "garner-seek",
+  "lang": "js",
+  "arm": "native",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 248,
+   "cache_create": 6132,
+   "cache_read": 12014,
+   "cost": 0.075074
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 13.8,
+    "out_tokens": 248
+   }
+  ],
+  "task": "garner-seek",
+  "lang": "js",
+  "arm": "xerj",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 6,
+   "output": 3872,
+   "cache_create": 12163,
+   "cache_read": 41214,
+   "cost": 0.24187200000000003
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 27.4,
+    "out_tokens": 1810
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 23.5,
+    "out_tokens": 2062
+   }
+  ],
+  "task": "garner-crop",
+  "lang": "js",
+  "arm": "bare",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 9,
+  "tokens": {
+   "input": 14,
+   "output": 1446,
+   "cache_create": 8692,
+   "cache_read": 150075,
+   "cost": 0.19899849999999997
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 9
+   }
+  ],
+  "task": "garner-crop",
+  "lang": "js",
+  "arm": "native",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 4,
+   "output": 1044,
+   "cache_create": 13015,
+   "cache_read": 24028,
+   "cost": 0.17193999999999998
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 8.0,
+    "out_tokens": 212
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 13.3,
+    "out_tokens": 832
+   }
+  ],
+  "task": "garner-crop",
+  "lang": "js",
+  "arm": "xerj",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 6,
+   "output": 4971,
+   "cache_create": 12593,
+   "cache_read": 41206,
+   "cost": 0.27384200000000003
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 34.3,
+    "out_tokens": 2511
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 31.3,
+    "out_tokens": 2460
+   }
+  ],
+  "task": "garner-crop",
+  "lang": "js",
+  "arm": "bare",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 9,
+  "tokens": {
+   "input": 18,
+   "output": 1276,
+   "cache_create": 8315,
+   "cache_read": 194181,
+   "cost": 0.21305649999999998
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 9
+   }
+  ],
+  "task": "garner-crop",
+  "lang": "js",
+  "arm": "native",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 4,
+   "output": 1168,
+   "cache_create": 12885,
+   "cache_read": 24028,
+   "cost": 0.17363299999999998
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 10.8,
+    "out_tokens": 84
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 19.2,
+    "out_tokens": 1084
+   }
+  ],
+  "task": "garner-crop",
+  "lang": "js",
+  "arm": "xerj",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 21819,
+   "cache_create": 5178,
+   "cache_read": 12014,
+   "cost": 0.60402
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 248.8,
+    "out_tokens": 21819
+   }
+  ],
+  "task": "ledger-replay",
+  "lang": "java",
+  "arm": "bare",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 10,
+  "tokens": {
+   "input": 15,
+   "output": 1522,
+   "cache_create": 8725,
+   "cache_read": 173108,
+   "cost": 0.212752
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 10
+   }
+  ],
+  "task": "ledger-replay",
+  "lang": "java",
+  "arm": "native",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 92,
+   "cache_create": 6165,
+   "cache_read": 12014,
+   "cost": 0.069967
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 4.1,
+    "out_tokens": 92
+   }
+  ],
+  "task": "ledger-replay",
+  "lang": "java",
+  "arm": "xerj",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 12343,
+   "cache_create": 5178,
+   "cache_read": 12014,
+   "cost": 0.36711
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 142.8,
+    "out_tokens": 12343
+   }
+  ],
+  "task": "ledger-replay",
+  "lang": "java",
+  "arm": "bare",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 10,
+   "output": 1134,
+   "cache_create": 8343,
+   "cache_read": 104589,
+   "cost": 0.1649425
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "ledger-replay",
+  "lang": "java",
+  "arm": "native",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 92,
+   "cache_create": 6167,
+   "cache_read": 12014,
+   "cost": 0.069987
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 3.6,
+    "out_tokens": 92
+   }
+  ],
+  "task": "ledger-replay",
+  "lang": "java",
+  "arm": "xerj",
+  "trial": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 8,
+   "output": 40511,
+   "cache_create": 30959,
+   "cache_read": 58759,
+   "cost": 1.3601774999999998
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 260.9,
+    "out_tokens": 24118
+   },
+   {
+    "round": 2,
+    "verdict": "test-fail",
+    "seconds": 160.0,
+    "out_tokens": 16393
+   }
+  ],
+  "task": "ledger-checkpoint",
+  "lang": "java",
+  "arm": "bare",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 12,
+   "output": 1232,
+   "cache_create": 8408,
+   "cache_read": 126516,
+   "cost": 0.179033
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "ledger-checkpoint",
+  "lang": "java",
+  "arm": "native",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 103,
+   "cache_create": 6184,
+   "cache_read": 12014,
+   "cost": 0.07195800000000001
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 9.1,
+    "out_tokens": 103
+   }
+  ],
+  "task": "ledger-checkpoint",
+  "lang": "java",
+  "arm": "xerj",
+  "trial": 0
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 8,
+   "output": 32396,
+   "cache_create": 29466,
+   "cache_read": 58883,
+   "cost": 1.1407954999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "test-fail",
+    "seconds": 247.0,
+    "out_tokens": 21428
+   },
+   {
+    "round": 2,
+    "verdict": "test-fail",
+    "seconds": 121.1,
+    "out_tokens": 10968
+   }
+  ],
+  "task": "ledger-checkpoint",
+  "lang": "java",
+  "arm": "bare",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 12,
+   "output": 1316,
+   "cache_create": 8399,
+   "cache_read": 127684,
+   "cost": 0.181627
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "ledger-checkpoint",
+  "lang": "java",
+  "arm": "native",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 103,
+   "cache_create": 6190,
+   "cache_read": 12014,
+   "cost": 0.072018
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 3.9,
+    "out_tokens": 103
+   }
+  ],
+  "task": "ledger-checkpoint",
+  "lang": "java",
+  "arm": "xerj",
+  "trial": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 14,
+   "output": 32481,
+   "cache_create": 39000,
+   "cache_read": 125217,
+   "cost": 1.2668344999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "build-error",
+    "seconds": 42.9,
+    "out_tokens": 2920
+   },
+   {
+    "round": 2,
+    "verdict": "test-fail",
+    "seconds": 369.4,
+    "out_tokens": 29561
+   }
+  ],
+  "task": "arena-build",
+  "lang": "c",
+  "arm": "bare",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 14,
+   "output": 2694,
+   "cache_create": 10518,
+   "cache_read": 152531,
+   "cost": 0.24972750000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "arena-build",
+  "lang": "c",
+  "arm": "native",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 4,
+   "output": 3191,
+   "cache_create": 13591,
+   "cache_read": 24028,
+   "cost": 0.231746
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "build-error",
+    "seconds": 17.4,
+    "out_tokens": 1206
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 26.9,
+    "out_tokens": 1985
+   }
+  ],
+  "task": "arena-build",
+  "lang": "c",
+  "arm": "xerj",
+  "trial": 0
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 33,
+   "output": 24327,
+   "cache_create": 47779,
+   "cache_read": 452316,
+   "cost": 1.314616
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "build-error",
+    "seconds": 44.3,
+    "out_tokens": 2974
+   },
+   {
+    "round": 2,
+    "verdict": "build-error",
+    "seconds": 310.8,
+    "out_tokens": 21353
+   }
+  ],
+  "task": "arena-build",
+  "lang": "c",
+  "arm": "bare",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 9,
+  "tokens": {
+   "input": 11,
+   "output": 2540,
+   "cache_create": 10486,
+   "cache_read": 130126,
+   "cost": 0.234335
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 9
+   }
+  ],
+  "task": "arena-build",
+  "lang": "c",
+  "arm": "native",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 1127,
+   "cache_create": 6010,
+   "cache_read": 12014,
+   "cost": 0.095704
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 16.1,
+    "out_tokens": 1127
+   }
+  ],
+  "task": "arena-build",
+  "lang": "c",
+  "arm": "xerj",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 6,
+   "output": 4855,
+   "cache_create": 16172,
+   "cache_read": 46749,
+   "cost": 0.3072705
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 61.1,
+    "out_tokens": 4855
+   }
+  ],
+  "task": "arena-reuse",
+  "lang": "c",
+  "arm": "bare",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 10,
+  "tokens": {
+   "input": 19,
+   "output": 2841,
+   "cache_create": 10766,
+   "cache_read": 226125,
+   "cost": 0.2927065
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 10
+   }
+  ],
+  "task": "arena-reuse",
+  "lang": "c",
+  "arm": "native",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 791,
+   "cache_create": 6032,
+   "cache_read": 12014,
+   "cost": 0.08750999999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 12.7,
+    "out_tokens": 791
+   }
+  ],
+  "task": "arena-reuse",
+  "lang": "c",
+  "arm": "xerj",
+  "trial": 0
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 16,
+   "output": 13258,
+   "cache_create": 35739,
+   "cache_read": 157771,
+   "cost": 0.7702285000000001
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "build-error",
+    "seconds": 30.8,
+    "out_tokens": 2137
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 148.4,
+    "out_tokens": 11121
+   }
+  ],
+  "task": "arena-reuse",
+  "lang": "c",
+  "arm": "bare",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 8,
+  "tokens": {
+   "input": 16,
+   "output": 2218,
+   "cache_create": 9687,
+   "cache_read": 177020,
+   "cost": 0.24177400000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "turns": 8
+   }
+  ],
+  "task": "arena-reuse",
+  "lang": "c",
+  "arm": "native",
+  "trial": 1
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 850,
+   "cache_create": 6030,
+   "cache_read": 12014,
+   "cost": 0.08898
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 13.8,
+    "out_tokens": 850
+   }
+  ],
+  "task": "arena-reuse",
+  "lang": "c",
+  "arm": "xerj",
+  "trial": 1
+ }
+]

@@ -1,0 +1,769 @@
+[
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 22,
+   "output": 14731,
+   "cache_create": 29800,
+   "cache_read": 209812,
+   "cost": 0.7737449999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 73.9,
+    "out_tokens": 5034,
+    "code_chars": 1803
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 135.4,
+    "out_tokens": 9697,
+    "code_chars": 2070
+   }
+  ],
+  "task": "spool-window",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 945,
+   "cache_create": 9075,
+   "cache_read": 128145,
+   "cost": 0.17940550000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 22.6,
+    "turns": 7,
+    "out_tokens": 945
+   }
+  ],
+  "task": "spool-window",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 669,
+   "cache_create": 8398,
+   "cache_read": 84608,
+   "cost": 0.14519800000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 15.6,
+    "turns": 5,
+    "out_tokens": 669
+   }
+  ],
+  "task": "spool-window",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 1
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 35,
+   "output": 17217,
+   "cache_create": 59843,
+   "cache_read": 530807,
+   "cost": 1.2966195
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 45.1,
+    "out_tokens": 2548,
+    "code_chars": 1030
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 213.2,
+    "out_tokens": 14669,
+    "code_chars": 1206
+   }
+  ],
+  "task": "spool-window",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 925,
+   "cache_create": 9154,
+   "cache_read": 128137,
+   "cost": 0.1796965
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 24.3,
+    "turns": 7,
+    "out_tokens": 925
+   }
+  ],
+  "task": "spool-window",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 643,
+   "cache_create": 8376,
+   "cache_read": 84566,
+   "cost": 0.144322
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 19.3,
+    "turns": 5,
+    "out_tokens": 643
+   }
+  ],
+  "task": "spool-window",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 56,
+   "output": 19629,
+   "cache_create": 56976,
+   "cache_read": 888398,
+   "cost": 1.507219
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 69.8,
+    "out_tokens": 3898,
+    "code_chars": 1288
+   },
+   {
+    "round": 2,
+    "verdict": "compile-error",
+    "seconds": 233.7,
+    "out_tokens": 15731,
+    "code_chars": 1438
+   }
+  ],
+  "task": "cadence-run",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 1108,
+   "cache_create": 9051,
+   "cache_read": 128183,
+   "cost": 0.1832745
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 23.4,
+    "turns": 7,
+    "out_tokens": 1108
+   }
+  ],
+  "task": "cadence-run",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 681,
+   "cache_create": 8357,
+   "cache_read": 84377,
+   "cost": 0.1448525
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 18.9,
+    "turns": 5,
+    "out_tokens": 681
+   }
+  ],
+  "task": "cadence-run",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 35,
+   "output": 16695,
+   "cache_create": 49388,
+   "cache_read": 503174,
+   "cost": 1.165578
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 62.4,
+    "out_tokens": 3869,
+    "code_chars": 2180
+   },
+   {
+    "round": 2,
+    "verdict": "compile-error",
+    "seconds": 183.0,
+    "out_tokens": 12826,
+    "code_chars": 1984
+   }
+  ],
+  "task": "cadence-run",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 1119,
+   "cache_create": 9031,
+   "cache_read": 128058,
+   "cost": 0.183297
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 23.2,
+    "turns": 7,
+    "out_tokens": 1119
+   }
+  ],
+  "task": "cadence-run",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 807,
+   "cache_create": 8805,
+   "cache_read": 84127,
+   "cost": 0.1523575
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 19.3,
+    "turns": 5,
+    "out_tokens": 807
+   }
+  ],
+  "task": "cadence-run",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 1
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 4,
+   "output": 1138,
+   "cache_create": 11250,
+   "cache_read": 24028,
+   "cost": 0.15512900000000002
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 10.9,
+    "out_tokens": 676,
+    "code_chars": 1008
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 7.8,
+    "out_tokens": 462,
+    "code_chars": 1133
+   }
+  ],
+  "task": "quill-codec",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 6,
+  "tokens": {
+   "input": 10,
+   "output": 1236,
+   "cache_create": 8969,
+   "cache_read": 105773,
+   "cost": 0.17443050000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 23.2,
+    "turns": 6,
+    "out_tokens": 1236
+   }
+  ],
+  "task": "quill-codec",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 985,
+   "cache_create": 8520,
+   "cache_read": 84499,
+   "cost": 0.1541345
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 19.6,
+    "turns": 5,
+    "out_tokens": 985
+   }
+  ],
+  "task": "quill-codec",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 1
+ },
+ {
+  "solved": true,
+  "rounds": 2,
+  "tokens": {
+   "input": 6,
+   "output": 1573,
+   "cache_create": 11757,
+   "cache_read": 41336,
+   "cost": 0.17973499999999998
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 18.2,
+    "out_tokens": 1071,
+    "code_chars": 994
+   },
+   {
+    "round": 2,
+    "verdict": "pass",
+    "seconds": 8.4,
+    "out_tokens": 502,
+    "code_chars": 1151
+   }
+  ],
+  "task": "quill-codec",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 1248,
+   "cache_create": 9172,
+   "cache_read": 128291,
+   "cost": 0.18802950000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 29.4,
+    "turns": 7,
+    "out_tokens": 1248
+   }
+  ],
+  "task": "quill-codec",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 1013,
+   "cache_create": 8523,
+   "cache_read": 84500,
+   "cost": 0.154865
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 18.8,
+    "turns": 5,
+    "out_tokens": 1013
+   }
+  ],
+  "task": "quill-codec",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 20,
+   "output": 2981,
+   "cache_create": 19911,
+   "cache_read": 261332,
+   "cost": 0.405211
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "no-code-block",
+    "seconds": 55.9,
+    "usage": {
+     "input": 20,
+     "output": 2981,
+     "cache_create": 19911,
+     "cache_read": 261332,
+     "cost": 0.405211
+    }
+   }
+  ],
+  "task": "trellis-order",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 1139,
+   "cache_create": 8974,
+   "cache_read": 128048,
+   "cost": 0.18319100000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 23.4,
+    "turns": 7,
+    "out_tokens": 1139
+   }
+  ],
+  "task": "trellis-order",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 762,
+   "cache_create": 8530,
+   "cache_read": 84574,
+   "cost": 0.14877200000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 20.0,
+    "turns": 5,
+    "out_tokens": 762
+   }
+  ],
+  "task": "trellis-order",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 43,
+   "output": 39654,
+   "cache_create": 63638,
+   "cache_read": 729123,
+   "cost": 1.9944664999999997
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 58.4,
+    "out_tokens": 3329,
+    "code_chars": 460
+   },
+   {
+    "round": 2,
+    "verdict": "test-fail",
+    "seconds": 486.5,
+    "out_tokens": 36325,
+    "code_chars": 4792
+   }
+  ],
+  "task": "trellis-order",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 1043,
+   "cache_create": 9136,
+   "cache_read": 127995,
+   "cost": 0.18238449999999998
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 21.4,
+    "turns": 7,
+    "out_tokens": 1043
+   }
+  ],
+  "task": "trellis-order",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 803,
+   "cache_create": 8433,
+   "cache_read": 84553,
+   "cost": 0.1467215
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 17.6,
+    "turns": 5,
+    "out_tokens": 803
+   }
+  ],
+  "task": "trellis-order",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 20,
+   "output": 22138,
+   "cache_create": 39615,
+   "cache_read": 219475,
+   "cost": 1.0614055000000002
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 40.0,
+    "out_tokens": 2125,
+    "code_chars": 681
+   },
+   {
+    "round": 2,
+    "verdict": "test-fail",
+    "seconds": 271.0,
+    "out_tokens": 20013,
+    "code_chars": 6495
+   }
+  ],
+  "task": "sieve-member",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 1034,
+   "cache_create": 9308,
+   "cache_read": 128640,
+   "cost": 0.184172
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 24.2,
+    "turns": 7,
+    "out_tokens": 1034
+   }
+  ],
+  "task": "sieve-member",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 627,
+   "cache_create": 8684,
+   "cache_read": 85238,
+   "cost": 0.14747599999999997
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 17.6,
+    "turns": 5,
+    "out_tokens": 627
+   }
+  ],
+  "task": "sieve-member",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 25,
+   "output": 5496,
+   "cache_create": 24733,
+   "cache_read": 379890,
+   "cost": 0.5755840000000001
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 96.9,
+    "out_tokens": 5496,
+    "code_chars": 1570
+   },
+   {
+    "round": 2,
+    "verdict": "generation-timeout",
+    "seconds": 500.1,
+    "usage": null
+   }
+  ],
+  "task": "sieve-member",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 12,
+   "output": 1062,
+   "cache_create": 9115,
+   "cache_read": 128275,
+   "cost": 0.1827695
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 23.4,
+    "turns": 7,
+    "out_tokens": 1062
+   }
+  ],
+  "task": "sieve-member",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 712,
+   "cache_create": 8660,
+   "cache_read": 85212,
+   "cost": 0.14934799999999998
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 18.0,
+    "turns": 5,
+    "out_tokens": 712
+   }
+  ],
+  "task": "sieve-member",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 1
+ }
+]

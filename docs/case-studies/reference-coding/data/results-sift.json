@@ -1,0 +1,699 @@
+[
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 36,
+   "output": 30828,
+   "cache_create": 49303,
+   "cache_read": 505997,
+   "cost": 1.5195505000000002
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 130.0,
+    "out_tokens": 9029,
+    "code_chars": 2571
+   },
+   {
+    "round": 2,
+    "verdict": "test-fail",
+    "seconds": 287.2,
+    "out_tokens": 21799,
+    "code_chars": 6481
+   }
+  ],
+  "task": "sift-build",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 10,
+   "output": 929,
+   "cache_create": 11357,
+   "cache_read": 110979,
+   "cost": 0.1932525
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 20.4,
+    "turns": 7,
+    "out_tokens": 929
+   }
+  ],
+  "task": "sift-build",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 4,
+  "tokens": {
+   "input": 8,
+   "output": 620,
+   "cache_create": 9975,
+   "cache_read": 89560,
+   "cost": 0.16373900000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 22.5,
+    "turns": 4,
+    "out_tokens": 620
+   }
+  ],
+  "task": "sift-build",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 28,
+   "output": 14237,
+   "cache_create": 42965,
+   "cache_read": 342081,
+   "cost": 0.9591835000000001
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 71.0,
+    "out_tokens": 4094,
+    "code_chars": 2108
+   },
+   {
+    "round": 2,
+    "verdict": "compile-error",
+    "seconds": 147.2,
+    "out_tokens": 10143,
+    "code_chars": 3016
+   }
+  ],
+  "task": "sift-build",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 10,
+   "output": 1012,
+   "cache_create": 11366,
+   "cache_read": 110996,
+   "cost": 0.195421
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 20.1,
+    "turns": 7,
+    "out_tokens": 1012
+   }
+  ],
+  "task": "sift-build",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 4,
+  "tokens": {
+   "input": 8,
+   "output": 580,
+   "cache_create": 9977,
+   "cache_read": 89562,
+   "cost": 0.16276000000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 19.8,
+    "turns": 4,
+    "out_tokens": 580
+   }
+  ],
+  "task": "sift-build",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 20,
+   "output": 25557,
+   "cache_create": 53358,
+   "cache_read": 236026,
+   "cost": 1.29273
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 32.6,
+    "out_tokens": 1957,
+    "code_chars": 881
+   },
+   {
+    "round": 2,
+    "verdict": "test-fail",
+    "seconds": 319.0,
+    "out_tokens": 23600,
+    "code_chars": 4990
+   }
+  ],
+  "task": "sift-build",
+  "arm": "bare",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 10,
+   "output": 947,
+   "cache_create": 11403,
+   "cache_read": 111029,
+   "cost": 0.1941875
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 19.4,
+    "turns": 7,
+    "out_tokens": 947
+   }
+  ],
+  "task": "sift-build",
+  "arm": "native",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 4,
+  "tokens": {
+   "input": 8,
+   "output": 565,
+   "cache_create": 10060,
+   "cache_read": 89563,
+   "cost": 0.16322050000000002
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 14.2,
+    "turns": 4,
+    "out_tokens": 565
+   }
+  ],
+  "task": "sift-build",
+  "arm": "xerj",
+  "trial": 2,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 20,
+   "output": 10639,
+   "cache_create": 30745,
+   "cache_read": 240374,
+   "cost": 0.6959660000000001
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 21.7,
+    "out_tokens": 1456,
+    "code_chars": 675
+   },
+   {
+    "round": 2,
+    "verdict": "compile-error",
+    "seconds": 135.9,
+    "out_tokens": 9183,
+    "code_chars": 662
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 14,
+   "output": 1290,
+   "cache_create": 11978,
+   "cache_read": 164743,
+   "cost": 0.23542449999999998
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 31.4,
+    "turns": 7,
+    "out_tokens": 1290
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 818,
+   "cache_create": 10355,
+   "cache_read": 90258,
+   "cost": 0.172863
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 21.0,
+    "turns": 5,
+    "out_tokens": 818
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 24,
+   "output": 20576,
+   "cache_create": 39566,
+   "cache_read": 271637,
+   "cost": 1.0483485
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 60.4,
+    "out_tokens": 3439,
+    "code_chars": 1071
+   },
+   {
+    "round": 2,
+    "verdict": "compile-error",
+    "seconds": 234.7,
+    "out_tokens": 17137,
+    "code_chars": 1109
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 14,
+   "output": 1196,
+   "cache_create": 11779,
+   "cache_read": 164456,
+   "cost": 0.230916
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 30.0,
+    "turns": 7,
+    "out_tokens": 1196
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 4,
+  "tokens": {
+   "input": 8,
+   "output": 738,
+   "cache_create": 10148,
+   "cache_read": 89792,
+   "cost": 0.16856499999999996
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 17.1,
+    "turns": 4,
+    "out_tokens": 738
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 41,
+   "output": 18843,
+   "cache_create": 50119,
+   "cache_read": 586053,
+   "cost": 1.2678824999999998
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 72.0,
+    "out_tokens": 4126,
+    "code_chars": 1136
+   },
+   {
+    "round": 2,
+    "verdict": "compile-error",
+    "seconds": 220.1,
+    "out_tokens": 14717,
+    "code_chars": 917
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "bare",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 14,
+   "output": 1220,
+   "cache_create": 11806,
+   "cache_read": 164507,
+   "cost": 0.23183149999999997
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 28.9,
+    "turns": 7,
+    "out_tokens": 1220
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "native",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 4,
+  "tokens": {
+   "input": 8,
+   "output": 756,
+   "cache_create": 10136,
+   "cache_read": 89780,
+   "cost": 0.168879
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 15.9,
+    "turns": 4,
+    "out_tokens": 756
+   }
+  ],
+  "task": "sift-merge",
+  "arm": "xerj",
+  "trial": 2,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 31,
+   "output": 20770,
+   "cache_create": 40446,
+   "cache_read": 459474,
+   "cost": 1.155787
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 28.2,
+    "out_tokens": 1926,
+    "code_chars": 1126
+   },
+   {
+    "round": 2,
+    "verdict": "no-code-block",
+    "seconds": 287.3,
+    "usage": {
+     "input": 27,
+     "output": 18844,
+     "cache_create": 34936,
+     "cache_read": 430146,
+     "cost": 1.037019
+    }
+   }
+  ],
+  "task": "sift-until",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 14,
+   "output": 1432,
+   "cache_create": 11540,
+   "cache_read": 162842,
+   "cost": 0.23360800000000004
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 28.0,
+    "turns": 7,
+    "out_tokens": 1432
+   }
+  ],
+  "task": "sift-until",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 1031,
+   "cache_create": 10542,
+   "cache_read": 90308,
+   "cost": 0.180052
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 18.7,
+    "turns": 5,
+    "out_tokens": 1031
+   }
+  ],
+  "task": "sift-until",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 20,
+   "output": 12585,
+   "cache_create": 52236,
+   "cache_read": 250833,
+   "cost": 0.9646294999999999
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 38.6,
+    "out_tokens": 2493,
+    "code_chars": 1021
+   },
+   {
+    "round": 2,
+    "verdict": "compile-error",
+    "seconds": 142.4,
+    "out_tokens": 10092,
+    "code_chars": 1023
+   }
+  ],
+  "task": "sift-until",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 10,
+   "output": 1242,
+   "cache_create": 11732,
+   "cache_read": 111305,
+   "cost": 0.2049995
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 27.9,
+    "turns": 7,
+    "out_tokens": 1242
+   }
+  ],
+  "task": "sift-until",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 1096,
+   "cache_create": 10517,
+   "cache_read": 90366,
+   "cost": 0.181461
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 20.5,
+    "turns": 5,
+    "out_tokens": 1096
+   }
+  ],
+  "task": "sift-until",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 1
+ },
+ {
+  "solved": false,
+  "rounds": 2,
+  "tokens": {
+   "input": 6,
+   "output": 2120,
+   "cache_create": 26456,
+   "cache_read": 46816,
+   "cost": 0.341832
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "compile-error",
+    "seconds": 33.8,
+    "out_tokens": 2120,
+    "code_chars": 1278
+   },
+   {
+    "round": 2,
+    "verdict": "generation-timeout",
+    "seconds": 400.1,
+    "usage": null
+   }
+  ],
+  "task": "sift-until",
+  "arm": "bare",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 7,
+  "tokens": {
+   "input": 10,
+   "output": 1393,
+   "cache_create": 11649,
+   "cache_read": 111243,
+   "cost": 0.2079185
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 26.6,
+    "turns": 7,
+    "out_tokens": 1393
+   }
+  ],
+  "task": "sift-until",
+  "arm": "native",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 960,
+   "cache_create": 10405,
+   "cache_read": 90252,
+   "cost": 0.176884
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 19.4,
+    "turns": 5,
+    "out_tokens": 960
+   }
+  ],
+  "task": "sift-until",
+  "arm": "xerj",
+  "trial": 2,
+  "ref_passages": 1
+ }
+]

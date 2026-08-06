@@ -1,0 +1,422 @@
+[
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 7635,
+   "cache_create": 5495,
+   "cache_read": 12014,
+   "cost": 0.252818
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 78.8,
+    "out_tokens": 7635,
+    "code_chars": 10510
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 31,
+  "tokens": {
+   "input": 43,
+   "output": 21851,
+   "cache_create": 50660,
+   "cache_read": 929608,
+   "cost": 1.5189519999999999
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 290.7,
+    "turns": 31,
+    "out_tokens": 21851
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 13858,
+   "cache_create": 25899,
+   "cache_read": 112318,
+   "cost": 0.667695
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 153.3,
+    "turns": 5,
+    "out_tokens": 13858
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 3
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 8213,
+   "cache_create": 5493,
+   "cache_read": 12014,
+   "cost": 0.26723800000000003
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 84.2,
+    "out_tokens": 8213,
+    "code_chars": 9995
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 26,
+  "tokens": {
+   "input": 40,
+   "output": 22253,
+   "cache_create": 54367,
+   "cache_read": 823710,
+   "cost": 1.513108
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 284.8,
+    "turns": 26,
+    "out_tokens": 22253
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": false,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 10472,
+   "cache_create": 22261,
+   "cache_read": 108632,
+   "cost": 0.544832
+  },
+  "history": [
+   {
+    "verdict": "test-fail",
+    "seconds": 119.0,
+    "turns": 5,
+    "out_tokens": 10472
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 3
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 6566,
+   "cache_create": 5495,
+   "cache_read": 12014,
+   "cost": 0.226088
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 65.3,
+    "out_tokens": 6566,
+    "code_chars": 10991
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "bare",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 20,
+  "tokens": {
+   "input": 26,
+   "output": 14794,
+   "cache_create": 30702,
+   "cache_read": 423791,
+   "cost": 0.8899635
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 182.1,
+    "turns": 20,
+    "out_tokens": 14794
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "native",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 6,
+  "tokens": {
+   "input": 10,
+   "output": 12746,
+   "cache_create": 24950,
+   "cache_read": 143121,
+   "cost": 0.6458115
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 147.7,
+    "turns": 6,
+    "out_tokens": 12746
+   }
+  ],
+  "task": "resp-kv",
+  "arm": "xerj",
+  "trial": 2,
+  "ref_passages": 3
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 4724,
+   "cache_create": 5476,
+   "cache_read": 12014,
+   "cost": 0.17983300000000002
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 51.6,
+    "out_tokens": 4724,
+    "code_chars": 6063
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "bare",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 25,
+  "tokens": {
+   "input": 46,
+   "output": 18242,
+   "cache_create": 49018,
+   "cache_read": 894528,
+   "cost": 1.394769
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 249.8,
+    "turns": 25,
+    "out_tokens": 18242
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "native",
+  "trial": 0,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 24800,
+   "cache_create": 32946,
+   "cache_read": 111779,
+   "cost": 1.0084415
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 276.5,
+    "turns": 5,
+    "out_tokens": 24800
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "xerj",
+  "trial": 0,
+  "ref_passages": 3
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 9305,
+   "cache_create": 5472,
+   "cache_read": 12014,
+   "cost": 0.29432300000000006
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 102.1,
+    "out_tokens": 9305,
+    "code_chars": 7708
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "bare",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 37,
+  "tokens": {
+   "input": 69,
+   "output": 27651,
+   "cache_create": 66953,
+   "cache_read": 1571493,
+   "cost": 2.1479415
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 389.3,
+    "turns": 37,
+    "out_tokens": 27651
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "native",
+  "trial": 1,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 5,
+  "tokens": {
+   "input": 8,
+   "output": 21408,
+   "cache_create": 29573,
+   "cache_read": 108344,
+   "cost": 0.888194
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 243.0,
+    "turns": 5,
+    "out_tokens": 21408
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "xerj",
+  "trial": 1,
+  "ref_passages": 3
+ },
+ {
+  "solved": true,
+  "rounds": 1,
+  "tokens": {
+   "input": 2,
+   "output": 8138,
+   "cache_create": 5476,
+   "cache_read": 12014,
+   "cost": 0.265183
+  },
+  "history": [
+   {
+    "round": 1,
+    "verdict": "pass",
+    "seconds": 89.1,
+    "out_tokens": 8138,
+    "code_chars": 6155
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "bare",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 32,
+  "tokens": {
+   "input": 57,
+   "output": 20909,
+   "cache_create": 55592,
+   "cache_read": 1195468,
+   "cost": 1.6777040000000003
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 299.8,
+    "turns": 32,
+    "out_tokens": 20909
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "native",
+  "trial": 2,
+  "ref_passages": 0
+ },
+ {
+  "solved": true,
+  "rounds": 6,
+  "tokens": {
+   "input": 10,
+   "output": 14050,
+   "cache_create": 22570,
+   "cache_read": 138403,
+   "cost": 0.6492535
+  },
+  "history": [
+   {
+    "verdict": "pass",
+    "seconds": 162.2,
+    "turns": 6,
+    "out_tokens": 14050
+   }
+  ],
+  "task": "memcached-kv",
+  "arm": "xerj",
+  "trial": 2,
+  "ref_passages": 3
+ }
+]
