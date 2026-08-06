@@ -319,8 +319,11 @@ mod clustering_key_tests {
         let dir = std::env::temp_dir().join("xerj-ax-178-key");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // `const` is invisible to the shipped Rust query, so this file parses
-        // to zero symbols — exactly the case #170 improves.
+        // #170 now captures the `const`, so this file parses to one symbol and
+        // GAINS a `defs` field — the case #170 improves. The point of this test
+        // survives that change: the newly-captured extractor name must still be
+        // kept out of the clustering key (#180), so a const-only file and a
+        // fn/struct file still land in ONE dataset rather than re-homing apart.
         let table = scan(
             &dir,
             "table.rs",
@@ -337,7 +340,8 @@ mod clustering_key_tests {
                 s.sketches[0].key_fields
             );
         }
-        assert!(!table.sketches[0].fields.contains_key("defs"));
+        // #170: the const is now captured, so the table file has `defs` too.
+        assert!(table.sketches[0].fields.contains_key("defs"));
         assert!(code.sketches[0].fields.contains_key("defs"));
 
         // …so the two land in one dataset instead of one dataset each.
