@@ -158,7 +158,7 @@ Reference pages for individual subsystems, written against the source and
 including the limits each one does not lift:
 
 - [Second brain](./docs/SECOND_BRAIN.md) for the relationship layer over
-  indexed documents: the `/_graph` routes, evidence on links, the seven
+  indexed documents: the `/_graph` routes, evidence on links, the eight
   detectors and the two-hop cap.
 - [Scripting](./docs/SCRIPTING.md) for the Painless subset, where scripts run,
   and the resource limits that bound them.

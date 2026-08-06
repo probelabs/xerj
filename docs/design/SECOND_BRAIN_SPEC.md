@@ -836,11 +836,13 @@ engine/crates/xerj-autoindex/src/detect/
   cratecite.rs  // crate-dir name in prose          type "cratecite" w 0.5  conf 0.6
   sequence.rs   // card → s_0, s_i -> s_{i+1}       type "sequence"  w 0.8  conf 0.99
   samedir.rs    // chain over sorted files per dir  type "same_dir"  w 0.3  conf 0.4
+  sharedterm.rs // distinctive vocabulary in common type "shared_term" w 0.45 conf 0.5
 ```
 
 Detector tags as of the cross-file-type revision: `wikilink@2`, `mdlink@2`,
-`href@2`, `pathcite@1`, `cratecite@1`, `sequence@2`, `samedir@2`. The @2 bumps
-record two behavior changes (per the "bump on ANY behavior change" rule):
+`href@2`, `pathcite@1`, `cratecite@1`, `sequence@2`, `samedir@2`, plus
+`sharedterm@1` (issue #164, the first detector that reads what a document says
+rather than what it cites). The @2 bumps record two behavior changes (per the "bump on ANY behavior change" rule):
 every file-level endpoint moved from the target's `s0` section to its
 **file-card node**, and edges gained `src_format`/`dst_format`. Edges written
 by @1 detectors remain in place, attributable, and time-travelable.
@@ -929,12 +931,19 @@ pub trait EdgeDetector: Sync {
     fn detect_text(&self, _ctx: &SectionCtx<'_>, _out: &mut Vec<EdgeDraft>) {}
     /// Corpus-structural detection, called once after Phase A. Default: no-op.
     fn detect_structure(&self, _corpus: &CorpusIndex, _out: &mut Vec<EdgeDraft>) {}
+    /// Corpus-wide detection over the whole run's text, called once AFTER
+    /// Phase B — the phase for edges that cannot be judged one section at a
+    /// time (sharedterm cannot know a term is distinctive until every document
+    /// has been read). Such a detector accumulates in `detect_text` behind
+    /// interior mutability and emits here; determinism over Phase B's parallel
+    /// workers is its own responsibility. Default: no-op.
+    fn detect_corpus(&self, _corpus: &CorpusIndex, _out: &mut Vec<EdgeDraft>) {}
 }
 
 /// The registry. Order is normative (fixture edge ordering depends on it only
 /// via edge sort, so this is cosmetic — but keep it).
 pub fn default_detectors() -> Vec<Box<dyn EdgeDetector>>;
-// wikilink, mdlink, href, pathcite, cratecite, sequence, samedir
+// wikilink, mdlink, href, pathcite, cratecite, sequence, samedir, sharedterm
 ```
 
 ### 6.4 Determinism + edge identity rules
@@ -1008,6 +1017,21 @@ target's FILE CARD (§6.6.2a).
   reachable within the 2-hop cap for small dirs at O(n). quote =
   `"{left.rel} and {right.rel} share directory {dir}"` (dir `"."` for root),
   offset 0, `src_file` = left.rel, `valid_at_ms` = left file's mtime.
+- **sharedterm@1** (corpus-wide, emitted from `detect_corpus` after Phase B):
+  two documents that use the same distinctive terms. Terms are lowercased
+  alphanumeric runs of 3–32 chars, minus a built-in English function-word list
+  and pure numbers; a term counts as distinctive only if it appears in at least
+  2 and at most `ceil(0.10 × documents)` of them (absolute ceiling 64), so a
+  corpus of ≤10 documents emits nothing. Each document contributes its 24
+  rarest qualifying terms; candidate pairs are ranked by how many distinctive
+  terms they share and accepted round-robin, one per document per round, until
+  every document holds at most 5 `shared_term` edges — refused candidates are
+  counted as `edges_capped` in the run summary. Endpoints are the two FILE
+  CARDS (`src` = the rel-smaller document), offset 0, `valid_at_ms` = src
+  file's mtime, quote = `"{a} and {b} share N distinctive terms: …"` naming the
+  rarest 12. This links documents that share VOCABULARY, not documents that
+  share MEANING: the terms are compared as strings, and nothing in this path is
+  a model. UI name: **"shared wording"**.
 
 ### 6.6 Pipeline hooks (where, exactly)
 

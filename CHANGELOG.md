@@ -62,6 +62,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not: neither attests immutable model bytes, so a fresh semantic run is
   allowed but a resume is refused.
 
+- **A detector that connects documents by what they say, not only by what they
+  cite** (#164). Every shipped detector was structural — `wikilink`, `mdlink`,
+  `href`, `pathcite` and `cratecite` need an explicit citation, `sequence` and
+  `samedir` need a filesystem relationship — so a folder of PDFs or saved pages,
+  where no document links to another, produced a graph whose only edges ran
+  inside single documents and along directory chains. `sharedterm@1` emits a
+  `shared_term` edge (weight 0.45, confidence 0.5) between two documents that
+  use the same distinctive words, and carries those words as the edge evidence
+  so a wrong link is inspectable exactly like a wrong `mdlink`.
+
+  Measured on 240 arXiv PDFs filed in 24 topic folders (236 extractable), same
+  binary, same corpus: before, 11,854 edges — 11,642 `sequence` inside single
+  documents plus 212 `same_dir`, with 212 cross-document edges and **none**
+  crossing a folder. After, 462 `shared_term` edges (271 further candidates
+  refused by the density cap), 377 of them joining documents in different
+  folders and 296 joining different top-level topics. Two independent runs
+  produced identical counts and identical evidence.
+
+  Density is capped rather than trusted: a term in more than 10% of the corpus
+  is that corpus's vocabulary and is ignored, a link needs at least two shared
+  word families (so a singular and its plural are not two signals), and no
+  document takes more than 5 `shared_term` edges. What the cap refused is
+  reported by the run as `edges_capped` instead of vanishing. A corpus of ten
+  documents or fewer therefore produces no `shared_term` edges at all, which is
+  the 10% rule being honest rather than an exception.
+
+  The honest limit, which the docs and the console now state: this links
+  documents that share VOCABULARY, not documents that share MEANING. Terms are
+  compared as strings with no stemming and no model — XERJ's built-in embedder
+  is lexical feature hashing and this detector does not use even that. Against
+  the corpus's own topic filing, a random pair of those documents shares a
+  top-level topic 17.0% of the time; `shared_term` links do so 35.9% of the
+  time. Real signal, and a noisy one.
+
 ### Changed
 
 - **BREAKING: an existing semantic `autoindex` state directory cannot be

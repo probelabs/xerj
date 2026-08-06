@@ -1648,6 +1648,58 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
     });
 
+    // Corpus-wide edges (§6.6.2, `EdgeDetector::detect_corpus`): the pass for
+    // relationships that only exist once EVERY document has been read —
+    // sharedterm cannot know which words are distinctive until it has seen the
+    // whole run. It runs after Phase B for the same reason per-file edges are
+    // written after their file's nodes: an edge must never precede the docs it
+    // points at. Skipped when Phase B already failed — that run bails below,
+    // and edges over a half-read corpus would be edges over a lie.
+    if let Some(gr) = &graph {
+        if bulk_errors.lock().unwrap().is_empty() {
+            let mut drafts = Vec::new();
+            for det in &gr.detectors {
+                det.detect_corpus(&gr.corpus, &mut drafts);
+            }
+            if !drafts.is_empty() {
+                let out = detect::assemble(&drafts, &gr.edges_index, gr.created_at_ms);
+                gr.self_dropped
+                    .fetch_add(out.self_dropped, Ordering::Relaxed);
+                let mut send_err: Option<String> = None;
+                let mut buf: Vec<u8> = Vec::new();
+                for edge in &out.edges {
+                    buf.extend_from_slice(&edge.ndjson);
+                    if buf.len() >= bulk_cut
+                        && record_bulk_outcome(
+                            &es,
+                            std::mem::take(&mut buf),
+                            &junk_records,
+                            &bulk_errors,
+                            &mut send_err,
+                        )
+                    {
+                        break;
+                    }
+                }
+                if send_err.is_none() && !buf.is_empty() {
+                    record_bulk_outcome(&es, buf, &junk_records, &bulk_errors, &mut send_err);
+                }
+                match send_err {
+                    Some(e) => bulk_errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("write corpus-wide graph edges: {e}")),
+                    None => {
+                        let mut written = gr.written.lock().unwrap();
+                        for edge in &out.edges {
+                            *written.entry(edge.detector).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let bulk_errs = bulk_errors.into_inner().unwrap();
     if !bulk_errs.is_empty() {
         anyhow::bail!(
@@ -1919,6 +1971,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             let c = det.counters();
             counters.unresolved += c.unresolved;
             counters.ambiguous += c.ambiguous;
+            counters.capped += c.capped;
         }
         let raw = gr.href_raw.counters();
         counters.unresolved += raw.unresolved;
@@ -1934,6 +1987,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             "by_detector": by_detector,
             "edges_unresolved": counters.unresolved,
             "edges_ambiguous": counters.ambiguous,
+            "edges_capped": counters.capped,
             "edges_self_dropped": gr.self_dropped.load(Ordering::Relaxed),
             "edges_invalidated": gr.invalidated,
         })
@@ -1989,12 +2043,13 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 .map(|m| m.iter().map(|(tag, n)| format!("{tag} {n}")).collect())
                 .unwrap_or_default();
             println!(
-                "graph: {} edges → {} ({}); {} unresolved, {} ambiguous, {} self-dropped, {} invalidated",
+                "graph: {} edges → {} ({}); {} unresolved, {} ambiguous, {} capped, {} self-dropped, {} invalidated",
                 g["edges_written"],
                 g["edges_index"].as_str().unwrap_or(""),
                 if by.is_empty() { "no detections".to_string() } else { by.join(", ") },
                 g["edges_unresolved"],
                 g["edges_ambiguous"],
+                g["edges_capped"],
                 g["edges_self_dropped"],
                 g["edges_invalidated"],
             );

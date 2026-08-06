@@ -592,6 +592,96 @@ fn fixture_folder_end_to_end_matches_the_contract_edge_set() {
     );
 }
 
+/// The corpus-wide pass, end to end: documents that never cite each other and
+/// do not even share a directory are linked by the words only they use — and
+/// the edge lands in the edges index carrying those words as its evidence.
+/// `detect_corpus` runs after Phase B, so this is also the proof that the
+/// third detection phase is wired into the pipeline at all.
+#[test]
+fn shared_vocabulary_links_documents_that_cite_nothing() {
+    let corpus = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    // Two recipes in different folders: no link, no shared directory, one
+    // shared distinctive vocabulary.
+    fs::create_dir(corpus.path().join("bread")).unwrap();
+    fs::create_dir(corpus.path().join("pickles")).unwrap();
+    fs::create_dir(corpus.path().join("admin")).unwrap();
+    fs::write(
+        corpus.path().join("bread/sourdough.md"),
+        "The starter ferments overnight. Lactobacillus and wild yeast do the \
+         work; the note on hydration is filed.",
+    )
+    .unwrap();
+    fs::write(
+        corpus.path().join("pickles/kimchi.md"),
+        "Cabbage ferments in brine. Lactobacillus again, and the note says \
+         three days.",
+    )
+    .unwrap();
+    // Ten unrelated documents: enough corpus for "distinctive" to mean
+    // something (the 10% rule), and everyday words in all of them.
+    for i in 0..10 {
+        fs::write(
+            corpus.path().join(format!("admin/memo{i:02}.md")),
+            format!("The note was filed. Item unique{i:02} is recorded."),
+        )
+        .unwrap();
+    }
+    let es = MockEs::start();
+    assert_eq!(
+        crate::run_index(cfg(corpus.path(), state.path(), &es.url)).unwrap(),
+        0
+    );
+
+    let anchors = es.anchors();
+    let edges = es.index(EDGES_INDEX);
+    let shared: Vec<&Value> = edges
+        .values()
+        .filter(|s| s["type"] == json!("shared_term"))
+        .collect();
+    assert_eq!(
+        shared.len(),
+        1,
+        "exactly one vocabulary link, between the two recipes: {shared:#?}"
+    );
+    let e = shared[0];
+    assert_eq!(e["detector"], json!("sharedterm@1"));
+    assert_eq!(e["weight"], json!(0.45));
+    assert_eq!(e["confidence"], json!(0.5));
+    assert_eq!(e["src"], json!(anchors["bread/sourdough.md"]));
+    assert_eq!(e["dst"], json!(anchors["pickles/kimchi.md"]));
+    assert_eq!(e["src_file"], json!("bread/sourdough.md"));
+    let quote = e["evidence"]["quote"].as_str().unwrap();
+    assert!(
+        quote.contains("lactobacillus") && quote.contains("ferments"),
+        "the shared terms must be inspectable on the edge: {quote}"
+    );
+    assert!(
+        !quote.contains("note") && !quote.contains("filed"),
+        "words the whole corpus uses are not evidence of anything: {quote}"
+    );
+
+    let g = journal_graph_summary(state.path());
+    assert_eq!(g["by_detector"]["sharedterm@1"], json!(1));
+    assert_eq!(g["edges_capped"], json!(0), "nothing hit the density cap");
+
+    // Same corpus, fresh run: the vocabulary edge is byte-identical, so a
+    // re-run converges instead of accumulating beliefs.
+    let state2 = tempfile::tempdir().unwrap();
+    assert_eq!(
+        crate::run_index(cfg(corpus.path(), state2.path(), &es.url)).unwrap(),
+        0
+    );
+    let after: Vec<Value> = es
+        .index(EDGES_INDEX)
+        .values()
+        .filter(|s| s["type"] == json!("shared_term"))
+        .cloned()
+        .collect();
+    assert_eq!(after.len(), 1, "the re-run overwrote in place");
+    assert_eq!(after[0]["evidence"]["quote"], json!(quote));
+}
+
 #[test]
 fn dangling_wikilink_is_counted_not_silently_dropped() {
     let corpus = tempfile::tempdir().unwrap();

@@ -64,6 +64,7 @@ const TYPE_WORDS = {
   cratecite: 'CITES CRATE',
   sequence: 'READING ORDER',
   same_dir: 'SAME FOLDER',
+  shared_term: 'SHARED WORDING',
   manual: 'HAND-ASSERTED',
 };
 export const typeName = (t) =>
@@ -81,6 +82,7 @@ const DETECTOR_WORDS = {
   cratecite: 'CITES CRATE',
   sequence: 'READING ORDER',
   samedir: 'FOLDER NEIGHBORS',
+  sharedterm: 'SHARED WORDING',
   manual: 'HAND-ASSERTED',
 };
 export const detectorName = (tag) => {
@@ -95,16 +97,18 @@ export const detectorName = (tag) => {
 // Not every link's evidence is a quote, and saying so is load-bearing:
 //   AUTHORED links (wikilink/mdlink/href) carry the exact text the
 //     author wrote — a real quote, quoted.
-//   STRUCTURAL links (samedir/sequence) carry a detector-generated
-//     rationale — real evidence of WHY, but never text from the note,
-//     so it must never wear quotation marks.
+//   STRUCTURAL links (samedir/sequence/sharedterm) carry a detector-
+//     generated rationale — real evidence of WHY, but never text from
+//     the note, so it must never wear quotation marks. sharedterm's
+//     rationale NAMES the shared words, which is the whole reason an
+//     inferred link is inspectable at all.
 //   Links with no evidence at all (asserted by hand or agent without a
 //     quote) say so — absence is shown, not papered over.
 
 // pathcite/cratecite quote the author's actual line (a real citation the
 // author typed, resolved structurally) — authored, quote-rendered.
 const AUTHORED_DETECTORS = new Set(['wikilink', 'mdlink', 'href', 'pathcite', 'cratecite']);
-const STRUCTURAL_DETECTORS = new Set(['samedir', 'sequence']);
+const STRUCTURAL_DETECTORS = new Set(['samedir', 'sequence', 'sharedterm']);
 const detectorBase = (tag) => String(tag || '').split('@')[0];
 
 /** 'quote' | 'rationale' | 'none' — how this link's evidence renders. */
@@ -1003,7 +1007,7 @@ const MapPanel = ({ data }) => {
   return `
   <div class="sb-map" data-sb-map>
     <div class="sb-map-mount" data-sb-map-mount>${inner}</div>
-    <div class="sb-map-disclosure mono faint">GROUPED BY LINK STRUCTURE — CITATIONS AND FOLDER NEIGHBORHOOD, NOT MEANING</div>
+    <div class="sb-map-disclosure mono faint">GROUPED BY LINK STRUCTURE — CITATIONS, FOLDER NEIGHBORHOOD AND SHARED WORDING, NOT MEANING</div>
   </div>`;
 };
 
@@ -1093,7 +1097,7 @@ const CrossingsPanel = ({ data }) => {
   // §0 invariant 8: no surface may imply the links mean anything —
   // they are citations and structure found by deterministic detectors.
   const embed = o.embedder
-    ? `<div class="hint" style="margin-top:var(--sp-1);">LINKS COME FROM STRUCTURE AND CITATIONS, NOT MEANING — embedder: ${esc(o.embedder)}</div>`
+    ? `<div class="hint" style="margin-top:var(--sp-1);">LINKS COME FROM STRUCTURE, CITATIONS AND SHARED WORDING, NOT MEANING — embedder: ${esc(o.embedder)}</div>`
     : '';
   if (!c) return `<div class="panel-empty mono faint">NOT TALLIED YET</div>${embed}`;
   if (c.error) return `<div class="panel-empty mono faint">COULD NOT TALLY · ${esc(String(c.error).slice(0, 60))}</div>${embed}`;
