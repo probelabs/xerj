@@ -506,9 +506,37 @@ impl FtsSearcher {
         cap: usize,
         explain: bool,
     ) -> Result<(Vec<ScoredHit>, u64)> {
+        // The no-op observer monomorphises away, so this stays byte-identical to
+        // the pre-#179 bounded search on the hot (no-delete) path.
+        self.search_bounded_observed(query, cap, explain, |_| {})
+    }
+
+    /// Like [`Self::search_bounded`], but invokes `observe(doc_id)` once for
+    /// EVERY match in the full match set — before the `cap` is applied — so a
+    /// caller can derive an exact per-match statistic without materialising the
+    /// whole hit list.  The returned total is the exact physical match count
+    /// regardless of `cap` ([`TopN`] counts every push).
+    ///
+    /// #179: the delete-present read path uses this to tally LIVE matches (via
+    /// the segment ghost bitmap) during a BOUNDED scan, instead of forcing
+    /// `cap == usize::MAX` purely to hold the complete hit list for the count.
+    /// The scan already visits every posting on the bounded path, so the
+    /// observer is free; the win is shedding the full-set sort and the
+    /// O(matches) `Vec` that the unbounded path built on any index that had ever
+    /// seen a delete.
+    pub fn search_bounded_observed<F: FnMut(u32)>(
+        &self,
+        query: &Query,
+        cap: usize,
+        explain: bool,
+        mut observe: F,
+    ) -> Result<(Vec<ScoredHit>, u64)> {
         if cap == usize::MAX {
             let mut hits = self.execute(query, explain)?;
             let total = hits.len() as u64;
+            for h in &hits {
+                observe(h.doc_id);
+            }
             hits.sort_unstable();
             return Ok((hits, total));
         }
@@ -516,11 +544,15 @@ impl FtsSearcher {
         let mut top = TopN::new(cap);
         match query {
             // Streaming leaf: push each scored posting directly into the heap.
-            Query::Term(tq) => self.collect_term(tq, explain, &mut top)?,
+            Query::Term(tq) => self.scan_term(tq, explain, |h| {
+                observe(h.doc_id);
+                top.push(h);
+            })?,
             // Compound / positional arms: reuse the exact hit-set builder, then
             // drain into the bounded heap (the sort is what we shed here).
             _ => {
                 for hit in self.execute(query, explain)? {
+                    observe(hit.doc_id);
                     top.push(hit);
                 }
             }
@@ -550,17 +582,12 @@ impl FtsSearcher {
         Ok(hits)
     }
 
-    /// Streaming variant of [`Self::execute_term`] for the bounded search path:
-    /// each scored posting is offered straight to the `TopN` heap, so a keyword
-    /// term matching tens of thousands of docs never materialises the full hit
-    /// `Vec` for a size:10 request.
-    fn collect_term(&self, tq: &TermQuery, explain: bool, top: &mut TopN) -> Result<()> {
-        self.scan_term(tq, explain, |h| top.push(h))
-    }
-
-    /// Shared scoring scan used by both [`Self::execute_term`] (Vec) and
-    /// [`Self::collect_term`] (bounded heap).  Emits one `ScoredHit` per
-    /// matching posting in ascending doc_id order.
+    /// Shared scoring scan used by both [`Self::execute_term`] (Vec) and the
+    /// bounded [`Self::search_bounded_observed`] path (which offers each scored
+    /// posting straight to the `TopN` heap, so a keyword term matching tens of
+    /// thousands of docs never materialises the full hit `Vec` for a size:10
+    /// request).  Emits one `ScoredHit` per matching posting in ascending
+    /// doc_id order.
     fn scan_term<F: FnMut(ScoredHit)>(
         &self,
         tq: &TermQuery,
