@@ -10,7 +10,7 @@ against it unchanged.
 [![CI](https://github.com/xerj-org/xerj/actions/workflows/ci.yml/badge.svg)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/xerj-org/xerj?include_prereleases&sort=semver)](https://github.com/xerj-org/xerj/releases)
-[![ES conformance](https://img.shields.io/badge/ES%20conformance-1360%2F1363-brightgreen.svg)](https://xerj.org/benchmarks)
+[![ES conformance](https://img.shields.io/badge/ES%20conformance-1365%2F1368-brightgreen.svg)](https://xerj.org/benchmarks)
 
 <video src="https://xerj.org/xerj-biz-demo.mp4" poster="docs/media/demo-poster.png" controls muted playsinline width="840">
   <a href="https://xerj.org/aise-demo.html"><img src="docs/media/demo-poster.png" width="840" alt="Watch the XERJ demo: boot, ingest, search, vectors, dashboards"></a>
@@ -109,7 +109,7 @@ XERJ implements the Elasticsearch REST API: indices, documents, bulk, search,
 aggregations, mappings, kNN, scroll, reindex and the `_cat` endpoints. Kibana and
 the official client libraries connect to it directly.
 
-The conformance suite runs on every commit and currently passes **1360 of 1363**
+The conformance suite runs on every commit and currently passes **1365 of 1368**
 cases. It lives in [`engine/tests/es-compat-yaml`](./engine/tests/es-compat-yaml),
 and the remaining gaps are listed there rather than hidden. XERJ is compatible
 with the API. It is not a reimplementation of Elasticsearch internals, and it is
