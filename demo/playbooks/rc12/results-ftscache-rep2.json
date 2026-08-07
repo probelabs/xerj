@@ -1,0 +1,176 @@
+{
+  "label": "ftscache-rep2",
+  "docs": 500000,
+  "raw_source_bytes": 356593195,
+  "index_total_bytes": 154413171,
+  "index_over_raw": 0.433,
+  "ingest_seconds": 30.15,
+  "forcemerge_seconds": 105.75,
+  "by_artifact": {
+    "dv": 57357593,
+    "seg": 51449822,
+    "post": 40951589,
+    "ids": 3057388,
+    "meta": 1464327,
+    "fst": 64485,
+    "json": 35338,
+    "norms": 28305,
+    "wal": 4116,
+    "toml": 104,
+    "xerj_master_key": 64,
+    "sidx": 32,
+    "lock": 8
+  },
+  "queries": {
+    "term_keyword_low_card": {
+      "p50_ms": 0.623,
+      "p99_ms": 0.768,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "term_keyword_high_card": {
+      "p50_ms": 1.429,
+      "p99_ms": 1.617,
+      "took_ms": 1,
+      "hits": 1
+    },
+    "range_date_narrow": {
+      "p50_ms": 0.407,
+      "p99_ms": 0.526,
+      "took_ms": 0,
+      "hits": 50
+    },
+    "range_long_wide": {
+      "p50_ms": 0.38,
+      "p99_ms": 0.505,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "match_text_common": {
+      "p50_ms": 57.206,
+      "p99_ms": 57.949,
+      "took_ms": 56,
+      "hits": 10000
+    },
+    "match_text_multi": {
+      "p50_ms": 334.223,
+      "p99_ms": 347.116,
+      "took_ms": 333,
+      "hits": 10000
+    },
+    "match_phrase": {
+      "p50_ms": 327.649,
+      "p99_ms": 337.466,
+      "took_ms": 315,
+      "hits": 10000
+    },
+    "bool_must_filter": {
+      "p50_ms": 2750.581,
+      "p99_ms": 2775.305,
+      "took_ms": 2736,
+      "hits": 10000
+    },
+    "deep_page": {
+      "p50_ms": 61.19,
+      "p99_ms": 64.421,
+      "took_ms": 62,
+      "hits": 10000
+    },
+    "large_page": {
+      "p50_ms": 64.361,
+      "p99_ms": 65.596,
+      "took_ms": 59,
+      "hits": 10000
+    },
+    "sort_by_numeric": {
+      "p50_ms": 2.502,
+      "p99_ms": 2.687,
+      "took_ms": 1,
+      "hits": 10000
+    },
+    "agg_terms_low_card": {
+      "p50_ms": 0.463,
+      "p99_ms": 0.706,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "agg_terms_high_card": {
+      "p50_ms": 2.906,
+      "p99_ms": 3.712,
+      "took_ms": 2,
+      "hits": 10000
+    },
+    "agg_stats_numeric": {
+      "p50_ms": 0.272,
+      "p99_ms": 0.411,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "agg_date_histogram": {
+      "p50_ms": 17.208,
+      "p99_ms": 17.379,
+      "took_ms": 16,
+      "hits": 10000
+    },
+    "agg_histogram_numeric": {
+      "p50_ms": 10.518,
+      "p99_ms": 11.056,
+      "took_ms": 10,
+      "hits": 10000
+    },
+    "agg_nested_terms_stats": {
+      "p50_ms": 3.384,
+      "p99_ms": 3.885,
+      "took_ms": 3,
+      "hits": 10000
+    },
+    "boosting": {
+      "p50_ms": 2713.273,
+      "p99_ms": 2748.389,
+      "took_ms": 2723,
+      "hits": 10000
+    },
+    "function_score": {
+      "p50_ms": 4564.462,
+      "p99_ms": 4601.268,
+      "took_ms": 4577,
+      "hits": 10000
+    },
+    "match_phrase_prefix": {
+      "p50_ms": 4460.21,
+      "p99_ms": 4633.372,
+      "took_ms": 4311,
+      "hits": 10000
+    },
+    "fuzzy_text": {
+      "p50_ms": 197.238,
+      "p99_ms": 200.498,
+      "took_ms": 196,
+      "hits": 10000
+    },
+    "wildcard_text": {
+      "p50_ms": 73.52,
+      "p99_ms": 76.535,
+      "took_ms": 73,
+      "hits": 10000
+    },
+    "prefix_text": {
+      "p50_ms": 66.945,
+      "p99_ms": 70.127,
+      "took_ms": 65,
+      "hits": 10000
+    },
+    "agg_terms_on_text": {
+      "p50_ms": 3443.724,
+      "p99_ms": 3935.99,
+      "took_ms": 3422,
+      "hits": 10000
+    },
+    "sort_on_text": {
+      "p50_ms": 1586.369,
+      "p99_ms": 1657.992,
+      "took_ms": 1651,
+      "hits": 10000
+    }
+  }
+}

@@ -63,7 +63,46 @@ fuzzy; no change on brute-scan families."*
 
 ---
 
-## The one regression, stated plainly
+## Repeat run — the regression did not reproduce
+
+A second independent run (`results-ftscache-rep2.json`, fresh instance, fresh
+data dir, same seeded corpus) settles the `match_phrase_prefix` question:
+
+| query | base | run 1 | run 2 | run 2 vs base |
+|---|---:|---:|---:|---:|
+| `match_phrase_prefix` | 4369.24 | **4684.25** | **4460.21** | 0.98x |
+| `match_text_common` | 166.29 | 57.85 | 57.21 | **2.91x** |
+| `prefix_text` | 170.91 | 69.22 | 66.94 | **2.55x** |
+| `wildcard_text` | 180.52 | 74.79 | 73.52 | **2.46x** |
+| `large_page` | 168.96 | 64.05 | 64.36 | **2.63x** |
+| `fuzzy_text` | 306.16 | 195.25 | 197.24 | **1.55x** |
+| `match_phrase` | 495.58 | 339.90 | 327.65 | **1.51x** |
+| `match_text_multi` | 493.90 | 342.99 | 334.22 | **1.48x** |
+| `function_score` | 4608.30 | 4588.56 | 4564.46 | 1.01x |
+| `boosting` | 2708.92 | 2704.39 | 2713.27 | 1.00x |
+
+`match_phrase_prefix` moved 4684 → 4460 between the two cache runs, a 5% swing
+with no code change. Its earlier 0.93x was **run-to-run variance on a
+multi-second brute-scan query, not a regression** — as suspected but, correctly,
+not assumed.
+
+**The wins are stable to within ~2% across both runs**, which is the more
+important result: the 2.4–2.9x on the mid-tier full-text shapes reproduces
+exactly, and the brute-scan families are flat in both.
+
+### What this says about the harness
+
+Multi-second shapes carry ±5% run-to-run noise at 40 repetitions. Any future
+claim about `function_score`, `boosting`, `match_phrase_prefix`,
+`agg_terms_on_text`, `bool_must_filter` or `sort_on_text` needs either more
+repetitions or repeated runs — a single run cannot resolve anything smaller than
+about 10% on those. The sub-millisecond shapes are noisy in relative terms for
+the opposite reason (`agg_stats_numeric` 0.20 → 0.27 ms reads as "0.75x" but is
+70 microseconds); they should be read as a pass/fail guard, not as ratios.
+
+---
+
+## The one regression, stated plainly (superseded by the repeat run above)
 
 `match_phrase_prefix` moved 4369.24 → 4684.25 ms (0.93x). This is **above noise
 by the p99 test**: the cached p50 (4684) exceeds the base p99 (4651).
