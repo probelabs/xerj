@@ -232,6 +232,14 @@ QUERIES = {
                                                  "interval":250}}}},
  "agg_nested_terms_stats":{"size":0,"aggs":{"m":{"terms":{"field":"model"},
                             "aggs":{"s":{"stats":{"field":"cost_usd"}}}}}},
+ # --- pathological: served from the TEXT doc-values column ---
+ # ES rejects both (fielddata disabled on text by default). XERJ answers them
+ # from `.dv`, keyed by the WHOLE document body, and they are by three orders of
+ # magnitude the slowest operations in this suite. If the "no doc-values for
+ # text" lever lands, these must turn into ERRORS, not faster queries — an
+ # `error` entry here is the SUCCESS condition, not a regression.
+ "agg_terms_on_text":     {"size":0,"aggs":{"a":{"terms":{"field":"body","size":3}}}},
+ "sort_on_text":          {"size":1,"sort":[{"body":"asc"}]},
 }
 def run(body):
     d = json.dumps(body).encode()

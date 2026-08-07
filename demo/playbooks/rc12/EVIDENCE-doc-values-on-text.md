@@ -81,17 +81,74 @@ artifact of that corpus's keyword fields: it is inherent to how XERJ treats `tex
 
 ---
 
-## What this does and does not establish
+## Experiment 3 — what reads the text `.dv`, and what it returns
 
-**Established:** doc-values are built for analyzed `text` fields; the
-`"doc_values": false` mapping option is accepted and ignored; on a pure-text index
-the resulting column is ~40% of the segment.
+This is the crux the first two experiments could not settle: if something reads the
+column, dropping it trades disk for latency rather than winning outright.
 
-**Not established here:** the net saving on a realistic mixed corpus, and — the
-crux — what currently *reads* `.dv` for a text field. XERJ's read path grew
-doc-values prefilters for `term`/`terms`/`range`/`bool`, and the `size:0` count
-shortcut reads from doc-values too. If any of those fire on `text` fields, naively
-dropping the column moves queries onto a slower path instead of saving anything,
-and the disk win would be paid for in latency. That interaction must be settled
-before this lever is scheduled — it is the difference between a real win and a
-trade.
+Run against the 500k-doc baseline index (`BASELINE.md`), whose `body` is 40 Zipfian
+tokens per document.
+
+```sh
+# terms aggregation on the analyzed text field
+curl -s -X POST localhost:9400/rc12bench/_search -H 'Content-Type: application/json' \
+  -d '{"size":0,"aggs":{"a":{"terms":{"field":"body","size":3}}}}'
+
+# sort on the analyzed text field
+curl -s -X POST localhost:9400/rc12bench/_search -H 'Content-Type: application/json' \
+  -d '{"size":1,"sort":[{"body":"asc"}]}'
+```
+
+**Both succeed**, served from the `.dv` column. Elasticsearch rejects both by
+default (`Fielddata is disabled on text fields by default`) because neither is
+meaningful on analyzed text.
+
+| operation | engine `took` | result |
+|---|---:|---|
+| `terms` agg on `body` | **7,817 ms** | buckets keyed by the **entire 40-token body** as one term |
+| `sort` on `body` | **1,651 ms** | orders by the whole body string |
+
+For scale: **every other query shape in the 17-query baseline suite reports
+`took: 0`.** These two are the slowest operations measured anywhere in this
+campaign, by three orders of magnitude.
+
+A sample bucket key from the aggregation:
+
+```
+"bitmap0000 bitmap0004 commit0000 merge0000 shard0232 decode0000 flush0021
+ merge0706 index0000 stream0011 filter0001 decode0760 ..."
+```
+
+That is one document's whole body as a single aggregation bucket. A terms
+aggregation is supposed to bucket by *term*; this buckets by *document*. With
+500,000 documents the result is up to 500,000 buckets each occurring once, which is
+why `sum_other_doc_count` is 65,533 and the answer carries no information.
+
+---
+
+## What this establishes
+
+The text doc-values column is not a trade. It is a **triple defect**:
+
+1. **Disk.** 37.1% of the index on the 500k mixed corpus, 39.7% on a pure-text
+   index. The largest single artifact in both.
+2. **Semantics.** The two operations it enables return answers that are wrong in
+   kind, not merely imprecise — bucketing by document instead of by term. ES
+   refuses them for exactly this reason.
+3. **Latency.** Those same two operations are the slowest in the engine by a wide
+   margin (7.8 s and 1.65 s against `took: 0` everywhere else).
+
+So the read-path interaction that would have made this a trade does not exist in
+the form feared. Nothing *useful* reads the text `.dv`. Dropping it removes the
+largest artifact, removes two wrong answers, and removes the two slowest
+operations.
+
+**Consequence to decide explicitly:** after the change, `terms`-agg and `sort` on a
+`text` field must **error** the way ES does, rather than silently returning fewer
+results. That is a deliberate, documented behaviour change and it needs an ES-YAML
+conformance check — the suite must stay at 1360 passed / 0 failed / 3 skipped.
+
+**Still to determine:** whether the doc-values *prefilters* (term/terms/range/bool)
+or the `size:0` count shortcut ever bind to a `text` field. Those paths are real and
+fast; if any of them can target `text`, they need a fallback before the column goes
+away.
