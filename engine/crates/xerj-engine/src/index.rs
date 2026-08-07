@@ -13470,6 +13470,73 @@ impl Index {
         // paths, FTS, DocsForScan, and match_all.
         let mut mem_matches_known: Option<u64> = None;
         let mem_doc_count = self.memtable.doc_count();
+
+        // ── #188: INDEX-WIDE BM25 collection statistics ───────────────────
+        //
+        // BM25 only compares two documents when both were scored against the
+        // same `N`, `avgdl` and `doc_freq`.  Historically every arm used its
+        // own: each segment scored against its own `FieldStats`, and the
+        // memtable against the union over its shards only.  Two user-visible
+        // consequences:
+        //
+        //   * overwriting a document PROMOTED it — its live copy moves to the
+        //     memtable, and alone there it scores idf=ln(4/3), dl/avgdl=1,
+        //     i.e. a fixed 0.28768 that beats almost any correctly-normalised
+        //     segment hit, regardless of the document's real length;
+        //   * scores tracked segment TOPOLOGY — the same 365-doc corpus
+        //     flushed into 1 segment vs 16 scored `strong0` at 0.177 vs 0.570.
+        //
+        // Fix: fold one `CollectionStats` over every live arm (all segments
+        // plus the memtable) and hand it to BOTH the memtable scorer and every
+        // segment `FtsSearcher`.  This is Lucene's shape —
+        // `IndexSearcher.fieldStats` sums `docCount`/`sumTotalTermFreq` over
+        // `reader.leaves()` and `TermStates.build` sums `docFreq` over them,
+        // then ONE `SimScorer` scores every leaf — and tantivy's
+        // (`Bm25StatisticsProvider for Searcher` sums over `segment_readers()`,
+        // `Bm25Weight::for_terms` builds one weight from it).  It is also
+        // already this repo's convention on the columnar path:
+        // `leaf_constant_score` sums df + total_docs across every segment.
+        //
+        // SINGLE-ARM GATE.  With at most one live scoring arm the union is the
+        // identity, so we skip it and take the historical path verbatim.  That
+        // is not just an optimisation: for a memtable-only index the union
+        // would also redefine `N` from `doc_count()` (all memtable docs) to
+        // per-field docs-with-field, so the gate is what keeps every
+        // index → refresh → search shape — the ES-YAML suite's dominant one,
+        // and one segment per refresh on a 1-ingest-shard runner — byte-exact.
+        //
+        // `count_only` skips it too: a size:0 count never builds a scorer, and
+        // the pre-pass would be pure cost on the `term_doc_freq` shortcut.
+        //
+        // The stats derive from the SAME `snap` binding as the segment walk —
+        // taking a second snapshot would reintroduce the flush double-count
+        // race documented above and let scores and `hits.total` disagree
+        // mid-flush.
+        //
+        // LAZY.  Several shapes that project to FTS never build a BM25 scorer
+        // at all — the columnar `scored_columnar` / `leaf_constant_score`
+        // routes, the precomputed-agg route, a segment loop the F1 early-break
+        // skips.  Computing behind a `OnceCell` means only a query that
+        // actually scores pays the pre-pass, and it is computed at most once
+        // per search however many arms ask for it.
+        let stats_gate_open =
+            !count_only && snap.segments.len() + usize::from(mem_doc_count > 0) > 1;
+        // `OnceLock`, not `OnceCell`: `search_inner` is an async fn whose
+        // future must stay `Send`, and a `&OnceCell` is not.
+        let stats_cell: std::sync::OnceLock<Option<Arc<xerj_fts::CollectionStats>>> =
+            std::sync::OnceLock::new();
+        let collection_stats = || -> Option<Arc<xerj_fts::CollectionStats>> {
+            if !stats_gate_open {
+                return None;
+            }
+            stats_cell
+                .get_or_init(|| {
+                    self.build_collection_stats(&snap, query, &text_fields, &exact_fields)
+                        .map(Arc::new)
+                })
+                .clone()
+        };
+
         let mem_snapshot = {
             let mem = &*self.memtable;
             if mem_doc_count == 0 {
@@ -13714,11 +13781,17 @@ impl Index {
                     let mut field_boosts: std::collections::HashMap<String, f32> =
                         std::collections::HashMap::new();
                     collect_field_boosts(query, &mut field_boosts);
-                    let (hits, mem_total) = mem.search_text_boosted_with_total(
+                    // #188: score against the INDEX-WIDE statistics when the
+                    // index has more than one live arm, so a document that an
+                    // overwrite just moved into the memtable is normalised
+                    // against the whole corpus rather than against itself.
+                    let mem_stats = collection_stats();
+                    let (hits, mem_total) = mem.search_text_boosted_with_total_using(
                         &text,
                         &field_filter,
                         mem_limit,
                         &field_boosts,
+                        mem_stats.as_deref(),
                     );
                     if !hits.is_empty() {
                         let uncollected = mem_total.saturating_sub(hits.len() as u64);
@@ -14370,7 +14443,13 @@ impl Index {
                     // `timed_out: false`).
                     let searcher =
                         FtsSearcher::new(Arc::clone(&reader), Arc::clone(&self.registry))
-                            .with_deadline(Some(search_deadline));
+                            .with_deadline(Some(search_deadline))
+                            // #188: index-wide BM25 statistics — one union of
+                            // avgdl/N/df over every segment plus the memtable,
+                            // so `_score` stops depending on which segment a
+                            // document happens to sit in.  `None` keeps this
+                            // segment's own stats (single-arm gate).
+                            .with_collection_stats(collection_stats());
                     let fts_query = query_node_to_fts(query, &text_fields, &exact_fields);
 
                     // Count-only fast path for single-term FTS queries:
@@ -18859,6 +18938,122 @@ impl Index {
     /// instead of the IDF-less flat scorer. `None` (→ legacy flat scoring)
     /// when the query isn't such a leaf, the memtable is non-empty, or any
     /// segment lacks a clean column.
+    /// Fold the INDEX-WIDE BM25 collection statistics for one query (#188):
+    /// per-field `FieldStats` and per-(field, term) `doc_freq`, unioned over
+    /// every segment in `snap` PLUS the memtable.
+    ///
+    /// Modelled on `IndexSearcher.fieldStats` (sums `docCount` over
+    /// `reader.leaves()`) + `TermStates.build` (sums `docFreq` over them) —
+    /// Apache-2.0, adapted, not copied:
+    /// `lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java:1144-1159`
+    /// and `.../index/TermStates.java:96-126,158-164`; the Rust shape follows
+    /// tantivy's `Bm25StatisticsProvider for Searcher`
+    /// (`tantivy/src/query/bm25.rs:26-49`, MIT).
+    ///
+    /// `None` when there is nothing to unify — no FTS projection, or a query
+    /// whose field × term cross-product is too wide to be worth a pre-pass.
+    /// The caller then keeps the historical per-arm statistics.
+    ///
+    /// COST.  Per segment this opens a STATS-ONLY reader
+    /// (`FtsIndexReader::open_stats_only`): the FST is mmap'd and `.meta` is
+    /// read, but the postings envelope (whole-file read + zstd decompress) and
+    /// the norms table (O(docs)) are skipped — they are the expensive parts of
+    /// a full open and the statistics never touch them.  The pre-pass also
+    /// cannot defeat the two read-path fast paths it sits near: F1's
+    /// early-break requires `!query_needs_fts`, and the `term_doc_freq`
+    /// count-only shortcut requires `count_only` — the caller gates this
+    /// whole block off for both.
+    fn build_collection_stats(
+        &self,
+        snap: &xerj_storage::index_store::IndexSnapshot,
+        query: &QueryNode,
+        text_fields: &[String],
+        exact_fields: &HashSet<String>,
+    ) -> Option<xerj_fts::CollectionStats> {
+        // Widest (field × term) pre-pass we will pay for.  A field-less
+        // `query_string` over a wide mapping can project hundreds of leaves;
+        // past this point the FST seeks stop being cheap relative to the
+        // search itself, and falling back to per-arm statistics is the
+        // conservative choice (same "decline rather than over-serve"
+        // convention as `MAX_QS_CROSS_PRODUCT`).
+        const MAX_STATS_PROBES: usize = 4096;
+
+        let fq = query_node_to_fts(query, text_fields, exact_fields)?;
+        let mut fields: Vec<String> = Vec::new();
+        collect_fts_query_fields(&fq, &mut fields);
+        if fields.is_empty() {
+            return None;
+        }
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        collect_fts_query_terms(&fq, &mut pairs);
+        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+
+        // The memtable's own contribution, analysed with ITS analyzer over the
+        // raw query text — the same input its FTS arm will score, so the
+        // tokens line up with the ones it actually uses.  Collected FIRST so
+        // any token the segment projection never named (per-field analyzers
+        // can differ) joins `pairs` and gets its segment-side df in the single
+        // pass below, instead of the memtable silently keeping a local df.
+        let mem_stats: Option<xerj_fts::CollectionStats> = if self.memtable.doc_count() > 0 {
+            extract_query_text(query)
+                .and_then(|text| self.memtable.collection_stats(&text, &field_refs))
+        } else {
+            None
+        };
+        if let Some(ms) = mem_stats.as_ref() {
+            for (f, t) in ms.term_keys() {
+                if !pairs.iter().any(|(pf, pt)| pf == f && pt == t) {
+                    pairs.push((f.clone(), t.clone()));
+                }
+            }
+        }
+
+        if (fields.len() + pairs.len()) * snap.segments.len().max(1) > MAX_STATS_PROBES {
+            return None;
+        }
+
+        let mut out = xerj_fts::CollectionStats::new();
+        let segments_dir = self.data_dir.join("segments");
+        for meta in snap.segments.iter() {
+            let Ok(reader) =
+                xerj_fts::FtsIndexReader::open_stats_only(&segments_dir, &meta.id, &field_refs)
+            else {
+                // A segment whose statistics we cannot read would skew the
+                // union low and silently inflate every other arm's IDF.
+                // Fall back to per-arm statistics rather than half a union.
+                return None;
+            };
+            for f in &fields {
+                if let Some(fs) = reader.field_stats(f) {
+                    out.add_field(f, fs);
+                }
+            }
+            for (f, term) in &pairs {
+                if let Some(df) = reader.term_doc_freq(f, term) {
+                    out.add_doc_freq(f, term, df as u64);
+                }
+            }
+        }
+        if let Some(ms) = mem_stats.as_ref() {
+            for (f, fs) in ms.field_iter() {
+                if fields.iter().any(|x| x == f) {
+                    out.add_field(f, fs);
+                }
+            }
+            for (f, term) in &pairs {
+                if let Some(df) = ms.df(f, term) {
+                    out.add_doc_freq(f, term, df);
+                }
+            }
+        }
+
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
     fn leaf_constant_score(
         &self,
         q: &QueryNode,
@@ -31312,6 +31507,56 @@ fn collect_fts_query_fields(q: &FtsQuery, out: &mut Vec<String>) {
             }
         }
         FtsQuery::MatchAll => {}
+    }
+}
+
+/// The EXACT `(field, term)` pairs whose BM25 `doc_freq` this projected query
+/// will feed to a scorer (#188).
+///
+/// Only the leaves that carry a literal, analysed term are collected — the
+/// multi-term expansions (prefix / wildcard / fuzzy / phrase-prefix) resolve
+/// their terms per segment from that segment's own dictionary, so there is no
+/// query-time term set to gather an index-wide df for.  Those leaves keep
+/// their local df; the index-wide `avgdl`/`N` from the same `CollectionStats`
+/// still applies to them via `make_scorer`, which is the dominant term.
+fn collect_fts_query_terms(q: &FtsQuery, out: &mut Vec<(String, String)>) {
+    let push = |field: &str, term: &str, out: &mut Vec<(String, String)>| {
+        let pair = (field.to_owned(), term.to_owned());
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    };
+    match q {
+        FtsQuery::Term(t) => push(&t.field, &t.term, out),
+        FtsQuery::Phrase(p) => {
+            for term in &p.terms {
+                push(&p.field, term, out);
+            }
+        }
+        FtsQuery::PhrasePrefix(p) => {
+            // Every term but the last is a literal; the last is a prefix
+            // expanded per segment.
+            let n = p.terms.len();
+            for term in p.terms.iter().take(n.saturating_sub(1)) {
+                push(&p.field, term, out);
+            }
+        }
+        FtsQuery::Prefix(_) | FtsQuery::Wildcard(_) | FtsQuery::Fuzzy(_) | FtsQuery::MatchAll => {}
+        FtsQuery::Bool(b) => {
+            for sub in b
+                .must
+                .iter()
+                .chain(b.should.iter())
+                .chain(b.must_not.iter())
+            {
+                collect_fts_query_terms(sub, out);
+            }
+        }
+        FtsQuery::DisMax(d) => {
+            for sub in &d.queries {
+                collect_fts_query_terms(sub, out);
+            }
+        }
     }
 }
 

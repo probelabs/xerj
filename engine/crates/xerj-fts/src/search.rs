@@ -16,7 +16,7 @@
 
 use crate::{
     analyzer::AnalyzerRegistry,
-    bm25::{Bm25Scorer, QueryExplanation, ScoreBreakdown},
+    bm25::{Bm25Scorer, CollectionStats, QueryExplanation, ScoreBreakdown},
     index::FtsIndexReader,
     postings::PostingsReader,
 };
@@ -438,6 +438,14 @@ pub struct FtsSearcher {
     /// searcher are partial. Atomic (not `Cell`) so the searcher stays
     /// `Sync`.
     deadline_tripped: std::sync::atomic::AtomicBool,
+    /// Index-wide BM25 statistics (#188). When set, every scorer this
+    /// searcher builds uses the union `avgdl`/`N` over ALL segments plus the
+    /// memtable, and every scoring `doc_freq` is the union df — so a
+    /// document's score no longer depends on which segment it landed in.
+    /// `None` keeps the historical per-segment statistics, which the engine
+    /// uses when the index has at most one live scoring arm (where the union
+    /// is the identity).
+    collection: Option<Arc<CollectionStats>>,
 }
 
 impl FtsSearcher {
@@ -447,12 +455,20 @@ impl FtsSearcher {
             registry,
             deadline: None,
             deadline_tripped: std::sync::atomic::AtomicBool::new(false),
+            collection: None,
         }
     }
 
     /// Builder: arm the cooperative deadline. `None` disables (default).
     pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    /// Builder: score against index-wide collection statistics instead of
+    /// this segment's own (#188). `None` (default) keeps per-segment stats.
+    pub fn with_collection_stats(mut self, stats: Option<Arc<CollectionStats>>) -> Self {
+        self.collection = stats;
         self
     }
 
@@ -600,6 +616,11 @@ impl FtsSearcher {
         };
 
         let scorer = self.make_scorer(&tq.field);
+        // IDF df: index-wide when the engine supplied collection stats (#188).
+        // `tp.doc_frequency` below stays LOCAL — it is the postings-decode
+        // length for this segment's list, a different quantity that happens to
+        // share a name.
+        let score_df = self.scoring_df(&tq.field, &tq.term, tp.doc_frequency as u64);
         let post_data = match self.reader.postings_data(&tq.field, &tp) {
             Some(d) => d,
             None => return Ok(()),
@@ -616,18 +637,12 @@ impl FtsSearcher {
                 .unwrap_or(1) as u32;
 
             let (score, explanation) = if explain {
-                let bd = scorer.score_term_explain(
-                    &tq.term,
-                    tp.doc_frequency as u64,
-                    posting.term_freq,
-                    doc_len,
-                );
+                let bd = scorer.score_term_explain(&tq.term, score_df, posting.term_freq, doc_len);
                 let s = bd.score * tq.boost;
                 let boosted_bd = ScoreBreakdown { score: s, ..bd };
                 (s, Some(QueryExplanation::new(vec![boosted_bd])))
             } else {
-                let s = scorer.score_term(tp.doc_frequency as u64, posting.term_freq, doc_len)
-                    * tq.boost;
+                let s = scorer.score_term(score_df, posting.term_freq, doc_len) * tq.boost;
                 (s, None)
             };
 
@@ -696,6 +711,14 @@ impl FtsSearcher {
             .unwrap_or(0);
 
         let scorer = self.make_scorer(&pq.field);
+        // Per-term IDF df, index-wide when available (#188).  `term_maps[i].1`
+        // remains the segment-local postings length used to size the decode.
+        let score_dfs: Vec<u64> = pq
+            .terms
+            .iter()
+            .enumerate()
+            .map(|(i, term)| self.scoring_df(&pq.field, term, term_maps[i].1 as u64))
+            .collect();
         let mut hits = Vec::new();
 
         'doc: for &doc_id in term_maps[min_idx].0.keys() {
@@ -717,14 +740,15 @@ impl FtsSearcher {
             let mut total_score = 0.0f32;
             let mut breakdowns = Vec::new();
             for (term_idx, term) in pq.terms.iter().enumerate() {
-                let (map, df) = &term_maps[term_idx];
+                let (map, _local_df) = &term_maps[term_idx];
+                let df = score_dfs[term_idx];
                 let tf = map.get(&doc_id).map(|(f, _)| *f).unwrap_or(1);
                 if explain {
-                    let bd = scorer.score_term_explain(term, *df as u64, tf, doc_len);
+                    let bd = scorer.score_term_explain(term, df, tf, doc_len);
                     total_score += bd.score;
                     breakdowns.push(bd);
                 } else {
-                    total_score += scorer.score_term(*df as u64, tf, doc_len);
+                    total_score += scorer.score_term(df, tf, doc_len);
                 }
             }
             total_score *= pq.boost;
@@ -1211,11 +1235,32 @@ impl FtsSearcher {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// The scorer for `field`: index-wide statistics when the engine supplied
+    /// them (#188), else this segment's own — the historical behaviour, kept
+    /// as the fallback for direct `xerj-fts` users and for fields the union
+    /// never saw.
     fn make_scorer(&self, field: &str) -> Bm25Scorer {
+        if let Some(scorer) = self.collection.as_ref().and_then(|c| c.scorer(field)) {
+            return scorer;
+        }
         self.reader
             .field_stats(field)
             .map(|stats| stats.to_scorer())
             .unwrap_or_else(|| Bm25Scorer::new(1.0, 1))
+    }
+
+    /// The `doc_freq` to FEED THE SCORER for `(field, term)`.
+    ///
+    /// NOT interchangeable with the segment-local `TermPostings::doc_frequency`
+    /// used to size a `PostingsReader` — that one is the number of postings to
+    /// decode from THIS segment's list and must stay local.  Only the IDF
+    /// argument becomes index-wide.
+    #[inline]
+    fn scoring_df(&self, field: &str, term: &str, local: u64) -> u64 {
+        self.collection
+            .as_ref()
+            .and_then(|c| c.df(field, term))
+            .unwrap_or(local)
     }
 }
 

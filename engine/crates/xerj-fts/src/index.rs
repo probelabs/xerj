@@ -930,6 +930,13 @@ pub struct FtsIndexReader {
     segment_id: String,
     /// Loaded per-field data
     fields: HashMap<String, LoadedField>,
+    /// Set by [`FtsIndexReader::open_stats_only`]: the postings envelope and
+    /// the norms table were NOT loaded, so this reader can answer
+    /// `field_stats` / `term_doc_freq` (FST + `.meta` only) and nothing else.
+    /// `postings_data` and `field_length` fail closed (`None`) rather than
+    /// silently returning empty payloads — a stats-only reader handed to the
+    /// searcher must produce zero hits, never wrong ones.
+    stats_only: bool,
 }
 
 /// Backing storage for a field's postings bytes.
@@ -991,6 +998,40 @@ impl FtsIndexReader {
         segment_id: impl Into<String>,
         field_names: &[&str],
     ) -> Result<Self> {
+        Self::open_inner(segment_dir, segment_id, field_names, false)
+    }
+
+    /// Open ONLY what BM25 collection statistics need: the FST term
+    /// dictionary (mmap'd) and the small `.meta` side-car.
+    ///
+    /// Skips the two expensive parts of a full [`Self::open`]:
+    ///
+    ///  * the postings envelope — a whole-file `fs::read` plus a zstd
+    ///    decompress of every posting list in the field, O(index bytes);
+    ///  * the norms table — a whole-file `fs::read` plus decode, O(docs).
+    ///
+    /// That makes the per-segment `field_stats` + `term_doc_freq` pre-pass
+    /// the index-wide scorer needs (#188) cost one mmap and one small read
+    /// per field, instead of re-paying the full open a second time.
+    ///
+    /// The returned reader can answer [`Self::field_stats`],
+    /// [`Self::term_doc_freq`] and [`Self::lookup_term`]; [`Self::postings_data`]
+    /// and [`Self::field_length`] return `None` on it by construction, so
+    /// handing one to a searcher yields zero hits rather than wrong ones.
+    pub fn open_stats_only(
+        segment_dir: impl AsRef<Path>,
+        segment_id: impl Into<String>,
+        field_names: &[&str],
+    ) -> Result<Self> {
+        Self::open_inner(segment_dir, segment_id, field_names, true)
+    }
+
+    fn open_inner(
+        segment_dir: impl AsRef<Path>,
+        segment_id: impl Into<String>,
+        field_names: &[&str],
+        stats_only: bool,
+    ) -> Result<Self> {
         let segment_dir = segment_dir.as_ref().to_path_buf();
         let segment_id = segment_id.into();
         let mut fields = HashMap::new();
@@ -1035,8 +1076,15 @@ impl FtsIndexReader {
             //
             // The query path references `post_data` by slice in all
             // three cases, so there's no per-query decompress cost.
-            let raw_post = fs::read(&post_path)
-                .with_context(|| format!("reading postings {:?}", post_path))?;
+            //
+            // STATS-ONLY: skip the read + decompress entirely — the caller
+            // only wants `field_stats`/`term_doc_freq`, both of which live
+            // in `.meta`/`.fst`.
+            let raw_post = if stats_only {
+                Vec::new()
+            } else {
+                fs::read(&post_path).with_context(|| format!("reading postings {:?}", post_path))?
+            };
             let post_data = if raw_post.len() >= 8 && &raw_post[..4] == POST_MAGIC_ZSTD {
                 let mut len_buf = [0u8; 4];
                 len_buf.copy_from_slice(&raw_post[4..8]);
@@ -1111,7 +1159,13 @@ impl FtsIndexReader {
                 }
             };
 
-            let norms = Self::load_norms(&norms_path)?;
+            // STATS-ONLY: the norms table is a whole-file read + decode that
+            // is O(docs); the statistics pre-pass never asks for a doc length.
+            let norms = if stats_only {
+                Vec::new()
+            } else {
+                Self::load_norms(&norms_path)?
+            };
 
             fields.insert(
                 field_name.to_owned(),
@@ -1128,6 +1182,7 @@ impl FtsIndexReader {
             segment_dir,
             segment_id,
             fields,
+            stats_only,
         })
     }
 
@@ -1243,7 +1298,14 @@ impl FtsIndexReader {
     }
 
     /// Get the raw postings bytes for a term (to hand to `PostingsReader`).
+    ///
+    /// Always `None` on a [`Self::open_stats_only`] reader — it never read the
+    /// postings envelope, so a caller that got this far would otherwise decode
+    /// an empty buffer and silently see zero postings.
     pub fn postings_data<'a>(&'a self, field: &str, tp: &TermPostings) -> Option<&'a [u8]> {
+        if self.stats_only {
+            return None;
+        }
         let loaded = self.fields.get(field)?;
         let start = tp.postings_offset as usize;
         let end = start + tp.postings_length as usize;
@@ -1284,7 +1346,9 @@ impl FtsIndexReader {
     }
 
     /// Look up the field length (norm) for a specific document.
-    /// Returns `None` if the document has no data for this field.
+    /// Returns `None` if the document has no data for this field — which is
+    /// every document on a [`Self::open_stats_only`] reader, whose norms
+    /// table was deliberately not loaded.
     pub fn field_length(&self, field: &str, doc_id: u32) -> Option<u16> {
         let loaded = self.fields.get(field)?;
         // Binary search by doc_id

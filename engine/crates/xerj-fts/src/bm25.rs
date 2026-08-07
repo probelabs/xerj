@@ -230,6 +230,141 @@ impl FieldStats {
     }
 }
 
+/// `FieldStats` is additive: the union of two arms' statistics is the sum of
+/// their doc counts and their total field lengths.  This is what makes an
+/// index-wide [`CollectionStats`] a plain fold over the segments plus the
+/// memtable (Lucene does the same fold in `IndexSearcher.fieldStats`, summing
+/// `docCount`/`sumTotalTermFreq` over `reader.leaves()`).
+impl std::ops::AddAssign<&FieldStats> for FieldStats {
+    fn add_assign(&mut self, rhs: &FieldStats) {
+        self.total_docs += rhs.total_docs;
+        self.total_field_length += rhs.total_field_length;
+    }
+}
+
+// ── Collection stats (index-wide: every segment + the memtable) ──────────────
+
+/// Index-wide BM25 collection statistics — the union over every live scoring
+/// arm (all segments **and** the memtable), for exactly the (field, term)
+/// pairs one query needs.
+///
+/// ## Why this exists (#188)
+///
+/// BM25 is only comparable between two documents when both were scored
+/// against the *same* `N`, `avgdl` and `doc_freq`.  Before this type each arm
+/// scored against its own local statistics: every segment used its own
+/// `FieldStats`, and the memtable used the union over its shards.  Two
+/// consequences, both user-visible:
+///
+///  * **Overwriting a document promoted it.**  An overwrite moves the live
+///    copy into the memtable; if it is the only doc there, `N = 1`,
+///    `df = 1` and `dl/avgdl = 1`, so `idf = ln(4/3) = 0.2877` and
+///    `tf_norm = 1.0` — a fixed 0.2877 that outranks almost any correctly
+///    scored segment hit, regardless of the document's real length or the
+///    corpus.
+///  * **Scores depended on segment topology.**  The same corpus flushed into
+///    1 segment vs 16 gave the same document scores differing by >3×,
+///    because `avgdl`/`N` were per-segment.
+///
+/// Feeding one `CollectionStats` to every arm makes the score a function of
+/// the index, not of where a document happens to be sitting.
+///
+/// ## Semantics
+///
+/// Statistics are **physical / ghost-inclusive** — tombstoned and superseded
+/// versions still count until a merge purges them.  That matches Lucene (which
+/// counts deleted docs in `docFreq`/`docCount` until they are merged away) and
+/// the memtable's existing delete-aware aggregation.
+///
+/// `N` is the per-field *docs-with-field* count, not the index doc count —
+/// the same pairing Lucene's `BM25Similarity.idfExplain` uses
+/// (`fieldStats.docCount()` with `termStats.docFreq()`).
+#[derive(Debug, Clone, Default)]
+pub struct CollectionStats {
+    /// Per-field union over every live arm.
+    fields: std::collections::HashMap<String, FieldStats>,
+    /// Index-wide doc_freq for exactly the (field, term) pairs the query needs.
+    doc_freq: std::collections::HashMap<(String, String), u64>,
+}
+
+impl CollectionStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one arm's `FieldStats` for `field` into the union.
+    pub fn add_field(&mut self, field: &str, stats: &FieldStats) {
+        if stats.total_docs == 0 && stats.total_field_length == 0 {
+            return;
+        }
+        match self.fields.get_mut(field) {
+            Some(acc) => *acc += stats,
+            None => {
+                self.fields.insert(field.to_owned(), stats.clone());
+            }
+        }
+    }
+
+    /// Fold one arm's doc_freq for `(field, term)` into the union.
+    pub fn add_doc_freq(&mut self, field: &str, term: &str, df: u64) {
+        if df == 0 {
+            return;
+        }
+        *self
+            .doc_freq
+            .entry((field.to_owned(), term.to_owned()))
+            .or_insert(0) += df;
+    }
+
+    /// The union `FieldStats` for `field`, if any arm indexed it.
+    pub fn field(&self, field: &str) -> Option<&FieldStats> {
+        self.fields.get(field)
+    }
+
+    /// A scorer seeded with the index-wide `avgdl` + `N` for `field`.
+    ///
+    /// `None` when no arm reported the field — callers must then fall back to
+    /// their local statistics rather than score against `N = 0` (which would
+    /// clamp every IDF to zero).
+    pub fn scorer(&self, field: &str) -> Option<Bm25Scorer> {
+        self.fields
+            .get(field)
+            .filter(|s| s.total_docs > 0)
+            .map(|s| s.to_scorer())
+    }
+
+    /// Index-wide doc_freq for `(field, term)`; `None` when the pair was not
+    /// collected (caller falls back to its local df).
+    pub fn df(&self, field: &str, term: &str) -> Option<u64> {
+        // Borrowing a `(String, String)` key without allocating needs the
+        // `Borrow` trick, which tuples don't support — this map is only ever
+        // probed a handful of times per query (once per field × query term),
+        // so the two short allocations are not worth a custom key type.
+        self.doc_freq
+            .get(&(field.to_owned(), term.to_owned()))
+            .copied()
+    }
+
+    /// True when no arm contributed anything — the caller should use its
+    /// local statistics unchanged.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty() && self.doc_freq.is_empty()
+    }
+
+    /// Per-field union view (used by the memtable arm, which needs `N` and
+    /// `avgdl` separately from a `Bm25Scorer`).
+    pub fn field_iter(&self) -> impl Iterator<Item = (&String, &FieldStats)> {
+        self.fields.iter()
+    }
+
+    /// The `(field, term)` pairs this instance carries a df for — lets a
+    /// caller that folded one arm's stats discover which terms that arm
+    /// analysed, so the same set can be collected from the others.
+    pub fn term_keys(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.doc_freq.keys().map(|(f, t)| (f, t))
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -309,5 +444,141 @@ mod tests {
             total_field_length: 20,
         };
         assert_eq!(stats.avg_field_length(), 5.0);
+    }
+
+    // ── #188: index-wide collection statistics ───────────────────────────
+
+    #[test]
+    fn field_stats_add_assign_is_the_union() {
+        let mut a = FieldStats {
+            total_docs: 2,
+            total_field_length: 20,
+        };
+        let b = FieldStats {
+            total_docs: 3,
+            total_field_length: 60,
+        };
+        a += &b;
+        assert_eq!(a.total_docs, 5);
+        assert_eq!(a.total_field_length, 80);
+        assert_eq!(a.avg_field_length(), 16.0);
+    }
+
+    #[test]
+    fn collection_stats_folds_arms_and_answers_per_field() {
+        let mut cs = CollectionStats::new();
+        // Two "segments" and a "memtable", the shape the engine folds.
+        cs.add_field(
+            "body",
+            &FieldStats {
+                total_docs: 300,
+                total_field_length: 300_000,
+            },
+        );
+        cs.add_field(
+            "body",
+            &FieldStats {
+                total_docs: 65,
+                total_field_length: 1_300,
+            },
+        );
+        cs.add_field(
+            "body",
+            &FieldStats {
+                total_docs: 1,
+                total_field_length: 87,
+            },
+        );
+        cs.add_doc_freq("body", "quicklist", 300);
+        cs.add_doc_freq("body", "quicklist", 65);
+        cs.add_doc_freq("body", "quicklist", 1);
+
+        let fs = cs.field("body").expect("body present");
+        assert_eq!(fs.total_docs, 366);
+        assert_eq!(fs.total_field_length, 301_387);
+        assert_eq!(cs.df("body", "quicklist"), Some(366));
+        // Unknown field / term fall back to the caller's local stats.
+        assert!(cs.scorer("title").is_none());
+        assert_eq!(cs.df("body", "absent"), None);
+
+        let scorer = cs.scorer("body").expect("scorer");
+        assert_eq!(scorer.total_docs, 366);
+        assert!((scorer.avg_dl - 301_387.0 / 366.0).abs() < 0.01);
+    }
+
+    /// The single-arm identity: folding exactly ONE arm must produce a scorer
+    /// bit-identical to that arm's own `FieldStats::to_scorer()`.  This is the
+    /// property the engine's single-arm gate relies on being true.
+    #[test]
+    fn collection_stats_of_one_arm_is_that_arm() {
+        let only = FieldStats {
+            total_docs: 365,
+            total_field_length: 416_960,
+        };
+        let mut cs = CollectionStats::new();
+        cs.add_field("body", &only);
+        let a = cs.scorer("body").unwrap();
+        let b = only.to_scorer();
+        assert_eq!(a.total_docs, b.total_docs);
+        assert_eq!(a.avg_dl.to_bits(), b.avg_dl.to_bits());
+        assert_eq!(a.k1.to_bits(), b.k1.to_bits());
+        assert_eq!(a.b.to_bits(), b.b.to_bits());
+    }
+
+    /// An arm that reported the field but has zero documents must not produce
+    /// a scorer: `N = 0` drives `idf` negative and the `.max(0.0)` clamp would
+    /// silently zero every score.
+    #[test]
+    fn collection_stats_declines_an_empty_field() {
+        let mut cs = CollectionStats::new();
+        cs.add_field(
+            "body",
+            &FieldStats {
+                total_docs: 0,
+                total_field_length: 0,
+            },
+        );
+        assert!(cs.scorer("body").is_none());
+        assert!(cs.is_empty());
+    }
+
+    /// The concrete #188 arithmetic: the memtable-alone statistics that made
+    /// an overwritten document jump to first place, versus the index-wide
+    /// statistics that put it back where it belongs.
+    #[test]
+    fn index_wide_stats_demote_the_lone_memtable_document() {
+        // weak001: one occurrence of the term in an 87-token field.
+        let (tf, dl) = (1u32, 87u32);
+
+        // BEFORE — memtable alone: N = 1, df = 1, avgdl = 87.
+        let lone = FieldStats {
+            total_docs: 1,
+            total_field_length: 87,
+        };
+        let before = lone.to_scorer().score_term(1, tf, dl);
+        assert!(
+            (before - 0.28768212).abs() < 1e-6,
+            "the reported failure value should reproduce exactly, got {before}"
+        );
+
+        // AFTER — index-wide: 366 physical docs, df = 366, Σ len = 417 047.
+        let union = FieldStats {
+            total_docs: 366,
+            total_field_length: 417_047,
+        };
+        let scorer = union.to_scorer();
+        let weak = scorer.score_term(366, tf, dl);
+        // strong0: 10 occurrences in a 10-token field.
+        let strong = scorer.score_term(366, 10, 10);
+        assert!(
+            strong > weak,
+            "the short, term-dense document must outrank the long, buried one \
+             (strong={strong}, weak={weak})"
+        );
+        assert!(
+            before > strong,
+            "sanity: it is precisely because the lone-memtable score ({before}) beat the \
+             correctly-scored top hit ({strong}) that an overwrite promoted the document"
+        );
     }
 }
