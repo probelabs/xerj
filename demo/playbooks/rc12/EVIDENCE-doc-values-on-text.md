@@ -99,9 +99,25 @@ curl -s -X POST localhost:9400/rc12bench/_search -H 'Content-Type: application/j
   -d '{"size":1,"sort":[{"body":"asc"}]}'
 ```
 
-**Both succeed**, served from the `.dv` column. Elasticsearch rejects both by
-default (`Fielddata is disabled on text fields by default`) because neither is
-meaningful on analyzed text.
+**Both succeed**, served from the `.dv` column. Elasticsearch rejects both **by
+default** (`Fielddata is disabled on text fields by default`).
+
+> **Correction (important).** An earlier draft of this file said the whole-value
+> bucketing below is "semantically wrong" and that ES refuses it outright. That is
+> true only of *default* ES and of classic Lucene. Modern Elasticsearch supports
+> text doc-values behind the cluster feature `mapper.text.doc_values`, by attaching
+> a separate `SORTED_SET` doc-values field — and **XERJ's own conformance suite
+> already encodes that behaviour**:
+> `tests/es-compat-yaml/yaml/aggregations/terms_text_docvalues.yml` maps
+> `{type: text, index: false, doc_values: true}` and asserts whole-value buckets
+> (`"foo bar": 2`, `"baz qux": 1`).
+>
+> So whole-value bucketing is the *correct* answer when a user explicitly asks for
+> `doc_values: true` on a text field. The defect is not the shape of the answer —
+> it is that XERJ builds the column **unconditionally**, for every text field,
+> whether or not anyone asked. That reframes the lever from "never build
+> doc-values for text" to **"default off, and honour the flag"**, which is both the
+> real ES behaviour and the only version that keeps the 1360/0/3 gate green.
 
 | operation | engine `took` | result |
 |---|---:|---|
@@ -128,25 +144,43 @@ why `sum_other_doc_count` is 65,533 and the answer carries no information.
 
 ## What this establishes
 
-The text doc-values column is not a trade. It is a **triple defect**:
+The text doc-values column is built **unconditionally**, and that costs on two axes:
 
 1. **Disk.** 37.1% of the index on the 500k mixed corpus, 39.7% on a pure-text
    index. The largest single artifact in both.
-2. **Semantics.** The two operations it enables return answers that are wrong in
-   kind, not merely imprecise — bucketing by document instead of by term. ES
-   refuses them for exactly this reason.
-3. **Latency.** Those same two operations are the slowest in the engine by a wide
-   margin (7.8 s and 1.65 s against `took: 0` everywhere else).
+2. **Latency.** The two operations it enables are the slowest in the engine by a
+   wide margin (7.8 s and 1.65 s against `took: 0` everywhere else) — and today
+   every index pays the disk cost for them whether or not anyone ever runs one.
 
-So the read-path interaction that would have made this a trade does not exist in
-the form feared. Nothing *useful* reads the text `.dv`. Dropping it removes the
-largest artifact, removes two wrong answers, and removes the two slowest
-operations.
+Nothing reads this column unless a user explicitly aggregates or sorts on a text
+field, which is rare and which ES requires you to opt into.
 
-**Consequence to decide explicitly:** after the change, `terms`-agg and `sort` on a
-`text` field must **error** the way ES does, rather than silently returning fewer
-results. That is a deliberate, documented behaviour change and it needs an ES-YAML
-conformance check — the suite must stay at 1360 passed / 0 failed / 3 skipped.
+### The design this implies — and the trap in the RFC
+
+Discussion #148 says "ES/Lucene never builds doc_values for `text`; honouring
+`doc_values: false` drops the 22.9 MB `.dv` entirely." Implemented literally that
+**fails the conformance gate**, because of the `terms_text_docvalues.yml` cases
+above. The correct shape is:
+
+- **default off** for `text` (matching ES's default), and
+- **honour an explicit `doc_values: true`**, which still builds the column and
+  still returns whole-value buckets.
+
+### The detail that decides whether this lever is worth anything
+
+Measured across live corpora by parsing the `DV01` envelope and joining to each
+index's `_mapping`:
+
+| corpus | `semantic_text` | `text` | keyword | numeric |
+|---|---:|---:|---:|---:|
+| `xc-lucene*` (81 indices, 23.8 MiB `.dv`) | 86.1% | 4.7% | 8.2% | 1.0% |
+| `xc-dataplane-cilium-vendor*` (83 indices, 61.0 MiB `.dv`) | 91.9% | 5.2% | — | — |
+
+**`semantic_text`, not `text`, is where the bytes are.** Both map to
+`FieldType::Text` (`es_compat.rs:13678`), so one schema-level check captures
+90.8–97.1%. A policy keyed on the literal string `"text"` would capture under 5%
+and be nearly worthless. The RFC does not mention this distinction at all, and it
+is the single most important implementation detail in the lever.
 
 **Still to determine:** whether the doc-values *prefilters* (term/terms/range/bool)
 or the `size:0` count shortcut ever bind to a `text` field. Those paths are real and

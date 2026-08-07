@@ -34,8 +34,15 @@ echo "    data:   $DATA"
 
 # ── fresh instance ───────────────────────────────────────────────────────────
 # There is no --port flag; the listen ports come from a TOML config.
-pkill -f "[x]erj -c $DATA/xerj.toml" 2>/dev/null || true
-sleep 1
+# Free the PORT, not just this label's data dir: a previous run under a
+# DIFFERENT label still owns the socket, and killing only our own config path
+# leaves it up. The new server then fails to bind and exits, while every
+# subsequent request silently hits the OLD instance — which surfaces as a
+# baffling 409 on index creation rather than as a bind error.
+for pid in $(lsof -ti tcp:"$PORT" 2>/dev/null); do
+  kill "$pid" 2>/dev/null || true
+done
+sleep 2
 rm -rf "$DATA"; mkdir -p "$DATA"
 cat > "$DATA/xerj.toml" <<EOF
 [server]
@@ -44,7 +51,15 @@ es_compat_port = $PORT
 rest_port      = $((PORT + 1))
 grpc_port      = $((PORT + 2))
 EOF
-nohup "$BIN" -c "$DATA/xerj.toml" --data-dir "$DATA" --insecure \
+# XERJ_DISABLE_QUERY_CACHE=1 is MANDATORY, not optional. Without it the
+# whole-result cache clones the answer for a repeated identical query body, and
+# since this harness fires 40 identical repeats per shape, every number becomes
+# the cache's latency instead of the engine's. A first run of this harness
+# without it reported `took: 0` for all 17 shapes and nearly led to the
+# conclusion that no query work was measurable at all. See
+# demo/playbooks/CRITICAL_FINDING_read_perf_cache_mirage.md.
+nohup env XERJ_DISABLE_QUERY_CACHE=1 \
+  "$BIN" -c "$DATA/xerj.toml" --data-dir "$DATA" --insecure \
   > "$DATA/server.log" 2>&1 &
 disown
 
@@ -232,6 +247,22 @@ QUERIES = {
                                                  "interval":250}}}},
  "agg_nested_terms_stats":{"size":0,"aggs":{"m":{"terms":{"field":"model"},
                             "aggs":{"s":{"stats":{"field":"cost_usd"}}}}}},
+ # --- the two read families READ_SCORECARD_2026-07-09.md leaves UNFIXED ---
+ # Both still brute-scan and score every document: boosting ~163ms,
+ # function_score ~157ms on 100k docs = 64.5% of that scorecard's total read
+ # time. These are the largest remaining query-latency levers in the engine.
+ "boosting":              {"query":{"boosting":{
+                             "positive":{"match":{"body":"index0000"}},
+                             "negative":{"match":{"body":"merge0000"}},
+                             "negative_boost":0.2}}},
+ "function_score":        {"query":{"function_score":{
+                             "query":{"match":{"body":"index0000"}},
+                             "functions":[{"filter":{"term":{"status":"ok"}},"weight":2}]}}},
+ # phrase families improved 5-6x in that sweep but remain super-linear (~40ms)
+ "match_phrase_prefix":   {"query":{"match_phrase_prefix":{"body":"index0000 segment"}}},
+ "fuzzy_text":            {"query":{"fuzzy":{"body":{"value":"index0001","fuzziness":1}}}},
+ "wildcard_text":         {"query":{"wildcard":{"body":"index00*"}}},
+ "prefix_text":           {"query":{"prefix":{"body":"index00"}}},
  # --- pathological: served from the TEXT doc-values column ---
  # ES rejects both (fielddata disabled on text by default). XERJ answers them
  # from `.dv`, keyed by the WHOLE document body, and they are by three orders of

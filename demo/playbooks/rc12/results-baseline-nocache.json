@@ -1,0 +1,24 @@
+{
+  "label": "baseline-nocache",
+  "docs": 500000,
+  "raw_source_bytes": 356593195,
+  "index_total_bytes": 154413167,
+  "index_over_raw": 0.433,
+  "ingest_seconds": 31.86,
+  "forcemerge_seconds": 139.13,
+  "by_artifact": {
+    "dv": 57357593,
+    "seg": 51449817,
+    "post": 40951589,
+    "ids": 3057388,
+    "meta": 1464327,
+    "fst": 64485,
+    "json": 35337,
+    "norms": 28305,
+    "wal": 4119,
+    "toml": 104,
+    "xerj_master_key": 64,
+    "sidx": 32,
+    "lock": 7
+  }
+}
