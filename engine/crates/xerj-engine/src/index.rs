@@ -36517,11 +36517,12 @@ mod flush_memory_integration_tests {
             .unwrap();
 
         let shard = idx.memtable.shard_for_dynamic(&doc_id);
-        let (field_configs, excluded_fts_fields) = {
+        let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = idx.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
                 crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                doc_values_skip_set(&schema.schema),
             )
         };
         let mut warm_caches = idx.publish_warm_caches();
