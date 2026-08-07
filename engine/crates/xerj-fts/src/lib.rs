@@ -70,7 +70,10 @@ pub use analyzer::{
     WhitespaceTokenizer,
 };
 
-pub use bm25::{Bm25Scorer, FieldStats, QueryExplanation, ScoreBreakdown, DEFAULT_B, DEFAULT_K1};
+pub use bm25::{
+    Bm25Scorer, CollectionStats, FieldStats, QueryExplanation, ScoreBreakdown, DEFAULT_B,
+    DEFAULT_K1,
+};
 
 pub use index::{FieldIndexConfig, FtsIndexReader, FtsIndexWriter};
 

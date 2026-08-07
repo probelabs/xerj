@@ -161,11 +161,23 @@ async fn highlight_block_does_not_change_multi_match_ranking() {
     // top-3 is unambiguous (a tie straddling the page boundary is a different
     // question — which of several equal-scoring docs to keep — and not what
     // this test is about).
+    //
+    // The tf must decrease in BOTH fields, not just `body`.  `multi_match`
+    // defaults to `best_fields`, i.e. the MAX over the per-field scores, and
+    // since #188 made BM25 statistics index-wide the winning field here is
+    // `title`: every one of the 44 documents has "listpack" in its body, so
+    // the body IDF collapses to ln(1 + 0.5/44.5) = 0.0112, while only the 4
+    // strong docs have it in the title (IDF = ln(10) = 2.303).  A constant
+    // `"title": "listpack"` therefore gave all four strong docs the SAME
+    // 2.859662 and put a 4-way tie across the size:3 page boundary.  (Before
+    // #188 the strong docs were alone in their own segment, where both fields
+    // had df == N == 4 and the longer body won the max — which is exactly the
+    // per-segment-statistics artefact #188 removed.)
     for i in 0..4 {
         let body = "listpack ".repeat(8 - i) + &"filler ".repeat(i * 6);
         idx.index_document(
             Some(format!("strong{i}")),
-            json!({"title": "listpack", "body": body}),
+            json!({"title": "listpack ".repeat(4 - i), "body": body}),
         )
         .await
         .unwrap();

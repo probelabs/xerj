@@ -1021,7 +1021,7 @@ impl ShardedFtsMemtable {
         limit: usize,
         field_boosts: &std::collections::HashMap<String, f32>,
     ) -> Vec<MemtableHit> {
-        self.search_text_boosted_inner(query, fields, limit, limit, field_boosts)
+        self.search_text_boosted_inner(query, fields, limit, limit, field_boosts, None)
             .0
     }
 
@@ -1041,7 +1041,134 @@ impl ShardedFtsMemtable {
         limit: usize,
         field_boosts: &std::collections::HashMap<String, f32>,
     ) -> (Vec<MemtableHit>, u64) {
-        self.search_text_boosted_inner(query, fields, limit, usize::MAX, field_boosts)
+        self.search_text_boosted_inner(query, fields, limit, usize::MAX, field_boosts, None)
+    }
+
+    /// `search_text_boosted_with_total` scored against INDEX-WIDE BM25
+    /// statistics (#188).
+    ///
+    /// `stats` is the union over every live arm (all segments + this
+    /// memtable), computed once per search by the engine.  Without it the
+    /// memtable's "global" statistics are global only across its own shards —
+    /// so a document whose live copy has just been moved here by an overwrite
+    /// scores against `N = 1`, `df = 1`, `dl/avgdl = 1`, and outranks every
+    /// correctly-normalised segment hit.
+    ///
+    /// `None` reproduces `search_text_boosted_with_total` bit-for-bit; the
+    /// engine passes `None` when the index has at most one live scoring arm.
+    pub fn search_text_boosted_with_total_using(
+        &self,
+        query: &str,
+        fields: &[&str],
+        limit: usize,
+        field_boosts: &std::collections::HashMap<String, f32>,
+        stats: Option<&xerj_fts::CollectionStats>,
+    ) -> (Vec<MemtableHit>, u64) {
+        self.search_text_boosted_inner(query, fields, limit, usize::MAX, field_boosts, stats)
+    }
+
+    /// This memtable's contribution to the index-wide BM25 collection
+    /// statistics (#188): per-field `FieldStats` and per-(field, term)
+    /// doc_freq for the analysed `query` tokens, restricted to `fields`
+    /// (empty ⇒ every indexed field).
+    ///
+    /// Ghost-inclusive, exactly like the in-search aggregation it was hoisted
+    /// out of: tombstoned and superseded versions count until a flush/merge
+    /// purges them, which is what Lucene does and what keeps a delete from
+    /// silently shifting every score.
+    ///
+    /// Returns `None` when the memtable can't analyse the query (no analyzer,
+    /// or the query analyses to zero tokens) — the caller must then not build
+    /// index-wide stats at all rather than build partial ones.
+    pub fn collection_stats(
+        &self,
+        query: &str,
+        fields: &[&str],
+    ) -> Option<xerj_fts::CollectionStats> {
+        let analyzer = self.shards.iter().find_map(|s| {
+            let g = s.read();
+            g.registry
+                .get_analyzer("default")
+                .or_else(|| g.registry.get_analyzer("standard"))
+        })?;
+        let q_tokens = analyzer.analyze(query);
+        if q_tokens.is_empty() {
+            return None;
+        }
+        let (field_total_len, term_df) = self.aggregate_shard_stats(&q_tokens, fields);
+        let mut out = xerj_fts::CollectionStats::new();
+        for (fname, (sum, n)) in field_total_len {
+            out.add_field(
+                &fname,
+                &xerj_fts::FieldStats {
+                    total_docs: n,
+                    total_field_length: sum.round() as u64,
+                },
+            );
+        }
+        for ((fname, term), df) in term_df {
+            out.add_doc_freq(&fname, &term, df);
+        }
+        Some(out)
+    }
+
+    /// Shared cross-shard fold behind both [`Self::collection_stats`] and the
+    /// in-search aggregation: `(per-field (Σ field_len, docs-with-field),
+    /// per-(field, term) doc_freq)`, ghosts included.
+    fn aggregate_shard_stats(
+        &self,
+        q_tokens: &[xerj_fts::analyzer::Token],
+        fields: &[&str],
+    ) -> (
+        std::collections::HashMap<String, (f64, u64)>,
+        std::collections::HashMap<(String, String), u64>,
+    ) {
+        let mut field_total_len: std::collections::HashMap<String, (f64, u64)> =
+            std::collections::HashMap::new();
+        let mut term_df: std::collections::HashMap<(String, String), u64> =
+            std::collections::HashMap::new();
+        for shard in &self.shards {
+            let g = shard.read();
+            // Field length sums (live).
+            for (fname, (sum, n)) in &g.avg_field_lengths {
+                let entry = field_total_len.entry(fname.clone()).or_insert((0.0, 0));
+                entry.0 += sum;
+                entry.1 += n;
+            }
+            // Field length sums (tombstoned versions retained for avgdl).
+            for (fname, (sum, n)) in &g.ghost_field_len {
+                let entry = field_total_len.entry(fname.clone()).or_insert((0.0, 0));
+                entry.0 += sum;
+                entry.1 += n;
+            }
+            // Per-term doc_freq across shards (live postings).
+            for (fname, postings) in &g.index {
+                if !fields.is_empty() && !fields.iter().any(|f| f == fname) {
+                    continue;
+                }
+                for token in q_tokens {
+                    if let Some(pl) = postings.get(&token.text) {
+                        *term_df
+                            .entry((fname.clone(), token.text.clone()))
+                            .or_insert(0) += pl.len() as u64;
+                    }
+                }
+            }
+            // Per-term doc_freq from tombstoned versions (delete-aware df).
+            for (fname, terms) in &g.ghost_doc_freq {
+                if !fields.is_empty() && !fields.iter().any(|f| f == fname) {
+                    continue;
+                }
+                for token in q_tokens {
+                    if let Some(df) = terms.get(&token.text) {
+                        *term_df
+                            .entry((fname.clone(), token.text.clone()))
+                            .or_insert(0) += *df;
+                    }
+                }
+            }
+        }
+        (field_total_len, term_df)
     }
 
     /// Shared body: `shard_limit` caps each shard's hit materialisation
@@ -1054,6 +1181,7 @@ impl ShardedFtsMemtable {
         limit: usize,
         shard_limit: usize,
         field_boosts: &std::collections::HashMap<String, f32>,
+        external: Option<&xerj_fts::CollectionStats>,
     ) -> (Vec<MemtableHit>, u64) {
         // Pre-pass: tokenise the query (use any shard's analyzer — they're
         // all the same registry-provided one) and aggregate per-term
@@ -1073,65 +1201,68 @@ impl ShardedFtsMemtable {
             return (Vec::new(), 0);
         }
 
-        // Delete-aware BM25 collection statistics (Lucene/ES parity): the
-        // scoring N counts both live docs AND tombstoned/superseded versions
-        // that have not yet been merged away.  NOTE: this is *only* the N fed
-        // to the BM25 IDF — hits.total and pagination still use the live
-        // `doc_count()`, so a search over an index that has never had an
-        // update/delete scores bit-for-bit identically to before.
-        let mut global_doc_count: u64 = self.doc_count() as u64;
-        // Aggregate (per-field global avg_field_len, per-(field,term) doc_freq).
-        let mut field_total_len: std::collections::HashMap<String, (f64, u64)> =
+        // ── Statistics fed to the per-shard scorers ──────────────────────
+        //
+        // TWO modes, and the difference is deliberate:
+        //
+        //  * `external = Some(cs)` (#188) — the engine computed the INDEX-WIDE
+        //    union (all segments + this memtable) and every arm scores against
+        //    it, so a document's score no longer depends on which arm holds it.
+        //    `N` is then per-field docs-with-field, matching Lucene's pairing
+        //    of `FieldStats.docCount()` with `TermStats.docFreq()`.
+        //  * `external = None` — the historical memtable-only aggregation,
+        //    global across SHARDS with a single scalar `N`.  Kept byte-exact
+        //    because the engine takes this path whenever the index has at most
+        //    one live scoring arm, where the union is the identity, and any
+        //    drift there would move every memtable-only score.
+        //
+        // Delete-aware in both modes (Lucene/ES parity): the scoring `N`
+        // counts live docs AND tombstoned/superseded versions not yet merged
+        // away.  This is *only* the BM25 IDF `N` — hits.total and pagination
+        // still use the live `doc_count()`.
+        let mut global_field_doc_count: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
-        let mut term_global_df: std::collections::HashMap<(String, String), u64> =
-            std::collections::HashMap::new();
-        for shard in &self.shards {
-            let g = shard.read();
-            // Live N is already in `global_doc_count`; add tombstoned versions.
-            global_doc_count += g.ghost_docs;
-            // Field length sums (live).
-            for (fname, (sum, n)) in &g.avg_field_lengths {
-                let entry = field_total_len.entry(fname.clone()).or_insert((0.0, 0));
-                entry.0 += sum;
-                entry.1 += n;
-            }
-            // Field length sums (tombstoned versions retained for avgdl).
-            for (fname, (sum, n)) in &g.ghost_field_len {
-                let entry = field_total_len.entry(fname.clone()).or_insert((0.0, 0));
-                entry.0 += sum;
-                entry.1 += n;
-            }
-            // Per-term doc_freq across shards (live postings).
-            for (fname, postings) in &g.index {
-                if !fields.is_empty() && !fields.iter().any(|f| f == fname) {
-                    continue;
+        let global_doc_count: u64;
+        let global_avg_field_len: std::collections::HashMap<String, f32>;
+        let term_global_df: std::collections::HashMap<(String, String), u64>;
+        match external {
+            Some(cs) => {
+                // Scalar N is unused in this mode (every scored field is in
+                // the per-field map), but keep it a sane non-zero fallback.
+                global_doc_count = self.doc_count() as u64;
+                let mut avg = std::collections::HashMap::new();
+                for (fname, fs) in cs.field_iter() {
+                    avg.insert(fname.clone(), fs.avg_field_length());
+                    global_field_doc_count.insert(fname.clone(), fs.total_docs);
                 }
+                global_avg_field_len = avg;
+                let mut df = std::collections::HashMap::new();
                 for token in &q_tokens {
-                    if let Some(pl) = postings.get(&token.text) {
-                        *term_global_df
-                            .entry((fname.clone(), token.text.clone()))
-                            .or_insert(0) += pl.len() as u64;
+                    for fname in global_avg_field_len.keys() {
+                        if !fields.is_empty() && !fields.iter().any(|f| f == fname) {
+                            continue;
+                        }
+                        if let Some(v) = cs.df(fname, &token.text) {
+                            df.insert((fname.clone(), token.text.clone()), v);
+                        }
                     }
                 }
+                term_global_df = df;
             }
-            // Per-term doc_freq from tombstoned versions (delete-aware df).
-            for (fname, terms) in &g.ghost_doc_freq {
-                if !fields.is_empty() && !fields.iter().any(|f| f == fname) {
-                    continue;
+            None => {
+                let mut n: u64 = self.doc_count() as u64;
+                for shard in &self.shards {
+                    n += shard.read().ghost_docs;
                 }
-                for token in &q_tokens {
-                    if let Some(df) = terms.get(&token.text) {
-                        *term_global_df
-                            .entry((fname.clone(), token.text.clone()))
-                            .or_insert(0) += *df;
-                    }
-                }
+                global_doc_count = n;
+                let (field_total_len, df) = self.aggregate_shard_stats(&q_tokens, fields);
+                global_avg_field_len = field_total_len
+                    .into_iter()
+                    .map(|(k, (sum, n))| (k, if n == 0 { 0.0 } else { (sum / n as f64) as f32 }))
+                    .collect();
+                term_global_df = df;
             }
         }
-        let global_avg_field_len: std::collections::HashMap<String, f32> = field_total_len
-            .into_iter()
-            .map(|(k, (sum, n))| (k, if n == 0 { 0.0 } else { (sum / n as f64) as f32 }))
-            .collect();
 
         let mut all: Vec<MemtableHit> = Vec::new();
         for s in &self.shards {
@@ -1140,6 +1271,7 @@ impl ShardedFtsMemtable {
                 fields,
                 shard_limit,
                 global_doc_count,
+                &global_field_doc_count,
                 &global_avg_field_len,
                 &term_global_df,
                 field_boosts,
@@ -2362,12 +2494,20 @@ impl FtsMemtable {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         )
     }
 
     /// search_text variant that uses caller-supplied GLOBAL doc_count,
     /// per-field avg lengths, and per-(field,term) doc frequencies.
     /// Falls back to local stats when the global maps are empty.
+    ///
+    /// `global_field_doc_count` is the per-field `N` (docs WITH the field).
+    /// When it carries the field, it wins over the scalar `global_doc_count` —
+    /// that is the Lucene pairing (`FieldStats.docCount()` with
+    /// `TermStats.docFreq()`, `BM25Similarity.idfExplain`) and the shape the
+    /// index-wide statistics of #188 arrive in.  Empty ⇒ the historical
+    /// single-scalar behaviour, so memtable-only searches score unchanged.
     // The stats params mirror the cross-shard aggregation the orchestrator
     // computes once per query; bundling them into a struct would just move
     // the arity into a builder for a single internal call site.
@@ -2378,6 +2518,7 @@ impl FtsMemtable {
         fields: &[&str],
         limit: usize,
         global_doc_count: u64,
+        global_field_doc_count: &std::collections::HashMap<String, u64>,
         global_avg_field_len: &std::collections::HashMap<String, f32>,
         global_term_df: &std::collections::HashMap<(String, String), u64>,
         field_boosts: &std::collections::HashMap<String, f32>,
@@ -2435,8 +2576,15 @@ impl FtsMemtable {
                     .get(*field_name)
                     .copied()
                     .unwrap_or_else(|| self.avg_field_length(field_name));
+                // Per-field N (docs WITH the field) when the caller supplied
+                // index-wide statistics; the scalar otherwise.
+                let field_doc_count = global_field_doc_count
+                    .get(*field_name)
+                    .copied()
+                    .filter(|n| *n > 0)
+                    .unwrap_or(doc_count);
 
-                let scorer = Bm25Scorer::new(avg_field_len, doc_count);
+                let scorer = Bm25Scorer::new(avg_field_len, field_doc_count);
                 // Per-field boost from the query tree (ES `boost` on match /
                 // `field^N` on multi_match). 1.0 when unboosted, so scores
                 // stay bit-identical for boost-free queries.
