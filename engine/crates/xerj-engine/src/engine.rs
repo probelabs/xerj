@@ -377,8 +377,10 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn segment_hydration_cache_capacities(&self) -> [usize; 7] {
-        let mut total = [0_usize; 7];
+    pub fn segment_hydration_cache_capacities(
+        &self,
+    ) -> [usize; crate::segment_cache_budget::CATEGORY_COUNT] {
+        let mut total = [0_usize; crate::segment_cache_budget::CATEGORY_COUNT];
         for index in self.indices.iter() {
             let capacities = index.value().segment_hydration_cache_capacities();
             for (sum, capacity) in total.iter_mut().zip(capacities) {

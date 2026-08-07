@@ -37,7 +37,9 @@ use xerj_vector::hnsw::{HnswIndex, HnswParams};
 use xerj_vector::Sq8Params;
 
 use crate::aggs::run_aggs_with_all;
-use crate::segment_cache_budget::{CacheResident, SegmentCacheCategory, SegmentHydrationBudget};
+use crate::segment_cache_budget::{
+    CacheResident, SegmentCacheCategory, SegmentHydrationBudget, CATEGORY_COUNT,
+};
 use crate::segment_cache_estimates as cache_estimates;
 
 pub(crate) type Resident<T> = Arc<CacheResident<T>>;
@@ -5156,7 +5158,7 @@ impl Index {
     /// Aggregate DashMap table capacities for the seven hydration families.
     /// These are diagnostic table slots, separate from the refundable
     /// retained-payload/key budget.
-    pub fn segment_hydration_cache_capacities(&self) -> [usize; 7] {
+    pub fn segment_hydration_cache_capacities(&self) -> [usize; CATEGORY_COUNT] {
         [
             self.stored_slices_cache.capacity(),
             self.dv_cache.capacity(),
@@ -5165,6 +5167,7 @@ impl Index {
             self.id_pos_cache.capacity(),
             self.row_seq_cache.capacity(),
             self.decoded_stored_cache.capacity(),
+            self.fts_reader_cache.capacity(),
         ]
     }
 
