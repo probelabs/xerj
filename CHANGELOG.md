@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.12] - 2026-08-07
+
 ### Changed
 
 - **`doc_values` on the mapping is now honoured instead of silently ignored.**
