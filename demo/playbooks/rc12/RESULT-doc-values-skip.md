@@ -65,6 +65,51 @@ compatible than the audits assumed.
 
 ---
 
+## Query latency — nothing regressed, and the two column-served shapes got faster
+
+This was the risk: `agg_terms_on_text` and `sort_on_text` were served **from the
+column this change removes**. Losing it should, on the naive reading, make them
+slower. It did not.
+
+| query | base | dvskip | ratio |
+|---|---:|---:|---:|
+| **`agg_terms_on_text`** | 3414.46 | **2546.75** | **1.34x FASTER** |
+| **`sort_on_text`** | 1535.11 | 1553.13 | 0.99x (unchanged) |
+| `bool_must_filter` | 2846.62 | 2705.97 | 1.05x |
+| `function_score` | 4608.30 | 4467.75 | 1.03x |
+| `boosting` | 2708.92 | 2659.36 | 1.02x |
+| `match_phrase_prefix` | 4369.24 | 4395.82 | 0.99x |
+
+**The terms aggregation on a text field got 1.34x faster by losing its
+doc-values column.** Walking a 55 MB column whose every entry is a whole
+document body was *slower* than the brute path it now falls back to. So the
+column was not merely unused — it was actively worse than its own fallback,
+while costing 35.6% of the index.
+
+`sort_on_text` is unchanged, which is the expected outcome for the other
+column-served shape.
+
+### The apparent regressions are sub-millisecond noise
+
+| query | base | dvskip | ratio | absolute |
+|---|---:|---:|---:|---:|
+| `agg_stats_numeric` | 0.20 | 0.24 | 0.85x | **+40 µs** |
+| `agg_terms_high_card` | 2.75 | 3.06 | 0.90x | +0.31 ms |
+| `agg_terms_low_card` | 0.41 | 0.45 | 0.93x | +40 µs |
+
+These are the shapes `RESULT-fts-reader-cache.md` already flagged as unreadable
+as ratios: a 40-microsecond move reads as "0.85x". They are a pass/fail guard,
+and they pass — nothing left the sub-millisecond band.
+
+### Full-text wins carry through
+
+This run has **both** changes in, so the full-text numbers reproduce the FTS
+reader cache result a third time: `match_text_common` 2.86x, `large_page` 2.64x,
+`prefix_text` 2.54x, `wildcard_text` 2.45x, `fuzzy_text` 1.56x, `match_phrase`
+1.52x. Consistent with both earlier runs to within ~2%.
+
+---
+
 ## Correctness
 
 ES-YAML conformance with this change **and** the FTS reader cache in:
