@@ -186,3 +186,49 @@ is the single most important implementation detail in the lever.
 or the `size:0` count shortcut ever bind to a `text` field. Those paths are real and
 fast; if any of them can target `text`, they need a fallback before the column goes
 away.
+
+---
+
+## The denominator — why 37.1% is NOT the headline
+
+An independent adversarial re-measurement (parsing the `DV01` envelope of **all
+7,113 `.dv` sidecars** across a 4,245 MiB live data dir) confirmed the *numerator*
+and demolished the *denominator*:
+
+| | measured |
+|---|---:|
+| `.dv` removed by skipping text/`semantic_text` | **90–99%** of `.dv` payload |
+| `.dv` as a share of on-disk bytes (4,245 MiB, 7,113 sidecars) | **6.97%** |
+| per-index `.dv` share, range | **1.71% – 11.88%** |
+| `.seg` (stored `_source`) as a share | **64.21%** |
+| `.dv` share on `rc12bench` 500k (this file's corpus) | 37.1% |
+| `.dv` share on a synthetic pure-text index | 39.7% |
+
+Both sets of numbers are correct. They differ because **the lever's worth is set by
+how large `_source` is relative to the indexed text.** On autoindex-generated code
+corpora, where `_source` holds whole source files, `.seg` dominates at 64% and `.dv`
+is ~7% — on `xc-dataplane-cilium-vendor` it is **1.71%**, making the whole lever
+worth about 1.6% there. On short-document corpora like this file's benchmark, the
+same lever is worth ~37%.
+
+**The defensible public statement is therefore a range, never a single number:**
+*"removes 90–99% of the doc-values sidecar; that sidecar is 2–40% of index size
+depending on corpus."* Quoting 37% as the headline would be a cross-corpus splice —
+per-type split measured on one corpus, denominator imported from another.
+
+### A correction to the correction above
+
+The earlier note in this file claimed that implementing the lever "fails the
+conformance gate" on `terms_text_docvalues.yml`. **That was re-checked and refuted.**
+All three cases survive a columnless text field: case 2 already runs with no column
+today (arrays suppress the column at `index.rs:17407-17409`), and cases 1 and 3 bail
+to the brute path and produce byte-identical buckets. The gate stays green.
+
+The real constraint on this lever is the denominator, not conformance. It should
+still be implemented as "default off, honour an explicit `doc_values: true`", because
+that matches ES and is the right behaviour — but it should be **scheduled on the
+strength of `.seg`, not `.dv`**, on any corpus where `_source` dominates.
+
+Also noted: `is_aggregatable()` is *not* the only reader of `options.doc_values` —
+`crates/xerj-console-api/src/data_sources.rs:199` reads it too and reports it in the
+console field listing.
