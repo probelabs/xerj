@@ -7322,6 +7322,7 @@ impl Index {
         let excluded_fts_fields = self
             .flush_signal
             .semantic_derived_vector_fields(&self.schema);
+        let dv_skip = self.flush_signal.doc_values_skip_set(&self.schema);
         let dataset_version = Arc::clone(&self.dataset_version);
         let query_cache = Arc::clone(&self.query_cache);
         let warm_caches = self.publish_warm_caches();
@@ -7351,6 +7352,7 @@ impl Index {
                 data_dir,
                 field_configs,
                 excluded_fts_fields,
+                dv_skip,
                 on_drained,
                 warm_caches,
                 #[cfg(test)]
@@ -7566,11 +7568,12 @@ impl Index {
         // memtable, writes the segment file + FTS index, swaps the snapshot,
         // and checkpoints the WAL.  The drained memtable is dropped, freeing
         // all RAM.
-        let (field_configs, excluded_fts_fields) = {
+        let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
                 crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                doc_values_skip_set(&schema.schema),
             )
         };
         // Explicit refresh: wait behind any in-flight concurrent flushes
@@ -7594,6 +7597,7 @@ impl Index {
                 self.data_dir.clone(),
                 field_configs.clone(),
                 excluded_fts_fields.clone(),
+                dv_skip.clone(),
                 || {}, // serial refresh path — no permit to drop early
                 self.publish_warm_caches(),
                 #[cfg(test)]
@@ -7701,9 +7705,12 @@ impl Index {
                 let _ = field_configs_once.set(cfg.clone());
                 cfg
             };
-            let excluded_fts_fields = {
+            let (excluded_fts_fields, dv_skip) = {
                 let schema = self.schema.read().await;
-                crate::memtable::semantic_derived_vector_fields(&schema.schema)
+                (
+                    crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                    doc_values_skip_set(&schema.schema),
+                )
             };
 
             let flush_signal_cb = Arc::clone(&self.flush_signal);
@@ -7730,6 +7737,7 @@ impl Index {
                     data_dir,
                     field_configs,
                     excluded_fts_fields,
+                    dv_skip,
                     on_drained,
                     warm_caches,
                     #[cfg(test)]
@@ -8018,6 +8026,14 @@ impl Index {
             }
         }
 
+        // Derived once from the schema, then moved into each merge task: a
+        // force-merge must not resurrect a doc-values column that flush
+        // correctly skipped.
+        let dv_skip = {
+            let guard = self.schema.read().await;
+            doc_values_skip_set(&guard.schema)
+        };
+
         // Launch up to MERGE_PARALLELISM tasks at a time, consuming the
         // queue as tasks complete.  Results are applied back to the
         // snapshot in the order they finish (apply_merge is atomic).
@@ -8047,6 +8063,7 @@ impl Index {
             let field_configs_for_task = field_configs.clone();
             let excluded_fts_fields_for_task = excluded_fts_fields.clone();
             let segments_dir_for_task = segments_dir.clone();
+            let dv_skip_for_merge = dv_skip.clone();
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
@@ -8497,8 +8514,10 @@ impl Index {
                     // Doc-values side-car — reuse the same `Value`s we
                     // stashed in fts_input above (M5.22).
                     {
-                        let columns =
-                            build_doc_value_columns(fts_input.iter().map(|(_, _, v)| Some(v)));
+                        let columns = build_doc_value_columns(
+                            fts_input.iter().map(|(_, _, v)| Some(v)),
+                            &dv_skip_for_merge,
+                        );
                         if !columns.is_empty() {
                             if let Err(e) = write_doc_values_sidecar(
                                 &segments_dir_for_task,
@@ -16569,11 +16588,12 @@ impl Index {
 
     /// Flush the memtable to a new segment on disk, then build the FTS index.
     pub async fn flush(self: &Arc<Self>) -> Result<()> {
-        let (field_configs, excluded_fts_fields) = {
+        let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
                 crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                doc_values_skip_set(&schema.schema),
             )
         };
         // M5.15 — PARALLEL final flush.
@@ -16616,6 +16636,7 @@ impl Index {
                 let data_dir = data_dir.clone();
                 let field_configs = field_configs.clone();
                 let excluded_fts_fields = excluded_fts_fields.clone();
+                let dv_skip = dv_skip.clone();
                 let warm_caches = warm_caches.clone();
                 #[cfg(test)]
                 let test_hook = flush_test_hook.clone();
@@ -16637,6 +16658,7 @@ impl Index {
                         data_dir,
                         field_configs,
                         excluded_fts_fields,
+                        dv_skip,
                         on_drained,
                         warm_caches,
                         #[cfg(test)]
@@ -17357,8 +17379,38 @@ impl Index {
 // This mirrors what ES does when `dynamic` mapping infers field types
 // without explicit schema declarations.
 
+/// Fields whose declared mapping says they must NOT get a doc-values column.
+///
+/// Derived from the SCHEMA rather than from the documents, so it is stable
+/// across flush and merge — a force-merge must not resurrect a column that
+/// flush correctly skipped. Dynamic (unmapped) fields are absent from the
+/// schema and keep today's behaviour of getting a column.
+pub fn doc_values_skip_set(schema: &Schema) -> std::collections::HashSet<String> {
+    let mut skip = std::collections::HashSet::new();
+    for field in &schema.fields {
+        if !field.options.doc_values {
+            skip.insert(field.name.clone());
+        }
+    }
+    skip
+}
+
+/// Build the per-segment doc-values columns.
+///
+/// `skip` names fields whose declared mapping says they must not have
+/// doc-values — either an explicit `"doc_values": false`, or an analyzed/large
+/// type (`text`, `semantic_text`, `binary`, …) that did not ask for them. The
+/// builder is otherwise schema-free and files a column for every `_source` key
+/// it sees, which is how `"doc_values": false` came to be silently ignored.
+///
+/// This is the single largest artifact on text-heavy corpora: on the 500k-doc
+/// rc.12 benchmark the one analyzed `text` field is 95.87% of the `.dv` side-car
+/// and 35.6% of the whole index. It is much smaller where `_source` dominates
+/// (6.97% across the `xc-*` code corpora), so the saving is corpus-dependent and
+/// must always be quoted as a range.
 fn build_doc_value_columns<'a>(
     sources: impl Iterator<Item = Option<&'a Value>>,
+    skip: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeMap<String, xerj_storage::doc_values::Column> {
     use std::collections::BTreeMap;
     use xerj_storage::doc_values::{Column, KeywordColumn, NumericColumn};
@@ -17393,6 +17445,11 @@ fn build_doc_value_columns<'a>(
             // Skip the `_id`, `_seq_no`, `_source` envelope keys — they're
             // bookkeeping, not user data.
             if field.starts_with('_') {
+                continue;
+            }
+            // Honour the declared mapping. Checked before any allocation so a
+            // skipped field costs nothing per doc.
+            if skip.contains(field.as_str()) {
                 continue;
             }
             // Lookup-first (`get_mut` before `entry`) so the common case
@@ -22380,6 +22437,10 @@ async fn do_flush_shard(
     data_dir: PathBuf,
     field_configs: HashMap<String, xerj_fts::index::FieldIndexConfig>,
     excluded_fts_fields: std::collections::HashSet<String>,
+    // Fields the mapping says get no doc-values column. Threaded through for
+    // the same reason as `excluded_fts_fields`: this is a free fn with no
+    // access to `Index`.
+    dv_skip_for_flush: std::collections::HashSet<String>,
     on_drained: impl FnOnce() + Send + 'static,
     // Publish-time cache warm (see `warm_segment_at_publish`): the index's
     // read-path caches, threaded through because this is a free fn without
@@ -22643,6 +22704,7 @@ async fn do_flush_shard(
                     drained_fts_for_build
                         .iter()
                         .map(|(_id, _fields, src)| Some(src.as_ref())),
+                    &dv_skip_for_flush,
                 );
                 if !columns.is_empty() {
                     write_doc_values_sidecar(&segments_dir_for_dv, meta.id.as_str(), &columns)
@@ -22927,6 +22989,19 @@ impl SyncFlushCoord {
         });
         *self.field_configs_cache.write() = Some(cfg.clone());
         cfg
+    }
+
+    fn doc_values_skip_set(
+        &self,
+        schema: &Arc<RwLock<ManagedSchema>>,
+    ) -> std::collections::HashSet<String> {
+        let Some(rt) = self.rt.as_ref() else {
+            return std::collections::HashSet::new();
+        };
+        rt.block_on(async {
+            let guard = schema.read().await;
+            doc_values_skip_set(&guard.schema)
+        })
     }
 
     fn semantic_derived_vector_fields(
@@ -36484,6 +36559,7 @@ mod flush_memory_integration_tests {
             idx.data_dir.clone(),
             field_configs,
             excluded_fts_fields,
+            dv_skip,
             || {},
             warm_caches,
             Some(hook),

@@ -13520,6 +13520,42 @@ fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
             fc.fields = es_properties_to_fields(sub_props);
         }
 
+        // `doc_values` — carry the DECLARED mapping intent onto the field.
+        //
+        // This option was accepted, echoed back by `GET _mapping`, and then
+        // ignored: the doc-values side-car builder is schema-free and filed a
+        // column for every `_source` string, so `"doc_values": false` bought
+        // nothing and aggregating on such a field still succeeded (where ES
+        // errors). An accepted-but-ignored mapping option is a correctness bug
+        // on its own, before any footprint argument.
+        //
+        // The default follows ES: analyzed/large types get no doc-values
+        // unless asked for. Keying on the DECLARED es_type is load-bearing —
+        // `text` and `semantic_text` both resolve to `FieldType::Text`, and on
+        // real corpora `semantic_text` is 86-92% of the side-car while plain
+        // `text` is under 5%, so a policy that only looked at the resolved type
+        // (or only at the literal string "text") would miss almost all of it.
+        //
+        // An explicit `"doc_values": true` on a text field is still honoured:
+        // modern ES supports that behind the `mapper.text.doc_values` feature,
+        // and the conformance suite exercises it in
+        // tests/es-compat-yaml/yaml/aggregations/terms_text_docvalues.yml.
+        let doc_values_default = !matches!(
+            es_type,
+            "text"
+                | "annotated_text"
+                | "match_only_text"
+                | "search_as_you_type"
+                | "semantic_text"
+                | "binary"
+                | "object"
+                | "nested"
+        );
+        fc.options.doc_values = field_def
+            .get("doc_values")
+            .and_then(Value::as_bool)
+            .unwrap_or(doc_values_default);
+
         // Handle copy_to: store the target field in a special null_value marker.
         if let Some(copy_target) = field_def.get("copy_to").and_then(Value::as_str) {
             fc.options.null_value = Some(Value::String(format!("__copy_to__:{}", copy_target)));
