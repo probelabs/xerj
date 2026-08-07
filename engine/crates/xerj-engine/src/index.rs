@@ -5016,6 +5016,29 @@ pub struct Index {
     /// Budgeted like `stored_slices_cache`; entries evicted by id at the
     /// merge-completion site.  Segments are immutable → no invalidation.
     decoded_stored_cache: Arc<dashmap::DashMap<String, Resident<Vec<u8>>>>,
+    /// Per-(segment, field-set) cache of an opened `FtsIndexReader`.
+    ///
+    /// `FtsIndexReader::open` was called INSIDE the per-segment loop of
+    /// `search_bounded` on every query, and it is not cheap: it performs TWO
+    /// zstd decompressions per field — the whole `.post` blob (`ZPS1`) and the
+    /// whole `.meta` flat array (`ZFM4`) — into owned `Vec`s, because a
+    /// compressed blob cannot be mmap'd. Measured on one real production field
+    /// (`body`, 17.0 MB `.post` -> 25.3 MB, 2.8 MB `.meta` -> 15.8 MB): ~50 ms
+    /// and ~41 MB per (segment, field), rebuilt and thrown away every query.
+    /// The comment on `PostData` ("open allocates almost nothing per segment")
+    /// describes only the uncompressed/mmap path, which modern segments never
+    /// take.
+    ///
+    /// Segments are immutable, so this needs no invalidation — the same
+    /// argument every other cache here rests on. Entries are evicted by id at
+    /// the merge-completion site and the payload is budget-charged, so a large
+    /// corpus degrades to today's open-per-query rather than growing without
+    /// bound.
+    ///
+    /// The key includes the field set because `open` loads exactly the fields
+    /// it is asked for; a reader opened for a narrower set must never satisfy
+    /// a query needing a wider one.
+    fts_reader_cache: Arc<dashmap::DashMap<String, Resident<Arc<FtsIndexReader>>>>,
     /// Per-(segment, query-shape) match-count cache for the
     /// `try_shortcut_count` Bool intersection arm.  The fused columnar
     /// walk is O(anchor-predicate matches) per segment PER QUERY — for a
@@ -5422,6 +5445,7 @@ impl Index {
             stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(dashmap::DashMap::new()),
             decoded_stored_cache: Arc::new(dashmap::DashMap::new()),
+            fts_reader_cache: Arc::new(dashmap::DashMap::new()),
             shortcut_count_cache: Arc::new(dashmap::DashMap::new()),
             ghost_positions_cache: Arc::new(dashmap::DashMap::new()),
             regexp_expand_cache: Arc::new(dashmap::DashMap::new()),
@@ -5768,6 +5792,7 @@ impl Index {
             stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(dashmap::DashMap::new()),
             decoded_stored_cache: Arc::new(dashmap::DashMap::new()),
+            fts_reader_cache: Arc::new(dashmap::DashMap::new()),
             shortcut_count_cache: Arc::new(dashmap::DashMap::new()),
             ghost_positions_cache: Arc::new(dashmap::DashMap::new()),
             regexp_expand_cache: Arc::new(dashmap::DashMap::new()),
@@ -14353,13 +14378,13 @@ impl Index {
                 let mut fts_deadline_tripped = false;
                 let t_fts = std::time::Instant::now();
                 let reader_opt = if needs_fts {
-                    FtsIndexReader::open(&fts_dir, &seg_id, &field_refs).ok()
+                    self.fts_reader_for(&fts_dir, &seg_id, &field_refs)
                 } else {
                     None
                 };
                 dbg_fts_ms += t_fts.elapsed().as_millis() as u64;
                 if let Some(reader) = reader_opt {
-                    let reader = Arc::new(reader);
+                    let reader = Arc::clone(&*reader);
                     // Arm the cooperative deadline (RC4 blocker 12): the
                     // searcher's multi-term expansions (prefix / wildcard /
                     // fuzzy term-dictionary walks) are otherwise
@@ -14540,7 +14565,9 @@ impl Index {
                                 // candidate (rare).  The exact live count above used
                                 // `dead_matches` over the FULL set and is untouched.
                                 let mut seg_hits = seg_hits;
-                                if deletes_present && fts_cap != usize::MAX && seg_total > fts_cap as u64
+                                if deletes_present
+                                    && fts_cap != usize::MAX
+                                    && seg_total > fts_cap as u64
                                 {
                                     let dead_in_top = ghost_bm
                                         .as_deref()
@@ -14794,30 +14821,31 @@ impl Index {
                                         // set).  Shared by the in-walk 2×cap eager
                                         // trim and the end-of-run trim so admission
                                         // and final ordering always agree.
-                                        let trim_to_cap = |hits: Vec<Hit>| -> (Vec<Hit>, Option<f32>) {
-                                            let mut decorated: Vec<(u64, Hit)> = hits
-                                                .into_iter()
-                                                .map(|h| {
-                                                    (
-                                                        self.lookup_seq_no(&h.id)
-                                                            .unwrap_or(u64::MAX),
-                                                        h,
-                                                    )
-                                                })
-                                                .collect();
-                                            decorated.sort_by(|a, b| {
-                                                b.1.score
-                                                    .partial_cmp(&a.1.score)
-                                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                                    .then_with(|| a.0.cmp(&b.0))
-                                                    .then_with(|| a.1.id.cmp(&b.1.id))
-                                            });
-                                            decorated.truncate(materialisation_limit);
-                                            let worst = decorated.last().map(|(_, h)| h.score);
-                                            let kept =
-                                                decorated.into_iter().map(|(_, h)| h).collect();
-                                            (kept, worst)
-                                        };
+                                        let trim_to_cap =
+                                            |hits: Vec<Hit>| -> (Vec<Hit>, Option<f32>) {
+                                                let mut decorated: Vec<(u64, Hit)> = hits
+                                                    .into_iter()
+                                                    .map(|h| {
+                                                        (
+                                                            self.lookup_seq_no(&h.id)
+                                                                .unwrap_or(u64::MAX),
+                                                            h,
+                                                        )
+                                                    })
+                                                    .collect();
+                                                decorated.sort_by(|a, b| {
+                                                    b.1.score
+                                                        .partial_cmp(&a.1.score)
+                                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                                        .then_with(|| a.0.cmp(&b.0))
+                                                        .then_with(|| a.1.id.cmp(&b.1.id))
+                                                });
+                                                decorated.truncate(materialisation_limit);
+                                                let worst = decorated.last().map(|(_, h)| h.score);
+                                                let kept =
+                                                    decorated.into_iter().map(|(_, h)| h).collect();
+                                                (kept, worst)
+                                            };
                                         for sh in &seg_hits {
                                             // `seg_hits` descends by score, so once
                                             // a hit's score is STRICTLY below the
@@ -18604,6 +18632,10 @@ impl Index {
         self.row_seq_cache.remove(segment_id);
         self.stored_slices_cache.remove(segment_id);
         self.decoded_stored_cache.remove(segment_id);
+        // Keyed by "<segment_id>\u{1}<field-set>", so evict by prefix.
+        let fts_prefix = format!("{segment_id}\u{1}");
+        self.fts_reader_cache
+            .retain(|key, _| !key.starts_with(&fts_prefix));
         let shadow_prefix = format!("{segment_id}\u{1}");
         self.sort_shadow_cache
             .retain(|key, _| !key.starts_with(&shadow_prefix));
@@ -18631,6 +18663,48 @@ impl Index {
         if self.sort_shadow_cache.is_empty() {
             self.sort_shadow_cache.shrink_to_fit();
         }
+    }
+
+    /// Open a segment's FTS side-cars, reusing a cached reader when one exists.
+    ///
+    /// This is the read-side of `fts_reader_cache`. See that field for why the
+    /// open is expensive (two zstd decompressions per field, ~50 ms / ~41 MB on
+    /// a real production field) and why caching is sound (segments are
+    /// immutable).
+    ///
+    /// Returns `None` exactly where the previous inline
+    /// `FtsIndexReader::open(..).ok()` returned `None`, so a missing or
+    /// unreadable side-car still falls through to the stored-doc scan rather
+    /// than failing the query.
+    fn fts_reader_for(
+        &self,
+        fts_dir: &std::path::Path,
+        segment_id: &str,
+        fields: &[&str],
+    ) -> Option<Resident<Arc<FtsIndexReader>>> {
+        // The field set is part of the identity: `open` loads only the fields
+        // it is given, so a reader opened for a narrower set must never serve a
+        // query that needs a wider one. Sort so that permutations of the same
+        // set share one entry.
+        let mut sorted: Vec<&str> = fields.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let key = format!("{segment_id}\u{1}{}", sorted.join("\u{2}"));
+
+        if let Some(hit) = self.fts_reader_cache.get(&key) {
+            return Some(Arc::clone(hit.value()));
+        }
+
+        let reader = Arc::new(FtsIndexReader::open(fts_dir, segment_id, fields).ok()?);
+        let bytes = reader.retained_bytes();
+        Some(self.publish_current(
+            &self.fts_reader_cache,
+            segment_id,
+            key,
+            SegmentCacheCategory::FtsReader,
+            bytes,
+            reader,
+        ))
     }
 
     fn dv_columns_for(
