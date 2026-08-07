@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`doc_values` on the mapping is now honoured instead of silently ignored.**
+  `"doc_values": false` was accepted, echoed back by `GET _mapping`, and had no
+  effect — aggregating and sorting on such a field succeeded, where
+  Elasticsearch errors. The doc-values sidecar builder was schema-free and filed
+  a column for every `_source` string it saw. The default now follows ES: no
+  doc-values for `text`, `annotated_text`, `match_only_text`,
+  `search_as_you_type`, `semantic_text`, `binary`, `object` and `nested`; an
+  explicit `"doc_values": true` on a text field still builds the column and
+  still returns whole-value buckets.
+
+  Measured on a 500k-doc corpus (one analyzed `text` field), force-merged: index
+  154,413,167 → 99,424,772 bytes (**1.553x smaller**, `index/raw` 0.433x →
+  0.279x) and force-merge 139.13 s → 59.69 s (**2.33x faster**, merge re-encodes
+  the sidecar and there are 55 MB fewer bytes to build). The `.dv` artifact falls
+  95.9%; every other artifact is byte-identical. A `terms` aggregation on a text
+  field got **1.34x faster** (3414 → 2547 ms) after losing its column, because
+  walking a column of whole document bodies was slower than the brute path it
+  falls back to.
+
+  The saving is corpus-dependent: it removes 90-99% of the doc-values sidecar,
+  and that sidecar is 2-37% of index size depending on how large text bodies are
+  relative to `_source`. On source-code corpora where `_source` dominates it is
+  nearer the low end.
+
+### Performance
+
+- **The per-segment FTS reader is cached instead of rebuilt on every query.**
+  `FtsIndexReader::open` sat inside the per-segment search loop and performed two
+  zstd decompressions per field — the whole `.post` blob and the whole `.meta`
+  array — into owned buffers, then discarded them. Measured on one production
+  field: ~50 ms and ~41 MB per (segment, field), per query.
+
+  Readers are now cached per (segment, field-set), charged against the segment
+  hydration budget under a new `fts_reader` category (visible in
+  `_nodes/stats`), and evicted at merge completion. Segments are immutable, so
+  no invalidation is needed; if the budget refuses the charge the reader is
+  returned uncached, so an oversized corpus degrades to the previous behaviour
+  rather than growing without bound.
+
+  Measured p50 on 500k docs with the query cache disabled: `match` on text
+  166.29 → 57.85 ms (2.87x), 500-doc page 168.96 → 64.05 ms (2.64x), `prefix`
+  170.91 → 69.22 ms (2.47x), `wildcard` 180.52 → 74.79 ms (2.41x), `fuzzy`
+  306.16 → 195.25 ms (1.57x), `match_phrase` 495.58 → 339.90 ms (1.46x).
+  Brute-scan families (`function_score`, `boosting`) are unchanged — their cost
+  is scanning and scoring, not opening a reader.
+
 ### Fixed
 
 - **`xerj autoindex` no longer duplicates an index when an extractor improves**
