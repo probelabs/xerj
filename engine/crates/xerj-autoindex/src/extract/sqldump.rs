@@ -363,7 +363,20 @@ fn parse_insert_head(head: &[u8]) -> Option<(String, Vec<String>)> {
 fn process_statement_head(head: &[u8], tables: &mut HashMap<String, Vec<String>>) {
     let head = String::from_utf8_lossy(head);
     let trimmed = head.trim_start();
-    if trimmed.len() < 12 || !trimmed[..12].eq_ignore_ascii_case("create table") {
+    // Compare as BYTES.  `trimmed.len()` is a byte length, so the old
+    // `len() < 12 || !trimmed[..12]` guard admitted any input whose 12th byte
+    // lands inside a multi-byte character and then panicked slicing it — the
+    // same failure the buffer comment above describes, surviving here in `&str`
+    // form.  Real input hit it: a ClickHouse fixture containing 'ا' and another
+    // containing '设' each aborted the whole `autoindex` run (the workspace
+    // builds with `panic = "abort"`, so one bad file kills every other file's
+    // work).  `get(..12)` on `&[u8]` cannot split a character and returns None
+    // when the input is short, folding both guards into one total operation.
+    if !trimmed
+        .as_bytes()
+        .get(..12)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"create table"))
+    {
         return;
     }
     let name_re = regex::Regex::new(
@@ -549,6 +562,45 @@ mod utf8_safety_tests {
         // The slice that used to panic is now a plain byte slice.
         assert!(t.len() >= 6);
         let _ = &t[..6];
+    }
+
+    /// Regression: `process_statement_head` guarded with `trimmed.len() < 12`
+    /// (a BYTE length) and then sliced `trimmed[..12]` on a `&str`. Any head
+    /// whose 12th byte lands inside a multi-byte character passed the guard and
+    /// panicked on the slice. Found by indexing ClickHouse: fixtures containing
+    /// 'ا' and '设' each aborted the whole `autoindex` run (`panic = "abort"`).
+    /// Neither of these heads is a CREATE TABLE — the only correct behaviour is
+    /// to return quietly, never to abort the process.
+    #[test]
+    fn statement_head_with_multibyte_at_byte_12_does_not_panic() {
+        let mut tables: HashMap<String, Vec<String>> = HashMap::new();
+        for head in [
+            "-- comment ا rest of the line",     // 'ا' spans bytes 11..13
+            "-- comment 设计 rest",               // '设' spans bytes 11..14
+            "  — leading em-dash then text",     // multibyte before byte 12
+            "短",                                 // shorter than 12 bytes
+            "",
+        ] {
+            process_statement_head(head.as_bytes(), &mut tables);
+        }
+        assert!(tables.is_empty(), "none of these heads declare a table");
+    }
+
+    /// The byte-wise comparison must still accept a real CREATE TABLE, in any
+    /// case, and must not regress into matching a mere prefix.
+    #[test]
+    fn statement_head_still_captures_create_table() {
+        let mut tables: HashMap<String, Vec<String>> = HashMap::new();
+        process_statement_head(b"  CrEaTe TaBlE users (id INT, name TEXT)", &mut tables);
+        assert_eq!(
+            tables.get("users").map(|c| c.len()),
+            Some(2),
+            "case-insensitive CREATE TABLE must still be captured"
+        );
+
+        let mut other: HashMap<String, Vec<String>> = HashMap::new();
+        process_statement_head("create tableX ا (id INT)".as_bytes(), &mut other);
+        assert!(other.is_empty(), "`create tableX` is not `create table`");
     }
 
     #[test]
