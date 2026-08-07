@@ -60,6 +60,49 @@ fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudge
     panic!("Index construction requires the process ResourceGovernor to be initialised");
 }
 
+/// Wait for a publication test barrier, on the runtime and bounded.
+///
+/// A test must never park a tokio BLOCKING-pool thread to wait for a signal
+/// that is produced by work queued on that same pool — that is a self-deadlock,
+/// not a slow test.  Two publication paths produce their signal from inside a
+/// `spawn_blocking` closure:
+///
+/// * the merge encode (`run_merge_once`'s `spawn_one`), which must complete
+///   before any `Merge*` publication point is reached, and
+/// * the flush finalize, whose `build_fts` closure — and therefore the
+///   `FlushPublisherTestHook::callback` that signals `entered` — runs inside
+///   the finalize `spawn_blocking`.
+///
+/// tokio grows the blocking pool only when it observes `num_idle_threads() == 0`
+/// at push time (tokio-1.52.0 `src/runtime/blocking/pool.rs:407`); otherwise it
+/// merely `notify_one()`s (same file, :456-458).  The idle counter is
+/// decremented by the waking worker itself around its park (same file,
+/// :533-546), so two submits inside a single wake-up window can both observe
+/// "1 idle", both merely notify, and one thread is left to service two tasks.
+/// Widening the pool cap does not help — the cap is already tokio's default
+/// 512; it is the growth heuristic that starves.  On 32 cores the idle thread
+/// almost always wakes and decrements between the two submits; on a 2-core CI
+/// runner it often does not.  That is the entire 2-core dependence of this
+/// family of flakes.
+///
+/// Waiting here keeps the waiter on the runtime and leaves the blocking pool
+/// free for the work that produces the signal.  The bound preserves the #158
+/// diagnostic: an unreached publication point fails in 20 s naming the barrier
+/// instead of hanging until CI's six-hour ceiling.
+///
+/// Barriers that deliberately occupy a blocking thread are the exception and
+/// must stay as they are — see
+/// `cancelling_waiter_while_blocking_worker_is_queued_still_restores`, whose
+/// `spawn_blocking` blocker is the subject of the test.
+#[cfg(test)]
+async fn await_publication_barrier<T>(rx: tokio::sync::oneshot::Receiver<T>, what: &str) -> T {
+    match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => panic!("publication barrier `{what}` sender dropped ({e:?})"),
+        Err(e) => panic!("publication barrier `{what}` never fired ({e:?})"),
+    }
+}
+
 #[cfg(test)]
 mod collection_publication_fail_closed_tests {
     use super::*;
@@ -256,13 +299,16 @@ mod collection_publication_fail_closed_tests {
 
         let ledger: &'static crate::ingest_memory::Ledger =
             Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        // `entered` fires from `build_fts`, which runs inside the flush
+        // finalize's `spawn_blocking`; waiting for it on the blocking pool can
+        // starve the very closure that signals it (`await_publication_barrier`).
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
         let hook = FlushPublisherTestHook {
             callback: Arc::new(move || {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
+                let _ = entered_tx.lock().take().unwrap().send(());
                 resume_rx.lock().take().unwrap().recv().unwrap();
                 inject_error
             }),
@@ -276,9 +322,7 @@ mod collection_publication_fail_closed_tests {
         let flush = tokio::spawn(
             FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { flush_idx.flush().await }),
         );
-        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
-            .await
-            .unwrap();
+        await_publication_barrier(entered_rx, "entered").await;
         assert_eq!(idx.memtable.doc_count(), 0, "flush did not drain first");
 
         let attempts_before = idx.collection_publication.reader_admission_attempts();
@@ -817,13 +861,15 @@ mod flush_publication_recovery_tests {
             .await
             .unwrap();
         let version_before_flush = idx.dataset_version.load(Ordering::Acquire);
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        // `entered` fires from inside the flush finalize's `spawn_blocking`;
+        // wait for it on the runtime (see `await_publication_barrier`).
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let release_rx = parking_lot::Mutex::new(Some(release_rx));
         let hook = FlushPublisherTestHook {
             callback: Arc::new(move || {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
+                let _ = entered_tx.lock().take().unwrap().send(());
                 release_rx.lock().take().unwrap().recv().unwrap();
                 false
             }),
@@ -837,9 +883,7 @@ mod flush_publication_recovery_tests {
             let idx = Arc::clone(&idx);
             tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
         };
-        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
-            .await
-            .unwrap();
+        await_publication_barrier(entered_rx, "entered").await;
         flush.abort();
         assert!(flush.await.unwrap_err().is_cancelled());
         let request = xerj_query::parse_request(&json!({
@@ -896,13 +940,15 @@ mod flush_publication_recovery_tests {
         .await
         .unwrap();
         let version_before_flush = idx.dataset_version.load(Ordering::Acquire);
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        // `entered` fires from inside the flush finalize's `spawn_blocking`;
+        // wait for it on the runtime (see `await_publication_barrier`).
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let release_rx = parking_lot::Mutex::new(Some(release_rx));
         let hook = FlushPublisherTestHook {
             callback: Arc::new(move || {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
+                let _ = entered_tx.lock().take().unwrap().send(());
                 release_rx.lock().take().unwrap().recv().unwrap();
                 false
             }),
@@ -916,9 +962,7 @@ mod flush_publication_recovery_tests {
             let idx = Arc::clone(&idx);
             tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
         };
-        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
-            .await
-            .unwrap();
+        await_publication_barrier(entered_rx, "entered").await;
         flush.abort();
         assert!(flush.await.unwrap_err().is_cancelled());
         release_tx.send(()).unwrap();
@@ -1203,13 +1247,15 @@ mod flush_publication_recovery_tests {
             .await
             .unwrap();
 
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        // `entered` fires from inside the flush finalize's `spawn_blocking`;
+        // wait for it on the runtime (see `await_publication_barrier`).
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let release_rx = parking_lot::Mutex::new(Some(release_rx));
         let hook = FlushPublisherTestHook {
             callback: Arc::new(move || {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
+                let _ = entered_tx.lock().take().unwrap().send(());
                 release_rx.lock().take().unwrap().recv().unwrap();
                 true
             }),
@@ -1223,9 +1269,7 @@ mod flush_publication_recovery_tests {
             let idx = Arc::clone(&idx);
             tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
         };
-        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
-            .await
-            .unwrap();
+        await_publication_barrier(entered_rx, "entered").await;
         idx.index_document(Some("same".into()), json!({"body": "new beta"}))
             .await
             .unwrap();
@@ -1261,13 +1305,15 @@ mod flush_publication_recovery_tests {
         idx.index_document(Some("same".into()), json!({"body": "alpha"}))
             .await
             .unwrap();
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        // `entered` fires from inside the flush finalize's `spawn_blocking`;
+        // wait for it on the runtime (see `await_publication_barrier`).
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let release_rx = parking_lot::Mutex::new(Some(release_rx));
         let hook = FlushPublisherTestHook {
             callback: Arc::new(move || {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
+                let _ = entered_tx.lock().take().unwrap().send(());
                 release_rx.lock().take().unwrap().recv().unwrap();
                 true
             }),
@@ -1281,9 +1327,7 @@ mod flush_publication_recovery_tests {
             let idx = Arc::clone(&idx);
             tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
         };
-        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
-            .await
-            .unwrap();
+        await_publication_barrier(entered_rx, "entered").await;
         assert!(idx.delete_document("same").await.unwrap());
         release_tx.send(()).unwrap();
         assert!(flush.await.unwrap().is_err());
@@ -1801,6 +1845,14 @@ mod merge_publication_transaction_tests {
             .unwrap();
         index.flush().await.unwrap();
         assert_eq!(index.store.snapshot().segments.len(), 2);
+        // Every test in this module drives the merge itself with an explicit
+        // `run_merge_once()`.  The 5-second background merge loop is pure
+        // interference here: a tick that wins the `merge_in_progress` CAS makes
+        // the test's own `run_merge_once()` return `Ok(0)`, after which
+        // `merge.await.unwrap_err()` fails with "called `unwrap_err()` on an
+        // `Ok` value" — a second, distinct flake mode.  Same precedent as
+        // `cancelling_waiter_while_blocking_worker_is_queued_still_restores`.
+        index.abort_background_tasks();
         (engine, index)
     }
 
@@ -2005,21 +2057,29 @@ mod merge_publication_transaction_tests {
             .iter()
             .map(|meta| meta.id.clone())
             .collect();
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        // `entered` is awaited on the RUNTIME, not on a blocking-pool thread:
+        // the signal it waits for is produced by the merge encode, which
+        // `run_merge_once` submits to that very pool via `spawn_blocking`.
+        // Parking a pool thread here deadlocked the two against each other on
+        // 2-core runners — see `await_publication_barrier` for the mechanism.
+        // `resume` stays a sync barrier: blocking the merge worker inside the
+        // hook is exactly what this test exists to exercise.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let resume_rx = parking_lot::Mutex::new(Some(resume_rx));
         index.set_publication_test_hook(Some(Arc::new(move |_, point| {
             if point == PublicationTestPoint::MergeAfterRepoint {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
+                // Ignore a closed receiver: if the test body already panicked
+                // and dropped it, the real failure is that panic, not a
+                // secondary one raised on a merge worker thread.
+                let _ = entered_tx.lock().take().unwrap().send(());
                 await_barrier(&resume_rx.lock().take().unwrap(), "resume");
             }
         })));
         let merge_index = Arc::clone(&index);
         let merge = tokio::spawn(async move { merge_index.run_merge_once().await });
-        tokio::task::spawn_blocking(move || await_barrier(&entered_rx, "entered"))
-            .await
-            .unwrap();
+        await_publication_barrier(entered_rx, "entered").await;
         let read_index = Arc::clone(&index);
         let read = tokio::spawn(async move { read_index.get_document("a").await });
         tokio::task::yield_now().await;
@@ -14540,7 +14600,9 @@ impl Index {
                                 // candidate (rare).  The exact live count above used
                                 // `dead_matches` over the FULL set and is untouched.
                                 let mut seg_hits = seg_hits;
-                                if deletes_present && fts_cap != usize::MAX && seg_total > fts_cap as u64
+                                if deletes_present
+                                    && fts_cap != usize::MAX
+                                    && seg_total > fts_cap as u64
                                 {
                                     let dead_in_top = ghost_bm
                                         .as_deref()
@@ -14794,30 +14856,31 @@ impl Index {
                                         // set).  Shared by the in-walk 2×cap eager
                                         // trim and the end-of-run trim so admission
                                         // and final ordering always agree.
-                                        let trim_to_cap = |hits: Vec<Hit>| -> (Vec<Hit>, Option<f32>) {
-                                            let mut decorated: Vec<(u64, Hit)> = hits
-                                                .into_iter()
-                                                .map(|h| {
-                                                    (
-                                                        self.lookup_seq_no(&h.id)
-                                                            .unwrap_or(u64::MAX),
-                                                        h,
-                                                    )
-                                                })
-                                                .collect();
-                                            decorated.sort_by(|a, b| {
-                                                b.1.score
-                                                    .partial_cmp(&a.1.score)
-                                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                                    .then_with(|| a.0.cmp(&b.0))
-                                                    .then_with(|| a.1.id.cmp(&b.1.id))
-                                            });
-                                            decorated.truncate(materialisation_limit);
-                                            let worst = decorated.last().map(|(_, h)| h.score);
-                                            let kept =
-                                                decorated.into_iter().map(|(_, h)| h).collect();
-                                            (kept, worst)
-                                        };
+                                        let trim_to_cap =
+                                            |hits: Vec<Hit>| -> (Vec<Hit>, Option<f32>) {
+                                                let mut decorated: Vec<(u64, Hit)> = hits
+                                                    .into_iter()
+                                                    .map(|h| {
+                                                        (
+                                                            self.lookup_seq_no(&h.id)
+                                                                .unwrap_or(u64::MAX),
+                                                            h,
+                                                        )
+                                                    })
+                                                    .collect();
+                                                decorated.sort_by(|a, b| {
+                                                    b.1.score
+                                                        .partial_cmp(&a.1.score)
+                                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                                        .then_with(|| a.0.cmp(&b.0))
+                                                        .then_with(|| a.1.id.cmp(&b.1.id))
+                                                });
+                                                decorated.truncate(materialisation_limit);
+                                                let worst = decorated.last().map(|(_, h)| h.score);
+                                                let kept =
+                                                    decorated.into_iter().map(|(_, h)| h).collect();
+                                                (kept, worst)
+                                            };
                                         for sh in &seg_hits {
                                             // `seg_hits` descends by score, so once
                                             // a hit's score is STRICTLY below the
@@ -36285,14 +36348,16 @@ mod flush_memory_integration_tests {
             .unwrap();
         assert!(idx.memtable_bytes() > 0);
 
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        // `entered` fires from inside the flush finalize's `spawn_blocking`;
+        // wait for it on the runtime (see `await_publication_barrier`).
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let mut publisher_release = PublisherRelease(Some(release_tx));
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let release_rx = parking_lot::Mutex::new(Some(release_rx));
         let hook = FlushPublisherTestHook {
             callback: Arc::new(move || {
-                entered_tx.lock().take().unwrap().send(()).unwrap();
+                let _ = entered_tx.lock().take().unwrap().send(());
                 let _ = release_rx.lock().take().unwrap().recv();
                 inject_error
             }),
@@ -36307,9 +36372,7 @@ mod flush_memory_integration_tests {
             let idx = Arc::clone(&idx);
             tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
         };
-        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
-            .await
-            .unwrap();
+        await_publication_barrier(entered_rx, "entered").await;
         assert_eq!(idx.memtable_bytes(), 0);
         assert!(
             ledger

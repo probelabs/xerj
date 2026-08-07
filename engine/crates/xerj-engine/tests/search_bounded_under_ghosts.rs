@@ -224,7 +224,10 @@ async fn page_reaching_into_truncated_ghost_segment_is_exact() {
 
     // Ground truth: full materialisation.
     let full = idx.search(&match_body(500, false)).await.unwrap();
-    assert_eq!(full.total.value, expected_total, "live total wrong under ghosts");
+    assert_eq!(
+        full.total.value, expected_total,
+        "live total wrong under ghosts"
+    );
 
     // Pages that reach well into the weak segment must equal the ground-truth
     // prefix — this is the assertion the re-expand exists to satisfy.
@@ -232,7 +235,10 @@ async fn page_reaching_into_truncated_ghost_segment_is_exact() {
         let mut truth = page(&full.hits);
         truth.truncate(size);
         let r = idx.search(&match_body(size, false)).await.unwrap();
-        assert_eq!(r.total.value, expected_total, "size:{size} total drifted under ghosts");
+        assert_eq!(
+            r.total.value, expected_total,
+            "size:{size} total drifted under ghosts"
+        );
         assert_eq!(
             page(&r.hits),
             truth,
@@ -315,12 +321,23 @@ async fn large_single_segment_with_top_ghost_returns_exact_order() {
         .unwrap();
 
     let full = idx.search(&match_body(500, false)).await.unwrap();
-    assert_eq!(full.total.value, (n as u64) - 1, "live total wrong under a top ghost");
+    assert_eq!(
+        full.total.value,
+        (n as u64) - 1,
+        "live total wrong under a top ghost"
+    );
     for size in [10usize, 50, 200] {
         let mut truth = page(&full.hits);
         truth.truncate(size);
         let r = idx.search(&match_body(size, false)).await.unwrap();
-        assert_eq!(page(&r.hits), truth, "size:{size} order wrong with a top-scoring ghost");
-        assert!(r.hits.iter().all(|h| h.id != "weak0000"), "deleted top-scorer leaked");
+        assert_eq!(
+            page(&r.hits),
+            truth,
+            "size:{size} order wrong with a top-scoring ghost"
+        );
+        assert!(
+            r.hits.iter().all(|h| h.id != "weak0000"),
+            "deleted top-scorer leaked"
+        );
     }
 }
