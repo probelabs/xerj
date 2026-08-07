@@ -3230,7 +3230,9 @@ mod semantic_deadline_regression_tests {
             idx.remove_segment_hydration_entries(&old_meta.id);
         }
 
-        let all = (1_u64 << 7) - 1;
+        // Derived, not hard-coded: a new SegmentCacheCategory must widen this
+        // mask automatically or the test silently stops covering it.
+        let all = (1_u64 << CATEGORY_COUNT) - 1;
         idx.test_segment_cache_publish_ready_mask
             .store(0, Ordering::Release);
         idx.test_segment_cache_publish_pause_mask
@@ -3313,6 +3315,27 @@ mod semantic_deadline_regression_tests {
                         category,
                         1,
                         vec![b'{', b'}'],
+                    );
+                }
+                SegmentCacheCategory::FtsReader => {
+                    // Open with an empty field set: the reader is then cheap to
+                    // build and holds nothing, but it exercises the same
+                    // publish/evict path as a real one, which is what this test
+                    // is about. `open` on a flushed segment cannot fail here.
+                    let key = format!("{old_id}\u{1}");
+                    let reader = FtsIndexReader::open(
+                        idx.data_dir.join("segments"),
+                        old_id.clone(),
+                        &[] as &[&str],
+                    )
+                    .expect("opening a flushed segment with no fields must succeed");
+                    let _ = idx.publish_current(
+                        &idx.fts_reader_cache,
+                        &old_id,
+                        key,
+                        category,
+                        1,
+                        Arc::new(reader),
                     );
                 }
             }));
