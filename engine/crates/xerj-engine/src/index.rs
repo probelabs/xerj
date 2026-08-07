@@ -37,7 +37,9 @@ use xerj_vector::hnsw::{HnswIndex, HnswParams};
 use xerj_vector::Sq8Params;
 
 use crate::aggs::run_aggs_with_all;
-use crate::segment_cache_budget::{CacheResident, SegmentCacheCategory, SegmentHydrationBudget};
+use crate::segment_cache_budget::{
+    CacheResident, SegmentCacheCategory, SegmentHydrationBudget, CATEGORY_COUNT,
+};
 use crate::segment_cache_estimates as cache_estimates;
 
 pub(crate) type Resident<T> = Arc<CacheResident<T>>;
@@ -3288,7 +3290,9 @@ mod semantic_deadline_regression_tests {
             idx.remove_segment_hydration_entries(&old_meta.id);
         }
 
-        let all = (1_u64 << 7) - 1;
+        // Derived, not hard-coded: a new SegmentCacheCategory must widen this
+        // mask automatically or the test silently stops covering it.
+        let all = (1_u64 << CATEGORY_COUNT) - 1;
         idx.test_segment_cache_publish_ready_mask
             .store(0, Ordering::Release);
         idx.test_segment_cache_publish_pause_mask
@@ -3371,6 +3375,27 @@ mod semantic_deadline_regression_tests {
                         category,
                         1,
                         vec![b'{', b'}'],
+                    );
+                }
+                SegmentCacheCategory::FtsReader => {
+                    // Open with an empty field set: the reader is then cheap to
+                    // build and holds nothing, but it exercises the same
+                    // publish/evict path as a real one, which is what this test
+                    // is about. `open` on a flushed segment cannot fail here.
+                    let key = format!("{old_id}\u{1}");
+                    let reader = FtsIndexReader::open(
+                        idx.data_dir.join("segments"),
+                        old_id.clone(),
+                        &[] as &[&str],
+                    )
+                    .expect("opening a flushed segment with no fields must succeed");
+                    let _ = idx.publish_current(
+                        &idx.fts_reader_cache,
+                        &old_id,
+                        key,
+                        category,
+                        1,
+                        Arc::new(reader),
                     );
                 }
             }));
@@ -5076,6 +5101,29 @@ pub struct Index {
     /// Budgeted like `stored_slices_cache`; entries evicted by id at the
     /// merge-completion site.  Segments are immutable → no invalidation.
     decoded_stored_cache: Arc<dashmap::DashMap<String, Resident<Vec<u8>>>>,
+    /// Per-(segment, field-set) cache of an opened `FtsIndexReader`.
+    ///
+    /// `FtsIndexReader::open` was called INSIDE the per-segment loop of
+    /// `search_bounded` on every query, and it is not cheap: it performs TWO
+    /// zstd decompressions per field — the whole `.post` blob (`ZPS1`) and the
+    /// whole `.meta` flat array (`ZFM4`) — into owned `Vec`s, because a
+    /// compressed blob cannot be mmap'd. Measured on one real production field
+    /// (`body`, 17.0 MB `.post` -> 25.3 MB, 2.8 MB `.meta` -> 15.8 MB): ~50 ms
+    /// and ~41 MB per (segment, field), rebuilt and thrown away every query.
+    /// The comment on `PostData` ("open allocates almost nothing per segment")
+    /// describes only the uncompressed/mmap path, which modern segments never
+    /// take.
+    ///
+    /// Segments are immutable, so this needs no invalidation — the same
+    /// argument every other cache here rests on. Entries are evicted by id at
+    /// the merge-completion site and the payload is budget-charged, so a large
+    /// corpus degrades to today's open-per-query rather than growing without
+    /// bound.
+    ///
+    /// The key includes the field set because `open` loads exactly the fields
+    /// it is asked for; a reader opened for a narrower set must never satisfy
+    /// a query needing a wider one.
+    fts_reader_cache: Arc<dashmap::DashMap<String, Resident<Arc<FtsIndexReader>>>>,
     /// Per-(segment, query-shape) match-count cache for the
     /// `try_shortcut_count` Bool intersection arm.  The fused columnar
     /// walk is O(anchor-predicate matches) per segment PER QUERY — for a
@@ -5193,7 +5241,7 @@ impl Index {
     /// Aggregate DashMap table capacities for the seven hydration families.
     /// These are diagnostic table slots, separate from the refundable
     /// retained-payload/key budget.
-    pub fn segment_hydration_cache_capacities(&self) -> [usize; 7] {
+    pub fn segment_hydration_cache_capacities(&self) -> [usize; CATEGORY_COUNT] {
         [
             self.stored_slices_cache.capacity(),
             self.dv_cache.capacity(),
@@ -5202,6 +5250,7 @@ impl Index {
             self.id_pos_cache.capacity(),
             self.row_seq_cache.capacity(),
             self.decoded_stored_cache.capacity(),
+            self.fts_reader_cache.capacity(),
         ]
     }
 
@@ -5482,6 +5531,7 @@ impl Index {
             stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(dashmap::DashMap::new()),
             decoded_stored_cache: Arc::new(dashmap::DashMap::new()),
+            fts_reader_cache: Arc::new(dashmap::DashMap::new()),
             shortcut_count_cache: Arc::new(dashmap::DashMap::new()),
             ghost_positions_cache: Arc::new(dashmap::DashMap::new()),
             regexp_expand_cache: Arc::new(dashmap::DashMap::new()),
@@ -5828,6 +5878,7 @@ impl Index {
             stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(dashmap::DashMap::new()),
             decoded_stored_cache: Arc::new(dashmap::DashMap::new()),
+            fts_reader_cache: Arc::new(dashmap::DashMap::new()),
             shortcut_count_cache: Arc::new(dashmap::DashMap::new()),
             ghost_positions_cache: Arc::new(dashmap::DashMap::new()),
             regexp_expand_cache: Arc::new(dashmap::DashMap::new()),
@@ -7331,6 +7382,7 @@ impl Index {
         let excluded_fts_fields = self
             .flush_signal
             .semantic_derived_vector_fields(&self.schema);
+        let dv_skip = self.flush_signal.doc_values_skip_set(&self.schema);
         let dataset_version = Arc::clone(&self.dataset_version);
         let query_cache = Arc::clone(&self.query_cache);
         let warm_caches = self.publish_warm_caches();
@@ -7360,6 +7412,7 @@ impl Index {
                 data_dir,
                 field_configs,
                 excluded_fts_fields,
+                dv_skip,
                 on_drained,
                 warm_caches,
                 #[cfg(test)]
@@ -7575,11 +7628,12 @@ impl Index {
         // memtable, writes the segment file + FTS index, swaps the snapshot,
         // and checkpoints the WAL.  The drained memtable is dropped, freeing
         // all RAM.
-        let (field_configs, excluded_fts_fields) = {
+        let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
                 crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                doc_values_skip_set(&schema.schema),
             )
         };
         // Explicit refresh: wait behind any in-flight concurrent flushes
@@ -7603,6 +7657,7 @@ impl Index {
                 self.data_dir.clone(),
                 field_configs.clone(),
                 excluded_fts_fields.clone(),
+                dv_skip.clone(),
                 || {}, // serial refresh path — no permit to drop early
                 self.publish_warm_caches(),
                 #[cfg(test)]
@@ -7710,9 +7765,12 @@ impl Index {
                 let _ = field_configs_once.set(cfg.clone());
                 cfg
             };
-            let excluded_fts_fields = {
+            let (excluded_fts_fields, dv_skip) = {
                 let schema = self.schema.read().await;
-                crate::memtable::semantic_derived_vector_fields(&schema.schema)
+                (
+                    crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                    doc_values_skip_set(&schema.schema),
+                )
             };
 
             let flush_signal_cb = Arc::clone(&self.flush_signal);
@@ -7739,6 +7797,7 @@ impl Index {
                     data_dir,
                     field_configs,
                     excluded_fts_fields,
+                    dv_skip,
                     on_drained,
                     warm_caches,
                     #[cfg(test)]
@@ -8027,6 +8086,14 @@ impl Index {
             }
         }
 
+        // Derived once from the schema, then moved into each merge task: a
+        // force-merge must not resurrect a doc-values column that flush
+        // correctly skipped.
+        let dv_skip = {
+            let guard = self.schema.read().await;
+            doc_values_skip_set(&guard.schema)
+        };
+
         // Launch up to MERGE_PARALLELISM tasks at a time, consuming the
         // queue as tasks complete.  Results are applied back to the
         // snapshot in the order they finish (apply_merge is atomic).
@@ -8056,6 +8123,7 @@ impl Index {
             let field_configs_for_task = field_configs.clone();
             let excluded_fts_fields_for_task = excluded_fts_fields.clone();
             let segments_dir_for_task = segments_dir.clone();
+            let dv_skip_for_merge = dv_skip.clone();
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
@@ -8506,8 +8574,10 @@ impl Index {
                     // Doc-values side-car — reuse the same `Value`s we
                     // stashed in fts_input above (M5.22).
                     {
-                        let columns =
-                            build_doc_value_columns(fts_input.iter().map(|(_, _, v)| Some(v)));
+                        let columns = build_doc_value_columns(
+                            fts_input.iter().map(|(_, _, v)| Some(v)),
+                            &dv_skip_for_merge,
+                        );
                         if !columns.is_empty() {
                             if let Err(e) = write_doc_values_sidecar(
                                 &segments_dir_for_task,
@@ -14486,13 +14556,13 @@ impl Index {
                 let mut fts_deadline_tripped = false;
                 let t_fts = std::time::Instant::now();
                 let reader_opt = if needs_fts {
-                    FtsIndexReader::open(&fts_dir, &seg_id, &field_refs).ok()
+                    self.fts_reader_for(&fts_dir, &seg_id, &field_refs)
                 } else {
                     None
                 };
                 dbg_fts_ms += t_fts.elapsed().as_millis() as u64;
                 if let Some(reader) = reader_opt {
-                    let reader = Arc::new(reader);
+                    let reader = Arc::clone(&*reader);
                     // Arm the cooperative deadline (RC4 blocker 12): the
                     // searcher's multi-term expansions (prefix / wildcard /
                     // fuzzy term-dictionary walks) are otherwise
@@ -16657,11 +16727,12 @@ impl Index {
 
     /// Flush the memtable to a new segment on disk, then build the FTS index.
     pub async fn flush(self: &Arc<Self>) -> Result<()> {
-        let (field_configs, excluded_fts_fields) = {
+        let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
                 crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                doc_values_skip_set(&schema.schema),
             )
         };
         // M5.15 — PARALLEL final flush.
@@ -16704,6 +16775,7 @@ impl Index {
                 let data_dir = data_dir.clone();
                 let field_configs = field_configs.clone();
                 let excluded_fts_fields = excluded_fts_fields.clone();
+                let dv_skip = dv_skip.clone();
                 let warm_caches = warm_caches.clone();
                 #[cfg(test)]
                 let test_hook = flush_test_hook.clone();
@@ -16725,6 +16797,7 @@ impl Index {
                         data_dir,
                         field_configs,
                         excluded_fts_fields,
+                        dv_skip,
                         on_drained,
                         warm_caches,
                         #[cfg(test)]
@@ -17445,8 +17518,38 @@ impl Index {
 // This mirrors what ES does when `dynamic` mapping infers field types
 // without explicit schema declarations.
 
+/// Fields whose declared mapping says they must NOT get a doc-values column.
+///
+/// Derived from the SCHEMA rather than from the documents, so it is stable
+/// across flush and merge — a force-merge must not resurrect a column that
+/// flush correctly skipped. Dynamic (unmapped) fields are absent from the
+/// schema and keep today's behaviour of getting a column.
+pub fn doc_values_skip_set(schema: &Schema) -> std::collections::HashSet<String> {
+    let mut skip = std::collections::HashSet::new();
+    for field in &schema.fields {
+        if !field.options.doc_values {
+            skip.insert(field.name.clone());
+        }
+    }
+    skip
+}
+
+/// Build the per-segment doc-values columns.
+///
+/// `skip` names fields whose declared mapping says they must not have
+/// doc-values — either an explicit `"doc_values": false`, or an analyzed/large
+/// type (`text`, `semantic_text`, `binary`, …) that did not ask for them. The
+/// builder is otherwise schema-free and files a column for every `_source` key
+/// it sees, which is how `"doc_values": false` came to be silently ignored.
+///
+/// This is the single largest artifact on text-heavy corpora: on the 500k-doc
+/// rc.12 benchmark the one analyzed `text` field is 95.87% of the `.dv` side-car
+/// and 35.6% of the whole index. It is much smaller where `_source` dominates
+/// (6.97% across the `xc-*` code corpora), so the saving is corpus-dependent and
+/// must always be quoted as a range.
 fn build_doc_value_columns<'a>(
     sources: impl Iterator<Item = Option<&'a Value>>,
+    skip: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeMap<String, xerj_storage::doc_values::Column> {
     use std::collections::BTreeMap;
     use xerj_storage::doc_values::{Column, KeywordColumn, NumericColumn};
@@ -17481,6 +17584,11 @@ fn build_doc_value_columns<'a>(
             // Skip the `_id`, `_seq_no`, `_source` envelope keys — they're
             // bookkeeping, not user data.
             if field.starts_with('_') {
+                continue;
+            }
+            // Honour the declared mapping. Checked before any allocation so a
+            // skipped field costs nothing per doc.
+            if skip.contains(field.as_str()) {
                 continue;
             }
             // Lookup-first (`get_mut` before `entry`) so the common case
@@ -18746,6 +18854,10 @@ impl Index {
         self.row_seq_cache.remove(segment_id);
         self.stored_slices_cache.remove(segment_id);
         self.decoded_stored_cache.remove(segment_id);
+        // Keyed by "<segment_id>\u{1}<field-set>", so evict by prefix.
+        let fts_prefix = format!("{segment_id}\u{1}");
+        self.fts_reader_cache
+            .retain(|key, _| !key.starts_with(&fts_prefix));
         let shadow_prefix = format!("{segment_id}\u{1}");
         self.sort_shadow_cache
             .retain(|key, _| !key.starts_with(&shadow_prefix));
@@ -18773,6 +18885,48 @@ impl Index {
         if self.sort_shadow_cache.is_empty() {
             self.sort_shadow_cache.shrink_to_fit();
         }
+    }
+
+    /// Open a segment's FTS side-cars, reusing a cached reader when one exists.
+    ///
+    /// This is the read-side of `fts_reader_cache`. See that field for why the
+    /// open is expensive (two zstd decompressions per field, ~50 ms / ~41 MB on
+    /// a real production field) and why caching is sound (segments are
+    /// immutable).
+    ///
+    /// Returns `None` exactly where the previous inline
+    /// `FtsIndexReader::open(..).ok()` returned `None`, so a missing or
+    /// unreadable side-car still falls through to the stored-doc scan rather
+    /// than failing the query.
+    fn fts_reader_for(
+        &self,
+        fts_dir: &std::path::Path,
+        segment_id: &str,
+        fields: &[&str],
+    ) -> Option<Resident<Arc<FtsIndexReader>>> {
+        // The field set is part of the identity: `open` loads only the fields
+        // it is given, so a reader opened for a narrower set must never serve a
+        // query that needs a wider one. Sort so that permutations of the same
+        // set share one entry.
+        let mut sorted: Vec<&str> = fields.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let key = format!("{segment_id}\u{1}{}", sorted.join("\u{2}"));
+
+        if let Some(hit) = self.fts_reader_cache.get(&key) {
+            return Some(Arc::clone(hit.value()));
+        }
+
+        let reader = Arc::new(FtsIndexReader::open(fts_dir, segment_id, fields).ok()?);
+        let bytes = reader.retained_bytes();
+        Some(self.publish_current(
+            &self.fts_reader_cache,
+            segment_id,
+            key,
+            SegmentCacheCategory::FtsReader,
+            bytes,
+            reader,
+        ))
     }
 
     fn dv_columns_for(
@@ -22538,6 +22692,10 @@ async fn do_flush_shard(
     data_dir: PathBuf,
     field_configs: HashMap<String, xerj_fts::index::FieldIndexConfig>,
     excluded_fts_fields: std::collections::HashSet<String>,
+    // Fields the mapping says get no doc-values column. Threaded through for
+    // the same reason as `excluded_fts_fields`: this is a free fn with no
+    // access to `Index`.
+    dv_skip_for_flush: std::collections::HashSet<String>,
     on_drained: impl FnOnce() + Send + 'static,
     // Publish-time cache warm (see `warm_segment_at_publish`): the index's
     // read-path caches, threaded through because this is a free fn without
@@ -22801,6 +22959,7 @@ async fn do_flush_shard(
                     drained_fts_for_build
                         .iter()
                         .map(|(_id, _fields, src)| Some(src.as_ref())),
+                    &dv_skip_for_flush,
                 );
                 if !columns.is_empty() {
                     write_doc_values_sidecar(&segments_dir_for_dv, meta.id.as_str(), &columns)
@@ -23085,6 +23244,19 @@ impl SyncFlushCoord {
         });
         *self.field_configs_cache.write() = Some(cfg.clone());
         cfg
+    }
+
+    fn doc_values_skip_set(
+        &self,
+        schema: &Arc<RwLock<ManagedSchema>>,
+    ) -> std::collections::HashSet<String> {
+        let Some(rt) = self.rt.as_ref() else {
+            return std::collections::HashSet::new();
+        };
+        rt.block_on(async {
+            let guard = schema.read().await;
+            doc_values_skip_set(&guard.schema)
+        })
     }
 
     fn semantic_derived_vector_fields(
@@ -36650,11 +36822,12 @@ mod flush_memory_integration_tests {
             .unwrap();
 
         let shard = idx.memtable.shard_for_dynamic(&doc_id);
-        let (field_configs, excluded_fts_fields) = {
+        let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = idx.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
                 crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                doc_values_skip_set(&schema.schema),
             )
         };
         let mut warm_caches = idx.publish_warm_caches();
@@ -36692,6 +36865,7 @@ mod flush_memory_integration_tests {
             idx.data_dir.clone(),
             field_configs,
             excluded_fts_fields,
+            dv_skip,
             || {},
             warm_caches,
             Some(hook),

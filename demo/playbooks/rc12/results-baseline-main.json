@@ -1,0 +1,128 @@
+{
+  "label": "baseline-main",
+  "docs": 500000,
+  "raw_source_bytes": 356593195,
+  "index_total_bytes": 154413168,
+  "index_over_raw": 0.433,
+  "ingest_seconds": 33.0,
+  "forcemerge_seconds": 116.52,
+  "by_artifact": {
+    "dv": 57357593,
+    "seg": 51449817,
+    "post": 40951589,
+    "ids": 3057388,
+    "meta": 1464327,
+    "fst": 64485,
+    "json": 35338,
+    "norms": 28305,
+    "wal": 4119,
+    "toml": 104,
+    "xerj_master_key": 64,
+    "sidx": 32,
+    "lock": 7
+  },
+  "queries": {
+    "term_keyword_low_card": {
+      "p50_ms": 0.297,
+      "p99_ms": 0.488,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "term_keyword_high_card": {
+      "p50_ms": 0.208,
+      "p99_ms": 0.559,
+      "took_ms": 0,
+      "hits": 1
+    },
+    "range_date_narrow": {
+      "p50_ms": 0.327,
+      "p99_ms": 0.584,
+      "took_ms": 0,
+      "hits": 50
+    },
+    "range_long_wide": {
+      "p50_ms": 0.302,
+      "p99_ms": 0.455,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "match_text_common": {
+      "p50_ms": 0.287,
+      "p99_ms": 0.361,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "match_text_multi": {
+      "p50_ms": 0.313,
+      "p99_ms": 0.406,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "match_phrase": {
+      "p50_ms": 0.282,
+      "p99_ms": 0.544,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "bool_must_filter": {
+      "p50_ms": 0.368,
+      "p99_ms": 0.743,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "deep_page": {
+      "p50_ms": 1.043,
+      "p99_ms": 1.161,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "large_page": {
+      "p50_ms": 4.718,
+      "p99_ms": 5.937,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "sort_by_numeric": {
+      "p50_ms": 1.171,
+      "p99_ms": 1.38,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "agg_terms_low_card": {
+      "p50_ms": 0.208,
+      "p99_ms": 0.296,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "agg_terms_high_card": {
+      "p50_ms": 0.239,
+      "p99_ms": 0.348,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "agg_stats_numeric": {
+      "p50_ms": 0.194,
+      "p99_ms": 0.308,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "agg_date_histogram": {
+      "p50_ms": 0.329,
+      "p99_ms": 0.456,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "agg_histogram_numeric": {
+      "p50_ms": 0.229,
+      "p99_ms": 0.379,
+      "took_ms": 0,
+      "hits": 10000
+    },
+    "agg_nested_terms_stats": {
+      "p50_ms": 0.213,
+      "p99_ms": 0.61,
+      "took_ms": 0,
+      "hits": 10000
+    }
+  }
+}

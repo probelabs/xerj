@@ -1253,6 +1253,37 @@ impl FtsIndexReader {
         }
     }
 
+    /// Heap bytes this reader retains, for the segment-cache budget.
+    ///
+    /// Only *owned* allocations are counted. `Mmap` backings are deliberately
+    /// excluded: they are page-cache pages the kernel can reclaim, not heap the
+    /// process is responsible for, and charging them would make the budget
+    /// refuse to cache readers that cost almost nothing to hold.
+    ///
+    /// The dominant terms are the two decompressed blobs. A compressed `.post`
+    /// (`ZPS1`) or `.meta` (`ZFM4`) cannot be mmap'd — it must be inflated into
+    /// an owned `Vec` at open time — so on a modern segment this is essentially
+    /// `post_uncompressed + meta_uncompressed`.
+    pub fn retained_bytes(&self) -> u64 {
+        let mut total: u64 = 0;
+        for (name, f) in &self.fields {
+            total += name.len() as u64;
+            if let PostData::Owned(v) = &f.post_data {
+                total += v.len() as u64;
+            }
+            if let FstData::Owned(m) = &f.fst {
+                total += m.as_fst().as_bytes().len() as u64;
+            }
+            total += f.meta.flat_records.len() as u64;
+            // `norms` is Vec<(u32, u16)>, which pads to 8 bytes per element.
+            total += (f.norms.len() as u64) * 8;
+            // Legacy ZFM1/ZFM2 keep per-term metadata in a HashMap instead of
+            // the flat array; approximate it rather than walking every entry.
+            total += (f.meta.terms.len() as u64) * 64;
+        }
+        total
+    }
+
     /// Look up a term in a field.
     ///
     /// Returns `Some(TermPostings)` if the term exists, `None` otherwise.
