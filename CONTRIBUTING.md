@@ -59,6 +59,17 @@ Run the full suite before opening a PR. A test that was passing yesterday and fa
 - Match the style, naming, and comment density of the surrounding code.
 - Comments should explain constraints and non-obvious *why*, not narrate the code.
 
+## Reference-coding (required for non-trivial subsystem work)
+
+Most of what XERJ does — merge policy, WAL recovery and crash safety, HNSW graph construction, compaction, postings layout — has been solved before, in public, by projects that hit the edge cases first. **Before writing a non-trivial implementation in one of these areas, read how at least one peer project solved it, and cite `file:line` in your PR description for anything you relied on.** Reviewers will ask.
+
+Two rules bind regardless of how you do the reading:
+
+- **Retrieved code is evidence, not authority.** A passage shows how *that* project solved the problem under *its* constraints, which are not automatically ours. Adapt and attribute; do not paste.
+- **Check the licence first.** XERJ is Apache-2.0. Some relevant projects are not compatible with copying — Sonic is GPL, and Elasticsearch is AGPL/SSPL/Elastic-licensed. You may study the *approach*, but their code must not land here. For Elasticsearch there is a second reason: XERJ states publicly that it shares no code with ES, and that has to stay true — read it for wire-protocol semantics, never for implementation. When in doubt, write your own implementation from the design, or ask in the PR.
+
+If you use an AI coding assistant, this step is where it earns its keep: retrieving the real implementation is far more reliable than letting the model re-derive an algorithm across retry loops. Maintainers dogfood XERJ itself for this — reference repositories are indexed locally and queried with `xerj autoindex` plus the `xc.py` helper in the internal `xerj-code` tooling. That setup is convenience, not a requirement for contributing; reading the upstream source directly satisfies the same rule.
+
 ## Git workflow
 
 Every non-trivial change lands on a task-named branch, gets a commit with a body explaining the motivation (and before/after benchmark numbers for perf work), and is fast-forwarded into `main`. The git history is the project's engineering log.
