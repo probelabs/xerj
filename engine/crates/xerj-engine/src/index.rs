@@ -14540,7 +14540,9 @@ impl Index {
                                 // candidate (rare).  The exact live count above used
                                 // `dead_matches` over the FULL set and is untouched.
                                 let mut seg_hits = seg_hits;
-                                if deletes_present && fts_cap != usize::MAX && seg_total > fts_cap as u64
+                                if deletes_present
+                                    && fts_cap != usize::MAX
+                                    && seg_total > fts_cap as u64
                                 {
                                     let dead_in_top = ghost_bm
                                         .as_deref()
@@ -14794,30 +14796,31 @@ impl Index {
                                         // set).  Shared by the in-walk 2×cap eager
                                         // trim and the end-of-run trim so admission
                                         // and final ordering always agree.
-                                        let trim_to_cap = |hits: Vec<Hit>| -> (Vec<Hit>, Option<f32>) {
-                                            let mut decorated: Vec<(u64, Hit)> = hits
-                                                .into_iter()
-                                                .map(|h| {
-                                                    (
-                                                        self.lookup_seq_no(&h.id)
-                                                            .unwrap_or(u64::MAX),
-                                                        h,
-                                                    )
-                                                })
-                                                .collect();
-                                            decorated.sort_by(|a, b| {
-                                                b.1.score
-                                                    .partial_cmp(&a.1.score)
-                                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                                    .then_with(|| a.0.cmp(&b.0))
-                                                    .then_with(|| a.1.id.cmp(&b.1.id))
-                                            });
-                                            decorated.truncate(materialisation_limit);
-                                            let worst = decorated.last().map(|(_, h)| h.score);
-                                            let kept =
-                                                decorated.into_iter().map(|(_, h)| h).collect();
-                                            (kept, worst)
-                                        };
+                                        let trim_to_cap =
+                                            |hits: Vec<Hit>| -> (Vec<Hit>, Option<f32>) {
+                                                let mut decorated: Vec<(u64, Hit)> = hits
+                                                    .into_iter()
+                                                    .map(|h| {
+                                                        (
+                                                            self.lookup_seq_no(&h.id)
+                                                                .unwrap_or(u64::MAX),
+                                                            h,
+                                                        )
+                                                    })
+                                                    .collect();
+                                                decorated.sort_by(|a, b| {
+                                                    b.1.score
+                                                        .partial_cmp(&a.1.score)
+                                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                                        .then_with(|| a.0.cmp(&b.0))
+                                                        .then_with(|| a.1.id.cmp(&b.1.id))
+                                                });
+                                                decorated.truncate(materialisation_limit);
+                                                let worst = decorated.last().map(|(_, h)| h.score);
+                                                let kept =
+                                                    decorated.into_iter().map(|(_, h)| h).collect();
+                                                (kept, worst)
+                                            };
                                         for sh in &seg_hits {
                                             // `seg_hits` descends by score, so once
                                             // a hit's score is STRICTLY below the
