@@ -17451,6 +17451,95 @@ mod passage_scroll_tests {
         }
     }
 
+    /// #174: a LEXICAL query that requests `fields: ["_passage"]` used to be
+    /// a silent no-op — `_passage` was populated only by the kNN/semantic
+    /// executors, so a caller slicing a large `body` got the licence banner
+    /// and `#include` block instead of the code that made the file match.
+    /// The lexical path must return the query-term-densest line-snapped
+    /// window with exact byte offsets into the original field.
+    #[tokio::test]
+    async fn lexical_multi_match_fills_passage_with_exact_offsets() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("body", FieldType::Text));
+        schema
+            .fields
+            .push(FieldConfig::new("title", FieldType::Text));
+        state
+            .engine
+            .create_index("lexical-passages", schema)
+            .unwrap();
+        let index = state.engine.get_index("lexical-passages").unwrap();
+        // A "large source file": banner and includes at the head, the
+        // definition that makes the file the right answer buried ~7 KB deep.
+        let source_body = format!(
+            "/* licence banner */\n{}void addReplyNull(client *c) {{\n    addReplyProto(c, \"$-1\\r\\n\", 5);\n}}\n{}",
+            "#include <deps.h>\n".repeat(400),
+            "static void trailer(void) {}\n".repeat(200),
+        );
+        index
+            .index_document(
+                Some("networking.c".into()),
+                json!({"body": source_body, "title": "networking", "page": 2}),
+            )
+            .await
+            .unwrap();
+        index.refresh().await.unwrap();
+        let app = crate::router::build_es_compat_router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/lexical-passages/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "size": 1,
+                            "fields": ["_passage"],
+                            "query": {"multi_match": {
+                                "query": "addReplyNull null bulk string reply",
+                                "fields": ["body", "title"]
+                            }}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resp: Value = serde_json::from_slice(&bytes).unwrap();
+        let passage = &resp["hits"]["hits"][0]["fields"]["_passage"][0];
+        assert!(
+            passage.is_object(),
+            "lexical `_passage` must not be a silent no-op: {resp}"
+        );
+        assert_eq!(passage["field"], "body");
+        assert_eq!(passage["page"], 2);
+        let start = passage["start_offset"].as_u64().unwrap() as usize;
+        let end = passage["end_offset"].as_u64().unwrap() as usize;
+        let text = passage["text"].as_str().unwrap();
+        assert_eq!(
+            &source_body[start..end],
+            text,
+            "offsets must slice the original field exactly"
+        );
+        assert!(
+            text.contains("addReplyNull"),
+            "the passage must carry the code that made the file rank, got: {text:?}"
+        );
+        assert!(start > 0, "the head-of-file slice is exactly the #174 bug");
+        assert_eq!(
+            passage["ordinal"].as_u64().unwrap() as usize,
+            source_body[..start].matches('\n').count(),
+            "ordinal = zero-based line index of the window start"
+        );
+    }
+
     async fn assert_ambiguous_passage_query_is_actionable_400(app: &axum::Router, body: Value) {
         let response = app
             .clone()
