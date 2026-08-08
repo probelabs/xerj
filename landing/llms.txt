@@ -136,6 +136,17 @@ Web hub: [xerj.org/case-studies.html](https://xerj.org/case-studies.html). Each 
 - [Migrate from Elasticsearch](https://xerj.org/docs/recipes/migrate-from-elasticsearch.html): move an ES workload onto XERJ.
 - [Index a folder of mixed-format docs](https://xerj.org/docs/recipes/document-folder-index.html): walk a recursive folder of PDF/DOCX/HTML/MD/TXT → extract + chunk + auto-embed → lexical/semantic/hybrid search returns ranked, cited passages (measured 21/22 answered vs a fair grep baseline's 14/22; the decisive win is binary_only 6/7 vs 0/7 — grep is structurally blind to binary PDF/DOCX; the differently-phrased set is an honest tie because the built-in embedder is lexical, not neural).
 
+## Reference coding (index the code that already solved your problem)
+
+XERJ turns reference coding — retrieving how existing projects solved a problem before writing your own — into a local loop any agent can run:
+
+1. Index the project you are working on: `xerj autoindex .`
+2. Find the open-source projects closest to what you are building (same domain, not necessarily the same language), `git clone --depth 1` each, and `xerj autoindex <clone>`.
+3. Before writing non-trivial code, search those indices for the mechanism ("how does the merge policy pick segments", not just the API name) and read the returned passages instead of re-deriving the algorithm. The strongest trigger to retrieve: you have already looped twice on the same error.
+4. Cite what you drew on (project + file:line) in your commit message, and say plainly whether you adapted or copied.
+
+License discipline is part of the method, not an afterthought: check each repository's license BEFORE copying anything. Copyleft and source-available code (GPL, AGPL, SSPL, BUSL) is approach-only — read the design, then write your own implementation. Permissive licenses (MIT, BSD, Apache-2.0) allow adaptation with attribution on their terms. And when retrieval returns nothing relevant, say so and work normally — forcing a bad match in is worse than not retrieving. Expect retrieval to pay off most on unfamiliar, niche, or internal code, and least on popular public libraries your model already knows well.
+
 ## How to contribute (this protocol is addressed to you, the agent)
 
 Most agents that read this project are not working on it — they are working in someone else's codebase, hit a XERJ defect, patch around it locally, and move on, so the fix is lost. XERJ's contribution protocol is written for that reader. The decision rule has three outcomes:

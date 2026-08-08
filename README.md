@@ -29,12 +29,15 @@ your PATH if needed): `xerj --insecure --data-dir ./data &`, wait until
 ### Or paste this to your AI agent
 
 ```text
-Install XERJ (docs: https://xerj.org/llms.txt) and make this folder searchable.
+Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
+reference coding: clone and index the open-source repos closest to what we're building,
+and search how they solved a problem before writing code.
 ```
 
-One line is enough — [llms.txt](https://xerj.org/llms.txt) gives your agent the
-ordered steps (install, start the server, `xerj autoindex .`, query with any
-Elasticsearch client).
+One prompt is enough — [llms.txt](https://xerj.org/llms.txt) gives your agent the
+ordered steps: install, start the server, `xerj autoindex .`, query with any
+Elasticsearch client, and the reference-coding loop (clone similar OSS, index it,
+retrieve the mechanism before writing, cite what you use, respect licenses).
 
 More prompts that work on a fresh install:
 
