@@ -832,6 +832,17 @@ pub async fn create_index(
                     .insert(index.clone(), Value::Object(resolved_aliases));
             }
 
+            // ES-shape lifecycle attach: `index.lifecycle.name` in create-time
+            // settings is how ILM associates an index with a policy (there is
+            // no dedicated "attach" endpoint on the ES surface, unlike ISM's
+            // explicit `POST _plugins/_ism/add/{index}`). Best-effort and
+            // silent on a missing/untranslatable policy — real ILM is
+            // equally lenient here: it discovers the policy by name lazily
+            // and simply doesn't start managing until one exists.
+            if let Some(policy_name) = ilm_policy_name_from_settings(&body) {
+                let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
+            }
+
             let resp = EsIndexResponse::ok(&index);
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -20910,7 +20921,31 @@ pub async fn put_settings(
         state.engine.index_settings.insert(idx.clone(), existing);
     }
 
+    // Same lazy, best-effort `index.lifecycle.name` attach as create_index —
+    // `PUT {index}/_settings {"index.lifecycle.name": "policy"}` is the
+    // other real ILM entry point (attaching to an index that already
+    // exists, not just at creation).
+    if let Some(policy_name) = ilm_policy_name_from_settings(&body) {
+        for idx in &targets {
+            let _ = crate::ism_api::attach_policy(&state, idx, &policy_name).await;
+        }
+    }
+
     Json(json!({ "acknowledged": true })).into_response()
+}
+
+/// Extract `index.lifecycle.name` from an index-settings body, accepting
+/// both the nested (`{"index":{"lifecycle":{"name":"..."}}}`,
+/// `{"settings":{...}}`-wrapped at create time) and flat dotted-key
+/// (`{"index.lifecycle.name":"..."}`) forms ES accepts for every index
+/// setting.
+fn ilm_policy_name_from_settings(body: &Value) -> Option<String> {
+    let settings = body.get("settings").unwrap_or(body);
+    settings
+        .pointer("/index/lifecycle/name")
+        .or_else(|| settings.get("index.lifecycle.name"))
+        .and_then(Value::as_str)
+        .map(String::from)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -22722,10 +22757,34 @@ pub async fn put_ilm_policy(
     Path(name): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // Persist the policy in the real ILM store; `get_ilm_policy` reads it back
-    // out of this same DashMap, so PUT then GET round-trips faithfully.
-    state.engine.ilm_policies.insert(name, body);
-    Json(json!({ "acknowledged": true })).into_response()
+    // Persist the raw policy verbatim in the ILM store; `get_ilm_policy`
+    // reads it back out of this same DashMap, so PUT then GET round-trips
+    // faithfully regardless of whether translation below succeeds.
+    state.engine.ilm_policies.insert(name.clone(), body.clone());
+
+    // Translate into the shared internal model (`xerj_engine::lifecycle`)
+    // so the SAME background job that drives native ISM policies also
+    // drives this one — see that module's doc comment for why. Real ILM
+    // is lenient about phase actions it can't reproduce internally too
+    // (e.g. `searchable_snapshot` is best-effort); mirroring that, a
+    // translation failure here doesn't fail the PUT — the policy is
+    // still stored and GET-able, it just won't actually execute (no entry
+    // lands in `ism_policies`) until it's fixed. Surfaced back in the
+    // response so this isn't silent.
+    match xerj_engine::lifecycle::translate_ilm_policy(&body) {
+        Ok(policy) => {
+            state.engine.put_ism_policy(name, policy);
+            Json(json!({ "acknowledged": true })).into_response()
+        }
+        Err(reason) => Json(json!({
+            "acknowledged": true,
+            "xerj_lifecycle_execution": {
+                "status": "unsupported",
+                "reason": reason,
+            }
+        }))
+        .into_response(),
+    }
 }
 
 pub async fn get_ilm_policy(
@@ -22756,11 +22815,45 @@ pub async fn delete_ilm_policy(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     if state.engine.ilm_policies.remove(&name).is_some() {
+        state.engine.remove_ism_policy(&name);
         Json(json!({ "acknowledged": true })).into_response()
     } else {
         let e = xerj_common::XerjError::index_not_found(format!("policy [{name}] not found"));
         ApiError::new(e).into_response()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /{index}/_ilm/explain
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub async fn ilm_explain(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+) -> impl IntoResponse {
+    let mut indices = serde_json::Map::new();
+    match state.engine.managed_indices.get(&index) {
+        Some(managed) => {
+            indices.insert(
+                index.clone(),
+                json!({
+                    "index": index,
+                    "managed": true,
+                    "policy": managed.policy_id,
+                    "phase": managed.current_state,
+                    "phase_time_millis": managed.state_entered_at_ms,
+                    "action": managed.info_message,
+                    "step": managed.info_message,
+                    "step_info": { "message": managed.info_message },
+                    "failed_step": if managed.failed { Some(managed.info_message.clone()) } else { None },
+                }),
+            );
+        }
+        None => {
+            indices.insert(index.clone(), json!({ "index": index, "managed": false }));
+        }
+    }
+    Json(json!({ "indices": Value::Object(indices) })).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

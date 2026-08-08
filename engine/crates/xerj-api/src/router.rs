@@ -28,7 +28,8 @@ use uuid::Uuid;
 use xerj_common::config::CorsConfig;
 
 use crate::{
-    auth::auth_middleware, authz, es_compat, graph_api, memory_api, native, state::AppState,
+    auth::auth_middleware, authz, es_compat, graph_api, ism_api, memory_api, native,
+    state::AppState,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -454,6 +455,22 @@ pub fn build_es_compat_router(state: AppState) -> Router {
                 .get(es_compat::get_ilm_policy)
                 .delete(es_compat::delete_ilm_policy),
         )
+        .route("/:index/_ilm/explain", get(es_compat::ilm_explain))
+        // ── ISM (OpenSearch Index State Management) ─────────────────────────
+        // Same execution engine as ILM above — see `xerj_engine::lifecycle`.
+        .route(
+            "/_plugins/_ism/policies/:policy_id",
+            put(ism_api::put_ism_policy)
+                .get(ism_api::get_ism_policy)
+                .delete(ism_api::delete_ism_policy),
+        )
+        .route("/_plugins/_ism/policies", get(ism_api::list_ism_policies))
+        .route("/_plugins/_ism/add/:index", post(ism_api::add_ism_policy))
+        .route(
+            "/_plugins/_ism/explain/:index",
+            get(ism_api::explain_ism_index),
+        )
+        .route("/_plugins/_ism/explain", get(ism_api::list_managed_indices))
         // ── Component templates ────────────────────────────────────────────
         .route(
             "/_component_template/:name",

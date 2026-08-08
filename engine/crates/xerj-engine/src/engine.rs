@@ -272,8 +272,25 @@ pub struct Engine {
     pub closed_indices: Arc<DashMap<String, bool>>,
     /// data stream name → DataStream
     pub data_streams: Arc<DashMap<String, DataStream>>,
-    /// ILM policy name → policy JSON
+    /// ILM policy name → raw policy JSON, kept verbatim for `GET _ilm/policy`
+    /// round-trip fidelity. The REAL execution engine reads `ism_policies`
+    /// instead — `PUT _ilm/policy/{name}` writes to BOTH maps (see
+    /// `xerj_api::es_compat::put_ilm_policy`), translating into the shared
+    /// internal model. See `crate::lifecycle` for why one engine drives both
+    /// surfaces.
     pub ilm_policies: Arc<DashMap<String, Value>>,
+    /// policy id → the internal ISM-shaped model every managed index is
+    /// actually driven by, regardless of whether the policy was created via
+    /// `_plugins/_ism/policies` (native) or `_ilm/policy` (translated).
+    pub ism_policies: Arc<DashMap<String, crate::lifecycle::LifecyclePolicy>>,
+    /// index name → lifecycle execution cursor (current state, pending
+    /// action, timestamps). Presence in this map is what "managed" means —
+    /// an index with no entry here is not touched by the background job.
+    pub managed_indices: Arc<DashMap<String, crate::lifecycle::ManagedIndexState>>,
+    /// index name → creation time (epoch ms), for `min_index_age` and for
+    /// `GET /{index}`'s `creation_date` (previously synthesized as
+    /// `Utc::now()` on every request — see `record_index_created_at`).
+    pub index_created_at: Arc<DashMap<String, i64>>,
     /// component template name → template JSON
     pub component_templates: Arc<DashMap<String, Value>>,
     /// snapshot repository name → repo config JSON
@@ -430,6 +447,9 @@ impl Engine {
             closed_indices: Arc::new(DashMap::new()),
             data_streams: Arc::new(DashMap::new()),
             ilm_policies: Arc::new(DashMap::new()),
+            ism_policies: Arc::new(DashMap::new()),
+            managed_indices: Arc::new(DashMap::new()),
+            index_created_at: Arc::new(DashMap::new()),
             component_templates: Arc::new(DashMap::new()),
             snapshot_repos: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
@@ -506,6 +526,7 @@ impl Engine {
                         if let Some(m) = engine.index_mappings.get(name_str.as_str()) {
                             Engine::apply_date_mapping_flags(&idx, m.value());
                         }
+                        engine.load_or_backfill_index_created_at(&name_str);
                         engine.indices.insert(name_str, idx);
                     }
                     Err(e) => {
@@ -528,6 +549,12 @@ impl Engine {
         // restart, mistaking a missing-alias 404 for a still-in-progress
         // migration by another instance).
         engine.load_persisted_aliases();
+
+        // Restore ISM/ILM policies and managed-index execution state so a
+        // policy attached before a restart keeps running afterward instead
+        // of silently going idle.
+        engine.load_persisted_ism_policies();
+        engine.load_persisted_managed_indices();
 
         // Spawn the PIT sweeper. Pre-v0.6.2 PITs accumulated forever;
         // every open without close was a memory leak. The sweeper
@@ -834,6 +861,7 @@ impl Engine {
             &self.data_dir,
         )?;
         self.indices.insert(name.to_string(), idx);
+        self.record_index_created_at(name);
         info!(name, "index created with custom settings");
         Ok(())
     }
@@ -1096,6 +1124,184 @@ impl Engine {
                 warn!(error = %e, "ignoring corrupt aliases.json");
             }
         }
+    }
+
+    // ── Lifecycle management (ISM/ILM) persistence ──────────────────────────
+
+    fn ism_policies_path(&self) -> PathBuf {
+        self.data_dir.join("ism_policies.json")
+    }
+
+    fn managed_indices_path(&self) -> PathBuf {
+        self.data_dir.join("ism_managed_indices.json")
+    }
+
+    /// Insert (or overwrite) an ISM-shaped policy and persist the whole
+    /// store, mirroring `flush_aliases`. Both `_plugins/_ism/policies` (as
+    /// entered) and `_ilm/policy` (after translation) write through here —
+    /// see the `ism_policies` field doc.
+    pub fn put_ism_policy(&self, id: String, policy: crate::lifecycle::LifecyclePolicy) {
+        self.ism_policies.insert(id, policy);
+        self.flush_ism_policies();
+    }
+
+    pub fn remove_ism_policy(&self, id: &str) -> bool {
+        let removed = self.ism_policies.remove(id).is_some();
+        if removed {
+            self.flush_ism_policies();
+        }
+        removed
+    }
+
+    fn flush_ism_policies(&self) {
+        let snapshot: std::collections::HashMap<String, crate::lifecycle::LifecyclePolicy> = self
+            .ism_policies
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let bytes = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize ism_policies for persistence");
+                return;
+            }
+        };
+        if let Err(e) = crate::index::write_file_atomic(&self.ism_policies_path(), &bytes) {
+            warn!(error = %e, "failed to persist ism_policies.json (policies work until restart)");
+        }
+    }
+
+    fn load_persisted_ism_policies(&self) {
+        let Ok(bytes) = std::fs::read(self.ism_policies_path()) else {
+            return;
+        };
+        match serde_json::from_slice::<
+            std::collections::HashMap<String, crate::lifecycle::LifecyclePolicy>,
+        >(&bytes)
+        {
+            Ok(map) => {
+                let n = map.len();
+                for (id, policy) in map {
+                    self.ism_policies.insert(id, policy);
+                }
+                if n > 0 {
+                    info!(count = n, "restored persisted ISM/ILM policies");
+                }
+            }
+            Err(e) => warn!(error = %e, "ignoring corrupt ism_policies.json"),
+        }
+    }
+
+    /// Persist the whole `managed_indices` map. Called by `lifecycle::tick`
+    /// after any change, and by the attach/detach handlers.
+    pub fn persist_managed_indices(&self) {
+        let snapshot: std::collections::HashMap<String, crate::lifecycle::ManagedIndexState> = self
+            .managed_indices
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let bytes = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize managed_indices for persistence");
+                return;
+            }
+        };
+        if let Err(e) = crate::index::write_file_atomic(&self.managed_indices_path(), &bytes) {
+            warn!(error = %e, "failed to persist ism_managed_indices.json (state works until restart)");
+        }
+    }
+
+    fn load_persisted_managed_indices(&self) {
+        let Ok(bytes) = std::fs::read(self.managed_indices_path()) else {
+            return;
+        };
+        match serde_json::from_slice::<
+            std::collections::HashMap<String, crate::lifecycle::ManagedIndexState>,
+        >(&bytes)
+        {
+            Ok(map) => {
+                let n = map.len();
+                for (index_name, state) in map {
+                    self.managed_indices.insert(index_name, state);
+                }
+                if n > 0 {
+                    info!(count = n, "restored persisted ISM managed-index state");
+                }
+            }
+            Err(e) => warn!(error = %e, "ignoring corrupt ism_managed_indices.json"),
+        }
+    }
+
+    /// Spawn the background lifecycle-execution job: every
+    /// `config.lifecycle.tick_interval_secs` (default 300s = 5 minutes,
+    /// matching OpenSearch ISM's own default job interval), runs
+    /// `lifecycle::tick` over every managed index. Not latency-critical
+    /// (unlike the resource governor's sampler), so a plain `tokio::spawn`
+    /// on an interval is fine — uses a `Weak` self-pointer so it exits
+    /// cleanly when the engine is dropped (matters for tests, which create
+    /// and drop many `Engine`s).
+    pub fn spawn_lifecycle_manager(self: &Arc<Self>) {
+        let interval =
+            std::time::Duration::from_secs(self.config.lifecycle.tick_interval_secs.max(1));
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // skip the immediate first tick
+            loop {
+                tick.tick().await;
+                let Some(engine) = weak.upgrade() else {
+                    return; // engine dropped
+                };
+                crate::lifecycle::tick(&engine).await;
+            }
+        });
+    }
+
+    // ── Index creation-date tracking ─────────────────────────────────────────
+
+    fn index_created_at_path(&self, name: &str) -> PathBuf {
+        self.data_dir.join(name).join("created_at.json")
+    }
+
+    /// Record `name`'s creation time (now) and persist it — called exactly
+    /// once, at the end of `create_index_with_settings`. Without this,
+    /// `min_index_age` has no ground truth, and `GET /{index}`'s
+    /// `creation_date` was synthesized fresh on every single request
+    /// (always reporting "now"), which is what this replaces.
+    fn record_index_created_at(&self, name: &str) {
+        let now = crate::lifecycle::now_ms();
+        self.index_created_at.insert(name.to_string(), now);
+        match serde_json::to_vec_pretty(&serde_json::json!({ "creation_date_ms": now })) {
+            Ok(bytes) => {
+                if let Err(e) =
+                    crate::index::write_file_atomic(&self.index_created_at_path(name), &bytes)
+                {
+                    warn!(index = name, error = %e, "failed to persist created_at.json");
+                }
+            }
+            Err(e) => warn!(index = name, error = %e, "failed to serialize created_at.json"),
+        }
+    }
+
+    /// Load `name`'s persisted creation time on startup. An index directory
+    /// that predates this feature (no `created_at.json`) gets a synthetic
+    /// baseline of "now" recorded and persisted on first post-upgrade boot —
+    /// its true history is unknown, so `min_index_age` starts counting from
+    /// the upgrade rather than from the index's real (unrecorded) creation.
+    /// Documented tradeoff, not silently wrong: every index that existed
+    /// before this shipped gets exactly one synthetic reset, once.
+    fn load_or_backfill_index_created_at(&self, name: &str) {
+        let path = self.index_created_at_path(name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(ms) = v.get("creation_date_ms").and_then(Value::as_i64) {
+                    self.index_created_at.insert(name.to_string(), ms);
+                    return;
+                }
+            }
+        }
+        self.record_index_created_at(name);
     }
 
     /// Add an alias pointing to an index.
