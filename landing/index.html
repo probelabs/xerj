@@ -62,14 +62,13 @@
       </div>
       <div class="hero-install-agent">
         <span class="hero-install-label">OR PASTE THIS TO YOUR AI AGENT</span>
-        <p class="hero-install-agent-line">Install XERJ and make this folder searchable: run
-          <code>curl -fsSL https://xerj.org/get | sh</code> (it prints the install
-          path if xerj is not on your PATH), start
-          <code>xerj --insecure --data-dir ./data</code>, then run
-          <code>xerj autoindex .</code> and query localhost:9200 with the
-          Elasticsearch API.
-          <button type="button" class="hero-install-copy" data-copy="Install XERJ and make this folder searchable: run curl -fsSL https://xerj.org/get | sh (it prints the install path if xerj is not on your PATH), start xerj --insecure --data-dir ./data, then run xerj autoindex . and query localhost:9200 with the Elasticsearch API.">COPY</button>
-        </p>
+        <div class="hero-install-cmd">
+          <code>Install XERJ (docs: https://xerj.org/llms.txt) and make this folder searchable.</code>
+          <button type="button" class="hero-install-copy" data-copy="Install XERJ (docs: https://xerj.org/llms.txt) and make this folder searchable.">COPY</button>
+        </div>
+        <p class="hero-install-agent-line">One line is enough — llms.txt gives your agent
+          the ordered steps: install, start the server, <code>xerj autoindex .</code>,
+          query with any Elasticsearch client.</p>
       </div>
     </div>
 

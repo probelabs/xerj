@@ -28,10 +28,13 @@ your PATH if needed): `xerj --insecure --data-dir ./data &`, wait until
 
 ### Or paste this to your AI agent
 
-> Install XERJ and make this folder searchable: run `curl -fsSL https://xerj.org/get | sh`
-> (it prints the install path if `xerj` is not on your PATH), start
-> `xerj --insecure --data-dir ./data`, wait until http://localhost:9200 responds,
-> then run `xerj autoindex .` and query localhost:9200 with the Elasticsearch API.
+```text
+Install XERJ (docs: https://xerj.org/llms.txt) and make this folder searchable.
+```
+
+One line is enough — [llms.txt](https://xerj.org/llms.txt) gives your agent the
+ordered steps (install, start the server, `xerj autoindex .`, query with any
+Elasticsearch client).
 
 More prompts that work on a fresh install:
 
