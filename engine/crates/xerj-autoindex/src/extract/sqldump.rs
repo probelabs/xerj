@@ -575,10 +575,10 @@ mod utf8_safety_tests {
     fn statement_head_with_multibyte_at_byte_12_does_not_panic() {
         let mut tables: HashMap<String, Vec<String>> = HashMap::new();
         for head in [
-            "-- comment ا rest of the line",     // 'ا' spans bytes 11..13
-            "-- comment 设计 rest",               // '设' spans bytes 11..14
-            "  — leading em-dash then text",     // multibyte before byte 12
-            "短",                                 // shorter than 12 bytes
+            "-- comment ا rest of the line", // 'ا' spans bytes 11..13
+            "-- comment 设计 rest",          // '设' spans bytes 11..14
+            "  — leading em-dash then text", // multibyte before byte 12
+            "短",                            // shorter than 12 bytes
             "",
         ] {
             process_statement_head(head.as_bytes(), &mut tables);
