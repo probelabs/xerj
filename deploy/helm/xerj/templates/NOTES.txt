@@ -1,0 +1,42 @@
+XERJ {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+{{- if .Values.insecure }}
+
+  WARNING: insecure mode is ON.
+
+  TLS and authentication are both disabled. Every listener below is open to
+  anything that can reach this pod:
+
+    ES-compat   {{ .Values.service.esCompatPort }}
+    native REST {{ .Values.service.nativePort }}
+    gRPC        {{ .Values.service.grpcPort }}
+
+  This is fine for a local dev cluster and is not fine for anything holding
+  real data. Turn it off with:
+
+    helm upgrade {{ .Release.Name }} ... --set insecure=false
+
+{{- else }}
+
+  Auth is on. XERJ generates an admin key on first start and writes it to
+  {{ .Values.persistence.mountPath | default "/var/lib/xerj" }}/admin.key with mode 0600.
+
+  Read it with:
+
+    kubectl exec -n {{ .Release.Namespace }} {{ .Release.Name }}-0 -- cat {{ .Values.persistence.mountPath | default "/var/lib/xerj" }}/admin.key
+
+  Then call the API with:
+
+    curl -H "Authorization: ApiKey $KEY" http://{{ .Release.Name }}:{{ .Values.service.esCompatPort }}/_cluster/health
+
+{{- if not .Values.tls.enabled }}
+
+  Note: TLS is off, so that key crosses the network in cleartext. Set
+  tls.enabled=true and supply tls.secretName before exposing this outside
+  the cluster.
+{{- end }}
+{{- end }}
+
+Check it is up:
+
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}

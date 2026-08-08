@@ -50,9 +50,16 @@ probes:
     timeoutSeconds: 2
     failureThreshold: 3
 
-# Insecure mode disables TLS + auth (for dev/POC clusters).  Production
-# users should set this to false and supply tls.cert/key + auth.token.
-insecure: true
+# Insecure mode disables TLS AND auth.  Off by default: an install with no
+# values.yaml of your own is authenticated, matching the engine's own default
+# (auth.enabled = true, admin key auto-generated 0600 on first start).
+#
+# Set to true ONLY for a local dev or throwaway POC cluster.  Doing so leaves
+# the ES-compat, native REST and gRPC listeners open to anything that can reach
+# the pod.  Insecure defaults are the single most cited cause of the NoSQL data
+# exposures in user-feedback/09-security/insecure-defaults.md, and a chart
+# default is the configuration most users will ever run.
+insecure: false
 
 tls:
   enabled: false
