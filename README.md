@@ -26,6 +26,24 @@ your PATH if needed): `xerj --insecure --data-dir ./data &`, wait until
 `http://localhost:9200` responds, then `xerj autoindex ~/my-project` — see
 [Index a folder](#index-a-folder).
 
+### Or paste this to your AI agent
+
+> Install XERJ and make this folder searchable: run `curl -fsSL https://xerj.org/get | sh`
+> (it prints the install path if `xerj` is not on your PATH), start
+> `xerj --insecure --data-dir ./data`, wait until http://localhost:9200 responds,
+> then run `xerj autoindex .` and query localhost:9200 with the Elasticsearch API.
+
+More prompts that work on a fresh install:
+
+- *"Read https://xerj.org/llms.txt, set XERJ up as your search backend, index `./docs`,
+  and show me one example query per index it created."*
+- *"Run `xerj autoindex map` and tell me what is in this data — types, counts and the
+  gotchas it recorded — then answer my questions with search instead of reading files."*
+- *"Use XERJ's `/_memory/notes` API as your long-term memory for this project: store what
+  you learn as you work, and recall it by meaning next session."*
+
+Worked, validated examples for each capability: [xerj.org/recipes](https://xerj.org/recipes).
+
 [![CI](https://github.com/xerj-org/xerj/actions/workflows/ci.yml/badge.svg)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/xerj-org/xerj?include_prereleases&sort=semver)](https://github.com/xerj-org/xerj/releases)
