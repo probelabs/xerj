@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.13] - 2026-08-08
+
+### Security
+
+- **All 13 open Dependabot advisories against `engine/Cargo.lock` closed**
+  (#220). Twelve by lockfile-only version bumps — openssl 0.10.81 /
+  openssl-sys 0.9.117 (8 advisories: GHSA-8c75-8mhr-p7r9, GHSA-ghm9-cr32-g9qj,
+  GHSA-hppc-g8h3-xhp3, GHSA-pqf5-4pqq-29f5, GHSA-xp3w-r5p5-63rr,
+  GHSA-phqj-4mhp-q6mq, GHSA-xv59-967r-8726, GHSA-xmgf-hq76-4vx2),
+  rustls-webpki 0.103.13 (GHSA-82j2-j2ch-gfr8), quinn-proto 0.11.16
+  (GHSA-4w2j-m93h-cj5j), rand 0.8.7 (GHSA-cq8v-f236-94qc), webauthn-rs 0.5.5
+  (GHSA-22w3-693w-x895) — and one by removal: `protobuf` is gone from the
+  dependency graph entirely (GHSA-2gh3-rmm4-6rq5; `prometheus` now builds
+  without its protobuf feature — XERJ only ever served the Prometheus text
+  exposition format, and two new tests pin that format). A reachability
+  analysis found none of the 13 exploitable in a default deployment; closed
+  anyway.
+- npm developer-tooling bumps (#194): basic-ftp 5.3.1, ip-address 10.4.0,
+  js-yaml 4.3.1, ws 8.21.3 — transitive from puppeteer, never part of a
+  release artifact.
+
+### Changed
+
+- **The Helm chart now defaults to secure mode** (#213). It shipped
+  `insecure: true` — TLS and auth off — while the `/get` installer shipped
+  auth on. The default is now secure, and a new `NOTES.txt` states at install
+  time exactly what insecure mode turns off.
+
+### Documentation
+
+- Roadmap to 1.0.0 GA from a source review against the user-feedback corpus
+  (#212).
+- Install one-liner moved first on README, xerj.org hero and llms.txt, plus a
+  paste-to-your-agent install prompt (#219).
+
 ## [1.0.0-rc.12] - 2026-08-07
 
 ### Changed
