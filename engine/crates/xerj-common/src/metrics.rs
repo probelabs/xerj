@@ -493,6 +493,58 @@ mod tests {
         assert!(text.contains("xerj_docs_indexed_total"));
     }
 
+    /// `/metrics` must emit the Prometheus text exposition format exactly:
+    /// a `# HELP` line, a `# TYPE` line, then the sample.
+    ///
+    /// This pins the wire contract independently of which `proto` backend the
+    /// `prometheus` crate was compiled with. We build with
+    /// `default-features = false`, which drops the optional `protobuf` feature
+    /// (and with it protobuf 2.x, GHSA-2gh3-rmm4-6rq5); `proto::MetricFamily`
+    /// is then prometheus's pure-Rust `plain_model` rather than generated
+    /// protobuf code. The text output is required to be byte-identical either
+    /// way, and a scrape breaking silently is exactly the regression that
+    /// feature flip could cause.
+    #[test]
+    fn gather_text_emits_prometheus_exposition_format() {
+        let m = Metrics::new().unwrap();
+        m.docs_indexed.inc_by(3);
+        let text = m.gather_text().unwrap();
+
+        assert!(
+            text.contains(
+                "# HELP xerj_docs_indexed_total Total number of documents successfully indexed"
+            ),
+            "missing/incorrect HELP line:\n{text}"
+        );
+        assert!(
+            text.contains("# TYPE xerj_docs_indexed_total counter"),
+            "missing/incorrect TYPE line:\n{text}"
+        );
+        assert!(
+            text.lines().any(|l| l == "xerj_docs_indexed_total 3"),
+            "missing unlabelled sample line:\n{text}"
+        );
+    }
+
+    /// Labelled series must survive the same encoder path — label rendering is
+    /// the other place a `proto` backend swap could diverge.
+    #[test]
+    fn gather_text_renders_labelled_series() {
+        let m = Metrics::new().unwrap();
+        m.record_docs_indexed("my-index", 2);
+        let text = m.gather_text().unwrap();
+
+        assert!(
+            text.contains("# TYPE xerj_docs_indexed_by_index_total counter"),
+            "missing TYPE line for labelled counter:\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l == "xerj_docs_indexed_by_index_total{index=\"my-index\"} 2"),
+            "missing/incorrect labelled sample line:\n{text}"
+        );
+    }
+
     #[test]
     fn isolated_registries_do_not_conflict() {
         // Two Metrics instances must not share state
