@@ -196,6 +196,13 @@ pub struct ApiKeyRecord {
     pub expiration_ms: Option<u64>,
     /// Set once the key has been invalidated (revoked).
     pub invalidated: bool,
+    /// When the key was invalidated, in epoch milliseconds — `None` while the
+    /// key is live. Reported as `invalidation` by `GET /_security/api_key`
+    /// (ES stamps the analogous `invalidation_time` on its key doc in the
+    /// same update that flips `api_key_invalidated`). `#[serde(default)]` so
+    /// an `api_keys.json` written before this field existed still loads.
+    #[serde(default)]
+    pub invalidation_ms: Option<u64>,
     /// Index-scoped grants parsed from the `role_descriptors` supplied at
     /// creation (`crate::rbac::roles_from_role_descriptors`).
     ///
@@ -968,6 +975,44 @@ impl Engine {
     pub fn persist_api_key(&self, id: String, record: ApiKeyRecord) {
         self.api_keys.insert(id, record);
         self.flush_api_keys();
+    }
+
+    /// Invalidate (revoke) minted API keys by id — issue #208's missing half.
+    /// `ApiKeyRecord.invalidated` has been honoured by the auth path since the
+    /// field existed, but nothing could ever set it, so a leaked key was
+    /// permanent and rotation impossible.
+    ///
+    /// Returns `(invalidated, previously_invalidated)` ids — the two non-error
+    /// buckets of ES's `DELETE /_security/api_key` response. An id that
+    /// matches no record lands in **neither** list: ES resolves selectors to
+    /// keys first and answers with an empty response when nothing matches
+    /// (`ApiKeyService#invalidateApiKeys`), it does not error per unknown id.
+    ///
+    /// The flag and `invalidation_ms` are flipped in-memory — the auth
+    /// middleware reads this same map, so revocation takes effect on the very
+    /// next request — and the store is flushed to `api_keys.json` once at the
+    /// end, same durability contract as [`Self::persist_api_key`].
+    pub fn invalidate_api_keys(&self, ids: &[String], now_ms: u64) -> (Vec<String>, Vec<String>) {
+        let mut invalidated = Vec::new();
+        let mut previously = Vec::new();
+        for id in ids {
+            let Some(mut rec) = self.api_keys.get_mut(id) else {
+                continue;
+            };
+            if rec.invalidated {
+                previously.push(id.clone());
+            } else {
+                rec.invalidated = true;
+                rec.invalidation_ms = Some(now_ms);
+                invalidated.push(id.clone());
+            }
+            // `rec` (a DashMap guard) drops here, before `flush_api_keys`
+            // re-iterates the map below.
+        }
+        if !invalidated.is_empty() {
+            self.flush_api_keys();
+        }
+        (invalidated, previously)
     }
 
     /// Serialize the current `api_keys` map to `<data_dir>/api_keys.json`
