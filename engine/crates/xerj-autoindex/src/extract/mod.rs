@@ -116,6 +116,31 @@ pub fn read_whole(path: &Path, gzip: bool, cap: u64) -> Result<Option<Vec<u8>>> 
     Ok(Some(buf))
 }
 
+/// Render a file as a DOCUMENT (title = file stem, body = decoded text,
+/// section-split), regardless of its format family. This is how demoted
+/// one-off config files (`dataset` module docs, #173) are indexed: their
+/// key sets are configuration, not a schema, so their retrievable value is
+/// the text itself. Emits the same `title`/`body`/`section` vocabulary as
+/// every other document extractor (`FieldOrigin::Extractor`).
+pub fn extract_as_document(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
+    let mut stats = ExtractStats::default();
+    let Some(bytes) = read_whole(path, gzip, MAX_WHOLE_FILE)? else {
+        stats.junk += 1;
+        return Ok(stats);
+    };
+    let (text, _) = crate::sniff::decode_text(&bytes);
+    if text.trim().is_empty() {
+        stats.junk += 1;
+        return Ok(stats);
+    }
+    let title = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "untitled".into());
+    emit_document(&title, &[], text.trim(), sink, &mut stats);
+    Ok(stats)
+}
+
 /// Dispatch to the family extractor. `limit_bytes` bounds SAMPLING reads;
 /// `None` = full stream.
 pub fn extract(

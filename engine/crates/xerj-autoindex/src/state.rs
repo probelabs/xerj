@@ -193,6 +193,11 @@ pub struct FileAssignment {
     pub content_digest: Option<String>,
     /// group (None = whole file) → dataset slug
     pub assignments: Vec<(Option<String>, String)>,
+    /// Demoted one-off config file (#173): index it through the document
+    /// renderer (`extract::extract_as_document`), not its family extractor.
+    /// Defaults false so frozen plans from earlier versions resume unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_document: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
