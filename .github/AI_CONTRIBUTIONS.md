@@ -151,7 +151,6 @@ cargo run --release -p es-yaml-runner -- --dir tests/es-compat-yaml/yaml
 
 The runner needs a live node, and it exits non-zero if any case fails.
 
-
 Gate on **failures, not on the pass total** — the total grows as cases are
 added. A docs-only or landing-only change does not need this run
 (`docs/CONTRIBUTION_REVIEW.md` says so explicitly); if you skipped it, say in
