@@ -13161,6 +13161,18 @@ impl Index {
         // post-pass over the rendered page (`apply_highlight`), so at `size: 0`
         // — where there is no page — it has nothing to do, and a `size: 0` body
         // must execute identically with and without it.
+        //
+        // `min_score` IS in this list (#193): the threshold applies to FINAL
+        // scores, so a `size:0 + min_score` count must score its matches
+        // exactly like `size:N` does — count-only mode would close the
+        // index-wide stats gate below (per-arm scores; a different threshold
+        // scale than the size:N page, user-visible since #192) and skip
+        // materialisation entirely, leaving the post-collection min_score
+        // filter nothing to subtract, i.e. a total that ignores the
+        // threshold.  Same call ES makes: `QueryPhaseCollector` refuses the
+        // `Weight#count` shortcut whenever min_score is set and collects
+        // only docs with `scorer.score() >= minScore` (approach only,
+        // QueryPhaseCollector.java:77-79,123 — no code copied).
         let need_hits_output: bool = size > 0;
         let need_sources_for_post: bool = need_hits_output
             || !request.rescore.is_empty()
@@ -13169,7 +13181,8 @@ impl Index {
                 .sort
                 .iter()
                 .any(|sf| !sf.is_score() && !sf.is_doc_order())
-            || request.aggs.is_some();
+            || request.aggs.is_some()
+            || request.min_score.is_some();
         let count_only: bool = !need_sources_for_post;
 
         // --- Memtable search ---
@@ -13661,8 +13674,14 @@ impl Index {
             }
             stats_cell
                 .get_or_init(|| {
-                    self.build_collection_stats(&snap, query, &text_fields, &exact_fields)
-                        .map(Arc::new)
+                    self.build_collection_stats(
+                        &snap,
+                        query,
+                        &text_fields,
+                        &exact_fields,
+                        mem_doc_count,
+                    )
+                    .map(Arc::new)
                 })
                 .clone()
         };
@@ -19169,20 +19188,33 @@ impl Index {
     /// The caller then keeps the historical per-arm statistics.
     ///
     /// COST.  Per segment this opens a STATS-ONLY reader
-    /// (`FtsIndexReader::open_stats_only`): the FST is mmap'd and `.meta` is
-    /// read, but the postings envelope (whole-file read + zstd decompress) and
-    /// the norms table (O(docs)) are skipped — they are the expensive parts of
-    /// a full open and the statistics never touch them.  The pre-pass also
-    /// cannot defeat the two read-path fast paths it sits near: F1's
-    /// early-break requires `!query_needs_fts`, and the `term_doc_freq`
-    /// count-only shortcut requires `count_only` — the caller gates this
-    /// whole block off for both.
+    /// (`FtsIndexReader::open_stats_only`): the FST is mmap'd and the `.meta`
+    /// side-car is read AND ZFM4-decoded — a zstd decompress of the
+    /// `num_terms × 24`-byte records section, so O(field vocabulary), small
+    /// but not free (#193).  What IS skipped are the two expensive parts of a
+    /// full open: the postings envelope (whole-file read + zstd decompress of
+    /// every posting list, O(index bytes)) and the norms table (O(docs)) —
+    /// the statistics never touch either.  The pre-pass also cannot defeat
+    /// the two read-path fast paths it sits near: F1's early-break requires
+    /// `!query_needs_fts`, and the `term_doc_freq` count-only shortcut
+    /// requires `count_only` — the caller gates this whole block off for
+    /// both.
+    ///
+    /// `mem_doc_count` is the caller's ONE point-in-time memtable count —
+    /// captured next to the segment snapshot and already the input to the
+    /// `stats_gate_open` arm arithmetic (#193).  Re-reading
+    /// `self.memtable.doc_count()` here made the include-the-memtable
+    /// decision from a SECOND, later reading that could disagree with the
+    /// gate's (and re-paid the 16-shard lock fan-out the capture exists to
+    /// avoid).  The stats CONTENT still reads the live shards — exactly like
+    /// the memtable search arm it feeds, which holds no snapshot either.
     fn build_collection_stats(
         &self,
         snap: &xerj_storage::index_store::IndexSnapshot,
         query: &QueryNode,
         text_fields: &[String],
         exact_fields: &HashSet<String>,
+        mem_doc_count: usize,
     ) -> Option<xerj_fts::CollectionStats> {
         // Widest (field × term) pre-pass we will pay for.  A field-less
         // `query_string` over a wide mapping can project hundreds of leaves;
@@ -19208,7 +19240,7 @@ impl Index {
         // any token the segment projection never named (per-field analyzers
         // can differ) joins `pairs` and gets its segment-side df in the single
         // pass below, instead of the memtable silently keeping a local df.
-        let mem_stats: Option<xerj_fts::CollectionStats> = if self.memtable.doc_count() > 0 {
+        let mem_stats: Option<xerj_fts::CollectionStats> = if mem_doc_count > 0 {
             extract_query_text(query)
                 .and_then(|text| self.memtable.collection_stats(&text, &field_refs))
         } else {

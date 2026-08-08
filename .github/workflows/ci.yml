@@ -222,8 +222,10 @@ jobs:
           done
           echo "xerj failed to become healthy"; cat "$DATA/server.log"; exit 1
 
-      # The runner exits non-zero if any case fails. The 3 skipped cases do not
-      # count as failures, so a clean run gates the PR at 1326 passing / 0 failing.
+      # The runner exits non-zero if any case fails. Skipped cases do not count
+      # as failures, so the gate is 0 failures — not an exact pass total, which
+      # grows as cases are added (1365 passed / 3 skipped at the last measured
+      # run, per #189; this comment previously said 1326 and had drifted).
       - name: Run ES-compat YAML suite (0 failures required)
         working-directory: engine
         run: cargo run --release -p es-yaml-runner -- --dir tests/es-compat-yaml/yaml
