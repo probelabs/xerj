@@ -21,8 +21,10 @@ on x86-64 and arm64. You can also [build from source](#build-from-source). It
 speaks the Elasticsearch API, so existing clients, dashboards and tooling work
 against it unchanged.
 
-First commands after install: `xerj --insecure --data-dir ./data &` then
-`xerj autoindex ~/my-project` — see [Index a folder](#index-a-folder).
+First commands after install (the installer prints where `xerj` landed — add it to
+your PATH if needed): `xerj --insecure --data-dir ./data &`, wait until
+`http://localhost:9200` responds, then `xerj autoindex ~/my-project` — see
+[Index a folder](#index-a-folder).
 
 [![CI](https://github.com/xerj-org/xerj/actions/workflows/ci.yml/badge.svg)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)

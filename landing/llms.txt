@@ -9,7 +9,7 @@ XERJ is built to be an AI agent's data layer: point it at files and get an API; 
 - Linux / macOS: `curl -fsSL https://xerj.org/get | sh`
 - Windows PowerShell: `irm https://xerj.org/get.ps1 | iex`
 
-The installer detects OS/CPU (Linux x86_64/aarch64 static musl, macOS x86_64/arm64, Windows x64/ARM64), downloads the latest GitHub release, verifies its SHA-256 (fail-closed), and installs a single `xerj` binary — default `~/.local/bin` on Unix (it prints the exact path and a PATH hint if that directory is not on your PATH; it does not edit your shell profile), `%LOCALAPPDATA%\Programs\xerj` on Windows (added to the user PATH; opt out with `XERJ_NO_PATH=1`). Pin a version with `XERJ_VERSION=vX.Y.Z`; both scripts honor `XERJ_INSTALL_DIR`.
+The installer detects OS/CPU (Linux x86_64/aarch64 static musl, macOS x86_64/arm64, Windows x64/ARM64), downloads the latest GitHub release, verifies its SHA-256 (fail-closed on a missing or mismatched checksum; the sh installer skips verification with a warning only if the machine has neither `sha256sum` nor `shasum`), and installs a single `xerj` binary — default `~/.local/bin` on Unix (it prints the exact path and a PATH hint if that directory is not on your PATH; it does not edit your shell profile), `%LOCALAPPDATA%\Programs\xerj` on Windows (added to the user PATH; opt out with `XERJ_NO_PATH=1`). Pin a version with `XERJ_VERSION=vX.Y.Z`; both scripts honor `XERJ_INSTALL_DIR`.
 
 First run, in order (autoindex is a client of a running node at `http://localhost:9200` by default):
 
