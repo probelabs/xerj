@@ -31685,6 +31685,44 @@ fn prune_missing_should_fields(q: &FtsQuery, has_field: &dyn Fn(&str) -> bool) -
     Some(FtsQuery::Bool(Box::new(pruned)))
 }
 
+/// Is this `multi_match` field spec (boost already stripped) a MAPPED field
+/// for projection purposes?
+///
+/// ES resolves each `multi_match` field against the mapping and silently
+/// skips the ones that do not resolve; XERJ's equivalent of "resolves" is:
+///
+///   * a schema field itself (`text_fields` ∪ `exact_fields` is exactly the
+///     flat schema field list — see the construction in `search`), or
+///   * a dotted path whose prefix is a schema field.  Sub-fields carry no
+///     top-level FTS side-car of their own (`build_fts_field_configs` and
+///     the memtable indexer both key on top-level `_source` keys), so both
+///     multi-fields (`title.keyword` — shares the parent's source value)
+///     and object sub-paths (`user.name`) are served by the stored-doc
+///     scan's `get_field_value` fallback today.  Keeping their clause in
+///     the projection is what routes the query onto that scan (the
+///     per-segment `fts_has_field` gate fails), so dropping them here would
+///     change matching for MAPPED data — they must survive the filter.
+///
+/// Only a spec with NO schema field anywhere on its dotted prefix chain is
+/// unmapped in ES's sense, and those are exactly the ones ES ignores.
+fn multi_match_field_is_mapped(
+    field: &str,
+    text_fields: &[String],
+    exact_fields: &std::collections::HashSet<String>,
+) -> bool {
+    let known = |f: &str| exact_fields.contains(f) || text_fields.iter().any(|t| t == f);
+    if known(field) {
+        return true;
+    }
+    // Walk every dot-prefix: `a.b.c` is mapped when `a` or `a.b` is.
+    for (i, ch) in field.char_indices() {
+        if ch == '.' && known(&field[..i]) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Collect every field name referenced by an FTS query tree.
 ///
 /// Used to (a) extend the set of side-car fields `FtsIndexReader::open`
@@ -31980,6 +32018,7 @@ fn query_node_to_fts(
             query,
             fields,
             match_type,
+            operator,
             boost,
             ..
         } => {
@@ -31987,6 +32026,22 @@ fn query_node_to_fts(
             let analyzer = registry.get_analyzer("standard")?;
             let tokens = analyzer.analyze(query);
             // Split boost factors out of field specs (e.g. "title^3" → ("title", 3.0)).
+            //
+            // ES IGNORES unmapped fields in `multi_match` (its per-type
+            // builders skip any field the mapping cannot resolve): the query
+            // runs over the mapped subset, and only when EVERY field is
+            // unmapped does it match nothing.  Before this filter, a clause
+            // was built for the unmapped field anyway; the per-segment
+            // "reader has every queried field" gate then refused FTS for the
+            // WHOLE query and the stored-doc fallback — whose multi_match
+            // default arm requires the entire query string as one substring —
+            // silently zeroed every multi-token query (#217; single-token
+            // queries survived because the one token IS the whole string).
+            // A field spec is kept when it names a schema field OR a dotted
+            // sub-path under one (`title.keyword`, `user.name`): those have
+            // no top-level FTS side-car and must keep today's stored-scan
+            // routing, which resolves them via the multi-field/_source
+            // fallback in `get_field_value`.
             let field_specs: Vec<(String, f32)> = if fields.is_empty() {
                 text_fields.iter().map(|s| (s.clone(), 1.0)).collect()
             } else {
@@ -31996,9 +32051,32 @@ fn query_node_to_fts(
                         let (f, b) = parse_field_boost(s);
                         (f.to_string(), b)
                     })
+                    .filter(|(f, _)| multi_match_field_is_mapped(f, text_fields, exact_fields))
                     .collect()
             };
+            // Every named field is unmapped: ES matches NOTHING (no error).
+            // Returning None keeps `needs_fts` false and routes the request
+            // to the stored-doc scan (`is_doc_scan_query` includes
+            // MultiMatch), which finds no such fields in any document.
             if field_specs.is_empty() {
+                return None;
+            }
+            // `operator: and` binds PER FIELD for the field-centric types
+            // (ES best_fields/most_fields build one match query per field
+            // with the given operator): every token must match in the SAME
+            // field — mirror the Match arm's AND lowering (must-clauses).
+            // `cross_fields` is term-centric (each token must appear in at
+            // least ONE of the fields, not all in the same one), which a
+            // per-field FTS bool cannot express — decline and leave it to
+            // the stored-doc scan, whose cross_fields arm implements the
+            // combined-text semantics.  Without this, dropping an unmapped
+            // field would FLIP an `operator: and` query from the scan's
+            // AND semantics onto the FTS OR path, over-matching.
+            let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
+            if is_and
+                && tokens.len() > 1
+                && matches!(match_type, xerj_query::ast::MultiMatchType::CrossFields)
+            {
                 return None;
             }
             // Keyword-typed fields match by WHOLE value (their FST holds one
@@ -32039,10 +32117,16 @@ fn query_node_to_fts(
                         *fb,
                     )));
                 } else {
+                    // `operator: and` → per-field must (all tokens in this
+                    // field), same as the Match arm; default → per-field OR.
                     let mut field_bool = FtsBool::new().boost(*fb);
                     for token in &tokens {
-                        field_bool = field_bool
-                            .should(FtsQuery::Term(FtsTerm::new(field.as_str(), &token.text)));
+                        let term = FtsQuery::Term(FtsTerm::new(field.as_str(), &token.text));
+                        field_bool = if is_and {
+                            field_bool.must(term)
+                        } else {
+                            field_bool.should(term)
+                        };
                     }
                     per_field.push(FtsQuery::Bool(Box::new(field_bool)));
                 }
@@ -34668,6 +34752,164 @@ mod fts_projection_tests {
             }
             other => panic!("expected dis_max, got {:?}", other),
         }
+    }
+
+    fn mm(fields: &[&str], query: &str) -> QueryNode {
+        QueryNode::MultiMatch {
+            fields: fields.iter().map(|s| s.to_string()).collect(),
+            query: query.into(),
+            match_type: xerj_query::ast::MultiMatchType::BestFields,
+            operator: None,
+            analyzer: None,
+            boost: None,
+        }
+    }
+
+    /// #217 — an UNMAPPED field in `multi_match` must be dropped from the
+    /// projection (ES ignores unmapped fields), so the surviving clause is
+    /// byte-identical to the same query without that field. Before the fix
+    /// the ghost clause survived, the per-segment `fts_has_field` gate then
+    /// refused FTS for the whole query, and the stored-doc fallback's
+    /// whole-substring semantics zeroed every multi-token query.
+    #[test]
+    fn multi_match_unmapped_field_is_dropped_from_the_projection() {
+        let text_fields = vec!["body".to_string()];
+        let with_ghost = query_node_to_fts(
+            &mm(&["body", "ghost"], "merge zzzznotpresent"),
+            &text_fields,
+            &kw(&[]),
+        )
+        .expect("projects over the mapped subset");
+        let without = query_node_to_fts(
+            &mm(&["body"], "merge zzzznotpresent"),
+            &text_fields,
+            &kw(&[]),
+        )
+        .expect("control projects");
+        assert_eq!(
+            format!("{with_ghost:?}"),
+            format!("{without:?}"),
+            "the unmapped field must not change the projection"
+        );
+        // And no clause may reference the ghost field at all.
+        let mut fields = Vec::new();
+        collect_fts_query_fields(&with_ghost, &mut fields);
+        assert_eq!(fields, vec!["body".to_string()]);
+    }
+
+    /// #217 — single-token shape, same rule (this shape happened to survive
+    /// the bug via the stored scan; post-fix it stays on the postings path).
+    #[test]
+    fn multi_match_unmapped_field_single_token_projects_mapped_term() {
+        let fq = query_node_to_fts(
+            &mm(&["body", "ghost"], "merge"),
+            &["body".to_string()],
+            &kw(&[]),
+        )
+        .expect("projects");
+        match fq {
+            FtsQuery::Term(t) => {
+                assert_eq!(t.field, "body");
+                assert_eq!(t.term, "merge");
+            }
+            other => panic!("expected bare term over the mapped field, got {other:?}"),
+        }
+    }
+
+    /// #217 — EVERY named field unmapped: ES matches nothing (no error).
+    /// The projection declines; `is_doc_scan_query` routes the request to
+    /// the stored-doc scan, which finds no such fields in any document.
+    #[test]
+    fn multi_match_all_fields_unmapped_projects_none() {
+        assert!(query_node_to_fts(
+            &mm(&["ghost1", "ghost2"], "merge zzzznotpresent"),
+            &["body".to_string()],
+            &kw(&["status"]),
+        )
+        .is_none());
+    }
+
+    /// Dotted sub-paths under a mapped parent (`title.keyword`, `user.name`)
+    /// are NOT unmapped — they have no top-level FTS side-car and are served
+    /// by the stored scan's multi-field/_source fallback, so their clause
+    /// must SURVIVE the filter to keep that routing.
+    #[test]
+    fn multi_match_dotted_subfield_of_mapped_parent_is_kept() {
+        let fq = query_node_to_fts(
+            &mm(&["body", "title.keyword"], "merge policy"),
+            &["body".to_string(), "title".to_string()],
+            &kw(&[]),
+        )
+        .expect("projects");
+        let mut fields = Vec::new();
+        collect_fts_query_fields(&fq, &mut fields);
+        assert!(
+            fields.contains(&"title.keyword".to_string()),
+            "sub-field clause dropped: {fields:?}"
+        );
+        // …while a dotted path with an UNMAPPED root is dropped.
+        let fq = query_node_to_fts(
+            &mm(&["body", "ghost.sub"], "merge policy"),
+            &["body".to_string()],
+            &kw(&[]),
+        )
+        .expect("projects");
+        let mut fields = Vec::new();
+        collect_fts_query_fields(&fq, &mut fields);
+        assert_eq!(fields, vec!["body".to_string()]);
+    }
+
+    /// `operator: and` on the field-centric types binds per field: the
+    /// projection must demand every token in the SAME field (must-clauses),
+    /// mirroring the Match arm — not the OR-bool the default shape uses.
+    /// Without this, dropping an unmapped field would flip an AND query
+    /// from the scan's AND semantics onto the FTS OR path and over-match.
+    #[test]
+    fn multi_match_operator_and_projects_per_field_must() {
+        let q = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "title".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::BestFields,
+            operator: Some(xerj_query::ast::BoolOperator::And),
+            analyzer: None,
+            boost: None,
+        };
+        let fq = query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]))
+            .expect("projects");
+        match fq {
+            FtsQuery::DisMax(d) => {
+                assert_eq!(d.queries.len(), 2);
+                for clause in &d.queries {
+                    match clause {
+                        FtsQuery::Bool(b) => {
+                            assert_eq!(b.must.len(), 2, "every token required per field");
+                            assert!(b.should.is_empty());
+                        }
+                        other => panic!("expected per-field must-bool, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected dis_max, got {other:?}"),
+        }
+    }
+
+    /// `cross_fields` + `operator: and` is term-centric (each token must
+    /// appear in at least ONE field) — inexpressible as a per-field bool, so
+    /// the projection declines and the stored-doc scan's cross_fields arm
+    /// keeps the combined-text semantics.
+    #[test]
+    fn multi_match_cross_fields_and_declines_projection() {
+        let q = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "title".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::CrossFields,
+            operator: Some(xerj_query::ast::BoolOperator::And),
+            analyzer: None,
+            boost: None,
+        };
+        assert!(
+            query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]),).is_none()
+        );
     }
 
     /// match_phrase on a KEYWORD field projects to a single whole-value term
