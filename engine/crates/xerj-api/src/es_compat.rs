@@ -25774,8 +25774,16 @@ pub async fn security_create_api_key(
             creation_ms: now_ms,
             expiration_ms,
             invalidated: false,
+            invalidation_ms: None,
             roles,
         },
+    );
+    state.engine.audit.append(
+        "security.api_key.create",
+        principal.label(),
+        "_security/api_key",
+        "ok",
+        &format!("id={key_id} name={name}"),
     );
 
     Json(json!({
@@ -25784,6 +25792,382 @@ pub async fn security_create_api_key(
         "expiration": expiration,
         "api_key": api_key,
         "encoded": encoded
+    }))
+    .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET    /_security/api_key — list keys (never returns secrets)
+// DELETE /_security/api_key — invalidate (revoke) keys
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #208: only create existed — GET and DELETE both 405'd. The enforcement
+// half was already built (`auth::check_minted_key` rejects a record with
+// `invalidated: true`), but nothing could ever set the flag, so a leaked key
+// was permanent and rotation impossible.
+//
+// Wire contract derived from ES source (APPROACH ONLY — AGPL/Elastic, read
+// for semantics, no code copied):
+//   * request selectors `ids`/`name`/`realm_name`/`username`/`owner` and
+//     their mutual-exclusion rules: InvalidateApiKeyRequest.java:163-195,
+//     RestInvalidateApiKeyAction.java:87-96
+//   * invalidate response `{invalidated_api_keys,
+//     previously_invalidated_api_keys, error_count[, error_details]}`, 200:
+//     InvalidateApiKeyResponse.java:92-108
+//   * unknown ids match nothing and land in neither list (empty response,
+//     not an error): ApiKeyService.java:1965-1973
+//   * GET query params + "404 with body when `id` names a missing key":
+//     RestGetApiKeyAction.java:47-54, 70-73
+//   * per-key GET item shape (no secret, `type: rest`, optional
+//     `expiration`/`invalidation`): ApiKey.java:289-310
+
+/// The single-node owner identity, matching `GET /_security/_authenticate`
+/// (`security_authenticate` above): xerj has no multi-user store, so every
+/// minted key belongs to this one principal. A `username`/`realm_name`
+/// selector therefore matches either every key or none, and `owner=true`
+/// (ES: "only keys owned by the caller") is satisfied by every key.
+const API_KEY_OWNER_USERNAME: &str = "xerj";
+const API_KEY_OWNER_REALM: &str = "native";
+
+/// 400 in ES's `action_request_validation_exception` shape — what ES's REST
+/// layer answers when `InvalidateApiKeyRequest#validate` rejects a request.
+/// `errors` are joined as `Validation Failed: 1: a;2: b;`, matching
+/// `ActionRequestValidationException`'s message format.
+fn api_key_validation_error(errors: &[String]) -> Response {
+    let numbered: String = errors
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("{}: {};", i + 1, e))
+        .collect();
+    let reason = format!("Validation Failed: {numbered}");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "root_cause": [{
+                    "type": "action_request_validation_exception",
+                    "reason": reason
+                }],
+                "type": "action_request_validation_exception",
+                "reason": reason
+            },
+            "status": 400
+        })),
+    )
+        .into_response()
+}
+
+/// Rebuild an ES-shaped `role_descriptors` object from a key's parsed grants.
+/// Honest-lossy: creation normalizes descriptors through
+/// `rbac::roles_from_role_descriptors` (index names + index privileges only),
+/// so what comes back is that normalized form, not the caller's original
+/// descriptor JSON. An unscoped key reports `{}` — the same "no usable grant"
+/// signal the parse produced.
+fn api_key_role_descriptors_json(roles: &[xerj_engine::rbac::Role]) -> Value {
+    use xerj_engine::rbac::Privilege;
+    let mut out = serde_json::Map::new();
+    for role in roles {
+        let mut privileges: Vec<&'static str> = role
+            .privileges
+            .iter()
+            .map(|p| match p {
+                Privilege::ReadIndex => "read",
+                Privilege::WriteIndex => "write",
+                Privilege::AdminIndex => "manage",
+                Privilege::SnapshotCreate => "create_snapshot",
+                Privilege::SnapshotRestore => "restore_snapshot",
+                Privilege::SecurityAdmin => "manage_security",
+                Privilege::AuditRead => "read_audit",
+            })
+            .collect();
+        // HashSet order is nondeterministic; sort so the wire shape is stable.
+        privileges.sort_unstable();
+        privileges.dedup();
+        out.insert(
+            role.name.clone(),
+            json!({
+                "indices": [{ "names": role.indices, "privileges": privileges }]
+            }),
+        );
+    }
+    Value::Object(out)
+}
+
+/// One `api_keys[]` item, per ES's `ApiKey#innerToXContent` (ApiKey.java:
+/// 289-310): `expiration`/`invalidation` appear only when set, and the secret
+/// is **never** part of this shape — only the create response carries it.
+fn api_key_item_json(id: &str, rec: &xerj_engine::engine::ApiKeyRecord) -> Value {
+    let mut item = json!({
+        "id": id,
+        "name": rec.name,
+        "type": "rest",
+        "creation": rec.creation_ms,
+        "invalidated": rec.invalidated,
+        "username": API_KEY_OWNER_USERNAME,
+        "realm": API_KEY_OWNER_REALM,
+        "realm_type": "native",
+        "metadata": {},
+        "role_descriptors": api_key_role_descriptors_json(&rec.roles),
+    });
+    if let Some(exp) = rec.expiration_ms {
+        item["expiration"] = json!(exp);
+    }
+    if let Some(inv) = rec.invalidation_ms {
+        item["invalidation"] = json!(inv);
+    }
+    item
+}
+
+/// Only the superuser and unscoped (historical operator) credentials may see
+/// or revoke keys; a scoped key gets the same 403 the create gate gives it,
+/// and the fail-closed default covers `Denied` too. Listing exposes no
+/// secrets, and revocation only ever *reduces* privilege, so the trust level
+/// that may mint keys (see `security_create_api_key`) is the right bar.
+fn api_key_admin_gate(principal: &crate::auth::Principal) -> Option<Response> {
+    if matches!(
+        principal,
+        crate::auth::Principal::Superuser | crate::auth::Principal::Unscoped { .. }
+    ) {
+        None
+    } else {
+        Some(crate::authz::forbidden(
+            principal,
+            "<api keys>",
+            xerj_engine::rbac::Privilege::SecurityAdmin,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GetApiKeyParams {
+    id: Option<String>,
+    name: Option<String>,
+    username: Option<String>,
+    realm_name: Option<String>,
+    /// Accepted for ES parity; a no-op filter here (see
+    /// [`API_KEY_OWNER_USERNAME`] — every key is owned by the caller).
+    #[serde(default)]
+    #[allow(dead_code)]
+    owner: bool,
+    #[serde(default)]
+    active_only: bool,
+}
+
+pub async fn security_get_api_keys(
+    State(state): State<AppState>,
+    principal: crate::auth::Principal,
+    Query(params): Query<GetApiKeyParams>,
+) -> impl IntoResponse {
+    if let Some(denied) = api_key_admin_gate(&principal) {
+        return denied;
+    }
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let mut items: Vec<(u64, String, Value)> = Vec::new();
+    // A username/realm selector that names anything but the single-node
+    // identity matches nothing (there is no such user/realm here).
+    let identity_mismatch = params
+        .username
+        .as_deref()
+        .is_some_and(|u| u != API_KEY_OWNER_USERNAME)
+        || params
+            .realm_name
+            .as_deref()
+            .is_some_and(|r| r != API_KEY_OWNER_REALM);
+    if !identity_mismatch {
+        for entry in state.engine.api_keys.iter() {
+            let (id, rec) = (entry.key(), entry.value());
+            if params.id.as_deref().is_some_and(|want| want != id) {
+                continue;
+            }
+            if params.name.as_deref().is_some_and(|want| want != rec.name) {
+                continue;
+            }
+            // `active_only` drops invalidated AND expired keys — ES filters
+            // both (ApiKeyService#findApiKeys: `api_key_invalidated: false`
+            // plus an expiration-window clause).
+            if params.active_only
+                && (rec.invalidated || rec.expiration_ms.is_some_and(|exp| now_ms >= exp))
+            {
+                continue;
+            }
+            items.push((rec.creation_ms, id.clone(), api_key_item_json(id, rec)));
+        }
+    }
+    // DashMap iteration order is arbitrary; sort by (creation, id) so
+    // repeated listings are stable. ES guarantees no order here.
+    items.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let api_keys: Vec<Value> = items.into_iter().map(|(_, _, v)| v).collect();
+    state.engine.audit.append(
+        "security.api_key.get",
+        principal.label(),
+        "_security/api_key",
+        "ok",
+        &format!("returned={}", api_keys.len()),
+    );
+    // Looking up one specific id that doesn't exist is a resource lookup:
+    // 404, with the (empty) body still attached — RestGetApiKeyAction.java:
+    // 70-73 returns the rendered response at NOT_FOUND.
+    let status = if params.id.is_some() && api_keys.is_empty() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(json!({ "api_keys": api_keys }))).into_response()
+}
+
+pub async fn security_invalidate_api_key(
+    State(state): State<AppState>,
+    principal: crate::auth::Principal,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    if let Some(denied) = api_key_admin_gate(&principal) {
+        return denied;
+    }
+    let payload = body.map(|Json(v)| v).unwrap_or(Value::Null);
+
+    // ── Parse the selector fields (RestInvalidateApiKeyAction.java:87-96) ──
+    // `ids` is the documented plural; a bare string `id` is also accepted
+    // (ES kept it as a deprecated REST-compat alias) — lenient parsing is
+    // this file's convention.
+    let mut blank_id_positions: Vec<usize> = Vec::new();
+    let ids: Option<Vec<String>> = match payload.get("ids") {
+        Some(Value::Array(arr)) => Some(
+            arr.iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let s = v.as_str().unwrap_or("").trim();
+                    if s.is_empty() {
+                        blank_id_positions.push(i);
+                    }
+                    s.to_string()
+                })
+                .collect(),
+        ),
+        Some(Value::String(s)) => Some(vec![s.clone()]),
+        _ => payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()]),
+    };
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let realm_name = payload
+        .get("realm_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let username = payload
+        .get("username")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let owner = payload
+        .get("owner")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // ── Validate, mirroring InvalidateApiKeyRequest.java:163-195/228-252 ──
+    let mut errors: Vec<String> = Vec::new();
+    if let Some(ids) = &ids {
+        if ids.is_empty() {
+            errors.push("Field [ids] cannot be an empty array".to_string());
+        } else if !blank_id_positions.is_empty() {
+            let (noun, pos) = if blank_id_positions.len() == 1 {
+                ("id", "position")
+            } else {
+                ("ids", "positions")
+            };
+            errors.push(format!(
+                "Field [ids] must not contain blank id, but got blank {noun} at index {pos}: {blank_id_positions:?}"
+            ));
+        }
+    }
+    if ids.is_none() && name.is_none() && realm_name.is_none() && username.is_none() && !owner {
+        errors.push(
+            "One of [api key id(s), api key name, username, realm name] must be specified if \
+             [owner] flag is false"
+                .to_string(),
+        );
+    }
+    if (ids.is_some() || name.is_some()) && (realm_name.is_some() || username.is_some()) {
+        errors.push(
+            "username or realm name must not be specified when the api key id(s) or api key \
+             name are specified"
+                .to_string(),
+        );
+    }
+    if owner && (realm_name.is_some() || username.is_some()) {
+        errors.push(
+            "neither username nor realm-name may be specified when invalidating owned API keys"
+                .to_string(),
+        );
+    }
+    if ids.is_some() && name.is_some() {
+        errors.push("only one of [api key id(s), api key name] can be specified".to_string());
+    }
+    if !errors.is_empty() {
+        return api_key_validation_error(&errors);
+    }
+
+    // ── Resolve the selector to concrete key ids ──
+    let target_ids: Vec<String> = if let Some(ids) = ids {
+        // Dedupe, preserving order — ES's find phase returns each key once
+        // however many times its id was repeated.
+        let mut seen = std::collections::HashSet::new();
+        ids.into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
+    } else if let Some(name) = &name {
+        state
+            .engine
+            .api_keys
+            .iter()
+            .filter(|e| &e.value().name == name)
+            .map(|e| e.key().clone())
+            .collect()
+    } else if username
+        .as_deref()
+        .is_some_and(|u| u != API_KEY_OWNER_USERNAME)
+        || realm_name
+            .as_deref()
+            .is_some_and(|r| r != API_KEY_OWNER_REALM)
+    {
+        // A user/realm this node has never issued for: nothing to invalidate.
+        Vec::new()
+    } else {
+        // realm_name/username naming the single-node identity, or owner=true:
+        // both select every minted key (see API_KEY_OWNER_USERNAME).
+        state
+            .engine
+            .api_keys
+            .iter()
+            .map(|e| e.key().clone())
+            .collect()
+    };
+
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let (invalidated, previously) = state.engine.invalidate_api_keys(&target_ids, now_ms);
+    state.engine.audit.append(
+        "security.api_key.invalidate",
+        principal.label(),
+        "_security/api_key",
+        "ok",
+        &format!(
+            "invalidated=[{}] previously_invalidated=[{}]",
+            invalidated.join(","),
+            previously.join(",")
+        ),
+    );
+    // ES answers 200 whatever matched; ids that matched nothing appear in
+    // neither list. `error_details` exists only when per-key errors occurred,
+    // which this single-node store cannot produce — so `error_count` is 0 and
+    // the field is omitted (InvalidateApiKeyResponse.java:96-106).
+    Json(json!({
+        "invalidated_api_keys": invalidated,
+        "previously_invalidated_api_keys": previously,
+        "error_count": 0
     }))
     .into_response()
 }

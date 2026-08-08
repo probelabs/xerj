@@ -691,6 +691,7 @@ mod tests {
                 creation_ms: 0,
                 expiration_ms: None,
                 invalidated: false,
+                invalidation_ms: None,
                 roles,
             },
         );
