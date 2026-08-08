@@ -18,11 +18,49 @@ pub struct Es {
 
 pub struct BulkOutcome {
     pub item_errors: u64,
-    /// Per-item 5xx/429 failures are backend/admission failures, not bad source
-    /// records. Callers must not journal the source file complete.
+    /// Per-item backend/admission failures — 5xx/429 statuses plus
+    /// cluster/index write blocks recognised by TYPE (see
+    /// [`is_index_block_error`]). These are not bad source records: the same
+    /// record indexes fine once the server-side condition clears. Callers
+    /// must not journal the source file complete.
     pub server_errors: u64,
     pub first_error: Option<String>,
     pub first_server_error: Option<String>,
+}
+
+/// Whether a per-item bulk `error` object reports a cluster/index write
+/// block (e.g. `read_only_allow_delete` at the disk flood-stage watermark,
+/// or an explicit `index.blocks.write`).
+///
+/// Blocks must be recognised by error TYPE and wording, never by HTTP
+/// status: Elasticsearch maps explicit/API blocks to 403 FORBIDDEN and only
+/// the flood-stage block to 429 (IndexMetadata block constants), and XERJ
+/// mirrors that split, so a status-only classifier files a 403 block under
+/// "bad source record". That is issue #195: every rejected document was
+/// counted as junk, the source file was journaled complete, and the
+/// instructed rerun then resumed past the journal and reported success over
+/// an empty index. ES itself carries retryability on the block, not the
+/// status (ClusterBlockException::retryable) — the type is the contract.
+///
+/// Matches (verified against live responses):
+///   - XERJ:  `{"type":"engine_exception","reason":"index [x] is blocked
+///     for write operations","status":403}`
+///   - ES:    `{"type":"cluster_block_exception","reason":"index [x]
+///     blocked by: [FORBIDDEN/8/index write (api)];"}`
+///
+/// A reason merely *containing* "blocked" could in principle be a
+/// field-value echo in a mapping error; misclassifying that direction is
+/// the safe one — the file is retried instead of silently dropped.
+fn is_index_block_error(error: &Value) -> bool {
+    let type_is_block = error
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.contains("cluster_block") || t.contains("index_block"));
+    let reason_is_block = error
+        .get("reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| reason.contains("blocked"));
+    type_is_block || reason_is_block
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,7 +313,10 @@ impl Es {
                                     item_errors += 1;
                                     let item_status =
                                         op.get("status").and_then(Value::as_u64).unwrap_or(500);
-                                    if item_status == 429 || item_status >= 500 {
+                                    if item_status == 429
+                                        || item_status >= 500
+                                        || is_index_block_error(&op["error"])
+                                    {
                                         server_errors += 1;
                                         if first_server_error.is_none() {
                                             first_server_error = Some(
@@ -611,6 +652,58 @@ mod tests {
             if let Ok(identity) = result {
                 assert_eq!(identity.dimensions, None);
                 assert!(!identity.resumable);
+            }
+            server.join().unwrap();
+        }
+    }
+
+    /// #195: cluster/index write blocks arrive with status 403 (only the
+    /// flood-stage block is 429), so they must be classified as backend
+    /// failures by error TYPE/wording — never counted as junk source
+    /// records. A genuine per-item 400 stays junk.
+    #[test]
+    fn per_item_write_block_errors_are_backend_failures_not_junk() {
+        for (body, expect_server_errors) in [
+            // XERJ shape: explicit write block via the semantic bulk path.
+            (
+                br#"{"errors":true,"items":[{"index":{"_index":"i","_id":"a","status":403,"error":{"type":"engine_exception","reason":"index [i] is blocked for write operations","status":403}}}]}"#.to_vec(),
+                1u64,
+            ),
+            // ES shape: cluster_block_exception recognised by TYPE alone
+            // (reason deliberately free of the word "blocked").
+            (
+                br#"{"errors":true,"items":[{"index":{"_index":"i","_id":"a","status":403,"error":{"type":"cluster_block_exception","reason":"FORBIDDEN/8/index write (api)"}}}]}"#.to_vec(),
+                1u64,
+            ),
+            // A real bad-record 400 must stay in the junk bucket.
+            (
+                br#"{"errors":true,"items":[{"index":{"_index":"i","_id":"a","status":400,"error":{"type":"document_parsing_exception","reason":"failed to parse field [ts] of type [date]"}}}]}"#.to_vec(),
+                0u64,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                respond_json(&mut stream, &body);
+            });
+            let es = Es::new(&format!("http://{address}"), None).unwrap();
+            let outcome = es.bulk(b"{\"index\":{}}\n{}\n".to_vec()).unwrap();
+            assert_eq!(outcome.item_errors, 1);
+            assert_eq!(
+                outcome.server_errors, expect_server_errors,
+                "{:?}",
+                outcome.first_error
+            );
+            if expect_server_errors > 0 {
+                let reason = outcome.first_server_error.expect("server error recorded");
+                assert!(
+                    reason.contains("block") || reason.contains("FORBIDDEN"),
+                    "{reason}"
+                );
+            } else {
+                assert!(outcome.first_server_error.is_none());
             }
             server.join().unwrap();
         }

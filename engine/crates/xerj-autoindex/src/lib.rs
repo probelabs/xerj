@@ -1748,6 +1748,37 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
     }
 
+    // ── zero-live verification gate (#195) ───────────────────────────────
+    //
+    // The journal's completed files claim records were made visible; the
+    // live counts above are what the server actually answers with. When the
+    // journal says records landed but ZERO documents are live across every
+    // dataset index, the run must not report success: the user (or agent)
+    // would be left with green, mapped, empty indices and no way to tell
+    // "the corpus has no match" from "nothing was ever written". This is
+    // the last-resort catch for any rejection path the per-bulk
+    // classification does not recognise.
+    let (files_done_journaled, journal_records) = {
+        let journal = journal_mx.lock().unwrap();
+        (
+            journal.done.len(),
+            journal.done.values().map(|fd| fd.records).sum::<u64>(),
+        )
+    };
+    let live_records: u64 = ds_counts.values().sum();
+    if journal_records > 0 && live_records == 0 {
+        anyhow::bail!(
+            "autoindex verification failed: the resume journal records {journal_records} \
+             record(s) from {files_done_journaled} completed file(s), but 0 documents are \
+             live across the {} dataset index(es). The indices exist and look healthy but \
+             hold nothing — a server-side write rejection (e.g. a disk flood-stage or \
+             index write block), deleted indices, or an unreadable server can all cause \
+             this. Fix the server-side condition, then rerun with --fresh to re-index \
+             from scratch",
+            plan.datasets.len()
+        );
+    }
+
     // correlations
     let mut key_corrs: Vec<correlate::KeyCorr> = Vec::new();
     if let Some(clusters) = &clusters_rt {
@@ -2010,6 +2041,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "files_junk": all_junk.len(),
         "records_total": total_records,
         "junk_records_total": junk_records_by_run,
+        // This-run submission accounting (#195): what THIS invocation sent
+        // and had accepted, vs `records_total` above which is the live
+        // server-side count. A healthy run keeps these consistent; a
+        // mismatch is visible without reading a server log.
+        "files_submitted_this_run": files_done.load(Ordering::Relaxed),
+        "records_submitted_this_run": records_total.load(Ordering::Relaxed),
         "wall_seconds": (wall * 10.0).round() / 10.0,
         "workers": cfg.workers,
         "semantic": !cfg.no_semantic,
@@ -2020,7 +2057,21 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     push_doc(&format!("run:{run_id}"), &run_doc, &mut cat_buf);
 
     if !cat_buf.is_empty() {
-        es.bulk(cat_buf).context("write catalog")?;
+        let outcome = es.bulk(cat_buf).context("write catalog")?;
+        // The catalog is the data map every later `map`/`status`/agent query
+        // reads; a rejected catalog bulk (e.g. a write block that engaged
+        // mid-run) must not be swallowed into a "success" exit (#195).
+        if outcome.server_errors > 0 {
+            anyhow::bail!(
+                "write catalog: bulk backend failed for {} item(s): {}. Fix the reported \
+                 server condition and rerun the same command",
+                outcome.server_errors,
+                outcome
+                    .first_server_error
+                    .as_deref()
+                    .unwrap_or("unknown server error")
+            );
+        }
     }
     es.refresh(catalog::CATALOG_INDEX).ok();
     journal_mx.lock().unwrap().finish(&run_doc)?;
@@ -2032,6 +2083,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     } else if !cfg.quiet {
         println!("\ndone in {wall:.1}s — {} datasets, {} records live, {} duplicate aliases, {} junk records, {} junk/skipped files",
             plan.datasets.len(), total_records, plan.duplicate_files.len(), junk_total_records, all_junk.len());
+        // Indexed-vs-submitted honesty line (#195): the live count against
+        // what this run actually submitted, so a silent-rejection mismatch
+        // is visible in the client output alone. Units differ on purpose: a
+        // source record (e.g. one prose file) can expand to several section
+        // documents, but submitted records with ZERO live documents is
+        // always a defect (and fails above, before this line prints).
+        println!(
+            "indexed: {} documents live; this run submitted {} source records from {} files",
+            total_records,
+            records_total.load(Ordering::Relaxed),
+            files_done.load(Ordering::Relaxed),
+        );
         let mut rows: Vec<(&String, u64)> = plan
             .datasets
             .iter()
