@@ -25,6 +25,13 @@ struct MockState {
     delete_calls: usize,
     stop: bool,
     embedding_identity_sha256: String,
+    /// Reject every data-bulk item with a 403 explicit write-block error
+    /// (the status ES gives `index.blocks.write` / `read_only`; only the
+    /// flood-stage block is 429) without applying anything — the #195 shape.
+    block_writes: bool,
+    /// Accept every data bulk (`errors: false`) but persist nothing — the
+    /// shape of any rejection path the client-side classifier misses.
+    swallow_data_bulks: bool,
 }
 
 struct MockEndpoint {
@@ -130,7 +137,11 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
     } else if method == "GET" && path.ends_with("/_count") {
         json!({"count": state.lock().unwrap().docs.len()})
     } else if method == "POST" && path.ends_with("/_search") {
-        json!({"hits":{"total":{"value":0},"hits":[]},"aggregations":{}})
+        // Report the REAL number of stored docs: `run_index` now verifies
+        // live counts against the journal (#195), so a mock that always
+        // answered 0 hits would (rightly) fail every successful run.
+        let total = state.lock().unwrap().docs.len();
+        json!({"hits":{"total":{"value":total},"hits":[]},"aggregations":{}})
     } else {
         // ping, index creation/mapping, refresh, and catalog operations
         json!({"acknowledged": true})
@@ -162,6 +173,26 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
 
     let mut locked = state.lock().unwrap();
     locked.data_bulk_number += 1;
+    if locked.block_writes {
+        // Explicit write block: per-item 403 (never 429/5xx), nothing applied.
+        let items: Vec<Value> = lines
+            .chunks_exact(2)
+            .map(|_| {
+                json!({"index": {
+                    "status": 403,
+                    "error": {
+                        "type": "cluster_block_exception",
+                        "reason": "index [failure-test-csv] is blocked for write operations",
+                        "status": 403
+                    }
+                }})
+            })
+            .collect();
+        return json!({"errors": true, "items": items});
+    }
+    if locked.swallow_data_bulks {
+        return json!({"errors": false, "items": []});
+    }
     let fail = !locked.failed_once && locked.data_bulk_number == locked.fail_data_bulk;
     let pairs = lines.chunks_exact(2);
     let visible = if fail { pairs.len() / 2 } else { pairs.len() };
@@ -877,4 +908,68 @@ fn partial_file_done_is_rolled_back_before_another_worker_commits() {
             .as_str()
             .is_some_and(|value| value.ends_with("-new"))
     }));
+}
+
+/// #195: an index write block rejects every bulk item with status 403 (the
+/// status ES assigns explicit/API blocks — only the flood-stage
+/// `read_only_allow_delete` block is 429). A status-based classifier filed
+/// those items under "junk source records", journaled the file COMPLETE, and
+/// the instructed rerun then resumed past the journal and reported success
+/// over an empty index. Blocks must be classified by error type: fatal,
+/// file left pending, and the rerun after the block lifts must really index.
+#[test]
+fn write_block_rejections_are_backend_fatal_and_the_file_stays_pending() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("records.csv"),
+        "id,value\n0,blocked\n1,blocked\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    endpoint.state.lock().unwrap().block_writes = true;
+    let error = format!("{:#}", run_index(config.clone()).unwrap_err());
+    assert!(error.contains("blocked"), "{error}");
+    assert_eq!(
+        file_done_count(state_dir.path()),
+        0,
+        "a write-blocked source file must stay pending in the journal"
+    );
+    assert!(endpoint.state.lock().unwrap().docs.is_empty());
+
+    // Block lifted: the SAME command must resume and actually index.
+    endpoint.state.lock().unwrap().block_writes = false;
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(file_done_count(state_dir.path()), 1);
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 2);
+}
+
+/// #195 last-resort gate: a backend that ACCEPTS every bulk but persists
+/// nothing (the shape of any rejection path the per-item classifier does
+/// not recognise) must not yield a success exit. The journal says records
+/// landed; the live count says zero; the run must fail and say how to
+/// recover.
+#[test]
+fn zero_live_documents_after_journaled_records_fails_the_run() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("records.csv"),
+        "id,value\n0,ghost\n1,ghost\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    endpoint.state.lock().unwrap().swallow_data_bulks = true;
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    let error = format!("{:#}", run_index(config).unwrap_err());
+    assert!(error.contains("verification failed"), "{error}");
+    assert!(error.contains("0 documents are live"), "{error}");
+    assert!(error.contains("--fresh"), "{error}");
 }
