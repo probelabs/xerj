@@ -6608,8 +6608,17 @@ async fn search_impl(
             return too_many_scroll_contexts(scroll_cap);
         }
         // Cap scroll snapshot at 10k hits — matches the default max_result_window.
-        body.size = 10_000;
+        body.size = SCROLL_SNAPSHOT_MAX_HITS;
         body.from = 0;
+        // Scroll totals must be EXACT: the truncation check at context-
+        // registration time (issue #198) compares the exact total against
+        // the snapshot cap, and ES itself refuses anything less in a scroll
+        // context ("disabling [track_total_hits] is not allowed in a scroll
+        // context" — SearchSourceBuilder validation). Forcing `true` here
+        // overrides a body-level `false`/limit, and the URL-param merge
+        // below only fills in when the body value is None, so it cannot
+        // undo this.
+        body.track_total_hits = Some(Value::Bool(true));
     }
     // `?sort=field:order` → convert to sort array.
     if let Some(ref sort_str) = params.sort {
@@ -12154,6 +12163,16 @@ async fn search_impl(
     // and keep the full snapshot (which was stored in scroll_snapshot) for
     // subsequent pages.
     if is_scroll_request {
+        // Issue #198: the snapshot above is bounded by
+        // SCROLL_SNAPSHOT_MAX_HITS, but `total_count` is exact
+        // (track_total_hits was forced accurate for scroll). A result set
+        // larger than the snapshot cannot be served completely — fail
+        // loudly instead of handing back a truncated export that looks
+        // complete. `total_count` is a lower bound of the true total in
+        // every tracking mode, so this check never fires spuriously.
+        if total_count > SCROLL_SNAPSHOT_MAX_HITS as u64 {
+            return scroll_window_exceeded(total_count, SCROLL_SNAPSHOT_MAX_HITS);
+        }
         if let Some(hits_arr) = response_body["hits"]["hits"].as_array_mut() {
             if hits_arr.len() > scroll_page_size {
                 hits_arr.truncate(scroll_page_size);
@@ -16908,9 +16927,11 @@ pub async fn search_with_scroll(
 
     let aggs_value = body.aggs.clone().or_else(|| body.aggregations.clone());
 
-    // For scroll: fetch ALL docs by setting a large size.
+    // For scroll: snapshot up to the scroll window in one search. A result
+    // set that does not fit is rejected loudly below (issue #198) rather
+    // than silently truncated.
     let scroll_body = EsSearchBody {
-        size: 10000,
+        size: SCROLL_SNAPSHOT_MAX_HITS,
         from: 0,
         query: body.query.clone(),
         sort: body.sort.clone(),
@@ -16918,7 +16939,13 @@ pub async fn search_with_scroll(
         aggs: body.aggs.clone(),
         aggregations: body.aggregations.clone(),
         highlight: body.highlight.clone(),
-        track_total_hits: body.track_total_hits.clone(),
+        // Scroll requires exact totals for the truncation check (and ES
+        // rejects disabling track_total_hits in a scroll context anyway).
+        track_total_hits: if params.scroll.is_some() {
+            Some(Value::Bool(true))
+        } else {
+            body.track_total_hits.clone()
+        },
         suggest: None,
         explain: body.explain,
         script_fields: body.script_fields.clone(),
@@ -16952,6 +16979,10 @@ pub async fn search_with_scroll(
     // Execute search across all indices and collect ALL hits.
     let mut all_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total_count: u64 = 0;
+    // Issue #198: set when any index matches more documents than the
+    // per-index snapshot fetch could carry — the scroll would be a
+    // silently truncated export.
+    let mut scroll_truncated = false;
 
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
@@ -16959,15 +16990,20 @@ pub async fn search_with_scroll(
             Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
         };
 
-        // Use a large size to capture everything.
+        // Fetch up to the scroll window per index.
         let mut full_req = search_req.clone();
-        full_req.size = 10000;
+        full_req.size = SCROLL_SNAPSHOT_MAX_HITS;
         full_req.from = 0;
 
         match idx.search(&full_req).await {
             Ok(result) => {
                 if let Some(reason) = &result.script_failure {
                     return script_limit_response(reason);
+                }
+                if result.hits.len() >= SCROLL_SNAPSHOT_MAX_HITS
+                    && result.total.value > result.hits.len() as u64
+                {
+                    scroll_truncated = true;
                 }
                 total_count += result.total.value;
                 for hit in result.hits {
@@ -16982,6 +17018,12 @@ pub async fn search_with_scroll(
 
     // If scroll param present, store context and return first page.
     if params.scroll.is_some() {
+        // Issue #198: refuse to register a context whose snapshot is
+        // missing documents — a truncated scroll looks complete to the
+        // caller (reindex/backup/migration) and silently loses data.
+        if scroll_truncated {
+            return scroll_window_exceeded(total_count, SCROLL_SNAPSHOT_MAX_HITS);
+        }
         let scroll_id = Uuid::new_v4().to_string();
         // Extract just the hits from the pairs.
         let hits_only: Vec<xerj_query::executor::Hit> =
@@ -17552,6 +17594,175 @@ mod passage_scroll_tests {
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_window_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        // Never fsync — these tests index >10k docs and only care about
+        // scroll-window semantics, not durability.
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    async fn index_docs(state: &AppState, index: &str, n: usize) {
+        let idx = state.engine.get_or_create_index(index).expect("index");
+        let mut batch: Vec<(String, Value)> = Vec::with_capacity(n);
+        for i in 0..n {
+            batch.push((format!("doc-{i:06}"), json!({ "n": i })));
+        }
+        idx.index_batch_turbo(batch, true, false)
+            .await
+            .expect("bulk index");
+        // Publish every memtable shard to the search surface — turbo ingest
+        // scatters docs across shards by worker thread (see the load-bearing
+        // refresh comment in `reindex_keyset_tests`).
+        idx.refresh().await.expect("refresh");
+    }
+
+    async fn body_json(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn post_json(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_json(resp).await
+    }
+
+    /// Issue #198: a scroll whose exact result set exceeds the snapshot
+    /// window must fail loudly (400 with an actionable reason), not return
+    /// a truncated export that looks complete. Before the fix both scroll
+    /// entry points answered 200 with exactly 10,000 hits snapshotted and
+    /// a total that said otherwise.
+    #[tokio::test]
+    async fn scroll_over_window_fails_loudly_instead_of_truncating() {
+        let state = test_state();
+        let n = 10_050usize;
+        index_docs(&state, "big", n).await;
+        let app = crate::router::build_es_compat_router(state.clone());
+
+        // Primary path: POST /{index}/_search?scroll=1m
+        let (status, body) =
+            post_json(&app, "/big/_search?scroll=1m", json!({ "size": 100 })).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "expected a loud 400, got: {body}"
+        );
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        let reason = body["error"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("[10050]") && reason.contains("[10000]"),
+            "reason must name both the result-set size and the window: {reason}"
+        );
+
+        // Even when the caller tries to disable totals, scroll forces exact
+        // counting (ES outright rejects disabling track_total_hits in a
+        // scroll context), so truncation is still detected.
+        let (status, body) = post_json(
+            &app,
+            "/big/_search?scroll=1m",
+            json!({ "track_total_hits": false }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "track_total_hits:false must not smuggle a truncated scroll through: {body}"
+        );
+
+        // Secondary path: the /{index}/_search_scroll route.
+        let (status, body) = post_json(
+            &app,
+            "/big/_search_scroll?scroll=1m",
+            json!({ "size": 100 }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "_search_scroll must reject an over-window scroll too: {body}"
+        );
+
+        // A refused scroll must not leak a half-registered context.
+        assert!(
+            state.engine.scrolls.is_empty(),
+            "failed scroll requests must not leave scroll contexts behind"
+        );
+
+        // Boundary: a result set of EXACTLY the window size is legal — the
+        // loud failure is for genuinely unservable result sets only.
+        let (status, body) = post_json(
+            &app,
+            "/big/_search?scroll=1m",
+            json!({ "size": 1, "query": { "range": { "n": { "lt": 10000 } } } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 10_000);
+        assert_eq!(body["hits"]["total"]["relation"], "eq");
+        assert!(body["_scroll_id"].is_string());
+    }
+
+    /// An under-window scroll still walks the complete result set: every
+    /// document exactly once, exact total on the first page.
+    #[tokio::test]
+    async fn scroll_under_window_still_pages_completely() {
+        let state = test_state();
+        index_docs(&state, "small", 25).await;
+        let app = crate::router::build_es_compat_router(state.clone());
+
+        let (status, body) =
+            post_json(&app, "/small/_search?scroll=1m", json!({ "size": 10 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 25);
+        assert_eq!(body["hits"]["total"]["relation"], "eq");
+        let scroll_id = body["_scroll_id"].as_str().expect("scroll id").to_string();
+
+        let mut seen = body["hits"]["hits"].as_array().unwrap().len();
+        loop {
+            let (status, body) = post_json(
+                &app,
+                "/_search/scroll",
+                json!({ "scroll": "1m", "scroll_id": scroll_id }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let page = body["hits"]["hits"].as_array().unwrap().len();
+            if page == 0 {
+                break;
+            }
+            seen += page;
+        }
+        assert_eq!(seen, 25, "scroll must return every document exactly once");
     }
 }
 
@@ -28796,6 +29007,49 @@ pub async fn async_search_delete(
         Some(_) => Json(json!({ "acknowledged": true })).into_response(),
         None => async_search_not_found(&id),
     }
+}
+
+/// Maximum number of hits a scroll context may snapshot (issue #198).
+///
+/// xerj scroll is a bounded up-front snapshot, not a segment-walking
+/// cursor: the initial search materialises every hit into the context and
+/// continuation requests page that Vec. This cap matches the default
+/// `index.max_result_window` (10,000), which the engine enforces on
+/// `from + size` anyway — a larger snapshot request would be rejected at
+/// the engine boundary. A result set that exceeds the cap is REFUSED with
+/// [`scroll_window_exceeded`] rather than silently truncated.
+const SCROLL_SNAPSHOT_MAX_HITS: usize = 10_000;
+
+/// ES-shaped 400 for a scroll whose exact result set exceeds the snapshot
+/// window (issue #198).
+///
+/// Before this existed, a scroll over >10k documents returned the first
+/// 10k pages and then stopped, indistinguishable from a complete export —
+/// the worst possible failure mode on the reindex/backup/migration path
+/// scroll exists for. ES never truncates a scroll (it is a true cursor),
+/// so there is no ES-native error for this condition; the response
+/// mirrors the `illegal_argument_exception` shape of
+/// `ResultWindowTooLarge`, which is the closest ES analogue (deep
+/// pagination past the window).
+fn scroll_window_exceeded(total: u64, cap: usize) -> axum::response::Response {
+    let reason = format!(
+        "Scroll result set is too large: [{total}] matching documents exceed the scroll \
+         snapshot window of [{cap}]. xerj materialises the full scroll snapshot up front \
+         and will not return a silently truncated result set. Page with [search_after] on \
+         a unique sort key instead, or narrow the query."
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+                "type": "illegal_argument_exception",
+                "reason": reason,
+            },
+            "status": 400,
+        })),
+    )
+        .into_response()
 }
 
 /// ES-shaped 429 for exceeding the open-scroll-contexts cap (RC4
