@@ -17168,7 +17168,50 @@ pub async fn next_scroll(
             return ApiError::new(e).into_response();
         }
     };
+    let scroll_keep_alive = body.scroll.as_deref().or(params.scroll.as_deref());
+    scroll_page_response(
+        &state,
+        scroll_id,
+        scroll_keep_alive,
+        params.rest_total_hits_as_int.as_deref() == Some("true"),
+    )
+    .await
+}
 
+/// `GET|POST /_search/scroll/{scroll_id}` — the legacy path-parameter form
+/// of scroll continuation. A real, documented ES/OpenSearch REST API
+/// variant alongside the body/query-param form above (`next_scroll`), not
+/// a client mistake: found missing while investigating why OpenSearch
+/// Dashboards 3.7.0 crashes fatally partway through its saved-objects
+/// migration (`.kibana_1` → `.kibana_2`) against xerj. Traced via request
+/// tracing (`logging.access_log = true`) to the exact call: the migration
+/// opens a scroll (`POST /.kibana_1/_search?scroll=15m`, 200), bulk-indexes
+/// the first page into the new index (200), then continues the scroll via
+/// `GET /_search/scroll/{scroll_id}` — which had no matching route at all,
+/// so axum's default fallback returned a bare 404 with an empty body. OSD's
+/// migration code treats that as fatal and aborts the whole process rather
+/// than retrying, so ANY client using this form — not just OSD 3.7.0's
+/// migrator — would have hit the same wall.
+pub async fn next_scroll_path(
+    State(state): State<AppState>,
+    Path(scroll_id): Path<String>,
+    Query(params): Query<ScrollQueryParamsFull>,
+) -> impl IntoResponse {
+    scroll_page_response(
+        &state,
+        scroll_id,
+        params.scroll.as_deref(),
+        params.rest_total_hits_as_int.as_deref() == Some("true"),
+    )
+    .await
+}
+
+async fn scroll_page_response(
+    state: &AppState,
+    scroll_id: String,
+    scroll_keep_alive: Option<&str>,
+    rest_total_hits_as_int: bool,
+) -> Response {
     // An id xerj never issued (its scroll ids are v4 UUIDs) cannot name a
     // context: ES answers 400 `Cannot parse scroll id`, not a 404 (item 4e).
     if Uuid::parse_str(&scroll_id).is_err() {
@@ -17190,12 +17233,7 @@ pub async fn next_scroll(
             // (body wins over query param, like scroll_id) sets a new
             // keep-alive (capped); absent → the previous keep-alive window
             // restarts from now, matching ES.
-            if let Some(ka_secs) = body
-                .scroll
-                .as_deref()
-                .or(params.scroll.as_deref())
-                .and_then(parse_keep_alive_to_secs)
-            {
+            if let Some(ka_secs) = scroll_keep_alive.and_then(parse_keep_alive_to_secs) {
                 let capped = ka_secs.min(state.config.search_context.scroll_max_keep_alive_secs);
                 ctx.keep_alive = std::time::Duration::from_secs(capped);
             }
@@ -17296,7 +17334,7 @@ pub async fn next_scroll(
             });
 
             // rest_total_hits_as_int=true → flatten hits.total to a bare integer.
-            if params.rest_total_hits_as_int.as_deref() == Some("true") {
+            if rest_total_hits_as_int {
                 resp["hits"]["total"] = json!(total);
             }
             Json(resp).into_response()
@@ -17381,6 +17419,63 @@ mod passage_scroll_tests {
             1
         );
         assert_eq!(body["hits"]["hits"][0]["fields"]["_passage"][0]["page"], 2);
+    }
+
+    /// Regression test for a real bug found live: OpenSearch Dashboards
+    /// 3.7.0's saved-objects migration (`.kibana_1` → `.kibana_2`) continues
+    /// its scroll via `GET /_search/scroll/{scroll_id}` (the legacy
+    /// path-parameter form — a real ES/OpenSearch REST variant, not a
+    /// client mistake), which had no matching route at all and 404'd with
+    /// an empty body. OSD's migration code treats that as fatal and crashes
+    /// the whole process rather than retrying.
+    #[tokio::test]
+    async fn scroll_continuation_via_legacy_path_param_form_works() {
+        let state = test_state();
+        let scroll_id = Uuid::new_v4().to_string();
+        let now = Instant::now();
+        state.engine.scrolls.insert(
+            scroll_id.clone(),
+            xerj_engine::engine::ScrollContext {
+                index: "reports".into(),
+                hits: vec![passage_hit("page-1", 0), passage_hit("page-2", 1)],
+                position: 1,
+                page_size: 1,
+                created: now,
+                keep_alive: Duration::from_secs(60),
+                expires_at: now + Duration::from_secs(60),
+            },
+        );
+        let app = crate::router::build_es_compat_router(state);
+
+        // GET form, exactly as OSD 3.7.0's migrator calls it.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/_search/scroll/{scroll_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["hits"]["hits"][0]["_id"], "page-2");
+        assert_eq!(body["_scroll_id"], scroll_id);
+
+        // An id xerj never issued still gets ES's 400 "cannot parse", not a
+        // bare 404, matching the body-form endpoint's existing behavior.
+        let response = app
+            .oneshot(
+                Request::get("/_search/scroll/not-a-real-scroll-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -17621,6 +17716,16 @@ pub async fn clear_scroll(
         state.engine.scrolls.clear();
     }
 
+    Json(json!({ "succeeded": true, "num_freed": num_freed })).into_response()
+}
+
+/// `DELETE /_search/scroll/{scroll_id}` — the same legacy path-parameter
+/// form as `next_scroll_path`, for clearing rather than continuing.
+pub async fn clear_scroll_path(
+    State(state): State<AppState>,
+    Path(scroll_id): Path<String>,
+) -> impl IntoResponse {
+    let num_freed = usize::from(state.engine.scrolls.remove(&scroll_id).is_some());
     Json(json!({ "succeeded": true, "num_freed": num_freed })).into_response()
 }
 
