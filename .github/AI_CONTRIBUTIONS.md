@@ -62,11 +62,10 @@ it is the project's engineering log, and it is searchable.
 gh search issues --repo xerj-org/xerj "<two or three distinctive terms>"
 ```
 
-That searches open and closed issues (do not pass `--state`; it only accepts
-`open` or `closed`, and the default covers both).
-A closed issue often carries the workaround you are about to re-derive, and
-"closed as intended behaviour" is an answer. A duplicate wastes a maintainer's
-time and yours.
+That covers open and closed issues — do not pass `--state`, which only accepts
+`open` or `closed`, never `all`. Search closed issues especially: one often
+carries the workaround you are about to re-derive, and "closed as intended
+behaviour" is an answer. A duplicate wastes a maintainer's time and yours.
 
 **Reduce it to a clean data directory.** XERJ state is durable, so a fresh
 directory separates an engine defect from your corpus:
@@ -145,9 +144,13 @@ compatibility contract, and it gates every engine change:
 
 ```sh
 cd engine
-./target/release/xerj --insecure --data-dir "$(mktemp -d)" &   # boot first
+./target/release/xerj --insecure --data-dir "$(mktemp -d)" &
+until curl -fs -m1 localhost:9200/_cluster/health >/dev/null; do sleep 0.25; done
 cargo run --release -p es-yaml-runner -- --dir tests/es-compat-yaml/yaml
 ```
+
+The runner needs a live node, and it exits non-zero if any case fails.
+
 
 Gate on **failures, not on the pass total** — the total grows as cases are
 added. A docs-only or landing-only change does not need this run
