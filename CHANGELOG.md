@@ -543,7 +543,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indices and the state directory, or rebuild under a new state directory,
   prefix and brain. `--fresh` is refused for the same case, because it does
   not delete those documents either. `--json` emits the same facts as
-  `xerj.autoindex.unsupported_sync_delta.v1` on stdout with exit 1.
+  `xerj.autoindex.unsupported_sync_delta.v1` on stdout with exit 1. Deleting a
+  file that was only ever *skipped* is not refused: a junk file publishes no
+  documents, and the stale junk-catalog sweep removes its one catalog row, so
+  nothing is stranded.
 - **Files added after a plan was frozen are now called out on stderr.** They
   are still not indexed by a rerun that resumes an existing plan — the plan is
   a crash-resume boundary, not a folder-sync generation — but the run now

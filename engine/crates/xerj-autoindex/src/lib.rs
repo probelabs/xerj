@@ -1301,15 +1301,14 @@ impl UnsupportedInventoryDelta {
                 path: assignment.rel.clone(),
             })
             .collect();
-        vanished_content_groups.extend(
-            plan.junk_files
-                .iter()
-                .filter(|junk| !current_keys.contains(junk.file_key.as_str()))
-                .map(|junk| InventoryDeltaEntry {
-                    file_key: junk.file_key.clone(),
-                    path: junk.rel.clone(),
-                }),
-        );
+        // Deliberately NOT extended with `plan.junk_files`. A junk/skipped file
+        // published no documents, no aliases and no graph edges — its entire
+        // live footprint is one `file:{key}` catalog row, and the stale
+        // junk-catalog sweep below (#238) deletes that row before dropping the
+        // plan entry. Removing it therefore strands nothing, so refusing the
+        // rerun would block a case the pipeline now handles completely. Junk
+        // keys stay in `durable_keys` above: an unchanged skipped file is still
+        // not an addition.
 
         let stable_order = |left: &InventoryDeltaEntry, right: &InventoryDeltaEntry| {
             left.path

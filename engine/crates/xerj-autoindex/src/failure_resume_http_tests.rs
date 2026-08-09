@@ -748,7 +748,7 @@ fn unchanged_planned_junk_is_not_reported_as_added_content() {
 }
 
 #[test]
-fn deleted_planned_junk_fails_closed_before_catalog_can_stay_stale() {
+fn deleted_planned_junk_is_swept_rather_than_refused() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
     let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
     let corpus = tempfile::tempdir().unwrap();
@@ -763,8 +763,33 @@ fn deleted_planned_junk_fails_closed_before_catalog_can_stay_stale() {
     let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
     assert_eq!(run_index(config.clone()).unwrap(), 3);
 
+    // A junk file publishes exactly one catalog row and nothing else, and the
+    // #238 sweep deletes that row. Nothing is stranded, so the removal gate
+    // must not fire — refusing here would block a case the pipeline handles
+    // completely. Only a file that published DOCUMENTS refuses a rerun.
     fs::remove_file(corpus.path().join("opaque.bin")).unwrap();
-    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &[], &["opaque.bin"]);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    {
+        let locked = endpoint.state.lock().unwrap();
+        assert!(
+            locked
+                .catalog_docs
+                .values()
+                .all(|doc| doc["path"].as_str() != Some("opaque.bin")),
+            "the deleted junk file's catalog row must be swept, not left immortal"
+        );
+        assert!(
+            locked
+                .catalog_docs
+                .values()
+                .any(|doc| doc["path"].as_str() == Some("rows.csv")),
+            "the surviving indexed file keeps its entry"
+        );
+    }
+
+    // Deleting the INDEXED file is still refused: its documents are live.
+    fs::remove_file(corpus.path().join("rows.csv")).unwrap();
+    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &[], &["rows.csv"]);
 }
 
 #[test]
