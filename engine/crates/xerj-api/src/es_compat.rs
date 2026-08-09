@@ -21267,6 +21267,56 @@ pub async fn cat_shards(State(state): State<AppState>) -> impl IntoResponse {
 // PUT /{index}/_settings — update index settings
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Republish an index's authoritative `index.blocks` map into the display-side
+/// `engine.index_settings` entry that `GET /{index}/_settings` serves.
+///
+/// Enforcement reads `Index::settings` (persisted at `<index>/settings.json`);
+/// `GET /_settings` reads the separate `engine.index_settings` map. Without this
+/// mirror the two disagree — a block set through `PUT /_block/{block}` was
+/// enforced but invisible, which is how "I can't tell whether the block is
+/// still on" turns into "I can't get rid of it".
+async fn sync_display_blocks(state: &AppState, name: &str) {
+    let Ok(idx) = state.engine.get_index(name) else {
+        return;
+    };
+    let blocks = idx
+        .get_settings()
+        .await
+        .pointer("/index/blocks")
+        .cloned()
+        .filter(|b| b.as_object().is_some_and(|m| !m.is_empty()));
+
+    let mut display = state
+        .engine
+        .index_settings
+        .get(name)
+        .map(|v| v.clone())
+        .unwrap_or_else(|| json!({ "index": {} }));
+    if !display.is_object() {
+        display = json!({ "index": {} });
+    }
+    let root = display.as_object_mut().unwrap();
+    if !root.get("index").is_some_and(Value::is_object) {
+        root.insert("index".to_string(), json!({}));
+    }
+    let inner = root.get_mut("index").unwrap().as_object_mut().unwrap();
+    // Drop any dotted spellings a settings PUT may have left behind, so the
+    // nested map below is the single rendering of the block state.
+    inner.retain(|k, _| !k.starts_with("blocks."));
+    match blocks {
+        Some(b) => {
+            inner.insert("blocks".to_string(), b);
+        }
+        None => {
+            inner.remove("blocks");
+        }
+    }
+    state
+        .engine
+        .index_settings
+        .insert(name.to_string(), display);
+}
+
 pub async fn put_settings(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -21306,6 +21356,21 @@ pub async fn put_settings(
             }
         }
         state.engine.index_settings.insert(idx.clone(), existing);
+    }
+
+    // `index.blocks.*` is not a display-only setting: it gates writes and reads
+    // in the engine, whose `Index::settings` is a different store from the
+    // `engine.index_settings` map updated above. Forward the block keys so a
+    // settings PUT can both set *and clear* a block — previously it updated only
+    // the display copy, leaving every block permanent once set.
+    for name in &targets {
+        let Ok(idx) = state.engine.get_index(name) else {
+            continue;
+        };
+        if let Err(e) = idx.apply_block_settings(&body).await {
+            return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+        }
+        sync_display_blocks(&state, name).await;
     }
 
     Json(json!({ "acknowledged": true })).into_response()
@@ -27727,42 +27792,60 @@ pub async fn get_mapping_field(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PUT /{index}/_block/{block}
+// PUT    /{index}/_block/{block}   — add a block
+// DELETE /{index}/_block/{block}   — remove it again
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn put_index_block(
-    State(state): State<AppState>,
-    Path((index, block)): Path<(String, String)>,
-) -> impl IntoResponse {
+/// Shared body of the two `_block` verbs.
+///
+/// `enabled` selects add vs remove. Removal exists because the only other way
+/// off a block — `PUT /_settings` — used to write the display copy alone, so an
+/// index that took a block could never be un-blocked without a restart.
+async fn set_index_block(
+    state: AppState,
+    index: String,
+    block: String,
+    enabled: bool,
+) -> axum::response::Response {
     let idx = match state.engine.get_index(&index) {
         Ok(i) => i,
         Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
-    // Validate block name.
-    let valid_blocks = [
-        "read_only",
-        "read_only_allow_delete",
-        "write",
-        "metadata",
-        "read",
-    ];
-    if !valid_blocks.contains(&block.as_str()) {
+    if !xerj_engine::Index::BLOCK_NAMES.contains(&block.as_str()) {
         let e = xerj_common::XerjError::invalid_query(format!(
-            "invalid index block: {block}; valid values are: read_only, read_only_allow_delete, write, metadata, read"
+            "invalid index block: {block}; valid values are: {}",
+            xerj_engine::Index::BLOCK_NAMES.join(", ")
         ));
         return ApiError::new(e).into_response();
     }
 
-    match idx.set_block(&block).await {
-        Ok(()) => Json(json!({
-            "acknowledged": true,
-            "shards_acknowledged": true,
-            "indices": [{ "name": index, "blocked": true }]
-        }))
-        .into_response(),
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    if let Err(e) = idx.set_block_state(&block, enabled).await {
+        return ApiError::new(xerj_common::XerjError::from(e)).into_response();
     }
+    // Keep GET /_settings in step with what is actually enforced.
+    sync_display_blocks(&state, &index).await;
+
+    Json(json!({
+        "acknowledged": true,
+        "shards_acknowledged": true,
+        "indices": [{ "name": index, "blocked": enabled }]
+    }))
+    .into_response()
+}
+
+pub async fn put_index_block(
+    State(state): State<AppState>,
+    Path((index, block)): Path<(String, String)>,
+) -> impl IntoResponse {
+    set_index_block(state, index, block, true).await
+}
+
+pub async fn delete_index_block(
+    State(state): State<AppState>,
+    Path((index, block)): Path<(String, String)>,
+) -> impl IntoResponse {
+    set_index_block(state, index, block, false).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
