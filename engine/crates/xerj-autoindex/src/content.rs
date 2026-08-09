@@ -35,9 +35,20 @@ pub(crate) static DIGEST_RAN_OFF_THE_SCAN_POOL: std::sync::atomic::AtomicBool =
 ///
 /// This is linear in corpus bytes for adversarial common-prefix inputs rather
 /// than pairwise O(n² × file_size).
-pub fn resolve(files: Vec<FileEntry>) -> Result<Inventory> {
+///
+/// `hashed` is called with each file's byte count as it completes.
+/// Hashing reads the whole corpus, so on a large tree this is minutes of work
+/// that reported nothing before #241. The callback runs on the scan pool's
+/// workers and must therefore be `Sync`; it does no I/O of its own — it only
+/// bumps the progress counters that the ticker thread reads.
+pub fn resolve_reporting(
+    files: Vec<FileEntry>,
+    hashed: &(dyn Fn(u64) + Sync),
+) -> Result<Inventory> {
     // Phase A belongs to the run's scan pool, not to rayon's global pool:
     // `--workers` has to bound the CPU-bound phase to mean anything (#240 §2).
+    // The progress callback therefore fires from scan-pool threads, which is
+    // also the pool whose width the ETA is computed against (#241).
     let digests: Vec<Result<String>> = crate::pool::install(|| {
         files
             .par_iter()
@@ -56,7 +67,9 @@ pub fn resolve(files: Vec<FileEntry>) -> Result<Inventory> {
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                full_digest(&file.path, file.size)
+                let digest = full_digest(&file.path, file.size);
+                hashed(file.size);
+                digest
             })
             .collect()
     });
@@ -214,11 +227,20 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// These tests are about identity resolution, not progress reporting.
+    fn resolve(files: Vec<FileEntry>) -> Result<Inventory> {
+        resolve_reporting(files, &|_| {})
+    }
+
     /// #240 §2: the digest phase ran on rayon's default global pool — every
     /// core on the machine — so `--workers` never bounded it. It must run on
     /// the run's own scan pool, whose width the CLI sets.
+    ///
+    /// #241 rides on the same closure: moving phase A into a private pool must
+    /// not cost the progress stream a single completion, or the percent the
+    /// ticker prints would stall below 100 for the rest of the phase.
     #[test]
-    fn the_digest_phase_runs_on_the_runs_scan_pool() {
+    fn the_digest_phase_runs_on_the_runs_scan_pool_and_still_reports_every_file() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..32 {
             fs::write(dir.path().join(format!("f{i}.txt")), format!("body {i}\n")).unwrap();
@@ -226,7 +248,16 @@ mod tests {
         OBSERVED_DIGEST_POOL_THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
         DIGEST_RAN_OFF_THE_SCAN_POOL.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        resolve(crate::walk::walk(dir.path(), false).unwrap()).unwrap();
+        let files = crate::walk::walk(dir.path(), false).unwrap();
+        let expected_files = files.len() as u64;
+        let expected_bytes: u64 = files.iter().map(|f| f.size).sum();
+        let reported_files = std::sync::atomic::AtomicU64::new(0);
+        let reported_bytes = std::sync::atomic::AtomicU64::new(0);
+        resolve_reporting(files, &|bytes| {
+            reported_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            reported_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        })
+        .unwrap();
 
         assert!(
             !DIGEST_RAN_OFF_THE_SCAN_POOL.load(std::sync::atomic::Ordering::Relaxed),
@@ -236,6 +267,16 @@ mod tests {
             OBSERVED_DIGEST_POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed),
             crate::pool::scan_pool().current_num_threads(),
             "the digest phase must see exactly the scan pool the run configured"
+        );
+        assert_eq!(
+            reported_files.load(std::sync::atomic::Ordering::Relaxed),
+            expected_files,
+            "every hashed file must still be credited to the progress stream"
+        );
+        assert_eq!(
+            reported_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            expected_bytes,
+            "the bytes-based percent must see the whole corpus"
         );
     }
 

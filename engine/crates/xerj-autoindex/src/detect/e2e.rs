@@ -275,6 +275,8 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         dry_run: false,
         json: false,
         quiet: true,
+        progress: crate::progress::ProgressMode::None,
+        progress_interval: None,
     }
 }
 

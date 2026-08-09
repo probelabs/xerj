@@ -443,6 +443,10 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         dry_run: false,
         json: false,
         quiet: false,
+        // `xerj brain` is a foreground command a human watches; it gets the
+        // same auto-resolved progress surface as `xerj autoindex` (#241).
+        progress: xerj_autoindex::progress::ProgressMode::Auto,
+        progress_interval: None,
     }
 }
 

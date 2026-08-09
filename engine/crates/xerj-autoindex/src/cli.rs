@@ -1,6 +1,8 @@
 //! Hand-rolled arg parser (house style of xerj-server — no clap).
 
+use crate::progress::ProgressMode;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Largest `--bulk-mb` accepted. Past this a single bulk body stops being a
 /// unit of work and starts being a memory incident on the server.
@@ -37,6 +39,12 @@ pub struct IndexCfg {
     pub dry_run: bool,
     pub json: bool,
     pub quiet: bool,
+    /// Progress surface. Orthogonal to `json`: `--json` shapes *stdout* (the
+    /// result), `--progress` shapes *stderr* (liveness).
+    pub progress: ProgressMode,
+    /// Progress cadence. `None` means "the surface's default" — 1 s on a
+    /// terminal, 5 s for a pipe.
+    pub progress_interval: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,8 +109,17 @@ pub fn print_help() {
              --no-graph           skip relationship detection (wikilinks, local links,\n\
                                   section order, directory chains) — no edges are written\n\
              --dry-run            walk+sniff+infer, print the plan, index nothing\n\
-             --json               machine-readable output (map: raw catalog docs)\n\
-             --quiet              errors only\n\
+             --json               machine-readable RESULT on stdout (map: raw catalog docs).\n\
+                                  Orthogonal to --progress, which owns stderr.\n\
+             --progress <MODE>    liveness on stderr: auto|plain|json|none (default auto).\n\
+                                  auto = live redrawn line when stderr is a terminal,\n\
+                                  otherwise one parseable line per interval. plain and\n\
+                                  json force that shape everywhere (CI, pipes, agents).\n\
+             --progress-interval <SECS>\n\
+                                  progress cadence, 1..=3600 (default 1 on a terminal,\n\
+                                  5 otherwise). This is the guaranteed upper bound on\n\
+                                  silence between phases.\n\
+             --quiet              errors only (implies --progress none)\n\
              --dataset <SLUG>     (map) show a single dataset\n\
              --help, -h           this help\n\
          \n\
@@ -125,6 +142,18 @@ pub fn print_help() {
              ONNX runs only for fields inferred as semantic_text (normally long body text;\n\
              short/structured datasets may infer none). Use --dry-run or `autoindex map` to\n\
              confirm a semantic field before attributing an indexing result to embeddings.\n\
+         \n\
+         PROGRESS STREAM:\n\
+             stdout is the RESULT, stderr is PROGRESS — pipe them separately.\n\
+             Every run that reaches an exit — success OR error — ends with one\n\
+             terminal line, in every mode, so an outcome never has to be guessed\n\
+             from silence:\n\
+               xerj-done ok=true exit=3 reason=completed-with-junk wall=57.6s …\n\
+             (A run killed by a signal cannot print one; a missing terminal line\n\
+             after the process is gone means it died, not that it finished.)\n\
+             --progress plain emits `xerj-progress phase=… pct=… eta_s=…` lines;\n\
+             `pct`/`eta_s` are the literal word `unknown` (JSON null) whenever they\n\
+             cannot be computed honestly, never a filler number.\n\
          \n\
          EXIT CODES: 0 complete; 3 completed-with-junk (junk recorded, never fatal);\n\
                      2 usage; 1 endpoint unreachable / journal-config mismatch\n"
@@ -159,6 +188,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut dry_run = false;
     let mut json = false;
     let mut quiet = false;
+    let mut progress: Option<ProgressMode> = None;
+    let mut progress_interval: Option<Duration> = None;
     let mut dataset: Option<String> = None;
 
     while let Some(arg) = it.next() {
@@ -250,6 +281,25 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--dry-run" => dry_run = true,
             "--json" => json = true,
             "--md" => json = false,
+            "--progress" => {
+                let raw = it
+                    .next()
+                    .ok_or("--progress needs a value: auto, plain, json or none")?;
+                progress = Some(ProgressMode::parse(&raw)?);
+            }
+            "--progress-interval" => {
+                let secs: u64 = it
+                    .next()
+                    .ok_or("--progress-interval needs a value in seconds")?
+                    .parse()
+                    .map_err(|_| {
+                        "--progress-interval needs an integer in the range 1..=3600".to_string()
+                    })?;
+                if !(1..=3_600).contains(&secs) {
+                    return Err("--progress-interval must be in the range 1..=3600 seconds".into());
+                }
+                progress_interval = Some(Duration::from_secs(secs));
+            }
             "--quiet" => quiet = true,
             "--dataset" => dataset = it.next(),
             "--help" | "-h" => return Ok(Cmd::Help),
@@ -267,7 +317,41 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         return Err("--prefix must contain at least one [a-z0-9] character".into());
     }
 
+    // Contradictory progress requests are refused, never silently resolved in
+    // one side's favour: accepting a flag we will not honour is the defect
+    // class tracked in #204, and "I asked for progress and got none" is the
+    // exact complaint this option exists to answer.
+    let progress_explicit = progress.is_some() || progress_interval.is_some();
+    if quiet {
+        match progress {
+            Some(ProgressMode::None) | None => {}
+            Some(mode) => {
+                return Err(format!(
+                    "--quiet and --progress {} contradict each other: --quiet means no progress \
+                     output. Drop one of the two",
+                    mode.as_str()
+                ))
+            }
+        }
+    }
+    let progress = if quiet {
+        ProgressMode::None
+    } else {
+        progress.unwrap_or(ProgressMode::Auto)
+    };
+    if progress_interval.is_some() && progress == ProgressMode::None {
+        return Err(
+            "--progress-interval sets the cadence of a progress stream that --progress none / \
+             --quiet turns off. Drop one of the two"
+                .into(),
+        );
+    }
+
     match (sub.as_deref(), folder) {
+        (Some("map"), _) | (Some("status"), _) if progress_explicit => Err(format!(
+            "--progress/--progress-interval apply only to indexing, not `autoindex {}`",
+            sub.as_deref().unwrap_or_default()
+        )),
         (Some("map"), _) if bulk_timeout_explicit => {
             Err("--bulk-timeout-secs applies only to indexing, not `autoindex map`".into())
         }
@@ -312,6 +396,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 dry_run,
                 json,
                 quiet,
+                progress,
+                progress_interval,
             }))
         }
         _ => Ok(Cmd::Help),
@@ -320,7 +406,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Cmd};
+    use super::{parse, Cmd, Duration, ProgressMode};
 
     fn index(args: &[&str]) -> super::IndexCfg {
         match parse(args.iter().map(|s| s.to_string()).collect()).unwrap() {
@@ -411,6 +497,73 @@ mod tests {
             let err = parse(args.into_iter().map(str::to_string).collect()).unwrap_err();
             assert!(err.contains("--bulk-timeout-secs"), "{err}");
         }
+    }
+
+    #[test]
+    fn progress_defaults_to_auto_and_quiet_turns_it_off() {
+        let cfg = index(&["data"]);
+        assert_eq!(cfg.progress, ProgressMode::Auto);
+        assert_eq!(cfg.progress_interval, None);
+        assert_eq!(index(&["data", "--quiet"]).progress, ProgressMode::None);
+        assert_eq!(
+            index(&["data", "--progress", "json"]).progress,
+            ProgressMode::Json
+        );
+        // --json shapes stdout, --progress shapes stderr; they never collide.
+        let both = index(&["data", "--json", "--progress", "plain"]);
+        assert!(both.json);
+        assert_eq!(both.progress, ProgressMode::Plain);
+        assert_eq!(
+            index(&["data", "--progress-interval", "30"]).progress_interval,
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn contradictory_and_malformed_progress_requests_are_refused() {
+        for args in [
+            vec!["data", "--progress"],
+            vec!["data", "--progress", "tty"],
+            vec!["data", "--progress", "yes"],
+            vec!["data", "--progress-interval"],
+            vec!["data", "--progress-interval", "0"],
+            vec!["data", "--progress-interval", "3601"],
+            vec!["data", "--progress-interval", "soon"],
+            // Accepting either of these and honouring only one half would be a
+            // silent lie about what the run will print.
+            vec!["data", "--quiet", "--progress", "plain"],
+            vec!["data", "--progress", "none", "--progress-interval", "5"],
+            vec!["data", "--quiet", "--progress-interval", "5"],
+        ] {
+            let rendered = args.join(" ");
+            let err = match parse(args.into_iter().map(str::to_string).collect()) {
+                Err(err) => err,
+                Ok(other) => panic!("`{rendered}` must not be accepted, got {other:?}"),
+            };
+            assert!(
+                err.contains("--progress"),
+                "`{rendered}` must explain itself: {err}"
+            );
+        }
+        // The one benign combination stays benign.
+        assert_eq!(
+            index(&["data", "--quiet", "--progress", "none"]).progress,
+            ProgressMode::None
+        );
+    }
+
+    #[test]
+    fn progress_flags_are_rejected_for_non_index_subcommands() {
+        for args in [
+            vec!["map", "--progress", "json"],
+            vec!["--progress", "json", "map"],
+            vec!["status", "--progress-interval", "5"],
+        ] {
+            let err = parse(args.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(err.contains("apply only to indexing"), "{err}");
+        }
+        // --quiet keeps its historical no-op acceptance on map/status.
+        assert!(parse(["map", "--quiet"].into_iter().map(str::to_string).collect()).is_ok());
     }
 
     #[test]

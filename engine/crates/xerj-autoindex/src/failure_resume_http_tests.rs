@@ -276,6 +276,8 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         dry_run: false,
         json: false,
         quiet: true,
+        progress: crate::progress::ProgressMode::None,
+        progress_interval: None,
     }
 }
 
@@ -1099,4 +1101,113 @@ fn zero_live_documents_after_journaled_records_fails_the_run() {
     assert!(error.contains("verification failed"), "{error}");
     assert!(error.contains("0 documents are live"), "{error}");
     assert!(error.contains("--fresh"), "{error}");
+}
+
+/// #241 regression: a run must never be silent.
+///
+/// Before this fix `autoindex` printed a handful of phase banners, one line
+/// per 200 completed files, and then nothing at all through the entire
+/// `finalize` block — measured at 47-64% of wall in the issue and at 45% (100
+/// of 222 s) on the corpus used to reproduce it here. An agent watching the
+/// stream could not tell a running index from a hung one.
+///
+/// This asserts the three properties that make the stream readable, through
+/// the REAL progress surface a production run uses:
+///   1. phase B reports as it goes, with a percent and an ETA field;
+///   2. the previously-silent finalize block reports at all;
+///   3. every run ends with a terminal line that states the outcome in words,
+///      because exit 3 is a success an agent otherwise reads as failure.
+#[test]
+fn a_run_reports_progress_through_every_phase_and_closes_the_stream() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // Distinct bytes per file: byte-identical files collapse into one
+    // canonical file plus aliases, which would make `files=8` a lie.
+    for n in 0..8 {
+        fs::write(
+            corpus.path().join(format!("rows-{n}.csv")),
+            format!("id,value\n{n}0,alpha\n{n}1,beta\n{n}2,gamma\n"),
+        )
+        .unwrap();
+    }
+
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+    config.progress_interval = Some(std::time::Duration::from_secs(1));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, _report) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+
+    let progress_lines: Vec<&str> = stream
+        .lines()
+        .filter(|line| line.starts_with("xerj-progress "))
+        .collect();
+    assert!(
+        progress_lines.len() >= 5,
+        "a run must narrate its phases, got {} line(s):\n{stream}",
+        progress_lines.len()
+    );
+    assert!(
+        progress_lines
+            .iter()
+            .any(|line| line.contains("phase=index")),
+        "phase B must report:\n{stream}"
+    );
+    assert!(
+        progress_lines
+            .iter()
+            .any(|line| line.contains("phase=finalize")),
+        "the finalize block was the longest silence in the tool; it must report now:\n{stream}"
+    );
+    assert!(
+        progress_lines
+            .iter()
+            .all(|line| line.contains(" pct=") && line.contains(" eta_s=")),
+        "every progress line carries a percent and an ETA field (possibly `unknown`):\n{stream}"
+    );
+
+    let done = stream
+        .lines()
+        .find(|line| line.starts_with("xerj-done "))
+        .unwrap_or_else(|| panic!("a run must close its own stream:\n{stream}"));
+    assert!(
+        done.contains("ok=true") && done.contains(&format!("exit={code}")),
+        "{done}"
+    );
+    assert!(done.contains("reason=completed"), "{done}");
+    assert!(done.contains("files=8"), "{done}");
+}
+
+/// The other half of the contract: `--quiet` still means silence, so nothing
+/// here can spam a caller that asked for none.
+#[test]
+fn quiet_runs_emit_no_progress_stream_at_all() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("rows.csv"), "id,value\n0,alpha\n").unwrap();
+
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(config.progress, crate::progress::ProgressMode::None);
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap();
+    }
+    assert!(
+        buffer.lock().unwrap().is_empty(),
+        "--quiet asked for nothing: {}",
+        String::from_utf8_lossy(&buffer.lock().unwrap())
+    );
 }
