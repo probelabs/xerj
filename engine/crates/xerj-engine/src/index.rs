@@ -17352,8 +17352,8 @@ impl Index {
                         continue;
                     }
                     if !schema.schema.has_field(key) && !out.iter().any(|(k, _)| k == key) {
-                        let ft = infer_field_type(val, date_detection);
-                        out.push((key.clone(), FieldConfig::new(key.clone(), ft)));
+                        let fc = dynamic_field_config(key, val, date_detection);
+                        out.push((key.clone(), fc));
                     }
                 }
             }
@@ -17435,10 +17435,7 @@ impl Index {
                 .filter(|(key, _)| {
                     !key.starts_with(PASSAGE_METADATA_PREFIX) && !schema.schema.has_field(key)
                 })
-                .map(|(key, val)| {
-                    let ft = infer_field_type(val, date_detection);
-                    (key.clone(), FieldConfig::new(key.clone(), ft))
-                })
+                .map(|(key, val)| (key.clone(), dynamic_field_config(key, val, date_detection)))
                 .collect()
         };
 
@@ -27207,6 +27204,35 @@ fn infer_field_type(val: &Value, date_detection: bool) -> FieldType {
     }
 }
 
+/// ES `ignore_above` default on the auto-created `keyword` sub-field of a
+/// dynamically mapped string (ES `DynamicFieldsBuilder`: `TextFieldMapper` +
+/// `KeywordFieldMapper("keyword").ignoreAbove(256)`).
+const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
+
+/// Build the [`FieldConfig`] for a dynamically discovered field.
+///
+/// Wraps [`infer_field_type`] and mirrors the ES default dynamic mapping for
+/// strings: any field inferred as `Text` gets a `keyword` multi-field
+/// sub-field (`ignore_above: 256`), so the standard ES habit of exact-match
+/// filtering / aggregating on `<field>.keyword` is discoverable from the
+/// mapping (`GET _mapping`, `_field_caps`) exactly like on ES (#209).
+///
+/// The query path already resolves `<field>.keyword` to the parent's
+/// doc-values column (see `fast_aggs::dv_col`, `aggs::get_nested_field`);
+/// this records that contract in the schema rather than leaving it implicit.
+/// Sub-fields of a leaf parent are NOT top-level `schema.fields` entries, so
+/// the search path's text/keyword field sets are unaffected.
+fn dynamic_field_config(key: &str, val: &Value, date_detection: bool) -> FieldConfig {
+    let ft = infer_field_type(val, date_detection);
+    let mut fc = FieldConfig::new(key.to_string(), ft);
+    if matches!(fc.field_type, FieldType::Text) {
+        let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
+        kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
+        fc.fields.push(kw);
+    }
+    fc
+}
+
 // ── DocValues fast-path helpers ───────────────────────────────────────────────
 
 /// Try to resolve a Term or Range query directly from the memtable's DocValues
@@ -34986,6 +35012,55 @@ mod date_detection_tests {
         // Numbers are never date-detected.
         let num = serde_json::json!(1721900000000i64);
         assert!(matches!(infer_field_type(&num, true), FieldType::Long));
+    }
+
+    /// #209: dynamically discovered string fields must carry the ES-default
+    /// `keyword` multi-field (`ignore_above: 256`) so `<field>.keyword` is
+    /// discoverable from the mapping, exactly like ES default dynamic
+    /// mapping (`DynamicFieldsBuilder`: text + keyword(ignore_above=256)).
+    #[test]
+    fn dynamic_string_gets_keyword_multi_field() {
+        let fc = dynamic_field_config("category", &serde_json::json!("books"), true);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1, "expected exactly one sub-field");
+        let kw = &fc.fields[0];
+        assert_eq!(kw.name, "keyword");
+        assert!(matches!(kw.field_type, FieldType::Keyword));
+        assert_eq!(kw.options.ignore_above, Some(256));
+
+        // Whitespace strings are still Text (+ keyword sub-field): the
+        // multi-field replaces the never-wired short-string→Keyword split.
+        let fc = dynamic_field_config("city", &serde_json::json!("New York"), true);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1);
+
+        // Arrays of strings behave like strings (ES maps them identically).
+        let fc = dynamic_field_config("tags", &serde_json::json!(["a", "b"]), true);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1);
+
+        // Null pins Text in xerj (pre-existing behavior) — keep the
+        // invariant "every dynamic Text field has a .keyword sub-field".
+        let fc = dynamic_field_config("maybe", &Value::Null, true);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1);
+
+        // Non-string inferences carry NO multi-field.
+        for (val, want_sub) in [
+            (serde_json::json!(42), 0usize),
+            (serde_json::json!(2.5), 0),
+            (serde_json::json!(true), 0),
+            (serde_json::json!("2026-07-25T10:30:00Z"), 0), // date-detected
+            (serde_json::json!({"a": 1}), 0),
+        ] {
+            let fc = dynamic_field_config("f", &val, true);
+            assert_eq!(fc.fields.len(), want_sub, "value {val} sub-field count");
+        }
+
+        // date_detection=false: the ISO string is Text again → gets keyword.
+        let fc = dynamic_field_config("ts", &serde_json::json!("2026-07-25T10:30:00Z"), false);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1);
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on
