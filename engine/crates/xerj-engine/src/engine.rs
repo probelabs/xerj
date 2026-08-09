@@ -505,8 +505,14 @@ impl Engine {
                         // Restore the raw ES mapping blob (analyzers, formats,
                         // dims — full fidelity) BEFORE any ingest/query can run,
                         // so GET /_mapping and mapping-dependent code paths see
-                        // the same mapping as pre-restart.
-                        engine.load_persisted_es_mapping(&name_str);
+                        // the same mapping as pre-restart. A corrupt blob fails
+                        // the index (#202) rather than serving it with a
+                        // silently reduced mapping.
+                        if let Err(e) = engine.load_persisted_es_mapping(&name_str) {
+                            warn!(name = name_str.as_str(), error = %e, "failed to open index");
+                            engine.failed_indices.insert(name_str, e.to_string());
+                            continue;
+                        }
                         // The index isn't registered yet, so the propagation
                         // inside load can't find it — set the toggles on the
                         // local handle instead.
@@ -831,6 +837,24 @@ impl Engine {
             ));
         }
 
+        // An index that failed to open is absent from `indices` but its data
+        // directory is still on disk, so without this check both `PUT /{index}`
+        // and bulk auto-create would happily "create" it — running
+        // `Index::create` over the existing store and overwriting `schema.json`
+        // with an empty mapping. That is the very mapping loss #202 is about,
+        // reached through the other door, and it would also destroy the
+        // evidence. Refuse, and say what is wrong and how to get out of it.
+        if let Some(reason) = self.failed_indices.get(name) {
+            return Err(EngineError::Common(xerj_common::XerjError::storage(
+                format!(
+                    "index [{name}] exists on disk but failed to open ({}); refusing to \
+                     re-create it over the existing data — repair the file, or DELETE the \
+                     index to discard it",
+                    reason.value()
+                ),
+            )));
+        }
+
         // Apply matching template (highest priority wins) on every create path.
         let effective_schema = self.apply_index_template(name, schema);
         let idx = Index::create_with_settings(
@@ -941,19 +965,36 @@ impl Engine {
     /// (re)opened from disk — boot scan and snapshot restore.  A missing
     /// file is fine (pre-fix indices, dynamic-only indices): readers fall
     /// back to schema-derived properties from `schema.json`.
-    fn load_persisted_es_mapping(&self, name: &str) {
+    ///
+    /// A file that is present but unreadable or unparseable is **not** fine and
+    /// is no longer logged-and-ignored (#202). This blob is the full-fidelity
+    /// mapping — analyzers, date formats, `dense_vector` dims — and is what
+    /// `GET /{index}/_mapping` answers with; dropping it leaves the index
+    /// serving a quietly emptier mapping than the one its own data was written
+    /// under. The caller fails the index instead, which turns cluster health
+    /// red and keeps the corrupt index out of the served set.
+    fn load_persisted_es_mapping(&self, name: &str) -> Result<()> {
         let path = self.data_dir.join(name).join("es_mapping.json");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(EngineError::CorruptIndexMetadata {
+                    file: path.display().to_string(),
+                    reason: e.to_string(),
+                })
+            }
         };
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(mapping) => {
                 self.propagate_date_detection(name, &mapping);
                 self.index_mappings.insert(name.to_string(), mapping);
+                Ok(())
             }
-            Err(e) => {
-                warn!(index = name, error = %e, "ignoring corrupt es_mapping.json");
-            }
+            Err(e) => Err(EngineError::CorruptIndexMetadata {
+                file: path.display().to_string(),
+                reason: format!("{e} ({} bytes on disk)", bytes.len()),
+            }),
         }
     }
 
@@ -1186,12 +1227,52 @@ impl Engine {
                 xerj_common::XerjError::index_not_found(name),
             ));
         }
-        let idx =
-            self.indices.remove(name).map(|(_, v)| v).ok_or_else(|| {
-                EngineError::Common(xerj_common::XerjError::index_not_found(name))
-            })?;
-
-        idx.delete_all_data().await?;
+        match self.indices.remove(name).map(|(_, v)| v) {
+            Some(idx) => idx.delete_all_data().await?,
+            // An index that failed to open (corrupt metadata, embedding
+            // identity mismatch, …) is not in `indices`, but its directory is
+            // still on disk and `create` now refuses to write over it. Without
+            // this branch that name would be permanently stuck: unopenable,
+            // uncreatable, undeletable — the operator's only recovery would be
+            // stopping the node and removing the directory by hand. Deleting a
+            // failed index is exactly the "restore from backup" escape hatch,
+            // so it must work through the API.
+            None => {
+                let Some((_, reason)) = self.failed_indices.remove(name) else {
+                    return Err(EngineError::Common(
+                        xerj_common::XerjError::index_not_found(name),
+                    ));
+                };
+                // `IndexName` rejects '.', '..', separators and '..'
+                // substrings, so the join cannot escape data_dir; the
+                // canonical re-check is defence in depth against a symlinked
+                // index directory.
+                let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+                let dir = self.data_dir.join(index_name.as_str());
+                if let (Ok(dir_canon), Ok(root_canon)) =
+                    (dir.canonicalize(), self.data_dir.canonicalize())
+                {
+                    if !dir_canon.starts_with(&root_canon) {
+                        self.failed_indices.insert(name.to_string(), reason);
+                        return Err(EngineError::Common(
+                            xerj_common::XerjError::invalid_mapping(format!(
+                                "refusing to delete index [{name}] outside data_dir (canonical)"
+                            )),
+                        ));
+                    }
+                }
+                if dir.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&dir) {
+                        // Put the failure back so health stays red and the
+                        // operator can retry — a half-deleted corrupt index
+                        // must not look like a clean slate.
+                        self.failed_indices.insert(name.to_string(), reason);
+                        return Err(EngineError::Io(e));
+                    }
+                }
+                warn!(name, "deleted an index that had failed to open");
+            }
+        }
 
         // Remove this index from every alias that references it; drop the
         // alias entirely when its backing list becomes empty.
@@ -1965,11 +2046,22 @@ impl Engine {
                 Ok(idx) => {
                     // Snapshot dirs carry es_mapping.json — reload it so the
                     // restored index serves the same mapping it was saved with.
-                    self.load_persisted_es_mapping(idx_name);
+                    // A corrupt blob in the snapshot fails the restore of that
+                    // index instead of restoring it with a reduced mapping.
+                    if let Err(e) = self.load_persisted_es_mapping(idx_name) {
+                        warn!(index = idx_name, error = %e, "failed to reopen restored index");
+                        self.failed_indices.insert(idx_name.clone(), e.to_string());
+                        continue;
+                    }
                     if let Some(m) = self.index_mappings.get(idx_name) {
                         Engine::apply_date_mapping_flags(&idx, m.value());
                     }
                     self.indices.insert(idx_name.clone(), idx);
+                    // Restoring from a snapshot is *the* repair for an index
+                    // that failed to open, so clear the recorded failure —
+                    // otherwise cluster health stays red after the repair
+                    // actually worked.
+                    self.failed_indices.remove(idx_name);
                     info!(index = idx_name, "index restored from snapshot");
                 }
                 Err(e) => {

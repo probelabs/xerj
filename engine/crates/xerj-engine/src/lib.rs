@@ -331,6 +331,20 @@ pub enum EngineError {
 
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// An index metadata sidecar (`schema.json`, `settings.json`,
+    /// `es_mapping.json`) is present on disk but could not be read or parsed.
+    ///
+    /// This is deliberately distinct from the file being **absent**, which is a
+    /// legitimate state (indices created before create-time schema persistence
+    /// have no `schema.json`; an index created without settings has no
+    /// `settings.json`) and still opens with a dynamic mapping. Unparseable
+    /// means the recorded mapping is *lost*, and defaulting there silently
+    /// re-infers every field type from whatever documents arrive next — so the
+    /// open is refused instead, the same way `xerj-storage` refuses a segment
+    /// whose header does not match (`StorageError::UnsupportedVersion`).
+    #[error("corrupt index metadata: {file} exists but could not be loaded ({reason}); refusing to open the index rather than fall back to a default mapping — restore the file or restore the index from a snapshot")]
+    CorruptIndexMetadata { file: String, reason: String },
 }
 
 /// Engine-level result alias.
@@ -345,6 +359,12 @@ impl From<EngineError> for xerj_common::XerjError {
             EngineError::Fts(f) => xerj_common::XerjError::internal(f.to_string()),
             EngineError::Io(io) => xerj_common::XerjError::storage_io("IO error", io),
             EngineError::Serde(s) => xerj_common::XerjError::serialization(s.to_string()),
+            // `store_exception` (500) is the ES type for "this shard's on-disk
+            // state is unusable" — the closest honest mapping for a corrupt
+            // sidecar, and it keeps the reason string intact for the client.
+            corrupt @ EngineError::CorruptIndexMetadata { .. } => {
+                xerj_common::XerjError::storage(corrupt.to_string())
+            }
         }
     }
 }

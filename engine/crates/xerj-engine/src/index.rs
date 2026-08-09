@@ -5564,8 +5564,11 @@ impl Index {
 
         // Load persisted settings BEFORE opening the store so the WAL shard
         // count (index.xerj_ingest_shards) matches what create used — the WAL
-        // write layout (root vs s{N}/) and doc routing depend on it.
-        let settings = load_settings(&index_dir).unwrap_or(Value::Null);
+        // write layout (root vs s{N}/) and doc routing depend on it. An
+        // unparseable settings.json is refused rather than defaulted to null:
+        // the shard count, the custom analyzers and the index blocks all live
+        // in here, so "null" is a different index, not a safe fallback.
+        let settings = load_settings(&index_dir)?.unwrap_or(Value::Null);
         let store_config = store_config_from(config, wal_shards_override_from_settings(&settings));
         let store = IndexStore::open(&index_dir, store_config)?;
 
@@ -5574,8 +5577,11 @@ impl Index {
         let segment_doc_count: u64 = snap.segments.iter().map(|s| s.doc_count).sum();
         drop(snap);
 
-        // Load schema from disk if it exists.
-        let schema = load_schema(&index_dir).unwrap_or_else(|_| ManagedSchema::dynamic());
+        // Load schema from disk if it exists. Absent → dynamic mapping (a
+        // pre-persistence index legitimately has no schema.json). Present but
+        // unparseable → refuse: the explicit mapping is gone and every field
+        // type would be silently re-inferred from the next writes (#202).
+        let schema = load_schema(&index_dir)?.unwrap_or_else(ManagedSchema::dynamic);
         validate_embedding_identity(
             &index_dir,
             &schema.schema,
@@ -17039,9 +17045,13 @@ impl Index {
                 );
             }
         }
+        // Atomic, like every other settings.json writer (create and the index
+        // block path). This was the one plain `fs::write` left, i.e. the one
+        // way to actually produce the torn settings.json that `Index::open`
+        // now refuses (#202) — a kill -9 mid-update left a half-written file.
         let path = self.data_dir.join("settings.json");
         let bytes = serde_json::to_vec_pretty(&new_settings)?;
-        std::fs::write(&path, bytes).map_err(EngineError::Io)?;
+        write_file_atomic(&path, &bytes).map_err(EngineError::Io)?;
         *self.settings.write().await = new_settings;
         Ok(())
     }
@@ -25478,16 +25488,57 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn load_schema(index_dir: &Path) -> std::result::Result<ManagedSchema, ()> {
-    let path = index_dir.join("schema.json");
-    let bytes = std::fs::read(path).map_err(|_| ())?;
-    serde_json::from_slice(&bytes).map_err(|_| ())
+/// Read one of the index's JSON sidecar files, keeping ABSENT and UNPARSEABLE
+/// apart (issue #202).
+///
+/// * `Ok(None)`  — the file is genuinely not there. That is a legitimate state
+///   (`schema.json` was only written by `put_mapping` before create-time
+///   persistence landed; `settings.json` is only written when settings are
+///   non-null), and the caller's default is the correct answer.
+/// * `Err(..)`   — the file exists but cannot be read or does not deserialize.
+///   The recorded mapping/settings are *lost*: substituting a default here does
+///   not preserve behaviour, it silently re-derives every field type from the
+///   next documents to arrive (verified: a `keyword` field came back as `long`
+///   after one post-corruption write). The caller must refuse to open, exactly
+///   as a segment with an unexpected header is refused rather than guessed at
+///   (`xerj-storage/src/segment.rs:243-246`).
+///
+/// Prior art for failing loudly on unparseable index metadata rather than
+/// defaulting: tantivy's `load_metas` turns a `meta.json` that does not
+/// deserialize into `DataCorruption` naming the file
+/// (tantivy `src/index/index.rs:29-49`), while absence is a *separate*
+/// pre-check (`Index::exists`, `src/index/index.rs:324-326`) that routes to
+/// create; sled likewise raises `InvalidData` on any unreadable metadata frame
+/// instead of skipping it (sled `src/metadata_store.rs:518,546,582`).
+fn load_sidecar<T: serde::de::DeserializeOwned>(index_dir: &Path, file: &str) -> Result<Option<T>> {
+    let path = index_dir.join(file);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A file we cannot read is not a file that is absent: an EACCES or an
+        // EIO here used to be indistinguishable from "never written".
+        Err(e) => {
+            return Err(EngineError::CorruptIndexMetadata {
+                file: path.display().to_string(),
+                reason: e.to_string(),
+            })
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => Err(EngineError::CorruptIndexMetadata {
+            file: path.display().to_string(),
+            reason: format!("{e} ({} bytes on disk)", bytes.len()),
+        }),
+    }
 }
 
-fn load_settings(index_dir: &Path) -> std::result::Result<Value, ()> {
-    let path = index_dir.join("settings.json");
-    let bytes = std::fs::read(path).map_err(|_| ())?;
-    serde_json::from_slice(&bytes).map_err(|_| ())
+fn load_schema(index_dir: &Path) -> Result<Option<ManagedSchema>> {
+    load_sidecar(index_dir, "schema.json")
+}
+
+fn load_settings(index_dir: &Path) -> Result<Option<Value>> {
+    load_sidecar(index_dir, "settings.json")
 }
 
 // ── Date math in index names ──────────────────────────────────────────────────
