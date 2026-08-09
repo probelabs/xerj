@@ -228,6 +228,12 @@ many in-flight bulk buffers; bounds both the scan and the indexing phase), `--pr
 print the inferred plan without indexing anything, `--follow-symlinks`
 (loop-safe), `--sample N` records per file for inference (default 500).
 
+`--workers` is a ceiling, not a promise: when the server answers `429 Too Many
+Requests` the run halves its own bulk concurrency on the spot and probes back
+up one worker at a time only after a clean streak, so a busy server is not
+handed the same load six times over. The run's summary records where it ended
+up (`bulk_concurrency_final`, `bulk_congestion_events`).
+
 Your dataset names, field types, and counts will reflect *your* folder — that
 is the point. The behaviors shown here (decimal-comma → `double`, date
 strings → typed `date`, keyword inference, junk recording, resume-to-identical

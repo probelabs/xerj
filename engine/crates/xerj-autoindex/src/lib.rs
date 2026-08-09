@@ -939,7 +939,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             cfg.bulk_timeout_secs
         );
     }
-    let es = Es::with_bulk_timeout(&cfg.url, cfg.api_key.clone(), cfg.bulk_timeout_secs)?;
+    // The run's bulk load is admitted through one window `--workers` wide, so
+    // a 429 can shrink what the run offers instead of only delaying it
+    // (#240 §8). Enabled here and nowhere else: probes have nothing to
+    // throttle.
+    let es = Es::with_bulk_timeout(&cfg.url, cfg.api_key.clone(), cfg.bulk_timeout_secs)?
+        .with_bulk_concurrency(cfg.workers, !cfg.quiet);
     es.ping()?;
 
     let discovered_files = walk::walk(&cfg.root, cfg.follow_symlinks)?;
@@ -2405,6 +2410,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "bulk_mb": cfg.bulk_mb,
         "cores_available": xerj_common::resource::cores(),
         "memory_safe_zone_mb": xerj_common::resource::memory_safe_zone_bytes() / (1024 * 1024),
+        // What the server's backpressure did to the offered load. A final
+        // limit below `workers` means this run met real congestion and
+        // answered it, which is the difference between a slow run and a run
+        // that was making the machine worse (#240 §8).
+        "bulk_concurrency_final": es.bulk_concurrency_limit(),
+        "bulk_congestion_events": es.bulk_congestion_events(),
         "resource_notes": cfg.resource_notes,
         "semantic": !cfg.no_semantic,
     });
