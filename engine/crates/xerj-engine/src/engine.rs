@@ -1694,9 +1694,11 @@ impl Engine {
     /// Store a pipeline definition that could not be compiled, together with
     /// the reason, and make sure nothing stale is left behind.
     ///
-    /// Issue #204. This exists for exactly one case: a definition xerj accepts
-    /// for wire compatibility (Elasticsearch does) but cannot execute, because
-    /// it names a processor this build does not implement. Storing it keeps
+    /// Issue #204. This exists for one case: a definition xerj accepts for wire
+    /// compatibility (Elasticsearch does) but cannot execute — because it names
+    /// a processor this build does not implement, or sets an option on one that
+    /// this build cannot honour (a processor-level `if` guard, an `on_failure`
+    /// chain, a `grok` `patterns` array). Storing it keeps
     /// `GET`/`_simulate` truthful about what was submitted; recording the
     /// reason is what stops [`Self::process_through_pipeline`] from silently
     /// passing documents through untransformed. A previously-compiled pipeline

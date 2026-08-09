@@ -874,6 +874,68 @@ impl TransformPlugin for SetPlugin {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AppendPlugin
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Append a value to a field, creating or widening a list as needed.
+///
+/// Elasticsearch's `append` semantics, which is what this exists for: the field
+/// becomes a list if it is not one already, a list `value` extends rather than
+/// nests, and a missing field is created as a single-element list
+/// (`IngestDocument.appendFieldValue`, read for semantics only).
+///
+/// Issue #204: `append` used to be *mapped onto `set`* in the ES→xerj processor
+/// translation (`es_compat.rs`), so `{"append": {"field": "tags", "value":
+/// "b"}}` REPLACED `["a"]` with `"b"` instead of producing `["a", "b"]` —
+/// under a `200 {"acknowledged": true}`, and disagreeing with the `_simulate`
+/// interpreter, which has always implemented a real append. Two behaviours for
+/// one pipeline; this is the one that runs at ingest.
+pub struct AppendPlugin {
+    field: String,
+    value: Value,
+}
+
+impl AppendPlugin {
+    pub fn new(field: impl Into<String>, value: Value) -> Self {
+        Self {
+            field: field.into(),
+            value,
+        }
+    }
+}
+
+impl TransformPlugin for AppendPlugin {
+    fn name(&self) -> &str {
+        "append"
+    }
+
+    fn process(&self, doc: &mut Value) -> ProcessAction {
+        let Some(obj) = doc.as_object_mut() else {
+            return ProcessAction::Pass;
+        };
+        let slot = obj
+            .entry(self.field.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        match slot {
+            Value::Array(existing) => match self.value.clone() {
+                Value::Array(more) => existing.extend(more),
+                one => existing.push(one),
+            },
+            scalar => {
+                let previous = scalar.clone();
+                let mut out = vec![previous];
+                match self.value.clone() {
+                    Value::Array(more) => out.extend(more),
+                    one => out.push(one),
+                }
+                *scalar = Value::Array(out);
+            }
+        }
+        ProcessAction::Pass
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RemoveNullPlugin
 // ─────────────────────────────────────────────────────────────────────────────
 

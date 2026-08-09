@@ -1312,19 +1312,43 @@ impl AnalyzerRegistry {
     /// existing index. That leniency is right at open time and wrong at create
     /// time, where every one of these constructs used to be accepted with a
     /// `200 {"acknowledged": true}` and then quietly replaced by something
-    /// weaker:
+    /// weaker.
     ///
-    /// - an unresolvable `tokenizer` became `standard` — an `edge_ngram`
-    ///   autocomplete index that matches nothing;
-    /// - an unresolvable `filter` was dropped — a missing `lowercase` turns
-    ///   every match case-sensitive;
-    /// - an unsupported filter/tokenizer `type` was skipped entirely;
-    /// - an unknown non-custom analyzer `type` left the analyzer unregistered,
-    ///   so fields naming it silently got `standard`.
+    /// # What is checked
+    ///
+    /// 1. a declared `filter` / `tokenizer` whose `type` this build cannot
+    ///    construct **and** whose *name* does not resolve to an equivalent
+    ///    built-in (see [`Self::builtin_filter_honours`] — the by-name fallback
+    ///    `apply_settings` actually takes);
+    /// 2. a `pattern` tokenizer whose regex does not compile;
+    /// 3. an analyzer naming a `tokenizer` / `filter` that is neither declared
+    ///    nor built in — the unresolvable tokenizer used to become `standard`
+    ///    (an `edge_ngram` autocomplete index that matches nothing) and the
+    ///    unresolvable filter used to be dropped (a missing `lowercase` turns
+    ///    every match case-sensitive);
+    /// 4. an unknown non-custom analyzer `type`, which left the analyzer
+    ///    unregistered so fields naming it silently got `standard`;
+    /// 5. `char_filter` — declared at either level and never built by
+    ///    `apply_settings`, so the stripping/mapping never happens;
+    /// 6. `normalizer` — accepted by ES for `keyword` fields, never built here;
+    /// 7. an analyzer whose `filter` is not an array or whose `tokenizer` is
+    ///    not a string: `apply_settings` drops the value shape-first and falls
+    ///    back to "no filters" / `standard`.
+    ///
+    /// # What is NOT checked
+    ///
+    /// Option-level divergence *inside* a type this build does construct — e.g.
+    /// `synonym.synonyms_path` (file-backed rule lists are not read),
+    /// `length.min` (defaults to 2 here, 0 in ES), `asciifolding
+    /// .preserve_original`. Those are pre-existing gaps, tracked separately;
+    /// this function does not claim to cover them, and the by-name fallback in
+    /// (1) is deliberately conservative about them: a name that resolves to a
+    /// built-in is only accepted when the declared options ask for exactly what
+    /// that built-in does.
     ///
     /// Returns one human-readable message per problem, empty when the block can
-    /// be honoured exactly as written. `Index::create_with_settings` turns a
-    /// non-empty result into a 400 so the caller learns at the door.
+    /// be honoured as written. `Index::create_with_settings` turns a non-empty
+    /// result into a 400 so the caller learns at the door.
     ///
     /// `settings` may be either the full envelope (`{"settings": {"analysis":
     /// …}}`) or the inner settings object — the same two shapes
@@ -1348,13 +1372,39 @@ impl AnalyzerRegistry {
                     .get("type")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if !SUPPORTED_FILTER_TYPES.contains(&filter_type) {
-                    problems.push(format!(
-                        "token filter [{filter_name}]: unsupported type [{filter_type}] \
-                         (supported: {})",
-                        SUPPORTED_FILTER_TYPES.join(", ")
-                    ));
+                if SUPPORTED_FILTER_TYPES.contains(&filter_type) {
+                    continue;
                 }
+                // The `type` is one `apply_settings` cannot BUILD — but that is
+                // not the whole story, and reading only the type is what made
+                // this check reject settings blocks xerj serves correctly.
+                // `apply_settings` looks the name up in `custom_filters` first
+                // and falls through to `resolve_builtin_filter(name)`
+                // (analyzer.rs:1284-1286), so `{"english_stop": {"type":
+                // "stop", "stopwords": "_english_"}}` — the canonical
+                // Elasticsearch-docs `rebuilt_english` block — really does
+                // strip English stopwords. Complaining about its type 400s a
+                // `PUT /{index}` that used to work AND analysed as asked.
+                if Self::builtin_filter_honours(filter_name, filter_def) {
+                    continue;
+                }
+                if probe.resolve_builtin_filter(filter_name).is_some() {
+                    // The name resolves, but to something that is NOT what the
+                    // declaration asks for (a custom `stopwords` list, another
+                    // `language`). Saying "unsupported type" here would be
+                    // misleading — the type is fine, the options are not.
+                    problems.push(format!(
+                        "token filter [{filter_name}]: [{filter_type}] with these options is \
+                         not supported — the built-in [{filter_name}] filter would be used \
+                         instead, which is not what this declares"
+                    ));
+                    continue;
+                }
+                problems.push(format!(
+                    "token filter [{filter_name}]: unsupported type [{filter_type}] \
+                     (supported: {})",
+                    SUPPORTED_FILTER_TYPES.join(", ")
+                ));
             }
         }
 
@@ -1364,6 +1414,20 @@ impl AnalyzerRegistry {
                 declared_tokenizers.insert(tok_name.as_str());
                 let tok_type = tok_def.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if !SUPPORTED_TOKENIZER_TYPES.contains(&tok_type) {
+                    // Same by-name fallback as filters: `apply_settings` reaches
+                    // `resolve_builtin_tokenizer(name)` (analyzer.rs:1454-1473)
+                    // when the declared type built nothing.
+                    if Self::builtin_tokenizer_honours(tok_name, tok_def) {
+                        continue;
+                    }
+                    if probe.resolve_builtin_tokenizer(tok_name).is_some() {
+                        problems.push(format!(
+                            "tokenizer [{tok_name}]: [{tok_type}] with these options is not \
+                             supported — the built-in [{tok_name}] tokenizer would be used \
+                             instead, which is not what this declares"
+                        ));
+                        continue;
+                    }
                     problems.push(format!(
                         "tokenizer [{tok_name}]: unsupported type [{tok_type}] \
                          (supported: {})",
@@ -1385,6 +1449,34 @@ impl AnalyzerRegistry {
             }
         }
 
+        // `char_filter` never reaches the built pipeline: every analyzer is
+        // registered as `AnalyzerPipeline::new(vec![], tokenizer, filters)` —
+        // the char-filter slot is hard-coded empty. A declared `html_strip` or
+        // `mapping` therefore strips/maps nothing, with no signal anywhere.
+        if analysis
+            .pointer("/char_filter")
+            .and_then(|v| v.as_object())
+            .is_some_and(|m| !m.is_empty())
+        {
+            problems.push(
+                "char filters are not supported (analysis.char_filter is declared but no \
+                 char filter is ever applied)"
+                    .to_string(),
+            );
+        }
+        // `normalizer` is the keyword-field analogue and is equally unbuilt.
+        if analysis
+            .pointer("/normalizer")
+            .and_then(|v| v.as_object())
+            .is_some_and(|m| !m.is_empty())
+        {
+            problems.push(
+                "normalizers are not supported (analysis.normalizer is declared but never \
+                 built, so keyword fields naming one are indexed unchanged)"
+                    .to_string(),
+            );
+        }
+
         if let Some(analyzer_map) = analysis.pointer("/analyzer").and_then(|v| v.as_object()) {
             for (analyzer_name, analyzer_def) in analyzer_map {
                 let analyzer_type = analyzer_def
@@ -1401,6 +1493,49 @@ impl AnalyzerRegistry {
                     continue;
                 }
 
+                // Per-analyzer char filters: same hard-coded-empty slot.
+                if analyzer_def
+                    .get("char_filter")
+                    .is_some_and(|v| !matches!(v, serde_json::Value::Array(a) if a.is_empty()))
+                {
+                    problems.push(format!(
+                        "analyzer [{analyzer_name}]: `char_filter` is not supported — the \
+                         declared char filters are never applied"
+                    ));
+                }
+
+                // Shape errors are silent losses, not type errors:
+                // `apply_settings` reads `tokenizer` with `as_str()` and
+                // `filter` with `as_array()`, so a wrong-shaped value is
+                // dropped and the analyzer is built with `standard` / no
+                // filters — accepted, and not what was written.
+                match analyzer_def.get("tokenizer") {
+                    None | Some(serde_json::Value::String(_)) => {}
+                    Some(other) => problems.push(format!(
+                        "analyzer [{analyzer_name}]: `tokenizer` must be a tokenizer name \
+                         (string), got {other} — it would be ignored and `standard` used"
+                    )),
+                }
+                let mut filter_names: Vec<&str> = Vec::new();
+                match analyzer_def.get("filter") {
+                    None => {}
+                    Some(serde_json::Value::Array(arr)) => {
+                        for v in arr {
+                            match v.as_str() {
+                                Some(s) => filter_names.push(s),
+                                None => problems.push(format!(
+                                    "analyzer [{analyzer_name}]: `filter` entries must be \
+                                     filter names (strings), got {v} — it would be ignored"
+                                )),
+                            }
+                        }
+                    }
+                    Some(other) => problems.push(format!(
+                        "analyzer [{analyzer_name}]: `filter` must be an array of filter \
+                         names, got {other} — it would be ignored and no filters applied"
+                    )),
+                }
+
                 let tokenizer_name = analyzer_def
                     .get("tokenizer")
                     .and_then(|v| v.as_str())
@@ -1413,11 +1548,6 @@ impl AnalyzerRegistry {
                     ));
                 }
 
-                let filter_names: Vec<&str> = analyzer_def
-                    .get("filter")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
                 for fname in filter_names {
                     if !declared_filters.contains(fname)
                         && probe.resolve_builtin_filter(fname).is_none()
@@ -1431,7 +1561,70 @@ impl AnalyzerRegistry {
         }
 
         problems.sort();
+        problems.dedup();
         problems
+    }
+
+    /// Does a declared token filter resolve, by NAME, to a built-in that does
+    /// exactly what the declaration asks for?
+    ///
+    /// This is the fallback `apply_settings` genuinely takes: a `type` it
+    /// cannot build leaves `custom_filters` without an entry, and the analyzer
+    /// loop then calls [`Self::resolve_builtin_filter`] with the *declared
+    /// name*. Judging such a declaration on its `type` alone reports a filter
+    /// that is in fact honoured — and, through the create-time gate, 400s a
+    /// `PUT /{index}` that previously worked.
+    ///
+    /// Deliberately narrow: only the exact option sets the built-in reproduces
+    /// return `true`. A custom `stopwords` list under the name `english_stop`
+    /// is still a problem, because the English list is what would actually run.
+    fn builtin_filter_honours(name: &str, def: &serde_json::Value) -> bool {
+        let ty = def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match (name, ty) {
+            // `LowercaseFilter`. ES's `lowercase` filter takes an optional
+            // `language` (greek/irish/turkish); only the default is this.
+            ("lowercase", "lowercase") => def.get("language").is_none(),
+            // `StopwordsFilter::english()`. ES's `stop` defaults to
+            // `_english_`, which is exactly the list built here.
+            ("stop" | "english_stop", "stop") => {
+                def.get("stopwords_path").is_none()
+                    && match def.get("stopwords") {
+                        None => true,
+                        Some(serde_json::Value::String(s)) => s == "_english_",
+                        _ => false,
+                    }
+                    && def.get("ignore_case").is_none()
+                    && def.get("remove_trailing").is_none()
+            }
+            // `StemmerFilter::english()` — rust-stemmers' Snowball English.
+            ("stemmer" | "english_stemmer", "stemmer") => {
+                match def.get("language").or_else(|| def.get("name")) {
+                    None => true,
+                    Some(serde_json::Value::String(s)) => {
+                        matches!(s.as_str(), "english" | "porter2")
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Tokenizer counterpart of [`Self::builtin_filter_honours`].
+    ///
+    /// `apply_settings` resolves an unbuilt tokenizer by declared name through
+    /// [`Self::resolve_builtin_tokenizer`], so `{"standard": {"type":
+    /// "standard"}}` is honoured exactly as written.
+    fn builtin_tokenizer_honours(name: &str, def: &serde_json::Value) -> bool {
+        let ty = def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match (name, ty) {
+            // `max_token_length` is not implemented by `StandardTokenizer`.
+            ("standard", "standard") => def.get("max_token_length").is_none(),
+            ("whitespace", "whitespace") => def.get("max_token_length").is_none(),
+            // `buffer_size` is a performance knob with no semantic effect.
+            ("keyword", "keyword") => true,
+            _ => false,
+        }
     }
 
     /// Locate the `analysis` block inside an index-settings object.
@@ -2372,5 +2565,151 @@ mod unsupported_analysis_tests {
                 "tokenizer type `{t}` is on the supported list but did not build"
             );
         }
+    }
+
+    /// The canonical Elasticsearch-docs `rebuilt_english` shape, cut down to the
+    /// parts xerj can serve. Judging `english_stop` on its `type` alone made
+    /// `unsupported_analysis` report it as unsupported — and, through the
+    /// create-time gate, 400 a `PUT /{index}` that xerj had always accepted AND
+    /// analysed correctly. Both halves are asserted here: no complaint, and the
+    /// registry built from the same block really does strip English stopwords.
+    #[test]
+    fn declared_filter_resolved_by_name_is_honoured_not_reported() {
+        let settings = json!({
+            "analysis": {
+                "filter": {
+                    "english_stop": { "type": "stop", "stopwords": "_english_" }
+                },
+                "analyzer": {
+                    "rebuilt_english": {
+                        "type": "custom",
+                        "tokenizer": "standard",
+                        "filter": ["lowercase", "english_stop"]
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            AnalyzerRegistry::unsupported_analysis(&settings),
+            Vec::<String>::new()
+        );
+
+        let mut registry = AnalyzerRegistry::with_defaults();
+        registry.apply_settings(&settings);
+        let terms = registry
+            .get_analyzer("rebuilt_english")
+            .expect("analyzer must be registered")
+            .analyze_to_terms("The Quick Brown Fox");
+        assert_eq!(
+            terms,
+            vec!["quick".to_string(), "brown".to_string(), "fox".to_string()],
+            "the built registry must apply the stopword filter the block declares"
+        );
+    }
+
+    /// …but only when the built-in is what the declaration actually asks for.
+    /// A custom stopword list under the same name is NOT honoured — the English
+    /// list would run instead — so it must still be reported, and with a message
+    /// about the options rather than a misleading "unsupported type".
+    #[test]
+    fn declared_filter_with_options_the_builtin_cannot_reproduce_is_reported() {
+        let problems = AnalyzerRegistry::unsupported_analysis(&json!({
+            "analysis": {
+                "filter": {
+                    "english_stop": { "type": "stop", "stopwords": ["pelican", "walrus"] }
+                }
+            }
+        }));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("not supported") && problems[0].contains("english_stop"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn builtin_tokenizer_resolved_by_name_is_honoured_not_reported() {
+        assert_eq!(
+            AnalyzerRegistry::unsupported_analysis(&json!({
+                "analysis": {
+                    "tokenizer": { "whitespace": { "type": "whitespace" } },
+                    "analyzer": { "a": { "type": "custom", "tokenizer": "whitespace" } }
+                }
+            })),
+            Vec::<String>::new()
+        );
+    }
+
+    /// `AnalyzerPipeline::new(vec![], …)` — the char-filter slot is hard-coded
+    /// empty, so a declared `html_strip` strips nothing. Measured pre-fix:
+    /// `<b>hello</b>` tokenised to `["b", "hello", "b"]` with `problems == []`.
+    #[test]
+    fn char_filters_are_reported_because_they_are_never_built() {
+        let settings = json!({
+            "analysis": {
+                "char_filter": { "strip_html": { "type": "html_strip" } },
+                "analyzer": {
+                    "a": {
+                        "type": "custom",
+                        "tokenizer": "standard",
+                        "char_filter": ["strip_html"]
+                    }
+                }
+            }
+        });
+        let problems = AnalyzerRegistry::unsupported_analysis(&settings);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems.iter().all(|p| p.contains("char filter")),
+            "{problems:?}"
+        );
+
+        // The reason it must be reported: nothing strips the tags.
+        let mut registry = AnalyzerRegistry::with_defaults();
+        registry.apply_settings(&settings);
+        assert!(
+            registry
+                .get_analyzer("a")
+                .expect("registered")
+                .analyze_to_terms("<b>hello</b>")
+                .contains(&"b".to_string()),
+            "char filters really are not applied — that is why they are refused"
+        );
+    }
+
+    #[test]
+    fn normalizers_are_reported_because_they_are_never_built() {
+        let problems = AnalyzerRegistry::unsupported_analysis(&json!({
+            "analysis": {
+                "normalizer": { "lower": { "type": "custom", "filter": ["lowercase"] } }
+            }
+        }));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("normalizer"), "{problems:?}");
+    }
+
+    /// `apply_settings` reads `filter` with `as_array()`, so a bare string is
+    /// dropped and the analyzer is built with no filters at all. Measured
+    /// pre-fix: `problems == []`, terms `["ABC"]` from `"ABC"` — the
+    /// `lowercase` the caller wrote never ran.
+    #[test]
+    fn wrong_shaped_analyzer_keys_are_reported() {
+        let problems = AnalyzerRegistry::unsupported_analysis(&json!({
+            "analysis": {
+                "analyzer": {
+                    "a": { "type": "custom", "tokenizer": "standard", "filter": "lowercase" },
+                    "b": { "type": "custom", "tokenizer": ["standard"] }
+                }
+            }
+        }));
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("`filter` must be")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("`tokenizer` must be")),
+            "{problems:?}"
+        );
     }
 }

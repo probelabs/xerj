@@ -11,10 +11,10 @@ use tracing::{debug, warn};
 
 use crate::{
     builtins::{
-        AddFieldPlugin, ConvertTypePlugin, CopyFieldPlugin, DropFieldPlugin, FieldRenamePlugin,
-        GrokPlugin, JsonParsePlugin, LowercasePlugin, PiiRedactionPlugin, RemoveNullPlugin,
-        RoutePlugin, SetPlugin, SplitPlugin, TimestampParsePlugin, UppercasePlugin,
-        UrlDecodePlugin, CONVERT_TARGET_TYPES, GROK_PATTERN_NAMES, PII_TYPE_NAMES,
+        AddFieldPlugin, AppendPlugin, ConvertTypePlugin, CopyFieldPlugin, DropFieldPlugin,
+        FieldRenamePlugin, GrokPlugin, JsonParsePlugin, LowercasePlugin, PiiRedactionPlugin,
+        RemoveNullPlugin, RoutePlugin, SetPlugin, SplitPlugin, TimestampParsePlugin,
+        UppercasePlugin, UrlDecodePlugin, CONVERT_TARGET_TYPES, GROK_PATTERN_NAMES, PII_TYPE_NAMES,
     },
     Result, TransformPlugin, WasmError,
 };
@@ -99,15 +99,17 @@ pub struct Pipeline {
 impl Pipeline {
     /// Build a [`Pipeline`] from a [`PipelineConfig`].
     ///
-    /// Returns [`WasmError::InvalidConfig`] when a plugin-specific config is
-    /// malformed, and [`WasmError::UnsupportedStage`] when the stage type
-    /// itself is one xerj does not implement.
+    /// Three outcomes, deliberately distinct (issue #204):
     ///
-    /// Those two are deliberately distinct (issue #204). A malformed config is
-    /// a caller error and the definition must be refused. An unimplemented
-    /// stage type is a *xerj capability gap*: the caller wrote something
-    /// legitimate that we cannot run, and the honest answer is to say so at the
-    /// point of use rather than pretend either way.
+    /// - [`WasmError::InvalidConfig`] — the caller's mistake. The definition
+    ///   must be refused.
+    /// - [`WasmError::UnsupportedStage`] — a *xerj capability gap*: the caller
+    ///   wrote something legitimate that we cannot run. The honest answer is to
+    ///   say so at the point of use rather than pretend either way.
+    /// - [`WasmError::UnsupportedOption`] — the same gap one level down: the
+    ///   stage exists, an option on it does not (a processor-level `if` guard,
+    ///   a `grok` `patterns` array). Silently dropping these is what makes a
+    ///   compiled pipeline write the wrong document under a `201`.
     pub fn from_config(name: impl Into<String>, config: &PipelineConfig) -> Result<Self> {
         let name = name.into();
         let mut stages: Vec<Arc<dyn TransformPlugin>> = Vec::new();
@@ -116,6 +118,13 @@ impl Pipeline {
             let plugin =
                 build_plugin(&stage_cfg.stage_type, &stage_cfg.config).map_err(|e| match e {
                     StageBuildError::Unsupported(stage) => WasmError::UnsupportedStage { stage },
+                    StageBuildError::UnsupportedOption { option, reason } => {
+                        WasmError::UnsupportedOption {
+                            stage: stage_cfg.stage_type.clone(),
+                            option,
+                            reason,
+                        }
+                    }
                     StageBuildError::Config(reason) => WasmError::InvalidConfig {
                         plugin: stage_cfg.stage_type.clone(),
                         reason,
@@ -191,14 +200,17 @@ impl std::fmt::Debug for Pipeline {
 
 /// Why [`build_plugin`] refused a stage.
 ///
-/// Split in two on purpose (issue #204): `Config` is the caller's mistake and
-/// must be refused at definition time; `Unsupported` is xerj's gap and has to
-/// be reported as such so callers are not told their processor is invalid when
-/// it is merely unimplemented here.
+/// Split three ways on purpose (issue #204): `Config` is the caller's mistake
+/// and must be refused at definition time; `Unsupported` and
+/// `UnsupportedOption` are xerj's gaps and have to be reported as such, so
+/// callers are not told their processor is invalid when it is merely
+/// unimplemented here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StageBuildError {
     /// The stage type is not implemented by this build.
     Unsupported(String),
+    /// The stage type IS implemented but an option on it is not.
+    UnsupportedOption { option: String, reason: String },
     /// The stage type exists but its config cannot be honoured.
     Config(String),
 }
@@ -209,11 +221,47 @@ impl From<String> for StageBuildError {
     }
 }
 
+/// Elasticsearch processor-level keys that decide **whether** a processor runs
+/// or **what happens when it fails**, none of which the compiled pipeline can
+/// act on.
+///
+/// Issue #204, applied to this PR's own new surface. `PUT /_ingest/pipeline`
+/// now means "compiled ⇒ xerj honours this"; a `{"set": {…, "if": "ctx.foo ==
+/// 'never'"}}` that compiles and then sets the field on every document makes
+/// that promise false, and writes the wrong document under a `201`. The
+/// pipeline is accepted (ES accepts it) and recorded as unrunnable, so the gap
+/// surfaces at ingest instead of being silently resolved in the caller's face.
+///
+/// `tag` and `description` are deliberately NOT here: they are identification
+/// metadata that changes no document and no decision on this path.
+const UNHONOURED_PROCESSOR_KEYS: &[(&str, &str)] = &[
+    (
+        "if",
+        "the guard is not evaluated, so the processor would run on documents it excludes",
+    ),
+    (
+        "on_failure",
+        "the recovery processors are not run; the pipeline's `on_error` policy applies instead",
+    ),
+    (
+        "ignore_failure",
+        "a failing processor is not ignored; the pipeline's `on_error` policy applies instead",
+    ),
+];
+
 /// Instantiate a built-in plugin by name.
 fn build_plugin(
     stage_type: &str,
     config: &Value,
 ) -> std::result::Result<Arc<dyn TransformPlugin>, StageBuildError> {
+    for (key, reason) in UNHONOURED_PROCESSOR_KEYS {
+        if config.get(key).is_some() {
+            return Err(StageBuildError::UnsupportedOption {
+                option: (*key).to_string(),
+                reason: (*reason).to_string(),
+            });
+        }
+    }
     match stage_type {
         "json_parse" => {
             let field = str_field(config, "field")?;
@@ -280,6 +328,27 @@ fn build_plugin(
 
         "grok" => {
             let field = str_field(config, "field")?;
+            // Elasticsearch's `grok` processor is driven by `patterns` — an
+            // ARRAY of grok expressions (`["%{IP:client} %{WORD:method}"]`),
+            // optionally with `pattern_definitions`. xerj's `grok` is a
+            // different, narrower thing: one NAMED pattern out of
+            // `GROK_PATTERN_NAMES`. Reading `pattern` and defaulting to
+            // `SYSLOG` meant an ES grok processor compiled clean, answered
+            // `200 acknowledged` under this PR's "compiled ⇒ honoured"
+            // contract, and left the document untouched (issue #204 — measured:
+            // `{"message": "10.0.0.1 GET"}` came back with no `client` field).
+            for key in ["patterns", "pattern_definitions"] {
+                if config.get(key).is_some() {
+                    return Err(StageBuildError::UnsupportedOption {
+                        option: key.to_string(),
+                        reason: format!(
+                            "xerj's grok stage takes a named `pattern` from [{}], not \
+                             arbitrary grok expressions",
+                            GROK_PATTERN_NAMES.join(", ")
+                        ),
+                    });
+                }
+            }
             let pattern_name = match config.get("pattern") {
                 None => "SYSLOG".to_string(),
                 Some(Value::String(s)) => {
@@ -371,11 +440,45 @@ fn build_plugin(
                 .get("value")
                 .cloned()
                 .ok_or_else(|| "missing 'value'".to_string())?;
-            let override_existing = config
-                .get("override")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            // Elasticsearch's `set` processor defaults `override` to TRUE
+            // (`SetProcessor.java:135` — `readBooleanProperty(…, "override",
+            // true)`; ES is read for semantics only, no code reproduced). This
+            // was `unwrap_or(false)`, so `{"set": {"field": "env", "value":
+            // "prod"}}` left an existing `{"env": "dev"}` untouched: a weaker
+            // fallback on user configuration, in the file the #204 sweep
+            // rewrote. A present-but-non-boolean `override` is a caller error
+            // rather than a silent fall-through to the default.
+            let override_existing = match config.get("override") {
+                None => true,
+                Some(v) => v
+                    .as_bool()
+                    .ok_or_else(|| format!("'override' must be a boolean, got {v}"))?,
+            };
             Ok(Arc::new(SetPlugin::new(field, value, override_existing)))
+        }
+
+        "append" => {
+            let field = str_field(config, "field")?;
+            let value = config
+                .get("value")
+                .cloned()
+                .ok_or_else(|| "missing 'value'".to_string())?;
+            // ES's `allow_duplicates` defaults to true (`AppendProcessor
+            // .java:121`) and that is what `AppendPlugin` does; the
+            // de-duplicating variant is not implemented, so asking for it must
+            // not be silently ignored.
+            match config.get("allow_duplicates") {
+                None | Some(Value::Bool(true)) => {}
+                Some(_) => {
+                    return Err(StageBuildError::UnsupportedOption {
+                        option: "allow_duplicates".to_string(),
+                        reason: "values are always appended; de-duplicating append is not \
+                                 implemented"
+                            .to_string(),
+                    })
+                }
+            }
+            Ok(Arc::new(AppendPlugin::new(field, value)))
         }
 
         "remove_null" => Ok(Arc::new(RemoveNullPlugin)),
@@ -666,5 +769,151 @@ mod fallback_regression_tests {
         .is_err());
         // Absent `formats` is still the documented epoch/RFC-3339 default.
         assert!(build("timestamp_parse", serde_json::json!({ "field": "ts" })).is_ok());
+    }
+
+    /// A processor-level `if` guard is not evaluated on this path. Compiling it
+    /// meant `PUT /_ingest/pipeline` answered 200 — which this change redefined
+    /// to mean "xerj honours this" — and then ran the processor on exactly the
+    /// documents the guard excludes. Measured pre-fix: `{"foo":
+    /// "something-else"}` came out `{"foo": "something-else", "env": "prod"}`.
+    #[test]
+    fn a_processor_level_if_guard_is_not_silently_dropped() {
+        let err = build(
+            "set",
+            serde_json::json!({
+                "field": "env", "value": "prod", "if": "ctx.foo == 'never'"
+            }),
+        )
+        .expect_err("an unhonourable `if` must not compile");
+        assert!(
+            matches!(&err, WasmError::UnsupportedOption { stage, option, .. }
+                     if stage == "set" && option == "if"),
+            "expected UnsupportedOption(if), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn on_failure_and_ignore_failure_are_not_silently_dropped() {
+        for key in ["on_failure", "ignore_failure"] {
+            let mut cfg = serde_json::json!({ "field": "env", "value": "prod" });
+            cfg[key] = serde_json::json!(if key == "ignore_failure" {
+                serde_json::json!(true)
+            } else {
+                serde_json::json!([{ "set": { "field": "x", "value": 1 } }])
+            });
+            let err = build("set", cfg).expect_err("{key} must not be dropped");
+            assert!(
+                matches!(&err, WasmError::UnsupportedOption { option, .. } if option == key),
+                "expected UnsupportedOption({key}), got: {err:?}"
+            );
+        }
+    }
+
+    /// `tag` and `description` are identification metadata — they change no
+    /// document and no decision on this path — so they stay accepted.
+    #[test]
+    fn processor_metadata_keys_still_compile() {
+        assert!(build(
+            "set",
+            serde_json::json!({
+                "field": "env", "value": "prod",
+                "tag": "t1", "description": "sets env"
+            })
+        )
+        .is_ok());
+    }
+
+    /// ES's `grok` is driven by `patterns` (an array of grok expressions);
+    /// xerj's takes one NAMED pattern. Reading `pattern` and defaulting to
+    /// `SYSLOG` meant an ES grok processor compiled clean and left the document
+    /// untouched — measured pre-fix: `{"message": "10.0.0.1 GET"}` with the
+    /// `%{IP:client}` capture nowhere.
+    #[test]
+    fn es_grok_patterns_array_is_not_silently_replaced_by_syslog() {
+        let err = build(
+            "grok",
+            serde_json::json!({
+                "field": "message", "patterns": ["%{IP:client} %{WORD:method}"]
+            }),
+        )
+        .expect_err("`patterns` must not compile to the SYSLOG default");
+        assert!(
+            matches!(&err, WasmError::UnsupportedOption { stage, option, .. }
+                     if stage == "grok" && option == "patterns"),
+            "expected UnsupportedOption(patterns), got: {err:?}"
+        );
+    }
+
+    /// Elasticsearch's `set` defaults `override` to true (SetProcessor.java:135
+    /// — read for semantics only). `unwrap_or(false)` made `{"set": {"field":
+    /// "env", "value": "prod"}}` a no-op against an existing `{"env": "dev"}`.
+    #[test]
+    fn set_overrides_by_default_like_elasticsearch() {
+        let pl = build(
+            "set",
+            serde_json::json!({ "field": "env", "value": "prod" }),
+        )
+        .expect("set builds");
+        let mut doc = serde_json::json!({ "env": "dev" });
+        pl.process(&mut doc);
+        assert_eq!(doc["env"], "prod");
+
+        // …and the opt-out still works.
+        let pl = build(
+            "set",
+            serde_json::json!({ "field": "env", "value": "prod", "override": false }),
+        )
+        .expect("set builds");
+        let mut doc = serde_json::json!({ "env": "dev" });
+        pl.process(&mut doc);
+        assert_eq!(doc["env"], "dev");
+
+        // A non-boolean `override` is refused rather than defaulted.
+        assert!(build(
+            "set",
+            serde_json::json!({ "field": "env", "value": "prod", "override": "yes" })
+        )
+        .is_err());
+    }
+
+    /// `append` used to be mapped onto `set` in the ES translation, so it
+    /// REPLACED the field. It is now a real append and agrees with the
+    /// `_simulate` interpreter.
+    #[test]
+    fn append_extends_rather_than_replacing() {
+        let pl = build(
+            "append",
+            serde_json::json!({ "field": "tags", "value": "b" }),
+        )
+        .expect("append builds");
+
+        let mut doc = serde_json::json!({ "tags": ["a"] });
+        pl.process(&mut doc);
+        assert_eq!(doc["tags"], serde_json::json!(["a", "b"]));
+
+        // A scalar widens into a list; a missing field becomes a 1-element one.
+        let mut doc = serde_json::json!({ "tags": "a" });
+        pl.process(&mut doc);
+        assert_eq!(doc["tags"], serde_json::json!(["a", "b"]));
+        let mut doc = serde_json::json!({});
+        pl.process(&mut doc);
+        assert_eq!(doc["tags"], serde_json::json!(["b"]));
+
+        // A list value extends rather than nesting.
+        let pl = build(
+            "append",
+            serde_json::json!({ "field": "tags", "value": ["b", "c"] }),
+        )
+        .expect("append builds");
+        let mut doc = serde_json::json!({ "tags": ["a"] });
+        pl.process(&mut doc);
+        assert_eq!(doc["tags"], serde_json::json!(["a", "b", "c"]));
+
+        // De-duplicating append is not implemented; asking for it is refused.
+        assert!(build(
+            "append",
+            serde_json::json!({ "field": "tags", "value": "b", "allow_duplicates": false })
+        )
+        .is_err());
     }
 }

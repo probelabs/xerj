@@ -62,6 +62,24 @@ pub enum WasmError {
     #[error("unsupported stage type '{stage}'")]
     UnsupportedStage { stage: String },
 
+    /// The stage type IS implemented, but the caller set an option this build
+    /// cannot honour — an Elasticsearch processor-level `if` guard, an
+    /// `on_failure` recovery chain, a `grok` `patterns` array.
+    ///
+    /// Issue #204 again, one level down. Reporting these as `InvalidConfig`
+    /// would tell a caller their valid ES processor is malformed; ignoring them
+    /// is what the sweep exists to kill — a `set` that runs on documents its
+    /// `if` excludes is a silently wrong document, not a cosmetic gap. Handled
+    /// exactly like [`WasmError::UnsupportedStage`] at the API boundary: the
+    /// definition is accepted (ES accepts it) and recorded as unrunnable, so
+    /// every ingest through it refuses loudly.
+    #[error("stage '{stage}': option '{option}' is not supported by this build ({reason})")]
+    UnsupportedOption {
+        stage: String,
+        option: String,
+        reason: String,
+    },
+
     /// The pipeline is registered but carries a stage this build cannot run,
     /// so no document may pass through it.
     #[error("pipeline '{pipeline}' is registered but cannot run: {reason}")]

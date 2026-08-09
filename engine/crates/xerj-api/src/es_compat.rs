@@ -16540,11 +16540,17 @@ pub async fn index_stats(
                 Ok(idx) => idx.hnsw_stats().await,
                 Err(_) => json!({ "present": false }),
             };
+            let schema_persist_failures = state
+                .engine
+                .get_index(name)
+                .map(|idx| idx.schema_persist_failures())
+                .unwrap_or(0);
             let primaries = json!({
                 "docs": { "count": doc_count, "deleted": 0 },
                 "store": { "size_in_bytes": store_size_bytes },
                 "dense_vector": dv,
                 "hnsw": hnsw,
+                "mappings": { "schema_persist_failures": schema_persist_failures },
                 "merges": {
                     "current": if merging { 1 } else { 0 },
                     "current_docs": 0,
@@ -16681,11 +16687,24 @@ pub async fn index_stats(
             )
         })
         .unwrap_or((0, false));
+    // XERJ extension (issue #204): dynamic-mapping evolution that could not be
+    // written to `schema.json`. Non-zero means the on-disk mapping is behind
+    // the live one and a restart will lose those fields. It is counted rather
+    // than raised because schema evolution runs after the document has been
+    // admitted — there is no caller left to fail — so a health check needs to
+    // be able to READ it. This is that read: without it the counter existed and
+    // nothing in the workspace looked at it.
+    let schema_persist_failures = state
+        .engine
+        .get_index(&index)
+        .map(|idx| idx.schema_persist_failures())
+        .unwrap_or(0);
     let primaries = json!({
         "docs": { "count": doc_count, "deleted": 0 },
         "store": { "size_in_bytes": store_size_bytes },
         "dense_vector": dense_vector_stats,
         "hnsw": hnsw_stats,
+        "mappings": { "schema_persist_failures": schema_persist_failures },
         "indexing": {
             // Real cumulative indexing counters (RC4 W4 item 1): plumbed from
             // the per-index `metric_index_count` / `metric_index_total_ms`
@@ -21652,6 +21671,27 @@ pub async fn put_settings(
     // Normalize body into the `{ "index": { ... } }` shape we store.
     let inner = body.get("index").cloned().unwrap_or(body.clone());
 
+    // An `analysis` block here is accepted-and-ignored, and it is the one hole
+    // that would walk straight around the create-time gate: this handler merges
+    // the body into `engine.index_settings` (the display copy read back by
+    // `GET /{index}/_settings`) and nothing else. The index's
+    // `AnalyzerRegistry` is built once, at create/open (index.rs:5428, :5617),
+    // and there is no rebuild path — so a settings PUT that "adds an analyzer"
+    // changes what the API echoes back and not one token of what is indexed.
+    // Refuse it. Elasticsearch also refuses analysis updates on an open index
+    // (they are non-dynamic settings), so this narrows behaviour towards ES
+    // rather than away from it (issue #204).
+    if inner.pointer("/analysis").is_some() || body.pointer("/analysis").is_some() {
+        let e = xerj_common::XerjError::config(format!(
+            "index [{index}]: `analysis` settings cannot be updated after the index is \
+             created — the analyzer registry is built at index creation and this request \
+             would change only what `GET /{index}/_settings` echoes back, not how \
+             documents are analysed. Create a new index with the analysis block and \
+             reindex."
+        ));
+        return ApiError::new(e).into_response();
+    }
+
     for idx in &targets {
         let mut existing = state
             .engine
@@ -21745,9 +21785,31 @@ pub async fn put_ingest_pipeline(
             "date" => "timestamp_parse".to_string(),
             "json" => "json_parse".to_string(),
             "convert" => "convert".to_string(),
-            "append" | "set" => "set".to_string(),
+            // `append` used to be folded into `set` here, which REPLACES the
+            // field instead of extending it — a different document, under a
+            // 200, and in disagreement with the `_simulate` interpreter below,
+            // which has always implemented a real append (issue #204). There is
+            // now an `append` stage; the two agree.
+            "set" => "set".to_string(),
             "copy" => "copy_field".to_string(),
             other => other.to_string(),
+        }
+    }
+
+    /// Elasticsearch `convert` target types that name exactly the same
+    /// conversion as one of xerj's, under a different word.
+    ///
+    /// Issue #204 permits an *equivalent* fallback; `ConvertTypePlugin`'s
+    /// `integer` parses to `i64` and its `float` to `f64` (`builtins.rs`), so
+    /// ES `long` and `double` are the same conversion and 400ing them rejected
+    /// previously-accepted ES pipelines for no gain. `auto`, `ip`, `short` and
+    /// `byte` have no equivalent here and stay refused rather than being
+    /// silently widened.
+    fn map_convert_type(es_type: &str) -> Option<&'static str> {
+        match es_type {
+            "long" => Some("integer"),
+            "double" => Some("float"),
+            _ => None,
         }
     }
     let xerj_config = if let Some(processors) = body.get("processors").and_then(Value::as_array) {
@@ -21798,6 +21860,19 @@ pub async fn put_ingest_pipeline(
                         _ => proc_config.clone(),
                     }
                 }
+                "convert" => {
+                    // ES vocabulary → xerj vocabulary for the two targets that
+                    // are the same conversion under a different name.
+                    let mut cfg = proc_config.clone();
+                    if let Some(mapped) = proc_config
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .and_then(map_convert_type)
+                    {
+                        cfg["type"] = json!(mapped);
+                    }
+                    cfg
+                }
                 _ => proc_config.clone(),
             };
             stages.push(json!({"type": xerj_type, "config": adapted_config}));
@@ -21840,6 +21915,25 @@ pub async fn put_ingest_pipeline(
                 format!(
                     "processor [{stage}] is not implemented by this xerj build; \
                      no document can be ingested through pipeline [{id}]"
+                ),
+            );
+            Json(json!({ "acknowledged": true })).into_response()
+        }
+        // Same shape one level down: the processor exists, an option on it does
+        // not. ES accepts the definition, so we do too — and record why it
+        // cannot run, so no document is written as if the option had been
+        // honoured (issue #204 applied to this endpoint's own new contract).
+        Err(xerj_wasm::WasmError::UnsupportedOption {
+            stage,
+            option,
+            reason,
+        }) => {
+            state.engine.register_unrunnable_pipeline(
+                &id,
+                body,
+                format!(
+                    "processor [{stage}] option [{option}] is not supported by this xerj \
+                     build ({reason}); no document can be ingested through pipeline [{id}]"
                 ),
             );
             Json(json!({ "acknowledged": true })).into_response()
@@ -25042,22 +25136,69 @@ async fn clone_index_to(state: &AppState, source: &str, target: &str) -> Result<
         .get_index(target)
         .map_err(|e| ApiError::new(xerj_common::XerjError::from(e)))?;
 
-    // Copy all documents.
-    let search_req = xerj_query::parse_request(&json!({
-        "query": { "match_all": {} },
-        "size": 10000,
-        "from": 0,
-    }))
-    .map_err(|e| ApiError::new(xerj_common::XerjError::invalid_query(e.to_string())))?;
+    // Copy EVERY document, and fail loudly if any copy fails.
+    //
+    // Issue #204, the "a partial export instead of a full one" case, verbatim.
+    // This used to be a single `size: 10000` search whose per-document writes
+    // were swallowed with `let _ =`, and then answered `{"acknowledged": true,
+    // "shards_acknowledged": true}` — so cloning an index with 10,001
+    // documents silently produced a 10,000-document copy, and a clone in which
+    // every single write failed was reported as a success. `_clone`, `_shrink`
+    // and `_split` all land here, on user data.
+    //
+    // Same keyset (`search_after` on `_id`) paging the `_reindex` handler uses,
+    // for the same reason: `from`-offset paging truncates at
+    // `max_result_window`. The source is flushed first because the in-memory
+    // memtable's sort path does not order by `_id` reliably, so un-flushed
+    // writes would be skipped or duplicated across pages.
+    let _ = src_idx.flush().await;
 
-    let results = src_idx
-        .search(&search_req)
-        .await
-        .map_err(|e| ApiError::new(xerj_common::XerjError::from(e)))?;
+    const CLONE_PAGE_SIZE: usize = 1_000;
+    let mut search_after: Option<Value> = None;
+    let mut copied = 0usize;
 
-    for hit in results.hits {
-        if !hit.source.is_null() {
-            let _ = dest_idx.index_document(Some(hit.id), hit.source).await;
+    loop {
+        let mut search_body = json!({
+            "query": { "match_all": {} },
+            "size": CLONE_PAGE_SIZE,
+            "sort": [{ "_id": "asc" }],
+        });
+        if let Some(sa) = &search_after {
+            search_body["search_after"] = sa.clone();
+        }
+        let search_req = xerj_query::parse_request(&search_body)
+            .map_err(|e| ApiError::new(xerj_common::XerjError::invalid_query(e.to_string())))?;
+
+        let results = src_idx
+            .search(&search_req)
+            .await
+            .map_err(|e| ApiError::new(xerj_common::XerjError::from(e)))?;
+
+        let batch = results.hits.len();
+        if batch == 0 {
+            break;
+        }
+        search_after = results.hits.last().map(|h| json!([h.id.clone()]));
+
+        for hit in results.hits {
+            if hit.source.is_null() {
+                continue;
+            }
+            let id = hit.id.clone();
+            dest_idx
+                .index_document(Some(hit.id), hit.source)
+                .await
+                .map_err(|e| {
+                    ApiError::new(xerj_common::XerjError::internal(format!(
+                        "clone of [{source}] into [{target}] failed after {copied} \
+                         document(s): document [{id}] could not be written: {e}"
+                    )))
+                })?;
+            copied += 1;
+        }
+
+        if batch < CLONE_PAGE_SIZE {
+            break;
         }
     }
     Ok(())
