@@ -1349,6 +1349,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             // `started` intentionally stays out of this additive upgrade.
             // Older catalogs dynamically mapped it as text, and asking the
             // engine to change that existing field to date aborts every run.
+            // `catalog::catalog_mapping` declares it `date` for a fresh
+            // catalog, so the field is permanently bimodal across installs;
+            // its doc comment carries the full tripwire.
             "summary_generated_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
             "invocation_telemetry_scope": {"type": "keyword"}
         }}),
@@ -2360,9 +2363,19 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     // dataset docs
     let mut junk_records_by_run: u64 = junk_records.load(Ordering::Relaxed);
-    let dataset_stats = {
+    let (dataset_stats, durable_junk_records) = {
         let journal = journal_mx.lock().unwrap();
-        durable_dataset_stats(&plan, &journal.done)
+        let stats = durable_dataset_stats(&plan, &journal.done);
+        // One definition of "junk records" per map. The dataset docs below
+        // report the durable per-file commits, so the run doc must too:
+        // reporting the invocation-local counter there made a no-op resume
+        // publish `junk_records_total: 0` next to dataset docs that showed
+        // the real number, in the same `xerj autoindex map` output. The
+        // per-dataset values are this same total attributed to each file's
+        // first assigned dataset, so they sum back to it for every file the
+        // frozen plan still describes.
+        let durable_junk: u64 = journal.done.values().map(|done| done.junk).sum();
+        (stats, durable_junk)
     };
     for d in &plan.datasets {
         let sample_queries = catalog::build_sample_queries(d, &key_corrs);
@@ -2558,7 +2571,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "duplicate_files": plan.duplicate_files.len(),
         "files_junk": junk_file_count,
         "records_total": total_records,
-        "junk_records_total": junk_records_by_run,
+        // Durable corpus descriptor, same definition as every dataset doc's
+        // `junk_records`; `junk_records_this_run` below is the invocation
+        // counter, which also includes records the backend itself rejected.
+        "junk_records_total": durable_junk_records,
+        "junk_records_this_run": junk_records_by_run,
         // This-run submission accounting (#195): what THIS invocation sent
         // and had accepted, vs `records_total` above which is the live
         // server-side count. A healthy run keeps these consistent; a
@@ -3251,6 +3268,7 @@ mod map_metadata_tests {
                 .enumerate()
                 .map(|(group, slug)| (Some(format!("group-{group}")), (*slug).to_string()))
                 .collect(),
+            as_document: false,
         }
     }
 

@@ -8,7 +8,28 @@ use serde_json::{json, Value};
 
 pub const CATALOG_INDEX: &str = "autoindex-catalog";
 
+/// Explicit mapping for a **freshly created** catalog index.
+///
+/// Tripwire — `started` is bimodal across installs, on purpose. This function
+/// declares it `date`, but the additive upgrade in `run_index_report`
+/// deliberately omits it: catalogs created before this mapping existed have a
+/// dynamically inferred `text` `started`, and asking the engine to change an
+/// existing `text` field to `date` is refused with a 400
+/// `illegal_argument_exception` (`xerj-api/src/es_compat.rs:1792`) and aborts
+/// the whole invocation. So a catalog created from here sorts `started`
+/// server-side, and an upgraded legacy catalog does not.
+///
+/// Nothing may rely on `started` being a `date`: `run_map` sorts runs
+/// client-side, which is what keeps the split benign. Any future server-side
+/// range query, `sort`, or date aggregation on `started` must first migrate
+/// legacy catalogs by reindexing them — not by adding `started` to the
+/// additive upgrade, which is exactly the abort described above.
 pub fn catalog_mapping() -> Value {
+    // The three run-metadata fields are inserted after the literal rather than
+    // written inside it: `serde_json::json!` recurses once per key, and at 40
+    // properties the macro exceeds the default `recursion_limit = 128` and
+    // fails to compile. Adding another field here must use this same tail, not
+    // the literal.
     let mut mapping = json!({
         "mappings": {"properties": {
             "doc_kind": {"type": "keyword"},
@@ -54,6 +75,7 @@ pub fn catalog_mapping() -> Value {
         .pointer_mut("/mappings/properties")
         .and_then(Value::as_object_mut)
         .expect("catalog mapping properties");
+    // See the tripwire on this function before touching `started`.
     properties.insert(
         "started".into(),
         json!({"type": "date", "format": "strict_date_optional_time||epoch_millis"}),

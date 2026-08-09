@@ -31,6 +31,12 @@ struct MockState {
     catalog_preexists: bool,
     catalog_mapping_upgraded: bool,
     catalog_bulk_before_upgrade: bool,
+    /// Catalog bulk actions the fixture does not model. Recorded rather than
+    /// panicked on: this runs inside the server thread while the state guard
+    /// is held, so a panic here would poison the `Mutex` and turn
+    /// `MockEndpoint::drop`'s `join().unwrap()` into a second, misleading
+    /// panic. Tests assert on it from the test thread instead.
+    unexpected_catalog_actions: Vec<String>,
     stop: bool,
     embedding_identity_sha256: String,
     /// Reject every data-bulk item with a 403 explicit write-block error
@@ -165,12 +171,21 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
         });
         let mut locked = state.lock().unwrap();
         if locked.catalog_preexists && started_requested {
+            // The literal shape `PUT /_mapping` returns for an incompatible
+            // type change (`xerj-api/src/es_compat.rs`): 400
+            // `illegal_argument_exception`, not `mapper_parsing_exception`,
+            // which is reserved for a malformed mapping body.
+            let reason = "mapper [started] cannot be changed from type [text] to [date]";
             (
                 400,
-                json!({"error": {
-                    "type": "mapper_parsing_exception",
-                    "reason": "field [started] already exists as [text], cannot add [date]"
-                }}),
+                json!({
+                    "error": {
+                        "root_cause": [{"type": "illegal_argument_exception", "reason": reason}],
+                        "type": "illegal_argument_exception",
+                        "reason": reason,
+                    },
+                    "status": 400,
+                }),
             )
         } else {
             locked.catalog_mapping_upgraded = upgraded;
@@ -259,6 +274,14 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
                 locked.catalog_docs.insert(id.to_owned(), doc);
                 line += 2;
             } else {
+                // Fixture drift, not a product signal. Recorded rather than
+                // panicked on: this runs on the server thread with the state
+                // guard held, so a panic here poisons the `Mutex` and turns
+                // `MockEndpoint::drop`'s `join().unwrap()` into a second,
+                // misleading panic. Tests assert on it from the test thread.
+                locked
+                    .unexpected_catalog_actions
+                    .push(format!("unexpected catalog bulk action: {action}"));
                 line += 1;
             }
         }
@@ -663,6 +686,11 @@ fn existing_catalog_is_upgraded_before_new_run_metadata_is_written() {
     assert!(
         !state.catalog_bulk_before_upgrade,
         "new run metadata must not reach a legacy catalog before its additive mapping upgrade"
+    );
+    assert!(
+        state.unexpected_catalog_actions.is_empty(),
+        "fixture does not model these catalog bulk actions: {:?}",
+        state.unexpected_catalog_actions
     );
 }
 
