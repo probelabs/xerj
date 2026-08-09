@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The installer is now fail-closed on checksum *verification*, not just on
+  checksum *download*.** `landing/get` printed
+  `warning: sha256sum/shasum not found — skipping checksum verification` and
+  installed anyway — which is not what "refusing to install an unverified
+  binary", three lines above it, implies. It now searches `sha256sum`,
+  `shasum`, `openssl`, `sha256`, `busybox` and `cksum`, and stops if none is
+  present. A machine with no hashing tool at all can still proceed, but only by
+  setting `XERJ_INSECURE_SKIP_CHECKSUM=1` — an explicit choice, made by the
+  user, not a silent default. The downloaded checksum is also validated as 64
+  hex characters before use.
+
+- **`XERJ_LIBC=gnu` makes the glibc Linux builds reachable from the one-line
+  installer again.** `landing/get:61` unconditionally overrode the target with
+  `unknown-linux-musl` after the `case` arm had set `unknown-linux-gnu`, so the
+  script could never request a linux-gnu asset — while the code read as though
+  it could. musl remains the deliberate default (static, no glibc-version
+  floor, and xerj links jemalloc so musl's allocator is not in the path), and
+  the comment now says so; `XERJ_LIBC=gnu` opts into the glibc build.
+
+### Added
+
+- **`/get` and `/get.ps1` are counted.** `functions/get.js` (a Cloudflare Pages
+  Function) serves the installer straight out of `landing/get`, unchanged, and
+  records the request. The install path had never had a counter of any kind —
+  `curl` runs no JavaScript, so no page beacon could ever observe it, and the
+  number of installs was simply unknown. It records timestamp, country,
+  User-Agent and a coarse OS guess; it records **no IP address, no cookie and
+  no identifier of any kind**, so two installs by one person cannot be
+  distinguished from two installs by two people. It is fail-open: if the
+  storage binding is missing or the write throws, the installer is still
+  served. **No telemetry was added to the xerj binary, and none is planned.**
+
+- **`metrics/release-downloads.jsonl` + a daily GitHub Action.** GitHub reports
+  release `download_count` as a running total and keeps no history, so the one
+  uninflated adoption number this project has could be read but never trended.
+  One committed line per day turns it into a series. `scripts/adoption-snapshot.sh`
+  prints the funnel on demand, including which repo-level numbers are
+  contaminated and why.
+
 ## [1.0.0-rc.13] - 2026-08-08
 
 ### Security
