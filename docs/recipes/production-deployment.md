@@ -40,6 +40,11 @@ enabled = true                 # this is already the default
 enabled   = true
 cert_path = "/var/lib/xerj/xerj.crt"
 key_path  = "/var/lib/xerj/xerj.key"
+
+# TLS covers REST and ES-compat only — :8081 stays cleartext h2c. On a
+# non-loopback bind that combination refuses to start unless you say the
+# exposure is intended. See "gRPC posture" below before keeping this line.
+allow_insecure_grpc_h2c = true
 ```
 
 Boot it:
@@ -68,11 +73,14 @@ listener lines shown, the Data-dir/Console lines between them elided with `…`)
 ```
  Native REST  :8080 [TLS ]
  ES-compat    :9200 [TLS ]
- gRPC         :8081 [h2c]
+ gRPC         :8081 [h2c — plaintext, no TLS]
  …
  ┌─ Deployment posture (see PATH_TO_100_PCT_v0.6.0_to_v1.0.md) ──
  │ ✓  TLS:    in-process rustls termination active (REST + ES-compat)
  │           (self-signed by default — supply a CA cert for production)
+ │ ⚠  gRPC:   :8081 is NOT covered by TLS — cleartext h2c on a non-loopback
+ │           bind, allowed by tls.allow_insecure_grpc_h2c (issue #229).
+ │           Terminate TLS for it at your proxy/mesh, or bind loopback.
  │ ✓  Auth:   single API-key (no RBAC; per-doc / per-field controls roadmap v0.9)
  │ ⚠  Audit:  request tracing only — tamper-evident WORM audit log v0.9
  │ ⚠  Encryption-at-rest: not engine-level — use OS FDE or S3 SSE for now
@@ -189,6 +197,37 @@ Because the gRPC port carries cleartext frames, **terminate TLS in front of
 `:8081` at a reverse proxy** (or keep it on a trusted network / mesh) if
 clients reach it over an untrusted link. If you don't use gRPC, don't expose
 the port.
+
+**XERJ refuses to start rather than let that gap pass unnoticed.** With
+`tls.enabled = true` and a `server.bind_address` that is not loopback, startup
+aborts non-zero before binding anything:
+
+```
+Error: tls.enabled = true but the gRPC listener on 0.0.0.0:8081 speaks
+cleartext h2c — TLS covers the REST and ES-compat listeners only, and
+server.bind_address = "0.0.0.0" is not loopback, so gRPC traffic (including
+API keys) would cross the network unencrypted while the node reports itself
+as TLS-enabled. Refusing to start. Fix by binding to loopback
+(server.bind_address = "127.0.0.1"), or terminate TLS for the gRPC port at a
+proxy, sidecar or service mesh and declare it:
+tls.allow_insecure_grpc_h2c = true.
+```
+
+Three ways out, in the order you should prefer them:
+
+1. **Bind loopback** (`server.bind_address = "127.0.0.1"`) and let a proxy on
+   the same host own every public port. No opt-out needed.
+2. **Terminate TLS for `:8081`** at your proxy, sidecar or mesh, then set
+   `tls.allow_insecure_grpc_h2c = true` to record that you did. This is what
+   the quickstart config in
+   [section 1](#1-secure-quickstart--tls--auth-in-one-config-file) does,
+   because it binds `0.0.0.0`.
+3. **Accept plaintext gRPC on a trusted network** — same setting, and the
+   startup banner will keep saying `:8081` is uncovered on every boot.
+
+`--insecure` never trips this: it clears `tls.enabled`, so nothing is claiming
+the port is encrypted in the first place. The check only fires when TLS is on,
+which is exactly when the mismatch is invisible.
 
 ### Behind a reverse proxy: `server.trusted_proxies`
 
