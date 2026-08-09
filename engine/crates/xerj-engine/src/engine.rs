@@ -1181,11 +1181,34 @@ impl Engine {
         {
             Ok(map) => {
                 let n = map.len();
+                let mut restored = 0;
                 for (id, policy) in map {
+                    // Every REST-reachable insertion path (native ISM PUT and
+                    // the ILM-shape translation) already runs `validate()`
+                    // before a policy lands here — this is the one path that
+                    // doesn't, since it reads back whatever was on disk. A
+                    // hand-edited or corrupted single entry in an otherwise
+                    // parseable file would silently satisfy `change_policy`'s
+                    // "does this policy_id exist" check without ever having
+                    // been checked structurally. Skip just that entry rather
+                    // than discarding the whole file, matching the
+                    // per-entry granularity of the corruption it's guarding
+                    // against.
+                    if let Err(reason) = policy.validate() {
+                        warn!(policy_id = %id, error = %reason, "skipping invalid persisted ISM/ILM policy");
+                        continue;
+                    }
                     self.ism_policies.insert(id, policy);
+                    restored += 1;
                 }
-                if n > 0 {
-                    info!(count = n, "restored persisted ISM/ILM policies");
+                if restored > 0 {
+                    info!(count = restored, "restored persisted ISM/ILM policies");
+                }
+                if restored < n {
+                    warn!(
+                        skipped = n - restored,
+                        "some persisted ISM/ILM policies failed validation and were not restored"
+                    );
                 }
             }
             Err(e) => warn!(error = %e, "ignoring corrupt ism_policies.json"),
@@ -2411,5 +2434,75 @@ mod snapshot_path_security_tests {
         let err2 = validate_snapshot_path(&repo, "s1", &snap, data.path(), &["/".to_string()])
             .expect_err("`..` must be rejected even with a permissive allowlist");
         assert!(err2.to_string().contains(".."), "unexpected error: {err2}");
+    }
+}
+
+#[cfg(test)]
+mod ism_policy_persistence_validation_tests {
+    use crate::lifecycle::{LifecyclePolicy, LifecycleState};
+    use crate::Engine;
+    use xerj_common::config::Config;
+
+    fn valid_policy() -> LifecyclePolicy {
+        LifecyclePolicy {
+            description: None,
+            default_state: "only".to_string(),
+            states: vec![LifecycleState {
+                name: "only".to_string(),
+                actions: vec![],
+                transitions: vec![],
+            }],
+        }
+    }
+
+    /// `load_persisted_ism_policies` is the one path into `ism_policies`
+    /// that doesn't go through the REST layer's `validate()` call (native
+    /// PUT and the ILM-translation path both validate before ever storing
+    /// a policy) — it just reads back whatever was written to disk. A
+    /// hand-edited or otherwise corrupted single entry must not silently
+    /// load: `change_ism_policy` only checks "does this policy_id exist",
+    /// so an unvalidated entry here would be reachable through it without
+    /// ever having passed the same structural checks a direct PUT enforces.
+    #[tokio::test]
+    async fn corrupt_single_entry_is_skipped_valid_entries_still_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+
+        // "broken" transitions to a state that doesn't exist — exactly what
+        // `LifecyclePolicy::validate()` rejects, but nothing stops it being
+        // written to disk directly (bypassing the REST layer entirely).
+        let mut policies = std::collections::HashMap::new();
+        policies.insert("good-policy".to_string(), valid_policy());
+        policies.insert(
+            "broken-policy".to_string(),
+            LifecyclePolicy {
+                description: None,
+                default_state: "start".to_string(),
+                states: vec![LifecycleState {
+                    name: "start".to_string(),
+                    actions: vec![],
+                    transitions: vec![crate::lifecycle::LifecycleTransition {
+                        state_name: "does-not-exist".to_string(),
+                        conditions: None,
+                    }],
+                }],
+            },
+        );
+        std::fs::write(
+            dir.path().join("ism_policies.json"),
+            serde_json::to_vec(&policies).unwrap(),
+        )
+        .unwrap();
+
+        let engine = Engine::new(config).unwrap();
+        assert!(
+            engine.ism_policies.contains_key("good-policy"),
+            "a structurally valid persisted policy must still load"
+        );
+        assert!(
+            !engine.ism_policies.contains_key("broken-policy"),
+            "a policy that would fail validate() must not be silently restored"
+        );
     }
 }
