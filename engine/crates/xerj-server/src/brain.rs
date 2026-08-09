@@ -398,10 +398,19 @@ fn live_node_docs(es: &Es, brain: &str) -> Result<Option<u64>> {
     else {
         return Ok(None);
     };
-    let response = es.search(
+    // A meta doc that outlived its nodes index is precisely the wiped-data-dir
+    // case this probe exists to catch, so the index being gone must reach
+    // `journal_server_disagreement()` as absence. Propagating the 404 would
+    // short-circuit the caller and print a raw HTTP error instead of the
+    // recovery text. Any other failure still propagates: a probe failure is
+    // never converted into reset authorization.
+    let Some(response) = es.search_present(
         nodes_index,
         &json!({"size": 0, "track_total_hits": true, "query": {"match_all": {}}}),
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
     response
         .pointer("/hits/total/value")
         .and_then(Value::as_u64)

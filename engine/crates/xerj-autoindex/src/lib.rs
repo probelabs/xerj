@@ -102,6 +102,12 @@ pub fn run_cli() -> i32 {
 }
 
 const GB: u64 = 1 << 30;
+/// How many entries a human-facing listing prints before it summarises the
+/// rest. These lists are bounded by the corpus, not by the fault: unmounting a
+/// bind mount under an indexed root makes every content group vanish at once,
+/// so an uncapped listing is one rendered entry per journalled file — megabytes
+/// of stderr, in the code paths whose entire job is to be read by a person.
+const REFUSAL_LIST_CAP: usize = 10;
 const SAMPLE_LIMIT_BYTES: u64 = 4 << 20;
 const SQLDUMP_SAMPLE_LIMIT: u64 = 64 << 20;
 
@@ -1211,12 +1217,21 @@ impl UnsupportedInventoryDeltaError {
 
 impl std::fmt::Display for UnsupportedInventoryDeltaError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Capped like the duplicate and unplanned-file listings above; see
+        // REFUSAL_LIST_CAP. The machine-readable `--json` rendering keeps the
+        // full lists, so nothing is lost — only the prose is bounded.
         let render = |entries: &[InventoryDeltaEntry]| {
-            entries
+            let mut rendered = entries
                 .iter()
+                .take(REFUSAL_LIST_CAP)
                 .map(|entry| format!("{} ({})", entry.path, entry.file_key))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", ");
+            let remaining = entries.len().saturating_sub(REFUSAL_LIST_CAP);
+            if remaining > 0 {
+                rendered.push_str(&format!(", … and {remaining} more"));
+            }
+            rendered
         };
         write!(
             formatter,
@@ -1515,7 +1530,20 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // Acquire state authority before discovery as well as hashing. A waiter
     // must never classify a path snapshot taken while another owner was
     // publishing or replacing the durable plan.
-    let preflight = state::Journal::preflight(&state_dir, &root_str, &cfg.url, &cfg.prefix)?;
+    let preflight =
+        state::Journal::preflight(&state_dir, &root_str, &cfg.url, &cfg.prefix, cfg.fresh)?;
+    if let Some(reason) = preflight.unreadable_plan.as_deref() {
+        // Only reachable under --fresh; without it the preflight would have
+        // returned this as an error. It goes through the progress surface, not
+        // a raw eprintln!, so `--progress none` (which `--quiet` selects) stays
+        // silent and `--progress json` stays one parseable stream (#241).
+        pr.note(&format!(
+            "autoindex: --fresh: the durable resume plan in {} could not be read ({reason}); \
+             rebuilding it from the current folder. Documents published for files that are no \
+             longer present cannot be identified from an unreadable plan and are not deleted.",
+            state_dir.join("journal.ndjson").display()
+        ));
+    }
     // Totals are unknown until the walk returns, so this phase honestly
     // reports `pct=unknown` and proves liveness with the clock alone.
     pr.phase("walk", 0, 0);
@@ -1722,14 +1750,15 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             "autoindex: {} byte-identical duplicate path(s) will reuse canonical content",
             duplicate_files.len()
         ));
-        for duplicate in duplicate_files.iter().take(10) {
+        for duplicate in duplicate_files.iter().take(REFUSAL_LIST_CAP) {
             pr.note(&format!(
                 "  duplicate: {} → {}",
                 duplicate.rel, duplicate.duplicate_of
             ));
         }
-        if duplicate_files.len() > 10 {
-            pr.note(&format!("  … and {} more", duplicate_files.len() - 10));
+        let remaining = duplicate_files.len().saturating_sub(REFUSAL_LIST_CAP);
+        if remaining > 0 {
+            pr.note(&format!("  … and {remaining} more"));
         }
     }
 
@@ -1995,11 +2024,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
              indexed:",
             new_unplanned.len()
         );
-        for jf in new_unplanned.iter().take(10) {
+        for jf in new_unplanned.iter().take(REFUSAL_LIST_CAP) {
             eprintln!("  not in plan, skipped: {}", jf.rel);
         }
-        if new_unplanned.len() > 10 {
-            eprintln!("  … and {} more", new_unplanned.len() - 10);
+        let remaining = new_unplanned.len().saturating_sub(REFUSAL_LIST_CAP);
+        if remaining > 0 {
+            eprintln!("  … and {remaining} more");
         }
         eprintln!(
             "autoindex: re-run with --fresh to rebuild the plan in place and index them (ids \
@@ -3800,6 +3830,55 @@ mod inventory_delta_tests {
         assert!(message.contains(".xerj-memory-corpus-edges"), "{message}");
         assert!(message.contains("new --state-dir"), "{message}");
         assert!(message.contains("`--fresh`"), "{message}");
+    }
+
+    /// The prose refusal is bounded by REFUSAL_LIST_CAP, not by the corpus: an
+    /// unmounted bind mount under an indexed root vanishes every group at once,
+    /// and rendering 82k entries into one String is megabytes of stderr in the
+    /// one path whose job is to be read. `--json` still carries all of them.
+    #[test]
+    fn refusal_prose_caps_its_listings_while_json_keeps_every_entry() {
+        let mut plan = Plan::default();
+        let total = REFUSAL_LIST_CAP * 3;
+        for i in 0..total {
+            plan.files.insert(
+                format!("gone{i:03}"),
+                assignment(&format!("gone{i:03}.csv")),
+            );
+        }
+        let error = UnsupportedInventoryDelta::between(&[], &[], &plan).into_error(targets());
+        let message = format!("{error:#}");
+        assert!(message.contains("gone000.csv"), "{message}");
+        assert!(
+            message.contains(&format!(", … and {} more", total - REFUSAL_LIST_CAP)),
+            "{message}"
+        );
+        // The tail past the cap must not be rendered at all, not merely elided.
+        let last = format!("gone{:03}.csv", total - 1);
+        assert!(!message.contains(&last), "{message}");
+        assert_eq!(
+            message.matches(".csv (").count(),
+            REFUSAL_LIST_CAP,
+            "{message}"
+        );
+
+        let stdout = route_cli_error(&error, true)
+            .stdout
+            .expect("the typed refusal renders as JSON under --json");
+        let value: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            value["vanished_content_groups"].as_array().unwrap().len(),
+            total
+        );
+    }
+
+    #[test]
+    fn refusal_prose_below_the_cap_has_no_more_tail() {
+        let mut plan = Plan::default();
+        plan.files.insert("gone".into(), assignment("gone.csv"));
+        let error = UnsupportedInventoryDelta::between(&[], &[], &plan).into_error(targets());
+        let message = format!("{error:#}");
+        assert!(!message.contains("… and "), "{message}");
     }
 
     #[test]

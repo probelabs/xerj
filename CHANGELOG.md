@@ -555,7 +555,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   URL, prefix, and brain identity plus recovery instructions, including the
   explicit `--fresh` rerun for a genuinely wiped data directory. Probe
   transport and malformed-response failures remain errors instead of being
-  reported as an empty destination.
+  reported as an empty destination. A nodes index that was deleted out from
+  under a surviving brain meta doc reads as absence and reaches that recovery
+  text, rather than surfacing as a raw HTTP 404.
+- **`--fresh` still recovers a state directory whose journal cannot be
+  parsed.** The rerun gate reads the durable plan before the run starts, and a
+  plan that is malformed, or recorded for a different root/URL/prefix, is fatal
+  to a resume — but not to `--fresh`, which deletes that journal unread. The
+  preflight is now no more fatal than the open it precedes: under `--fresh` the
+  unreadable plan is reported on stderr and rebuilt from the current folder.
+  Without `--fresh` the refusal is unchanged. Because the removal gate has no
+  comparison basis in that case, the warning says so: documents already
+  published for files that are now gone cannot be identified from an unreadable
+  plan and are not deleted.
+- **Refusal and skip listings are capped at ten entries plus an "and N more"
+  tail.** Unmounting a bind mount under an indexed root vanishes every content
+  group at once, so the uncapped listing was one rendered entry per journalled
+  file. `--json` still carries every entry.
 
 ## [1.0.0-rc.10] - 2026-08-03
 
