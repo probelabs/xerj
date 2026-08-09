@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`autoindex` parses each PDF once per fresh run instead of twice.** Phase A
+  already paid a *complete* parse for every PDF — `extract::extract` routes
+  `Family::Pdf` straight to the isolated worker and drops the sampling limit,
+  so only delivery ever stopped early — and phase B then spawned the worker
+  again for the same bytes. Phase A now retains each validated worker response
+  in an anonymous temporary file under `--state-dir` and phase B replays it.
+  Reuse is an optional accelerator, never correctness-critical state: it is
+  bounded to 384 MiB of retained-plus-in-flight bytes and to an artifact-handle
+  cap derived from live `RLIMIT_NOFILE` and open-descriptor counts, both
+  re-probed at every admission; a 4 GiB-or-half-free filesystem floor is
+  reserved for the journal and phase-B staging first; and every artifact is
+  verified (physical length, content digest, JSON decode, worker-protocol
+  identity) before a single record is published. Anything that cannot be
+  measured conservatively declines and reparses — which is why the optimization
+  is **Linux-only** today: other platforms have no live descriptor evidence.
+  A restart has a frozen plan but no trusted handle, so it parses again; the
+  spool is deliberately not journal state. `--json` gains a
+  `pdf_extraction_reuse` block so the behaviour is observable rather than
+  inferred from timing. Original work by Leonid Bugaev (@buger).
+
 ## [1.0.0-rc.14] - 2026-08-10
 
 ### Changed
