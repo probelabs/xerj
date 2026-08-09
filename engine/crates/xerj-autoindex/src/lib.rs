@@ -1109,7 +1109,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     // ── Phase A: inference (skipped when a frozen plan exists) ──────────
     let mut clusters_rt: Option<Vec<dataset::Cluster>> = None;
-    let plan: Plan = if let Some(p) = journal.plan.clone() {
+    let mut plan: Plan = if let Some(p) = journal.plan.clone() {
         p
     } else {
         if !cfg.quiet {
@@ -1133,6 +1133,37 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         clusters_rt = Some(clusters);
         plan
     };
+
+    // ── stale junk-catalog sweep (#238) ──────────────────────────────────
+    //
+    // A junk/skipped file is never indexed and never enters the graph corpus
+    // — both walk `plan.files`, which by construction does not contain it. Its
+    // ENTIRE live footprint is one `file:{key}` catalog document, so removing
+    // that document is a complete removal, unlike an indexed file where
+    // dropping the catalog entry while its records stay live would be a lie.
+    //
+    // The durable plan is the only thing that remembers the document exists:
+    // nothing else in a run remembers a file it deliberately did not read. So
+    // the sweep is driven from the plan, and the plan entry may be dropped
+    // only after the delete has actually landed — the same order quickwit's
+    // GC keeps, deleting split files first and removing metastore records
+    // only for the deletes that succeeded (quickwit,
+    // quickwit/quickwit-index-management/src/garbage_collection.rs:484-534,
+    // Apache-2.0; approach only, no code taken). Dropping the record first
+    // would strand the document exactly as before.
+    //
+    // A key that is somehow BOTH planned and junk is left alone: deleting
+    // `file:{key}` would take out a live indexed file's catalog entry, and an
+    // immortal junk row is the cheaper of those two failures.
+    let live_keys: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let stale_junk_keys: std::collections::HashSet<String> = plan
+        .junk_files
+        .iter()
+        .filter(|junk| {
+            !live_keys.contains(junk.file_key.as_str()) && !plan.files.contains_key(&junk.file_key)
+        })
+        .map(|junk| junk.file_key.clone())
+        .collect();
 
     if cfg.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -2129,6 +2160,20 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         cat_buf.extend_from_slice(action.to_string().as_bytes());
         cat_buf.push(b'\n');
     }
+    // Junk/skipped files that left the corpus (#238). Deletes lead the buffer
+    // so a key that is re-reported in the same run — a junk file whose bytes
+    // changed, a legacy plan key rewritten under the current scheme — is
+    // deleted before its replacement document is indexed, never after.
+    let mut swept_junk_keys: Vec<&str> = stale_junk_keys.iter().map(String::as_str).collect();
+    swept_junk_keys.sort_unstable();
+    for key in &swept_junk_keys {
+        let action = json!({"delete": {
+            "_index": catalog::CATALOG_INDEX,
+            "_id": catalog::file_id(key),
+        }});
+        cat_buf.extend_from_slice(action.to_string().as_bytes());
+        cat_buf.push(b'\n');
+    }
 
     // dataset docs
     let mut junk_records_by_run: u64 = junk_records.load(Ordering::Relaxed);
@@ -2217,9 +2262,17 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
     }
     let extra = extra_junk.into_inner().unwrap();
-    let mut all_junk: Vec<&JunkFile> = plan.junk_files.iter().collect();
+    let mut all_junk: Vec<&JunkFile> = plan
+        .junk_files
+        .iter()
+        .filter(|junk| !stale_junk_keys.contains(&junk.file_key))
+        .collect();
     all_junk.extend(extra.iter());
     all_junk.extend(new_unplanned.iter());
+    // Counted now: every later reader of this number outlives the borrows
+    // `all_junk` holds on `plan` and `new_unplanned`, which the durable
+    // junk-plan update below mutates.
+    let junk_file_count = all_junk.len();
     for jf in &all_junk {
         let (id, doc) = catalog::file_doc(
             &jf.file_key,
@@ -2309,7 +2362,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "unique_content_files": files.len(),
         "files_indexed": journal_mx.lock().unwrap().done.len(),
         "duplicate_files": plan.duplicate_files.len(),
-        "files_junk": all_junk.len(),
+        "files_junk": junk_file_count,
         "records_total": total_records,
         "junk_records_total": junk_records_by_run,
         // This-run submission accounting (#195): what THIS invocation sent
@@ -2345,6 +2398,27 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
     }
     es.refresh(catalog::CATALOG_INDEX).ok();
+    // ── durable junk record, written last (#238) ─────────────────────────
+    //
+    // Only now is the plan allowed to claim what the catalog holds: the
+    // documents above are written and the swept ones deleted. A failed
+    // catalog bulk bailed out before this point with the plan untouched, so
+    // the next run recomputes the identical additions and removals and
+    // retries them — losing a record here is what makes a document immortal.
+    //
+    // Post-freeze skipped files are re-derived on every rerun, so this
+    // converges: once they are in the plan they are `planned_junk`, the
+    // additions are empty, and no further plan record is appended.
+    if !new_unplanned.is_empty() || !stale_junk_keys.is_empty() {
+        plan.junk_files
+            .retain(|junk| !stale_junk_keys.contains(&junk.file_key));
+        plan.junk_files.append(&mut new_unplanned);
+        journal_mx
+            .lock()
+            .unwrap()
+            .write_plan(&plan)
+            .context("record junk/skipped catalog entries in the resume plan")?;
+    }
     journal_mx.lock().unwrap().finish(&run_doc)?;
 
     // ── summary ──────────────────────────────────────────────────────────
@@ -2353,7 +2427,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         println!("{run_doc}");
     } else if !cfg.quiet {
         println!("\ndone in {wall:.1}s — {} datasets, {} records live, {} duplicate aliases, {} junk records, {} junk/skipped files",
-            plan.datasets.len(), total_records, plan.duplicate_files.len(), junk_total_records, all_junk.len());
+            plan.datasets.len(), total_records, plan.duplicate_files.len(), junk_total_records, junk_file_count);
         // Indexed-vs-submitted honesty line (#195): the live count against
         // what this run actually submitted, so a silent-rejection mismatch
         // is visible in the client output alone. Units differ on purpose: a
@@ -2397,7 +2471,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             cfg.url, cfg.prefix
         );
     }
-    let code = if junk_total_records > 0 || !all_junk.is_empty() {
+    let code = if junk_total_records > 0 || junk_file_count > 0 {
         3
     } else {
         0
