@@ -642,7 +642,9 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         )
         .route(
             "/_security/api_key",
-            post(es_compat::security_create_api_key),
+            post(es_compat::security_create_api_key)
+                .get(es_compat::security_get_api_keys)
+                .delete(es_compat::security_invalidate_api_key),
         )
         .route(
             "/_security/privilege",

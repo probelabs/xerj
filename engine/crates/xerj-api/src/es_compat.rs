@@ -6619,8 +6619,17 @@ async fn search_impl(
             return too_many_scroll_contexts(scroll_cap);
         }
         // Cap scroll snapshot at 10k hits — matches the default max_result_window.
-        body.size = 10_000;
+        body.size = SCROLL_SNAPSHOT_MAX_HITS;
         body.from = 0;
+        // Scroll totals must be EXACT: the truncation check at context-
+        // registration time (issue #198) compares the exact total against
+        // the snapshot cap, and ES itself refuses anything less in a scroll
+        // context ("disabling [track_total_hits] is not allowed in a scroll
+        // context" — SearchSourceBuilder validation). Forcing `true` here
+        // overrides a body-level `false`/limit, and the URL-param merge
+        // below only fills in when the body value is None, so it cannot
+        // undo this.
+        body.track_total_hits = Some(Value::Bool(true));
     }
     // `?sort=field:order` → convert to sort array.
     if let Some(ref sort_str) = params.sort {
@@ -12165,6 +12174,16 @@ async fn search_impl(
     // and keep the full snapshot (which was stored in scroll_snapshot) for
     // subsequent pages.
     if is_scroll_request {
+        // Issue #198: the snapshot above is bounded by
+        // SCROLL_SNAPSHOT_MAX_HITS, but `total_count` is exact
+        // (track_total_hits was forced accurate for scroll). A result set
+        // larger than the snapshot cannot be served completely — fail
+        // loudly instead of handing back a truncated export that looks
+        // complete. `total_count` is a lower bound of the true total in
+        // every tracking mode, so this check never fires spuriously.
+        if total_count > SCROLL_SNAPSHOT_MAX_HITS as u64 {
+            return scroll_window_exceeded(total_count, SCROLL_SNAPSHOT_MAX_HITS);
+        }
         if let Some(hits_arr) = response_body["hits"]["hits"].as_array_mut() {
             if hits_arr.len() > scroll_page_size {
                 hits_arr.truncate(scroll_page_size);
@@ -16919,9 +16938,11 @@ pub async fn search_with_scroll(
 
     let aggs_value = body.aggs.clone().or_else(|| body.aggregations.clone());
 
-    // For scroll: fetch ALL docs by setting a large size.
+    // For scroll: snapshot up to the scroll window in one search. A result
+    // set that does not fit is rejected loudly below (issue #198) rather
+    // than silently truncated.
     let scroll_body = EsSearchBody {
-        size: 10000,
+        size: SCROLL_SNAPSHOT_MAX_HITS,
         from: 0,
         query: body.query.clone(),
         sort: body.sort.clone(),
@@ -16929,7 +16950,13 @@ pub async fn search_with_scroll(
         aggs: body.aggs.clone(),
         aggregations: body.aggregations.clone(),
         highlight: body.highlight.clone(),
-        track_total_hits: body.track_total_hits.clone(),
+        // Scroll requires exact totals for the truncation check (and ES
+        // rejects disabling track_total_hits in a scroll context anyway).
+        track_total_hits: if params.scroll.is_some() {
+            Some(Value::Bool(true))
+        } else {
+            body.track_total_hits.clone()
+        },
         suggest: None,
         explain: body.explain,
         script_fields: body.script_fields.clone(),
@@ -16963,6 +16990,10 @@ pub async fn search_with_scroll(
     // Execute search across all indices and collect ALL hits.
     let mut all_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total_count: u64 = 0;
+    // Issue #198: set when any index matches more documents than the
+    // per-index snapshot fetch could carry — the scroll would be a
+    // silently truncated export.
+    let mut scroll_truncated = false;
 
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
@@ -16970,15 +17001,20 @@ pub async fn search_with_scroll(
             Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
         };
 
-        // Use a large size to capture everything.
+        // Fetch up to the scroll window per index.
         let mut full_req = search_req.clone();
-        full_req.size = 10000;
+        full_req.size = SCROLL_SNAPSHOT_MAX_HITS;
         full_req.from = 0;
 
         match idx.search(&full_req).await {
             Ok(result) => {
                 if let Some(reason) = &result.script_failure {
                     return script_limit_response(reason);
+                }
+                if result.hits.len() >= SCROLL_SNAPSHOT_MAX_HITS
+                    && result.total.value > result.hits.len() as u64
+                {
+                    scroll_truncated = true;
                 }
                 total_count += result.total.value;
                 for hit in result.hits {
@@ -16993,6 +17029,12 @@ pub async fn search_with_scroll(
 
     // If scroll param present, store context and return first page.
     if params.scroll.is_some() {
+        // Issue #198: refuse to register a context whose snapshot is
+        // missing documents — a truncated scroll looks complete to the
+        // caller (reindex/backup/migration) and silently loses data.
+        if scroll_truncated {
+            return scroll_window_exceeded(total_count, SCROLL_SNAPSHOT_MAX_HITS);
+        }
         let scroll_id = Uuid::new_v4().to_string();
         // Extract just the hits from the pairs.
         let hits_only: Vec<xerj_query::executor::Hit> =
@@ -17462,6 +17504,95 @@ mod passage_scroll_tests {
         }
     }
 
+    /// #174: a LEXICAL query that requests `fields: ["_passage"]` used to be
+    /// a silent no-op — `_passage` was populated only by the kNN/semantic
+    /// executors, so a caller slicing a large `body` got the licence banner
+    /// and `#include` block instead of the code that made the file match.
+    /// The lexical path must return the query-term-densest line-snapped
+    /// window with exact byte offsets into the original field.
+    #[tokio::test]
+    async fn lexical_multi_match_fills_passage_with_exact_offsets() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("body", FieldType::Text));
+        schema
+            .fields
+            .push(FieldConfig::new("title", FieldType::Text));
+        state
+            .engine
+            .create_index("lexical-passages", schema)
+            .unwrap();
+        let index = state.engine.get_index("lexical-passages").unwrap();
+        // A "large source file": banner and includes at the head, the
+        // definition that makes the file the right answer buried ~7 KB deep.
+        let source_body = format!(
+            "/* licence banner */\n{}void addReplyNull(client *c) {{\n    addReplyProto(c, \"$-1\\r\\n\", 5);\n}}\n{}",
+            "#include <deps.h>\n".repeat(400),
+            "static void trailer(void) {}\n".repeat(200),
+        );
+        index
+            .index_document(
+                Some("networking.c".into()),
+                json!({"body": source_body, "title": "networking", "page": 2}),
+            )
+            .await
+            .unwrap();
+        index.refresh().await.unwrap();
+        let app = crate::router::build_es_compat_router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/lexical-passages/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "size": 1,
+                            "fields": ["_passage"],
+                            "query": {"multi_match": {
+                                "query": "addReplyNull null bulk string reply",
+                                "fields": ["body", "title"]
+                            }}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resp: Value = serde_json::from_slice(&bytes).unwrap();
+        let passage = &resp["hits"]["hits"][0]["fields"]["_passage"][0];
+        assert!(
+            passage.is_object(),
+            "lexical `_passage` must not be a silent no-op: {resp}"
+        );
+        assert_eq!(passage["field"], "body");
+        assert_eq!(passage["page"], 2);
+        let start = passage["start_offset"].as_u64().unwrap() as usize;
+        let end = passage["end_offset"].as_u64().unwrap() as usize;
+        let text = passage["text"].as_str().unwrap();
+        assert_eq!(
+            &source_body[start..end],
+            text,
+            "offsets must slice the original field exactly"
+        );
+        assert!(
+            text.contains("addReplyNull"),
+            "the passage must carry the code that made the file rank, got: {text:?}"
+        );
+        assert!(start > 0, "the head-of-file slice is exactly the #174 bug");
+        assert_eq!(
+            passage["ordinal"].as_u64().unwrap() as usize,
+            source_body[..start].matches('\n').count(),
+            "ordinal = zero-based line index of the window start"
+        );
+    }
+
     async fn assert_ambiguous_passage_query_is_actionable_400(app: &axum::Router, body: Value) {
         let response = app
             .clone()
@@ -17563,6 +17694,175 @@ mod passage_scroll_tests {
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_window_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        // Never fsync — these tests index >10k docs and only care about
+        // scroll-window semantics, not durability.
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    async fn index_docs(state: &AppState, index: &str, n: usize) {
+        let idx = state.engine.get_or_create_index(index).expect("index");
+        let mut batch: Vec<(String, Value)> = Vec::with_capacity(n);
+        for i in 0..n {
+            batch.push((format!("doc-{i:06}"), json!({ "n": i })));
+        }
+        idx.index_batch_turbo(batch, true, false)
+            .await
+            .expect("bulk index");
+        // Publish every memtable shard to the search surface — turbo ingest
+        // scatters docs across shards by worker thread (see the load-bearing
+        // refresh comment in `reindex_keyset_tests`).
+        idx.refresh().await.expect("refresh");
+    }
+
+    async fn body_json(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn post_json(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_json(resp).await
+    }
+
+    /// Issue #198: a scroll whose exact result set exceeds the snapshot
+    /// window must fail loudly (400 with an actionable reason), not return
+    /// a truncated export that looks complete. Before the fix both scroll
+    /// entry points answered 200 with exactly 10,000 hits snapshotted and
+    /// a total that said otherwise.
+    #[tokio::test]
+    async fn scroll_over_window_fails_loudly_instead_of_truncating() {
+        let state = test_state();
+        let n = 10_050usize;
+        index_docs(&state, "big", n).await;
+        let app = crate::router::build_es_compat_router(state.clone());
+
+        // Primary path: POST /{index}/_search?scroll=1m
+        let (status, body) =
+            post_json(&app, "/big/_search?scroll=1m", json!({ "size": 100 })).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "expected a loud 400, got: {body}"
+        );
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        let reason = body["error"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("[10050]") && reason.contains("[10000]"),
+            "reason must name both the result-set size and the window: {reason}"
+        );
+
+        // Even when the caller tries to disable totals, scroll forces exact
+        // counting (ES outright rejects disabling track_total_hits in a
+        // scroll context), so truncation is still detected.
+        let (status, body) = post_json(
+            &app,
+            "/big/_search?scroll=1m",
+            json!({ "track_total_hits": false }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "track_total_hits:false must not smuggle a truncated scroll through: {body}"
+        );
+
+        // Secondary path: the /{index}/_search_scroll route.
+        let (status, body) = post_json(
+            &app,
+            "/big/_search_scroll?scroll=1m",
+            json!({ "size": 100 }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "_search_scroll must reject an over-window scroll too: {body}"
+        );
+
+        // A refused scroll must not leak a half-registered context.
+        assert!(
+            state.engine.scrolls.is_empty(),
+            "failed scroll requests must not leave scroll contexts behind"
+        );
+
+        // Boundary: a result set of EXACTLY the window size is legal — the
+        // loud failure is for genuinely unservable result sets only.
+        let (status, body) = post_json(
+            &app,
+            "/big/_search?scroll=1m",
+            json!({ "size": 1, "query": { "range": { "n": { "lt": 10000 } } } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 10_000);
+        assert_eq!(body["hits"]["total"]["relation"], "eq");
+        assert!(body["_scroll_id"].is_string());
+    }
+
+    /// An under-window scroll still walks the complete result set: every
+    /// document exactly once, exact total on the first page.
+    #[tokio::test]
+    async fn scroll_under_window_still_pages_completely() {
+        let state = test_state();
+        index_docs(&state, "small", 25).await;
+        let app = crate::router::build_es_compat_router(state.clone());
+
+        let (status, body) =
+            post_json(&app, "/small/_search?scroll=1m", json!({ "size": 10 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 25);
+        assert_eq!(body["hits"]["total"]["relation"], "eq");
+        let scroll_id = body["_scroll_id"].as_str().expect("scroll id").to_string();
+
+        let mut seen = body["hits"]["hits"].as_array().unwrap().len();
+        loop {
+            let (status, body) = post_json(
+                &app,
+                "/_search/scroll",
+                json!({ "scroll": "1m", "scroll_id": scroll_id }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let page = body["hits"]["hits"].as_array().unwrap().len();
+            if page == 0 {
+                break;
+            }
+            seen += page;
+        }
+        assert_eq!(seen, 25, "scroll must return every document exactly once");
     }
 }
 
@@ -25931,8 +26231,16 @@ pub async fn security_create_api_key(
             creation_ms: now_ms,
             expiration_ms,
             invalidated: false,
+            invalidation_ms: None,
             roles,
         },
+    );
+    state.engine.audit.append(
+        "security.api_key.create",
+        principal.label(),
+        "_security/api_key",
+        "ok",
+        &format!("id={key_id} name={name}"),
     );
 
     Json(json!({
@@ -25941,6 +26249,382 @@ pub async fn security_create_api_key(
         "expiration": expiration,
         "api_key": api_key,
         "encoded": encoded
+    }))
+    .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET    /_security/api_key — list keys (never returns secrets)
+// DELETE /_security/api_key — invalidate (revoke) keys
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #208: only create existed — GET and DELETE both 405'd. The enforcement
+// half was already built (`auth::check_minted_key` rejects a record with
+// `invalidated: true`), but nothing could ever set the flag, so a leaked key
+// was permanent and rotation impossible.
+//
+// Wire contract derived from ES source (APPROACH ONLY — AGPL/Elastic, read
+// for semantics, no code copied):
+//   * request selectors `ids`/`name`/`realm_name`/`username`/`owner` and
+//     their mutual-exclusion rules: InvalidateApiKeyRequest.java:163-195,
+//     RestInvalidateApiKeyAction.java:87-96
+//   * invalidate response `{invalidated_api_keys,
+//     previously_invalidated_api_keys, error_count[, error_details]}`, 200:
+//     InvalidateApiKeyResponse.java:92-108
+//   * unknown ids match nothing and land in neither list (empty response,
+//     not an error): ApiKeyService.java:1965-1973
+//   * GET query params + "404 with body when `id` names a missing key":
+//     RestGetApiKeyAction.java:47-54, 70-73
+//   * per-key GET item shape (no secret, `type: rest`, optional
+//     `expiration`/`invalidation`): ApiKey.java:289-310
+
+/// The single-node owner identity, matching `GET /_security/_authenticate`
+/// (`security_authenticate` above): xerj has no multi-user store, so every
+/// minted key belongs to this one principal. A `username`/`realm_name`
+/// selector therefore matches either every key or none, and `owner=true`
+/// (ES: "only keys owned by the caller") is satisfied by every key.
+const API_KEY_OWNER_USERNAME: &str = "xerj";
+const API_KEY_OWNER_REALM: &str = "native";
+
+/// 400 in ES's `action_request_validation_exception` shape — what ES's REST
+/// layer answers when `InvalidateApiKeyRequest#validate` rejects a request.
+/// `errors` are joined as `Validation Failed: 1: a;2: b;`, matching
+/// `ActionRequestValidationException`'s message format.
+fn api_key_validation_error(errors: &[String]) -> Response {
+    let numbered: String = errors
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("{}: {};", i + 1, e))
+        .collect();
+    let reason = format!("Validation Failed: {numbered}");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "root_cause": [{
+                    "type": "action_request_validation_exception",
+                    "reason": reason
+                }],
+                "type": "action_request_validation_exception",
+                "reason": reason
+            },
+            "status": 400
+        })),
+    )
+        .into_response()
+}
+
+/// Rebuild an ES-shaped `role_descriptors` object from a key's parsed grants.
+/// Honest-lossy: creation normalizes descriptors through
+/// `rbac::roles_from_role_descriptors` (index names + index privileges only),
+/// so what comes back is that normalized form, not the caller's original
+/// descriptor JSON. An unscoped key reports `{}` — the same "no usable grant"
+/// signal the parse produced.
+fn api_key_role_descriptors_json(roles: &[xerj_engine::rbac::Role]) -> Value {
+    use xerj_engine::rbac::Privilege;
+    let mut out = serde_json::Map::new();
+    for role in roles {
+        let mut privileges: Vec<&'static str> = role
+            .privileges
+            .iter()
+            .map(|p| match p {
+                Privilege::ReadIndex => "read",
+                Privilege::WriteIndex => "write",
+                Privilege::AdminIndex => "manage",
+                Privilege::SnapshotCreate => "create_snapshot",
+                Privilege::SnapshotRestore => "restore_snapshot",
+                Privilege::SecurityAdmin => "manage_security",
+                Privilege::AuditRead => "read_audit",
+            })
+            .collect();
+        // HashSet order is nondeterministic; sort so the wire shape is stable.
+        privileges.sort_unstable();
+        privileges.dedup();
+        out.insert(
+            role.name.clone(),
+            json!({
+                "indices": [{ "names": role.indices, "privileges": privileges }]
+            }),
+        );
+    }
+    Value::Object(out)
+}
+
+/// One `api_keys[]` item, per ES's `ApiKey#innerToXContent` (ApiKey.java:
+/// 289-310): `expiration`/`invalidation` appear only when set, and the secret
+/// is **never** part of this shape — only the create response carries it.
+fn api_key_item_json(id: &str, rec: &xerj_engine::engine::ApiKeyRecord) -> Value {
+    let mut item = json!({
+        "id": id,
+        "name": rec.name,
+        "type": "rest",
+        "creation": rec.creation_ms,
+        "invalidated": rec.invalidated,
+        "username": API_KEY_OWNER_USERNAME,
+        "realm": API_KEY_OWNER_REALM,
+        "realm_type": "native",
+        "metadata": {},
+        "role_descriptors": api_key_role_descriptors_json(&rec.roles),
+    });
+    if let Some(exp) = rec.expiration_ms {
+        item["expiration"] = json!(exp);
+    }
+    if let Some(inv) = rec.invalidation_ms {
+        item["invalidation"] = json!(inv);
+    }
+    item
+}
+
+/// Only the superuser and unscoped (historical operator) credentials may see
+/// or revoke keys; a scoped key gets the same 403 the create gate gives it,
+/// and the fail-closed default covers `Denied` too. Listing exposes no
+/// secrets, and revocation only ever *reduces* privilege, so the trust level
+/// that may mint keys (see `security_create_api_key`) is the right bar.
+fn api_key_admin_gate(principal: &crate::auth::Principal) -> Option<Response> {
+    if matches!(
+        principal,
+        crate::auth::Principal::Superuser | crate::auth::Principal::Unscoped { .. }
+    ) {
+        None
+    } else {
+        Some(crate::authz::forbidden(
+            principal,
+            "<api keys>",
+            xerj_engine::rbac::Privilege::SecurityAdmin,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GetApiKeyParams {
+    id: Option<String>,
+    name: Option<String>,
+    username: Option<String>,
+    realm_name: Option<String>,
+    /// Accepted for ES parity; a no-op filter here (see
+    /// [`API_KEY_OWNER_USERNAME`] — every key is owned by the caller).
+    #[serde(default)]
+    #[allow(dead_code)]
+    owner: bool,
+    #[serde(default)]
+    active_only: bool,
+}
+
+pub async fn security_get_api_keys(
+    State(state): State<AppState>,
+    principal: crate::auth::Principal,
+    Query(params): Query<GetApiKeyParams>,
+) -> impl IntoResponse {
+    if let Some(denied) = api_key_admin_gate(&principal) {
+        return denied;
+    }
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let mut items: Vec<(u64, String, Value)> = Vec::new();
+    // A username/realm selector that names anything but the single-node
+    // identity matches nothing (there is no such user/realm here).
+    let identity_mismatch = params
+        .username
+        .as_deref()
+        .is_some_and(|u| u != API_KEY_OWNER_USERNAME)
+        || params
+            .realm_name
+            .as_deref()
+            .is_some_and(|r| r != API_KEY_OWNER_REALM);
+    if !identity_mismatch {
+        for entry in state.engine.api_keys.iter() {
+            let (id, rec) = (entry.key(), entry.value());
+            if params.id.as_deref().is_some_and(|want| want != id) {
+                continue;
+            }
+            if params.name.as_deref().is_some_and(|want| want != rec.name) {
+                continue;
+            }
+            // `active_only` drops invalidated AND expired keys — ES filters
+            // both (ApiKeyService#findApiKeys: `api_key_invalidated: false`
+            // plus an expiration-window clause).
+            if params.active_only
+                && (rec.invalidated || rec.expiration_ms.is_some_and(|exp| now_ms >= exp))
+            {
+                continue;
+            }
+            items.push((rec.creation_ms, id.clone(), api_key_item_json(id, rec)));
+        }
+    }
+    // DashMap iteration order is arbitrary; sort by (creation, id) so
+    // repeated listings are stable. ES guarantees no order here.
+    items.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let api_keys: Vec<Value> = items.into_iter().map(|(_, _, v)| v).collect();
+    state.engine.audit.append(
+        "security.api_key.get",
+        principal.label(),
+        "_security/api_key",
+        "ok",
+        &format!("returned={}", api_keys.len()),
+    );
+    // Looking up one specific id that doesn't exist is a resource lookup:
+    // 404, with the (empty) body still attached — RestGetApiKeyAction.java:
+    // 70-73 returns the rendered response at NOT_FOUND.
+    let status = if params.id.is_some() && api_keys.is_empty() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(json!({ "api_keys": api_keys }))).into_response()
+}
+
+pub async fn security_invalidate_api_key(
+    State(state): State<AppState>,
+    principal: crate::auth::Principal,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    if let Some(denied) = api_key_admin_gate(&principal) {
+        return denied;
+    }
+    let payload = body.map(|Json(v)| v).unwrap_or(Value::Null);
+
+    // ── Parse the selector fields (RestInvalidateApiKeyAction.java:87-96) ──
+    // `ids` is the documented plural; a bare string `id` is also accepted
+    // (ES kept it as a deprecated REST-compat alias) — lenient parsing is
+    // this file's convention.
+    let mut blank_id_positions: Vec<usize> = Vec::new();
+    let ids: Option<Vec<String>> = match payload.get("ids") {
+        Some(Value::Array(arr)) => Some(
+            arr.iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let s = v.as_str().unwrap_or("").trim();
+                    if s.is_empty() {
+                        blank_id_positions.push(i);
+                    }
+                    s.to_string()
+                })
+                .collect(),
+        ),
+        Some(Value::String(s)) => Some(vec![s.clone()]),
+        _ => payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()]),
+    };
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let realm_name = payload
+        .get("realm_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let username = payload
+        .get("username")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let owner = payload
+        .get("owner")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // ── Validate, mirroring InvalidateApiKeyRequest.java:163-195/228-252 ──
+    let mut errors: Vec<String> = Vec::new();
+    if let Some(ids) = &ids {
+        if ids.is_empty() {
+            errors.push("Field [ids] cannot be an empty array".to_string());
+        } else if !blank_id_positions.is_empty() {
+            let (noun, pos) = if blank_id_positions.len() == 1 {
+                ("id", "position")
+            } else {
+                ("ids", "positions")
+            };
+            errors.push(format!(
+                "Field [ids] must not contain blank id, but got blank {noun} at index {pos}: {blank_id_positions:?}"
+            ));
+        }
+    }
+    if ids.is_none() && name.is_none() && realm_name.is_none() && username.is_none() && !owner {
+        errors.push(
+            "One of [api key id(s), api key name, username, realm name] must be specified if \
+             [owner] flag is false"
+                .to_string(),
+        );
+    }
+    if (ids.is_some() || name.is_some()) && (realm_name.is_some() || username.is_some()) {
+        errors.push(
+            "username or realm name must not be specified when the api key id(s) or api key \
+             name are specified"
+                .to_string(),
+        );
+    }
+    if owner && (realm_name.is_some() || username.is_some()) {
+        errors.push(
+            "neither username nor realm-name may be specified when invalidating owned API keys"
+                .to_string(),
+        );
+    }
+    if ids.is_some() && name.is_some() {
+        errors.push("only one of [api key id(s), api key name] can be specified".to_string());
+    }
+    if !errors.is_empty() {
+        return api_key_validation_error(&errors);
+    }
+
+    // ── Resolve the selector to concrete key ids ──
+    let target_ids: Vec<String> = if let Some(ids) = ids {
+        // Dedupe, preserving order — ES's find phase returns each key once
+        // however many times its id was repeated.
+        let mut seen = std::collections::HashSet::new();
+        ids.into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
+    } else if let Some(name) = &name {
+        state
+            .engine
+            .api_keys
+            .iter()
+            .filter(|e| &e.value().name == name)
+            .map(|e| e.key().clone())
+            .collect()
+    } else if username
+        .as_deref()
+        .is_some_and(|u| u != API_KEY_OWNER_USERNAME)
+        || realm_name
+            .as_deref()
+            .is_some_and(|r| r != API_KEY_OWNER_REALM)
+    {
+        // A user/realm this node has never issued for: nothing to invalidate.
+        Vec::new()
+    } else {
+        // realm_name/username naming the single-node identity, or owner=true:
+        // both select every minted key (see API_KEY_OWNER_USERNAME).
+        state
+            .engine
+            .api_keys
+            .iter()
+            .map(|e| e.key().clone())
+            .collect()
+    };
+
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let (invalidated, previously) = state.engine.invalidate_api_keys(&target_ids, now_ms);
+    state.engine.audit.append(
+        "security.api_key.invalidate",
+        principal.label(),
+        "_security/api_key",
+        "ok",
+        &format!(
+            "invalidated=[{}] previously_invalidated=[{}]",
+            invalidated.join(","),
+            previously.join(",")
+        ),
+    );
+    // ES answers 200 whatever matched; ids that matched nothing appear in
+    // neither list. `error_details` exists only when per-key errors occurred,
+    // which this single-node store cannot produce — so `error_count` is 0 and
+    // the field is omitted (InvalidateApiKeyResponse.java:96-106).
+    Json(json!({
+        "invalidated_api_keys": invalidated,
+        "previously_invalidated_api_keys": previously,
+        "error_count": 0
     }))
     .into_response()
 }
@@ -28953,6 +29637,49 @@ pub async fn async_search_delete(
         Some(_) => Json(json!({ "acknowledged": true })).into_response(),
         None => async_search_not_found(&id),
     }
+}
+
+/// Maximum number of hits a scroll context may snapshot (issue #198).
+///
+/// xerj scroll is a bounded up-front snapshot, not a segment-walking
+/// cursor: the initial search materialises every hit into the context and
+/// continuation requests page that Vec. This cap matches the default
+/// `index.max_result_window` (10,000), which the engine enforces on
+/// `from + size` anyway — a larger snapshot request would be rejected at
+/// the engine boundary. A result set that exceeds the cap is REFUSED with
+/// [`scroll_window_exceeded`] rather than silently truncated.
+const SCROLL_SNAPSHOT_MAX_HITS: usize = 10_000;
+
+/// ES-shaped 400 for a scroll whose exact result set exceeds the snapshot
+/// window (issue #198).
+///
+/// Before this existed, a scroll over >10k documents returned the first
+/// 10k pages and then stopped, indistinguishable from a complete export —
+/// the worst possible failure mode on the reindex/backup/migration path
+/// scroll exists for. ES never truncates a scroll (it is a true cursor),
+/// so there is no ES-native error for this condition; the response
+/// mirrors the `illegal_argument_exception` shape of
+/// `ResultWindowTooLarge`, which is the closest ES analogue (deep
+/// pagination past the window).
+fn scroll_window_exceeded(total: u64, cap: usize) -> axum::response::Response {
+    let reason = format!(
+        "Scroll result set is too large: [{total}] matching documents exceed the scroll \
+         snapshot window of [{cap}]. xerj materialises the full scroll snapshot up front \
+         and will not return a silently truncated result set. Page with [search_after] on \
+         a unique sort key instead, or narrow the query."
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+                "type": "illegal_argument_exception",
+                "reason": reason,
+            },
+            "status": 400,
+        })),
+    )
+        .into_response()
 }
 
 /// ES-shaped 429 for exceeding the open-scroll-contexts cap (RC4

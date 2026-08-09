@@ -33,7 +33,7 @@ use cli::{Cmd, IndexCfg, MapCfg, StatusCfg};
 use detect::EdgeDetector as _;
 use esclient::Es;
 use sniff::{Family, Sniffed};
-use state::{FileAssignment, FileDone, JunkFile, Plan, PlanDataset};
+use state::{DuplicateFile, FileAssignment, FileDone, JunkFile, Plan, PlanDataset};
 
 /// Entry point for the `xerj autoindex` subcommand (blocking; the server
 /// binary calls this via spawn_blocking). Returns the process exit code.
@@ -358,7 +358,8 @@ mod clustering_key_tests {
                 records: s.sketches[0].records,
             })
             .collect();
-        let clusters = dataset::cluster(sketches, &rels);
+        let scopes = vec![String::new(); rels.len()];
+        let clusters = dataset::cluster(sketches, &rels, &scopes);
         assert_eq!(clusters.len(), 1, "{clusters:#?}");
     }
 
@@ -378,6 +379,348 @@ mod clustering_key_tests {
         names.sort();
         assert_eq!(names, ["email", "id"]);
     }
+}
+
+#[cfg(test)]
+mod phase_a_grouping_tests {
+    use super::*;
+
+    fn cfg_for(root: &Path) -> IndexCfg {
+        IndexCfg {
+            root: root.to_path_buf(),
+            url: "http://unused.invalid".into(),
+            api_key: None,
+            workers: 1,
+            pdf_workers: 1,
+            pdf_timeout_secs: 10,
+            bulk_mb: 1,
+            bulk_timeout_secs: 10,
+            prefix: "t".into(),
+            state_dir: None,
+            fresh: true,
+            follow_symlinks: false,
+            max_file_gb: 2,
+            sample: 500,
+            no_semantic: false,
+            brain: None,
+            no_graph: true,
+            dry_run: true,
+            json: false,
+            quiet: true,
+        }
+    }
+
+    fn plan_for(root: &Path) -> Plan {
+        let files = walk::walk(root, false).unwrap();
+        let keys: Vec<String> = files
+            .iter()
+            .map(|f| ids::file_key(&f.path, f.size).unwrap())
+            .collect();
+        let digests: Vec<String> = (0..files.len()).map(|i| format!("d{i}")).collect();
+        let (plan, _) = build_phase_a(root, &files, &keys, &digests, Vec::new(), &cfg_for(root));
+        plan
+    }
+
+    const CODE: &str = "// The event loop dispatches every ready connection to a worker.\n\
+        // Each worker drains its queue before polling for more sockets.\n\
+        static void dispatch_ready_connections(struct event_loop *loop) {\n\
+            for (int index = 0; index < loop->ready_count; index++) {\n\
+                worker_submit(loop->workers, loop->ready[index]);\n\
+            }\n\
+        }\n";
+
+    const PROSE: &str = "# Overview\n\nThis server accepts client connections and stores \
+        keys in memory. Every command travels through the same parser before the \
+        dispatcher routes it to the matching handler function.\n";
+
+    /// #173 end to end through the real planner: a tree holding two
+    /// repositories of source, prose and one-off config JSON yields one
+    /// document dataset per repository — with `body` elected `semantic_text`
+    /// — plus the genuine data dataset, instead of one dataset per incidental
+    /// config schema with no vector arm.
+    #[test]
+    fn a_two_repo_tree_plans_one_document_dataset_per_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for repo in ["valkey", "memcached"] {
+            std::fs::create_dir_all(root.join(repo).join(".git")).unwrap();
+            std::fs::write(root.join(repo).join(".git").join("HEAD"), "ref: x").unwrap();
+        }
+        std::fs::create_dir_all(root.join("valkey/src")).unwrap();
+        std::fs::create_dir_all(root.join("valkey/commands")).unwrap();
+        std::fs::create_dir_all(root.join("memcached/data")).unwrap();
+        std::fs::write(root.join("valkey/src/server.c"), CODE).unwrap();
+        std::fs::write(root.join("valkey/README.md"), PROSE).unwrap();
+        // one-off configs: single-record JSON, each with its own key set
+        std::fs::write(
+            root.join("valkey/commands/get.json"),
+            r#"{"GET": {"summary": "Return the string value stored at the given key.", "arity": 2}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("valkey/commands/set.json"),
+            r#"{"SET": {"summary": "Store the given string value under the given key.", "arity": 3}}"#,
+        )
+        .unwrap();
+        // distinct bytes — byte-identical files alias into one canonical copy
+        std::fs::write(root.join("memcached/proto.c"), format!("{CODE}\n// v2\n")).unwrap();
+        // a genuine data file: recurring rows, real schema
+        std::fs::write(
+            root.join("memcached/data/events.csv"),
+            "id,email,level\n1,a@b.example,info\n2,c@d.example,warn\n3,e@f.example,info\n",
+        )
+        .unwrap();
+
+        let plan = plan_for(root);
+        let mut slugs: Vec<&str> = plan.datasets.iter().map(|d| d.slug.as_str()).collect();
+        slugs.sort();
+        assert_eq!(
+            slugs,
+            ["memcached-data", "memcached-docs", "valkey-docs"],
+            "{:#?}",
+            plan.datasets
+        );
+
+        // every docs dataset carries the vector arm on body
+        for d in plan.datasets.iter().filter(|d| d.family == "docs") {
+            let body = d.specs.iter().find(|s| s.name == "body").unwrap();
+            assert_eq!(body.es_type, "semantic_text", "{}: {:#?}", d.slug, d.specs);
+            assert_eq!(d.semantic_field.as_deref(), Some("body"), "{}", d.slug);
+        }
+
+        // the one-off configs were demoted: document-rendered, and their
+        // config keys never reached the docs mapping
+        let by_rel: HashMap<&str, &FileAssignment> =
+            plan.files.values().map(|f| (f.rel.as_str(), f)).collect();
+        assert!(by_rel["valkey/commands/get.json"].as_document);
+        assert!(by_rel["valkey/commands/set.json"].as_document);
+        assert!(!by_rel["valkey/src/server.c"].as_document);
+        assert!(!by_rel["memcached/data/events.csv"].as_document);
+        let vdocs = plan
+            .datasets
+            .iter()
+            .find(|d| d.slug == "valkey-docs")
+            .unwrap();
+        assert!(
+            !vdocs.specs.iter().any(|s| s.name.contains("summary")),
+            "config keys leaked into the docs mapping: {:#?}",
+            vdocs.specs
+        );
+        assert_eq!(vdocs.file_count, 4, "code + prose + 2 demoted configs");
+
+        // the CSV kept its real schema
+        let data = plan
+            .datasets
+            .iter()
+            .find(|d| d.slug == "memcached-data")
+            .unwrap();
+        assert!(data.specs.iter().any(|s| s.name == "email"), "{data:#?}");
+    }
+
+    /// #196: the same tree WITHOUT nested `.git` markers (or with one at the
+    /// root — a workspace) is ONE scope: a single document corpus.
+    #[test]
+    fn a_single_workspace_plans_one_document_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("wasm/examples")).unwrap();
+        std::fs::write(root.join("src/a.c"), CODE).unwrap();
+        std::fs::write(root.join("src/b.c"), CODE).unwrap();
+        std::fs::write(root.join("README.md"), PROSE).unwrap();
+        std::fs::write(root.join("wasm/examples/demo.md"), PROSE).unwrap();
+
+        let plan = plan_for(root);
+        assert_eq!(
+            plan.datasets.len(),
+            1,
+            "one workspace, one corpus: {:#?}",
+            plan.datasets
+        );
+        assert_eq!(plan.datasets[0].slug, "docs");
+        assert_eq!(plan.datasets[0].file_count, 4);
+    }
+}
+
+// ─── Phase A plan building (pure: no server contact) ─────────────────────
+
+/// Repository scope per file: the deepest ancestor directory (root-relative,
+/// "/"-separated) containing a `.git` entry, or "" when the file is under
+/// none. The walk never descends into `.git` itself, but the marker is still
+/// on disk. A `.git` at the autoindex root yields "" for every file — the
+/// whole tree is one scope — and so does a tree with no `.git` at all, which
+/// is exactly the #173/#196 property: one autoindex of one folder yields a
+/// corpus searchable as one corpus, split only at nested repository roots.
+fn compute_scopes(root: &Path, rels: &[String]) -> Vec<String> {
+    let mut cache: HashMap<String, bool> = HashMap::new();
+    rels.iter()
+        .map(|rel| {
+            let mut scope = String::new();
+            let mut prefix = String::new();
+            let mut segs = rel.split('/').peekable();
+            while let Some(seg) = segs.next() {
+                if segs.peek().is_none() {
+                    break; // final segment is the file name
+                }
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(seg);
+                let repo = *cache
+                    .entry(prefix.clone())
+                    .or_insert_with(|| root.join(&prefix).join(".git").exists());
+                if repo {
+                    scope = prefix.clone();
+                }
+            }
+            scope
+        })
+        .collect()
+}
+
+/// Sniff + sample every file, cluster into datasets, and assemble the plan.
+/// Pure planning: reads the tree, never the server — which is what makes the
+/// #173/#196 grouping behaviour testable end-to-end without a cluster.
+fn build_phase_a(
+    root: &Path,
+    files: &[walk::FileEntry],
+    keys: &[String],
+    digests: &[String],
+    duplicate_files: Vec<DuplicateFile>,
+    cfg: &IndexCfg,
+) -> (Plan, Vec<dataset::Cluster>) {
+    use rayon::prelude::*;
+    let scans: Vec<FileScan> = files
+        .par_iter()
+        .map(|f| scan_file(&f.path, f.size, cfg.sample, cfg.max_file_gb))
+        .collect();
+
+    let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+    let scopes = compute_scopes(root, &rels);
+    // (family, gzip) per file, from the scan's sniff — reused for assignments
+    // and demoted-file re-sampling instead of re-sniffing every file.
+    let file_meta: Vec<Option<(Family, bool)>> = scans
+        .iter()
+        .map(|sc| sc.sniffed.as_ref().map(|s| (s.family, s.gzip)))
+        .collect();
+    let mut sketches = Vec::new();
+    let mut junk_files = Vec::new();
+    for (i, sc) in scans.into_iter().enumerate() {
+        let family = sc
+            .sniffed
+            .as_ref()
+            .map(|s| s.family)
+            .unwrap_or(Family::Binary);
+        if let Some((status, reason)) = sc.junk {
+            junk_files.push(JunkFile {
+                file_key: keys[i].clone(),
+                rel: files[i].rel.clone(),
+                format: format_str(sc.sniffed.as_ref()),
+                status,
+                reason,
+                bytes: files[i].size,
+            });
+            continue;
+        }
+        for gs in sc.sketches {
+            sketches.push(dataset::Sketch {
+                file_idx: i,
+                group: gs.group,
+                family,
+                fields: gs.fields,
+                key_fields: gs.key_fields,
+                records: gs.records,
+            });
+        }
+    }
+    let mut clusters = dataset::cluster(sketches, &rels, &scopes);
+
+    // Demoted one-off config files (#173) were sampled as flattened records;
+    // phase B will index them as documents. Re-sample them through the same
+    // document renderer so the docs dataset's mapping and stats describe what
+    // actually gets indexed.
+    for c in clusters.iter_mut().filter(|c| !c.demoted.is_empty()) {
+        let demoted = c.demoted.clone();
+        let fields = &mut c.fields;
+        let mut sampled_total = 0u64;
+        for m in demoted {
+            let gzip = file_meta[m].map(|(_, g)| g).unwrap_or(false);
+            let mut sampled = 0u64;
+            let mut sink = |rec: extract::RawRecord| -> bool {
+                if (sampled as usize) < cfg.sample {
+                    for (k, v) in &rec.fields {
+                        fields.entry(k.clone()).or_default().add(v);
+                    }
+                }
+                sampled += 1;
+                (sampled as usize) < cfg.sample
+            };
+            // An unreadable file junks at phase B like any other; the plan
+            // keeps its membership either way.
+            let _ = extract::extract_as_document(&files[m].path, gzip, &mut sink);
+            sampled_total += sampled;
+        }
+        c.records += sampled_total;
+    }
+
+    // per-file assignments
+    let mut file_assignments: HashMap<String, FileAssignment> = HashMap::new();
+    for (ci, c) in clusters.iter().enumerate() {
+        let demoted: std::collections::HashSet<usize> = c.demoted.iter().copied().collect();
+        for &m in &c.members {
+            let key = &keys[m];
+            let (family, gzip) = file_meta[m].unwrap_or((c.family, false));
+            let fa = file_assignments
+                .entry(key.clone())
+                .or_insert_with(|| FileAssignment {
+                    rel: files[m].rel.clone(),
+                    path_id: files[m].rel_id.clone(),
+                    family: family.as_str().to_string(),
+                    gzip,
+                    content_digest: Some(digests[m].clone()),
+                    assignments: Vec::new(),
+                    as_document: false,
+                });
+            fa.as_document |= demoted.contains(&m);
+            fa.assignments
+                .push((c.group.clone(), clusters[ci].slug.clone()));
+        }
+    }
+
+    let mut datasets = Vec::new();
+    for c in &clusters {
+        let specs =
+            infer::infer_fields_with_policy(&c.fields, c.records, cfg.no_semantic, c.is_docs);
+        let time_field = infer::elect_time_field(&specs);
+        let semantic_field = specs
+            .iter()
+            .find(|s| s.es_type == "semantic_text")
+            .map(|s| s.name.clone());
+        datasets.push(PlanDataset {
+            slug: c.slug.clone(),
+            index: format!("{}-{}", cfg.prefix, c.slug),
+            family: if c.is_docs {
+                "docs".to_string()
+            } else {
+                c.family.as_str().to_string()
+            },
+            group: c.group.clone(),
+            specs,
+            time_field,
+            semantic_field,
+            sampled_records: c.records,
+            file_count: c.members.len(),
+        });
+    }
+    let plan = Plan {
+        datasets,
+        files: file_assignments,
+        junk_files,
+        duplicate_files,
+        alias_paths_indexed: true,
+    };
+    (plan, clusters)
 }
 
 // ─── mapping builder ─────────────────────────────────────────────────────
@@ -564,7 +907,6 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
 pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     extract::pdf::configure_workers(cfg.pdf_workers);
     extract::pdf::configure_timeout(cfg.pdf_timeout_secs);
-    use rayon::prelude::*;
     let t0 = Instant::now();
     if !cfg.quiet {
         eprintln!(
@@ -773,99 +1115,21 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         if !cfg.quiet {
             eprintln!("phase A: sniffing + sampling {} files…", files.len());
         }
-        let scans: Vec<FileScan> = files
-            .par_iter()
-            .map(|f| scan_file(&f.path, f.size, cfg.sample, cfg.max_file_gb))
-            .collect();
-
-        let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
-        let mut sketches = Vec::new();
-        let mut junk_files = Vec::new();
-        for (i, sc) in scans.into_iter().enumerate() {
-            let family = sc
-                .sniffed
-                .as_ref()
-                .map(|s| s.family)
-                .unwrap_or(Family::Binary);
-            if let Some((status, reason)) = sc.junk {
-                junk_files.push(JunkFile {
-                    file_key: keys[i].clone(),
-                    rel: files[i].rel.clone(),
-                    format: format_str(sc.sniffed.as_ref()),
-                    status,
-                    reason,
-                    bytes: files[i].size,
-                });
-                continue;
-            }
-            for gs in sc.sketches {
-                sketches.push(dataset::Sketch {
-                    file_idx: i,
-                    group: gs.group,
-                    family,
-                    fields: gs.fields,
-                    key_fields: gs.key_fields,
-                    records: gs.records,
-                });
-            }
-        }
-        let clusters = dataset::cluster(sketches, &rels);
+        let (plan, clusters) = build_phase_a(
+            &cfg.root,
+            &files,
+            &keys,
+            &digests,
+            duplicate_files.clone(),
+            &cfg,
+        );
         if !cfg.quiet {
             eprintln!(
                 "phase A: {} datasets inferred, {} junk/skipped files",
-                clusters.len(),
-                junk_files.len()
+                plan.datasets.len(),
+                plan.junk_files.len()
             );
         }
-
-        // per-file assignments
-        let mut file_assignments: HashMap<String, FileAssignment> = HashMap::new();
-        for (ci, c) in clusters.iter().enumerate() {
-            for &m in &c.members {
-                let key = &keys[m];
-                let sn = sniff::sniff(&files[m].path).ok();
-                let fa = file_assignments
-                    .entry(key.clone())
-                    .or_insert_with(|| FileAssignment {
-                        rel: files[m].rel.clone(),
-                        path_id: files[m].rel_id.clone(),
-                        family: c.family.as_str().to_string(),
-                        gzip: sn.map(|s| s.gzip).unwrap_or(false),
-                        content_digest: Some(digests[m].clone()),
-                        assignments: Vec::new(),
-                    });
-                fa.assignments
-                    .push((c.group.clone(), clusters[ci].slug.clone()));
-            }
-        }
-
-        let mut datasets = Vec::new();
-        for c in &clusters {
-            let specs = infer::infer_fields(&c.fields, c.records, cfg.no_semantic);
-            let time_field = infer::elect_time_field(&specs);
-            let semantic_field = specs
-                .iter()
-                .find(|s| s.es_type == "semantic_text")
-                .map(|s| s.name.clone());
-            datasets.push(PlanDataset {
-                slug: c.slug.clone(),
-                index: format!("{}-{}", cfg.prefix, c.slug),
-                family: c.family.as_str().to_string(),
-                group: c.group.clone(),
-                specs,
-                time_field,
-                semantic_field,
-                sampled_records: c.records,
-                file_count: c.members.len(),
-            });
-        }
-        let plan = Plan {
-            datasets,
-            files: file_assignments,
-            junk_files,
-            duplicate_files,
-            alias_paths_indexed: true,
-        };
         clusters_rt = Some(clusters);
         plan
     };
@@ -1401,7 +1665,14 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             }
                             true
                         };
-                        let res = extract::extract(&f.path, &sn, None, &mut sink);
+                        // Demoted one-off config files (#173) index as
+                        // documents — their key sets are configuration, not a
+                        // schema (see `dataset` module docs).
+                        let res = if fa.as_document {
+                            extract::extract_as_document(&f.path, sn.gzip, &mut sink)
+                        } else {
+                            extract::extract(&f.path, &sn, None, &mut sink)
+                        };
                         match res {
                             Ok(stats) => {
                                 file_junk += stats.junk;
@@ -1748,6 +2019,37 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
     }
 
+    // ── zero-live verification gate (#195) ───────────────────────────────
+    //
+    // The journal's completed files claim records were made visible; the
+    // live counts above are what the server actually answers with. When the
+    // journal says records landed but ZERO documents are live across every
+    // dataset index, the run must not report success: the user (or agent)
+    // would be left with green, mapped, empty indices and no way to tell
+    // "the corpus has no match" from "nothing was ever written". This is
+    // the last-resort catch for any rejection path the per-bulk
+    // classification does not recognise.
+    let (files_done_journaled, journal_records) = {
+        let journal = journal_mx.lock().unwrap();
+        (
+            journal.done.len(),
+            journal.done.values().map(|fd| fd.records).sum::<u64>(),
+        )
+    };
+    let live_records: u64 = ds_counts.values().sum();
+    if journal_records > 0 && live_records == 0 {
+        anyhow::bail!(
+            "autoindex verification failed: the resume journal records {journal_records} \
+             record(s) from {files_done_journaled} completed file(s), but 0 documents are \
+             live across the {} dataset index(es). The indices exist and look healthy but \
+             hold nothing — a server-side write rejection (e.g. a disk flood-stage or \
+             index write block), deleted indices, or an unreadable server can all cause \
+             this. Fix the server-side condition, then rerun with --fresh to re-index \
+             from scratch",
+            plan.datasets.len()
+        );
+    }
+
     // correlations
     let mut key_corrs: Vec<correlate::KeyCorr> = Vec::new();
     if let Some(clusters) = &clusters_rt {
@@ -2010,6 +2312,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "files_junk": all_junk.len(),
         "records_total": total_records,
         "junk_records_total": junk_records_by_run,
+        // This-run submission accounting (#195): what THIS invocation sent
+        // and had accepted, vs `records_total` above which is the live
+        // server-side count. A healthy run keeps these consistent; a
+        // mismatch is visible without reading a server log.
+        "files_submitted_this_run": files_done.load(Ordering::Relaxed),
+        "records_submitted_this_run": records_total.load(Ordering::Relaxed),
         "wall_seconds": (wall * 10.0).round() / 10.0,
         "workers": cfg.workers,
         "semantic": !cfg.no_semantic,
@@ -2020,7 +2328,21 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     push_doc(&format!("run:{run_id}"), &run_doc, &mut cat_buf);
 
     if !cat_buf.is_empty() {
-        es.bulk(cat_buf).context("write catalog")?;
+        let outcome = es.bulk(cat_buf).context("write catalog")?;
+        // The catalog is the data map every later `map`/`status`/agent query
+        // reads; a rejected catalog bulk (e.g. a write block that engaged
+        // mid-run) must not be swallowed into a "success" exit (#195).
+        if outcome.server_errors > 0 {
+            anyhow::bail!(
+                "write catalog: bulk backend failed for {} item(s): {}. Fix the reported \
+                 server condition and rerun the same command",
+                outcome.server_errors,
+                outcome
+                    .first_server_error
+                    .as_deref()
+                    .unwrap_or("unknown server error")
+            );
+        }
     }
     es.refresh(catalog::CATALOG_INDEX).ok();
     journal_mx.lock().unwrap().finish(&run_doc)?;
@@ -2032,6 +2354,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     } else if !cfg.quiet {
         println!("\ndone in {wall:.1}s — {} datasets, {} records live, {} duplicate aliases, {} junk records, {} junk/skipped files",
             plan.datasets.len(), total_records, plan.duplicate_files.len(), junk_total_records, all_junk.len());
+        // Indexed-vs-submitted honesty line (#195): the live count against
+        // what this run actually submitted, so a silent-rejection mismatch
+        // is visible in the client output alone. Units differ on purpose: a
+        // source record (e.g. one prose file) can expand to several section
+        // documents, but submitted records with ZERO live documents is
+        // always a defect (and fails above, before this line prints).
+        println!(
+            "indexed: {} documents live; this run submitted {} source records from {} files",
+            total_records,
+            records_total.load(Ordering::Relaxed),
+            files_done.load(Ordering::Relaxed),
+        );
         let mut rows: Vec<(&String, u64)> = plan
             .datasets
             .iter()
@@ -2351,6 +2685,7 @@ mod duplicate_integration_tests {
             gzip: false,
             content_digest: None,
             assignments: vec![(None, "text".to_string())],
+            as_document: false,
         }
     }
 

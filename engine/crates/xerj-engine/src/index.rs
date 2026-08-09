@@ -16635,6 +16635,23 @@ impl Index {
             page
         };
 
+        // --- Fill `_passage` for lexical queries (issue #174) ---
+        //
+        // The `_passage` pseudo-field used to be populated only by the
+        // kNN/semantic executors; a lexical query that requested it got a
+        // silent no-op, so callers slicing a large `body` had no way to know
+        // WHERE in the file the match lived. Like highlighting, this is a
+        // post-pass over the returned page only (never the full candidate
+        // set), reads the already-materialised `hit.source`, and must run
+        // BEFORE `apply_source_filter` for the same reason highlighting does:
+        // the passage resolves against the stored document, independent of
+        // the `_source` projection.
+        let page = if passage_requested(request) {
+            apply_lexical_passages(page, query)
+        } else {
+            page
+        };
+
         // --- Apply _source filtering ---
         let page = apply_source_filter(page, &request.source);
 
@@ -25575,10 +25592,7 @@ fn passage_match_from_source(
     {
         return None;
     }
-    let page = get_field_value(source, "page")
-        .or_else(|| get_field_value(source, "page_number"))
-        .or_else(|| get_field_value(source, "metadata.page"))
-        .and_then(|value| value.as_u64());
+    let page = passage_page_from_source(source);
     Some(PassageMatch {
         field: field.to_string(),
         ordinal,
@@ -25587,6 +25601,424 @@ fn passage_match_from_source(
         text: text[start_usize..end_usize].to_string(),
         page,
     })
+}
+
+/// Autoindex PDF page identity, shared by the semantic and lexical passage
+/// builders so both wire the same `page` provenance.
+fn passage_page_from_source(source: &Value) -> Option<u64> {
+    get_field_value(source, "page")
+        .or_else(|| get_field_value(source, "page_number"))
+        .or_else(|| get_field_value(source, "metadata.page"))
+        .and_then(|value| value.as_u64())
+}
+
+/// Maximum byte length of a query-time lexical `_passage` window.
+///
+/// Sized so an agent gets enough surrounding code to read an implementation
+/// (~50 lines of typical source), not just a keyword-in-context fragment —
+/// that distinction is the whole point of `_passage` vs `highlight` (#174).
+const LEXICAL_PASSAGE_MAX_BYTES: usize = 2048;
+
+/// Collect the field names (with any `^boost` suffix still attached) that the
+/// query's TEXT clauses target — the same clause set whose tokens
+/// `collect_highlight_terms` extracts, so passage field targeting and passage
+/// term extraction can never disagree about which clauses count.
+fn collect_passage_query_fields(query: &QueryNode, out: &mut Vec<String>) {
+    match query {
+        QueryNode::Match { field, .. } | QueryNode::MatchPhrase { field, .. } => {
+            out.push(field.clone());
+        }
+        QueryNode::MultiMatch { fields, .. } => {
+            if fields.is_empty() {
+                // ES defaults an empty multi_match field list to all fields.
+                out.push("*".to_string());
+            } else {
+                out.extend(fields.iter().cloned());
+            }
+        }
+        QueryNode::QueryString { default_field, .. } => {
+            out.push(default_field.clone().unwrap_or_else(|| "*".to_string()));
+        }
+        QueryNode::Term { field, .. } => out.push(field.clone()),
+        QueryNode::Bool {
+            must,
+            should,
+            filter,
+            ..
+        } => {
+            for q in must.iter().chain(should.iter()).chain(filter.iter()) {
+                collect_passage_query_fields(q, out);
+            }
+        }
+        QueryNode::Boosted { query, .. }
+        | QueryNode::Constant { query, .. }
+        | QueryNode::FunctionScore { query, .. } => {
+            collect_passage_query_fields(query, out);
+        }
+        _ => {}
+    }
+}
+
+/// Resolve one query field spec against a hit's `_source` into concrete
+/// `(dotted_field_name, text)` pairs.
+///
+/// - A plain name resolves via `get_field_value` (dot paths supported).
+/// - `*` / `prefix*` walk the source tree and match the flattened dotted
+///   path, mirroring `match_any_field_wildcard`'s prefix semantics.
+/// - Only string leaves qualify; internal `__xerj_passage_meta__*` keys are
+///   never passage sources. Multi-valued (array) fields are skipped: a byte
+///   offset into "the field" is ambiguous across elements.
+fn collect_passage_field_texts(source: &Value, field_spec: &str) -> Vec<(String, String)> {
+    let (name, _boost) = parse_field_boost(field_spec);
+    if !name.contains('*') {
+        if name.starts_with(PASSAGE_METADATA_PREFIX) {
+            return Vec::new();
+        }
+        return match get_field_value(source, name) {
+            Some(Value::String(s)) => vec![(name.to_string(), s)],
+            _ => Vec::new(),
+        };
+    }
+    let prefix = name.strip_suffix('*').unwrap_or(name);
+    let mut out = Vec::new();
+    fn walk(value: &Value, path: &str, prefix: &str, out: &mut Vec<(String, String)>) {
+        match value {
+            Value::Object(obj) => {
+                for (key, val) in obj {
+                    if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                        continue;
+                    }
+                    let dotted = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(val, &dotted, prefix, out);
+                }
+            }
+            Value::String(s) if path.starts_with(prefix) => {
+                out.push((path.to_string(), s.clone()));
+            }
+            _ => {}
+        }
+    }
+    walk(source, "", prefix, &mut out);
+    out
+}
+
+/// Count non-overlapping occurrences of `needle` in `hay` (both lowercase).
+fn count_term_occurrences(hay: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(pos) = hay[from..].find(needle) {
+        count += 1;
+        from = from + pos + needle.len();
+    }
+    count
+}
+
+/// Pick the query-term-densest window of a text, snapped to line boundaries.
+///
+/// Returns `(score, start_byte, end_byte, first_line_index)` for the best
+/// window of at most [`LEXICAL_PASSAGE_MAX_BYTES`], or `None` when no query
+/// term occurs in the text. `text_lower`/`lower_map` come from
+/// [`build_lower_offset_map`] (built once per field by the caller);
+/// `weighted_terms` carries a per-term weight computed by the caller.
+///
+/// Adapted from tantivy's snippet generator (MIT,
+/// `tantivy/src/snippet/mod.rs:205-260`): candidate windows bounded by a byte
+/// budget, scored by summing per-term weights, best window wins, ties keep
+/// the earliest. Two deliberate departures:
+///
+/// - tantivy greedily segments at token offsets, which can split the optimum
+///   across a boundary and slice mid-line. We snap candidates to LINE
+///   boundaries (the natural passage unit for source code — the driving use
+///   case of #174) and slide the window over lines, so every line-snapped
+///   window within budget is considered in O(lines).
+/// - the winning window is reduced to its tight core (first..last scored
+///   line) and then re-expanded alternately before/after, so the matches sit
+///   roughly centred in the returned passage instead of at its tail.
+///
+/// A single line longer than the whole budget (minified JS, single-line
+/// JSON) cannot be line-snapped; it degrades to a char-boundary-snapped
+/// window inside that line, centred on its first term occurrence, rescored
+/// over what the trimmed window actually contains.
+fn select_lexical_passage(
+    text: &str,
+    text_lower: &str,
+    lower_map: &[(usize, usize, usize)],
+    weighted_terms: &[(&str, f32)],
+) -> Option<(f32, usize, usize, u32)> {
+    if text.is_empty() {
+        return None;
+    }
+    let orig_len = text.len();
+
+    // All term occurrences as (start_byte_in_original, weight).
+    let mut occurrences: Vec<(usize, f32)> = Vec::new();
+    for &(term, weight) in weighted_terms {
+        if term.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(pos) = text_lower[from..].find(term) {
+            let abs = from + pos;
+            let (oa, ob) = lower_span_to_orig(lower_map, orig_len, abs, abs + term.len());
+            if ob > oa {
+                occurrences.push((oa, weight));
+            }
+            from = abs + term.len();
+        }
+    }
+    if occurrences.is_empty() {
+        return None;
+    }
+    occurrences.sort_unstable_by_key(|&(start, _)| start);
+
+    // Line spans as [start, end) byte ranges EXCLUDING the trailing newline;
+    // window length between lines still counts interior newlines because it
+    // is measured end-to-start.
+    let bytes = text.as_bytes();
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut line_start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            lines.push((line_start, i));
+            line_start = i + 1;
+        }
+    }
+    if line_start < orig_len {
+        lines.push((line_start, orig_len));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+
+    // Per-line score: sum of weights of occurrences starting in the line
+    // (occurrences are sorted, so one forward pointer suffices).
+    let mut line_scores = vec![0.0f32; lines.len()];
+    let mut occ_idx = 0;
+    for (li, &(ls, _)) in lines.iter().enumerate() {
+        let next_start = lines.get(li + 1).map_or(usize::MAX, |&(s, _)| s);
+        while occ_idx < occurrences.len() && occurrences[occ_idx].0 < next_start {
+            if occurrences[occ_idx].0 >= ls {
+                line_scores[li] += occurrences[occ_idx].1;
+            }
+            occ_idx += 1;
+        }
+    }
+
+    // Slide a line-snapped window under the byte budget. Line scores are
+    // non-negative, so for each end line the max-score window is the widest
+    // one that fits — exactly what the two-pointer maintains. Strictly
+    // greater keeps the earliest window on score ties (same rule as
+    // `choose_passage_winner`). Best is recorded as the window's TIGHT CORE
+    // (first..last scored line) so the expansion below can centre the budget
+    // around the matches instead of arriving with maximal leading filler.
+    enum Cand {
+        /// Tight core as inclusive line indices.
+        Lines(usize, usize),
+        /// Char-snapped byte window inside one oversized line (+ its line).
+        Bytes(usize, usize, usize),
+    }
+    let mut best: Option<(f32, Cand)> = None;
+    let mut lo = 0;
+    let mut acc = 0.0f32;
+    for hi in 0..lines.len() {
+        acc += line_scores[hi];
+        while lo < hi && lines[hi].1 - lines[lo].0 > LEXICAL_PASSAGE_MAX_BYTES {
+            acc -= line_scores[lo];
+            lo += 1;
+        }
+        if lines[hi].1 - lines[lo].0 <= LEXICAL_PASSAGE_MAX_BYTES {
+            if acc > 0.0 && best.as_ref().is_none_or(|&(s, _)| acc > s) {
+                // Tight core: zero-score head/tail lines carry no signal.
+                let tlo = (lo..=hi).find(|&i| line_scores[i] > 0.0).unwrap_or(lo);
+                let thi = (lo..=hi)
+                    .rev()
+                    .find(|&i| line_scores[i] > 0.0)
+                    .unwrap_or(hi);
+                best = Some((acc, Cand::Lines(tlo, thi)));
+            }
+        } else {
+            // lo == hi and this single line alone exceeds the budget: take a
+            // char-boundary window inside it around its first occurrence.
+            debug_assert_eq!(lo, hi);
+            if line_scores[hi] > 0.0 {
+                let (ls, le) = lines[hi];
+                let anchor = occurrences
+                    .iter()
+                    .map(|&(s, _)| s)
+                    .find(|&s| s >= ls && s < le)
+                    .unwrap_or(ls);
+                let half = LEXICAL_PASSAGE_MAX_BYTES / 2;
+                let w_start0 = anchor.saturating_sub(half).max(ls);
+                let mut w_end = (w_start0 + LEXICAL_PASSAGE_MAX_BYTES).min(le);
+                let mut w_start = w_end.saturating_sub(LEXICAL_PASSAGE_MAX_BYTES).max(ls);
+                while w_start < le && !text.is_char_boundary(w_start) {
+                    w_start += 1;
+                }
+                while w_end > w_start && !text.is_char_boundary(w_end) {
+                    w_end -= 1;
+                }
+                if w_end > w_start {
+                    // Rescore over what the trimmed window actually holds.
+                    let trimmed: f32 = occurrences
+                        .iter()
+                        .filter(|&&(s, _)| s >= w_start && s < w_end)
+                        .map(|&(_, w)| w)
+                        .sum();
+                    if trimmed > 0.0 && best.as_ref().is_none_or(|&(s, _)| trimmed > s) {
+                        best = Some((trimmed, Cand::Bytes(w_start, w_end, hi)));
+                    }
+                }
+            }
+            // No window ending at a later line may include this line.
+            acc = 0.0;
+            lo = hi + 1;
+        }
+    }
+
+    match best? {
+        (score, Cand::Bytes(start, end, line)) => Some((score, start, end, line as u32)),
+        (score, Cand::Lines(core_lo, core_hi)) => {
+            // Spend the remaining budget on context, alternating a line
+            // before / a line after the core so the matches end up roughly
+            // centred — "enough surrounding code to read an implementation"
+            // is the point of `_passage` over `highlight` (#174).
+            let mut w_lo = core_lo;
+            let mut w_hi = core_hi;
+            let mut before = true;
+            loop {
+                let fits_before =
+                    w_lo > 0 && lines[w_hi].1 - lines[w_lo - 1].0 <= LEXICAL_PASSAGE_MAX_BYTES;
+                let fits_after = w_hi + 1 < lines.len()
+                    && lines[w_hi + 1].1 - lines[w_lo].0 <= LEXICAL_PASSAGE_MAX_BYTES;
+                match (fits_before, fits_after) {
+                    (false, false) => break,
+                    (true, false) => w_lo -= 1,
+                    (false, true) => w_hi += 1,
+                    (true, true) => {
+                        if before {
+                            w_lo -= 1;
+                        } else {
+                            w_hi += 1;
+                        }
+                        before = !before;
+                    }
+                }
+            }
+            Some((score, lines[w_lo].0, lines[w_hi].1, w_lo as u32))
+        }
+    }
+}
+
+/// Post-page pass that fills `hit.passage` for lexical queries when the
+/// caller opted in via `fields: ["_passage"]` (#174).
+///
+/// Runs over the returned page only, against the already-materialised
+/// `hit.source` — no new stored bytes, no re-index. For each hit the best
+/// line-snapped window across every text field the query targets wins;
+/// `ordinal` carries the zero-based line index of the passage's first line
+/// (the lexical analogue of the semantic path's chunk ordinal — there is no
+/// ingest-time chunk sequence at query time, and "which line" is exactly
+/// what a caller slicing a large file needs).
+///
+/// Term weighting adapts tantivy's corpus-rarity snippet scoring
+/// (`tantivy/src/snippet/mod.rs:421`, `1/(1+doc_freq)`, MIT) to the one
+/// document in hand: each occurrence of a term weighs `1/(1+n)²` where `n`
+/// is the term's occurrence count across the hit's candidate fields. The
+/// SQUARE is a deliberate departure from tantivy: with `1/(1+n)` a window
+/// holding n occurrences of one ubiquitous term sums to `n/(1+n) → 1`,
+/// outbidding the lone occurrence of a distinctive term (weight ½); squared,
+/// a term's total possible contribution is `n/(1+n)² ≤ ¼`, so no swarm of
+/// "null" can beat the window that contains "addReplyNull". Weights are per
+/// DOCUMENT, not per field — per-field weights would let a two-line symbol
+/// list outbid the body window the caller actually wants, because its single
+/// occurrence of every term looks maximally rare.
+fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
+    let terms = extract_highlight_terms(query);
+    if terms.is_empty() {
+        return hits;
+    }
+    let mut field_specs: Vec<String> = Vec::new();
+    collect_passage_query_fields(query, &mut field_specs);
+    // Dedup while preserving query order: on cross-field score ties the
+    // FIRST field the query listed wins — deterministic, and closer to
+    // caller intent than alphabetical order.
+    let mut seen_specs = HashSet::new();
+    field_specs.retain(|spec| seen_specs.insert(spec.clone()));
+    if field_specs.is_empty() {
+        return hits;
+    }
+    hits.into_iter()
+        .map(|mut hit| {
+            // The kNN/semantic executors fill `passage` from exact
+            // ingest-time chunk offsets; never overwrite that provenance.
+            if hit.passage.is_some() || hit.source.is_null() {
+                return hit;
+            }
+            // Resolve every candidate field ONCE, deduped by concrete field
+            // name (`body` and `body^2` are the same field), lowercasing
+            // each text a single time.
+            let mut seen_fields: HashSet<String> = HashSet::new();
+            let mut candidates: Vec<(String, String, String, Vec<(usize, usize, usize)>)> =
+                Vec::new();
+            for spec in &field_specs {
+                for (field_name, text) in collect_passage_field_texts(&hit.source, spec) {
+                    if seen_fields.insert(field_name.clone()) {
+                        let (lower, map) = build_lower_offset_map(&text);
+                        candidates.push((field_name, text, lower, map));
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                return hit;
+            }
+            // Document-level term rarity across all candidate fields,
+            // squared so one term's total contribution stays bounded (see
+            // the weighting note in this function's doc comment).
+            let weighted_terms: Vec<(&str, f32)> = terms
+                .iter()
+                .map(|term| {
+                    let total: usize = candidates
+                        .iter()
+                        .map(|(_, _, lower, _)| count_term_occurrences(lower, term))
+                        .sum();
+                    let denom = 1.0 + total as f32;
+                    (term.as_str(), 1.0 / (denom * denom))
+                })
+                .collect();
+            let mut best: Option<(f32, PassageMatch)> = None;
+            for (field_name, text, lower, map) in &candidates {
+                if let Some((score, start, end, ordinal)) =
+                    select_lexical_passage(text, lower, map, &weighted_terms)
+                {
+                    if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                        best = Some((
+                            score,
+                            PassageMatch {
+                                field: field_name.clone(),
+                                ordinal,
+                                start_offset: start as u64,
+                                end_offset: end as u64,
+                                text: text[start..end].to_string(),
+                                page: None,
+                            },
+                        ));
+                    }
+                }
+            }
+            if let Some((_, mut passage)) = best {
+                passage.page = passage_page_from_source(&hit.source);
+                hit.passage = Some(passage);
+            }
+            hit
+        })
+        .collect()
 }
 
 /// Shared tail of every top-level kNN executor (brute force and HNSW):
@@ -31685,6 +32117,44 @@ fn prune_missing_should_fields(q: &FtsQuery, has_field: &dyn Fn(&str) -> bool) -
     Some(FtsQuery::Bool(Box::new(pruned)))
 }
 
+/// Is this `multi_match` field spec (boost already stripped) a MAPPED field
+/// for projection purposes?
+///
+/// ES resolves each `multi_match` field against the mapping and silently
+/// skips the ones that do not resolve; XERJ's equivalent of "resolves" is:
+///
+///   * a schema field itself (`text_fields` ∪ `exact_fields` is exactly the
+///     flat schema field list — see the construction in `search`), or
+///   * a dotted path whose prefix is a schema field.  Sub-fields carry no
+///     top-level FTS side-car of their own (`build_fts_field_configs` and
+///     the memtable indexer both key on top-level `_source` keys), so both
+///     multi-fields (`title.keyword` — shares the parent's source value)
+///     and object sub-paths (`user.name`) are served by the stored-doc
+///     scan's `get_field_value` fallback today.  Keeping their clause in
+///     the projection is what routes the query onto that scan (the
+///     per-segment `fts_has_field` gate fails), so dropping them here would
+///     change matching for MAPPED data — they must survive the filter.
+///
+/// Only a spec with NO schema field anywhere on its dotted prefix chain is
+/// unmapped in ES's sense, and those are exactly the ones ES ignores.
+fn multi_match_field_is_mapped(
+    field: &str,
+    text_fields: &[String],
+    exact_fields: &std::collections::HashSet<String>,
+) -> bool {
+    let known = |f: &str| exact_fields.contains(f) || text_fields.iter().any(|t| t == f);
+    if known(field) {
+        return true;
+    }
+    // Walk every dot-prefix: `a.b.c` is mapped when `a` or `a.b` is.
+    for (i, ch) in field.char_indices() {
+        if ch == '.' && known(&field[..i]) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Collect every field name referenced by an FTS query tree.
 ///
 /// Used to (a) extend the set of side-car fields `FtsIndexReader::open`
@@ -31980,6 +32450,7 @@ fn query_node_to_fts(
             query,
             fields,
             match_type,
+            operator,
             boost,
             ..
         } => {
@@ -31987,6 +32458,22 @@ fn query_node_to_fts(
             let analyzer = registry.get_analyzer("standard")?;
             let tokens = analyzer.analyze(query);
             // Split boost factors out of field specs (e.g. "title^3" → ("title", 3.0)).
+            //
+            // ES IGNORES unmapped fields in `multi_match` (its per-type
+            // builders skip any field the mapping cannot resolve): the query
+            // runs over the mapped subset, and only when EVERY field is
+            // unmapped does it match nothing.  Before this filter, a clause
+            // was built for the unmapped field anyway; the per-segment
+            // "reader has every queried field" gate then refused FTS for the
+            // WHOLE query and the stored-doc fallback — whose multi_match
+            // default arm requires the entire query string as one substring —
+            // silently zeroed every multi-token query (#217; single-token
+            // queries survived because the one token IS the whole string).
+            // A field spec is kept when it names a schema field OR a dotted
+            // sub-path under one (`title.keyword`, `user.name`): those have
+            // no top-level FTS side-car and must keep today's stored-scan
+            // routing, which resolves them via the multi-field/_source
+            // fallback in `get_field_value`.
             let field_specs: Vec<(String, f32)> = if fields.is_empty() {
                 text_fields.iter().map(|s| (s.clone(), 1.0)).collect()
             } else {
@@ -31996,9 +32483,32 @@ fn query_node_to_fts(
                         let (f, b) = parse_field_boost(s);
                         (f.to_string(), b)
                     })
+                    .filter(|(f, _)| multi_match_field_is_mapped(f, text_fields, exact_fields))
                     .collect()
             };
+            // Every named field is unmapped: ES matches NOTHING (no error).
+            // Returning None keeps `needs_fts` false and routes the request
+            // to the stored-doc scan (`is_doc_scan_query` includes
+            // MultiMatch), which finds no such fields in any document.
             if field_specs.is_empty() {
+                return None;
+            }
+            // `operator: and` binds PER FIELD for the field-centric types
+            // (ES best_fields/most_fields build one match query per field
+            // with the given operator): every token must match in the SAME
+            // field — mirror the Match arm's AND lowering (must-clauses).
+            // `cross_fields` is term-centric (each token must appear in at
+            // least ONE of the fields, not all in the same one), which a
+            // per-field FTS bool cannot express — decline and leave it to
+            // the stored-doc scan, whose cross_fields arm implements the
+            // combined-text semantics.  Without this, dropping an unmapped
+            // field would FLIP an `operator: and` query from the scan's
+            // AND semantics onto the FTS OR path, over-matching.
+            let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
+            if is_and
+                && tokens.len() > 1
+                && matches!(match_type, xerj_query::ast::MultiMatchType::CrossFields)
+            {
                 return None;
             }
             // Keyword-typed fields match by WHOLE value (their FST holds one
@@ -32039,10 +32549,16 @@ fn query_node_to_fts(
                         *fb,
                     )));
                 } else {
+                    // `operator: and` → per-field must (all tokens in this
+                    // field), same as the Match arm; default → per-field OR.
                     let mut field_bool = FtsBool::new().boost(*fb);
                     for token in &tokens {
-                        field_bool = field_bool
-                            .should(FtsQuery::Term(FtsTerm::new(field.as_str(), &token.text)));
+                        let term = FtsQuery::Term(FtsTerm::new(field.as_str(), &token.text));
+                        field_bool = if is_and {
+                            field_bool.must(term)
+                        } else {
+                            field_bool.should(term)
+                        };
                     }
                     per_field.push(FtsQuery::Bool(Box::new(field_bool)));
                 }
@@ -34670,6 +35186,164 @@ mod fts_projection_tests {
         }
     }
 
+    fn mm(fields: &[&str], query: &str) -> QueryNode {
+        QueryNode::MultiMatch {
+            fields: fields.iter().map(|s| s.to_string()).collect(),
+            query: query.into(),
+            match_type: xerj_query::ast::MultiMatchType::BestFields,
+            operator: None,
+            analyzer: None,
+            boost: None,
+        }
+    }
+
+    /// #217 — an UNMAPPED field in `multi_match` must be dropped from the
+    /// projection (ES ignores unmapped fields), so the surviving clause is
+    /// byte-identical to the same query without that field. Before the fix
+    /// the ghost clause survived, the per-segment `fts_has_field` gate then
+    /// refused FTS for the whole query, and the stored-doc fallback's
+    /// whole-substring semantics zeroed every multi-token query.
+    #[test]
+    fn multi_match_unmapped_field_is_dropped_from_the_projection() {
+        let text_fields = vec!["body".to_string()];
+        let with_ghost = query_node_to_fts(
+            &mm(&["body", "ghost"], "merge zzzznotpresent"),
+            &text_fields,
+            &kw(&[]),
+        )
+        .expect("projects over the mapped subset");
+        let without = query_node_to_fts(
+            &mm(&["body"], "merge zzzznotpresent"),
+            &text_fields,
+            &kw(&[]),
+        )
+        .expect("control projects");
+        assert_eq!(
+            format!("{with_ghost:?}"),
+            format!("{without:?}"),
+            "the unmapped field must not change the projection"
+        );
+        // And no clause may reference the ghost field at all.
+        let mut fields = Vec::new();
+        collect_fts_query_fields(&with_ghost, &mut fields);
+        assert_eq!(fields, vec!["body".to_string()]);
+    }
+
+    /// #217 — single-token shape, same rule (this shape happened to survive
+    /// the bug via the stored scan; post-fix it stays on the postings path).
+    #[test]
+    fn multi_match_unmapped_field_single_token_projects_mapped_term() {
+        let fq = query_node_to_fts(
+            &mm(&["body", "ghost"], "merge"),
+            &["body".to_string()],
+            &kw(&[]),
+        )
+        .expect("projects");
+        match fq {
+            FtsQuery::Term(t) => {
+                assert_eq!(t.field, "body");
+                assert_eq!(t.term, "merge");
+            }
+            other => panic!("expected bare term over the mapped field, got {other:?}"),
+        }
+    }
+
+    /// #217 — EVERY named field unmapped: ES matches nothing (no error).
+    /// The projection declines; `is_doc_scan_query` routes the request to
+    /// the stored-doc scan, which finds no such fields in any document.
+    #[test]
+    fn multi_match_all_fields_unmapped_projects_none() {
+        assert!(query_node_to_fts(
+            &mm(&["ghost1", "ghost2"], "merge zzzznotpresent"),
+            &["body".to_string()],
+            &kw(&["status"]),
+        )
+        .is_none());
+    }
+
+    /// Dotted sub-paths under a mapped parent (`title.keyword`, `user.name`)
+    /// are NOT unmapped — they have no top-level FTS side-car and are served
+    /// by the stored scan's multi-field/_source fallback, so their clause
+    /// must SURVIVE the filter to keep that routing.
+    #[test]
+    fn multi_match_dotted_subfield_of_mapped_parent_is_kept() {
+        let fq = query_node_to_fts(
+            &mm(&["body", "title.keyword"], "merge policy"),
+            &["body".to_string(), "title".to_string()],
+            &kw(&[]),
+        )
+        .expect("projects");
+        let mut fields = Vec::new();
+        collect_fts_query_fields(&fq, &mut fields);
+        assert!(
+            fields.contains(&"title.keyword".to_string()),
+            "sub-field clause dropped: {fields:?}"
+        );
+        // …while a dotted path with an UNMAPPED root is dropped.
+        let fq = query_node_to_fts(
+            &mm(&["body", "ghost.sub"], "merge policy"),
+            &["body".to_string()],
+            &kw(&[]),
+        )
+        .expect("projects");
+        let mut fields = Vec::new();
+        collect_fts_query_fields(&fq, &mut fields);
+        assert_eq!(fields, vec!["body".to_string()]);
+    }
+
+    /// `operator: and` on the field-centric types binds per field: the
+    /// projection must demand every token in the SAME field (must-clauses),
+    /// mirroring the Match arm — not the OR-bool the default shape uses.
+    /// Without this, dropping an unmapped field would flip an AND query
+    /// from the scan's AND semantics onto the FTS OR path and over-match.
+    #[test]
+    fn multi_match_operator_and_projects_per_field_must() {
+        let q = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "title".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::BestFields,
+            operator: Some(xerj_query::ast::BoolOperator::And),
+            analyzer: None,
+            boost: None,
+        };
+        let fq = query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]))
+            .expect("projects");
+        match fq {
+            FtsQuery::DisMax(d) => {
+                assert_eq!(d.queries.len(), 2);
+                for clause in &d.queries {
+                    match clause {
+                        FtsQuery::Bool(b) => {
+                            assert_eq!(b.must.len(), 2, "every token required per field");
+                            assert!(b.should.is_empty());
+                        }
+                        other => panic!("expected per-field must-bool, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected dis_max, got {other:?}"),
+        }
+    }
+
+    /// `cross_fields` + `operator: and` is term-centric (each token must
+    /// appear in at least ONE field) — inexpressible as a per-field bool, so
+    /// the projection declines and the stored-doc scan's cross_fields arm
+    /// keeps the combined-text semantics.
+    #[test]
+    fn multi_match_cross_fields_and_declines_projection() {
+        let q = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "title".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::CrossFields,
+            operator: Some(xerj_query::ast::BoolOperator::And),
+            analyzer: None,
+            boost: None,
+        };
+        assert!(
+            query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]),).is_none()
+        );
+    }
+
     /// match_phrase on a KEYWORD field projects to a single whole-value term
     /// (routed through the postings index instead of the O(N) brute scan that
     /// made keyword match_phrase multi-second). ES: match_phrase on keyword is
@@ -35396,6 +36070,232 @@ mod highlight_multibyte_tests {
         let terms = vec!["dodo".to_string(), "cafe".to_string()];
         let out = highlight_full_text(text, &lower, &map, &terms, "<em>", "</em>");
         assert_eq!(out, "İİ <em>dodo</em> İ <em>cafe</em>");
+    }
+}
+
+#[cfg(test)]
+mod lexical_passage_tests {
+    //! Query-time `_passage` selection for the lexical path (#174): the
+    //! query-term-densest window of the source, snapped to line boundaries,
+    //! with exact byte offsets so a caller can slice a large field.
+    use super::*;
+    use serde_json::json;
+
+    fn select(text: &str, weighted: &[(&str, f32)]) -> Option<(f32, usize, usize, u32)> {
+        let (lower, map) = build_lower_offset_map(text);
+        select_lexical_passage(text, &lower, &map, weighted)
+    }
+
+    /// The head of the file (licence banner, includes) must lose to the deep
+    /// window that actually contains the query terms — the exact failure in
+    /// #174 where head-slicing `body` returned zero relevant characters.
+    #[test]
+    fn deep_definition_beats_file_head() {
+        let mut text = String::new();
+        text.push_str("/* Copyright banner licence text */\n");
+        for i in 0..200 {
+            text.push_str(&format!("#include <header_{i}.h>\n"));
+        }
+        let def_line_idx = text.lines().count();
+        text.push_str("void addReplyNull(client *c) {\n");
+        text.push_str("    addReplyProto(c, \"$-1\\r\\n\", 5);\n");
+        text.push_str("}\n");
+        for _ in 0..100 {
+            text.push_str("static int unrelated_trailer(void) { return 0; }\n");
+        }
+        let weighted = [("addreplynull", 0.5f32), ("reply", 0.25f32)];
+        let (score, start, end, ordinal) = select(&text, &weighted).expect("a window");
+        assert!(score > 0.0);
+        let passage = &text[start..end];
+        assert!(
+            passage.contains("addReplyNull"),
+            "window must cover the definition, got: {passage:?}"
+        );
+        // Line-snapped: starts at a line start, ends at a line end.
+        assert!(start == 0 || text.as_bytes()[start - 1] == b'\n');
+        assert!(end == text.len() || text.as_bytes()[end] == b'\n');
+        assert!(end - start <= LEXICAL_PASSAGE_MAX_BYTES);
+        // `ordinal` is the zero-based line index of the window start; the
+        // window is budget-limited so it starts well past the banner and at
+        // or before the definition line.
+        assert!(ordinal > 0, "must not sit at the file head");
+        assert!((ordinal as usize) <= def_line_idx);
+    }
+
+    /// A lone occurrence of a rare, distinctive term must outweigh a region
+    /// dense in a term that appears everywhere (tantivy's rarity weighting
+    /// adapted to one document).
+    #[test]
+    fn rare_term_outweighs_common_term_swarm() {
+        let mut text = String::new();
+        for _ in 0..40 {
+            text.push_str("null null null null common swamp line\n");
+        }
+        for _ in 0..80 {
+            text.push_str("padding line with nothing relevant at all\n");
+        }
+        text.push_str("the distinctive addreplynull definition lives here\n");
+        let null_count = count_term_occurrences(&text, "null");
+        let rare_count = count_term_occurrences(&text, "addreplynull");
+        assert_eq!(rare_count, 1);
+        // NOTE: "addreplynull" contains "null", so null_count includes it.
+        // Same squared-rarity formula as `apply_lexical_passages`.
+        let w = |n: usize| {
+            let denom = 1.0 + n as f32;
+            1.0 / (denom * denom)
+        };
+        let weighted = [("addreplynull", w(rare_count)), ("null", w(null_count))];
+        let (_, start, end, _) = select(&text, &weighted).expect("a window");
+        assert!(
+            text[start..end].contains("distinctive"),
+            "rare-term window must win, got: {:?}",
+            &text[start..end]
+        );
+    }
+
+    /// A single line longer than the whole budget (minified JS) cannot be
+    /// line-snapped: the fallback takes a char-boundary window inside the
+    /// line, centred on the first term occurrence.
+    #[test]
+    fn oversized_single_line_falls_back_to_char_window() {
+        let mut text = "é".repeat(3000);
+        text.push_str("needle");
+        text.push_str(&"é".repeat(3000));
+        let weighted = [("needle", 0.5f32)];
+        let (_, start, end, ordinal) = select(&text, &weighted).expect("a window");
+        assert_eq!(ordinal, 0);
+        assert!(end - start <= LEXICAL_PASSAGE_MAX_BYTES);
+        assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
+        assert!(text[start..end].contains("needle"));
+    }
+
+    #[test]
+    fn no_term_occurrence_returns_none() {
+        assert!(select("plain text without the words\n", &[("absent", 1.0)]).is_none());
+        assert!(select("", &[("absent", 1.0)]).is_none());
+    }
+
+    /// Exact slice contract: `start_offset`/`end_offset` must reproduce
+    /// `text` byte-for-byte when sliced from the original field.
+    #[test]
+    fn apply_fills_passage_with_exact_offsets_and_page() {
+        let body = format!(
+            "{}fn the_answer() {{\n    compute_bulk_reply()\n}}\n{}",
+            "// filler line of no consequence\n".repeat(120),
+            "// trailing filler\n".repeat(120)
+        );
+        let query = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "title".into()],
+            query: "the_answer bulk reply".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+        };
+        let hit = Hit {
+            id: "doc-1".into(),
+            score: 1.0,
+            source: json!({"body": body, "title": "unrelated", "page": 3}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![hit], &query);
+        let passage = out[0].passage.as_ref().expect("lexical passage filled");
+        assert_eq!(passage.field, "body");
+        assert_eq!(passage.page, Some(3));
+        let (s, e) = (passage.start_offset as usize, passage.end_offset as usize);
+        assert_eq!(&body[s..e], passage.text, "offsets must slice exactly");
+        assert!(passage.text.contains("the_answer"));
+        assert!(e - s <= LEXICAL_PASSAGE_MAX_BYTES);
+        // Line-snapped window with the match centred in surrounding context,
+        // and `ordinal` = zero-based line index of the window start.
+        assert!(
+            s == 0 || body.as_bytes()[s - 1] == b'\n',
+            "line-snapped start"
+        );
+        assert!(
+            e == body.len() || body.as_bytes()[e] == b'\n',
+            "line-snapped end"
+        );
+        assert_eq!(
+            passage.ordinal as usize,
+            body[..s].matches('\n').count(),
+            "ordinal = line index of window start"
+        );
+        assert!(passage.ordinal > 0, "window must not hug the file head");
+    }
+
+    /// A short symbol-list field must not capture the passage from the body:
+    /// term rarity is weighted per DOCUMENT, so `defs` containing each term
+    /// once does not look artificially rare next to `body`.
+    #[test]
+    fn short_symbol_field_does_not_capture_the_passage() {
+        let body = format!(
+            "{}void addReplyNull(client *c) {{\n    addReply(c, shared.nullbulk);\n    addReply(c, shared.bulk);\n}}\n{}",
+            "// preamble\n".repeat(50),
+            "// tail\n".repeat(50)
+        );
+        let query = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "defs".into()],
+            query: "addReplyNull bulk".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+        };
+        let hit = Hit {
+            id: "doc-1".into(),
+            score: 1.0,
+            source: json!({"body": body, "defs": "addReplyNull bulk"}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![hit], &query);
+        let passage = out[0].passage.as_ref().expect("lexical passage filled");
+        assert_eq!(
+            passage.field, "body",
+            "body window holds more weighted occurrences than the symbol list"
+        );
+    }
+
+    /// A semantic-path passage (exact ingest-time chunk provenance) must
+    /// never be overwritten by the query-time selector.
+    #[test]
+    fn existing_semantic_passage_is_preserved() {
+        let query = QueryNode::Match {
+            field: "body".into(),
+            query: "needle".into(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+        };
+        let semantic = PassageMatch {
+            field: "body".into(),
+            ordinal: 7,
+            start_offset: 10,
+            end_offset: 20,
+            text: "from-chunks".into(),
+            page: None,
+        };
+        let hit = Hit {
+            id: "doc-1".into(),
+            score: 1.0,
+            source: json!({"body": "needle here\n"}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: Some(semantic.clone()),
+        };
+        let out = apply_lexical_passages(vec![hit], &query);
+        assert_eq!(out[0].passage.as_ref(), Some(&semantic));
     }
 }
 

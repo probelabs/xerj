@@ -1596,11 +1596,21 @@ async fn async_main() -> Result<()> {
     // 5. Admin key (first-run)
     ensure_admin_key(&mut cfg)?;
 
-    // 6. TLS certificate
-    if let Err(e) = ensure_tls_cert(&mut cfg) {
-        error!("TLS setup failed ({e:#}) — falling back to plain HTTP");
-        cfg.tls.enabled = false;
-    }
+    // 6. TLS certificate — fail closed (issue #200). The operator asked for
+    //    TLS; if the certificate step cannot deliver it, refuse to start
+    //    rather than bind the same ports in cleartext. A downgrade is
+    //    invisible to every working client — the only signal is one log
+    //    line — while API keys cross a wire the operator believes is
+    //    encrypted. `Config::validate` has already rejected
+    //    `tls.enabled = true` with empty cert/key paths at load time, so an
+    //    error here means reusing or auto-generating the certificate
+    //    genuinely failed (unwritable data dir, obstructed target, …), and
+    //    a config that never went through `validate` (defaults) has TLS off.
+    ensure_tls_cert(&mut cfg).context(
+        "tls.enabled = true but TLS could not be established; refusing to \
+         start rather than serve plain HTTP — fix the certificate setup, or \
+         disable TLS explicitly (tls.enabled = false, or --insecure for dev)",
+    )?;
 
     // 6b. In-process TLS config (rustls).  Loaded once here and shared
     //     (cheap Arc clone) by both listeners.  When TLS is enabled but the
@@ -2066,6 +2076,48 @@ mod tls_tests {
         assert!(
             res.is_err(),
             "missing cert with TLS enabled must error, not downgrade"
+        );
+    }
+
+    /// Issue #200: a failure inside the certificate step must surface as an
+    /// error with `tls.enabled` left ON, so the caller (`async_main`) aborts
+    /// startup. Before the fix the call site swallowed the error and flipped
+    /// `tls.enabled = false`, downgrading an operator-requested HTTPS
+    /// listener to cleartext on the same ports.
+    ///
+    /// Scenario: `Config::validate` rejects `tls.enabled = true` with empty
+    /// paths outright, so the reachable failure shape is non-empty cert/key
+    /// paths whose files are missing (→ the auto-generation branch) with the
+    /// generation target obstructed. A directory squatting on
+    /// `<data_dir>/xerj.crt` makes the cert write fail deterministically on
+    /// every platform, for root too.
+    #[test]
+    fn ensure_tls_cert_failure_errors_without_downgrading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.server.data_dir = dir.path().to_string_lossy().into_owned();
+        cfg.tls.enabled = true;
+        cfg.tls.cert_path = dir
+            .path()
+            .join("missing.crt")
+            .to_string_lossy()
+            .into_owned();
+        cfg.tls.key_path = dir
+            .path()
+            .join("missing.key")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir_all(dir.path().join("xerj.crt")).unwrap();
+
+        let res = ensure_tls_cert(&mut cfg);
+        assert!(
+            res.is_err(),
+            "an obstructed cert auto-generation target must error"
+        );
+        assert!(
+            cfg.tls.enabled,
+            "a TLS setup failure must never flip tls.enabled off — \
+             fail closed, not fail open"
         );
     }
 }
