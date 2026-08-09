@@ -4,7 +4,8 @@
 //! (`xerj-ux/src/dashboards/*.js` + `registry.js`).  That made them a fixed,
 //! un-editable set: a layout tweak or a rename never survived a reload, and
 //! there was no server object to attach a per-panel query to.  This module
-//! materialises those same 14 dashboards as rows in `.xerj_dashboards` on
+//! materialises those same dashboards ([`BUILTIN_DASHBOARD_COUNT`] of them) as
+//! rows in `.xerj_dashboards` on
 //! first launch, so from that point on they are *data* the operator can edit
 //! (title, layout, panel geometry, per-panel query/viz) and that persists
 //! through the CRUD surface in [`crate::dashboards`].
@@ -125,9 +126,18 @@ fn pd(
     }
 }
 
-/// The 14 built-in dashboards, in registry order.  Titles are the panel
-/// `eyebrow` strings from the `.js` sources; dynamic eyebrows are captured as
-/// a stable static string.
+/// How many dashboards ship built in.
+///
+/// The one place this number is written down. Issue #211: it was also written
+/// into two module doc comments, which disagreed with each other (13 vs 14) and
+/// with [`seed_specs`], so a reader had to guess which prose was current. Prose
+/// elsewhere links here instead of repeating the figure, and
+/// [`tests::seeds_every_registry_dashboard`] pins it to the actual list.
+pub const BUILTIN_DASHBOARD_COUNT: usize = 14;
+
+/// The built-in dashboards ([`BUILTIN_DASHBOARD_COUNT`] of them), in registry
+/// order.  Titles are the panel `eyebrow` strings from the `.js` sources;
+/// dynamic eyebrows are captured as a stable static string.
 fn seed_specs() -> Vec<DashboardSpec> {
     vec![
         // ── AI group ────────────────────────────────────────────────────────
@@ -784,12 +794,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seeds_the_fourteen_dashboards() {
+    fn seeds_every_registry_dashboard() {
         let specs = seed_specs();
         assert_eq!(
             specs.len(),
-            14,
-            "must seed exactly the 14 registry dashboards"
+            BUILTIN_DASHBOARD_COUNT,
+            "seed_specs() and BUILTIN_DASHBOARD_COUNT disagree — update the \
+             constant in this file, which is what the docs quote"
         );
         // Deterministic ids, all `default-` prefixed and unique.
         let mut ids: Vec<String> = specs

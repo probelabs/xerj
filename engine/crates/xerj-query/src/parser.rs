@@ -137,6 +137,86 @@ fn unknown_type<T>(name: impl Into<String>) -> Result<T> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Capability manifest — the single source of truth for "what queries exist"
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Issue #211: hand-maintained lists of supported query types drifted from the
+// dispatch table in `parse_query`, in both directions — docs advertised
+// `has_child`/`has_parent`, which are rejected with a 400, and omitted a dozen
+// types that do run. Every such list now derives from these two constants, and
+// `dispatch_table_matches_capability_manifest` (below) fails the build if a
+// `parse_query` arm is added or removed without updating them. Docs are checked
+// against the same constants by `xerj-engine/tests/docs_capability_lists.rs`.
+
+/// Every query-type name [`parse_query`] dispatches to a real implementation.
+///
+/// **Acceptance, not fidelity.** A name here means the parser builds a
+/// [`QueryNode`] the planner and executor will run; it is not a claim that the
+/// semantics match Elasticsearch in every corner. Per-type gaps are tracked in
+/// `ROADMAP.md`.
+pub const SUPPORTED_QUERY_TYPES: &[&str] = &[
+    "bool",
+    "boosting",
+    "combined_fields",
+    "constant_score",
+    "dis_max",
+    "distance_feature",
+    "exists",
+    "function_score",
+    "fuzzy",
+    "geo_bounding_box",
+    "geo_distance",
+    "geo_polygon",
+    "geo_shape",
+    "hybrid",
+    "ids",
+    "intervals",
+    "knn",
+    "match",
+    "match_all",
+    "match_bool_prefix",
+    "match_none",
+    "match_phrase",
+    "match_phrase_prefix",
+    "more_like_this",
+    "multi_match",
+    "nested",
+    "percolate",
+    "pinned",
+    "prefix",
+    "query_string",
+    "range",
+    "rank_feature",
+    "regexp",
+    "script",
+    "script_score",
+    "semantic",
+    "simple_query_string",
+    "span_containing",
+    "span_first",
+    "span_near",
+    "span_not",
+    "span_or",
+    "span_term",
+    "span_within",
+    "term",
+    "terms",
+    "terms_set",
+    "type",
+    "wildcard",
+    "wrapper",
+];
+
+/// Query-type names [`parse_query`] recognises and **deliberately rejects**
+/// with a 400.
+///
+/// These are listed separately rather than dropped so the rejection is a
+/// documented contract: an ES client sending `has_child` gets a specific
+/// "not supported, denormalize the relationship" message instead of the
+/// generic unknown-query-type error — and never gets silently wrong hits.
+pub const REJECTED_QUERY_TYPES: &[&str] = &["has_child", "has_parent"];
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public entry points
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -5456,6 +5536,140 @@ mod tests {
         ] {
             let err = parse_query(&query).expect_err("an over-wide clause list must be refused");
             assert!(err.to_string().contains("too_many_clauses"), "got {err}");
+        }
+    }
+
+    // ── Capability manifest (issue #211) ─────────────────────────────────────
+
+    /// Names in `parse_query`'s dispatch table, read out of this file's own
+    /// source at compile time.
+    ///
+    /// A pattern line is one whose text before `=>` is nothing but quoted
+    /// string literals, `|` and whitespace — which is true of every match arm
+    /// head and of no arm body, so no marker comments are needed and nothing
+    /// has to be kept in sync by hand. The scan is bounded by the `match` head
+    /// and the catch-all arm that closes it.
+    fn dispatch_table_names() -> Vec<String> {
+        const SRC: &str = include_str!("parser.rs");
+        const START: &str = "match query_type.as_str() {";
+        const END: &str = "unknown => unknown_type(unknown),";
+
+        let start = SRC.find(START).expect("parse_query dispatch head moved") + START.len();
+        let end = SRC[start..]
+            .find(END)
+            .expect("parse_query catch-all arm moved")
+            + start;
+
+        let mut names = Vec::new();
+        for line in SRC[start..end].lines() {
+            let code = line.split("//").next().unwrap_or("");
+            let head = code.split("=>").next().unwrap_or("");
+            if !head.contains('"') {
+                continue;
+            }
+            // Everything that is not a string literal must be `|`/whitespace,
+            // otherwise this is an arm body that merely mentions a literal.
+            let mut literals = Vec::new();
+            let mut rest = String::new();
+            let mut in_str = false;
+            let mut current = String::new();
+            for ch in head.chars() {
+                match (ch, in_str) {
+                    ('"', false) => in_str = true,
+                    ('"', true) => {
+                        in_str = false;
+                        literals.push(std::mem::take(&mut current));
+                    }
+                    (c, true) => current.push(c),
+                    (c, false) => rest.push(c),
+                }
+            }
+            if in_str || rest.chars().any(|c| c != '|' && !c.is_whitespace()) {
+                continue;
+            }
+            names.extend(literals);
+        }
+        names
+    }
+
+    /// The drift guard. `SUPPORTED_QUERY_TYPES` + `REJECTED_QUERY_TYPES` must
+    /// be exactly the dispatch table — no more, no less.
+    ///
+    /// Without this, adding a `parse_query` arm leaves every published list
+    /// silently short (the pipeline-aggregation half of issue #211) and
+    /// deleting one leaves them advertising a query that 400s.
+    #[test]
+    fn dispatch_table_matches_capability_manifest() {
+        use std::collections::BTreeSet;
+
+        let dispatched: BTreeSet<String> = dispatch_table_names().into_iter().collect();
+        assert!(
+            dispatched.len() > 40,
+            "scraper found only {} arms — the dispatch table shape changed and the \
+             scan is silently under-reading it",
+            dispatched.len()
+        );
+
+        let supported: BTreeSet<String> = SUPPORTED_QUERY_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rejected: BTreeSet<String> =
+            REJECTED_QUERY_TYPES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            supported.len(),
+            SUPPORTED_QUERY_TYPES.len(),
+            "SUPPORTED_QUERY_TYPES contains duplicates"
+        );
+        assert!(
+            supported.is_disjoint(&rejected),
+            "a query type cannot be both supported and rejected: {:?}",
+            supported.intersection(&rejected).collect::<Vec<_>>()
+        );
+
+        let manifest: BTreeSet<String> = supported.union(&rejected).cloned().collect();
+        let missing: Vec<_> = dispatched.difference(&manifest).collect();
+        let extra: Vec<_> = manifest.difference(&dispatched).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "capability manifest has drifted from parse_query's dispatch table.\n  \
+             dispatched but not in the manifest: {missing:?}\n  \
+             in the manifest but not dispatched: {extra:?}\n  \
+             Fix SUPPORTED_QUERY_TYPES / REJECTED_QUERY_TYPES in this file; the \
+             docs are checked against them by xerj-engine/tests/docs_capability_lists.rs."
+        );
+    }
+
+    /// Behavioural half: the manifest's two halves must actually behave the
+    /// way they are labelled. A supported type must not answer
+    /// `unknown query type`, and a rejected type must refuse.
+    #[test]
+    fn manifest_labels_match_observed_behaviour() {
+        // `{ "<type>": {} }` — the minimal body that reaches the dispatch arm.
+        // Most arms then reject it for missing parameters; what matters here is
+        // only whether the *type* was recognised.
+        fn bare(name: &str) -> Value {
+            let mut obj = serde_json::Map::new();
+            obj.insert(name.to_string(), json!({}));
+            Value::Object(obj)
+        }
+
+        for name in SUPPORTED_QUERY_TYPES {
+            let err = parse_query(&bare(name)).err();
+            if let Some(QueryError::Parse(ParseError::UnknownQueryType(t))) = err {
+                panic!(
+                    "`{name}` is listed as supported but parse_query rejects it as unknown: {t}"
+                );
+            }
+        }
+        for name in REJECTED_QUERY_TYPES {
+            let err = parse_query(&bare(name))
+                .err()
+                .unwrap_or_else(|| panic!("`{name}` is listed as rejected but parsed cleanly"));
+            assert!(
+                err.to_string().contains("not supported"),
+                "`{name}` must refuse with an explanatory message, got: {err}"
+            );
         }
     }
 }

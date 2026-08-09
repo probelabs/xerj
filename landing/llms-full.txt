@@ -434,24 +434,75 @@ Supported mapping field types (ES type string → internal):
 6. SEARCH DSL — supported query types
 =====================================================================
 
-Full-text / term-level:
-  match, match_all, match_none, match_phrase, match_phrase_prefix, multi_match,
-  term, terms, range, prefix, wildcard, exists, ids, fuzzy, regexp, query_string,
-  simple_query_string, constant_score, boosting, dis_max.
+Both lists below are complete and machine-checked: they are generated from
+`SUPPORTED_QUERY_TYPES` (xerj-query/src/parser.rs) and `SUPPORTED_AGG_TYPES`
+(xerj-engine/src/aggs.rs), each pinned to its dispatch table by a unit test,
+and this file is compared against them by
+engine/crates/xerj-engine/tests/docs_capability_lists.rs. A type cannot ship
+without appearing here.
 
-Vector / semantic / hybrid:
-  knn (HNSW-served unfiltered / exact filtered; also top-level knn form),
-  semantic (over semantic_text), hybrid (rrf|linear).
+Acceptance is not a fidelity claim: a listed type parses, plans and executes,
+which is not a promise that every parameter matches Elasticsearch. The ES-YAML
+conformance suite is the measured answer; per-type gaps live in ROADMAP.md.
 
-Compound / geo:
-  bool (must / should / must_not / filter), function_score, geo_distance.
+<!-- generated:query-types -->
+Full-text        `match`, `match_phrase`, `match_phrase_prefix`,
+                 `match_bool_prefix`, `multi_match`, `combined_fields`,
+                 `query_string`, `simple_query_string`, `intervals`,
+                 `more_like_this`
+Term-level       `term`, `terms`, `terms_set`, `range`, `prefix`, `wildcard`,
+                 `regexp`, `fuzzy`, `exists`, `ids`, `script`
+Universal        `match_all`, `match_none`
+Compound/score   `bool`, `boosting`, `constant_score`, `dis_max`,
+                 `function_score`, `script_score`, `distance_feature`,
+                 `rank_feature`, `pinned`
+Vector/semantic  `knn`, `semantic`, `hybrid`
+Geo              `geo_distance`, `geo_bounding_box`, `geo_polygon`, `geo_shape`
+Span             `span_term`, `span_near`, `span_or`, `span_not`, `span_first`,
+                 `span_containing`, `span_within`
+Structure        `nested`
+Other            `percolate`, `type`, `wrapper`
+<!-- /generated:query-types -->
+
+Notes on the vector family: knn is HNSW-served for unfiltered queries on
+full-precision fields and exact-scanned for filtered / nested / SQ8 / small
+shapes (also available as the top-level `knn` request form); semantic queries
+run over semantic_text fields; hybrid fuses BM25 and vector scores (rrf|linear).
+
+Recognised and DELIBERATELY REJECTED with a 400 — XERJ never materialises a
+parent/child join, so running these would return silently wrong hits:
+
+<!-- generated:rejected-query-types -->
+`has_child`, `has_parent`
+<!-- /generated:rejected-query-types -->
+
+Any other query type answers `unknown query type`.
 
 Search body options: from, size, sort, _source (include/exclude), highlight, aggs,
 track_total_hits, and (via dedicated endpoints) scroll and point-in-time.
 
-Aggregations:
-  terms, stats, avg, sum, min, max, value_count, cardinality, range, histogram,
-  date_histogram, percentiles, filter, missing, composite.
+Aggregations (complete; all exact — cardinality is a true distinct count, not an
+HLL estimate, and terms doc_count is precise):
+
+<!-- generated:agg-types -->
+Metric     `avg`, `sum`, `min`, `max`, `stats`, `extended_stats`, `value_count`,
+           `cardinality`, `percentiles`, `percentile_ranks`,
+           `median_absolute_deviation`, `matrix_stats`, `string_stats`,
+           `boxplot`, `top_metrics`, `top_hits`, `scripted_metric`
+Bucket     `terms`, `multi_terms`, `rare_terms`, `significant_terms`,
+           `significant_text`, `range`, `date_range`, `ip_range`, `ip_prefix`,
+           `histogram`, `variable_width_histogram`, `date_histogram`,
+           `auto_date_histogram`, `filter`, `filters`, `missing`, `composite`,
+           `adjacency_matrix`, `time_series`, `global`
+Sampling   `sampler`, `random_sampler`, `diversified_sampler`
+Scope      `nested`, `reverse_nested`
+Geo        `geo_bounds`, `geo_centroid`, `geo_distance`, `geohash_grid`,
+           `geotile_grid`
+Pipeline   `avg_bucket`, `sum_bucket`, `min_bucket`, `max_bucket`,
+           `stats_bucket`, `extended_stats_bucket`, `percentiles_bucket`,
+           `derivative`, `cumulative_sum`, `serial_diff`, `moving_avg`,
+           `moving_fn`, `bucket_script`, `bucket_selector`, `bucket_sort`
+<!-- /generated:agg-types -->
 
 =====================================================================
 7. ENDPOINT CATALOGUE (Elasticsearch-compatible surface, :9200)
