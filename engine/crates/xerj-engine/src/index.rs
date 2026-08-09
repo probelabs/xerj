@@ -28450,6 +28450,11 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                 .map(str::to_string)
                 .collect();
             let is_cross = matches!(match_type, xerj_query::ast::MultiMatchType::CrossFields);
+            let is_phrase = matches!(
+                match_type,
+                xerj_query::ast::MultiMatchType::Phrase
+                    | xerj_query::ast::MultiMatchType::PhrasePrefix
+            );
             let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
             let field_texts: Vec<String> = fields
                 .iter()
@@ -28509,8 +28514,35 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                         .collect();
                     tokens.iter().all(|t| ft_tokens.contains(t.as_str()))
                 })
-            } else {
+            } else if is_phrase || tokens.is_empty() {
+                // phrase / phrase_prefix: the whole query must appear
+                // contiguously — substring approximation of phrase
+                // matching, shared with the segment path (whose FTS
+                // projection declines these types, so BOTH states evaluate
+                // this predicate and the hit set is flush-invariant). Also
+                // the fallback when the query has no alphanumeric tokens.
                 field_texts.iter().any(|ft| ft.contains(&q_lower))
+            } else {
+                // best_fields / most_fields with the default operator (OR,
+                // issue #218): ANY query token equal to ANY token of a
+                // single field admits the hit — ES's default `operator: or`,
+                // and exactly what the segment path executes (a per-field
+                // OR-bool over tokens; the same Occur::Should convention as
+                // tantivy's `new_multiterms_query`,
+                // tantivy/src/query/boolean_query/boolean_query.rs:244).
+                // Token EQUALITY, not substring: `jump` must not match
+                // "jumparound" (the segment term path never did).
+                //
+                // Pre-fix this branch was `ft.contains(&q_lower)` — whole-
+                // query substring containment, requiring every token
+                // adjacent and in order — so a multi-token query missed
+                // memtable docs the segment path matched, and the hit set
+                // changed at _flush.
+                field_texts.iter().any(|ft| {
+                    ft.split(|c: char| !c.is_alphanumeric())
+                        .filter(|t| !t.is_empty())
+                        .any(|ft_tok| tokens.iter().any(|qt| qt == ft_tok))
+                })
             }
         }
 
@@ -30172,18 +30204,72 @@ fn score_query_against_doc(q: &QueryNode, source: &Value) -> f32 {
             query,
             boost,
             match_type,
+            operator,
             ..
         } => {
             let q_lower = query.to_lowercase();
             let outer_boost = boost.unwrap_or(1.0);
             let is_cross = matches!(match_type, xerj_query::ast::MultiMatchType::CrossFields);
+            let is_phrase = matches!(
+                match_type,
+                xerj_query::ast::MultiMatchType::Phrase
+                    | xerj_query::ast::MultiMatchType::PhrasePrefix
+            );
+            let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
+            // Per-field hit test mirroring `doc_matches_query` (issue #218):
+            // token-level OR by default / AND on request; phrase types keep
+            // whole-query substring containment. Pre-fix this arm tested
+            // `contains(whole query)`, so a memtable doc admitted by the
+            // membership check could still score 0.0 and be dropped by
+            // scored paths / rescore.
+            let q_tokens: Vec<String> = q_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            let field_hit = |text_lc: &str| -> bool {
+                if is_phrase || q_tokens.is_empty() {
+                    return text_lc.contains(&q_lower);
+                }
+                let ft_tokens: std::collections::HashSet<&str> = text_lc
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if is_and {
+                    q_tokens.iter().all(|t| ft_tokens.contains(t.as_str()))
+                } else {
+                    q_tokens.iter().any(|t| ft_tokens.contains(t.as_str()))
+                }
+            };
             let mut sum_score = 0.0f32;
             let mut max_score = 0.0f32;
             let mut matched = false;
             for field_spec in fields {
                 let (field, field_boost) = parse_field_boost(field_spec);
-                if let Some(Value::String(s)) = get_field_value(source, field) {
-                    if s.to_lowercase().contains(&q_lower) {
+                // Same per-field text extraction as `doc_matches_query`:
+                // strings, arrays (joined), and other scalars — an array-
+                // valued field admitted by membership must not score 0.0.
+                let text_lc: Option<String> = match get_field_value(source, field) {
+                    Some(Value::String(s)) => Some(s.to_lowercase()),
+                    Some(Value::Array(arr)) => {
+                        let joined: Vec<String> = arr
+                            .iter()
+                            .map(|v| match v {
+                                Value::String(s) => s.to_lowercase(),
+                                other => other.to_string(),
+                            })
+                            .collect();
+                        if joined.is_empty() {
+                            None
+                        } else {
+                            Some(joined.join(" "))
+                        }
+                    }
+                    Some(other) => Some(other.to_string().to_lowercase()),
+                    None => None,
+                };
+                if let Some(text) = text_lc {
+                    if field_hit(&text) {
                         sum_score += field_boost;
                         if field_boost > max_score {
                             max_score = field_boost;
@@ -32512,6 +32598,24 @@ fn query_node_to_fts(
             boost,
             ..
         } => {
+            // The memtable evaluator (`doc_matches_query`) gives phrase /
+            // phrase_prefix multi_match whole-query-containment semantics,
+            // which is not expressible as this per-field token bool —
+            // projecting them as an OR over tokens made the segment path
+            // OVER-match (the reverse of issue #218's memtable under-match:
+            // a reversed phrase started matching at _flush).
+            // Decline the projection instead; the stored-doc scan then
+            // evaluates the same `doc_matches_query` predicate the memtable
+            // uses, keeping the matched set flush-invariant.
+            // (cross_fields + `operator: and` is declined too — see the
+            // `is_and` guard below, which needs the analyzed token count.)
+            if matches!(
+                match_type,
+                xerj_query::ast::MultiMatchType::Phrase
+                    | xerj_query::ast::MultiMatchType::PhrasePrefix
+            ) {
+                return None;
+            }
             let registry = AnalyzerRegistry::default();
             let analyzer = registry.get_analyzer("standard")?;
             let tokens = analyzer.analyze(query);
@@ -32561,7 +32665,12 @@ fn query_node_to_fts(
             // the stored-doc scan, whose cross_fields arm implements the
             // combined-text semantics.  Without this, dropping an unmapped
             // field would FLIP an `operator: and` query from the scan's
-            // AND semantics onto the FTS OR path, over-matching.
+            // AND semantics onto the FTS OR path, over-matching (#217) —
+            // and the segment path would admit docs missing an AND token
+            // that the memtable rejected, so the hit set changed at _flush
+            // (#218).  A SINGLE analyzed token needs no decline: "the token
+            // is in at least one field" is what the per-field clauses OR'd
+            // together already mean, so that shape keeps the postings path.
             let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
             if is_and
                 && tokens.len() > 1
@@ -32607,8 +32716,12 @@ fn query_node_to_fts(
                         *fb,
                     )));
                 } else {
-                    // `operator: and` → per-field must (all tokens in this
-                    // field), same as the Match arm; default → per-field OR.
+                    // Honour the operator like the Match arm above: AND →
+                    // every token must match in the SAME field (`must`); OR
+                    // (the ES default) → any token (`should`). Pre-fix the
+                    // operator was dropped here, so `operator: and` OR'd its
+                    // tokens on segments while the memtable required every
+                    // one — the hit set changed at _flush (issue #218).
                     let mut field_bool = FtsBool::new().boost(*fb);
                     for token in &tokens {
                         let term = FtsQuery::Term(FtsTerm::new(field.as_str(), &token.text));
