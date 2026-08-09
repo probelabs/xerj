@@ -20,6 +20,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  cla-config:
+    name: CLA gate config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # cla-bot reads .contributors straight off this repo; malformed JSON or a
+      # missing bot exemption breaks the gate silently (it just flags everyone).
+      # Regression test for the dependabot[bot] exemption (PR #194 comment).
+      - name: Validate .contributors (valid JSON, bot exemptions present)
+        run: |
+          jq -e 'type == "array" and all(.[]; type == "string")' .contributors
+          jq -e 'index("dependabot[bot]") != null' .contributors
+
   lint:
     name: Format + Clippy
     runs-on: ubuntu-latest
