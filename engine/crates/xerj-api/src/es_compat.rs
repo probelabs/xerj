@@ -13412,6 +13412,128 @@ mod malformed_bulk_route_tests {
     }
 }
 
+/// Issue #204 — an ingest pipeline that cannot be compiled must be REFUSED,
+/// not stored, acknowledged and quietly skipped.
+#[cfg(test)]
+mod ingest_pipeline_fail_closed_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    async fn put_pipeline(state: AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response = crate::router::build_es_compat_router(state)
+            .oneshot(
+                Request::put(format!("/_ingest/pipeline/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_uncompilable_pipeline_is_rejected_and_not_stored() {
+        let state = test_state();
+
+        // `social_security` is not a PII type xerj can redact. Pre-fix this
+        // answered 200/acknowledged, `GET` echoed it back, and every document
+        // routed through it kept its PII.
+        let (status, body) = put_pipeline(
+            state.clone(),
+            "redact",
+            json!({
+                "processors": [
+                    { "pii_redaction": { "types": ["social_security"] } }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+        // Nothing was stored: GET must 404 rather than echo a pipeline that
+        // does not exist in compiled form.
+        let response = crate::router::build_es_compat_router(state.clone())
+            .oneshot(
+                Request::get("/_ingest/pipeline/redact")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!state.engine.pipelines.contains_key("redact"));
+        assert!(!state.engine.transform_pipelines.contains_key("redact"));
+    }
+
+    #[tokio::test]
+    async fn a_processor_entry_that_is_not_a_processor_is_rejected() {
+        // Pre-fix `filter_map` dropped this silently and the pipeline compiled
+        // with zero stages.
+        let (status, body) = put_pipeline(
+            test_state(),
+            "broken",
+            json!({ "processors": [ "lowercase" ] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_compilable_pipeline_still_round_trips() {
+        let state = test_state();
+        let (status, _) = put_pipeline(
+            state.clone(),
+            "ok",
+            json!({
+                "processors": [
+                    { "pii_redaction": { "types": ["email"] } },
+                    { "set": { "field": "env", "value": "prod" } }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.engine.transform_pipelines.contains_key("ok"));
+
+        let response = crate::router::build_es_compat_router(state)
+            .oneshot(
+                Request::get("/_ingest/pipeline/ok")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
 #[cfg(test)]
 mod script_query_end_to_end_tests {
     //! Regression coverage for a real bug: the `script` query's unit tests
@@ -21389,11 +21511,16 @@ pub async fn put_ingest_pipeline(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // Store the raw JSON for GET /_ingest/pipeline.
-    state.engine.pipelines.insert(id.clone(), body.clone());
     // Convert ES processor format → xerj stage format, then compile.
     // ES: {"processors": [{"set": {"field":"x","value":"y"}}]}
     // xerj: {"stages": [{"type": "set", "config": {"field":"x","value":"y"}}]}
+    //
+    // Issue #204 — the raw body used to be stored FIRST and the compile
+    // failure only warn-logged, so a pipeline with an unsupported processor
+    // was answered `200 {"acknowledged": true}`, echoed back verbatim by
+    // `GET /_ingest/pipeline/{id}`, and never ran: the redaction / grok / date
+    // parsing the caller asked for silently did not happen. Compile first,
+    // store only on success, and answer 400 like ES does.
     //
     // ES → xerj name mapping for processors whose names differ:
     fn map_proc_name(es_name: &str) -> String {
@@ -21408,23 +21535,31 @@ pub async fn put_ingest_pipeline(
             other => other.to_string(),
         }
     }
-    let xerj_config =
-        if let Some(processors) = body.get("processors").and_then(Value::as_array) {
-            let stages: Vec<Value> = processors.iter().filter_map(|proc| {
-            let obj = proc.as_object()?;
-            let (proc_type, proc_config) = obj.iter().next()?;
+    let xerj_config = if let Some(processors) = body.get("processors").and_then(Value::as_array) {
+        let mut stages: Vec<Value> = Vec::with_capacity(processors.len());
+        for (i, proc) in processors.iter().enumerate() {
+            // A processor entry that is not a single-key object used to be
+            // dropped by `filter_map` — the pipeline then compiled with fewer
+            // stages than were written, and still acknowledged.
+            let Some((proc_type, proc_config)) = proc.as_object().and_then(|o| o.iter().next())
+            else {
+                let e = xerj_common::XerjError::invalid_mapping(format!(
+                    "pipeline [{id}] processor[{i}] is not a processor object \
+                     (expected {{\"<processor>\": {{...}}}})"
+                ));
+                return ApiError::new(e).into_response();
+            };
             let xerj_type = map_proc_name(proc_type.as_str());
             // Adapt ES config shapes to xerj config shapes where they differ.
             let adapted_config = match proc_type.as_str() {
                 "remove" => {
                     // ES: {"field": "x"} or {"field": ["x","y"]}
                     // xerj drop_field: {"fields": ["x","y"]}
-                    let fields = match proc_config.get("field") {
+                    match proc_config.get("field") {
                         Some(Value::String(s)) => json!({"fields": [s]}),
                         Some(Value::Array(a)) => json!({"fields": a}),
                         _ => proc_config.clone(),
-                    };
-                    fields
+                    }
                 }
                 "rename" => {
                     // ES: {"field": "old", "target_field": "new"}
@@ -21436,17 +21571,26 @@ pub async fn put_ingest_pipeline(
                 }
                 _ => proc_config.clone(),
             };
-            Some(json!({"type": xerj_type, "config": adapted_config}))
-        }).collect();
-            json!({
-                "description": body.get("description").and_then(Value::as_str).unwrap_or(""),
-                "stages": stages
-            })
-        } else {
-            body.clone()
-        };
+            stages.push(json!({"type": xerj_type, "config": adapted_config}));
+        }
+        json!({
+            "description": body.get("description").and_then(Value::as_str).unwrap_or(""),
+            "stages": stages
+        })
+    } else {
+        body.clone()
+    };
+    // `create_pipeline` publishes into BOTH the compiled map and the
+    // GET-visible `pipelines` map, and only on success — so a rejected
+    // definition leaves no phantom entry to echo back. (On success the stored
+    // blob is the translated xerj config, exactly as before: `create_pipeline`
+    // used to overwrite the raw body this handler had already inserted.)
     if let Err(e) = state.engine.create_pipeline(&id, xerj_config) {
-        tracing::warn!(pipeline = %id, error = %e, "pipeline stored but failed to compile");
+        tracing::warn!(pipeline = %id, error = %e, "rejected ingest pipeline definition");
+        let err = xerj_common::XerjError::invalid_mapping(format!(
+            "pipeline [{id}] cannot be created: {e}"
+        ));
+        return ApiError::new(err).into_response();
     }
     Json(json!({ "acknowledged": true })).into_response()
 }

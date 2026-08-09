@@ -5223,6 +5223,9 @@ pub struct Index {
     /// because we only ever take/replace under it, never hold across
     /// any awaits.
     pub(crate) merge_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Failed writes of `schema.json` during dynamic-mapping evolution.
+    /// See [`Index::persist_evolved_schema`] (issue #204).
+    schema_persist_failures: AtomicU64,
 }
 
 impl Index {
@@ -5341,6 +5344,25 @@ impl Index {
         config: &Config,
         data_dir: &Path,
     ) -> Result<Arc<Self>> {
+        // Issue #204 — refuse an analysis block we would only pretend to
+        // honour. `apply_settings` is total (it has to be: it also runs on the
+        // open path), so an unresolvable tokenizer silently became `standard`
+        // and an unresolvable filter was silently dropped — the index was then
+        // built with an analyzer the caller never asked for and nothing in the
+        // 200 response said so. Checked BEFORE the index directory is created
+        // so a rejected create leaves nothing behind.
+        let analysis_problems = AnalyzerRegistry::unsupported_analysis(&settings);
+        if !analysis_problems.is_empty() {
+            return Err(EngineError::Common(xerj_common::XerjError::config(
+                format!(
+                    "index [{}] cannot be created: xerj cannot honour this analysis \
+                 configuration — {}",
+                    name.as_str(),
+                    analysis_problems.join("; ")
+                ),
+            )));
+        }
+
         let index_dir = data_dir.join(name.as_str());
         // Defense-in-depth: IndexName::validate rejects '.', '..', separators,
         // and '..' substrings, so join cannot escape data_dir. The debug_assert
@@ -5544,6 +5566,7 @@ impl Index {
             flush_signal: Arc::new(SyncFlushCoord::new()),
             external_versions: Arc::new(dashmap::DashMap::new()),
             merge_task: Arc::new(parking_lot::Mutex::new(None)),
+            schema_persist_failures: AtomicU64::new(0),
         });
         // Kick off the background merge pass.  5 s cadence is aggressive
         // enough to collapse a burst of flushes quickly without burning a
@@ -5891,6 +5914,7 @@ impl Index {
             flush_signal: Arc::new(SyncFlushCoord::new()),
             external_versions: Arc::new(dashmap::DashMap::new()),
             merge_task: Arc::new(parking_lot::Mutex::new(None)),
+            schema_persist_failures: AtomicU64::new(0),
         });
         index.spawn_merge_task(5);
         // RC4 W2 item 17: a flush-time-stale HNSW snapshot used to stay
@@ -17642,7 +17666,7 @@ impl Index {
             }
         }
         if schema_changed {
-            let _ = self.save_schema(&schema).await;
+            self.persist_evolved_schema(&schema).await;
         }
     }
 
@@ -17716,8 +17740,43 @@ impl Index {
             }
         }
         if schema_changed {
-            let _ = self.save_schema(&schema).await;
+            self.persist_evolved_schema(&schema).await;
         }
+    }
+
+    /// Persist a dynamic-mapping evolution, complaining loudly if it does not
+    /// stick.
+    ///
+    /// Issue #204: both callers used to be `let _ = self.save_schema(..)`. The
+    /// in-memory schema had the new fields, `schema.json` did not, and the next
+    /// restart reopened the index with a mapping that had silently rolled back
+    /// — documents already on disk carrying those fields, no mapping for them,
+    /// and not one line anywhere saying why.
+    ///
+    /// This is a log-and-surface fix, not a fail-closed one, and deliberately
+    /// so: schema evolution runs *after* the document has been admitted, so
+    /// there is no caller left to fail. Losing the durable mapping is the lesser
+    /// evil against rejecting a document that is already indexed — but it is
+    /// an ERROR, not a shrug. `schema_persist_failures` counts it so a health
+    /// check can see it without reading logs.
+    async fn persist_evolved_schema(&self, schema: &ManagedSchema) {
+        if let Err(e) = self.save_schema(schema).await {
+            self.schema_persist_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                index = self.name.as_str(),
+                path = %self.data_dir.join("schema.json").display(),
+                error = %e,
+                "failed to persist dynamic mapping evolution — the new fields are \
+                 live in memory but WILL BE LOST on restart"
+            );
+        }
+    }
+
+    /// Number of times [`Self::persist_evolved_schema`] could not write
+    /// `schema.json`. Non-zero means the on-disk mapping is behind the
+    /// in-memory one and a restart will lose dynamically-mapped fields.
+    pub fn schema_persist_failures(&self) -> u64 {
+        self.schema_persist_failures.load(Ordering::Relaxed)
     }
 
     async fn save_schema(&self, schema: &ManagedSchema) -> Result<()> {

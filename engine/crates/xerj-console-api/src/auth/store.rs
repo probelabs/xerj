@@ -209,7 +209,13 @@ pub async fn count_passkeys_for_user(engine: &Engine, user_id: &str) -> ConsoleR
 
 pub async fn delete_passkey(engine: &Engine, credential_id: &str) -> ConsoleResult<()> {
     let idx = engine.get_index(indices::PASSKEYS)?;
-    let _ = idx.delete_document(credential_id).await;
+    // Issue #204: this was `let _ = ..`, so a delete refused by the engine
+    // (index write block, disk flood stage, storage error) still produced
+    // `204 No Content` — the console said the passkey was revoked while it
+    // remained on disk and kept authenticating. `delete_document` returns
+    // `Ok(false)` for an already-absent credential, so propagating cannot turn
+    // a repeat revoke into an error; only a genuine failure surfaces.
+    idx.delete_document(credential_id).await?;
     Ok(())
 }
 

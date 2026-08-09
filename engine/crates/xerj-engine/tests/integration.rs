@@ -6471,3 +6471,116 @@ async fn test_bare_count_bucket_script_inside_a_terms_bucket_agrees_on_both_path
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — an analysis block xerj cannot honour must be REFUSED at create
+// time, not accepted and quietly replaced with something weaker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_index_rejects_an_analysis_block_it_cannot_honour() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+
+    // Pre-fix: `autocomplete_tok` was never declared, `apply_settings`
+    // substituted a StandardTokenizer, and the caller got a 200 plus an index
+    // that does not do prefix matching at all.
+    let settings = json!({
+        "analysis": {
+            "analyzer": {
+                "default": {
+                    "type": "custom",
+                    "tokenizer": "autocomplete_tok",
+                    "filter": ["lowercase"]
+                }
+            }
+        }
+    });
+    let err = engine
+        .create_index_with_settings("bad_tok_idx", Schema::empty(), settings)
+        .expect_err("an unresolvable tokenizer must fail index creation");
+    let msg = err.to_string();
+    assert!(msg.contains("autocomplete_tok"), "unhelpful error: {msg}");
+
+    // Refused before anything hit the disk, and not registered in the engine.
+    assert!(engine.get_index("bad_tok_idx").is_err());
+    assert!(
+        !dir.path().join("bad_tok_idx").exists(),
+        "a rejected create must not leave an index directory behind"
+    );
+
+    // An unresolvable token filter is refused for the same reason: dropping
+    // `lowercase` silently makes every match case-sensitive.
+    let err = engine
+        .create_index_with_settings(
+            "bad_filter_idx",
+            Schema::empty(),
+            json!({
+                "analysis": {
+                    "analyzer": {
+                        "default": {
+                            "type": "custom",
+                            "tokenizer": "standard",
+                            "filter": ["lowercse"]
+                        }
+                    }
+                }
+            }),
+        )
+        .expect_err("an unresolvable token filter must fail index creation");
+    assert!(err.to_string().contains("lowercse"), "{err}");
+}
+
+#[tokio::test]
+async fn create_index_still_accepts_every_analysis_construct_we_support() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+
+    // The full supported surface in one settings block — this is the guard
+    // against the #204 check over-rejecting.
+    let settings = json!({
+        "analysis": {
+            "filter": {
+                "my_synonyms": { "type": "synonym", "synonyms": ["fast,quick"] },
+                "my_length":   { "type": "length", "min": 2, "max": 40 },
+                "my_shingle":  { "type": "shingle", "max_shingle_size": 2 },
+                "my_fold":     { "type": "asciifolding" }
+            },
+            "tokenizer": {
+                "ng":   { "type": "ngram", "min_gram": 2, "max_gram": 3 },
+                "edge": { "type": "edge_ngram", "min_gram": 1, "max_gram": 8 },
+                "pat":  { "type": "pattern", "pattern": "\\W+" }
+            },
+            "analyzer": {
+                "default": {
+                    "type": "custom",
+                    "tokenizer": "edge",
+                    "filter": ["lowercase", "stop", "stemmer", "asciifolding",
+                               "my_synonyms", "my_length", "my_shingle", "my_fold"]
+                },
+                "plain": { "type": "english" }
+            }
+        }
+    });
+    engine
+        .create_index_with_settings("good_idx", Schema::empty(), settings)
+        .expect("a fully supported analysis block must still create");
+
+    let idx = engine.get_index("good_idx").unwrap();
+    idx.index_document(Some("1".into()), json!({ "title": "javascript" }))
+        .await
+        .unwrap();
+    let result = idx
+        .search(&make_search(json!({"match": {"title": "java"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 1,
+        "the edge-ngram analyzer must actually be in force"
+    );
+
+    // An index with no analysis block at all is untouched by the check.
+    engine
+        .create_index_with_settings("plain_idx", Schema::empty(), json!({}))
+        .expect("empty settings must still create");
+}

@@ -821,11 +821,29 @@ pub async fn admin_backup(State(state): State<AppState>, body: Bytes) -> impl In
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
-    // Body is optional and lenient — `{}` or empty both mean "defaults".
+    // Body is optional — empty and `{}` both mean "defaults". A body that is
+    // PRESENT but unparseable is not: issue #204, this was
+    // `.unwrap_or_default()`, so a malformed request silently discarded the
+    // caller's `repo_path` / `name` / `indices` and ran a *different* backup
+    // (default location, every index) under a `201 Created`. An operator
+    // reading "created" had no way to know the archive they asked for is not
+    // the archive that exists.
     let req: BackupRequest = if body.is_empty() {
         BackupRequest::default()
     } else {
-        serde_json::from_slice(&body).unwrap_or_default()
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return native_error(
+                    xerj_common::XerjError::invalid_document_json(format!(
+                        "backup request body is not valid BackupRequest JSON: {e}"
+                    )),
+                    Some(&request_id),
+                    started.elapsed().as_millis() as u64,
+                )
+                .into_response();
+            }
+        }
     };
 
     let data_dir = state.engine.config().server.data_dir.clone();

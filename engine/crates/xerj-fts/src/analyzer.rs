@@ -894,6 +894,15 @@ fn nfkc_normalize(s: &str) -> String {
 
 // ── Analyzer registry ─────────────────────────────────────────────────────────
 
+/// `analysis.filter.*.type` values [`AnalyzerRegistry::apply_settings`] can
+/// actually build. Must stay in step with the `match filter_type` arms there —
+/// `supported_analysis_types_all_build` pins that.
+pub const SUPPORTED_FILTER_TYPES: &[&str] = &["synonym", "length", "shingle", "asciifolding"];
+
+/// `analysis.tokenizer.*.type` values [`AnalyzerRegistry::apply_settings`] can
+/// actually build. Must stay in step with the `match tok_type` arms there.
+pub const SUPPORTED_TOKENIZER_TYPES: &[&str] = &["ngram", "edge_ngram", "pattern"];
+
 /// Central registry that maps analyzer names to their pipelines.
 ///
 /// Built-in analyzers are registered by default; custom analyzers can be
@@ -1055,6 +1064,12 @@ impl AnalyzerRegistry {
     /// Extend this registry with custom analyzer definitions parsed from an
     /// index `settings.analysis` block.
     ///
+    /// **Total by design.** Every construct this method cannot honour is
+    /// skipped or replaced rather than raised, because it also runs on the
+    /// index-open path where a hard failure would make an existing index
+    /// unopenable. Callers on the *create* path must gate on
+    /// [`AnalyzerRegistry::unsupported_analysis`] first — see issue #204.
+    ///
     /// Accepts the ES-compatible JSON format:
     /// ```json
     /// {
@@ -1076,7 +1091,7 @@ impl AnalyzerRegistry {
     /// }
     /// ```
     pub fn apply_settings(&mut self, settings: &serde_json::Value) {
-        let analysis = match settings.pointer("/analysis") {
+        let analysis = match Self::analysis_block(settings) {
             Some(a) => a,
             None => return,
         };
@@ -1215,8 +1230,16 @@ impl AnalyzerRegistry {
 
                 if analyzer_type != "custom" {
                     // For non-custom types, look up the built-in by type name.
-                    if let Some(builtin) = self.get_analyzer(analyzer_type) {
-                        self.analyzers.insert(analyzer_name.clone(), builtin);
+                    match self.get_analyzer(analyzer_type) {
+                        Some(builtin) => {
+                            self.analyzers.insert(analyzer_name.clone(), builtin);
+                        }
+                        None => tracing::warn!(
+                            analyzer = analyzer_name.as_str(),
+                            analyzer_type,
+                            "unknown analyzer type — analyzer not registered, \
+                             fields referencing it fall back to `standard`"
+                        ),
                     }
                     continue;
                 }
@@ -1231,7 +1254,22 @@ impl AnalyzerRegistry {
                     .get(tokenizer_name)
                     .cloned()
                     .or_else(|| self.resolve_builtin_tokenizer(tokenizer_name))
-                    .unwrap_or_else(|| Arc::new(StandardTokenizer));
+                    .unwrap_or_else(|| {
+                        // Not equivalent: substituting `standard` for (say)
+                        // `edge_ngram` builds a completely different index.
+                        // `unsupported_analysis` rejects this at index-create
+                        // time; reaching it here means we are re-opening an
+                        // index whose settings.json predates that check, so
+                        // say so loudly rather than degrade in silence
+                        // (issue #204).
+                        tracing::warn!(
+                            analyzer = analyzer_name.as_str(),
+                            tokenizer = tokenizer_name,
+                            "unknown tokenizer in custom analyzer — falling back to \
+                             `standard`; this index does NOT tokenize as configured"
+                        );
+                        Arc::new(StandardTokenizer)
+                    });
 
                 // Resolve token filters.
                 let filter_names: Vec<&str> = analyzer_def
@@ -1261,6 +1299,155 @@ impl AnalyzerRegistry {
                 );
             }
         }
+    }
+
+    /// Report every `settings.analysis` construct that [`apply_settings`] would
+    /// accept and then silently NOT honour.
+    ///
+    /// [`apply_settings`]: AnalyzerRegistry::apply_settings
+    ///
+    /// Issue #204 — "degrade loudly or not at all". `apply_settings` is
+    /// deliberately total: it never fails, because it also runs on the
+    /// index-*open* path where refusing to build a registry would brick an
+    /// existing index. That leniency is right at open time and wrong at create
+    /// time, where every one of these constructs used to be accepted with a
+    /// `200 {"acknowledged": true}` and then quietly replaced by something
+    /// weaker:
+    ///
+    /// - an unresolvable `tokenizer` became `standard` — an `edge_ngram`
+    ///   autocomplete index that matches nothing;
+    /// - an unresolvable `filter` was dropped — a missing `lowercase` turns
+    ///   every match case-sensitive;
+    /// - an unsupported filter/tokenizer `type` was skipped entirely;
+    /// - an unknown non-custom analyzer `type` left the analyzer unregistered,
+    ///   so fields naming it silently got `standard`.
+    ///
+    /// Returns one human-readable message per problem, empty when the block can
+    /// be honoured exactly as written. `Index::create_with_settings` turns a
+    /// non-empty result into a 400 so the caller learns at the door.
+    ///
+    /// `settings` may be either the full envelope (`{"settings": {"analysis":
+    /// …}}`) or the inner settings object — the same two shapes
+    /// `build_registry_from_settings` accepts.
+    pub fn unsupported_analysis(settings: &serde_json::Value) -> Vec<String> {
+        let root = settings.pointer("/settings").unwrap_or(settings);
+        let Some(analysis) = Self::analysis_block(root) else {
+            return Vec::new();
+        };
+        let probe = Self::with_defaults();
+        let mut problems = Vec::new();
+
+        // Declared names are collected even when their `type` is unsupported,
+        // so a bad type is reported once (as a type problem) rather than twice
+        // (again as a dangling reference from every analyzer that uses it).
+        let mut declared_filters: HashSet<&str> = HashSet::new();
+        if let Some(filter_map) = analysis.pointer("/filter").and_then(|v| v.as_object()) {
+            for (filter_name, filter_def) in filter_map {
+                declared_filters.insert(filter_name.as_str());
+                let filter_type = filter_def
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !SUPPORTED_FILTER_TYPES.contains(&filter_type) {
+                    problems.push(format!(
+                        "token filter [{filter_name}]: unsupported type [{filter_type}] \
+                         (supported: {})",
+                        SUPPORTED_FILTER_TYPES.join(", ")
+                    ));
+                }
+            }
+        }
+
+        let mut declared_tokenizers: HashSet<&str> = HashSet::new();
+        if let Some(tok_map) = analysis.pointer("/tokenizer").and_then(|v| v.as_object()) {
+            for (tok_name, tok_def) in tok_map {
+                declared_tokenizers.insert(tok_name.as_str());
+                let tok_type = tok_def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if !SUPPORTED_TOKENIZER_TYPES.contains(&tok_type) {
+                    problems.push(format!(
+                        "tokenizer [{tok_name}]: unsupported type [{tok_type}] \
+                         (supported: {})",
+                        SUPPORTED_TOKENIZER_TYPES.join(", ")
+                    ));
+                    continue;
+                }
+                if tok_type == "pattern" {
+                    let pattern = tok_def
+                        .get("pattern")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(r"\W+");
+                    if PatternTokenizer::new(pattern).is_err() {
+                        problems.push(format!(
+                            "tokenizer [{tok_name}]: invalid pattern regex [{pattern}]"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(analyzer_map) = analysis.pointer("/analyzer").and_then(|v| v.as_object()) {
+            for (analyzer_name, analyzer_def) in analyzer_map {
+                let analyzer_type = analyzer_def
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("custom");
+
+                if analyzer_type != "custom" {
+                    if probe.get_analyzer(analyzer_type).is_none() {
+                        problems.push(format!(
+                            "analyzer [{analyzer_name}]: unknown analyzer type [{analyzer_type}]"
+                        ));
+                    }
+                    continue;
+                }
+
+                let tokenizer_name = analyzer_def
+                    .get("tokenizer")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("standard");
+                if !declared_tokenizers.contains(tokenizer_name)
+                    && probe.resolve_builtin_tokenizer(tokenizer_name).is_none()
+                {
+                    problems.push(format!(
+                        "analyzer [{analyzer_name}]: unknown tokenizer [{tokenizer_name}]"
+                    ));
+                }
+
+                let filter_names: Vec<&str> = analyzer_def
+                    .get("filter")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                for fname in filter_names {
+                    if !declared_filters.contains(fname)
+                        && probe.resolve_builtin_filter(fname).is_none()
+                    {
+                        problems.push(format!(
+                            "analyzer [{analyzer_name}]: unknown token filter [{fname}]"
+                        ));
+                    }
+                }
+            }
+        }
+
+        problems.sort();
+        problems
+    }
+
+    /// Locate the `analysis` block inside an index-settings object.
+    ///
+    /// ES accepts both the shorthand (`settings.analysis.*`) and the canonical
+    /// namespaced form (`settings.index.analysis.*`). Only the shorthand used
+    /// to be read here, so a settings body written the canonical way was
+    /// accepted, echoed back by `GET /{index}/_settings`, and then contributed
+    /// no analyzers at all — every field naming one silently got `standard`
+    /// (issue #204). Kept as one helper so the builder and
+    /// [`AnalyzerRegistry::unsupported_analysis`] can never disagree about
+    /// which block is in force.
+    fn analysis_block(settings: &serde_json::Value) -> Option<&serde_json::Value> {
+        settings
+            .pointer("/analysis")
+            .or_else(|| settings.pointer("/index/analysis"))
     }
 
     /// Resolve a tokenizer by its built-in name.
@@ -1996,5 +2183,194 @@ mod tests {
         assert!(terms.contains(&"ix".to_string()), "terms={terms:?}");
         assert!(terms.contains(&"fi".to_string()), "terms={terms:?}");
         assert!(terms.contains(&"test".to_string()), "terms={terms:?}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — `settings.analysis` constructs that used to degrade in silence
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod unsupported_analysis_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_settings_block_we_can_honour_reports_nothing() {
+        let settings = json!({
+            "analysis": {
+                "filter": {
+                    "my_synonyms": { "type": "synonym", "synonyms": ["fast,quick"] },
+                    "my_length":   { "type": "length", "min": 3, "max": 50 }
+                },
+                "tokenizer": {
+                    "autocomplete_tok": { "type": "edge_ngram", "min_gram": 1, "max_gram": 10 }
+                },
+                "analyzer": {
+                    "a": { "type": "custom", "tokenizer": "autocomplete_tok",
+                           "filter": ["lowercase", "my_synonyms", "my_length"] },
+                    "b": { "type": "english" }
+                }
+            }
+        });
+        assert!(
+            AnalyzerRegistry::unsupported_analysis(&settings).is_empty(),
+            "{:?}",
+            AnalyzerRegistry::unsupported_analysis(&settings)
+        );
+        // Absent analysis block, and the outer-envelope shape, both work.
+        assert!(AnalyzerRegistry::unsupported_analysis(&json!({})).is_empty());
+        assert!(
+            AnalyzerRegistry::unsupported_analysis(&json!({ "settings": settings })).is_empty()
+        );
+    }
+
+    /// ES's canonical `index.analysis.*` form must be BUILT, not ignored — and
+    /// therefore also validated.
+    #[test]
+    fn the_index_namespaced_form_is_honoured_by_builder_and_validator() {
+        let namespaced = json!({
+            "index": {
+                "analysis": {
+                    "tokenizer": { "edge": { "type": "edge_ngram", "min_gram": 1, "max_gram": 8 } },
+                    "analyzer": { "ac": { "type": "custom", "tokenizer": "edge" } }
+                }
+            }
+        });
+        assert!(
+            AnalyzerRegistry::unsupported_analysis(&namespaced).is_empty(),
+            "{:?}",
+            AnalyzerRegistry::unsupported_analysis(&namespaced)
+        );
+
+        let mut registry = AnalyzerRegistry::with_defaults();
+        registry.apply_settings(&namespaced);
+        let ac = registry
+            .get_analyzer("ac")
+            .expect("index.analysis.analyzer.ac must be registered, not silently dropped");
+        assert!(
+            ac.analyze_to_terms("java").contains(&"ja".to_string()),
+            "the edge-ngram tokenizer must be the one in force"
+        );
+
+        // And a broken one in that form is caught rather than ignored.
+        let bad = json!({ "index": { "analysis": { "analyzer": {
+            "ac": { "type": "custom", "tokenizer": "nope" } } } } });
+        assert_eq!(AnalyzerRegistry::unsupported_analysis(&bad).len(), 1);
+    }
+
+    #[test]
+    fn unresolvable_tokenizer_is_reported() {
+        // Pre-fix: this analyzer was registered with a StandardTokenizer and
+        // the index tokenized nothing like the caller asked for.
+        let problems = AnalyzerRegistry::unsupported_analysis(&json!({
+            "analysis": {
+                "analyzer": {
+                    "autocomplete": { "type": "custom", "tokenizer": "edge_ngram_tok" }
+                }
+            }
+        }));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("edge_ngram_tok"), "{problems:?}");
+    }
+
+    #[test]
+    fn unresolvable_filter_is_reported() {
+        let problems = AnalyzerRegistry::unsupported_analysis(&json!({
+            "analysis": {
+                "analyzer": {
+                    "a": { "type": "custom", "tokenizer": "standard",
+                           "filter": ["lowercse", "word_delimiter"] }
+                }
+            }
+        }));
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("lowercse")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("word_delimiter")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_component_type_is_reported_once_not_twice() {
+        // A filter declared with an unsupported `type` is skipped by
+        // apply_settings, so every analyzer naming it also loses it. Report
+        // the actionable cause (the type) and not the knock-on reference.
+        let problems = AnalyzerRegistry::unsupported_analysis(&json!({
+            "analysis": {
+                "filter": { "stem": { "type": "hunspell", "locale": "en_US" } },
+                "tokenizer": { "tok": { "type": "char_group" } },
+                "analyzer": {
+                    "a": { "type": "custom", "tokenizer": "tok", "filter": ["stem"] }
+                }
+            }
+        }));
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("hunspell")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("char_group")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_non_custom_analyzer_type_is_reported() {
+        let problems = AnalyzerRegistry::unsupported_analysis(&json!({
+            "analysis": { "analyzer": { "a": { "type": "kuromoji" } } }
+        }));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("kuromoji"), "{problems:?}");
+    }
+
+    #[test]
+    fn invalid_pattern_tokenizer_regex_is_reported() {
+        let problems = AnalyzerRegistry::unsupported_analysis(&json!({
+            "analysis": { "tokenizer": { "t": { "type": "pattern", "pattern": "[unclosed" } } }
+        }));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("invalid pattern regex"),
+            "{problems:?}"
+        );
+    }
+
+    /// The allow-lists are the contract `unsupported_analysis` enforces; if one
+    /// drifts from the `match` arms in `apply_settings` we would start
+    /// rejecting configurations we can serve (or accepting ones we cannot).
+    #[test]
+    fn supported_analysis_types_all_build() {
+        for t in SUPPORTED_FILTER_TYPES {
+            let mut registry = AnalyzerRegistry::with_defaults();
+            registry.apply_settings(&json!({
+                "analysis": {
+                    "filter": { "f": { "type": t, "synonyms": ["a,b"] } },
+                    "analyzer": { "a": { "type": "custom", "tokenizer": "standard",
+                                         "filter": ["f"] } }
+                }
+            }));
+            assert!(
+                registry.get_analyzer("a").is_some(),
+                "filter type `{t}` is on the supported list but did not build"
+            );
+        }
+        for t in SUPPORTED_TOKENIZER_TYPES {
+            let mut registry = AnalyzerRegistry::with_defaults();
+            registry.apply_settings(&json!({
+                "analysis": {
+                    "tokenizer": { "tk": { "type": t } },
+                    "analyzer": { "a": { "type": "custom", "tokenizer": "tk" } }
+                }
+            }));
+            assert!(
+                registry.get_analyzer("a").is_some(),
+                "tokenizer type `{t}` is on the supported list but did not build"
+            );
+        }
     }
 }

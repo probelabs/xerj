@@ -14,7 +14,7 @@ use crate::{
         AddFieldPlugin, ConvertTypePlugin, CopyFieldPlugin, DropFieldPlugin, FieldRenamePlugin,
         GrokPlugin, JsonParsePlugin, LowercasePlugin, PiiRedactionPlugin, RemoveNullPlugin,
         RoutePlugin, SetPlugin, SplitPlugin, TimestampParsePlugin, UppercasePlugin,
-        UrlDecodePlugin,
+        UrlDecodePlugin, CONVERT_TARGET_TYPES, GROK_PATTERN_NAMES, PII_TYPE_NAMES,
     },
     Result, TransformPlugin, WasmError,
 };
@@ -199,15 +199,7 @@ fn build_plugin(
 
         "timestamp_parse" => {
             let field = str_field(config, "field")?;
-            let formats: Vec<String> = config
-                .get("formats")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let formats = optional_string_array(config, "formats")?.unwrap_or_default();
             let target = config
                 .get("target")
                 .and_then(Value::as_str)
@@ -260,24 +252,45 @@ fn build_plugin(
 
         "grok" => {
             let field = str_field(config, "field")?;
-            let pattern_name = config
-                .get("pattern")
-                .and_then(Value::as_str)
-                .unwrap_or("SYSLOG")
-                .to_string();
+            let pattern_name = match config.get("pattern") {
+                None => "SYSLOG".to_string(),
+                Some(Value::String(s)) => {
+                    // Fail closed: an unrecognised pattern name used to fall
+                    // through to the generic catch-all, which extracts a
+                    // single `message` field and nothing else (issue #204).
+                    if !GROK_PATTERN_NAMES.contains(&s.as_str()) {
+                        return Err(format!(
+                            "unknown grok pattern '{s}' (known patterns: {})",
+                            GROK_PATTERN_NAMES.join(", ")
+                        ));
+                    }
+                    s.clone()
+                }
+                Some(other) => {
+                    return Err(format!("'pattern' must be a string, got {other}"));
+                }
+            };
             Ok(Arc::new(GrokPlugin::new(field, pattern_name)))
         }
 
         "pii_redaction" => {
-            let types: Vec<String> = config
-                .get("types")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_else(|| vec!["email".into(), "ip".into(), "credit_card".into()]);
+            // Fail closed on an unknown PII type: it used to contribute no
+            // regex, so a typo'd `types` list produced a stage that redacted
+            // nothing while reporting success (issue #204).
+            let types = match optional_string_array(config, "types")? {
+                None => vec!["email".into(), "ip".into(), "credit_card".into()],
+                Some(requested) => {
+                    for t in &requested {
+                        if !PII_TYPE_NAMES.contains(&t.as_str()) {
+                            return Err(format!(
+                                "unknown pii type '{t}' (known types: {})",
+                                PII_TYPE_NAMES.join(", ")
+                            ));
+                        }
+                    }
+                    requested
+                }
+            };
             Ok(Arc::new(PiiRedactionPlugin::new(types)))
         }
 
@@ -290,6 +303,14 @@ fn build_plugin(
         "convert" => {
             let field = str_field(config, "field")?;
             let target_type = str_field(config, "type")?;
+            // Fail closed: an unknown target type used to no-op per document
+            // rather than fail the pipeline definition (issue #204).
+            if !CONVERT_TARGET_TYPES.contains(&target_type.as_str()) {
+                return Err(format!(
+                    "unknown convert target type '{target_type}' (known types: {})",
+                    CONVERT_TARGET_TYPES.join(", ")
+                ));
+            }
             Ok(Arc::new(ConvertTypePlugin::new(field, target_type)))
         }
 
@@ -348,6 +369,33 @@ fn str_field(config: &Value, key: &str) -> std::result::Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("missing required string field '{key}'"))
+}
+
+/// Read an OPTIONAL array-of-strings config key.
+///
+/// `Ok(None)` means the key is absent (the caller applies its documented
+/// default). A present-but-wrong-shaped value is an error rather than a silent
+/// fall-through to the default — `"formats": "%Y-%m-%d"` used to be dropped by
+/// `and_then(Value::as_array)` and the stage then behaved as if no formats had
+/// been configured at all (issue #204).
+fn optional_string_array(
+    config: &Value,
+    key: &str,
+) -> std::result::Result<Option<Vec<String>>, String> {
+    let Some(raw) = config.get(key) else {
+        return Ok(None);
+    };
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| format!("'{key}' must be an array of strings"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("'{key}' must contain only strings, got {v}"))?;
+        out.push(s.to_string());
+    }
+    Ok(Some(out))
 }
 
 fn string_array(config: &Value, key: &str) -> std::result::Result<Vec<String>, String> {
@@ -438,5 +486,128 @@ mod tests {
             timeout_ms: 0,
         };
         assert!(Pipeline::from_config("bad", &cfg).is_err());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — weaker fallbacks on user-supplied processor configuration
+//
+// Each case below used to build a pipeline that was accepted, stored, and
+// reported healthy, and then did LESS than the caller asked for with no signal
+// at all. They now fail closed at `Pipeline::from_config`, which is where the
+// caller can still act on the error.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod fallback_regression_tests {
+    use super::*;
+
+    fn build(stage_type: &str, config: Value) -> std::result::Result<Pipeline, WasmError> {
+        Pipeline::from_config(
+            "t",
+            &PipelineConfig {
+                description: String::new(),
+                stages: vec![PipelineStageConfig {
+                    stage_type: stage_type.into(),
+                    config,
+                }],
+                on_error: ErrorPolicy::Drop,
+                timeout_ms: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn unknown_pii_type_is_rejected_not_silently_unredacted() {
+        // Pre-fix: `social_security` matched no `wants(..)` arm, the pattern
+        // list came out EMPTY, and the stage passed every document through
+        // with its PII intact while reporting success.
+        let err = build(
+            "pii_redaction",
+            serde_json::json!({ "types": ["ssn", "social_security"] }),
+        )
+        .expect_err("unknown pii type must fail the pipeline definition");
+        assert!(
+            err.to_string().contains("social_security"),
+            "error must name the offending type: {err}"
+        );
+
+        // The supported spelling still builds and still redacts.
+        let pl = build("pii_redaction", serde_json::json!({ "types": ["ssn"] }))
+            .expect("known pii type builds");
+        let mut doc = serde_json::json!({ "note": "ssn 123-45-6789" });
+        pl.process(&mut doc);
+        assert_eq!(doc["note"], "ssn [REDACTED_SSN]");
+    }
+
+    #[test]
+    fn non_array_pii_types_is_rejected_not_defaulted() {
+        // Pre-fix: `and_then(Value::as_array)` returned None for a bare string
+        // and the stage silently fell back to the built-in default type list.
+        assert!(build("pii_redaction", serde_json::json!({ "types": "ssn" })).is_err());
+    }
+
+    #[test]
+    fn absent_pii_types_still_uses_the_documented_default() {
+        let pl = build("pii_redaction", serde_json::json!({})).expect("default types build");
+        let mut doc = serde_json::json!({ "note": "mail me at a@b.com" });
+        pl.process(&mut doc);
+        assert_eq!(doc["note"], "mail me at [REDACTED_EMAIL]");
+    }
+
+    #[test]
+    fn unknown_grok_pattern_is_rejected_not_downgraded_to_catch_all() {
+        // Pre-fix: this compiled to `^(?P<message>.+)$`, so an nginx pipeline
+        // extracted one field instead of ten and nothing said so.
+        let err = build(
+            "grok",
+            serde_json::json!({ "field": "msg", "pattern": "NGINX_COMBINE" }),
+        )
+        .expect_err("typo'd grok pattern must fail");
+        assert!(
+            err.to_string().contains("NGINX_COMBINE"),
+            "error must name the offending pattern: {err}"
+        );
+
+        // The catch-all is still reachable — by asking for it.
+        let pl = build(
+            "grok",
+            serde_json::json!({ "field": "msg", "pattern": "GENERIC" }),
+        )
+        .expect("GENERIC is an explicit, supported pattern");
+        let mut doc = serde_json::json!({ "msg": "anything at all" });
+        pl.process(&mut doc);
+        assert_eq!(doc["message"], "anything at all");
+    }
+
+    #[test]
+    fn unknown_convert_target_type_is_rejected_not_a_per_document_noop() {
+        // Pre-fix: `"int"` built fine and then hit `_ => None` on every
+        // document, leaving the field a string forever.
+        let err = build(
+            "convert",
+            serde_json::json!({ "field": "status", "type": "int" }),
+        )
+        .expect_err("unknown convert target type must fail");
+        assert!(err.to_string().contains("int"), "{err}");
+
+        let pl = build(
+            "convert",
+            serde_json::json!({ "field": "status", "type": "integer" }),
+        )
+        .expect("known target type builds");
+        let mut doc = serde_json::json!({ "status": "404" });
+        pl.process(&mut doc);
+        assert_eq!(doc["status"], 404);
+    }
+
+    #[test]
+    fn non_array_timestamp_formats_is_rejected_not_dropped() {
+        assert!(build(
+            "timestamp_parse",
+            serde_json::json!({ "field": "ts", "formats": "%Y-%m-%d" })
+        )
+        .is_err());
+        // Absent `formats` is still the documented epoch/RFC-3339 default.
+        assert!(build("timestamp_parse", serde_json::json!({ "field": "ts" })).is_ok());
     }
 }
