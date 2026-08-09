@@ -31,21 +31,27 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Every documentation file that carries a machine-checked capability list.
+/// Documentation files that publish the **query**-type lists.
 ///
 /// Paths are repo-relative. A file listed here that has lost its markers is a
 /// hard failure, not a skip — a silently unchecked doc is the state this test
 /// exists to end.
-const CHECKED_DOCS: &[&str] = &["engine/README.md", "landing/llms-full.txt"];
+const QUERY_TYPE_DOCS: &[&str] = &[
+    "engine/README.md",
+    "landing/llms-full.txt",
+    "landing/docs/queries.html",
+];
 
-/// Pull the names out of a `<!-- generated:<section> -->` … `<!-- /generated:<section> -->`
-/// region.
-///
-/// Only backtick-delimited tokens count, so the region can carry readable
-/// family labels ("Full-text:", "Pipeline:") without them being mistaken for
-/// capability names. Anything backticked that is not an ES type name is a hard
-/// error rather than a silently mis-parsed entry.
-fn documented(doc: &str, path: &str, section: &str) -> BTreeSet<String> {
+/// Documentation files that publish the **aggregation**-type list.
+const AGG_TYPE_DOCS: &[&str] = &[
+    "engine/README.md",
+    "landing/llms-full.txt",
+    "landing/docs/aggregations.html",
+];
+
+/// Slice one `<!-- generated:<section> -->` … `<!-- /generated:<section> -->`
+/// region out of a document.
+fn region<'a>(doc: &'a str, path: &str, section: &str) -> &'a str {
     let open = format!("<!-- generated:{section} -->");
     let close = format!("<!-- /generated:{section} -->");
 
@@ -53,7 +59,7 @@ fn documented(doc: &str, path: &str, section: &str) -> BTreeSet<String> {
         panic!(
             "{path} has no `{open}` marker. Every capability list is generated \
              from the source constants and delimited by these markers; if the \
-             section was renamed or removed, update CHECKED_DOCS/SECTIONS in \
+             section was renamed or removed, update the *_DOCS lists in \
              this test rather than leaving the list unchecked."
         )
     }) + open.len();
@@ -61,36 +67,88 @@ fn documented(doc: &str, path: &str, section: &str) -> BTreeSet<String> {
         .find(&close)
         .unwrap_or_else(|| panic!("{path} opens `{open}` but never closes it with `{close}`"))
         + start;
+    &doc[start..end]
+}
 
-    let region = &doc[start..end];
+/// Reject anything inside a checked region that is not a bare ES type name.
+///
+/// Loudly, because a mis-parsed entry would silently satisfy neither side of
+/// the comparison and re-open exactly the drift this file exists to close
+/// (the accepted-and-ignored pattern tracked in #204).
+fn bare_name(token: &str, path: &str, section: &str) -> String {
+    assert!(
+        !token.is_empty()
+            && token
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
+        "{path} section `{section}` contains `{token}`, which is not a bare type name. \
+         The region is machine-checked and may hold only type names plus plain-text \
+         family labels — put prose outside the markers."
+    );
+    token.to_string()
+}
+
+/// Markdown / plain-text regions: only backtick-delimited tokens count, so the
+/// region can carry readable family labels ("Full-text:", "Pipeline:") without
+/// them being mistaken for capability names.
+fn documented_md(doc: &str, path: &str, section: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    let mut rest = region;
+    let mut rest = region(doc, path, section);
     while let Some(o) = rest.find('`') {
         let after = &rest[o + 1..];
         let Some(c) = after.find('`') else {
             panic!("{path} section `{section}` has an unclosed backtick");
         };
-        let token = after[..c].trim();
-        assert!(
-            !token.is_empty()
-                && token
-                    .chars()
-                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
-            "{path} section `{section}` contains `{token}`, which is not a bare type name. \
-             The region is machine-checked and may hold only backticked type names plus \
-             plain-text family labels — put prose outside the markers."
-        );
-        names.insert(token.to_string());
+        names.insert(bare_name(after[..c].trim(), path, section));
         rest = &after[c + 1..];
     }
     names
 }
 
-fn assert_section(section: &str, expected: &[&str]) {
+/// HTML regions on the docs site: one name per `<div class="item">` card, read
+/// up to the card's optional `<span class="dsc">` description.
+///
+/// Descriptions and headings are prose and are deliberately not scanned — only
+/// the card's own name is a capability claim.
+fn documented_html(doc: &str, path: &str, section: &str) -> BTreeSet<String> {
+    const CARD: &str = "<div class=\"item\"";
+    let reg = region(doc, path, section);
+    let mut names = BTreeSet::new();
+    let mut rest = reg;
+    while let Some(o) = rest.find(CARD) {
+        let after = &rest[o + CARD.len()..];
+        let Some(gt) = after.find('>') else {
+            panic!("{path} section `{section}` has an unterminated `{CARD}` tag");
+        };
+        let body = &after[gt + 1..];
+        // The name runs to the description span, or to the closing tag.
+        let cut = body.find('<').unwrap_or_else(|| {
+            panic!("{path} section `{section}` has a card that is never closed")
+        });
+        names.insert(bare_name(body[..cut].trim(), path, section));
+        rest = &body[cut..];
+    }
+    assert!(
+        !names.is_empty(),
+        "{path} section `{section}` contains no `{CARD}` cards — the markup changed \
+         and this check is reading nothing"
+    );
+    names
+}
+
+fn documented(doc: &str, path: &str, section: &str) -> BTreeSet<String> {
+    if path.ends_with(".html") {
+        documented_html(doc, path, section)
+    } else {
+        documented_md(doc, path, section)
+    }
+}
+
+fn assert_section(section: &str, docs: &[&str], expected: &[&str]) {
     let root = repo_root();
     let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
 
-    for rel in CHECKED_DOCS {
+    for rel in docs {
         let path = root.join(rel);
         let doc = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
@@ -111,7 +169,11 @@ fn assert_section(section: &str, expected: &[&str]) {
 
 #[test]
 fn documented_query_types_match_the_parser() {
-    assert_section("query-types", xerj_query::parser::SUPPORTED_QUERY_TYPES);
+    assert_section(
+        "query-types",
+        QUERY_TYPE_DOCS,
+        xerj_query::parser::SUPPORTED_QUERY_TYPES,
+    );
 }
 
 /// The other direction of the same defect: types the docs must show as
@@ -120,13 +182,18 @@ fn documented_query_types_match_the_parser() {
 fn documented_rejected_query_types_match_the_parser() {
     assert_section(
         "rejected-query-types",
+        QUERY_TYPE_DOCS,
         xerj_query::parser::REJECTED_QUERY_TYPES,
     );
 }
 
 #[test]
 fn documented_agg_types_match_the_engine() {
-    assert_section("agg-types", xerj_engine::aggs::SUPPORTED_AGG_TYPES);
+    assert_section(
+        "agg-types",
+        AGG_TYPE_DOCS,
+        xerj_engine::aggs::SUPPORTED_AGG_TYPES,
+    );
 }
 
 /// The markers are load-bearing, so prove the extractor actually rejects a
@@ -143,6 +210,110 @@ fn the_extractor_notices_drift() {
             .collect::<BTreeSet<_>>()
     );
     assert!(!listed.contains("bucket_script"));
+}
+
+/// Same proof for the HTML card grids on the docs site, which is where the
+/// second half of #211 was hiding: `landing/docs/queries.html` shipped cards
+/// for `boosted` and `semantic_search`, neither of which the parser has ever
+/// dispatched, and `landing/docs/aggregations.html` showed fifteen of
+/// sixty-two aggregations with the whole pipeline family absent.
+#[test]
+fn the_html_extractor_reads_card_names_and_ignores_prose() {
+    let doc = "<!-- generated:query-types -->\n\
+               <h2>Structural</h2>\n\
+               <div class=\"enum-list\">\n\
+               <div class=\"item\" id=\"match-all\">match_all<span class=\"dsc\">Everything, \
+               unlike match_none.</span></div>\n\
+               <div class=\"item\">term</div>\n\
+               </div>\n\
+               <!-- /generated:query-types -->";
+    let listed = documented(doc, "synthetic.html", "query-types");
+    assert_eq!(
+        listed,
+        ["match_all", "term"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<_>>(),
+        "a name mentioned only in a card description must not count as a capability"
+    );
+}
+
+/// A card whose name is prose rather than a bare type name must fail loudly,
+/// for the same reason the markdown extractor refuses a backticked qualifier:
+/// a mis-read entry would satisfy neither side of the comparison and quietly
+/// stop checking anything.
+#[test]
+#[should_panic(expected = "is not a bare type name")]
+fn an_html_card_that_is_not_a_type_name_is_refused() {
+    let doc = "<!-- generated:query-types -->\n\
+               <div class=\"item\">knn (HNSW-served)</div>\n\
+               <!-- /generated:query-types -->";
+    documented(doc, "synthetic.html", "query-types");
+}
+
+/// Every `engine/crates/<path>` the docs site cites must exist.
+///
+/// The docs pages footer each section with a `Source · …` pointer, and twenty-one
+/// of them named crates that have not existed under those paths for as long as
+/// the workspace has been `xerj-*`-prefixed (`engine/crates/logs/src/parse.rs`,
+/// `engine/crates/api/src/es_compat.rs`, `engine/crates/otlp/src/lib.rs`, …).
+/// A reader following one lands nowhere, which is the same failure as a list
+/// naming a query type that does not exist.
+#[test]
+fn every_source_pointer_in_the_docs_site_resolves() {
+    fn html_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                html_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "html") {
+                out.push(p);
+            }
+        }
+    }
+
+    let root = repo_root();
+    let mut pages = Vec::new();
+    html_files(&root.join("landing"), &mut pages);
+    assert!(
+        pages.len() > 20,
+        "only {} pages found under landing/ — this check is reading nothing",
+        pages.len()
+    );
+
+    let mut broken = Vec::new();
+    for page in &pages {
+        let text = std::fs::read_to_string(page).unwrap_or_default();
+        for (idx, _) in text.match_indices("engine/crates/") {
+            let tail: String = text[idx..]
+                .chars()
+                .take_while(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '*')
+                })
+                .collect();
+            let cited = tail.trim_end_matches('.').to_string();
+            // `engine/crates/*` and a bare `engine/crates/` are prose, not pointers.
+            if cited.ends_with('*') || cited == "engine/crates/" {
+                continue;
+            }
+            if !root.join(&cited).exists() {
+                broken.push(format!(
+                    "{} → {cited}",
+                    page.strip_prefix(&root).unwrap_or(page).display()
+                ));
+            }
+        }
+    }
+    broken.sort();
+    broken.dedup();
+    assert!(
+        broken.is_empty(),
+        "the docs site cites source paths that do not exist:\n  {}",
+        broken.join("\n  ")
+    );
 }
 
 /// The crate map is the same defect in a different list: it named eleven of the
