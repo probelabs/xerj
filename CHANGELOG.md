@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`index` on the mapping is now honoured instead of silently ignored**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)). `"index": false` was
+  accepted by `PUT /{index}`, echoed back verbatim by `GET /{index}/_mapping`,
+  and then had no effect at all: the field kept a full inverted index and
+  `match`, `term`, `match_phrase`, `prefix` and `wildcard` against it all
+  returned the document, where Elasticsearch answers 400. It is the sibling of
+  the `doc_values` fix in rc.12 and follows its shape.
+
+  The line is drawn where ES draws it. Since 8.1, `"index": false` on a
+  keyword / numeric / date / boolean / ip field keeps the doc-values column and
+  stays queryable — `MappedFieldType.isSearchable()` is "has postings **or** has
+  doc values" — so those queries keep working here, unchanged. Only a field with
+  neither (a `text` field, or anything with an explicit `"doc_values": false`)
+  is unsearchable, and a query naming one is now rejected with ES's own
+  sentence, `Cannot search on field [f] since it is not indexed nor has doc
+  values.`, as a 400 `search_phase_execution_exception` /
+  `query_shard_exception`. `_search`, `_count`, `_msearch` and `_explain` all
+  inherit the check. `exists` is unaffected and still returns zero hits rather
+  than an error, which is also what ES does.
+
+  The field is dropped from the full-text index at flush and merge only where
+  the stored-doc fallback is *equivalent* — a non-indexed `text` field. An
+  exact-typed field that kept its doc values keeps its whole-value postings,
+  because the fallback scan splits on non-alphanumerics and would start matching
+  `192.168.0.1` against `192.168.0.2`. So no byte-saving claim is made for this
+  change: for those types the footprint the option implies is knowingly forgone
+  rather than bought with wrong answers.
+
+  Known gap, unchanged by this release: the field-less `query_string` arm of the
+  stored-document scan is schema-free and walks every `_source` key, so a token
+  living only in an unsearchable field can still match there.
+
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**
   ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the
   resume plan was frozen is skipped and reported in the catalog — but that
