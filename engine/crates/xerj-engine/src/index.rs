@@ -25521,15 +25521,28 @@ fn resolve_date_math_inner(expr: &str) -> String {
         None => return expr.to_string(),
     };
     let brace_end = match expr.rfind('}') {
-        Some(i) => i,
-        None => return expr.to_string(),
+        // The closing brace must come AFTER the opening one, or the slice
+        // below is `expr[4..0]` — a panic, not an empty string. `<}<}<>{>{}>`
+        // is enough, and `panic = "abort"` makes it the process rather than a
+        // 400 (#207, found by the `index_name_date_math` fuzz target). Braces
+        // in the wrong order are not date math, so the name passes through.
+        Some(i) if i > brace_start => i,
+        _ => return expr.to_string(),
     };
 
     let prefix = &expr[..brace_start];
     let date_part = &expr[brace_start + 1..brace_end];
 
     let (math_expr, fmt) = if let Some(inner_brace) = date_part.find('{') {
-        let inner_end = date_part.rfind('}').unwrap_or(date_part.len());
+        // The closing brace has to come AFTER the opening one. `<{}{}>` gives a
+        // `date_part` of `}{`, where `rfind('}')` is 0 and `inner_brace` is 1 —
+        // and `date_part[2..0]` is a panic, not an error. With
+        // `panic = "abort"` that is the process, from an index name in a
+        // request URI. Same class as the two date-math offsets below.
+        let inner_end = date_part
+            .rfind('}')
+            .filter(|end| *end > inner_brace)
+            .unwrap_or(date_part.len());
         (
             &date_part[..inner_brace],
             &date_part[inner_brace + 1..inner_end],
@@ -25542,6 +25555,73 @@ fn resolve_date_math_inner(expr: &str) -> String {
     let date = resolve_now_date(math_expr, now);
     let formatted = format_date_expr(date, fmt);
     format!("{}{}", prefix, formatted)
+}
+
+#[cfg(test)]
+mod index_name_date_math_tests {
+    use super::resolve_date_math;
+
+    /// Two regressions in one, both reachable from an index name in a request
+    /// URI, and both aborts rather than errors because the release profile sets
+    /// `panic = "abort"` (#207).
+    ///
+    /// * `<{}{}>` gives an inner `date_part` of `}{`, where the closing brace
+    ///   is found *before* the opening one — and `date_part[2..0]` is a panic,
+    ///   not an empty slice.
+    /// * `<logs-{now+9999999999999d}>` reached `chrono::Duration::days`, which
+    ///   panics on a count that does not fit a `TimeDelta`. Same defect the
+    ///   `date_math` fuzz target found in `xerj_query::dates::add_unit`.
+    ///
+    /// Before the fix each of these aborts the test process.
+    #[test]
+    fn a_malformed_or_unrepresentable_index_name_resolves_instead_of_aborting() {
+        for name in [
+            "<{}{}>",
+            "<}{>",
+            "<a{}{}z>",
+            "<{{}}>",
+            "<logs-{now+9999999999999d}>",
+            "<logs-{now-9999999999999d}>",
+            "<logs-{now+9223372036854775807y}>",
+            "<logs-{now+9223372036854775807M}>",
+            "<logs-{now+9223372036854775807w}>",
+            "<logs-{now+9223372036854775807h}>",
+            "<logs-{now/d",
+            "<>",
+            // The unit position holding a multi-byte character — the digit
+            // scan stops there and the old code sliced one byte out of it.
+            "<logs-{now+9\u{1be}999d}>",
+            "<logs-{now+1\u{4e2d}}>",
+            "<logs-{now-\u{e9}}>",
+            "<logs-{now+1d/\u{4e2d}}>",
+            "<logs-{now\u{1be}}>",
+            // Braces in the wrong order, outer pair and inner pair.
+            "<}<}<>{>{}>",
+            "}{",
+            "<a}b{c>",
+            "<a{b}c{d>",
+        ] {
+            // Any string is allowed to come back. None may take the process.
+            let _ = resolve_date_math(name);
+        }
+    }
+
+    /// The ordinary forms still resolve, so the guards above did not turn the
+    /// feature off to make the crash go away.
+    #[test]
+    fn ordinary_index_name_date_math_still_resolves() {
+        let today = chrono::Utc::now().format("%Y.%m.%d").to_string();
+        assert_eq!(resolve_date_math("<logs-{now/d}>"), format!("logs-{today}"));
+        assert_eq!(
+            resolve_date_math("<logs-{now/d{yyyy.MM.dd}}>"),
+            format!("logs-{today}")
+        );
+        assert_eq!(
+            resolve_date_math("plain-index"),
+            "plain-index",
+            "a name with no date math is returned unchanged"
+        );
+    }
 }
 
 fn resolve_now_date(
@@ -25563,20 +25643,35 @@ fn resolve_now_date(
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(rest.len());
         let n: i64 = rest[..end].parse().unwrap_or(0) * sign;
-        let (unit, rest) = if end < rest.len() {
-            (&rest[end..end + 1], &rest[end + 1..])
-        } else {
-            ("", &rest[end..])
+        // The unit is one CHARACTER, not one byte. `end` lands on the first
+        // non-digit, which may be multi-byte: `<logs-{now+9ƾ999d}>` made
+        // `rest[end..end + 1]` split U+01BE in half and panic. With
+        // `panic = "abort"` that is the process, from an index name in a
+        // request URI. Found by the `index_name_date_math` fuzz target (#207).
+        let (unit, rest) = match rest[end..].chars().next() {
+            Some(c) => rest[end..].split_at(c.len_utf8()),
+            None => ("", &rest[end..]),
         };
+        // `Duration::days` and friends PANIC when the count does not fit a
+        // `TimeDelta`, and `n * 30` overflows before that. `expr` is the
+        // date-math inside an index name (`<logs-{now+9999999999999d}>`), which
+        // arrives in a request URI — so the panicking constructors are an
+        // unauthenticated crash. Same defect the `date_math` fuzz target found
+        // in `xerj_query::dates::add_unit`; this is the second copy.
+        //
+        // An offset that cannot be represented degrades to "no offset", which
+        // is what this resolver already does for an unrecognised unit. It has
+        // no error channel to report into.
         let offset = match unit {
-            "d" => Duration::days(n),
-            "h" => Duration::hours(n),
-            "w" => Duration::weeks(n),
-            "M" => Duration::days(n * 30),
-            "y" => Duration::days(n * 365),
-            _ => Duration::zero(),
-        };
-        (base + offset, rest)
+            "d" => Duration::try_days(n),
+            "h" => Duration::try_hours(n),
+            "w" => Duration::try_weeks(n),
+            "M" => n.checked_mul(30).and_then(Duration::try_days),
+            "y" => n.checked_mul(365).and_then(Duration::try_days),
+            _ => Some(Duration::zero()),
+        }
+        .unwrap_or_else(Duration::zero);
+        (base.checked_add_signed(offset).unwrap_or(base), rest)
     } else {
         (base, rest)
     };

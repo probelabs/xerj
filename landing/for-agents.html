@@ -331,7 +331,7 @@ $ curl -sXPOST localhost:9200/docfolder/_search \
   </p>
   <ul class="pitch" style="max-width:760px;">
     <li><a href="/llms.txt"><code class="inline">/llms.txt</code></a> — a plain-text manifest of the base URL, the seven agent operations (autoindex included), and the honesty caveats, written for an LLM to read directly.</li>
-    <li><a href="/openapi.json"><code class="inline">/openapi.json</code></a> — an OpenAPI description of the endpoints, for tool/codegen pipelines.</li>
+    <li><a href="/openapi.json"><code class="inline">/openapi.json</code></a> — an OpenAPI description of the six canonical agent operations (7 routes), for tool/codegen pipelines. It is a deliberately partial spec, not the whole ~210-route REST surface: an endpoint missing from it is "not written up yet", never "not supported".</li>
   </ul>
 </section>
 

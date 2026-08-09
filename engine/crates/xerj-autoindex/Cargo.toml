@@ -46,7 +46,7 @@ streaming-iterator = "0.1"
 flate2 = "1"                                     # gzip streaming (rust backend)
 pdf_oxide = { version = "=0.3.75", default-features = false, features = ["legacy-crypto"] }
 csv = "1"                                        # streaming CSV with sniffed dialect
-quick-xml = "0.36"                               # XML pull parser + DOCX internals
+quick-xml = "0.41"                               # XML pull parser + DOCX internals
 zip = { version = "2", default-features = false, features = ["deflate"] }  # DOCX container
 serde_yaml = "0.9"                               # YAML multi-doc
 # The one C dependency (bundled SQLite), isolated to this crate.

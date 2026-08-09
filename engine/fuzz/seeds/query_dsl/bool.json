@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"term":{"status":"ok"}}],"should":[{"match":{"body":"rust"}}],"must_not":[{"exists":{"field":"deleted"}}],"filter":[{"range":{"price":{"gte":10,"lt":100}}}],"minimum_should_match":1}}}

@@ -128,7 +128,7 @@
 xerj_segment_count{index="logs"} 2847
 xerj_merge_duration_seconds_count{index="logs"} 183
 xerj_merge_duration_seconds_sum{index="logs"} 1847.2</pre>
-  <p><strong>Fix:</strong> raise <code class="inline">[merge] max_concurrent</code> (1 → 2–4), raise <code class="inline">io_rate_mb_per_sec</code> (100 → 250–500 on NVMe), and raise <code class="inline">[storage] flush_size_mb</code> so flushes produce bigger starter segments.</p>
+  <p><strong>Fix:</strong> raise <code class="inline">[storage] flush_size_mb</code> so flushes produce bigger starter segments, and raise <code class="inline">[merge] max_merge_count</code> so each pass consumes more of them (watch RSS — peak merge memory scales with it). Set <code class="inline">XERJ_MERGE_PARALLELISM</code> above 1 for more concurrent merges on fast NVMe. <code class="inline">[merge] max_concurrent</code> and <code class="inline">io_rate_mb_per_sec</code> are accepted but not wired in this build, so neither will change anything here.</p>
 
   <h2>Symptom: queries time out under load</h2>
   <p><strong>Likely cause:</strong> too many concurrent queries or a single query that grew too large.</p>

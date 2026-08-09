@@ -427,9 +427,18 @@ async fn journey_log_analytics() {
 
 #[tokio::test]
 async fn journey_es_migration() {
-    // Verify ES API contracts work unchanged.
-    // Same curl commands. Same response fields. Drop-in replacement.
-    // Verify: PUT index, index doc, search, bulk, count.
+    // Verify that the ES-shaped *response bodies* the migration story depends on
+    // are produced: `_index`/`_id`/`result`/`_shards` on a write, `hits.total`
+    // as an object on a search, per-item results on a bulk.
+    //
+    // Scope, stated honestly because this test used to claim more than it does
+    // (#207): it drives the Rust engine API directly — `create_index`,
+    // `index_document`, `process_bulk` — and never makes an HTTP request. It is
+    // NOT evidence that "the same curl commands" work; nothing here exercises
+    // routing, URI parameters, headers, status codes or content negotiation.
+    // The HTTP wire contract is covered by the ES-compat YAML conformance suite
+    // (`engine/tests/es-compat-yaml`, run by the `conformance` CI job), which
+    // replays real Elasticsearch REST test cases over the network.
 
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
@@ -730,6 +739,22 @@ async fn journey_upgrade() {
 // Journey 8: "How many settings do I need to configure?"
 // ═════════════════════════════════════════════════════════════════════════════
 
+/// Leaf keys in a serialised config — one per setting a user can set.
+///
+/// Sub-configs are grouping, not settings, so only leaves count. An empty map
+/// contributes nothing, which is correct: a map-valued setting with no entries
+/// is not a knob anybody has turned.
+fn count_settings(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(fields) => fields.values().map(count_settings).sum(),
+        _ => 1,
+    }
+}
+
+/// Settings in a default `Config`, measured by `count_settings`. Quoted in
+/// `xerj-common/src/config.rs`; keep the two in step.
+const EXPECTED_SETTINGS: usize = 103;
+
 #[tokio::test]
 async fn journey_zero_config() {
     // Start with ZERO configuration.
@@ -774,13 +799,26 @@ async fn journey_zero_config() {
         "Search must work with zero configuration"
     );
 
-    // Count user-facing settings.
-    // xerj: 38 settings (5+2+3+5+5+3+1+6+2+4+3 - 1 auto-generated).
-    // ES: 3,000+ settings across elasticsearch.yml, jvm.options, log4j2.properties.
-    let xerj_settings: usize = 5 + 2 + 3 + 5 + 5 + 3 + 1 + 6 + 2 + 4 + 3 - 1; // = 38
+    // Count user-facing settings — by *counting them*, not by re-adding a
+    // hardcoded sum. This assertion used to read
+    //   let xerj_settings = 5 + 2 + 3 + 5 + 5 + 3 + 1 + 6 + 2 + 4 + 3 - 1;
+    //   assert_eq!(xerj_settings, 38);
+    // which is the identity 38 == 38: it could not fail whatever `Config`
+    // actually held, and by the time #207 was filed the real number was nowhere
+    // near 38 while three places in the tree quoted three different figures.
+    //
+    // `Config` is `Serialize` and every field defaults, so the honest count is
+    // the number of leaf keys in a default config. (`xerj.default.toml` sets
+    // the commonly tuned 53 of them and describes the rest in comments; its own
+    // agreement with `Config::default()` is pinned by
+    // `shipped_default_config_documents_the_real_defaults` in xerj-common.)
+    let xerj_settings = count_settings(&serde_json::to_value(Config::default()).unwrap());
     assert_eq!(
-        xerj_settings, 38,
-        "xerj must have exactly 38 user-facing settings"
+        xerj_settings, EXPECTED_SETTINGS,
+        "the settings count changed. That is fine — but it is quoted in prose, \
+         so update xerj-common/src/config.rs (module header and the total under \
+         `struct Config`) and EXPECTED_SETTINGS together, and re-check any doc \
+         that cites a number"
     );
 
     print_result(

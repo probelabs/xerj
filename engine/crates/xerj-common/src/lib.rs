@@ -7,13 +7,13 @@
 //! ## Design philosophy
 //!
 //! Unlike Elasticsearch's 3000+ configuration knobs, xerj deliberately exposes
-//! exactly **38 settings**, each meaningful and production-tested. Every default
+//! **103 settings**, each meaningful and production-tested. Every default
 //! is chosen so that a fresh deployment with zero configuration changes performs
 //! well for the majority of workloads.
 //!
 //! ## Modules
 //!
-//! - [`config`]  — TOML-based configuration (38 settings)
+//! - [`config`]  — TOML-based configuration (103 settings)
 //! - [`error`]   — Unified error type ([`XerjError`])
 //! - [`types`]   — Core domain types (documents, fields, IDs)
 //! - [`schema`]  — Index schema management and mapping evolution

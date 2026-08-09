@@ -178,7 +178,7 @@ OK</pre>
   <p>Most tunables pick up on <code class="inline">SIGHUP</code> without a restart. A few (ports, TLS certs, data_dir, cluster.enabled) require a full restart — those reject a reload with a clear error in the log.</p>
 <pre class="code">$ sudo systemctl reload xerj    # sends SIGHUP
 $ journalctl -u xerj -n 10 --no-pager
-... config reloaded: merge.io_rate_mb_per_sec 100 → 250
+... config reloaded: merge.max_merge_count 16 → 24
 ... config reloaded: limits.max_concurrent_searches 64 → 128</pre>
 
   <h2>Log levels</h2>

@@ -7,7 +7,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`cargo-audit` and `cargo-fuzz` now actually run in CI — they were only ever
+  documented** ([#207](https://github.com/xerj-org/xerj/issues/207)).
+  `user-feedback/09-security/cves-and-vulnerabilities.md` listed "`cargo-audit`
+  for dependency vulnerability scanning" and "fuzz testing (cargo-fuzz) on all
+  input parsing paths" as part of XERJ's answer to Elasticsearch's CVE history.
+  Neither existed: no audit job, no fuzz job, no fuzz target anywhere in the
+  tree. A reader comparing the two engines priced in a fuzzed parser surface
+  that was not there.
+  - New CI job `security-audit` runs `cargo audit` on every push and pull
+    request; a RUSTSEC vulnerability advisory fails the build.
+  - New CI job `fuzz` builds and runs six libFuzzer harnesses
+    (`engine/fuzz/`) over checked-in seeds: the Elasticsearch query DSL, the
+    Lucene `query_string` grammar, date math and date-format patterns,
+    index-name date math, SQL, and Painless scripts. `.github/scripts/fuzz-smoke.sh` is the same entry
+    point locally and in CI.
+  - `xerj-engine/tests/security_tooling_claims.rs` fails if a documented tool
+    stops running, if a fuzz target ships without a seed corpus, or if the
+    "all input parsing paths" overclaim reappears in any prose file.
+  - The claim itself is now specific about what is and is not covered.
+
+- **Fixed two high-severity advisories in the document-ingest XML parser.**
+  Turning the audit gate on found `quick-xml` 0.36.2 in `xerj-autoindex`, which
+  parses `.docx`, `.xlsx` and `.xml` files supplied by whoever owns the folder
+  being indexed: RUSTSEC-2026-0195 (unbounded namespace-declaration allocation →
+  memory-exhaustion DoS, CVSS 7.5) and RUSTSEC-2026-0194 (quadratic run time on
+  duplicate attribute names, CVSS 7.5). Upgraded to 0.41, which also
+  de-duplicates the crate — 0.41 was already in the tree via `pdf_oxide`.
+  `crossbeam-epoch` moved 0.9.18 → 0.9.20 for RUSTSEC-2026-0204.
+
+### Changed
+
+- **`merge.strategy = "log_structured"` is now refused at startup instead of
+  silently running the size-tiered policy**
+  ([#207](https://github.com/xerj-org/xerj/issues/207)). Nothing in the tree
+  ever read `merge.strategy`; `run_merge_once` always builds a
+  `SizeTieredMergePolicy`. An operator who chose a levelled policy for its read
+  amplification got the other one, quietly. This follows the `storage.backend`
+  and `vector.default_quantization` guards already in `Config::validate`.
+
+- **The three dormant `[merge]` settings now say so, in the code, in the shipped
+  TOML, on the docs site, and in the log at startup**
+  ([#207](https://github.com/xerj-org/xerj/issues/207)). The issue reported
+  merge I/O rate limiting as "claimed but dormant" and it is: the `RateLimiter`
+  that honours `io_rate_mb_per_sec` is wired only into `xerj-storage`'s legacy
+  `MergeExecutor`, which the engine never constructs. `min_segments` and
+  `max_concurrent` are unread too — the real per-tier trigger is
+  `min_merge_count`, and merge parallelism comes from `XERJ_MERGE_PARALLELISM`.
+  `MergeConfig::dormant_overrides` names any of the three the operator has moved
+  off its default and `xerj-server` logs each at WARN, so the operator throttling
+  merges to protect query latency finds out instead of guessing. They stay
+  accepted rather than becoming hard errors because the wrong value costs
+  latency, not data, and `io_rate_mb_per_sec = 100` has shipped in
+  `xerj.default.toml` since v0.1. Wiring a real throttle into `run_merge_once`
+  is the fix that makes this list shorter.
+
+- **`engine/xerj.default.toml` disagreed with the defaults it claims to
+  document, in four places.** `max_segment_mb` said 5120 against a real 8192,
+  `wal_max_size_mb` 512 against 1024, `flush_size_mb` 256 against 512, and
+  `default_quantization` `"scalar8"` against `"none"` — so `cp xerj.default.toml
+  xerj.toml`, the documented first step, silently changed four engine behaviours
+  including turning on 8-bit vector quantization. The file is corrected and
+  `shipped_default_config_documents_the_real_defaults` now diffs every leaf key
+  against `Config::default()`, so it cannot drift again. The docs site carried
+  the same four stale defaults and is corrected too.
+
+- **Four other claims from [#207](https://github.com/xerj-org/xerj/issues/207)
+  now match the source.**
+  - *Settings count.* `config.rs` said 38 in its header and 56 twenty lines
+    down while the count test asserted 60 — and the test asserted it by
+    re-adding a hardcoded sum (`5 + 2 + 3 + … - 1 == 38`), an identity that
+    could not fail whatever `Config` held. There was a second copy of the same
+    non-test in `config.rs` itself (`count_user_facing_settings`, `61 == 61`).
+    Both now serialise `Config::default()` and count leaf keys, section by
+    section. The measured figure is **103**, and 38 / 50 / 56 / 60 / 61 / "<50"
+    are corrected in `config.rs`, `xerj-common/src/lib.rs`, `engine/README.md`,
+    `xerj.default.toml` and the feedback responses, along with the stale
+    per-sub-config annotations (limits 3 → 13, storage 5 → 10, embedding 4 → 19,
+    merge 5 → 8, cluster 4 → 5, tls 3 → 4, auth 2 → 3). This closes item 10 of
+    `user-feedback/ROADMAP-TO-GA.md`. 103 versus 3,000+ is still the winning
+    story, told truthfully.
+  - *Wire-compatibility test framing.* `journey_es_migration` was described as
+    proving "the same curl commands" work. It calls the Rust engine API
+    directly and never makes an HTTP request. The response-shape assertions are
+    real and stay; the comment now says what the test does and points at the
+    ES-compat YAML conformance suite, which is what actually covers the wire.
+  - *OpenAPI spec.* `landing/openapi.json` declared `version: 1.0` while
+    specifying 7 routes of roughly 210. It is now titled and versioned as a
+    partial spec, and says so.
+
 ### Fixed
+
+- **A `query_string` containing one non-ASCII character aborted the process.**
+  `{"query_string":{"query":"_\u0660"}}` — or the same text in `?q=` — took the
+  server down. The Lucene tokeniser walks bytes but slices `&q[start..i]` as a
+  `&str`, and it broke on `is_whitespace()`, which is true for Latin-1 NBSP
+  (0xA0). In valid UTF-8 that byte is only ever a *continuation* byte, so the
+  scan stopped between the two bytes of U+0660 and the slice panicked on a
+  character boundary. Every delimiter test in that scanner is now `is_ascii_*`,
+  which makes "the scan can only stop on a character boundary" true by
+  construction. Nothing is lost: the only non-ASCII bytes the old test accepted
+  were 0x85 and 0xA0, neither of which is a standalone character in UTF-8.
+
+- **An index name of `<{}{}>` aborted the process.** Index-name date math finds
+  the first `{` and the last `}` inside the braces; when the `}` comes first,
+  `date_part[2..0]` is a panic, not an empty slice. Reachable from any request
+  that names an index. The closing brace is now required to come after the
+  opening one.
+
+- **A Painless script containing one non-ASCII character aborted the process.**
+  The second thing the new fuzz harnesses found, inside a second. The tokeniser
+  walks *bytes* (`bytes[i] as char` reinterprets each byte as Latin-1) but
+  slices `&src[start..i]` as a `&str`. Every continuation byte of a multi-byte
+  character reads as an alphabetic Latin-1 char, so an identifier scan could
+  start or stop inside one and the slice panicked on a char boundary —
+  `end byte index 24 is not a char boundary; it is inside 'ʋ'`. Scripts arrive
+  in ordinary search and update bodies and the release profile sets
+  `panic = "abort"`, so this was not a 400, it was the whole server. The
+  identifier scan is now ASCII-only, which keeps both ends on a character
+  boundary by construction; a non-ASCII byte reaches the tokeniser's
+  `unexpected char` error instead. String literals still carry any Unicode.
+
+- **A search body could abort the whole process: `{"range":{"ts":{"gte":"now+33333333333333H"}}}`.**
+  The first thing the new `date_math` fuzz target found, 20 seconds into its
+  first run. `chrono`'s `Duration::hours` and its siblings **panic** when the
+  count does not fit a `TimeDelta`, and they run before the
+  `checked_add_signed` that was supposed to make
+  `xerj_query::dates::add_unit` total — so the careful checking around them
+  bought nothing. A range bound goes straight from the request body into this
+  code (`parser.rs:931`), the release profile sets `panic = "abort"`, and the
+  result is an unauthenticated remote denial of service on a released binary.
+  Fixed with the fallible `try_*` constructors. Grepping for the same pattern
+  found two more copies in the index-name date-math resolvers
+  (`xerj-engine/src/index.rs`, `xerj-api/src/es_compat.rs`), reachable from a
+  request URI as `<logs-{now+9999999999999d}>`; both are fixed too, and their
+  `n * 30` / `n * 365` multiplications are now checked.
+
+- **An XML entity nobody declared no longer discards the text around it.**
+  Fallout from the `quick-xml` upgrade above, which is a breaking change to how
+  character data arrives: 0.38 stopped folding `&amp;` into the surrounding
+  `Event::Text` and began emitting each reference as its own
+  `Event::GeneralRef`. Entity handling is preserved across that change (a
+  reader that ignored the new event would have silently dropped every `&`, `<`,
+  `>` and `&#233;` while the words around them still arrived), and one case
+  gets better: 0.36's `BytesText::unescape()` failed the whole text node on an
+  entity no DTD declared for us, and `unwrap_or_default()` then discarded it —
+  now only the reference itself is dropped. Character data is also reassembled
+  from its fragments before being emitted, so an entity-bearing field stays one
+  value instead of becoming an array of pieces.
 
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**
   ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the

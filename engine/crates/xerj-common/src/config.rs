@@ -1,8 +1,14 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **38 settings** versus Elasticsearch's
-//! 3000+. Every option is named, documented, and has a sensible production-ready
-//! default. The format is TOML, loaded from a single file.
+//! Configuration is intentionally minimal: **103 settings** versus
+//! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
+//! production-ready default. The format is TOML, loaded from a single file.
+//!
+//! That number is measured, not asserted: `journey_zero_config` in
+//! `xerj-engine/tests/product_experience.rs` counts the leaf keys of a default
+//! `Config` and fails when it drifts. It used to say 38 here, 56 twenty lines
+//! down and 60 in the test — three figures, none of them the truth, because the
+//! test re-added a hardcoded sum instead of counting anything (#207).
 //!
 //! ## Quick start
 //!
@@ -48,15 +54,15 @@ use crate::error::XerjError;
 pub struct Config {
     /// Network and data directory settings — 6 settings.
     pub server: ServerConfig,
-    /// Authentication — 2 settings.
+    /// Authentication — 3 settings.
     pub auth: AuthConfig,
     /// CORS (cross-origin browser access) — 2 settings. Default restrictive.
     pub cors: CorsConfig,
-    /// TLS — 3 settings.
+    /// TLS — 4 settings.
     pub tls: TlsConfig,
-    /// Write-ahead log and flush behaviour — 5 settings.
+    /// Write-ahead log and flush behaviour — 10 settings.
     pub storage: StorageConfig,
-    /// Segment merging — 5 settings.
+    /// Segment merging — 8 settings.
     pub merge: MergeConfig,
     /// Data compression — 3 settings.
     pub compression: CompressionConfig,
@@ -66,15 +72,15 @@ pub struct Config {
     pub vector: VectorConfig,
     /// Log (time-series) retention — 2 settings.
     pub logs: LogsConfig,
-    /// External embedding service — 4 settings.
+    /// External embedding service — 19 settings.
     pub embedding: EmbeddingConfig,
-    /// Resource limits — 3 settings.
+    /// Resource limits — 13 settings.
     pub limits: LimitsConfig,
     /// High-throughput turbo indexing — 3 settings.
     pub indexing: IndexingConfig,
     /// Engine parallelism — 4 settings.
     pub engine: EngineConfig,
-    /// Cluster / Raft settings — 4 settings.
+    /// Cluster / Raft settings — 5 settings.
     pub cluster: ClusterConfig,
     /// Point-in-time TTL + sweep cadence — 3 settings.
     pub pit: PitConfig,
@@ -86,8 +92,10 @@ pub struct Config {
     pub compat: CompatConfig,
 }
 
-// Total: 5+3+2+3+10+5+3+1+6+2+4+3+4+3+2 = 56 fields (incl. cors: 2, auth: 3,
-// logging: 2). `Default` is derived — every field is a sub-config that
+// 19 sub-configs, 103 leaf settings in total. Do not maintain that sum by hand
+// — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
+// serialised `Config::default()` and fails if this comment and the module
+// header stop matching. `Default` is derived: every field is a sub-config that
 // implements `Default`, so the derive produces exactly the same all-defaults
 // value the manual impl used to build by hand.
 
@@ -213,6 +221,19 @@ impl Config {
             ));
         }
 
+        // Merge: only the size-tiered policy is implemented. `run_merge_once`
+        // (xerj-engine/src/index.rs) always builds a `SizeTieredMergePolicy`;
+        // nothing anywhere reads `merge.strategy`. Accepting `log_structured`
+        // would run size-tiered merging for an operator who chose a levelled
+        // policy for its read amplification — the same silent substitution the
+        // `storage.backend` guard above exists to prevent (#207).
+        if self.merge.strategy != MergeStrategy::SizeTiered {
+            return Err(XerjError::config(
+                "merge.strategy: the log_structured merge policy is not implemented in this \
+                 build; only \"size_tiered\" is supported",
+            ));
+        }
+
         // Vector: `scalar8` (SQ8) quantization is now wired into the kNN
         // serving path (`Index::run_knn_brute_force`): a `scalar8` dense_vector
         // field keeps a per-field u8 code store (1 byte/dim vs 4) and scores
@@ -308,7 +329,8 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (38 user-facing settings total)
+// Sub-configs  (103 user-facing settings total; counted by
+// `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Network and data-directory settings.
@@ -654,25 +676,45 @@ pub enum WalSync {
 
 /// Segment merge settings.
 ///
-/// **5 settings.**
+/// **8 settings**, of which three are **not read by the merge path that runs**
+/// — see [`MergeConfig::dormant_overrides`]. `run_merge_once`
+/// (`xerj-engine/src/index.rs`) reads `max_segment_mb`, `tier_floor_mb`,
+/// `min_merge_count` and `max_merge_count`, and nothing else from this struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MergeConfig {
-    /// Merge strategy: `"size_tiered"` or `"log_structured"` (default: `"size_tiered"`).
+    /// Merge strategy (default: `"size_tiered"`).
     ///
-    /// - `"size_tiered"` — groups similarly-sized segments. Best for write-heavy.
-    /// - `"log_structured"` — LSMT-style tiered levels. Best for mixed workloads.
+    /// Only `"size_tiered"` is implemented: `run_merge_once` always builds a
+    /// `SizeTieredMergePolicy`. `"log_structured"` is a documented variant with
+    /// no implementation behind it, so [`Config::validate`] rejects it rather
+    /// than run size-tiered merging while the operator believes otherwise.
     pub strategy: MergeStrategy,
     /// Minimum number of segments to trigger a merge (default: `10`).
+    ///
+    /// **DORMANT — accepted and validated, but nothing reads it.** The real
+    /// trigger is per-tier and comes from `min_merge_count`. Setting this away
+    /// from its default logs a warning at startup (see
+    /// [`MergeConfig::dormant_overrides`]).
     pub min_segments: u32,
     /// Maximum merged segment size in MiB (default: `8192` = 8 GiB).
     /// Segments at or above this size are excluded from further merges.
     pub max_segment_mb: u64,
     /// I/O rate cap for merge operations in MiB/s (default: `100`).
     ///
-    /// Throttle this to prevent merges from saturating I/O on shared storage.
+    /// **DORMANT — accepted, but merges are not throttled.** The `RateLimiter`
+    /// that honours this value is wired only into `xerj-storage`'s legacy
+    /// `MergeExecutor`, which the engine does not use; the merge that actually
+    /// runs (`run_merge_once`) never consults it. Setting it away from its
+    /// default logs a warning at startup (see
+    /// [`MergeConfig::dormant_overrides`]).
     pub io_rate_mb_per_sec: u64,
     /// Maximum number of concurrent merge operations (default: `1`).
+    ///
+    /// **DORMANT — accepted, but nothing reads it.** Merge parallelism comes
+    /// from the `XERJ_MERGE_PARALLELISM` environment variable, which also
+    /// defaults to 1. Setting this away from its default logs a warning at
+    /// startup (see [`MergeConfig::dormant_overrides`]).
     pub max_concurrent: u32,
     /// Tier boundary base for size-tiered merge policy in MiB (default: `4`).
     /// Segments group into tiers by `floor(log2(size / tier_floor_mb))`.
@@ -697,6 +739,54 @@ impl Default for MergeConfig {
             min_merge_count: 4,
             max_merge_count: 16,
         }
+    }
+}
+
+impl MergeConfig {
+    /// Merge settings this build accepts but does not act on, reported as
+    /// `("merge.io_rate_mb_per_sec", "what actually happens")` — and only when
+    /// the operator has moved one away from its default, because leaving a
+    /// dormant knob alone asks for nothing.
+    ///
+    /// Issue #207 found `io_rate_mb_per_sec` documented, validated and inert:
+    /// the `RateLimiter` that honours it lives in `xerj-storage`'s legacy
+    /// `MergeExecutor`, which the engine never constructs. `min_segments` and
+    /// `max_concurrent` are in the same state. That is the accepted-and-ignored
+    /// pattern tracked by #204, and the operator it hurts is the one throttling
+    /// merges to protect query latency — they get no throttle and no signal.
+    ///
+    /// These stay accepted rather than becoming hard errors like
+    /// `storage.backend`: the wrong value costs latency, not data, and
+    /// `io_rate_mb_per_sec = 100` has shipped in `xerj.default.toml` since v0.1,
+    /// so rejecting it would refuse to start on a config the project itself
+    /// handed out. The caller (`xerj-server/src/main.rs`) logs each line at
+    /// WARN. Wiring a real throttle into `run_merge_once` is the fix that makes
+    /// this list shorter.
+    pub fn dormant_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        let d = MergeConfig::default();
+        let mut out = Vec::new();
+        if self.io_rate_mb_per_sec != d.io_rate_mb_per_sec {
+            out.push((
+                "merge.io_rate_mb_per_sec",
+                "merge I/O is not throttled in this build — the rate limiter is \
+                 wired only into xerj-storage's unused MergeExecutor",
+            ));
+        }
+        if self.min_segments != d.min_segments {
+            out.push((
+                "merge.min_segments",
+                "nothing reads it — the merge trigger is per-tier and comes from \
+                 merge.min_merge_count",
+            ));
+        }
+        if self.max_concurrent != d.max_concurrent {
+            out.push((
+                "merge.max_concurrent",
+                "nothing reads it — merge parallelism comes from the \
+                 XERJ_MERGE_PARALLELISM environment variable",
+            ));
+        }
+        out
     }
 }
 
@@ -899,7 +989,7 @@ impl Default for LogsConfig {
 ///   * `"auto"` (default) — use the proxy when [`default_endpoint`] is set,
 ///     otherwise lexical. This preserves the historical behavior exactly.
 ///
-/// **8 settings.**
+/// **19 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
@@ -1001,7 +1091,7 @@ impl Default for EmbeddingConfig {
 
 /// Resource limits.
 ///
-/// **11 settings.**
+/// **13 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -1580,6 +1670,131 @@ mod tests {
             .expect("shipped xerj.default.toml must pass Config::validate");
     }
 
+    /// Flatten a serialised config to `("merge.max_segment_mb", 8192)` pairs.
+    fn flatten(prefix: &str, value: &serde_json::Value, out: &mut Vec<(String, String)>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (name, v) in fields {
+                    let path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}.{name}")
+                    };
+                    flatten(&path, v, out);
+                }
+            }
+            other => out.push((prefix.to_string(), other.to_string())),
+        }
+    }
+
+    /// The shipped file opens with "documents … their production-ready
+    /// defaults", so every value it sets must BE the default — otherwise
+    /// `cp xerj.default.toml xerj.toml`, the documented first step, silently
+    /// changes the engine's behaviour and the file becomes a second, divergent
+    /// source of truth for every number it quotes.
+    ///
+    /// It had already drifted when #207 was filed: the file said
+    /// `max_segment_mb = 5120` against a real default of 8192, so copying it
+    /// shrank the largest mergeable segment by 37% without saying so.
+    #[test]
+    fn shipped_default_config_documents_the_real_defaults() {
+        let toml_src = include_str!("../../../xerj.default.toml");
+        let from_file = serde_json::to_value(Config::from_toml_str(toml_src).unwrap()).unwrap();
+        let defaults = serde_json::to_value(Config::default()).unwrap();
+
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        flatten("", &from_file, &mut a);
+        flatten("", &defaults, &mut b);
+
+        let drift: Vec<String> = a
+            .iter()
+            .zip(b.iter())
+            .filter(|((_, file), (_, code))| file != code)
+            .map(|((key, file), (_, code))| format!("{key}: file says {file}, code says {code}"))
+            .collect();
+        assert!(
+            drift.is_empty(),
+            "engine/xerj.default.toml claims to document the shipped defaults but \
+             disagrees with Config::default() on {} setting(s):\n  {}",
+            drift.len(),
+            drift.join("\n  ")
+        );
+
+        // …and the file's own header quotes how many of the 103 it sets. That
+        // number was 38, then 56, and never once the truth (#207), so count the
+        // assignments instead of trusting the sentence.
+        let set_here = toml_src
+            .lines()
+            .filter(|l| {
+                let l = l.trim_start();
+                !l.starts_with('#')
+                    && l.split_once('=')
+                        .is_some_and(|(k, _)| !k.trim().is_empty() && !k.contains('['))
+            })
+            .count();
+        let total: usize = SETTINGS_BY_SECTION.iter().map(|(_, c)| c).sum();
+        let claim = format!("sets {set_here} of XERJ's {total} user-facing settings");
+        assert!(
+            toml_src.contains(&claim),
+            "xerj.default.toml's header must say {claim:?} — it sets {set_here} keys"
+        );
+    }
+
+    /// `merge.strategy = "log_structured"` used to parse, validate and then run
+    /// size-tiered merging anyway — nothing in the tree reads the field (#207).
+    /// An operator who picks a levelled policy for its read amplification must
+    /// hear that it does not exist, not get the other one silently.
+    #[test]
+    fn the_unimplemented_merge_strategy_is_rejected_not_silently_substituted() {
+        let err = Config::from_toml_str("[merge]\nstrategy = \"log_structured\"\n")
+            .expect_err("log_structured must be refused while it is unimplemented")
+            .to_string();
+        assert!(
+            err.contains("merge.strategy") && err.contains("not implemented"),
+            "the error must name the setting and say why: {err}"
+        );
+
+        Config::from_toml_str("[merge]\nstrategy = \"size_tiered\"\n")
+            .expect("the implemented policy must still be accepted");
+    }
+
+    /// The three merge knobs this build accepts without acting on. Silence was
+    /// the bug (#207): the operator throttling merges to protect query latency
+    /// got no throttle and no signal.
+    #[test]
+    fn dormant_merge_settings_are_named_only_when_an_operator_sets_them() {
+        assert!(
+            MergeConfig::default().dormant_overrides().is_empty(),
+            "an untouched default asks for nothing, so it must not warn"
+        );
+
+        for (toml, expected) in [
+            ("io_rate_mb_per_sec = 250", "merge.io_rate_mb_per_sec"),
+            ("min_segments = 4", "merge.min_segments"),
+            ("max_concurrent = 4", "merge.max_concurrent"),
+        ] {
+            let cfg = Config::from_toml_str(&format!("[merge]\n{toml}\n")).unwrap();
+            let named: Vec<&str> = cfg
+                .merge
+                .dormant_overrides()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            assert_eq!(
+                named,
+                vec![expected],
+                "setting {toml} must be reported, and nothing else"
+            );
+        }
+
+        // A setting that IS read by `run_merge_once` must never be reported.
+        let cfg = Config::from_toml_str("[merge]\nmax_segment_mb = 4096\n").unwrap();
+        assert!(
+            cfg.merge.dormant_overrides().is_empty(),
+            "max_segment_mb reaches the merge policy, so it is not dormant"
+        );
+    }
+
     #[test]
     fn onnx_throughput_controls_preserve_single_session_defaults() {
         let cfg = Config::from_toml_str("[embedding]\n").unwrap();
@@ -1646,33 +1861,87 @@ mod tests {
         );
     }
 
+    /// Leaf keys in a serialised value — one per setting a user can set.
+    /// Sub-configs are grouping, not settings, so only leaves count.
+    fn count_settings(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(fields) => fields.values().map(count_settings).sum(),
+            _ => 1,
+        }
+    }
+
+    /// Settings per section, and the total. Every one of these numbers is
+    /// quoted in a doc comment above the matching struct (and the total in the
+    /// module header, in `xerj-common/src/lib.rs`, in `engine/README.md` and in
+    /// `xerj.default.toml`) — change the table and the prose together.
+    const SETTINGS_BY_SECTION: &[(&str, usize)] = &[
+        ("server", 6),
+        ("auth", 3),
+        ("cors", 2),
+        ("tls", 4),
+        ("storage", 10),
+        ("merge", 8),
+        ("compression", 3),
+        ("fts", 1),
+        ("vector", 6),
+        ("logs", 2),
+        ("embedding", 19),
+        ("limits", 13),
+        ("indexing", 3),
+        ("engine", 4),
+        ("cluster", 5),
+        ("pit", 3),
+        ("search_context", 7),
+        ("logging", 2),
+        ("compat", 2),
+    ];
+
+    /// Count the settings by *counting them*.
+    ///
+    /// This test used to read
+    ///
+    /// ```ignore
+    /// let total = 6 + 3 + 4 + 10 + 5 + 3 + 1 + 6 + 2 + 4 + 12 + 3 + 2;
+    /// assert_eq!(total, 61);
+    /// ```
+    ///
+    /// — the identity `61 == 61`, which could not fail whatever `Config`
+    /// actually held. By the time #207 was filed it had drifted so far that the
+    /// tree quoted 38, 50, 56, 60 and 61 in five places, none of them right.
+    /// `Config` is `Serialize` and every field defaults, so the honest count is
+    /// the number of leaf keys in a default config.
     #[test]
     fn count_user_facing_settings() {
-        // 50 user-facing settings:
-        //   server: 6      (rest_port, grpc_port, es_compat_port, data_dir,
-        //                   bind_address, trusted_proxies)
-        //   auth:   3      (enabled, admin_api_key, metrics_token)   ← RC4-W4 item 4
-        //   tls:    4      (enabled, cert_path, key_path,
-        //                   allow_insecure_grpc_h2c)             ← issue #229
-        //   storage: 10    (wal_sync, wal_batch_ms, wal_max_size_mb, flush_size_mb,
-        //                   flush_interval_secs, backend, s3_bucket, s3_prefix,
-        //                   s3_region, local_cache_dir)
-        //   merge:  5      (strategy, min_segments, max_segment_mb, io_rate_mb_per_sec, max_concurrent)
-        //   compression: 3 (enabled, level, block_size_docs)
-        //   fts:    1      (default_analyzer)
-        //   vector: 6      (default_metric, hnsw_m, hnsw_ef_construction, hnsw_ef_search,
-        //                   default_quantization, max_dimensions)
-        //   logs:   2      (retention_days, time_partition)
-        //   embedding: 4   (default_endpoint, default_model, batch_size, timeout_ms)
-        //   limits: 12     (query/concurrency/mapping/bulk-actions/body/result/mget/bucket
-        //                   limits, snapshot repo allowlist, total memtable,
-        //                   segment hydration cache, RSS, disk)
-        //   indexing: 3    (turbo_batch_size, turbo_parallel, turbo_fast_analyzer)
-        //   logging: 2     (format, access_log)                      ← RC4-W4 item 6
-        //   ─────────
-        //   total: 61 fields, minus 1 auto-generated (admin_api_key) = 60 meaningful user settings
-        let total: usize = 6 + 3 + 4 + 10 + 5 + 3 + 1 + 6 + 2 + 4 + 12 + 3 + 2;
-        assert_eq!(total, 61);
+        let cfg = serde_json::to_value(Config::default()).expect("Config serialises");
+        let sections = cfg.as_object().expect("Config is a table");
+
+        let measured: Vec<(String, usize)> = sections
+            .iter()
+            .map(|(name, v)| (name.clone(), count_settings(v)))
+            .collect();
+        let expected: Vec<(String, usize)> = SETTINGS_BY_SECTION
+            .iter()
+            .map(|(n, c)| ((*n).to_string(), *c))
+            .collect();
+        assert_eq!(
+            measured, expected,
+            "the per-section settings counts changed. That is fine — but each is \
+             quoted in the doc comment above its struct, so update both"
+        );
+
+        let total: usize = SETTINGS_BY_SECTION.iter().map(|(_, c)| c).sum();
+        assert_eq!(
+            total,
+            count_settings(&cfg),
+            "the section table must sum to the whole config"
+        );
+        assert_eq!(
+            total, 103,
+            "the total settings count changed. It is quoted in this module's \
+             header, in xerj-common/src/lib.rs, in engine/README.md, in \
+             xerj.default.toml and in EXPECTED_SETTINGS in \
+             xerj-engine/tests/product_experience.rs — update all of them"
+        );
     }
 
     // ── gRPC h2c exposure: fail closed (issue #229) ──────────────────────────

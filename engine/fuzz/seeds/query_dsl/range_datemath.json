@@ -1,0 +1,1 @@
+{"query":{"range":{"ts":{"gte":"now-7d/d","lte":"now","format":"epoch_millis"}}}}

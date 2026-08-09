@@ -1201,15 +1201,25 @@ fn ms_to_naive(ms: i64) -> Option<NaiveDateTime> {
     chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.naive_utc())
 }
 
+/// `n` is a caller-supplied count straight out of a range bound
+/// (`"gte": "now+33333333333333H"`), so every arithmetic step here has to be
+/// fallible.
+///
+/// The `try_*` constructors are load-bearing: `Duration::hours` and its
+/// siblings **panic** when the count does not fit the underlying `TimeDelta`,
+/// and they panic *before* `checked_add_signed` ever sees the value — so the
+/// careful checking on the outside bought nothing. Found by the `date_math`
+/// fuzz target within 20 seconds of it first existing; `now+33333333333333H`
+/// panicked a search worker on an unauthenticated request.
 fn add_unit(dt: NaiveDateTime, n: i64, unit: char) -> Option<NaiveDateTime> {
     match unit {
         'y' => shift_months(dt, n.checked_mul(12)?),
         'M' => shift_months(dt, n),
-        'w' => dt.checked_add_signed(Duration::weeks(n)),
-        'd' => dt.checked_add_signed(Duration::days(n)),
-        'h' | 'H' => dt.checked_add_signed(Duration::hours(n)),
-        'm' => dt.checked_add_signed(Duration::minutes(n)),
-        's' => dt.checked_add_signed(Duration::seconds(n)),
+        'w' => dt.checked_add_signed(Duration::try_weeks(n)?),
+        'd' => dt.checked_add_signed(Duration::try_days(n)?),
+        'h' | 'H' => dt.checked_add_signed(Duration::try_hours(n)?),
+        'm' => dt.checked_add_signed(Duration::try_minutes(n)?),
+        's' => dt.checked_add_signed(Duration::try_seconds(n)?),
         _ => None,
     }
 }
@@ -2389,5 +2399,57 @@ mod ignored_metadata_field_oracle {
                 "`{bad}` should be _ignored"
             );
         }
+    }
+    /// Regression for the crash the `date_math` fuzz target found within 20
+    /// seconds of first existing (issue #207): `chrono`'s `Duration::hours`
+    /// and its siblings **panic** on a count that does not fit a `TimeDelta`,
+    /// and they run before the `checked_add_signed` that was supposed to make
+    /// this arithmetic total. `{"range":{"ts":{"gte":"now+33333333333333H"}}}`
+    /// therefore panicked a search worker on an unauthenticated request.
+    ///
+    /// Before the fix every case below aborts the test process rather than
+    /// failing an assertion.
+    #[test]
+    fn an_out_of_range_date_math_offset_is_an_error_not_a_panic() {
+        // The exact input libFuzzer minimised to, plus one per unit and both
+        // signs — the panic is in the unit constructors, so each has its own.
+        for math in [
+            "+33333333333333H",
+            "+9223372036854775807H",
+            "-9223372036854775807H",
+            "+9223372036854775807h",
+            "+9223372036854775807m",
+            "+9223372036854775807s",
+            "+9223372036854775807d",
+            "-9223372036854775807d",
+            "+9223372036854775807w",
+            "+9223372036854775807M",
+            "+9223372036854775807y",
+        ] {
+            for round_up in [false, true] {
+                assert!(
+                    apply_date_math(1_700_000_000_000, math, round_up).is_err(),
+                    "`now{math}` must be rejected, not panic"
+                );
+            }
+        }
+
+        // The in-range neighbours still work, so the guard is not just
+        // rejecting everything.
+        assert!(apply_date_math(1_700_000_000_000, "+1H", false).is_ok());
+        assert!(apply_date_math(1_700_000_000_000, "-24h/d", true).is_ok());
+
+        // …and the whole way in from a request body, which is how it is
+        // reached: `resolve_range_bound` hands any string bound straight to
+        // `resolve_date_bound_str`. The workspace builds with
+        // `panic = "abort"`, so before the fix this body did not fail a
+        // request — it took the process down.
+        let body = serde_json::json!({
+            "query": { "range": { "ts": { "gte": "now+33333333333333H" } } }
+        });
+        assert!(
+            crate::parse_request(&body).is_err(),
+            "an unrepresentable range bound must be a 400, not an abort"
+        );
     }
 }

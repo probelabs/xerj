@@ -1,0 +1,1 @@
+{"query":{"multi_match":{"query":"hello","fields":["title^2","body"],"type":"best_fields","fuzziness":"AUTO"}}}
