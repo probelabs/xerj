@@ -6005,10 +6005,10 @@ impl Index {
         external_version: Option<(u64, bool)>,
     ) -> Result<IndexResponse> {
         // Check write block.
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Default-format date validation — before any durable write so a
@@ -6329,10 +6329,10 @@ impl Index {
             return Ok(Vec::new());
         }
 
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Process-wide admission: disk flood-stage block (item 3) + parent
@@ -6678,10 +6678,10 @@ impl Index {
             return Ok(Vec::new());
         }
         let batch_len = docs.len();
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Process-wide admission: disk flood-stage block (item 3) + parent
@@ -7481,10 +7481,10 @@ impl Index {
             return Ok(Vec::new());
         }
 
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Process-wide admission: disk flood-stage block (item 3) + parent
@@ -12060,10 +12060,10 @@ impl Index {
         if_primary_term: Option<u64>,
     ) -> Result<DeleteDocOutcome> {
         // Check write block.
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Process-wide admission: disk flood-stage block (item 3) + parent
@@ -17050,58 +17050,190 @@ impl Index {
         Ok(())
     }
 
-    /// Returns true if the write block is set on this index.
-    pub async fn is_write_blocked(&self) -> bool {
-        let settings = self.settings.read().await;
-        settings
-            .pointer("/index/blocks/write")
-            .and_then(Value::as_bool)
+    /// Every block name the `_block` API and `index.blocks.*` settings accept.
+    pub const BLOCK_NAMES: [&'static str; 5] = [
+        "read_only",
+        "read_only_allow_delete",
+        "write",
+        "metadata",
+        "read",
+    ];
+
+    /// Every JSON location one `index.blocks.<name>` flag can occupy in a
+    /// stored settings document, canonical form first.
+    ///
+    /// A settings body is stored the way the client wrote it — `PUT /{index}`
+    /// forwards its `settings` blob to `Index::new` verbatim — and ES accepts
+    /// the nested and the dotted spellings interchangeably. Reading only the
+    /// nested one meant an index created with
+    /// `{"settings": {"index.blocks.write": true}}` reported no block and
+    /// admitted every write.
+    fn block_flag_pointers(name: &str) -> [String; 4] {
+        [
+            format!("/index/blocks/{name}"),
+            format!("/index/blocks.{name}"),
+            format!("/index.blocks.{name}"),
+            format!("/blocks/{name}"),
+        ]
+    }
+
+    /// Reads one `index.blocks.<name>` flag in whichever spelling it was stored
+    /// under. Accepts the boolean `true` and the string `"true"` — ES
+    /// normalises index settings to strings on the wire, so a settings round
+    /// trip can hand us either shape.
+    fn block_flag(settings: &Value, name: &str) -> bool {
+        Self::block_flag_pointers(name)
+            .iter()
+            .find_map(|p| match settings.pointer(p) {
+                Some(Value::Bool(b)) => Some(*b),
+                Some(Value::String(s)) => Some(s.eq_ignore_ascii_case("true")),
+                _ => None,
+            })
             .unwrap_or(false)
     }
 
+    /// Names the block that is currently denying **writes** on this index, or
+    /// `None` when writes are admitted.
+    ///
+    /// The returned name is threaded into `XerjError::IndexBlocked` so the HTTP
+    /// layer can pick the status ES picks. Three settings deny writes, and they
+    /// do *not* all answer the same status:
+    ///
+    /// | setting | denies | status |
+    /// |---|---|---|
+    /// | `index.blocks.write` | writes | 403 |
+    /// | `index.blocks.read_only` | writes + metadata changes | 403 |
+    /// | `index.blocks.read_only_allow_delete` | writes (incl. doc deletes) | 429 |
+    ///
+    /// Precedence is 403-before-429, matching how ES collapses a multi-block
+    /// `ClusterBlockException` down to one status: a non-retryable block always
+    /// wins over a retryable one
+    /// (`cluster/block/ClusterBlockException.java:95-107`, approach only — ES is
+    /// AGPL/SSPL/Elastic-2.0 and no code from it is reproduced here).
+    ///
+    /// Note what is deliberately **absent**: none of these deny *reads*. Only
+    /// `index.blocks.read` does that. `read_only` means "readable, not
+    /// writable", and `read_only_allow_delete` is the disk flood-stage block —
+    /// the "allow delete" is index deletion, not document deletion
+    /// (`docs/reference/elasticsearch/index-settings/index-block.md:29-34`:
+    /// "When `index.blocks.read_only_allow_delete` is set to `true`, deleting
+    /// documents is not permitted. However, deleting the index entirely …
+    /// is still permitted").
+    pub async fn write_block_reason(&self) -> Option<&'static str> {
+        let settings = self.settings.read().await;
+        for name in ["write", "read_only", "read_only_allow_delete"] {
+            if Self::block_flag(&settings, name) {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Returns true if any write-denying block is set on this index.
+    pub async fn is_write_blocked(&self) -> bool {
+        self.write_block_reason().await.is_some()
+    }
+
     /// Returns true if the read block is set on this index.
+    ///
+    /// Only `index.blocks.read` denies reads. `read_only` and
+    /// `read_only_allow_delete` leave the index searchable — see
+    /// [`Self::write_block_reason`].
     pub async fn is_read_blocked(&self) -> bool {
         let settings = self.settings.read().await;
-        settings
-            .pointer("/index/blocks/read")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        Self::block_flag(&settings, "read")
+    }
+
+    /// Erase every spelling of one block flag from a settings document, leaving
+    /// the canonical nested slot for the caller to write (or leave absent).
+    fn remove_block_spellings(settings: &mut Value, name: &str) {
+        let Some(root) = settings.as_object_mut() else {
+            return;
+        };
+        root.remove(&format!("index.blocks.{name}"));
+        if let Some(blocks) = root.get_mut("blocks").and_then(Value::as_object_mut) {
+            blocks.remove(name);
+        }
+        if let Some(index) = root.get_mut("index").and_then(Value::as_object_mut) {
+            index.remove(&format!("blocks.{name}"));
+            if let Some(blocks) = index.get_mut("blocks").and_then(Value::as_object_mut) {
+                blocks.remove(name);
+            }
+        }
     }
 
     /// Set a named block on the index (`read_only`, `read_only_allow_delete`, `write`, `metadata`, `read`).
     ///
     /// Stores as `index.blocks.<block_name> = true` in the settings.
     pub async fn set_block(&self, block_name: &str) -> Result<()> {
+        self.set_block_state(block_name, true).await
+    }
+
+    /// Clear a named block. The inverse of [`Self::set_block`], and what both
+    /// `DELETE /{index}/_block/{block}` and a
+    /// `PUT /{index}/_settings {"index.blocks.<name>": false}` land on.
+    pub async fn clear_block(&self, block_name: &str) -> Result<()> {
+        self.set_block_state(block_name, false).await
+    }
+
+    /// Set or clear `index.blocks.<block_name>`, persisting the result.
+    ///
+    /// Stores exactly the block the caller named — no alias expansion. Deriving
+    /// the effect at read time ([`Self::write_block_reason`]) instead of writing
+    /// derived flags at set time is what makes removal work: with expansion, a
+    /// `read_only` block left an independent `blocks.write: true` behind that
+    /// clearing `read_only` could not reach.
+    ///
+    /// Both directions first drop every non-canonical spelling of the block
+    /// ([`Self::block_flag_pointers`]), so a dotted key left by a create-time
+    /// settings body cannot outlive the nested key and silently re-block the
+    /// index — the same "block with no removal path" shape this fixes.
+    pub async fn set_block_state(&self, block_name: &str, enabled: bool) -> Result<()> {
         let mut settings = {
             let guard = self.settings.read().await;
             guard.clone()
         };
 
-        // Ensure nested structure: settings["index"]["blocks"][block_name] = true
-        if settings.is_null() {
+        // Ensure nested structure: settings["index"]["blocks"][block_name].
+        if !settings.is_object() {
             settings = Value::Object(serde_json::Map::new());
         }
+        Self::remove_block_spellings(&mut settings, block_name);
         let obj = settings.as_object_mut().unwrap();
-        let index_obj = obj
+        let index_obj = match obj
             .entry("index")
             .or_insert_with(|| Value::Object(serde_json::Map::new()))
             .as_object_mut()
-            .unwrap();
-        let blocks_obj = index_obj
+        {
+            Some(o) => o,
+            // A non-object `index` value (corrupt settings.json) — replace it
+            // rather than panic.
+            None => {
+                obj.insert("index".to_string(), Value::Object(serde_json::Map::new()));
+                obj.get_mut("index").unwrap().as_object_mut().unwrap()
+            }
+        };
+        let blocks_obj = match index_obj
             .entry("blocks")
             .or_insert_with(|| Value::Object(serde_json::Map::new()))
             .as_object_mut()
-            .unwrap();
-        blocks_obj.insert(block_name.to_string(), Value::Bool(true));
-
-        // Handle aliases: read_only also sets both read + write blocks.
-        if block_name == "read_only" {
-            blocks_obj.insert("read".to_string(), Value::Bool(true));
-            blocks_obj.insert("write".to_string(), Value::Bool(true));
-        }
-        if block_name == "read_only_allow_delete" {
-            blocks_obj.insert("read".to_string(), Value::Bool(true));
-            // write is NOT blocked (only delete is allowed)
+        {
+            Some(o) => o,
+            None => {
+                index_obj.insert("blocks".to_string(), Value::Object(serde_json::Map::new()));
+                index_obj
+                    .get_mut("blocks")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+            }
+        };
+        if enabled {
+            blocks_obj.insert(block_name.to_string(), Value::Bool(true));
+        } else {
+            // Removing the key rather than storing `false` keeps a cleared
+            // block out of GET /_settings, which is what ES shows.
+            blocks_obj.remove(block_name);
         }
 
         let path = self.data_dir.join("settings.json");
@@ -17109,6 +17241,86 @@ impl Index {
         write_file_atomic(&path, &bytes).map_err(EngineError::Io)?;
         *self.settings.write().await = settings;
         Ok(())
+    }
+
+    /// Apply an `index.blocks` sub-document from a settings update.
+    ///
+    /// Accepts the nested (`{"index": {"blocks": {"write": false}}}`), dotted
+    /// (`{"index.blocks.write": false}`) and bare (`{"blocks": {...}}`) shapes
+    /// that ES settings bodies come in. Values may be JSON booleans or the
+    /// strings `"true"`/`"false"` — ES stringifies index settings on the wire.
+    ///
+    /// Returns the block names that changed state.
+    pub async fn apply_block_settings(&self, body: &Value) -> Result<Vec<String>> {
+        let as_bool = |v: &Value| -> Option<bool> {
+            match v {
+                Value::Bool(b) => Some(*b),
+                Value::String(s) if s.eq_ignore_ascii_case("true") => Some(true),
+                Value::String(s) if s.eq_ignore_ascii_case("false") => Some(false),
+                Value::Null => Some(false),
+                _ => None,
+            }
+        };
+
+        // Collect name → desired state from every accepted shape.
+        let mut wanted: Vec<(String, bool)> = Vec::new();
+        let mut collect_nested = |blocks: &Value| {
+            if let Some(map) = blocks.as_object() {
+                for (name, v) in map {
+                    if Self::BLOCK_NAMES.contains(&name.as_str()) {
+                        if let Some(b) = as_bool(v) {
+                            wanted.push((name.clone(), b));
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(b) = body.pointer("/index/blocks") {
+            collect_nested(b);
+        }
+        if let Some(b) = body.get("blocks") {
+            collect_nested(b);
+        }
+        if let Some(map) = body.as_object() {
+            for (k, v) in map {
+                let name = k
+                    .strip_prefix("index.blocks.")
+                    .or_else(|| k.strip_prefix("blocks."));
+                if let Some(name) = name {
+                    if Self::BLOCK_NAMES.contains(&name) {
+                        if let Some(b) = as_bool(v) {
+                            wanted.push((name.to_string(), b));
+                        }
+                    }
+                }
+            }
+        }
+        // `{"index": {"blocks.write": false}}` — dotted under a nested `index`.
+        if let Some(map) = body.get("index").and_then(Value::as_object) {
+            for (k, v) in map {
+                if let Some(name) = k.strip_prefix("blocks.") {
+                    if Self::BLOCK_NAMES.contains(&name) {
+                        if let Some(b) = as_bool(v) {
+                            wanted.push((name.to_string(), b));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut applied = Vec::new();
+        for (name, enabled) in wanted {
+            let current = {
+                let guard = self.settings.read().await;
+                Self::block_flag(&guard, &name)
+            };
+            if current == enabled {
+                continue;
+            }
+            self.set_block_state(&name, enabled).await?;
+            applied.push(name);
+        }
+        Ok(applied)
     }
 
     // ── Schema ────────────────────────────────────────────────────────────────
