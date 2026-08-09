@@ -17374,8 +17374,10 @@ pub async fn put_index_template(
         mappings,
         priority: body.priority.unwrap_or(0),
     };
-    state.engine.templates.insert(name, tmpl);
-    Json(json!({ "acknowledged": true })).into_response()
+    match state.engine.put_index_template(name, tmpl) {
+        Ok(()) => Json(json!({ "acknowledged": true })).into_response(),
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    }
 }
 
 pub async fn get_index_template(
@@ -17435,11 +17437,14 @@ pub async fn delete_index_template(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.templates.remove(&name).is_some() {
-        Json(json!({ "acknowledged": true })).into_response()
-    } else {
-        let e = xerj_common::XerjError::index_not_found(format!("index template [{name}] missing"));
-        ApiError::new(e).into_response()
+    match state.engine.delete_index_template(&name) {
+        Ok(true) => Json(json!({ "acknowledged": true })).into_response(),
+        Ok(false) => {
+            let e =
+                xerj_common::XerjError::index_not_found(format!("index template [{name}] missing"));
+            ApiError::new(e).into_response()
+        }
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
 }
 
@@ -22151,8 +22156,6 @@ pub async fn put_ingest_pipeline(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // Store the raw JSON for GET /_ingest/pipeline.
-    state.engine.pipelines.insert(id.clone(), body.clone());
     // Convert ES processor format → xerj stage format, then compile.
     // ES: {"processors": [{"set": {"field":"x","value":"y"}}]}
     // xerj: {"stages": [{"type": "set", "config": {"field":"x","value":"y"}}]}
@@ -22207,10 +22210,17 @@ pub async fn put_ingest_pipeline(
         } else {
             body.clone()
         };
-    if let Err(e) = state.engine.create_pipeline(&id, xerj_config) {
-        tracing::warn!(pipeline = %id, error = %e, "pipeline stored but failed to compile");
+    // `Some(body)` keeps this surface's long-standing behaviour: a definition
+    // that will not compile is still stored and still readable through
+    // `GET /_ingest/pipeline/{id}` (the engine logs the compile error and
+    // drops the executable form, so `?pipeline={id}` behaves identically
+    // before and after a restart). An `Err` means it did not reach disk —
+    // answering `acknowledged` there would promise a pipeline that is gone at
+    // the next boot, which is the whole of issue #203.
+    match state.engine.put_pipeline(&id, xerj_config, Some(body)) {
+        Ok(_) => Json(json!({ "acknowledged": true })).into_response(),
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
-    Json(json!({ "acknowledged": true })).into_response()
 }
 
 pub async fn get_ingest_pipeline(
@@ -22240,11 +22250,13 @@ pub async fn delete_ingest_pipeline(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.pipelines.remove(&id).is_some() {
-        Json(json!({ "acknowledged": true })).into_response()
-    } else {
-        let e = xerj_common::XerjError::index_not_found(format!("pipeline [{id}] is missing"));
-        ApiError::new(e).into_response()
+    match state.engine.delete_pipeline(&id) {
+        Ok(true) => Json(json!({ "acknowledged": true })).into_response(),
+        Ok(false) => {
+            let e = xerj_common::XerjError::index_not_found(format!("pipeline [{id}] is missing"));
+            ApiError::new(e).into_response()
+        }
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
 }
 
@@ -24062,8 +24074,15 @@ pub async fn put_ilm_policy(
 ) -> impl IntoResponse {
     // Persist the raw policy verbatim in the ILM store; `get_ilm_policy`
     // reads it back out of this same DashMap, so PUT then GET round-trips
-    // faithfully regardless of whether translation below succeeds.
-    state.engine.ilm_policies.insert(name.clone(), body.clone());
+    // faithfully regardless of whether translation below succeeds — and the
+    // store is written to `<data_dir>/cluster_state.json`, so it round-trips
+    // after a restart too (issue #203). This write goes first because it is
+    // the one that can fail loudly: if the document cannot be persisted the
+    // request is a 500 and nothing has happened yet, rather than an
+    // `acknowledged` that a reboot silently undoes.
+    if let Err(e) = state.engine.put_ilm_policy(name.clone(), body.clone()) {
+        return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+    }
 
     // Translate into the shared internal model (`xerj_engine::lifecycle`)
     // so the SAME background job that drives native ISM policies also
@@ -24131,12 +24150,21 @@ pub async fn delete_ilm_policy(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.ilm_policies.remove(&name).is_some() {
-        state.engine.remove_ism_policy(&name);
-        Json(json!({ "acknowledged": true })).into_response()
-    } else {
-        let e = xerj_common::XerjError::index_not_found(format!("policy [{name}] not found"));
-        ApiError::new(e).into_response()
+    // Remove the verbatim document first: that is the guarded, persisted
+    // path, so a failure there is a 500 with nothing removed anywhere. Only
+    // once it is gone from `cluster_state.json` is the translated executor
+    // policy dropped, so the two files can never disagree in the direction
+    // that keeps running a policy `GET _ilm/policy` reports as deleted.
+    match state.engine.delete_ilm_policy(&name) {
+        Ok(true) => {
+            state.engine.remove_ism_policy(&name);
+            Json(json!({ "acknowledged": true })).into_response()
+        }
+        Ok(false) => {
+            let e = xerj_common::XerjError::index_not_found(format!("policy [{name}] not found"));
+            ApiError::new(e).into_response()
+        }
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
 }
 
@@ -24235,8 +24263,10 @@ pub async fn put_component_template(
     Path(name): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    state.engine.component_templates.insert(name, body);
-    Json(json!({ "acknowledged": true })).into_response()
+    match state.engine.put_component_template(name, body) {
+        Ok(()) => Json(json!({ "acknowledged": true })).into_response(),
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    }
 }
 
 pub async fn get_component_template(
@@ -24278,12 +24308,15 @@ pub async fn delete_component_template(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.component_templates.remove(&name).is_some() {
-        Json(json!({ "acknowledged": true })).into_response()
-    } else {
-        let e =
-            xerj_common::XerjError::index_not_found(format!("component template [{name}] missing"));
-        ApiError::new(e).into_response()
+    match state.engine.delete_component_template(&name) {
+        Ok(true) => Json(json!({ "acknowledged": true })).into_response(),
+        Ok(false) => {
+            let e = xerj_common::XerjError::index_not_found(format!(
+                "component template [{name}] missing"
+            ));
+            ApiError::new(e).into_response()
+        }
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
 }
 
@@ -33932,8 +33965,10 @@ pub async fn put_legacy_template(
     if let Some(settings) = body.get("settings").cloned() {
         body["settings"] = flatten_template_settings(&settings);
     }
-    state.engine.legacy_templates.insert(name, body);
-    Json(json!({ "acknowledged": true }))
+    match state.engine.put_legacy_template(name, body) {
+        Ok(()) => Json(json!({ "acknowledged": true })).into_response(),
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    }
 }
 
 /// Normalize a template's `settings` block to ES's storage form: every
@@ -34030,11 +34065,14 @@ pub async fn delete_legacy_template(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.legacy_templates.remove(&name).is_some() {
-        Json(json!({ "acknowledged": true })).into_response()
-    } else {
-        let e = xerj_common::XerjError::index_not_found(format!("index template [{name}] missing"));
-        ApiError::new(e).into_response()
+    match state.engine.delete_legacy_template(&name) {
+        Ok(true) => Json(json!({ "acknowledged": true })).into_response(),
+        Ok(false) => {
+            let e =
+                xerj_common::XerjError::index_not_found(format!("index template [{name}] missing"));
+            ApiError::new(e).into_response()
+        }
+        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
 }
 
