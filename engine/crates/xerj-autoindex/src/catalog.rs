@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 pub const CATALOG_INDEX: &str = "autoindex-catalog";
 
 pub fn catalog_mapping() -> Value {
-    json!({
+    let mut mapping = json!({
         "mappings": {"properties": {
             "doc_kind": {"type": "keyword"},
             "slug": {"type": "keyword"},
@@ -49,7 +49,24 @@ pub fn catalog_mapping() -> Value {
             "pearson_r": {"type": "double"},
             "activity_correlated": {"type": "boolean"},
         }}
-    })
+    });
+    let properties = mapping
+        .pointer_mut("/mappings/properties")
+        .and_then(Value::as_object_mut)
+        .expect("catalog mapping properties");
+    properties.insert(
+        "started".into(),
+        json!({"type": "date", "format": "strict_date_optional_time"}),
+    );
+    properties.insert(
+        "summary_generated_at".into(),
+        json!({"type": "date", "format": "strict_date_optional_time"}),
+    );
+    properties.insert(
+        "invocation_telemetry_scope".into(),
+        json!({"type": "keyword"}),
+    );
+    mapping
 }
 
 pub const GOTCHAS: &[&str] = &[
@@ -67,6 +84,11 @@ pub struct DatasetDocInput<'a> {
     pub pd: &'a PlanDataset,
     pub record_count: u64,
     pub junk_records: u64,
+    /// Canonical source bytes backing this dataset's durably live records.
+    ///
+    /// This is not a scan-time filesystem total: a removed path stays
+    /// represented until autoindex also removes its live records, and one
+    /// source feeding several datasets contributes its bytes to each.
     pub bytes: u64,
     pub file_count: usize,
     pub formats: Vec<String>,

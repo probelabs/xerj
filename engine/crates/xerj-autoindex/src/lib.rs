@@ -920,6 +920,39 @@ pub fn derive_brain_name(root: &Path) -> String {
     }
 }
 
+/// Source bytes durably represented by each dataset.
+///
+/// `FileDone` is the commit record for a successfully published canonical
+/// source. A source can feed more than one inferred dataset (for example, a
+/// workbook or database with multiple tables), so each distinct assigned
+/// dataset reports the complete source bytes it depends on. Repeated groups
+/// within the same dataset count the source only once.
+fn durable_dataset_bytes(plan: &Plan, done: &HashMap<String, FileDone>) -> HashMap<String, u64> {
+    let mut bytes_by_dataset = HashMap::new();
+    for (file_key, completed) in done {
+        let Some(assignment) = plan.files.get(file_key) else {
+            continue;
+        };
+        let assigned_datasets: std::collections::HashSet<&str> = assignment
+            .assignments
+            .iter()
+            .map(|(_, slug)| slug.as_str())
+            .collect();
+        for slug in assigned_datasets {
+            let bytes = bytes_by_dataset.entry(slug.to_string()).or_insert(0u64);
+            *bytes = bytes.saturating_add(completed.bytes);
+        }
+    }
+    bytes_by_dataset
+}
+
+fn invocation_report_timestamps(
+    started: chrono::DateTime<chrono::Utc>,
+    summary_generated_at: chrono::DateTime<chrono::Utc>,
+) -> (String, String) {
+    (started.to_rfc3339(), summary_generated_at.to_rfc3339())
+}
+
 fn run_index(cfg: IndexCfg) -> Result<i32> {
     run_index_report(cfg).map(|(code, _)| code)
 }
@@ -932,6 +965,9 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
 /// `None` when the run ended before a plan produced one (empty folder,
 /// `--dry-run`).
 pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
+    // The very first statement of the function, deliberately: `started` must
+    // be when this invocation began, not when its summary was built.
+    let invocation_started = chrono::Utc::now();
     // Fix the phase-A pool width BEFORE anything parallel starts: hashing and
     // sniffing are the CPU-bound phase, and they used to take every core no
     // matter what the caller asked for (#240 §2).
@@ -1281,9 +1317,14 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     es.ensure_index(catalog::CATALOG_INDEX, &catalog::catalog_mapping())?;
     es.update_mapping(
         catalog::CATALOG_INDEX,
-        &json!({"properties": {"duplicate_of": {"type": "keyword"}}}),
+        &json!({"properties": {
+            "duplicate_of": {"type": "keyword"},
+            "started": {"type": "date", "format": "strict_date_optional_time"},
+            "summary_generated_at": {"type": "date", "format": "strict_date_optional_time"},
+            "invocation_telemetry_scope": {"type": "keyword"}
+        }}),
     )
-    .context("upgrade autoindex catalog mapping for duplicate aliases")?;
+    .context("upgrade autoindex catalog mapping")?;
     // A replacement transaction starts before the effective new plan is
     // persisted and before live visibility changes. If the process dies at
     // any later boundary, journal replay removes the older file_done and
@@ -1337,7 +1378,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         records: AtomicU64,
         junk: AtomicU64,
         dropped: AtomicU64,
-        bytes: AtomicU64,
     }
     let mut ds_rt: HashMap<String, DsRt> = HashMap::new();
     for d in &plan.datasets {
@@ -1349,7 +1389,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 records: AtomicU64::new(0),
                 junk: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
-                bytes: AtomicU64::new(0),
             },
         );
     }
@@ -1999,10 +2038,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     records_total.fetch_add(file_records, Ordering::Relaxed);
                     junk_records.fetch_add(file_junk, Ordering::Relaxed);
                     if let Some(rt) = fa.assignments.first().and_then(|(_, slug)| ds_rt.get(slug)) {
-                        rt.bytes.fetch_add(
-                            f.size / fa.assignments.len().max(1) as u64,
-                            Ordering::Relaxed,
-                        );
                         if file_junk > 0 {
                             rt.junk.fetch_add(file_junk, Ordering::Relaxed);
                         }
@@ -2301,6 +2336,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     // dataset docs
     let mut junk_records_by_run: u64 = junk_records.load(Ordering::Relaxed);
+    let dataset_bytes = {
+        let journal = journal_mx.lock().unwrap();
+        durable_dataset_bytes(&plan, &journal.done)
+    };
     for d in &plan.datasets {
         let rt = &ds_rt[&d.slug];
         let sample_queries = catalog::build_sample_queries(d, &key_corrs);
@@ -2339,7 +2378,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             pd: d,
             record_count: *ds_counts.get(&d.slug).unwrap_or(&0),
             junk_records: rt.junk.load(Ordering::Relaxed),
-            bytes: rt.bytes.load(Ordering::Relaxed),
+            bytes: dataset_bytes.get(&d.slug).copied().unwrap_or(0),
             file_count: d.file_count,
             formats,
             time_min: tmin,
@@ -2443,6 +2482,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     }
 
     let wall = t0.elapsed().as_secs_f64();
+    let (started, summary_generated_at) =
+        invocation_report_timestamps(invocation_started, chrono::Utc::now());
     let total_records: u64 = ds_counts.values().sum();
     // Run-summary honesty (§6.6.4): what the detectors wrote AND what they
     // could not resolve — a dangling [[link]] is a fact about the corpus, not
@@ -2475,13 +2516,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             "edges_invalidated": gr.invalidated,
         })
     });
+    // A resume intentionally reuses and upserts the durable run id. Timing
+    // and detector counters therefore describe this latest invocation,
+    // while corpus descriptors describe the durable live run state.
     let mut run_doc = json!({
         "doc_kind": "run",
         "run_id": run_id,
         "root": root_str,
         "url": cfg.url,
         "prefix": cfg.prefix,
-        "started": chrono::Utc::now().to_rfc3339(),
+        "started": started,
+        "summary_generated_at": summary_generated_at,
+        "invocation_telemetry_scope": "latest_invocation_of_durable_run",
         "files_total": paths_discovered,
         "unique_content_files": files.len(),
         "files_indexed": journal_mx.lock().unwrap().done.len(),
@@ -3161,6 +3207,130 @@ mod duplicate_integration_tests {
         })
         .unwrap();
         assert_eq!(live, HashSet::from(["r0".into(), "r1".into()]));
+    }
+}
+
+#[cfg(test)]
+mod map_metadata_tests {
+    use super::*;
+
+    fn assignment(slugs: &[&str]) -> FileAssignment {
+        FileAssignment {
+            rel: "report.dat".into(),
+            path_id: "path:report.dat".into(),
+            family: "json".into(),
+            gzip: false,
+            content_digest: Some("digest".into()),
+            assignments: slugs
+                .iter()
+                .enumerate()
+                .map(|(group, slug)| (Some(format!("group-{group}")), (*slug).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn unchanged_resume_keeps_durable_assignment_aware_dataset_bytes() {
+        let _guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let plan = Plan {
+            files: HashMap::from([
+                (
+                    "shared".into(),
+                    assignment(&["quarterly", "quarterly", "annual"]),
+                ),
+                ("quarterly-only".into(), assignment(&["quarterly"])),
+            ]),
+            ..Plan::default()
+        };
+        let mut initial = state::Journal::open(
+            state_dir.path(),
+            "corpus",
+            "http://engine",
+            "ax",
+            300,
+            false,
+        )
+        .unwrap();
+        initial.write_plan(&plan).unwrap();
+        initial
+            .file_done(&FileDone {
+                file_key: "shared".into(),
+                path: "report.dat".into(),
+                records: 10,
+                junk: 0,
+                bytes: 100,
+                generation: Some("digest".into()),
+            })
+            .unwrap();
+        initial
+            .file_done(&FileDone {
+                file_key: "quarterly-only".into(),
+                path: "quarterly.json".into(),
+                records: 2,
+                junk: 0,
+                bytes: 23,
+                generation: Some("digest-2".into()),
+            })
+            .unwrap();
+        let before_resume = durable_dataset_bytes(&plan, &initial.done);
+        drop(initial);
+
+        // Opening the same durable run appends only an invocation-level
+        // resume record. No source is processed and no FileDone is appended.
+        let resumed = state::Journal::open(
+            state_dir.path(),
+            "corpus",
+            "http://engine",
+            "ax",
+            300,
+            false,
+        )
+        .unwrap();
+        let after_unchanged_resume =
+            durable_dataset_bytes(resumed.plan.as_ref().unwrap(), &resumed.done);
+
+        assert_eq!(before_resume, after_unchanged_resume);
+        assert_eq!(after_unchanged_resume["quarterly"], 123);
+        assert_eq!(after_unchanged_resume["annual"], 100);
+    }
+
+    #[test]
+    fn invocation_started_is_not_derived_from_summary_generation() {
+        let started = chrono::DateTime::parse_from_rfc3339("2026-08-04T00:29:05.673023686Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let summary_generated_at =
+            chrono::DateTime::parse_from_rfc3339("2026-08-04T00:31:37.937589283Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        let (reported_started, reported_summary_generated_at) =
+            invocation_report_timestamps(started, summary_generated_at);
+
+        assert_eq!(reported_started, "2026-08-04T00:29:05.673023686+00:00");
+        assert_eq!(
+            reported_summary_generated_at,
+            "2026-08-04T00:31:37.937589283+00:00"
+        );
+        assert_ne!(reported_started, reported_summary_generated_at);
+    }
+
+    #[test]
+    fn catalog_mapping_declares_latest_invocation_telemetry_fields() {
+        let mapping = catalog::catalog_mapping();
+        assert_eq!(
+            mapping.pointer("/mappings/properties/started/type"),
+            Some(&json!("date"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/summary_generated_at/type"),
+            Some(&json!("date"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/invocation_telemetry_scope/type"),
+            Some(&json!("keyword"))
+        );
     }
 }
 
