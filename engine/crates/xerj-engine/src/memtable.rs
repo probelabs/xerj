@@ -1218,8 +1218,27 @@ impl ShardedFtsMemtable {
         //
         // Delete-aware in both modes (Lucene/ES parity): the scoring `N`
         // counts live docs AND tombstoned/superseded versions not yet merged
-        // away.  This is *only* the BM25 IDF `N` — hits.total and pagination
-        // still use the live `doc_count()`.
+        // away — tantivy's scalar N is likewise physical, Σ `max_doc()` over
+        // segments (`Bm25StatisticsProvider for Searcher::total_num_docs`,
+        // tantivy/src/query/bm25.rs:38-45, MIT).  This is *only* the BM25
+        // IDF `N` — hits.total and pagination still use the live
+        // `doc_count()`.
+        //
+        // The ghost-inclusive scalar is computed ONCE here because BOTH
+        // modes need the same value (#193): the external mode falls back to
+        // it for any scored field the supplied union does not carry (or
+        // carries with `total_docs == 0`), and using the live-only count
+        // there silently raised IDF on indices holding tombstoned or
+        // superseded versions — an unintended divergence from the `None`
+        // path that the previous comment ("scalar N is unused in this
+        // mode") wrongly waved off.
+        let ghost_inclusive_n: u64 = {
+            let mut n: u64 = self.doc_count() as u64;
+            for shard in &self.shards {
+                n += shard.read().ghost_docs;
+            }
+            n
+        };
         let mut global_field_doc_count: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         let global_doc_count: u64;
@@ -1227,9 +1246,11 @@ impl ShardedFtsMemtable {
         let term_global_df: std::collections::HashMap<(String, String), u64>;
         match external {
             Some(cs) => {
-                // Scalar N is unused in this mode (every scored field is in
-                // the per-field map), but keep it a sane non-zero fallback.
-                global_doc_count = self.doc_count() as u64;
+                // Scalar N backs the per-field fallback (field absent from
+                // the union) — keep it ghost-inclusive, exactly like the
+                // `None` branch, so the two modes agree on IDF wherever
+                // the fallback engages.
+                global_doc_count = ghost_inclusive_n;
                 let mut avg = std::collections::HashMap::new();
                 for (fname, fs) in cs.field_iter() {
                     avg.insert(fname.clone(), fs.avg_field_length());
@@ -1250,11 +1271,7 @@ impl ShardedFtsMemtable {
                 term_global_df = df;
             }
             None => {
-                let mut n: u64 = self.doc_count() as u64;
-                for shard in &self.shards {
-                    n += shard.read().ghost_docs;
-                }
-                global_doc_count = n;
+                global_doc_count = ghost_inclusive_n;
                 let (field_total_len, df) = self.aggregate_shard_stats(&q_tokens, fields);
                 global_avg_field_len = field_total_len
                     .into_iter()
@@ -3966,5 +3983,87 @@ mod filtered_docs_arc_tests {
             mem.filtered_docs_arc(&preds).is_none(),
             "array-valued predicate field must force the full-corpus fallback"
         );
+    }
+}
+
+#[cfg(test)]
+mod external_scalar_n_ghost_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// #193 item 2 — the external-mode (`Some(cs)`) scalar `N` must be
+    /// ghost-inclusive, exactly like the historical `None` branch.
+    ///
+    /// The scalar only engages as the per-field fallback: a scored field the
+    /// supplied union does not carry.  This test pins the seam directly with
+    /// ONE shard, so the local per-shard fallbacks for `df` and `avgdl`
+    /// coincide with the `None` branch's cross-shard aggregation by
+    /// construction, and the ghost carries NO occurrence of the queried
+    /// field — leaving the scalar `N` as the ONLY quantity the two modes
+    /// could disagree on.  Before the fix the external branch used the
+    /// live-only `doc_count()` (2) where the `None` branch used
+    /// live + ghosts (3), so the same query on the same memtable scored
+    /// differently depending on which mode the engine happened to take.
+    #[test]
+    fn external_mode_scalar_n_matches_none_mode_under_ghosts() {
+        let registry = Arc::new(AnalyzerRegistry::default());
+        let mem = ShardedFtsMemtable::with_registry_and_shards(registry, 1);
+        let schema = Schema::empty();
+
+        // Two live docs carrying the queried term in `body`, one doomed doc
+        // that never mentions `body` at all.
+        mem.insert("a".into(), &json!({"body": "quicklist alpha"}), &schema, 1);
+        mem.insert(
+            "b".into(),
+            &json!({"body": "quicklist beta gamma delta"}),
+            &schema,
+            2,
+        );
+        mem.insert(
+            "ghost".into(),
+            &json!({"other": "unrelated text"}),
+            &schema,
+            3,
+        );
+        mem.remove("ghost");
+
+        // Union that does NOT carry `body` — the scored field falls back to
+        // the scalar N (plus local df/avgdl, identical across modes here).
+        let mut cs = xerj_fts::CollectionStats::new();
+        cs.add_field(
+            "other",
+            &xerj_fts::FieldStats {
+                total_docs: 1,
+                total_field_length: 2,
+            },
+        );
+
+        let boosts = std::collections::HashMap::new();
+        let (none_hits, none_total) =
+            mem.search_text_boosted_with_total("quicklist", &["body"], 10, &boosts);
+        let (ext_hits, ext_total) = mem.search_text_boosted_with_total_using(
+            "quicklist",
+            &["body"],
+            10,
+            &boosts,
+            Some(&cs),
+        );
+
+        assert_eq!(none_total, 2, "sanity: two live matches");
+        assert_eq!(ext_total, none_total, "totals must agree between modes");
+        assert_eq!(none_hits.len(), 2);
+        assert_eq!(ext_hits.len(), 2);
+        for (n, e) in none_hits.iter().zip(ext_hits.iter()) {
+            assert_eq!(n.doc_id, e.doc_id, "hit order diverged between modes");
+            assert_eq!(
+                n.score.to_bits(),
+                e.score.to_bits(),
+                "{}: external-mode fallback scored {} vs None-mode {} — the \
+                 scalar N dropped the ghost from IDF",
+                n.doc_id,
+                e.score,
+                n.score
+            );
+        }
     }
 }

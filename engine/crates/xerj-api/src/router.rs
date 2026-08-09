@@ -290,7 +290,10 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             get(es_compat::get_settings).put(es_compat::put_settings),
         )
         // ── Index blocks ───────────────────────────────────────────────────
-        .route("/:index/_block/:block", put(es_compat::put_index_block))
+        .route(
+            "/:index/_block/:block",
+            put(es_compat::put_index_block).delete(es_compat::delete_index_block),
+        )
         // ── Explain ────────────────────────────────────────────────────────
         .route(
             "/:index/_explain/:id",

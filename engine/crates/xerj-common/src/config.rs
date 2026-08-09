@@ -269,6 +269,42 @@ impl Config {
             self.server.bind_address, self.server.es_compat_port
         )
     }
+
+    /// Is `server.bind_address` confined to the local host?
+    ///
+    /// Only a loopback literal counts. `0.0.0.0` and `::` are *unspecified*,
+    /// not loopback — they bind every interface the host has, which is the
+    /// exposure this predicate exists to detect, and they are also the
+    /// shipped default. An address that does not parse is reported as not
+    /// confined: it fails closed here, and the `SocketAddr` parse at bind
+    /// time rejects it a moment later anyway.
+    pub fn bind_address_is_loopback(&self) -> bool {
+        self.server
+            .bind_address
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map(crate::net::canonical_ip)
+            .is_ok_and(|ip| ip.is_loopback())
+    }
+
+    /// Would starting now put a cleartext gRPC listener on a network-reachable
+    /// interface while the operator believes TLS covers the node? (issue #229)
+    ///
+    /// True only when all three hold: TLS is on, the bind address is not
+    /// confined to loopback, and the operator has not declared the exposure
+    /// intentional via `tls.allow_insecure_grpc_h2c`. The caller's job is to
+    /// refuse to start — see `xerj-server/src/main.rs`.
+    ///
+    /// The shape is Elasticsearch's bootstrap-check idea (approach only, no
+    /// code: `BootstrapChecks.java:58-70` gates enforcement on the transport
+    /// being bound off-loopback and offers one explicit override). Two
+    /// deliberate departures: ES also exempts link-local, which is still
+    /// reachable by every other host on the link, so this does not; and the
+    /// override lives in the config file the setting it relaxes lives in,
+    /// rather than a JVM system property.
+    pub fn grpc_h2c_exposed_off_loopback(&self) -> bool {
+        self.tls.enabled && !self.tls.allow_insecure_grpc_h2c && !self.bind_address_is_loopback()
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -484,7 +520,7 @@ pub struct CorsConfig {
 
 /// TLS settings.
 ///
-/// **3 settings.**
+/// **4 settings.**
 ///
 /// Defaults are derived: TLS is disabled (`enabled: false`) with empty
 /// cert/key paths so the engine starts out of the box; enable it in
@@ -492,12 +528,34 @@ pub struct CorsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TlsConfig {
-    /// Enable TLS on all listeners (default: `false` — enable in production).
+    /// Enable in-process TLS termination on the **REST and ES-compat**
+    /// listeners (default: `false` — enable in production).
+    ///
+    /// It does **not** cover the gRPC listener: `xerj-server/src/grpc.rs`
+    /// builds tonic without its `tls` feature, so `server.grpc_port` speaks
+    /// cleartext HTTP/2 (h2c) whatever this is set to (issue #229). Enabling
+    /// TLS while binding off-loopback therefore refuses to start unless
+    /// [`TlsConfig::allow_insecure_grpc_h2c`] says the exposure is intended.
     pub enabled: bool,
     /// Path to the PEM-encoded certificate file.
     pub cert_path: String,
     /// Path to the PEM-encoded private key file.
     pub key_path: String,
+    /// Permit the cleartext h2c gRPC listener on a network-reachable
+    /// interface while `enabled` is `true` (default: `false` — refuse).
+    ///
+    /// An operator who turns TLS on reasonably reads that as "every listener
+    /// is encrypted", and nothing on the wire corrects them: gRPC clients keep
+    /// working, so credentials and documents cross the network in the clear
+    /// with no symptom. Rather than downgrade silently, startup fails closed
+    /// and names this setting as the way to say the exposure is deliberate —
+    /// for example when a sidecar or service mesh terminates TLS in front of
+    /// `server.grpc_port`.
+    ///
+    /// Irrelevant when `enabled` is `false`: nothing then claims the gRPC
+    /// port is encrypted, and the startup banner already says the listeners
+    /// are plain TCP.
+    pub allow_insecure_grpc_h2c: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1594,7 +1652,8 @@ mod tests {
         //   server: 6      (rest_port, grpc_port, es_compat_port, data_dir,
         //                   bind_address, trusted_proxies)
         //   auth:   3      (enabled, admin_api_key, metrics_token)   ← RC4-W4 item 4
-        //   tls:    3      (enabled, cert_path, key_path)
+        //   tls:    4      (enabled, cert_path, key_path,
+        //                   allow_insecure_grpc_h2c)             ← issue #229
         //   storage: 10    (wal_sync, wal_batch_ms, wal_max_size_mb, flush_size_mb,
         //                   flush_interval_secs, backend, s3_bucket, s3_prefix,
         //                   s3_region, local_cache_dir)
@@ -1611,9 +1670,70 @@ mod tests {
         //   indexing: 3    (turbo_batch_size, turbo_parallel, turbo_fast_analyzer)
         //   logging: 2     (format, access_log)                      ← RC4-W4 item 6
         //   ─────────
-        //   total: 60 fields, minus 1 auto-generated (admin_api_key) = 59 meaningful user settings
-        let total: usize = 6 + 3 + 3 + 10 + 5 + 3 + 1 + 6 + 2 + 4 + 12 + 3 + 2;
-        assert_eq!(total, 60);
+        //   total: 61 fields, minus 1 auto-generated (admin_api_key) = 60 meaningful user settings
+        let total: usize = 6 + 3 + 4 + 10 + 5 + 3 + 1 + 6 + 2 + 4 + 12 + 3 + 2;
+        assert_eq!(total, 61);
+    }
+
+    // ── gRPC h2c exposure: fail closed (issue #229) ──────────────────────────
+
+    /// The reported default in `xerj.toml`-less deployments. `0.0.0.0` binds
+    /// every interface, so "TLS on, defaults otherwise" is exactly the case
+    /// that must be caught — this is the assertion that fails without the fix.
+    #[test]
+    fn tls_on_with_default_bind_flags_grpc_h2c_exposure() {
+        let cfg = Config::from_toml_str(
+            "[tls]\nenabled = true\ncert_path = \"/c.pem\"\nkey_path = \"/k.pem\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.server.bind_address, "0.0.0.0");
+        assert!(!cfg.bind_address_is_loopback(), "0.0.0.0 is not loopback");
+        assert!(cfg.grpc_h2c_exposed_off_loopback());
+    }
+
+    #[test]
+    fn tls_on_bound_to_loopback_is_fine() {
+        for bind in ["127.0.0.1", "127.0.0.5", "::1", "::ffff:127.0.0.1"] {
+            let cfg = Config::from_toml_str(&format!(
+                "[server]\nbind_address = \"{bind}\"\n\
+                 [tls]\nenabled = true\ncert_path = \"/c.pem\"\nkey_path = \"/k.pem\"\n"
+            ))
+            .unwrap();
+            assert!(cfg.bind_address_is_loopback(), "{bind} should be loopback");
+            assert!(!cfg.grpc_h2c_exposed_off_loopback(), "{bind} must not trip");
+        }
+    }
+
+    #[test]
+    fn tls_off_never_trips_the_check() {
+        // Nothing claims the port is encrypted, so there is no false promise
+        // to fail closed on — the banner already says the listeners are plain.
+        let cfg = Config::from_toml_str("[server]\nbind_address = \"0.0.0.0\"\n").unwrap();
+        assert!(!cfg.tls.enabled);
+        assert!(!cfg.grpc_h2c_exposed_off_loopback());
+    }
+
+    #[test]
+    fn explicit_opt_out_permits_the_exposure() {
+        let cfg = Config::from_toml_str(
+            "[server]\nbind_address = \"10.0.0.7\"\n\
+             [tls]\nenabled = true\ncert_path = \"/c.pem\"\nkey_path = \"/k.pem\"\n\
+             allow_insecure_grpc_h2c = true\n",
+        )
+        .unwrap();
+        assert!(!cfg.grpc_h2c_exposed_off_loopback());
+    }
+
+    #[test]
+    fn routable_bind_with_tls_trips_the_check() {
+        for bind in ["10.0.0.7", "0.0.0.0", "::", "fe80::1", "not-an-ip"] {
+            let cfg = Config::from_toml_str(&format!(
+                "[server]\nbind_address = \"{bind}\"\n\
+                 [tls]\nenabled = true\ncert_path = \"/c.pem\"\nkey_path = \"/k.pem\"\n"
+            ))
+            .unwrap();
+            assert!(cfg.grpc_h2c_exposed_off_loopback(), "{bind} must trip");
+        }
     }
 
     // ── Cluster auth: fail closed (issue #75) ────────────────────────────────

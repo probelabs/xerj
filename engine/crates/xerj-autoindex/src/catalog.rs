@@ -103,6 +103,13 @@ pub fn dataset_doc(inp: &DatasetDocInput) -> (String, Value) {
     (id, doc)
 }
 
+/// Catalog document id for a file. One definition, because the sweep that
+/// removes a junk/skipped file's document (`lib.rs`, "stale junk-catalog
+/// sweep") has to name the id without holding the document.
+pub fn file_id(file_key: &str) -> String {
+    format!("file:{file_key}")
+}
+
 #[allow(clippy::too_many_arguments)] // 1:1 with the file-status doc's fields
 pub fn file_doc(
     file_key: &str,
@@ -116,7 +123,7 @@ pub fn file_doc(
     run_id: &str,
 ) -> (String, Value) {
     (
-        format!("file:{file_key}"),
+        file_id(file_key),
         json!({
             "doc_kind": "file",
             "file_key": file_key,

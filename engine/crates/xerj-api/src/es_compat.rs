@@ -14691,6 +14691,9 @@ pub fn schema_to_es_properties(schema: &Schema) -> serde_json::Map<String, Value
         let es_type = native_type_to_es(&field.field_type);
         let mut field_obj = serde_json::Map::new();
         field_obj.insert("type".to_string(), Value::String(es_type.to_string()));
+        if let Some(n) = field.options.ignore_above {
+            field_obj.insert("ignore_above".to_string(), Value::Number(n.into()));
+        }
         if !field.fields.is_empty() {
             let sub_schema = Schema {
                 fields: field.fields.clone(),
@@ -14698,7 +14701,17 @@ pub fn schema_to_es_properties(schema: &Schema) -> serde_json::Map<String, Value
                 updated_at: Utc::now(),
             };
             let sub_props = schema_to_es_properties(&sub_schema);
-            field_obj.insert("properties".to_string(), Value::Object(sub_props));
+            // Children of an object-like parent are real sub-properties;
+            // children of a LEAF parent are multi-fields (e.g. the
+            // auto-created `keyword` sub-field on a dynamically mapped
+            // string, #209) and ES renders those under `fields`, not
+            // `properties` — `_field_caps` also discovers `<f>.keyword`
+            // from exactly this `fields` shape (`collect_multi_fields`).
+            let key = match field.field_type {
+                FieldType::Object | FieldType::Nested => "properties",
+                _ => "fields",
+            };
+            field_obj.insert(key.to_string(), Value::Object(sub_props));
         }
         props.insert(field.name.clone(), Value::Object(field_obj));
     }
@@ -18738,6 +18751,91 @@ mod flat_object_field_caps_tests {
         );
     }
 
+    /// #209: dynamic mapping inferred every string as bare `text` — no
+    /// `keyword` multi-field — so `GET _mapping` never advertised
+    /// `<field>.keyword` and `_field_caps` (what Kibana uses for field
+    /// discovery) never listed it, even though the query path resolves it.
+    /// ES default dynamic mapping emits
+    /// `{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}}`;
+    /// mirror that shape for dynamically discovered strings.
+    #[tokio::test]
+    async fn dynamic_string_mapping_advertises_keyword_multi_field() {
+        let router = crate::router::build_es_compat_router(test_state());
+
+        // Auto-create the index by writing a doc — pure dynamic mapping.
+        let write = router
+            .clone()
+            .oneshot(
+                Request::put("/dyn-kw-e2e/_doc/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"category": "books", "city": "New York", "price": 9.99}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("write response");
+        assert!(write.status().is_success());
+
+        // GET _mapping must render the ES default multi-field shape.
+        let mapping_resp = router
+            .clone()
+            .oneshot(
+                Request::get("/dyn-kw-e2e/_mapping")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("mapping response");
+        assert!(mapping_resp.status().is_success());
+        let bytes = to_bytes(mapping_resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let mapping: Value = serde_json::from_slice(&bytes).expect("JSON response");
+        let props = &mapping["dyn-kw-e2e"]["mappings"]["properties"];
+        for f in ["category", "city"] {
+            assert_eq!(props[f]["type"], "text", "{f} type, got: {mapping}");
+            assert_eq!(
+                props[f]["fields"]["keyword"]["type"], "keyword",
+                "{f} must carry a keyword multi-field, got: {mapping}"
+            );
+            assert_eq!(
+                props[f]["fields"]["keyword"]["ignore_above"], 256,
+                "{f}.keyword must advertise ignore_above 256, got: {mapping}"
+            );
+        }
+        // Numbers stay plain — no multi-field.
+        assert_eq!(props["price"]["type"], "double", "got: {mapping}");
+        assert!(
+            props["price"].get("fields").is_none(),
+            "price must not grow a multi-field: {mapping}"
+        );
+
+        // _field_caps must list `<field>.keyword` as an aggregatable keyword
+        // (this is how Kibana/index-pattern discovery finds it).
+        let caps_resp = router
+            .oneshot(
+                Request::get("/dyn-kw-e2e/_field_caps?fields=*")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("field_caps response");
+        assert!(caps_resp.status().is_success());
+        let bytes = to_bytes(caps_resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let caps: Value = serde_json::from_slice(&bytes).expect("JSON response");
+        assert_eq!(
+            caps["fields"]["category.keyword"]["keyword"]["aggregatable"], true,
+            "category.keyword must be an aggregatable keyword in _field_caps, got: {caps}"
+        );
+        assert_eq!(
+            caps["fields"]["city.keyword"]["keyword"]["type"], "keyword",
+            "city.keyword must appear in _field_caps, got: {caps}"
+        );
+    }
+
     /// Regression test for a real bug found live: `GET _mapping` correctly
     /// round-trips `float`/`integer` (it returns the stored mapping JSON
     /// verbatim), but `_field_caps` derived its reported type from the
@@ -21401,6 +21499,56 @@ pub async fn cat_shards(
 // PUT /{index}/_settings — update index settings
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Republish an index's authoritative `index.blocks` map into the display-side
+/// `engine.index_settings` entry that `GET /{index}/_settings` serves.
+///
+/// Enforcement reads `Index::settings` (persisted at `<index>/settings.json`);
+/// `GET /_settings` reads the separate `engine.index_settings` map. Without this
+/// mirror the two disagree — a block set through `PUT /_block/{block}` was
+/// enforced but invisible, which is how "I can't tell whether the block is
+/// still on" turns into "I can't get rid of it".
+async fn sync_display_blocks(state: &AppState, name: &str) {
+    let Ok(idx) = state.engine.get_index(name) else {
+        return;
+    };
+    let blocks = idx
+        .get_settings()
+        .await
+        .pointer("/index/blocks")
+        .cloned()
+        .filter(|b| b.as_object().is_some_and(|m| !m.is_empty()));
+
+    let mut display = state
+        .engine
+        .index_settings
+        .get(name)
+        .map(|v| v.clone())
+        .unwrap_or_else(|| json!({ "index": {} }));
+    if !display.is_object() {
+        display = json!({ "index": {} });
+    }
+    let root = display.as_object_mut().unwrap();
+    if !root.get("index").is_some_and(Value::is_object) {
+        root.insert("index".to_string(), json!({}));
+    }
+    let inner = root.get_mut("index").unwrap().as_object_mut().unwrap();
+    // Drop any dotted spellings a settings PUT may have left behind, so the
+    // nested map below is the single rendering of the block state.
+    inner.retain(|k, _| !k.starts_with("blocks."));
+    match blocks {
+        Some(b) => {
+            inner.insert("blocks".to_string(), b);
+        }
+        None => {
+            inner.remove("blocks");
+        }
+    }
+    state
+        .engine
+        .index_settings
+        .insert(name.to_string(), display);
+}
+
 pub async fn put_settings(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -21440,6 +21588,21 @@ pub async fn put_settings(
             }
         }
         state.engine.index_settings.insert(idx.clone(), existing);
+    }
+
+    // `index.blocks.*` is not a display-only setting: it gates writes and reads
+    // in the engine, whose `Index::settings` is a different store from the
+    // `engine.index_settings` map updated above. Forward the block keys so a
+    // settings PUT can both set *and clear* a block — previously it updated only
+    // the display copy, leaving every block permanent once set.
+    for name in &targets {
+        let Ok(idx) = state.engine.get_index(name) else {
+            continue;
+        };
+        if let Err(e) = idx.apply_block_settings(&body).await {
+            return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+        }
+        sync_display_blocks(&state, name).await;
     }
 
     Json(json!({ "acknowledged": true })).into_response()
@@ -28165,42 +28328,60 @@ pub async fn get_mapping_field(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PUT /{index}/_block/{block}
+// PUT    /{index}/_block/{block}   — add a block
+// DELETE /{index}/_block/{block}   — remove it again
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn put_index_block(
-    State(state): State<AppState>,
-    Path((index, block)): Path<(String, String)>,
-) -> impl IntoResponse {
+/// Shared body of the two `_block` verbs.
+///
+/// `enabled` selects add vs remove. Removal exists because the only other way
+/// off a block — `PUT /_settings` — used to write the display copy alone, so an
+/// index that took a block could never be un-blocked without a restart.
+async fn set_index_block(
+    state: AppState,
+    index: String,
+    block: String,
+    enabled: bool,
+) -> axum::response::Response {
     let idx = match state.engine.get_index(&index) {
         Ok(i) => i,
         Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
-    // Validate block name.
-    let valid_blocks = [
-        "read_only",
-        "read_only_allow_delete",
-        "write",
-        "metadata",
-        "read",
-    ];
-    if !valid_blocks.contains(&block.as_str()) {
+    if !xerj_engine::Index::BLOCK_NAMES.contains(&block.as_str()) {
         let e = xerj_common::XerjError::invalid_query(format!(
-            "invalid index block: {block}; valid values are: read_only, read_only_allow_delete, write, metadata, read"
+            "invalid index block: {block}; valid values are: {}",
+            xerj_engine::Index::BLOCK_NAMES.join(", ")
         ));
         return ApiError::new(e).into_response();
     }
 
-    match idx.set_block(&block).await {
-        Ok(()) => Json(json!({
-            "acknowledged": true,
-            "shards_acknowledged": true,
-            "indices": [{ "name": index, "blocked": true }]
-        }))
-        .into_response(),
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    if let Err(e) = idx.set_block_state(&block, enabled).await {
+        return ApiError::new(xerj_common::XerjError::from(e)).into_response();
     }
+    // Keep GET /_settings in step with what is actually enforced.
+    sync_display_blocks(&state, &index).await;
+
+    Json(json!({
+        "acknowledged": true,
+        "shards_acknowledged": true,
+        "indices": [{ "name": index, "blocked": enabled }]
+    }))
+    .into_response()
+}
+
+pub async fn put_index_block(
+    State(state): State<AppState>,
+    Path((index, block)): Path<(String, String)>,
+) -> impl IntoResponse {
+    set_index_block(state, index, block, true).await
+}
+
+pub async fn delete_index_block(
+    State(state): State<AppState>,
+    Path((index, block)): Path<(String, String)>,
+) -> impl IntoResponse {
+    set_index_block(state, index, block, false).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

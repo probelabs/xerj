@@ -6005,10 +6005,10 @@ impl Index {
         external_version: Option<(u64, bool)>,
     ) -> Result<IndexResponse> {
         // Check write block.
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Default-format date validation — before any durable write so a
@@ -6329,10 +6329,10 @@ impl Index {
             return Ok(Vec::new());
         }
 
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Process-wide admission: disk flood-stage block (item 3) + parent
@@ -6678,10 +6678,10 @@ impl Index {
             return Ok(Vec::new());
         }
         let batch_len = docs.len();
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Process-wide admission: disk flood-stage block (item 3) + parent
@@ -7481,10 +7481,10 @@ impl Index {
             return Ok(Vec::new());
         }
 
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Process-wide admission: disk flood-stage block (item 3) + parent
@@ -12060,10 +12060,10 @@ impl Index {
         if_primary_term: Option<u64>,
     ) -> Result<DeleteDocOutcome> {
         // Check write block.
-        if self.is_write_blocked().await {
+        if let Some(block) = self.write_block_reason().await {
             return Err(EngineError::Common(xerj_common::XerjError::index_blocked(
                 self.name.as_str(),
-                "write",
+                block,
             )));
         }
         // Process-wide admission: disk flood-stage block (item 3) + parent
@@ -13161,6 +13161,18 @@ impl Index {
         // post-pass over the rendered page (`apply_highlight`), so at `size: 0`
         // — where there is no page — it has nothing to do, and a `size: 0` body
         // must execute identically with and without it.
+        //
+        // `min_score` IS in this list (#193): the threshold applies to FINAL
+        // scores, so a `size:0 + min_score` count must score its matches
+        // exactly like `size:N` does — count-only mode would close the
+        // index-wide stats gate below (per-arm scores; a different threshold
+        // scale than the size:N page, user-visible since #192) and skip
+        // materialisation entirely, leaving the post-collection min_score
+        // filter nothing to subtract, i.e. a total that ignores the
+        // threshold.  Same call ES makes: `QueryPhaseCollector` refuses the
+        // `Weight#count` shortcut whenever min_score is set and collects
+        // only docs with `scorer.score() >= minScore` (approach only,
+        // QueryPhaseCollector.java:77-79,123 — no code copied).
         let need_hits_output: bool = size > 0;
         let need_sources_for_post: bool = need_hits_output
             || !request.rescore.is_empty()
@@ -13169,7 +13181,8 @@ impl Index {
                 .sort
                 .iter()
                 .any(|sf| !sf.is_score() && !sf.is_doc_order())
-            || request.aggs.is_some();
+            || request.aggs.is_some()
+            || request.min_score.is_some();
         let count_only: bool = !need_sources_for_post;
 
         // --- Memtable search ---
@@ -13661,8 +13674,14 @@ impl Index {
             }
             stats_cell
                 .get_or_init(|| {
-                    self.build_collection_stats(&snap, query, &text_fields, &exact_fields)
-                        .map(Arc::new)
+                    self.build_collection_stats(
+                        &snap,
+                        query,
+                        &text_fields,
+                        &exact_fields,
+                        mem_doc_count,
+                    )
+                    .map(Arc::new)
                 })
                 .clone()
         };
@@ -17050,58 +17069,190 @@ impl Index {
         Ok(())
     }
 
-    /// Returns true if the write block is set on this index.
-    pub async fn is_write_blocked(&self) -> bool {
-        let settings = self.settings.read().await;
-        settings
-            .pointer("/index/blocks/write")
-            .and_then(Value::as_bool)
+    /// Every block name the `_block` API and `index.blocks.*` settings accept.
+    pub const BLOCK_NAMES: [&'static str; 5] = [
+        "read_only",
+        "read_only_allow_delete",
+        "write",
+        "metadata",
+        "read",
+    ];
+
+    /// Every JSON location one `index.blocks.<name>` flag can occupy in a
+    /// stored settings document, canonical form first.
+    ///
+    /// A settings body is stored the way the client wrote it — `PUT /{index}`
+    /// forwards its `settings` blob to `Index::new` verbatim — and ES accepts
+    /// the nested and the dotted spellings interchangeably. Reading only the
+    /// nested one meant an index created with
+    /// `{"settings": {"index.blocks.write": true}}` reported no block and
+    /// admitted every write.
+    fn block_flag_pointers(name: &str) -> [String; 4] {
+        [
+            format!("/index/blocks/{name}"),
+            format!("/index/blocks.{name}"),
+            format!("/index.blocks.{name}"),
+            format!("/blocks/{name}"),
+        ]
+    }
+
+    /// Reads one `index.blocks.<name>` flag in whichever spelling it was stored
+    /// under. Accepts the boolean `true` and the string `"true"` — ES
+    /// normalises index settings to strings on the wire, so a settings round
+    /// trip can hand us either shape.
+    fn block_flag(settings: &Value, name: &str) -> bool {
+        Self::block_flag_pointers(name)
+            .iter()
+            .find_map(|p| match settings.pointer(p) {
+                Some(Value::Bool(b)) => Some(*b),
+                Some(Value::String(s)) => Some(s.eq_ignore_ascii_case("true")),
+                _ => None,
+            })
             .unwrap_or(false)
     }
 
+    /// Names the block that is currently denying **writes** on this index, or
+    /// `None` when writes are admitted.
+    ///
+    /// The returned name is threaded into `XerjError::IndexBlocked` so the HTTP
+    /// layer can pick the status ES picks. Three settings deny writes, and they
+    /// do *not* all answer the same status:
+    ///
+    /// | setting | denies | status |
+    /// |---|---|---|
+    /// | `index.blocks.write` | writes | 403 |
+    /// | `index.blocks.read_only` | writes + metadata changes | 403 |
+    /// | `index.blocks.read_only_allow_delete` | writes (incl. doc deletes) | 429 |
+    ///
+    /// Precedence is 403-before-429, matching how ES collapses a multi-block
+    /// `ClusterBlockException` down to one status: a non-retryable block always
+    /// wins over a retryable one
+    /// (`cluster/block/ClusterBlockException.java:95-107`, approach only — ES is
+    /// AGPL/SSPL/Elastic-2.0 and no code from it is reproduced here).
+    ///
+    /// Note what is deliberately **absent**: none of these deny *reads*. Only
+    /// `index.blocks.read` does that. `read_only` means "readable, not
+    /// writable", and `read_only_allow_delete` is the disk flood-stage block —
+    /// the "allow delete" is index deletion, not document deletion
+    /// (`docs/reference/elasticsearch/index-settings/index-block.md:29-34`:
+    /// "When `index.blocks.read_only_allow_delete` is set to `true`, deleting
+    /// documents is not permitted. However, deleting the index entirely …
+    /// is still permitted").
+    pub async fn write_block_reason(&self) -> Option<&'static str> {
+        let settings = self.settings.read().await;
+        for name in ["write", "read_only", "read_only_allow_delete"] {
+            if Self::block_flag(&settings, name) {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Returns true if any write-denying block is set on this index.
+    pub async fn is_write_blocked(&self) -> bool {
+        self.write_block_reason().await.is_some()
+    }
+
     /// Returns true if the read block is set on this index.
+    ///
+    /// Only `index.blocks.read` denies reads. `read_only` and
+    /// `read_only_allow_delete` leave the index searchable — see
+    /// [`Self::write_block_reason`].
     pub async fn is_read_blocked(&self) -> bool {
         let settings = self.settings.read().await;
-        settings
-            .pointer("/index/blocks/read")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        Self::block_flag(&settings, "read")
+    }
+
+    /// Erase every spelling of one block flag from a settings document, leaving
+    /// the canonical nested slot for the caller to write (or leave absent).
+    fn remove_block_spellings(settings: &mut Value, name: &str) {
+        let Some(root) = settings.as_object_mut() else {
+            return;
+        };
+        root.remove(&format!("index.blocks.{name}"));
+        if let Some(blocks) = root.get_mut("blocks").and_then(Value::as_object_mut) {
+            blocks.remove(name);
+        }
+        if let Some(index) = root.get_mut("index").and_then(Value::as_object_mut) {
+            index.remove(&format!("blocks.{name}"));
+            if let Some(blocks) = index.get_mut("blocks").and_then(Value::as_object_mut) {
+                blocks.remove(name);
+            }
+        }
     }
 
     /// Set a named block on the index (`read_only`, `read_only_allow_delete`, `write`, `metadata`, `read`).
     ///
     /// Stores as `index.blocks.<block_name> = true` in the settings.
     pub async fn set_block(&self, block_name: &str) -> Result<()> {
+        self.set_block_state(block_name, true).await
+    }
+
+    /// Clear a named block. The inverse of [`Self::set_block`], and what both
+    /// `DELETE /{index}/_block/{block}` and a
+    /// `PUT /{index}/_settings {"index.blocks.<name>": false}` land on.
+    pub async fn clear_block(&self, block_name: &str) -> Result<()> {
+        self.set_block_state(block_name, false).await
+    }
+
+    /// Set or clear `index.blocks.<block_name>`, persisting the result.
+    ///
+    /// Stores exactly the block the caller named — no alias expansion. Deriving
+    /// the effect at read time ([`Self::write_block_reason`]) instead of writing
+    /// derived flags at set time is what makes removal work: with expansion, a
+    /// `read_only` block left an independent `blocks.write: true` behind that
+    /// clearing `read_only` could not reach.
+    ///
+    /// Both directions first drop every non-canonical spelling of the block
+    /// ([`Self::block_flag_pointers`]), so a dotted key left by a create-time
+    /// settings body cannot outlive the nested key and silently re-block the
+    /// index — the same "block with no removal path" shape this fixes.
+    pub async fn set_block_state(&self, block_name: &str, enabled: bool) -> Result<()> {
         let mut settings = {
             let guard = self.settings.read().await;
             guard.clone()
         };
 
-        // Ensure nested structure: settings["index"]["blocks"][block_name] = true
-        if settings.is_null() {
+        // Ensure nested structure: settings["index"]["blocks"][block_name].
+        if !settings.is_object() {
             settings = Value::Object(serde_json::Map::new());
         }
+        Self::remove_block_spellings(&mut settings, block_name);
         let obj = settings.as_object_mut().unwrap();
-        let index_obj = obj
+        let index_obj = match obj
             .entry("index")
             .or_insert_with(|| Value::Object(serde_json::Map::new()))
             .as_object_mut()
-            .unwrap();
-        let blocks_obj = index_obj
+        {
+            Some(o) => o,
+            // A non-object `index` value (corrupt settings.json) — replace it
+            // rather than panic.
+            None => {
+                obj.insert("index".to_string(), Value::Object(serde_json::Map::new()));
+                obj.get_mut("index").unwrap().as_object_mut().unwrap()
+            }
+        };
+        let blocks_obj = match index_obj
             .entry("blocks")
             .or_insert_with(|| Value::Object(serde_json::Map::new()))
             .as_object_mut()
-            .unwrap();
-        blocks_obj.insert(block_name.to_string(), Value::Bool(true));
-
-        // Handle aliases: read_only also sets both read + write blocks.
-        if block_name == "read_only" {
-            blocks_obj.insert("read".to_string(), Value::Bool(true));
-            blocks_obj.insert("write".to_string(), Value::Bool(true));
-        }
-        if block_name == "read_only_allow_delete" {
-            blocks_obj.insert("read".to_string(), Value::Bool(true));
-            // write is NOT blocked (only delete is allowed)
+        {
+            Some(o) => o,
+            None => {
+                index_obj.insert("blocks".to_string(), Value::Object(serde_json::Map::new()));
+                index_obj
+                    .get_mut("blocks")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+            }
+        };
+        if enabled {
+            blocks_obj.insert(block_name.to_string(), Value::Bool(true));
+        } else {
+            // Removing the key rather than storing `false` keeps a cleared
+            // block out of GET /_settings, which is what ES shows.
+            blocks_obj.remove(block_name);
         }
 
         let path = self.data_dir.join("settings.json");
@@ -17109,6 +17260,86 @@ impl Index {
         write_file_atomic(&path, &bytes).map_err(EngineError::Io)?;
         *self.settings.write().await = settings;
         Ok(())
+    }
+
+    /// Apply an `index.blocks` sub-document from a settings update.
+    ///
+    /// Accepts the nested (`{"index": {"blocks": {"write": false}}}`), dotted
+    /// (`{"index.blocks.write": false}`) and bare (`{"blocks": {...}}`) shapes
+    /// that ES settings bodies come in. Values may be JSON booleans or the
+    /// strings `"true"`/`"false"` — ES stringifies index settings on the wire.
+    ///
+    /// Returns the block names that changed state.
+    pub async fn apply_block_settings(&self, body: &Value) -> Result<Vec<String>> {
+        let as_bool = |v: &Value| -> Option<bool> {
+            match v {
+                Value::Bool(b) => Some(*b),
+                Value::String(s) if s.eq_ignore_ascii_case("true") => Some(true),
+                Value::String(s) if s.eq_ignore_ascii_case("false") => Some(false),
+                Value::Null => Some(false),
+                _ => None,
+            }
+        };
+
+        // Collect name → desired state from every accepted shape.
+        let mut wanted: Vec<(String, bool)> = Vec::new();
+        let mut collect_nested = |blocks: &Value| {
+            if let Some(map) = blocks.as_object() {
+                for (name, v) in map {
+                    if Self::BLOCK_NAMES.contains(&name.as_str()) {
+                        if let Some(b) = as_bool(v) {
+                            wanted.push((name.clone(), b));
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(b) = body.pointer("/index/blocks") {
+            collect_nested(b);
+        }
+        if let Some(b) = body.get("blocks") {
+            collect_nested(b);
+        }
+        if let Some(map) = body.as_object() {
+            for (k, v) in map {
+                let name = k
+                    .strip_prefix("index.blocks.")
+                    .or_else(|| k.strip_prefix("blocks."));
+                if let Some(name) = name {
+                    if Self::BLOCK_NAMES.contains(&name) {
+                        if let Some(b) = as_bool(v) {
+                            wanted.push((name.to_string(), b));
+                        }
+                    }
+                }
+            }
+        }
+        // `{"index": {"blocks.write": false}}` — dotted under a nested `index`.
+        if let Some(map) = body.get("index").and_then(Value::as_object) {
+            for (k, v) in map {
+                if let Some(name) = k.strip_prefix("blocks.") {
+                    if Self::BLOCK_NAMES.contains(&name) {
+                        if let Some(b) = as_bool(v) {
+                            wanted.push((name.to_string(), b));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut applied = Vec::new();
+        for (name, enabled) in wanted {
+            let current = {
+                let guard = self.settings.read().await;
+                Self::block_flag(&guard, &name)
+            };
+            if current == enabled {
+                continue;
+            }
+            self.set_block_state(&name, enabled).await?;
+            applied.push(name);
+        }
+        Ok(applied)
     }
 
     // ── Schema ────────────────────────────────────────────────────────────────
@@ -17352,8 +17583,8 @@ impl Index {
                         continue;
                     }
                     if !schema.schema.has_field(key) && !out.iter().any(|(k, _)| k == key) {
-                        let ft = infer_field_type(val, date_detection);
-                        out.push((key.clone(), FieldConfig::new(key.clone(), ft)));
+                        let fc = dynamic_field_config(key, val, date_detection);
+                        out.push((key.clone(), fc));
                     }
                 }
             }
@@ -17435,10 +17666,7 @@ impl Index {
                 .filter(|(key, _)| {
                     !key.starts_with(PASSAGE_METADATA_PREFIX) && !schema.schema.has_field(key)
                 })
-                .map(|(key, val)| {
-                    let ft = infer_field_type(val, date_detection);
-                    (key.clone(), FieldConfig::new(key.clone(), ft))
-                })
+                .map(|(key, val)| (key.clone(), dynamic_field_config(key, val, date_detection)))
                 .collect()
         };
 
@@ -19186,20 +19414,33 @@ impl Index {
     /// The caller then keeps the historical per-arm statistics.
     ///
     /// COST.  Per segment this opens a STATS-ONLY reader
-    /// (`FtsIndexReader::open_stats_only`): the FST is mmap'd and `.meta` is
-    /// read, but the postings envelope (whole-file read + zstd decompress) and
-    /// the norms table (O(docs)) are skipped — they are the expensive parts of
-    /// a full open and the statistics never touch them.  The pre-pass also
-    /// cannot defeat the two read-path fast paths it sits near: F1's
-    /// early-break requires `!query_needs_fts`, and the `term_doc_freq`
-    /// count-only shortcut requires `count_only` — the caller gates this
-    /// whole block off for both.
+    /// (`FtsIndexReader::open_stats_only`): the FST is mmap'd and the `.meta`
+    /// side-car is read AND ZFM4-decoded — a zstd decompress of the
+    /// `num_terms × 24`-byte records section, so O(field vocabulary), small
+    /// but not free (#193).  What IS skipped are the two expensive parts of a
+    /// full open: the postings envelope (whole-file read + zstd decompress of
+    /// every posting list, O(index bytes)) and the norms table (O(docs)) —
+    /// the statistics never touch either.  The pre-pass also cannot defeat
+    /// the two read-path fast paths it sits near: F1's early-break requires
+    /// `!query_needs_fts`, and the `term_doc_freq` count-only shortcut
+    /// requires `count_only` — the caller gates this whole block off for
+    /// both.
+    ///
+    /// `mem_doc_count` is the caller's ONE point-in-time memtable count —
+    /// captured next to the segment snapshot and already the input to the
+    /// `stats_gate_open` arm arithmetic (#193).  Re-reading
+    /// `self.memtable.doc_count()` here made the include-the-memtable
+    /// decision from a SECOND, later reading that could disagree with the
+    /// gate's (and re-paid the 16-shard lock fan-out the capture exists to
+    /// avoid).  The stats CONTENT still reads the live shards — exactly like
+    /// the memtable search arm it feeds, which holds no snapshot either.
     fn build_collection_stats(
         &self,
         snap: &xerj_storage::index_store::IndexSnapshot,
         query: &QueryNode,
         text_fields: &[String],
         exact_fields: &HashSet<String>,
+        mem_doc_count: usize,
     ) -> Option<xerj_fts::CollectionStats> {
         // Widest (field × term) pre-pass we will pay for.  A field-less
         // `query_string` over a wide mapping can project hundreds of leaves;
@@ -19225,7 +19466,7 @@ impl Index {
         // any token the segment projection never named (per-field analyzers
         // can differ) joins `pairs` and gets its segment-side df in the single
         // pass below, instead of the memtable silently keeping a local df.
-        let mem_stats: Option<xerj_fts::CollectionStats> = if self.memtable.doc_count() > 0 {
+        let mem_stats: Option<xerj_fts::CollectionStats> = if mem_doc_count > 0 {
             extract_query_text(query)
                 .and_then(|text| self.memtable.collection_stats(&text, &field_refs))
         } else {
@@ -27207,6 +27448,35 @@ fn infer_field_type(val: &Value, date_detection: bool) -> FieldType {
     }
 }
 
+/// ES `ignore_above` default on the auto-created `keyword` sub-field of a
+/// dynamically mapped string (ES `DynamicFieldsBuilder`: `TextFieldMapper` +
+/// `KeywordFieldMapper("keyword").ignoreAbove(256)`).
+const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
+
+/// Build the [`FieldConfig`] for a dynamically discovered field.
+///
+/// Wraps [`infer_field_type`] and mirrors the ES default dynamic mapping for
+/// strings: any field inferred as `Text` gets a `keyword` multi-field
+/// sub-field (`ignore_above: 256`), so the standard ES habit of exact-match
+/// filtering / aggregating on `<field>.keyword` is discoverable from the
+/// mapping (`GET _mapping`, `_field_caps`) exactly like on ES (#209).
+///
+/// The query path already resolves `<field>.keyword` to the parent's
+/// doc-values column (see `fast_aggs::dv_col`, `aggs::get_nested_field`);
+/// this records that contract in the schema rather than leaving it implicit.
+/// Sub-fields of a leaf parent are NOT top-level `schema.fields` entries, so
+/// the search path's text/keyword field sets are unaffected.
+fn dynamic_field_config(key: &str, val: &Value, date_detection: bool) -> FieldConfig {
+    let ft = infer_field_type(val, date_detection);
+    let mut fc = FieldConfig::new(key.to_string(), ft);
+    if matches!(fc.field_type, FieldType::Text) {
+        let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
+        kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
+        fc.fields.push(kw);
+    }
+    fc
+}
+
 // ── DocValues fast-path helpers ───────────────────────────────────────────────
 
 /// Try to resolve a Term or Range query directly from the memtable's DocValues
@@ -28392,6 +28662,11 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                 .map(str::to_string)
                 .collect();
             let is_cross = matches!(match_type, xerj_query::ast::MultiMatchType::CrossFields);
+            let is_phrase = matches!(
+                match_type,
+                xerj_query::ast::MultiMatchType::Phrase
+                    | xerj_query::ast::MultiMatchType::PhrasePrefix
+            );
             let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
             let field_texts: Vec<String> = fields
                 .iter()
@@ -28451,8 +28726,35 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                         .collect();
                     tokens.iter().all(|t| ft_tokens.contains(t.as_str()))
                 })
-            } else {
+            } else if is_phrase || tokens.is_empty() {
+                // phrase / phrase_prefix: the whole query must appear
+                // contiguously — substring approximation of phrase
+                // matching, shared with the segment path (whose FTS
+                // projection declines these types, so BOTH states evaluate
+                // this predicate and the hit set is flush-invariant). Also
+                // the fallback when the query has no alphanumeric tokens.
                 field_texts.iter().any(|ft| ft.contains(&q_lower))
+            } else {
+                // best_fields / most_fields with the default operator (OR,
+                // issue #218): ANY query token equal to ANY token of a
+                // single field admits the hit — ES's default `operator: or`,
+                // and exactly what the segment path executes (a per-field
+                // OR-bool over tokens; the same Occur::Should convention as
+                // tantivy's `new_multiterms_query`,
+                // tantivy/src/query/boolean_query/boolean_query.rs:244).
+                // Token EQUALITY, not substring: `jump` must not match
+                // "jumparound" (the segment term path never did).
+                //
+                // Pre-fix this branch was `ft.contains(&q_lower)` — whole-
+                // query substring containment, requiring every token
+                // adjacent and in order — so a multi-token query missed
+                // memtable docs the segment path matched, and the hit set
+                // changed at _flush.
+                field_texts.iter().any(|ft| {
+                    ft.split(|c: char| !c.is_alphanumeric())
+                        .filter(|t| !t.is_empty())
+                        .any(|ft_tok| tokens.iter().any(|qt| qt == ft_tok))
+                })
             }
         }
 
@@ -30114,18 +30416,72 @@ fn score_query_against_doc(q: &QueryNode, source: &Value) -> f32 {
             query,
             boost,
             match_type,
+            operator,
             ..
         } => {
             let q_lower = query.to_lowercase();
             let outer_boost = boost.unwrap_or(1.0);
             let is_cross = matches!(match_type, xerj_query::ast::MultiMatchType::CrossFields);
+            let is_phrase = matches!(
+                match_type,
+                xerj_query::ast::MultiMatchType::Phrase
+                    | xerj_query::ast::MultiMatchType::PhrasePrefix
+            );
+            let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
+            // Per-field hit test mirroring `doc_matches_query` (issue #218):
+            // token-level OR by default / AND on request; phrase types keep
+            // whole-query substring containment. Pre-fix this arm tested
+            // `contains(whole query)`, so a memtable doc admitted by the
+            // membership check could still score 0.0 and be dropped by
+            // scored paths / rescore.
+            let q_tokens: Vec<String> = q_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            let field_hit = |text_lc: &str| -> bool {
+                if is_phrase || q_tokens.is_empty() {
+                    return text_lc.contains(&q_lower);
+                }
+                let ft_tokens: std::collections::HashSet<&str> = text_lc
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if is_and {
+                    q_tokens.iter().all(|t| ft_tokens.contains(t.as_str()))
+                } else {
+                    q_tokens.iter().any(|t| ft_tokens.contains(t.as_str()))
+                }
+            };
             let mut sum_score = 0.0f32;
             let mut max_score = 0.0f32;
             let mut matched = false;
             for field_spec in fields {
                 let (field, field_boost) = parse_field_boost(field_spec);
-                if let Some(Value::String(s)) = get_field_value(source, field) {
-                    if s.to_lowercase().contains(&q_lower) {
+                // Same per-field text extraction as `doc_matches_query`:
+                // strings, arrays (joined), and other scalars — an array-
+                // valued field admitted by membership must not score 0.0.
+                let text_lc: Option<String> = match get_field_value(source, field) {
+                    Some(Value::String(s)) => Some(s.to_lowercase()),
+                    Some(Value::Array(arr)) => {
+                        let joined: Vec<String> = arr
+                            .iter()
+                            .map(|v| match v {
+                                Value::String(s) => s.to_lowercase(),
+                                other => other.to_string(),
+                            })
+                            .collect();
+                        if joined.is_empty() {
+                            None
+                        } else {
+                            Some(joined.join(" "))
+                        }
+                    }
+                    Some(other) => Some(other.to_string().to_lowercase()),
+                    None => None,
+                };
+                if let Some(text) = text_lc {
+                    if field_hit(&text) {
                         sum_score += field_boost;
                         if field_boost > max_score {
                             max_score = field_boost;
@@ -32454,6 +32810,24 @@ fn query_node_to_fts(
             boost,
             ..
         } => {
+            // The memtable evaluator (`doc_matches_query`) gives phrase /
+            // phrase_prefix multi_match whole-query-containment semantics,
+            // which is not expressible as this per-field token bool —
+            // projecting them as an OR over tokens made the segment path
+            // OVER-match (the reverse of issue #218's memtable under-match:
+            // a reversed phrase started matching at _flush).
+            // Decline the projection instead; the stored-doc scan then
+            // evaluates the same `doc_matches_query` predicate the memtable
+            // uses, keeping the matched set flush-invariant.
+            // (cross_fields + `operator: and` is declined too — see the
+            // `is_and` guard below, which needs the analyzed token count.)
+            if matches!(
+                match_type,
+                xerj_query::ast::MultiMatchType::Phrase
+                    | xerj_query::ast::MultiMatchType::PhrasePrefix
+            ) {
+                return None;
+            }
             let registry = AnalyzerRegistry::default();
             let analyzer = registry.get_analyzer("standard")?;
             let tokens = analyzer.analyze(query);
@@ -32503,7 +32877,12 @@ fn query_node_to_fts(
             // the stored-doc scan, whose cross_fields arm implements the
             // combined-text semantics.  Without this, dropping an unmapped
             // field would FLIP an `operator: and` query from the scan's
-            // AND semantics onto the FTS OR path, over-matching.
+            // AND semantics onto the FTS OR path, over-matching (#217) —
+            // and the segment path would admit docs missing an AND token
+            // that the memtable rejected, so the hit set changed at _flush
+            // (#218).  A SINGLE analyzed token needs no decline: "the token
+            // is in at least one field" is what the per-field clauses OR'd
+            // together already mean, so that shape keeps the postings path.
             let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
             if is_and
                 && tokens.len() > 1
@@ -32549,8 +32928,12 @@ fn query_node_to_fts(
                         *fb,
                     )));
                 } else {
-                    // `operator: and` → per-field must (all tokens in this
-                    // field), same as the Match arm; default → per-field OR.
+                    // Honour the operator like the Match arm above: AND →
+                    // every token must match in the SAME field (`must`); OR
+                    // (the ES default) → any token (`should`). Pre-fix the
+                    // operator was dropped here, so `operator: and` OR'd its
+                    // tokens on segments while the memtable required every
+                    // one — the hit set changed at _flush (issue #218).
                     let mut field_bool = FtsBool::new().boost(*fb);
                     for token in &tokens {
                         let term = FtsQuery::Term(FtsTerm::new(field.as_str(), &token.text));
@@ -34986,6 +35369,55 @@ mod date_detection_tests {
         // Numbers are never date-detected.
         let num = serde_json::json!(1721900000000i64);
         assert!(matches!(infer_field_type(&num, true), FieldType::Long));
+    }
+
+    /// #209: dynamically discovered string fields must carry the ES-default
+    /// `keyword` multi-field (`ignore_above: 256`) so `<field>.keyword` is
+    /// discoverable from the mapping, exactly like ES default dynamic
+    /// mapping (`DynamicFieldsBuilder`: text + keyword(ignore_above=256)).
+    #[test]
+    fn dynamic_string_gets_keyword_multi_field() {
+        let fc = dynamic_field_config("category", &serde_json::json!("books"), true);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1, "expected exactly one sub-field");
+        let kw = &fc.fields[0];
+        assert_eq!(kw.name, "keyword");
+        assert!(matches!(kw.field_type, FieldType::Keyword));
+        assert_eq!(kw.options.ignore_above, Some(256));
+
+        // Whitespace strings are still Text (+ keyword sub-field): the
+        // multi-field replaces the never-wired short-string→Keyword split.
+        let fc = dynamic_field_config("city", &serde_json::json!("New York"), true);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1);
+
+        // Arrays of strings behave like strings (ES maps them identically).
+        let fc = dynamic_field_config("tags", &serde_json::json!(["a", "b"]), true);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1);
+
+        // Null pins Text in xerj (pre-existing behavior) — keep the
+        // invariant "every dynamic Text field has a .keyword sub-field".
+        let fc = dynamic_field_config("maybe", &Value::Null, true);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1);
+
+        // Non-string inferences carry NO multi-field.
+        for (val, want_sub) in [
+            (serde_json::json!(42), 0usize),
+            (serde_json::json!(2.5), 0),
+            (serde_json::json!(true), 0),
+            (serde_json::json!("2026-07-25T10:30:00Z"), 0), // date-detected
+            (serde_json::json!({"a": 1}), 0),
+        ] {
+            let fc = dynamic_field_config("f", &val, true);
+            assert_eq!(fc.fields.len(), want_sub, "value {val} sub-field count");
+        }
+
+        // date_detection=false: the ISO string is Text again → gets keyword.
+        let fc = dynamic_field_config("ts", &serde_json::json!("2026-07-25T10:30:00Z"), false);
+        assert!(matches!(fc.field_type, FieldType::Text));
+        assert_eq!(fc.fields.len(), 1);
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on
