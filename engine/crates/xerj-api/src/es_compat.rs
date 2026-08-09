@@ -184,6 +184,36 @@ pub async fn cluster_health_for_index(
     cluster_health_inner(state, Some(index), params).await
 }
 
+/// The `unassigned_info` block for an index whose only primary could not be
+/// opened (issue #206).
+///
+/// Field names and shape follow Elasticsearch's own `UnassignedInfo`
+/// serialisation — `reason`, `at` as an ISO-8601 instant, `failed_attempts`
+/// only when there has been one, `delayed`, `details`, `allocation_status`
+/// (`elasticsearch/server/src/main/java/org/elasticsearch/cluster/routing/UnassignedInfo.java:483-503`,
+/// read for semantics only; Elasticsearch is licence-incompatible with this
+/// project and nothing was copied). Matching the names is the point of the
+/// exercise: the operator's existing dashboard already knows how to render
+/// this block, and `details` is where the verbatim open error goes.
+fn unassigned_info_json(f: &xerj_engine::engine::FailedIndex) -> Value {
+    let mut info = json!({
+        "reason": "ALLOCATION_FAILED",
+        "at": Utc.timestamp_millis_opt(f.failed_at_ms)
+            .single()
+            .map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+            .unwrap_or_default(),
+        "delayed": false,
+        "details": f.reason,
+        // The primary's on-disk copy exists but cannot be opened, so there is
+        // no copy this node can allocate — ES's `no_valid_shard_copy`.
+        "allocation_status": "no_valid_shard_copy",
+    });
+    if f.retries > 0 {
+        info["failed_attempts"] = json!(f.retries);
+    }
+    info
+}
+
 async fn cluster_health_inner(
     state: AppState,
     index_filter: Option<String>,
@@ -248,6 +278,24 @@ async fn cluster_health_inner(
         selected
     };
 
+    // Indices that exist on disk but refused to open. Their primary has no
+    // serving copy, which is the textbook definition of a red cluster — and
+    // the one condition this endpoint used to ignore entirely, so an operator
+    // watching the ES-compatible surface never saw the failure that
+    // `/v1/health` was already reporting (issue #206).
+    let selected_failed: Vec<xerj_engine::engine::FailedIndex> = state
+        .engine
+        .list_failed_indices()
+        .into_iter()
+        .filter(|f| match &index_filter {
+            None => true,
+            Some(sel) => sel
+                .split(',')
+                .map(str::trim)
+                .any(|s| s == "_all" || s == "*" || s == f.name || glob_match_simple(s, &f.name)),
+        })
+        .collect();
+
     // Per-index shard count helper — defaults to 1 when unset.
     let shard_count = |name: &str| -> u32 {
         state
@@ -267,7 +315,7 @@ async fn cluster_health_inner(
             .unwrap_or(1) as u32
     };
 
-    let idx_count = selected.len() as u32;
+    let idx_count = (selected.len() + selected_failed.len()) as u32;
     let mut closed_count = 0u32;
     let mut unassigned_replicas: u32 = 0;
     for info in &selected {
@@ -314,12 +362,17 @@ async fn cluster_health_inner(
         }
     }
 
-    // Any unassigned replica forces yellow; closed indices surface as yellow
-    // in the legacy pre-7.2 path, but post-7.2 replicated-closed semantics
-    // keep the *cluster* status driven by replicas only. Our tests cover
-    // both — we currently only track a single "closed" flag per index and
-    // don't differentiate the closed-replication mode.
-    let status = if unassigned_replicas > 0 {
+    // An unopenable index is an unassigned PRIMARY — red, and it outranks
+    // every yellow condition. Any unassigned replica forces yellow; closed
+    // indices surface as yellow in the legacy pre-7.2 path, but post-7.2
+    // replicated-closed semantics keep the *cluster* status driven by
+    // replicas only. Our tests cover both — we currently only track a single
+    // "closed" flag per index and don't differentiate the closed-replication
+    // mode.
+    let unassigned_primaries = selected_failed.len() as u32;
+    let status = if unassigned_primaries > 0 {
+        "red"
+    } else if unassigned_replicas > 0 {
         "yellow"
     } else {
         "green"
@@ -360,12 +413,15 @@ async fn cluster_health_inner(
         })
         .unwrap_or(Some(1))
         .unwrap_or(1);
-    // wait_for_active_shards unmet: `all` when there are any unassigned
-    // replicas, or a numeric count greater than the currently active
-    // shards. The HTTP `timeout` has already elapsed by the time this
-    // check runs (we don't block), so we set timed_out accordingly.
+    // wait_for_active_shards unmet: `all` when any shard is unassigned —
+    // a replica, or (now that a failed index is a reachable state, issue
+    // #206) an unopenable primary, which is the more serious of the two and
+    // would otherwise have satisfied "all shards active" on a red cluster.
+    // A numeric count is unmet when it exceeds the currently active shards.
+    // The HTTP `timeout` has already elapsed by the time this check runs (we
+    // don't block), so we set timed_out accordingly.
     let wait_for_active_shards_unmet = match params.wait_for_active_shards.as_deref() {
-        Some("all") => unassigned_replicas > 0,
+        Some("all") => unassigned_replicas > 0 || unassigned_primaries > 0,
         Some(s) => s
             .parse::<u64>()
             .ok()
@@ -412,8 +468,8 @@ async fn cluster_health_inner(
         "active_shards": active,
         "relocating_shards": 0,
         "initializing_shards": 0,
-        "unassigned_shards": unassigned_replicas,
-        "unassigned_primary_shards": 0,
+        "unassigned_shards": unassigned_replicas + unassigned_primaries,
+        "unassigned_primary_shards": unassigned_primaries,
         "delayed_unassigned_shards": 0,
         "number_of_pending_tasks": 0,
         "number_of_in_flight_fetch": 0,
@@ -475,6 +531,36 @@ async fn cluster_health_inner(
             }
             indices_map.insert(info.name.clone(), idx_obj);
         }
+        // Failed indices carry the open error verbatim in `unassigned_info`,
+        // so `?level=indices` answers "which index, and why" in one call.
+        for f in &selected_failed {
+            let mut idx_obj = json!({
+                "status": "red",
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+                "active_primary_shards": 0,
+                "active_shards": 0,
+                "relocating_shards": 0,
+                "initializing_shards": 0,
+                "unassigned_shards": 1,
+                "unassigned_primary_shards": 1,
+                "unassigned_info": unassigned_info_json(f),
+            });
+            if level == "shards" {
+                idx_obj["shards"] = json!({
+                    "0": {
+                        "status": "red",
+                        "primary_active": false,
+                        "active_shards": 0,
+                        "relocating_shards": 0,
+                        "initializing_shards": 0,
+                        "unassigned_shards": 1,
+                        "unassigned_primary_shards": 1,
+                    }
+                });
+            }
+            indices_map.insert(f.name.clone(), idx_obj);
+        }
         resp["indices"] = Value::Object(indices_map);
     }
 
@@ -510,6 +596,11 @@ pub async fn cat_indices_pattern(
 
 async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::response::Response {
     let indices = state.engine.list_indices().await;
+    // Indices whose directory exists but refused to open. They are listed as
+    // `red` rather than omitted: an index the operator can see is an index the
+    // operator can delete or retry, and omitting them is what made a failed
+    // index invisible to every dashboard (issue #206).
+    let failed = state.engine.list_failed_indices();
 
     // Narrow to the path pattern when present (`/_cat/indices/{pattern}`):
     // a comma-separated list of concrete names and/or `*` globs. ES rules:
@@ -526,7 +617,10 @@ async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::re
                 .collect();
             for &p in &parts {
                 let is_wildcard = p == "_all" || p == "*" || p.contains('*');
-                if !is_wildcard && !indices.iter().any(|i| i.name == p) {
+                if !is_wildcard
+                    && !indices.iter().any(|i| i.name == p)
+                    && !failed.iter().any(|f| f.name == p)
+                {
                     return ApiError::new(xerj_common::XerjError::index_not_found(p))
                         .into_response();
                 }
@@ -569,6 +663,33 @@ async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::re
             hsize,
         ));
     }
+
+    // Failed indices, after the healthy ones. `red` is the status column and
+    // the shard is unassigned, so `pri` is 1 and every stat column is 0 —
+    // nothing about the contents can be read, and guessing a doc count here
+    // would be a claim we cannot back.
+    let selected_failed: Vec<&xerj_engine::engine::FailedIndex> = match pattern.as_deref() {
+        None => failed.iter().collect(),
+        Some(pat) => failed
+            .iter()
+            .filter(|f| {
+                pat.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .any(|p| {
+                        p == "_all" || p == "*" || f.name == p || glob_match_simple(p, &f.name)
+                    })
+            })
+            .collect(),
+    };
+    for f in selected_failed {
+        lines.push(format!(
+            "red open {} {} 1 0 0 0 0b 0b 0b",
+            f.name,
+            stable_index_uuid(&f.name),
+        ));
+    }
+
     // ES returns an empty body (not a bare newline) when nothing matches.
     let body = if lines.is_empty() {
         String::new()
@@ -1334,7 +1455,17 @@ pub async fn delete_index(
         .unwrap_or(true);
 
     let all = state.engine.list_indices().await;
-    let all_names: Vec<String> = all.iter().map(|i| i.name.clone()).collect();
+    let mut all_names: Vec<String> = all.iter().map(|i| i.name.clone()).collect();
+    // A failed index is deletable. Its name has to take part in selector
+    // resolution or a literal `DELETE /broken` 404s and a wildcard silently
+    // skips it — which is exactly the stuck state issue #206 describes.
+    all_names.extend(
+        state
+            .engine
+            .list_failed_indices()
+            .into_iter()
+            .map(|f| f.name),
+    );
 
     let mut to_delete: Vec<String> = Vec::new();
     let parts: Vec<&str> = index
@@ -1396,7 +1527,21 @@ pub async fn delete_index(
     }
 
     for name in &to_delete {
-        let _ = state.engine.delete_index(name).await;
+        // Report a delete that did not happen. The result used to be dropped
+        // on the floor, so an index whose bytes could not be removed (a failed
+        // index on a read-only mount, an fs error) still answered
+        // `acknowledged: true` and the operator had no way to know the name
+        // was still taken. A concurrent delete that already removed it is the
+        // one benign outcome and stays silent.
+        match state.engine.delete_index(name).await {
+            Ok(()) => {}
+            Err(e) => {
+                let inner: xerj_common::XerjError = e.into();
+                if !matches!(inner, xerj_common::XerjError::IndexNotFound { .. }) {
+                    return ApiError::new(inner).into_response();
+                }
+            }
+        }
         // RC4-W4 item 5: drop the index's per-index metric label series so it
         // doesn't linger for the process lifetime after the index is gone.
         state.metrics.prune_index_labels(name);
@@ -15863,6 +16008,14 @@ async fn cat_ann_inner(
 // GET /_cat/health
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `GET /_cat/health`.
+///
+/// The status column used to be the literal string `green`, so the one
+/// endpoint an operator's existing dashboard points at was the one endpoint
+/// that could not report a broken node — `/v1/health`, `/v1/cluster/health`
+/// and `/health/ready` all knew, and `_cat/health` said everything was fine
+/// (issue #206). It now reports the same status `_cluster/health` computes,
+/// from the same inputs.
 pub async fn cat_health(State(state): State<AppState>) -> impl IntoResponse {
     let health = state.engine.health().await;
     // epoch  timestamp  cluster  status  node.total  node.data  shards  pri  relo  init  unassign  pending_tasks  max_task_wait_time  active_shards_percent
@@ -15873,7 +16026,21 @@ pub async fn cat_health(State(state): State<AppState>) -> impl IntoResponse {
     let now = Utc::now();
     let ts = now.format("%H:%M:%S").to_string();
     let shards = health.index_count as u32;
-    let body = format!("{epoch} {ts} xerj green 1 1 {shards} {shards} 0 0 0 0 - 100.0%\n");
+    let unassigned = state.engine.list_failed_indices().len() as u32;
+    // Mirror `_cluster/health`: an unopenable index is an unassigned primary
+    // (red); an unassigned replica is yellow. The engine's own "yellow" means
+    // "unflushed memtable", which is a durability nuance rather than an ES
+    // shard state, so it deliberately does not colour this column.
+    let status = if unassigned > 0 { "red" } else { "green" };
+    let total = shards + unassigned;
+    let pct = if total == 0 {
+        100.0
+    } else {
+        (shards as f64) / (total as f64) * 100.0
+    };
+    let body = format!(
+        "{epoch} {ts} xerj {status} 1 1 {shards} {shards} 0 0 {unassigned} 0 - {pct:.1}%\n"
+    );
     (
         StatusCode::OK,
         [(
@@ -21247,6 +21414,12 @@ pub async fn cat_shards(State(state): State<AppState>) -> impl IntoResponse {
             info.name, info.doc_count, store_bytes,
         ));
     }
+    // `_cat/shards` is the call an operator makes straight after seeing a red
+    // cluster, so an index whose primary could not be opened has to be in it.
+    // ES prints UNASSIGNED rows with no node and empty stats.
+    for f in state.engine.list_failed_indices() {
+        lines.push(format!("{} 0 p UNASSIGNED 0 0b - -", f.name));
+    }
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -23340,6 +23513,45 @@ pub async fn cluster_state(State(state): State<AppState>) -> impl IntoResponse {
         );
     }
 
+    // An index that would not open still exists — its metadata belongs in
+    // cluster state, and its shard is UNASSIGNED with the open error as the
+    // allocation-failure detail. Leaving it out is what made a failed index
+    // invisible to every tool that reads cluster state (issue #206).
+    let mut unassigned_shards: Vec<Value> = Vec::new();
+    for f in state.engine.list_failed_indices() {
+        metadata_indices.insert(
+            f.name.clone(),
+            json!({
+                "state": "open",
+                "settings": {
+                    "index": {
+                        "number_of_shards": "1",
+                        "number_of_replicas": "0",
+                        "uuid": stable_index_uuid(&f.name),
+                        "version": { "created": "8130099" },
+                        "provided_name": f.name,
+                    }
+                },
+                "mappings": {},
+                "aliases": [],
+            }),
+        );
+        let shard = json!({
+            "state": "UNASSIGNED",
+            "primary": true,
+            "node": null,
+            "relocating_node": null,
+            "shard": 0,
+            "index": f.name,
+            "unassigned_info": unassigned_info_json(&f),
+        });
+        routing_table.insert(
+            f.name.clone(),
+            json!({ "shards": { "0": [shard.clone()] } }),
+        );
+        unassigned_shards.push(shard);
+    }
+
     Json(json!({
         "cluster_name": "xerj",
         "cluster_uuid": "xerj-cluster-1",
@@ -23363,7 +23575,7 @@ pub async fn cluster_state(State(state): State<AppState>) -> impl IntoResponse {
             "indices": routing_table,
         },
         "routing_nodes": {
-            "unassigned": [],
+            "unassigned": unassigned_shards,
             "nodes": {
                 node_id: []
             }

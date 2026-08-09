@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed index can now be inspected, deleted and retried without stopping
+  the server** ([#206](https://github.com/xerj-org/xerj/issues/206)). An index
+  directory that refused to open at boot was recorded in a map that only
+  `Engine::health` ever read. Live-reproduced with a corrupt `snapshot.json`:
+  it was absent from `_cat/indices` and `_cluster/state`, `DELETE /{index}`
+  answered `404 index_not_found` and left the bytes on disk, and the only
+  recovery was to stop the server and edit the data directory by hand. A
+  failed index is now a real state: listed as `red` in `_cat/indices`, present
+  in `_cluster/state` as an `UNASSIGNED` primary with `ALLOCATION_FAILED` and
+  the verbatim open error, enumerated with its reason by
+  `GET /_cluster/indices/failed`, reopenable via
+  `POST /_cluster/indices/failed/{name}/_retry` once the cause is fixed, and
+  deletable through the ordinary `DELETE /{index}`. Reads, writes and creates
+  against it return `503 no_shard_available_action_exception` carrying the
+  reason instead of a `404` that claimed it did not exist.
+
+  Two related defects in the same report are fixed with it. **Readiness no
+  longer hard-fails on a partly degraded node** — `/health/ready` returned
+  `503` for any red status, so one broken index pulled a pod holding 200
+  healthy ones out of service permanently; it now reports `200 ready
+  (degraded)` while the node can still serve something and `503` only when
+  every index it holds failed to open. And **`_cat/health` no longer prints a
+  hardcoded `green`** — the one health surface an existing ES dashboard points
+  at was the one that could not report a broken node; it and `_cluster/health`
+  now count an unopenable index as an unassigned primary, agreeing with
+  `/v1/health` and `/v1/cluster/health`.
+
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**
   ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the
   resume plan was frozen is skipped and reported in the catalog — but that
