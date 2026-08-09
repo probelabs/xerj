@@ -16,8 +16,29 @@ use std::thread;
 
 static FAILPOINT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Owns the process-global PDF worker environment for the duration of one
+/// test. `XERJ_PDF_WORKER_BIN` is read inside `spawn_worker`, so a test that
+/// sets it silently rewrites what every concurrently running test in this
+/// binary observes — including the unit tests in `extract::pdf`. Acquire this
+/// **before** the first `set_var`; the shared lock is the only thing that
+/// makes those two suites safe to run at the default thread count.
 #[cfg(unix)]
-struct PdfWorkerEnvGuard;
+struct PdfWorkerEnvGuard {
+    /// Held, never read: dropping it after the environment is cleared is the
+    /// whole point.
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl PdfWorkerEnvGuard {
+    fn acquire() -> Self {
+        Self {
+            _lock: crate::extract::pdf::WORKER_BIN_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        }
+    }
+}
 
 #[cfg(unix)]
 impl Drop for PdfWorkerEnvGuard {
@@ -1344,7 +1365,7 @@ fn fresh_pdf_is_parsed_once_and_failed_publication_retry_reparses_once() {
     let worker_script = String::from_utf8(
         br#"#!/bin/sh
 printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
-printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
 "#
         .to_vec(),
     )
@@ -1355,9 +1376,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 
     let endpoint = MockEndpoint::start(1);
     let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let _env = PdfWorkerEnvGuard::acquire();
     std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
     std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
-    let _env = PdfWorkerEnvGuard;
 
     let first = run_index(config.clone()).unwrap_err();
     assert!(format!("{first:#}").contains("bulk backend failed"));
@@ -1414,7 +1435,7 @@ fn refused_pdf_spool_reparses_and_reports_fallback_without_weakening_publication
     let worker_script = String::from_utf8(
         br#"#!/bin/sh
 printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
-printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
 "#
         .to_vec(),
     )
@@ -1425,9 +1446,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 
     let endpoint = MockEndpoint::start(0);
     let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let _env = PdfWorkerEnvGuard::acquire();
     std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
     std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
-    let _env = PdfWorkerEnvGuard;
 
     let (code, report) = run_index_report(config).unwrap();
     assert_eq!(code, 0);
@@ -1440,7 +1461,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     assert_eq!(reuse["phase_b_pdf_parses"], 1);
     assert_eq!(reuse["replay_verified"], 0);
     assert_eq!(reuse["artifacts_not_created"], 1);
-    assert_eq!(reuse["phase_a_pdf_parser_calls"], 1);
+    assert_eq!(reuse["phase_a_pdf_parser_responses"], 1);
     assert_eq!(reuse["capacity_status"], "disabled");
     assert_eq!(
         reuse["fallback_examples"][0]["path"],
@@ -1460,13 +1481,16 @@ fn refused_spool_does_not_pay_a_second_phase_a_source_hash() {
     let pdf = corpus.path().join("quarterly-report.pdf");
     fs::write(&pdf, b"%PDF-1.4\nsame-size-source-generation\n").unwrap();
     let size = fs::metadata(&pdf).unwrap().len();
-    let digest = content::resolve(vec![crate::walk::FileEntry {
-        path: pdf.clone(),
-        rel: "quarterly-report.pdf".into(),
-        rel_id: "quarterly-report.pdf".into(),
-        is_symlink: false,
-        size,
-    }])
+    let digest = content::resolve_reporting(
+        vec![crate::walk::FileEntry {
+            path: pdf.clone(),
+            rel: "quarterly-report.pdf".into(),
+            rel_id: "quarterly-report.pdf".into(),
+            is_symlink: false,
+            size,
+        }],
+        &|_| {},
+    )
     .unwrap()
     .digests
     .remove(0);
@@ -1475,7 +1499,7 @@ fn refused_spool_does_not_pay_a_second_phase_a_source_hash() {
     let worker_script = String::from_utf8(
         br#"#!/bin/sh
 printf 'Z' | dd of="$2" bs=1 seek=10 conv=notrunc 2>/dev/null
-printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null}]}'
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
 "#
         .to_vec(),
     )
@@ -1483,11 +1507,24 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
     fs::write(&worker, worker_script).unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    let _env = PdfWorkerEnvGuard::acquire();
     std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
-    let _env = PdfWorkerEnvGuard;
 
     let budget = crate::extract::pdf::ExtractionSpoolBudget::new(0, 0);
-    let scan = scan_file(&pdf, size, &digest, state_dir.path(), &budget, 100, 1);
+    let progress = Progress::silent();
+    let scan = scan_file(
+        &pdf,
+        size,
+        &digest,
+        &PhaseAContext {
+            state_dir: state_dir.path(),
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        },
+        100,
+        1,
+    );
     assert!(scan.pdf_spool.is_none());
     assert_eq!(scan.pdf_spool_fallbacks.len(), 1);
     for fallback in &scan.pdf_spool_fallbacks {
@@ -1507,6 +1544,94 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
         .is_none());
 }
 
+/// The other half of the branch above: with capacity available the artifact
+/// *is* created, and phase A must then throw it away because the source moved
+/// underneath the parser. Without this the source-generation arm of
+/// `scan_file` has no test at all — its sibling above deliberately runs with a
+/// zero budget, so it never reaches the `content::verify` comparison.
+#[cfg(unix)]
+#[test]
+fn source_changed_during_phase_a_discards_the_artifact_and_names_the_reason() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("quarterly-report.pdf");
+    fs::write(&pdf, b"%PDF-1.4\nsame-size-source-generation\n").unwrap();
+    let size = fs::metadata(&pdf).unwrap().len();
+    let digest = content::resolve_reporting(
+        vec![crate::walk::FileEntry {
+            path: pdf.clone(),
+            rel: "quarterly-report.pdf".into(),
+            rel_id: "quarterly-report.pdf".into(),
+            is_symlink: false,
+            size,
+        }],
+        &|_| {},
+    )
+    .unwrap()
+    .digests
+    .remove(0);
+
+    // Same trick as the sibling test: the worker rewrites one byte of its own
+    // input, so the file keeps its length and changes its digest.
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'Z' | dd of="$2" bs=1 seek=10 conv=notrunc 2>/dev/null
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    let _env = PdfWorkerEnvGuard::acquire();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+
+    let (budget, _) =
+        crate::extract::pdf::ExtractionSpoolBudget::for_state_dir(state_dir.path(), 1, 1, 8);
+    let progress = Progress::silent();
+    let scan = scan_file(
+        &pdf,
+        size,
+        &digest,
+        &PhaseAContext {
+            state_dir: state_dir.path(),
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        },
+        100,
+        1,
+    );
+
+    assert!(
+        scan.pdf_spool.is_none(),
+        "an artifact bound to a superseded source generation must not reach phase B"
+    );
+    let categories: Vec<&str> = scan
+        .pdf_spool_fallbacks
+        .iter()
+        .map(|fallback| fallback.category)
+        .collect();
+    assert_eq!(categories, vec!["source_generation_changed"]);
+    let report = budget.report();
+    assert_eq!(report["artifacts_created"], 1);
+    assert_eq!(report["artifacts_discarded_before_replay"], 1);
+    assert_eq!(report["phase_b_eligible_artifacts"], 0);
+    assert_eq!(report["current_live_artifacts"], 0);
+    assert_eq!(report["current_retained_or_reserved_bytes"], 0);
+    assert_eq!(
+        report["fallback_categories"]["source_generation_changed"],
+        1
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
@@ -1520,13 +1645,16 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
     let pdf = corpus.path().join("empty-report.pdf");
     fs::write(&pdf, b"%PDF-1.4\nempty test input\n").unwrap();
     let size = fs::metadata(&pdf).unwrap().len();
-    let digest = content::resolve(vec![crate::walk::FileEntry {
-        path: pdf.clone(),
-        rel: "empty-report.pdf".into(),
-        rel_id: "empty-report.pdf".into(),
-        is_symlink: false,
-        size,
-    }])
+    let digest = content::resolve_reporting(
+        vec![crate::walk::FileEntry {
+            path: pdf.clone(),
+            rel: "empty-report.pdf".into(),
+            rel_id: "empty-report.pdf".into(),
+            is_symlink: false,
+            size,
+        }],
+        &|_| {},
+    )
     .unwrap()
     .digests
     .remove(0);
@@ -1537,12 +1665,25 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
     );
     fs::write(&worker, script).unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    let _env = PdfWorkerEnvGuard::acquire();
     std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
-    let _env = PdfWorkerEnvGuard;
 
     let (budget, _) =
         crate::extract::pdf::ExtractionSpoolBudget::for_state_dir(state_dir.path(), 1, 1, 8);
-    let mut scan = scan_file(&pdf, size, &digest, state_dir.path(), &budget, 100, 1);
+    let progress = Progress::silent();
+    let mut scan = scan_file(
+        &pdf,
+        size,
+        &digest,
+        &PhaseAContext {
+            state_dir: state_dir.path(),
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        },
+        100,
+        1,
+    );
     assert!(scan.junk.is_some());
     assert!(scan.pdf_spool.is_some());
     assert!(take_pdf_spool_if_indexable(&mut scan.pdf_spool, true, &budget).is_none());
@@ -1576,7 +1717,7 @@ fn multi_pdf_run_reuses_every_artifact_and_reports_exact_success_counters() {
     let worker_script = String::from_utf8(
         br#"#!/bin/sh
 printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
-printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null}]}'
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
 "#
         .to_vec(),
     )
@@ -1589,9 +1730,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
     config.workers = 8;
     config.pdf_workers = 2;
+    let _env = PdfWorkerEnvGuard::acquire();
     std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
     std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
-    let _env = PdfWorkerEnvGuard;
     let (code, report) = run_index_report(config).unwrap();
     assert_eq!(code, 0);
     assert_eq!(
@@ -1615,7 +1756,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     assert!(reuse["peak_retained_or_reserved_bytes"].as_u64().unwrap() > 0);
     assert_eq!(reuse["current_live_artifacts"], 0);
     assert!(reuse["peak_live_artifacts"].as_u64().unwrap() > 0);
-    assert_eq!(reuse["phase_a_pdf_parser_calls"], PDFS);
+    assert_eq!(reuse["phase_a_pdf_parser_responses"], PDFS);
     assert_eq!(reuse["capacity_fallbacks"], 0);
     assert_eq!(reuse["io_fallbacks"], 0);
     assert_eq!(reuse["replay_verified"], PDFS);
@@ -1643,7 +1784,7 @@ fn corrupted_pdf_replay_reparses_without_blaming_the_source_or_backend() {
     let worker_script = String::from_utf8(
         br#"#!/bin/sh
 printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
-printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null}]}'
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
 "#
         .to_vec(),
     )
@@ -1654,9 +1795,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 
     let endpoint = MockEndpoint::start(0);
     let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let _env = PdfWorkerEnvGuard::acquire();
     std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
     std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
-    let _env = PdfWorkerEnvGuard;
     crate::extract::pdf::corrupt_replay_for_source_size(fs::metadata(&pdf).unwrap().len());
 
     let (code, report) = run_index_report(config).unwrap();
@@ -1668,7 +1809,10 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
     assert_eq!(reuse["replay_verified"], 0);
     assert_eq!(reuse["replay_integrity_failures"], 1);
-    assert_eq!(reuse["io_fallbacks"], 1);
+    assert_eq!(
+        reuse["io_fallbacks"], 0,
+        "a corrupted artifact is an integrity failure, not an I/O failure"
+    );
     assert_eq!(reuse["phase_b_pdf_parses"], 1);
     assert_eq!(reuse["current_live_artifacts"], 0);
     assert_eq!(reuse["current_retained_or_reserved_bytes"], 0);

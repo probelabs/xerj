@@ -215,15 +215,31 @@ fn take_pdf_spool_if_indexable<T>(
     }
 }
 
+/// Everything phase A needs beyond the file list and the run config: where a
+/// run-local PDF artifact may live, the shared admission budget, the one-line
+/// capacity explanation reported when files fall back — and the progress
+/// surface those lines go out through, because phase A now reports every file
+/// it touches (#241) as well as every artifact it could not keep.
+///
+/// Grouped so `scan_file` and `build_phase_a` each take one parameter instead
+/// of four.
+struct PhaseAContext<'a> {
+    state_dir: &'a Path,
+    budget: &'a std::sync::Arc<extract::pdf::ExtractionSpoolBudget>,
+    capacity_warning: Option<&'a str>,
+    progress: &'a Progress,
+}
+
 fn scan_file(
     path: &Path,
     size: u64,
     digest: &str,
-    state_dir: &Path,
-    pdf_spool_budget: &std::sync::Arc<extract::pdf::ExtractionSpoolBudget>,
+    ctx: &PhaseAContext<'_>,
     sample: usize,
     max_file_gb: u64,
 ) -> FileScan {
+    let state_dir = ctx.state_dir;
+    let pdf_spool_budget = ctx.budget;
     let mut out = FileScan {
         sniffed: None,
         sketches: Vec::new(),
@@ -389,7 +405,14 @@ mod clustering_key_tests {
         // Clustering keys are decided by extraction, not by PDF artifact
         // reuse: a zero budget keeps these cases on the plain parse path.
         let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
-        scan_file(&path, size, "d0", dir, &budget, 500, 2)
+        let progress = Progress::silent();
+        let ctx = PhaseAContext {
+            state_dir: dir,
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        };
+        scan_file(&path, size, "d0", &ctx, 500, 2)
     }
 
     /// The #178 mechanism, from the extractor to the clustering key: a source
@@ -504,16 +527,26 @@ mod phase_a_grouping_tests {
             .map(|f| ids::file_key(&f.path, f.size).unwrap())
             .collect();
         let digests: Vec<String> = (0..files.len()).map(|i| format!("d{i}")).collect();
-        let (plan, _) = build_phase_a(
+        // Planning is what these cases assert on; a zero budget keeps every
+        // file on the plain parse path so no artifact is ever retained.
+        let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
+        let progress = Progress::silent();
+        let ctx = PhaseAContext {
+            state_dir: root,
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        };
+        build_phase_a(
             root,
             &files,
             &keys,
             &digests,
             Vec::new(),
+            &ctx,
             &cfg_for(root),
-            &Progress::silent(),
-        );
-        plan
+        )
+        .plan
     }
 
     const CODE: &str = "// The event loop dispatches every ready connection to a worker.\n\
@@ -686,23 +719,21 @@ struct PhaseA {
 
 /// Record and report why individual PDFs could not retain a run-local
 /// artifact. Reuse is an accelerator, so this is purely informational: every
-/// listed file is parsed again by the normal phase B path. When the budget is
-/// globally disabled there is nothing to explain — no artifact was ever
-/// attempted — so nothing is recorded or printed.
+/// listed file is parsed again by the normal phase B path. Recording is kept
+/// even when the budget is globally disabled — the stored examples are the
+/// only place the `--json` report explains *why* nothing was reused, and they
+/// are already capped at three.
 ///
-/// Reporting goes through the progress surface, never a bare `eprintln!`:
+/// Reporting goes out through the progress surface, never a bare `eprintln!`:
 /// stderr belongs to that surface, so `--progress none` stays silent and
 /// `--progress json` stays a single parseable stream (#241).
 fn report_pdf_spool_fallbacks(
     files: &[walk::FileEntry],
     scans: &[FileScan],
-    pdf_spool_budget: &extract::pdf::ExtractionSpoolBudget,
-    pdf_spool_capacity_warning: Option<&str>,
-    pr: &Progress,
+    ctx: &PhaseAContext<'_>,
 ) {
-    if pdf_spool_budget.is_globally_disabled() {
-        return;
-    }
+    let pdf_spool_budget = ctx.budget;
+    let pr = ctx.progress;
     let reasons: Vec<(&str, &extract::pdf::SpoolFallback)> = scans
         .iter()
         .enumerate()
@@ -730,7 +761,7 @@ fn report_pdf_spool_fallbacks(
          phase B will parse them again safely",
         reasons.len()
     ));
-    if let Some(warning) = pdf_spool_capacity_warning {
+    if let Some(warning) = ctx.capacity_warning {
         pr.note(&format!("  PDF reuse capacity: {warning}"));
     }
     for (path, fallback) in reasons.iter().take(3) {
@@ -756,45 +787,30 @@ fn build_phase_a(
     keys: &[String],
     digests: &[String],
     duplicate_files: Vec<DuplicateFile>,
-    state_dir: &Path,
-    pdf_spool_budget: &std::sync::Arc<extract::pdf::ExtractionSpoolBudget>,
-    pdf_spool_capacity_warning: Option<&str>,
+    ctx: &PhaseAContext<'_>,
     cfg: &IndexCfg,
-    pr: &Progress,
 ) -> PhaseA {
     use rayon::prelude::*;
+    let pdf_spool_budget = ctx.budget;
+    let pr = ctx.progress;
     // Same pool as the digest phase: sniffing and sampling are the other half
     // of the CPU-bound phase `--workers` has to bound (#240 §2). Progress is
     // reported from inside that pool, so the straggler the ticker names is the
     // file a scan-pool thread is genuinely sitting on (#241). Retaining a PDF
-    // artifact happens inside that same guard, so a spooled file is counted
-    // exactly like a plainly parsed one.
+    // artifact happens inside that same guard, so a file whose extraction is
+    // spooled is counted exactly like a plainly parsed one.
     let scans: Vec<FileScan> = crate::pool::install(|| {
         files
             .par_iter()
             .zip(digests.par_iter())
             .map(|(f, digest)| {
                 let _in_flight = pr.file(&f.rel, f.size);
-                scan_file(
-                    &f.path,
-                    f.size,
-                    digest,
-                    state_dir,
-                    pdf_spool_budget,
-                    cfg.sample,
-                    cfg.max_file_gb,
-                )
+                scan_file(&f.path, f.size, digest, ctx, cfg.sample, cfg.max_file_gb)
             })
             .collect()
     });
 
-    report_pdf_spool_fallbacks(
-        files,
-        &scans,
-        pdf_spool_budget,
-        pdf_spool_capacity_warning,
-        pr,
-    );
+    report_pdf_spool_fallbacks(files, &scans, ctx);
 
     let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
     let scopes = compute_scopes(root, &rels);
@@ -1382,6 +1398,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             cfg.pdf_workers,
             cfg.bulk_mb,
         );
+    let phase_a_context = PhaseAContext {
+        state_dir: &state_dir,
+        budget: &pdf_spool_budget,
+        capacity_warning: pdf_spool_capacity_warning.as_deref(),
+        progress: &pr,
+    };
     let mut plan: Plan = if let Some(p) = journal.plan.clone() {
         p
     } else {
@@ -1403,11 +1425,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             &keys,
             &digests,
             duplicate_files.clone(),
-            &state_dir,
-            &pdf_spool_budget,
-            pdf_spool_capacity_warning.as_deref(),
+            &phase_a_context,
             &cfg,
-            &pr,
         );
         pdf_spools = spools;
         pr.note(&format!(

@@ -45,6 +45,16 @@ const JOURNAL_FILESYSTEM_HEADROOM: u64 = 64 << 20;
 const MIN_DESCRIPTOR_HEADROOM: u64 = 64;
 const DESCRIPTOR_HEADROOM_PER_WORKER: u64 = 4;
 
+/// Serializes every test that mutates the process-global
+/// `XERJ_PDF_WORKER_BIN`/`XERJ_TEST_PDF_COUNT` pair. The variables are read
+/// inside `spawn_worker`, so a test that sets them changes the behaviour of
+/// every other test running concurrently in this binary — including tests in
+/// sibling modules. Take this before the first `set_var` and hold it until the
+/// restoring guard drops. Poison is ignored on purpose: a panicking test must
+/// not cascade into unrelated failures here.
+#[cfg(test)]
+pub(crate) static WORKER_BIN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 static CORRUPT_REPLAY_SOURCE_SIZE: AtomicU64 = AtomicU64::new(u64::MAX);
 #[cfg(test)]
@@ -84,8 +94,11 @@ pub(crate) fn extract_and_spool(
 ) -> Result<(ExtractStats, Option<ExtractionSpool>, Option<SpoolFallback>)> {
     let _permit = worker_gate().acquire();
     let response = spawn_worker(path)?;
-    // Count completed parser protocol calls, not attempts that failed before
-    // producing a response which Phase A could use.
+    // Counted only once the worker has produced a usable protocol response.
+    // An invocation that spawned and then failed, timed out, or was killed is
+    // deliberately excluded — hence `..._responses` and not `..._calls` in the
+    // report. Total parser *invocations* are not a number this counter can
+    // honestly supply.
     budget.record_phase_a_parse();
     let (spool, fallback) =
         try_spool_response(state_dir, source_size, source_digest, budget, &response);
@@ -222,7 +235,7 @@ pub(crate) struct ExtractionSpoolBudget {
     exact_artifact_bytes: AtomicU64,
     peak_retained_or_reserved_bytes: AtomicU64,
     peak_live_artifacts: AtomicU64,
-    phase_a_pdf_parser_calls: AtomicU64,
+    phase_a_pdf_parser_responses: AtomicU64,
     capacity_status: &'static str,
     capacity_reason: &'static str,
     fallback_examples: Mutex<Vec<serde_json::Value>>,
@@ -272,7 +285,7 @@ impl ExtractionSpoolBudget {
             exact_artifact_bytes: AtomicU64::new(0),
             peak_retained_or_reserved_bytes: AtomicU64::new(0),
             peak_live_artifacts: AtomicU64::new(0),
-            phase_a_pdf_parser_calls: AtomicU64::new(0),
+            phase_a_pdf_parser_responses: AtomicU64::new(0),
             capacity_status: "enabled",
             capacity_reason: "explicit_budget",
             fallback_examples: Mutex::new(Vec::new()),
@@ -388,7 +401,7 @@ impl ExtractionSpoolBudget {
             exact_artifact_bytes: AtomicU64::new(0),
             peak_retained_or_reserved_bytes: AtomicU64::new(0),
             peak_live_artifacts: AtomicU64::new(0),
-            phase_a_pdf_parser_calls: AtomicU64::new(0),
+            phase_a_pdf_parser_responses: AtomicU64::new(0),
             capacity_status,
             capacity_reason,
             fallback_examples: Mutex::new(Vec::new()),
@@ -498,7 +511,7 @@ impl ExtractionSpoolBudget {
             "peak_retained_or_reserved_bytes": self.peak_retained_or_reserved_bytes.load(Ordering::Relaxed),
             "current_live_artifacts": self.spools.load(Ordering::Relaxed),
             "peak_live_artifacts": self.peak_live_artifacts.load(Ordering::Relaxed),
-            "phase_a_pdf_parser_calls": self.phase_a_pdf_parser_calls.load(Ordering::Relaxed),
+            "phase_a_pdf_parser_responses": self.phase_a_pdf_parser_responses.load(Ordering::Relaxed),
             "capacity_fallbacks": self.capacity_fallbacks.load(Ordering::Relaxed),
             "io_fallbacks": self.io_fallbacks.load(Ordering::Relaxed),
             "replay_verified": self.replay_verified.load(Ordering::Relaxed),
@@ -530,8 +543,13 @@ impl ExtractionSpoolBudget {
         self.phase_b_pdf_parses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A verified artifact that failed one of its pre-replay checks. This is
+    /// an *integrity* outcome, already counted by `replay_integrity_failures`
+    /// inside `replay_with_gate`; it deliberately does not touch
+    /// `io_fallbacks`, which counts only the artifact-creation I/O failures in
+    /// `try_spool_response`. A digest, JSON, or protocol-identity mismatch is
+    /// not an I/O event and reporting it as one would overstate disk trouble.
     pub(crate) fn record_replay_fallback(&self, path: &str, error: &anyhow::Error) {
-        self.record_io_fallback();
         self.record_fallback_category("replay_verification");
         self.record_fallback_example(
             path,
@@ -545,14 +563,6 @@ impl ExtractionSpoolBudget {
 
     pub(crate) fn platform_reuse_is_unavailable(&self) -> bool {
         self.capacity_status == "disabled" && self.capacity_reason == "descriptor_probe_unavailable"
-    }
-
-    /// True when no artifact can ever be retained on this run, for any reason
-    /// (unsupported platform, insufficient capacity, or a zero budget). The
-    /// caller uses this to skip building per-file fallback diagnostics that
-    /// would only restate one global fact once per PDF.
-    pub(crate) fn is_globally_disabled(&self) -> bool {
-        self.capacity_status == "disabled"
     }
 
     pub(crate) fn record_fallback_example(
@@ -582,7 +592,7 @@ impl ExtractionSpoolBudget {
     }
 
     fn record_phase_a_parse(&self) {
-        self.phase_a_pdf_parser_calls
+        self.phase_a_pdf_parser_responses
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -757,13 +767,25 @@ pub(crate) struct ExtractionSpool {
 }
 
 impl ExtractionSpool {
+    /// Verify and deliver the retained response exactly once.
+    ///
+    /// Four checks can fail against a caller that routed the right artifact to
+    /// the right file: the artifact's physical length, its content digest, its
+    /// JSON decode, and the worker protocol identity inside it. The
+    /// `source_size`/`source_digest` comparison below is a fifth check of a
+    /// different kind — a binding assertion. Phase B derives both values from
+    /// the same inventory entry that Phase A spooled under, so at the
+    /// production call site it can only fire if an artifact were routed to the
+    /// wrong file. Mutation of the *source* between phases is caught earlier
+    /// and with full strength by the `content::verify` call that Phase B runs
+    /// before extraction (`lib.rs`), not here.
     pub(crate) fn replay(
         self,
         source_size: u64,
         source_digest: &str,
         sink: Sink,
     ) -> Result<ExtractStats> {
-        self.replay_with_gate(source_size, source_digest, sink, worker_gate(), true)
+        self.replay_with_gate(source_size, source_digest, sink, worker_gate())
     }
 
     fn replay_with_gate(
@@ -772,7 +794,6 @@ impl ExtractionSpool {
         source_digest: &str,
         sink: Sink,
         gate: &WorkerGate,
-        _observe_global_replay: bool,
     ) -> Result<ExtractStats> {
         // JSON decoding materializes a bounded WorkerResponse just like the
         // parser protocol. Share the PDF gate so Phase B cannot multiply that
@@ -788,6 +809,7 @@ impl ExtractionSpool {
         } = self;
         let budget = Arc::clone(&reservation.budget);
         let decoded = (|| -> Result<WorkerResponse> {
+            // Binding assertion, not a source-mutation check — see `replay`.
             anyhow::ensure!(
                 source_size == expected_size && source_digest == expected_digest,
                 "PDF extraction spool belongs to a different source generation; retry extraction"
@@ -1549,7 +1571,7 @@ mod tests {
                 )]),
                 locator: format!("p1-s{index}"),
                 group: None,
-                origin: FieldOrigin::Extractor,
+                origin: super::FieldOrigin::Extractor,
             })
             .collect();
         let expected = response(records.clone());
@@ -1625,9 +1647,33 @@ mod tests {
 
     #[test]
     fn failed_worker_protocol_call_is_not_reported_as_a_completed_phase_a_parse() {
+        // `spawn_worker` reads the process-global `XERJ_PDF_WORKER_BIN`, which
+        // the run_index tests in `failure_resume_http_tests` point at a stub
+        // that answers successfully for *any* path. Without both the shared
+        // lock and an explicitly failing worker of our own, this test's
+        // outcome depends on which other test happens to be running — it only
+        // passed in CI because of `--test-threads=2` plus name ordering.
+        let _env_lock = super::WORKER_BIN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let source = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let missing = source.path().join("missing.pdf");
+        let previous = std::env::var_os("XERJ_PDF_WORKER_BIN");
+        std::env::set_var(
+            "XERJ_PDF_WORKER_BIN",
+            source.path().join("no-such-pdf-worker"),
+        );
+        struct RestoreWorkerBin(Option<std::ffi::OsString>);
+        impl Drop for RestoreWorkerBin {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("XERJ_PDF_WORKER_BIN", value),
+                    None => std::env::remove_var("XERJ_PDF_WORKER_BIN"),
+                }
+            }
+        }
+        let _restore = RestoreWorkerBin(previous);
         let budget = super::ExtractionSpoolBudget::new(super::MAX_WORKER_OUTPUT as u64, 1);
         let error = match super::extract_and_spool(
             &missing,
@@ -1638,10 +1684,10 @@ mod tests {
             &mut |_| true,
         ) {
             Err(error) => error,
-            Ok(_) => panic!("a missing PDF cannot produce a worker response"),
+            Ok(_) => panic!("a worker binary that does not exist cannot produce a response"),
         };
         assert!(!format!("{error:#}").is_empty());
-        assert_eq!(budget.report()["phase_a_pdf_parser_calls"], 0);
+        assert_eq!(budget.report()["phase_a_pdf_parser_responses"], 0);
         assert_eq!(budget.report()["reservations_started"], 0);
     }
 
@@ -1829,7 +1875,7 @@ mod tests {
             fields: serde_json::Map::from_iter([("body".into(), body.clone().into())]),
             locator: "p1-s0".into(),
             group: None,
-            origin: FieldOrigin::Extractor,
+            origin: super::FieldOrigin::Extractor,
         };
         let budget = super::ExtractionSpoolBudget::new(super::MAX_WORKER_OUTPUT as u64, 1);
         let spool = spool_response(
@@ -2000,7 +2046,7 @@ mod tests {
             fields: serde_json::Map::new(),
             locator: "page:1".into(),
             group: None,
-            origin: FieldOrigin::Extractor,
+            origin: super::FieldOrigin::Extractor,
         }];
         let spools: Vec<_> = (0..REPLAYS)
             .map(|_| {
@@ -2039,7 +2085,6 @@ mod tests {
                                 true
                             },
                             &gate,
-                            false,
                         )
                         .unwrap();
                 });
