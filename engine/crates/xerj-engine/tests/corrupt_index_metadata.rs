@@ -327,3 +327,84 @@ async fn a_failed_index_can_still_be_deleted() {
     engine.create_index("removable", Schema::empty()).unwrap();
     assert!(engine.get_index("removable").is_ok());
 }
+
+// ── the writer must not manufacture what the reader now refuses ───────────────
+
+/// Refusing a torn sidecar is only safe if our own writer cannot produce one.
+///
+/// `write_file_atomic` staged every write in `<file>.tmp` — one shared name for
+/// all writers of that path. Two concurrent settings writes (`PUT /_settings`
+/// racing another `PUT /_settings`, or an `index.blocks` update) therefore both
+/// opened it `O_TRUNC` and interleaved their bytes before either renamed, so
+/// the *complete* file that landed was a mix of two bodies. Pre-fix, this test
+/// reports 294 of 800 writes failing with ENOENT (the loser renaming a file the
+/// winner had already moved) and — with those errors swallowed, which is what
+/// the callers do — 16 of 200 rounds leaving an unparseable file. After the
+/// fix: no failed writes, no torn file, no debris.
+///
+/// Before #202 that torn file was "only" silently swapped for an empty mapping.
+/// Now it refuses the open, so a lost race would brick the index — which is why
+/// this test lives here and not in a general-hygiene file.
+#[test]
+fn concurrent_atomic_writes_never_leave_a_torn_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+
+    // Two bodies of very different length: a short write landing inside a long
+    // one is what leaves trailing garbage behind valid-looking JSON.
+    let small = serde_json::to_vec_pretty(&json!({"index": {"refresh_interval": "1s"}})).unwrap();
+    let big = serde_json::to_vec_pretty(&json!({
+        "index": {"analysis": (0..400).map(|i| format!("filter-{i}")).collect::<Vec<_>>()}
+    }))
+    .unwrap();
+
+    let mut torn = 0usize;
+    let mut write_errors: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = [&small, &big, &small, &big]
+                .into_iter()
+                .map(|payload| {
+                    let p = path.clone();
+                    s.spawn(move || xerj_engine::index::write_file_atomic(&p, payload))
+                })
+                .collect();
+            for h in handles {
+                // A shared staging name also made writes fail spuriously: the
+                // loser of the race renamed a file the winner had already moved
+                // (ENOENT). Record it rather than panicking, so a failure names
+                // the defect instead of "a scoped thread panicked".
+                if let Err(e) = h.join().expect("writer thread") {
+                    write_errors.push(e.to_string());
+                }
+            }
+        });
+        let bytes = std::fs::read(&path).unwrap();
+        if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+            torn += 1;
+        }
+    }
+    assert!(
+        write_errors.is_empty(),
+        "{} concurrent writes failed, first: {} — writers must not collide on a staging file",
+        write_errors.len(),
+        write_errors[0]
+    );
+    assert_eq!(
+        torn, 0,
+        "{torn}/200 rounds of concurrent writes left a settings.json that does not parse — \
+         the write path can manufacture the corruption the read path now refuses"
+    );
+
+    // And no staging debris is left behind for a successful write.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "settings.json")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging files left behind: {leftovers:?}"
+    );
+}

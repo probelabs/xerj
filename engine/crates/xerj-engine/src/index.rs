@@ -25464,21 +25464,58 @@ fn store_config_from(config: &Config, wal_shards_override: Option<usize>) -> Ind
     }
 }
 
+/// Per-process sequence that makes every in-flight temp file name unique.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A staging path next to `path` that no other writer can be using.
+///
+/// `path.with_extension("tmp")` — what this used to be — is the *same* name for
+/// every writer of that file, so two concurrent `write_file_atomic` calls on one
+/// sidecar both opened it `O_TRUNC` and interleaved their bytes before either
+/// renamed. Measured on this tree with the old shared name, 4 threads writing
+/// two different-length settings bodies for 200 rounds: 294 of the 800 writes
+/// failed outright with ENOENT (the loser renaming a file the winner had
+/// already moved), and with those errors swallowed — which is what the callers
+/// did — 16 of the 200 rounds left a `settings.json` that does not parse. That
+/// is exactly the file `Index::open` now refuses (#202), so the writer must not
+/// be able to manufacture it.
+///
+/// Prior art: tantivy stages atomic writes in a *unique* temp file created in
+/// the destination's own directory and then persists it over the target
+/// (`tempfile::Builder::tempfile_in` → `persist`,
+/// tantivy `src/directory/mmap_directory/mod.rs:362-378`, MIT). Same-directory
+/// keeps the rename on one filesystem; unique keeps concurrent writers apart.
+/// Adapted, not copied — we name the file ourselves rather than take a runtime
+/// dependency on `tempfile`, and we additionally fsync the parent directory.
+pub(crate) fn staging_path(path: &Path) -> std::path::PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sidecar".to_string());
+    path.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()))
+}
+
 /// Write `bytes` to `path` atomically: write a same-directory temp file,
 /// fsync it, then rename over the target.  A kill -9 mid-write leaves
 /// either the old file or the new file on disk, never a truncated one.
-/// This matters for `schema.json`: `load_schema` treats a torn file as
-/// "no schema" and silently falls back to an empty dynamic mapping,
-/// which is a mapping-loss corruption after crash.
+/// This matters for `schema.json` and `settings.json`: since #202 a torn
+/// sidecar is refused at open rather than silently replaced by a default, so
+/// the write path has to be the one thing that cannot produce one.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
+    let tmp = staging_path(path);
+    let staged = (|| -> std::io::Result<()> {
         use std::io::Write as _;
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        f.sync_all()
+    })();
+    // A unique staging name means a failed write leaves debris nobody will
+    // overwrite, so clean it up here rather than at the next write.
+    if let Err(e) = staged.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
     // Make the rename itself durable across power loss.
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {

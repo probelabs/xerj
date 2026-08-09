@@ -228,8 +228,12 @@ pub struct ApiKeyRecord {
 /// default. Mirrors `index::write_file_atomic` but hardens the mode.
 fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    {
+    // Unique staging name, for the same reason as `index::write_file_atomic`:
+    // two concurrent key mints sharing one `api_keys.tmp` can interleave into a
+    // key store that no longer parses, and a corrupt key store silently drops
+    // every persisted key at the next boot.
+    let tmp = crate::index::staging_path(path);
+    let staged = (|| -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -240,14 +244,19 @@ fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        // Belt and braces: pin 0600 even if the platform ignored the open mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    // Never leave a staging file behind on failure — it holds key material.
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    // Tighten an already-existing tmp inode too (create() reuses perms).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
