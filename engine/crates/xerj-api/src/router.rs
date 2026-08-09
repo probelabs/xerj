@@ -468,6 +468,18 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         .route("/_plugins/_ism/policies", get(ism_api::list_ism_policies))
         .route("/_plugins/_ism/add/:index", post(ism_api::add_ism_policy))
         .route(
+            "/_plugins/_ism/remove/:index",
+            post(ism_api::remove_ism_policy),
+        )
+        .route(
+            "/_plugins/_ism/change_policy/:index",
+            post(ism_api::change_ism_policy),
+        )
+        .route(
+            "/_plugins/_ism/retry/:index",
+            post(ism_api::retry_ism_index),
+        )
+        .route(
             "/_plugins/_ism/explain/:index",
             get(ism_api::explain_ism_index),
         )
