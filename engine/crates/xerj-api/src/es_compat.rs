@@ -13575,6 +13575,23 @@ fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
             .and_then(Value::as_bool)
             .unwrap_or(doc_values_default);
 
+        // `index` — the sibling of `doc_values` above, and the last open
+        // instance of the accepted-and-ignored class in #204. `"index": false`
+        // was parsed nowhere, echoed back verbatim by `GET _mapping`, and had
+        // no effect at all: the field kept its inverted index and every query
+        // against it kept matching.
+        //
+        // Carrying the declared intent here is what makes the two halves of
+        // the fix possible — `fts_excluded_fields` (xerj-engine) drops the
+        // field from the inverted index at flush/merge, and
+        // `unsearchable_query_field` (xerj-engine) rejects queries that ES
+        // rejects. Default `true` mirrors ES: every field is indexed unless
+        // the mapping says otherwise.
+        fc.options.indexed = field_def
+            .get("index")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
         // Handle copy_to: store the target field in a special null_value marker.
         if let Some(copy_target) = field_def.get("copy_to").and_then(Value::as_str) {
             fc.options.null_value = Some(Value::String(format!("__copy_to__:{}", copy_target)));

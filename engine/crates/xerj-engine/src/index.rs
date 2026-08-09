@@ -6908,7 +6908,7 @@ impl Index {
             let analyzer = mem
                 .default_analyzer()
                 .expect("standard analyzer always present");
-            let excluded_fts_fields = crate::memtable::semantic_derived_vector_fields(schema);
+            let excluded_fts_fields = crate::memtable::fts_excluded_fields(schema);
             let p_t = std::time::Instant::now();
             let analyzed: Vec<Vec<(String, Vec<xerj_fts::analyzer::Token>)>> = crate::ingest_pool()
                 .install(|| {
@@ -7379,9 +7379,7 @@ impl Index {
         let registry = Arc::clone(&self.registry);
         let data_dir = self.data_dir.clone();
         let field_configs = self.flush_signal.field_configs(&self.schema);
-        let excluded_fts_fields = self
-            .flush_signal
-            .semantic_derived_vector_fields(&self.schema);
+        let excluded_fts_fields = self.flush_signal.fts_excluded_fields(&self.schema);
         let dv_skip = self.flush_signal.doc_values_skip_set(&self.schema);
         let dataset_version = Arc::clone(&self.dataset_version);
         let query_cache = Arc::clone(&self.query_cache);
@@ -7632,7 +7630,7 @@ impl Index {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
-                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
         };
@@ -7768,7 +7766,7 @@ impl Index {
             let (excluded_fts_fields, dv_skip) = {
                 let schema = self.schema.read().await;
                 (
-                    crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                    crate::memtable::fts_excluded_fields(&schema.schema),
                     doc_values_skip_set(&schema.schema),
                 )
             };
@@ -8008,7 +8006,7 @@ impl Index {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
-                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                crate::memtable::fts_excluded_fields(&schema.schema),
             )
         };
         // Kept for the legacy "if !text_fields.is_empty()" branch — empty
@@ -12899,9 +12897,25 @@ impl Index {
         let from = request.from;
 
         // Resolve field aliases in the query: rewrite any alias field names to their targets.
+        //
+        // The unsearchable-field check rides on the same schema guard, and runs
+        // AFTER alias resolution so an alias inherits its target's mapping —
+        // which is what ES validates. See `unsearchable_query_field`: a field
+        // declared `"index": false` with no doc values has neither postings nor
+        // a column to scan, and ES fails the query rather than answering it
+        // from `_source` (#204 — accepted means honoured).
         let resolved_query = {
             let schema = self.schema.read().await;
-            rewrite_query_aliases(&request.query, &schema.schema)
+            let resolved = rewrite_query_aliases(&request.query, &schema.schema);
+            if let Some(field) = unsearchable_query_field(&resolved, &schema.schema) {
+                return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                    format!(
+                        "failed to create query: Cannot search on field [{field}] \
+                         since it is not indexed nor has doc values."
+                    ),
+                )));
+            }
+            resolved
         };
         let query = &resolved_query;
 
@@ -13263,6 +13277,27 @@ impl Index {
             let mut num: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut bf: std::collections::HashSet<String> = std::collections::HashSet::new();
             for f in &schema_guard.schema.fields {
+                // These sets are the field-less expansion: what a bare
+                // `query_string` / `simple_query_string` / `multi_match` on
+                // `*` projects a clause onto. ES expands `*` over SEARCHABLE
+                // fields only (`MappedFieldType.isSearchable()` = has terms OR
+                // has doc values), so a field declared `"index": false` with no
+                // doc values must not appear here — otherwise the projected
+                // clause falls through the per-segment `fts_has_field` gate
+                // onto the stored-doc scan and matches the field's `_source`
+                // text, which is the accepted-and-ignored bug wearing a
+                // different hat (#204). A named query on the same field is
+                // rejected outright by `unsearchable_query_field`; this is the
+                // implicit-expansion half of the same rule.
+                //
+                // `index: false` WITH doc values stays in: ES calls it
+                // searchable and answers it from the column (8.1 doc-values
+                // search). We answer it exactly too — see
+                // `memtable::fts_excluded_fields` for why such a field keeps
+                // its postings rather than falling back to the scan.
+                if !f.options.indexed && !f.options.doc_values {
+                    continue;
+                }
                 if matches!(f.field_type, FieldType::Text) {
                     tf.push(f.name.clone());
                 } else {
@@ -16767,7 +16802,7 @@ impl Index {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
-                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
         };
@@ -17972,7 +18007,7 @@ fn read_doc_values_sidecar(
 fn build_fts_field_configs(schema: &Schema) -> HashMap<String, xerj_fts::index::FieldIndexConfig> {
     use xerj_fts::index::FieldIndexConfig;
     let mut out = HashMap::new();
-    let excluded = crate::memtable::semantic_derived_vector_fields(schema);
+    let excluded = crate::memtable::fts_excluded_fields(schema);
     for f in &schema.fields {
         if excluded.contains(&f.name) {
             continue;
@@ -23517,7 +23552,7 @@ impl SyncFlushCoord {
         })
     }
 
-    fn semantic_derived_vector_fields(
+    fn fts_excluded_fields(
         &self,
         schema: &Arc<RwLock<ManagedSchema>>,
     ) -> std::collections::HashSet<String> {
@@ -23526,7 +23561,7 @@ impl SyncFlushCoord {
         };
         rt.block_on(async {
             let guard = schema.read().await;
-            crate::memtable::semantic_derived_vector_fields(&guard.schema)
+            crate::memtable::fts_excluded_fields(&guard.schema)
         })
     }
 }
@@ -26846,6 +26881,144 @@ fn lookup_vector_quantization(schema: &Schema, field: &str) -> Option<String> {
     }
     let parts: Vec<&str> = field.split('.').collect();
     find(&schema.fields, &parts).and_then(|fc| fc.options.quantization.clone())
+}
+
+/// Resolve a (possibly dotted) field path to its declared [`FieldConfig`].
+///
+/// Same walk as `lookup_vector_quantization`: a dotted path descends through
+/// `FieldConfig::fields` (object sub-paths and multi-fields). Returns `None`
+/// for anything the schema does not declare — dynamic fields have no declared
+/// mapping options to honour.
+fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig> {
+    fn find<'a>(fields: &'a [FieldConfig], path: &[&str]) -> Option<&'a FieldConfig> {
+        let head = *path.first()?;
+        let tail = &path[1..];
+        for fc in fields {
+            if fc.name == head {
+                if tail.is_empty() {
+                    return Some(fc);
+                }
+                return find(&fc.fields, tail);
+            }
+        }
+        None
+    }
+    find(&schema.fields, &field.split('.').collect::<Vec<_>>())
+}
+
+/// The first field in `q` that the mapping has made completely unsearchable.
+///
+/// A field is unsearchable when its mapping declares BOTH `"index": false`
+/// (no postings) and no doc values (nothing to scan instead) — for example
+/// `{"type": "text", "index": false}`, since `text` has no doc values by
+/// default. ES rejects every query naming such a field with
+/// `IllegalArgumentException: Cannot search on field [f] since it is not
+/// indexed nor has doc values.`, which its shard query builder wraps as a
+/// `query_shard_exception` inside a 400 `search_phase_execution_exception`.
+/// XERJ's `XerjError::InvalidQuery` + the `failed to create query:` prefix
+/// reproduce exactly that envelope (see `xerj-api/src/error.rs`).
+///
+/// `index: false` WITH doc values is *not* unsearchable: ES 8.1 added "doc
+/// values search" and answers term/terms/range/prefix/wildcard/regexp/fuzzy
+/// from the doc-values column instead (the whole of
+/// `search/390_doc_values_search.yml`). Those queries keep working here too,
+/// unchanged: such a field keeps its whole-value postings, because they are
+/// what answers it *exactly* — see `memtable::fts_excluded_fields`.
+///
+/// Deliberately NOT covered: the multi-field query types (`multi_match`,
+/// `query_string`, `simple_query_string`, `more_like_this`). ES throws when
+/// any *named* field is unsearchable, but XERJ expands wildcard field specs
+/// against the schema, so rejecting here would turn `fields: ["*"]` into a
+/// hard error for the whole index.
+///
+/// The FTS route for those queries no longer projects a clause onto an
+/// unsearchable field (`text_fields`/`exact_fields` in `search_inner` apply
+/// ES's `isSearchable()` rule), but the stored-doc scan's field-less
+/// `query_string` arm is schema-free: it walks every non-`_` key of
+/// `_source`, so a token living only in an unsearchable field still matches
+/// there. Measured, not assumed. That arm's divergence from the FTS
+/// projection predates this change and is called out in its own comment in
+/// `doc_matches_query`; making it schema-aware means threading a schema
+/// through ~79 call sites and is left as its own change.
+fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
+    let check = |field: &String| -> Option<String> {
+        let fc = declared_field(schema, field)?;
+        (!fc.options.indexed && !fc.options.doc_values).then(|| field.clone())
+    };
+    match q {
+        // ── Leaves that name exactly one field ────────────────────────────
+        QueryNode::Term { field, .. }
+        | QueryNode::Terms { field, .. }
+        | QueryNode::Range { field, .. }
+        | QueryNode::Prefix { field, .. }
+        | QueryNode::Wildcard { field, .. }
+        | QueryNode::Match { field, .. }
+        | QueryNode::MatchPhrase { field, .. }
+        | QueryNode::MatchPhrasePrefix { field, .. }
+        | QueryNode::Fuzzy { field, .. }
+        | QueryNode::Regexp { field, .. }
+        | QueryNode::Intervals { field, .. }
+        | QueryNode::SpanTerm { field, .. }
+        | QueryNode::GeoDistance { field, .. }
+        | QueryNode::GeoBoundingBox { field, .. }
+        | QueryNode::GeoPolygon { field, .. }
+        | QueryNode::GeoShape { field, .. } => check(field),
+
+        // `exists` is NOT an error in ES: an unsearchable field is simply
+        // absent from `_field_names`, so the clause matches nothing. The
+        // API layer already rewrites it to `match_none`
+        // (`es_compat::rewrite_unqueryable_exists`).
+        QueryNode::Exists { .. } => None,
+
+        // ── Composites: recurse ───────────────────────────────────────────
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .find_map(|c| unsearchable_query_field(c, schema)),
+        QueryNode::Constant { query, .. }
+        | QueryNode::Boosted { query, .. }
+        | QueryNode::Named { query, .. }
+        | QueryNode::Nested { query, .. }
+        | QueryNode::FunctionScore { query, .. } => unsearchable_query_field(query, schema),
+        QueryNode::Pinned { organic, .. } => unsearchable_query_field(organic, schema),
+        QueryNode::Boosting {
+            positive, negative, ..
+        } => unsearchable_query_field(positive, schema)
+            .or_else(|| unsearchable_query_field(negative, schema)),
+        QueryNode::DisMax { queries, .. } => queries
+            .iter()
+            .find_map(|c| unsearchable_query_field(c, schema)),
+        QueryNode::Hybrid { queries, .. } => queries
+            .iter()
+            .find_map(|wq| unsearchable_query_field(&wq.query, schema)),
+        QueryNode::Knn { filter, .. } | QueryNode::SemanticSearch { filter, .. } => filter
+            .as_ref()
+            .and_then(|f| unsearchable_query_field(f, schema)),
+        QueryNode::SpanNear { clauses, .. } | QueryNode::SpanOr { clauses } => clauses
+            .iter()
+            .find_map(|c| unsearchable_query_field(c, schema)),
+        QueryNode::SpanNot { include, exclude } => unsearchable_query_field(include, schema)
+            .or_else(|| unsearchable_query_field(exclude, schema)),
+        QueryNode::SpanFirst { match_query, .. } => unsearchable_query_field(match_query, schema),
+        QueryNode::SpanContaining { little, big } | QueryNode::SpanWithin { little, big } => {
+            unsearchable_query_field(little, schema)
+                .or_else(|| unsearchable_query_field(big, schema))
+        }
+
+        // Everything else names no single mapped field to validate:
+        // MatchAll/MatchNone/Ids/Script, the multi-field types documented
+        // above, `percolate` (the field holds stored queries, not data), and
+        // `more_like_this`.
+        _ => None,
+    }
 }
 
 /// Rewrite a query by resolving any field aliases to their canonical field names.
@@ -38158,7 +38331,7 @@ mod flush_memory_integration_tests {
             let schema = idx.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
-                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
         };

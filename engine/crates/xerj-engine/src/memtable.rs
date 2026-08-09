@@ -3576,7 +3576,7 @@ pub fn analyze_doc(
     schema: &Schema,
     analyzer: &AnalyzerPipeline,
 ) -> Vec<(String, Vec<Token>)> {
-    let excluded = semantic_derived_vector_fields(schema);
+    let excluded = fts_excluded_fields(schema);
     analyze_doc_excluding(source, schema, analyzer, &excluded)
 }
 
@@ -3590,6 +3590,14 @@ pub fn analyze_doc_excluding(
 
     // Index fields that are defined as Text in the schema.
     for field_cfg in &schema.fields {
+        // `excluded` is authoritative for schema fields too, not only for the
+        // dynamic-path sweep below. Before `index: false` was honoured the only
+        // members were semantic-derived vector fields, which are never
+        // `FieldType::Text`, so this loop could skip the check; a declared
+        // `"index": false` Text field is exactly the case that needs it.
+        if excluded.contains(&field_cfg.name) {
+            continue;
+        }
         if matches!(field_cfg.field_type, FieldType::Text) {
             if let Some(val) = source.get(&field_cfg.name) {
                 let text = extract_text_value(val);
@@ -3636,6 +3644,61 @@ pub fn semantic_derived_vector_fields(schema: &Schema) -> std::collections::Hash
             xerj_query::executor::PASSAGE_METADATA_PREFIX,
             target
         ));
+    }
+    excluded
+}
+
+/// Every field that must be kept OUT of the full-text inverted index.
+///
+/// Two disjoint reasons, unioned into one set so flush, merge, the memtable
+/// analyser and `build_fts_field_configs` cannot disagree:
+///
+///  * semantic-derived vector fields (see above) — engine-internal payloads
+///    that were never user text;
+///  * fields whose mapping declares `"index": false` — #204's last open
+///    accepted-and-ignored instance. The option was echoed by `GET _mapping`
+///    and then ignored, so the field kept a full inverted index and stayed
+///    searchable.
+///
+/// Derived from the SCHEMA rather than from the documents, exactly like
+/// `doc_values_skip_set` — a merge must not resurrect postings that flush
+/// correctly skipped. Dynamic (unmapped) fields are absent from the schema
+/// and are unaffected: there is no declared `index: false` to honour.
+///
+/// ## Why `index: false` alone is not enough to drop the postings
+///
+/// Dropping a field's postings does not make it unmatchable here: the
+/// per-segment `fts_has_field` gate routes the query onto the stored-doc
+/// scan instead. That fallback is only usable where it is *equivalent* —
+/// #204's second rule, "degrade loudly or not at all", applies to us as much
+/// as to anyone.
+///
+///  * A **Text** field's scan comparison is analysed, which is exactly what
+///    the postings did. Equivalent → the postings go.
+///  * An **exact-typed** field (keyword / ip / date / numeric / boolean) is
+///    FTS-indexed with the `keyword` analyzer: one whole-value token. The
+///    scan's `match` arm splits on non-alphanumerics, so `192.168.0.1` would
+///    start matching `192.168.0.2`. Measured, not theorised — it is the one
+///    case `search/390_doc_values_search.yml` fails on. Weaker → the postings
+///    stay, and they are what answers ES 8.1's "doc values search" exactly.
+///    Nothing observable changes for those fields; the footprint saving is
+///    knowingly forgone rather than bought with wrong answers.
+///  * A field with **no doc values either** is unsearchable in ES's sense
+///    (`MappedFieldType.isSearchable()` = has terms OR has doc values), and
+///    `unsearchable_query_field` in `index.rs` rejects every query naming it
+///    before execution — so no fallback of any strength ever runs, and the
+///    postings are pure waste whatever the type.
+pub fn fts_excluded_fields(schema: &Schema) -> std::collections::HashSet<String> {
+    let mut excluded = semantic_derived_vector_fields(schema);
+    for field in &schema.fields {
+        if field.options.indexed {
+            continue;
+        }
+        let fallback_is_equivalent =
+            matches!(field.field_type, FieldType::Text) || !field.options.doc_values;
+        if fallback_is_equivalent {
+            excluded.insert(field.name.clone());
+        }
     }
     excluded
 }
@@ -3712,6 +3775,95 @@ mod semantic_derived_vector_exclusion_tests {
         for derived in &excluded {
             assert!(!fields.contains_key(derived));
         }
+    }
+}
+
+#[cfg(test)]
+mod index_false_exclusion_tests {
+    //! `"index": false` must remove the field from the full-text index —
+    //! the storage half of #204's last accepted-and-ignored instance. Before
+    //! the fix `FieldOptions::indexed` was never read here, so a field the
+    //! mapping declared non-indexed got a full set of postings anyway.
+    use super::*;
+    use serde_json::json;
+    use xerj_common::types::{FieldConfig, FieldType};
+
+    fn schema_with_a_non_indexed_field() -> Schema {
+        let mut schema = Schema::empty();
+        let mut note = FieldConfig::new("note", FieldType::Text);
+        note.options.indexed = false;
+        note.options.doc_values = false;
+        schema.add_field(note).unwrap();
+        let mut code = FieldConfig::new("code", FieldType::Keyword);
+        code.options.indexed = false; // keeps doc values — still queryable
+        schema.add_field(code).unwrap();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    #[test]
+    fn non_indexed_fields_join_the_fts_exclusion_set() {
+        let schema = schema_with_a_non_indexed_field();
+        let excluded = fts_excluded_fields(&schema);
+        assert!(
+            excluded.contains("note"),
+            "a non-indexed Text field: the stored-doc scan analyses it the \
+             same way the postings did, so dropping them is equivalent: \
+             {excluded:?}"
+        );
+        assert!(
+            !excluded.contains("code"),
+            "a non-indexed KEYWORD that kept its doc values is still \
+             searchable in ES's sense, and the scan fallback is weaker than \
+             its whole-value postings (it would split `192.168.0.1` into \
+             tokens) — the postings stay: {excluded:?}"
+        );
+        assert!(!excluded.contains("body"), "{excluded:?}");
+
+        // …but with no doc values either, nothing can answer it, the query is
+        // rejected outright, and the postings are pure waste whatever the type.
+        let mut schema = Schema::empty();
+        let mut opaque = FieldConfig::new("opaque", FieldType::Keyword);
+        opaque.options.indexed = false;
+        opaque.options.doc_values = false;
+        schema.add_field(opaque).unwrap();
+        assert!(fts_excluded_fields(&schema).contains("opaque"));
+    }
+
+    #[test]
+    fn a_non_indexed_schema_text_field_is_never_analysed() {
+        // The schema-Text loop in `analyze_doc_excluding` used to ignore the
+        // exclusion set entirely (its only members were semantic-derived
+        // vector fields, which are never Text). A declared `index: false`
+        // Text field is exactly the case that made the omission visible.
+        let schema = schema_with_a_non_indexed_field();
+        let source = json!({ "note": "zzquagga", "code": "AB-1234", "body": "ordinary text" });
+        let analyzer = xerj_fts::analyzer::AnalyzerPipeline::new(
+            vec![],
+            std::sync::Arc::new(xerj_fts::analyzer::StandardTokenizer),
+            vec![std::sync::Arc::new(xerj_fts::analyzer::LowercaseFilter)
+                as std::sync::Arc<dyn xerj_fts::analyzer::TokenFilter>],
+        );
+        let analysed: std::collections::HashMap<String, Vec<Token>> =
+            analyze_doc(&source, &schema, &analyzer)
+                .into_iter()
+                .collect();
+        let names: Vec<&str> = analysed.keys().map(String::as_str).collect();
+        assert!(
+            !analysed.contains_key("note"),
+            "a non-indexed Text field must contribute no tokens: {names:?}"
+        );
+        assert!(
+            analysed.contains_key("code"),
+            "`code` kept its doc values, so it kept its whole-value postings \
+             too — see `fts_excluded_fields`: {names:?}"
+        );
+        assert!(
+            analysed.contains_key("body"),
+            "the indexed control field must still be analysed: {names:?}"
+        );
     }
 }
 
