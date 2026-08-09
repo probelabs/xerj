@@ -27075,6 +27075,8 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             operator,
             analyzer,
             boost,
+            slop,
+            max_expansions,
         } => QueryNode::MultiMatch {
             fields: fields.iter().map(|f| strip(f)).collect(),
             query: query.clone(),
@@ -27082,6 +27084,8 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             operator: *operator,
             analyzer: analyzer.clone(),
             boost: *boost,
+            slop: *slop,
+            max_expansions: *max_expansions,
         },
         QueryNode::GeoDistance {
             field,
@@ -28122,6 +28126,143 @@ fn geo_coord(v: &Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+/// Split raw field/query text into the lowercase alphanumeric token stream
+/// the stored-doc evaluator treats as "positions". It is the stored-scan
+/// counterpart of the standard analyzer's token stream: the analyzer drops
+/// punctuation and lowercases, so `merge, policy` yields `[merge, policy]`
+/// — two ADJACENT positions, which is why a positional phrase matches it
+/// and raw-substring containment does not (issue #230).
+fn phrase_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// True when `query_tokens` occur in `field_tokens` in order with at most
+/// `slop` intervening positions in total — the stored-scan twin of
+/// `xerj_fts::search`'s `phrase_positions_match`, which evaluates the same
+/// predicate over the segment's real term positions.
+///
+/// `slop == 0` is exact adjacency (a window compare); `slop > 0` anchors on
+/// EVERY occurrence of the first term and walks each later term to its
+/// earliest position after the previous match, summing the gaps — the same
+/// greedy walk `phrase_positions_match` runs over segment positions.
+///
+/// Anchoring on every occurrence is load-bearing: the previous stored-scan
+/// walk anchored only on the FIRST occurrence of the leading term, so
+/// `[a, x, x, x, a, b]` rejected the slop-1 phrase `a b` that both ES and
+/// the segment path accept (anchor at the second `a`).
+fn phrase_positions_in_tokens(field_tokens: &[String], query_tokens: &[String], slop: u32) -> bool {
+    if query_tokens.is_empty() {
+        return true;
+    }
+    if query_tokens.len() > field_tokens.len() {
+        return false;
+    }
+    if slop == 0 {
+        return field_tokens
+            .windows(query_tokens.len())
+            .any(|w| w == query_tokens);
+    }
+    for (start, tok) in field_tokens.iter().enumerate() {
+        if tok != &query_tokens[0] {
+            continue;
+        }
+        let mut current = start;
+        let mut total_gaps: u32 = 0;
+        let mut ok = true;
+        for qt in &query_tokens[1..] {
+            match field_tokens[current + 1..].iter().position(|ft| ft == qt) {
+                Some(off) => {
+                    let next = current + 1 + off;
+                    total_gaps += (next - current - 1) as u32;
+                    if total_gaps > slop {
+                        ok = false;
+                        break;
+                    }
+                    current = next;
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the leading `query_tokens[..n-1]` form an adjacent in-order
+/// phrase whose next position starts with `query_tokens[n-1]` — ES
+/// `match_phrase_prefix` semantics over the token stream. A single token
+/// degrades to "any token starts with it".
+///
+/// This is TERM-level, not substring-level: `merge poli` matches the token
+/// stream `[merge, policy]` (so it matches raw text `merge, policy` too),
+/// while `merge polic` does NOT satisfy the exact-phrase variant, because
+/// `polic` is not the term `policy`.
+fn phrase_prefix_positions_in_tokens(field_tokens: &[String], query_tokens: &[String]) -> bool {
+    let (last, head) = match query_tokens.split_last() {
+        Some(pair) => pair,
+        None => return true,
+    };
+    if head.is_empty() {
+        return field_tokens.iter().any(|t| t.starts_with(last.as_str()));
+    }
+    if head.len() >= field_tokens.len() {
+        return false;
+    }
+    field_tokens.windows(head.len()).enumerate().any(|(i, w)| {
+        w == head
+            && field_tokens
+                .get(i + head.len())
+                .is_some_and(|t| t.starts_with(last.as_str()))
+    })
+}
+
+/// Per-field phrase predicate for the phrase-shaped `multi_match` types,
+/// shared by the membership (`doc_matches_query`) and scoring
+/// (`score_query_against_doc`) arms so an admitted doc can never score 0.
+///
+/// `phrase_prefix` treats the trailing token as a prefix; `phrase` requires
+/// whole terms and honours `slop`. `slop` is deliberately unread on the
+/// prefix arm — the parser REFUSES a non-zero `slop` with
+/// `type: phrase_prefix` (neither this walk nor the segment's
+/// `PhrasePrefixQuery` can honour it), so the only value that reaches here
+/// is 0. Reading it would imply support that does not exist.
+///
+/// `field_text_lc` is the field's text as the rest of the `multi_match` arms
+/// see it — an array-valued field arrives already joined with a space.
+/// That means a phrase CAN span two array elements, which ES prevents with a
+/// `position_increment_gap`. XERJ has no such gap anywhere: the indexing
+/// path flattens an array to one space-joined string before the FTS layer
+/// ever sees it (`extract_field_text`), so the segment's positions have no
+/// gap either. Evaluating per element here would therefore FIX the memtable
+/// and leave the segment as it is — reintroducing the flush-variant hit set
+/// this fix exists to remove. The gap belongs in the indexing path; it is
+/// deliberately not attempted here.
+fn multi_match_phrase_hit(
+    field_text_lc: &str,
+    query_tokens: &[String],
+    is_prefix: bool,
+    slop: u32,
+) -> bool {
+    if query_tokens.is_empty() {
+        return true;
+    }
+    let field_tokens = phrase_tokens(field_text_lc);
+    if is_prefix {
+        phrase_prefix_positions_in_tokens(&field_tokens, query_tokens)
+    } else {
+        phrase_positions_in_tokens(&field_tokens, query_tokens, slop)
+    }
+}
+
 /// Evaluate a query against a single stored document source value.
 ///
 /// Returns true if the document matches the query.
@@ -28645,7 +28786,7 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
         // operator and match_type. `operator: and` + `cross_fields` (used
         // by `combined_fields`) requires every query token to appear in
         // at least one of the listed fields. The default (operator: or)
-        // admits the hit when any query substring hits any field.
+        // admits the hit when any query token equals a token of one field.
         //
         // Field specs may carry a boost factor (`"title^3"`); strip it for matching.
         QueryNode::MultiMatch {
@@ -28653,6 +28794,7 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
             query,
             match_type,
             operator,
+            slop,
             ..
         } => {
             let q_lower = query.to_lowercase();
@@ -28667,6 +28809,8 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                 xerj_query::ast::MultiMatchType::Phrase
                     | xerj_query::ast::MultiMatchType::PhrasePrefix
             );
+            let is_phrase_prefix =
+                matches!(match_type, xerj_query::ast::MultiMatchType::PhrasePrefix);
             let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
             let field_texts: Vec<String> = fields
                 .iter()
@@ -28693,7 +28837,34 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                     }
                 })
                 .collect();
-            if is_cross && is_and && !tokens.is_empty() {
+            if is_phrase && !tokens.is_empty() {
+                // phrase / phrase_prefix: POSITIONAL, per field (issue
+                // #230). ES lowers these types to a dis_max over per-field
+                // `match_phrase`/`match_phrase_prefix`, so the predicate is
+                // the same positional walk `MatchPhrase` uses — the query
+                // terms must occur in order in ONE field's analyzed token
+                // stream, within `slop` intervening positions (0 = exact
+                // adjacency), the trailing term treated as a prefix for
+                // `phrase_prefix`.
+                //
+                // Pre-fix this branch was `ft.contains(&q_lower)` — raw
+                // lowercase substring containment, which both UNDER-matched
+                // (`"merge policy"` missed the doc `merge, policy`, whose
+                // analyzed terms are adjacent) and OVER-matched (`"merge
+                // polic"` matched `merge policy`, where no such term
+                // exists). The segment path evaluates the same positions,
+                // now via `FtsQuery::Phrase`/`PhrasePrefix`, so the hit set
+                // stays flush-invariant.
+                //
+                // Tested FIRST, ahead of the operator branches: `operator`
+                // is meaningless for a phrase in ES (its phrase parser never
+                // consults it), and pre-fix `{"type":"phrase","operator":
+                // "and"}` fell into the token-AND branch below and silently
+                // stopped being a phrase at all.
+                field_texts
+                    .iter()
+                    .any(|ft| multi_match_phrase_hit(ft, &tokens, is_phrase_prefix, *slop))
+            } else if is_cross && is_and && !tokens.is_empty() {
                 // cross_fields + operator AND: every token must appear in
                 // at least one listed field (combined perspective).
                 let combined = field_texts.join(" ");
@@ -28726,13 +28897,10 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                         .collect();
                     tokens.iter().all(|t| ft_tokens.contains(t.as_str()))
                 })
-            } else if is_phrase || tokens.is_empty() {
-                // phrase / phrase_prefix: the whole query must appear
-                // contiguously — substring approximation of phrase
-                // matching, shared with the segment path (whose FTS
-                // projection declines these types, so BOTH states evaluate
-                // this predicate and the hit set is flush-invariant). Also
-                // the fallback when the query has no alphanumeric tokens.
+            } else if tokens.is_empty() {
+                // No alphanumeric tokens at all (e.g. a punctuation-only
+                // query): the analyzer yields nothing, so fall back to raw
+                // containment rather than admitting every document.
                 field_texts.iter().any(|ft| ft.contains(&q_lower))
             } else {
                 // best_fields / most_fields with the default operator (OR,
@@ -28781,58 +28949,22 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
             // `match_phrase`/`match_phrase_prefix`): that fix stops the
             // crash on `{query: true}`, but without this one the
             // (now-valid) query still silently matched 0 documents.
+            //
+            // The positional walk itself lives in
+            // `phrase_positions_in_tokens` so the `multi_match` phrase arm
+            // evaluates the SAME predicate (issue #230) instead of its own
+            // substring approximation.
             fn matches_scalar(v: &Value, query_tokens: &[String], slop: u32) -> Option<bool> {
                 let s = match v {
                     Value::String(s) => s.clone(),
                     Value::Bool(_) | Value::Number(_) => v.to_string(),
                     _ => return None,
                 };
-                let field_tokens: Vec<String> = s
-                    .to_lowercase()
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if query_tokens.is_empty() {
-                    return Some(true);
-                }
-                if query_tokens.len() > field_tokens.len() {
-                    return Some(false);
-                }
-                // slop=0: exact contiguous phrase match in order.
-                if slop == 0 {
-                    let found = field_tokens
-                        .windows(query_tokens.len())
-                        .any(|w| w == query_tokens);
-                    return Some(found);
-                }
-                // slop>0: ES enforces in-order positions with at most
-                // `slop` intervening tokens between adjacent query tokens.
-                // Find each query token AFTER the previous one and sum the
-                // gaps.
-                let mut last_pos: Option<usize> = None;
-                let mut total_gaps: i64 = 0;
-                let mut ordered_ok = true;
-                for qt in query_tokens {
-                    let search_start = last_pos.map(|p| p + 1).unwrap_or(0);
-                    match field_tokens[search_start..]
-                        .iter()
-                        .position(|ft| ft == qt)
-                        .map(|off| search_start + off)
-                    {
-                        Some(pos) => {
-                            if let Some(prev) = last_pos {
-                                total_gaps += (pos as i64 - prev as i64 - 1).max(0);
-                            }
-                            last_pos = Some(pos);
-                        }
-                        None => {
-                            ordered_ok = false;
-                            break;
-                        }
-                    }
-                }
-                Some(ordered_ok && total_gaps <= slop as i64)
+                Some(phrase_positions_in_tokens(
+                    &phrase_tokens(&s),
+                    query_tokens,
+                    slop,
+                ))
             }
             get_field_value(source, field)
                 .and_then(|v| match &v {
@@ -28949,36 +29081,22 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
         }
 
         QueryNode::MatchPhrasePrefix { field, query, .. } => {
+            // POSITIONAL, not substring (issue #230). Pre-fix this arm found
+            // the head phrase as a raw substring (`s_lower.find(head)`) and
+            // required the prefix to follow it in the raw text — so
+            // punctuation INSIDE the phrase (`merge, policy`) defeated it,
+            // while the segment path (`FtsQuery::PhrasePrefix`) matched over
+            // the analyzed positions. The two states disagreed at `_flush`.
+            // Both now walk the same analyzed token stream.
             fn matches_str(s: &str, query: &str) -> Option<bool> {
-                let tokens: Vec<&str> = query.split_whitespace().collect();
-                if tokens.is_empty() {
+                let query_tokens = phrase_tokens(query);
+                if query_tokens.is_empty() {
                     return Some(true);
                 }
-                let s_lower = s.to_lowercase();
-                let (prefix, exact_tokens) = match tokens.split_last() {
-                    Some(pair) => pair,
-                    None => return Some(true),
-                };
-                // All tokens except the last must appear as an ordered substring.
-                // Last token is a prefix match.
-                let phrase_without_last = exact_tokens.join(" ").to_lowercase();
-                let last_lower = prefix.to_lowercase();
-                if exact_tokens.is_empty() {
-                    // Only one token — prefix match on the whole query.
-                    Some(
-                        s_lower
-                            .split_whitespace()
-                            .any(|w| w.starts_with(last_lower.as_str())),
-                    )
-                } else {
-                    // Multi-token: check phrase prefix.
-                    if let Some(pos) = s_lower.find(&phrase_without_last) {
-                        let after = &s_lower[pos + phrase_without_last.len()..].trim_start();
-                        Some(after.starts_with(last_lower.as_str()))
-                    } else {
-                        Some(false)
-                    }
-                }
+                Some(phrase_prefix_positions_in_tokens(
+                    &phrase_tokens(s),
+                    &query_tokens,
+                ))
             }
             get_field_value(source, field)
                 .and_then(|v| match &v {
@@ -30417,6 +30535,7 @@ fn score_query_against_doc(q: &QueryNode, source: &Value) -> f32 {
             boost,
             match_type,
             operator,
+            slop,
             ..
         } => {
             let q_lower = query.to_lowercase();
@@ -30427,20 +30546,26 @@ fn score_query_against_doc(q: &QueryNode, source: &Value) -> f32 {
                 xerj_query::ast::MultiMatchType::Phrase
                     | xerj_query::ast::MultiMatchType::PhrasePrefix
             );
+            let is_phrase_prefix =
+                matches!(match_type, xerj_query::ast::MultiMatchType::PhrasePrefix);
             let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
             // Per-field hit test mirroring `doc_matches_query` (issue #218):
-            // token-level OR by default / AND on request; phrase types keep
-            // whole-query substring containment. Pre-fix this arm tested
-            // `contains(whole query)`, so a memtable doc admitted by the
-            // membership check could still score 0.0 and be dropped by
-            // scored paths / rescore.
+            // token-level OR by default / AND on request; phrase types run
+            // the same POSITIONAL predicate the membership arm uses (issue
+            // #230 — this copy used to test whole-query substring
+            // containment). Pre-fix this arm tested `contains(whole query)`,
+            // so a memtable doc admitted by the membership check could still
+            // score 0.0 and be dropped by scored paths / rescore.
             let q_tokens: Vec<String> = q_lower
                 .split(|c: char| !c.is_alphanumeric())
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
                 .collect();
             let field_hit = |text_lc: &str| -> bool {
-                if is_phrase || q_tokens.is_empty() {
+                if is_phrase && !q_tokens.is_empty() {
+                    return multi_match_phrase_hit(text_lc, &q_tokens, is_phrase_prefix, *slop);
+                }
+                if q_tokens.is_empty() {
                     return text_lc.contains(&q_lower);
                 }
                 let ft_tokens: std::collections::HashSet<&str> = text_lc
@@ -32808,26 +32933,28 @@ fn query_node_to_fts(
             match_type,
             operator,
             boost,
-            ..
+            slop,
+            max_expansions,
+            analyzer,
         } => {
-            // The memtable evaluator (`doc_matches_query`) gives phrase /
-            // phrase_prefix multi_match whole-query-containment semantics,
-            // which is not expressible as this per-field token bool —
-            // projecting them as an OR over tokens made the segment path
-            // OVER-match (the reverse of issue #218's memtable under-match:
-            // a reversed phrase started matching at _flush).
-            // Decline the projection instead; the stored-doc scan then
-            // evaluates the same `doc_matches_query` predicate the memtable
-            // uses, keeping the matched set flush-invariant.
-            // (cross_fields + `operator: and` is declined too — see the
+            // phrase / phrase_prefix are POSITIONAL (issue #230): they lower
+            // to one positional clause per field, combined by dis_max — the
+            // shape ES builds (`MultiMatchQueryParser.buildFieldQueries` +
+            // `combineGrouped` → `DisjunctionMaxQuery`, tie_breaker 0.0 for
+            // both phrase types; AGPL, read for semantics only, no code
+            // copied).  This used to `return None`, which forced an O(N)
+            // stored-doc scan per segment AND left the (substring) memtable
+            // predicate as the definition of "phrase".
+            // (cross_fields + `operator: and` is still declined — see the
             // `is_and` guard below, which needs the analyzed token count.)
-            if matches!(
+            let is_phrase_type = matches!(
                 match_type,
                 xerj_query::ast::MultiMatchType::Phrase
                     | xerj_query::ast::MultiMatchType::PhrasePrefix
-            ) {
-                return None;
-            }
+            );
+            let is_phrase_prefix =
+                matches!(match_type, xerj_query::ast::MultiMatchType::PhrasePrefix);
+            let query_analyzer_name = analyzer.as_deref();
             let registry = AnalyzerRegistry::default();
             let analyzer = registry.get_analyzer("standard")?;
             let tokens = analyzer.analyze(query);
@@ -32866,6 +32993,73 @@ fn query_node_to_fts(
             // MultiMatch), which finds no such fields in any document.
             if field_specs.is_empty() {
                 return None;
+            }
+            // ── phrase / phrase_prefix: one positional clause per field ──
+            if is_phrase_type {
+                let terms: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
+                // Every listed field must be an ANALYZED TEXT field with a
+                // positions side-car, and the query must analyze to at least
+                // one term, or the projection is declined WHOLE and the
+                // stored-doc scan — which now evaluates the same positional
+                // predicate — answers instead. Three reasons to bail:
+                //   * a keyword/exact field indexes ONE case-preserved
+                //     whole-value term, which the schema-blind stored-scan
+                //     evaluator (it tokenizes every field) cannot model — a
+                //     Term projection there would change the hit set at
+                //     `_flush`, the exact regression class of #218;
+                //   * a dotted multi-field path (`title.raw`) or a non-text
+                //     mapped type has no positions to intersect;
+                //   * a non-standard query `analyzer` produces terms this
+                //     projection does not reproduce (the `match_phrase` arm
+                //     declines on the same condition).
+                // Dropping just the offending field instead would shrink the
+                // disjunction and under-match.
+                if terms.is_empty()
+                    || !matches!(query_analyzer_name, None | Some("standard"))
+                    || field_specs.iter().any(|(f, _)| {
+                        exact_fields.contains(f.as_str()) || !text_fields.iter().any(|t| t == f)
+                    })
+                {
+                    return None;
+                }
+                let outer = boost.unwrap_or(1.0);
+                let mut per_field: Vec<FtsQuery> = Vec::with_capacity(field_specs.len());
+                for (field, fb) in &field_specs {
+                    per_field.push(if is_phrase_prefix {
+                        FtsQuery::PhrasePrefix(xerj_fts::search::PhrasePrefixQuery {
+                            field: field.clone(),
+                            terms: terms.clone(),
+                            max_expansions: *max_expansions as usize,
+                            boost: *fb,
+                        })
+                    } else if terms.len() == 1 {
+                        // A one-term phrase is just a term query — and scores
+                        // identically to `match_phrase` on that field.
+                        FtsQuery::Term(FtsTerm::boosted(field.as_str(), &terms[0], *fb))
+                    } else {
+                        FtsQuery::Phrase(xerj_fts::search::PhraseQuery {
+                            field: field.clone(),
+                            terms: terms.clone(),
+                            slop: *slop,
+                            boost: *fb,
+                        })
+                    });
+                }
+                if per_field.is_empty() {
+                    return None;
+                }
+                // ES combines the per-field phrase clauses with dis_max
+                // (tie_breaker 0.0 for phrase and phrase_prefix alike).
+                let combined = if per_field.len() == 1 {
+                    per_field.pop().unwrap()
+                } else {
+                    FtsQuery::DisMax(Box::new(FtsDisMax::new(per_field)))
+                };
+                return Some(if (outer - 1.0).abs() > f32::EPSILON {
+                    FtsQuery::Bool(Box::new(FtsBool::new().should(combined).boost(outer)))
+                } else {
+                    combined
+                });
             }
             // `operator: and` binds PER FIELD for the field-centric types
             // (ES best_fields/most_fields build one match query per field
@@ -35548,6 +35742,8 @@ mod fts_projection_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let fq = query_node_to_fts(&q, &[], &kw(&["model", "top_doc"])).expect("projects");
         match fq {
@@ -35576,6 +35772,8 @@ mod fts_projection_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let fq = query_node_to_fts(&q, &["title".to_string()], &kw(&["model"])).expect("projects");
         match fq {
@@ -35626,6 +35824,8 @@ mod fts_projection_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         }
     }
 
@@ -35737,6 +35937,8 @@ mod fts_projection_tests {
             operator: Some(xerj_query::ast::BoolOperator::And),
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let fq = query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]))
             .expect("projects");
@@ -35770,9 +35972,108 @@ mod fts_projection_tests {
             operator: Some(xerj_query::ast::BoolOperator::And),
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         assert!(
             query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]),).is_none()
+        );
+    }
+
+    /// #230 — `multi_match` phrase types project to POSITIONAL per-field
+    /// clauses combined by dis_max (the shape ES builds), instead of
+    /// declining the projection and forcing an O(N) stored-doc scan per
+    /// segment. `slop` rides along into the phrase clause.
+    #[test]
+    fn multi_match_phrase_projects_positional_dis_max() {
+        let mut q = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "title^3".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::Phrase,
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 2,
+            max_expansions: 50,
+        };
+        let text = vec!["body".to_string(), "title".to_string()];
+        match query_node_to_fts(&q, &text, &kw(&[])).expect("phrase projects") {
+            FtsQuery::DisMax(d) => {
+                assert_eq!(d.queries.len(), 2, "one phrase clause per field");
+                for clause in &d.queries {
+                    match clause {
+                        FtsQuery::Phrase(p) => {
+                            assert_eq!(p.terms, vec!["merge".to_string(), "policy".to_string()]);
+                            assert_eq!(p.slop, 2, "slop must reach the positional clause");
+                            if p.field == "title" {
+                                assert_eq!(p.boost, 3.0, "^3 field boost preserved");
+                            }
+                        }
+                        other => panic!("expected positional phrase clause, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected dis_max of phrase clauses, got {other:?}"),
+        }
+
+        // phrase_prefix lowers to the positional prefix clause, carrying
+        // `max_expansions`.
+        q = QueryNode::MultiMatch {
+            fields: vec!["body".into()],
+            query: "merge poli".into(),
+            match_type: xerj_query::ast::MultiMatchType::PhrasePrefix,
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 7,
+        };
+        match query_node_to_fts(&q, &text, &kw(&[])).expect("phrase_prefix projects") {
+            FtsQuery::PhrasePrefix(p) => {
+                assert_eq!(p.terms, vec!["merge".to_string(), "poli".to_string()]);
+                assert_eq!(p.max_expansions, 7);
+            }
+            other => panic!("expected phrase-prefix clause, got {other:?}"),
+        }
+    }
+
+    /// #230 parity guard — a KEYWORD field in a phrase `multi_match` declines
+    /// the projection. The keyword FST holds one case-preserved whole-value
+    /// term, which the schema-blind stored-scan evaluator (it tokenizes every
+    /// field) cannot model; projecting it would make the hit set change at
+    /// `_flush`, the regression class of #218. Same for a dotted multi-field
+    /// path, which has no positions side-car at all.
+    #[test]
+    fn multi_match_phrase_declines_non_positional_fields() {
+        let text = vec!["body".to_string()];
+        let keyword_field = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "tags".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::Phrase,
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+        };
+        assert!(
+            query_node_to_fts(&keyword_field, &text, &kw(&["tags"])).is_none(),
+            "keyword field must keep the stored-scan path"
+        );
+
+        let dotted = QueryNode::MultiMatch {
+            fields: vec!["body.raw".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::Phrase,
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+        };
+        assert!(
+            query_node_to_fts(&dotted, &text, &kw(&[])).is_none(),
+            "dotted multi-field path must keep the stored-scan path"
         );
     }
 
@@ -36623,6 +36924,8 @@ mod lexical_passage_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let hit = Hit {
             id: "doc-1".into(),
@@ -36677,6 +36980,8 @@ mod lexical_passage_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let hit = Hit {
             id: "doc-1".into(),

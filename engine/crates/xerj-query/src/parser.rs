@@ -602,6 +602,71 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
         .and_then(|v| v.as_str())
         .unwrap_or("best_fields");
 
+    // `slop` / `max_expansions` are the phrase parameters of `multi_match`.
+    // They used to be dropped here, so `{"type":"phrase","slop":2}` was
+    // accepted and silently evaluated as slop 0 (issue #230) — parse them
+    // and reject the values ES rejects instead of quietly mis-answering.
+    // ES: negative slop and non-positive max_expansions are 400s, and
+    // `slop` is not allowed with `type: bool_prefix`.
+    // `u32::try_from` rather than `as u32`: a wrapping cast would turn an
+    // out-of-range slop into a small honoured one — a silently wrong answer.
+    let slop: u32 = match obj.get("slop") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        {
+            Some(n) if n < 0 => return invalid("`multi_match.slop` must not be negative"),
+            Some(n) => match u32::try_from(n) {
+                Ok(s) => s,
+                Err(_) => return invalid("`multi_match.slop` is out of range"),
+            },
+            None => return invalid("`multi_match.slop` must be an integer"),
+        },
+    };
+    let max_expansions: u32 = match obj.get("max_expansions") {
+        None | Some(Value::Null) => 50,
+        Some(v) => match v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        {
+            Some(n) if n <= 0 => return invalid("`multi_match.max_expansions` must be positive"),
+            Some(n) => match u32::try_from(n) {
+                Ok(m) => m,
+                Err(_) => return invalid("`multi_match.max_expansions` is out of range"),
+            },
+            None => return invalid("`multi_match.max_expansions` must be an integer"),
+        },
+    };
+    if slop != 0 && type_str == "bool_prefix" {
+        // ES's own wording — `310_match_bool_prefix.yml` catches this exact
+        // regex. The suite's runner only checks that the call is allowed to
+        // fail, so this arm passed while XERJ silently ignored `slop`.
+        return invalid("[slop] not allowed for type [bool_prefix]");
+    }
+    if slop != 0 && type_str == "phrase_prefix" {
+        // FAIL LOUDLY rather than accept-and-ignore (#204). XERJ evaluates a
+        // `phrase_prefix` as an ADJACENT head phrase plus a trailing prefix
+        // term, in both the positional segment clause
+        // (`xerj_fts::search::PhrasePrefixQuery`, which carries no slop) and
+        // the stored-doc walk. ES does honour slop here, so silently
+        // dropping it would answer a different query than the one asked —
+        // exactly the class of defect this fix exists to remove.
+        return invalid(
+            "`multi_match.slop` is not supported for type [phrase_prefix]: xerj matches a \
+             phrase_prefix as an adjacent phrase plus a trailing prefix term. Remove [slop], \
+             or use type [phrase]",
+        );
+    }
+    // `slop` on the FIELD-CENTRIC types (best_fields / most_fields /
+    // cross_fields) is accepted and unused, which is also what ES does:
+    // those types lower to a BOOLEAN match query, and only the PHRASE and
+    // PHRASE_PREFIX types lower to a phrase query that reads slop
+    // (`MultiMatchQueryBuilder.Type`, elasticsearch/server/src/main/java/
+    // org/elasticsearch/index/query/MultiMatchQueryBuilder.java:91 — AGPL,
+    // read for semantics only). Same answer as ES, so there is nothing to
+    // fail loudly about.
+
     // bool_prefix: rewrite to a Bool::should over per-field match_bool_prefix
     // clauses. Tokens except the last become Match queries, the last becomes
     // a Prefix query — matching ES `match_bool_prefix` semantics across all
@@ -767,6 +832,8 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
         operator,
         analyzer,
         boost,
+        slop,
+        max_expansions,
     })
 }
 
@@ -2063,6 +2130,8 @@ fn make_simple_query_node(term: &str, fields: &[String]) -> QueryNode {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         }
     }
 }
@@ -4347,6 +4416,68 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// #230 — `slop` and `max_expansions` are phrase parameters of
+    /// `multi_match`. They used to be dropped here, so `{"type":"phrase",
+    /// "slop":2}` was accepted and silently answered as an exact phrase.
+    #[test]
+    fn test_multi_match_phrase_params_are_parsed() {
+        let node = q(json!({
+            "multi_match": {
+                "query": "quick fox", "fields": ["body"],
+                "type": "phrase", "slop": 3
+            }
+        }));
+        assert!(matches!(
+            node,
+            QueryNode::MultiMatch {
+                match_type: MultiMatchType::Phrase,
+                slop: 3,
+                max_expansions: 50,
+                ..
+            }
+        ));
+
+        let node = q(json!({
+            "multi_match": {
+                "query": "quick fo", "fields": ["body"],
+                "type": "phrase_prefix", "max_expansions": 7
+            }
+        }));
+        assert!(matches!(
+            node,
+            QueryNode::MultiMatch {
+                match_type: MultiMatchType::PhrasePrefix,
+                slop: 0,
+                max_expansions: 7,
+                ..
+            }
+        ));
+    }
+
+    /// Values ES rejects must be rejected here too, not silently coerced.
+    #[test]
+    fn test_multi_match_phrase_params_are_validated() {
+        for bad in [
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "phrase", "slop": -1}}),
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "phrase", "slop": 4294967296i64}}),
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "phrase_prefix", "max_expansions": 0}}),
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "bool_prefix", "slop": 2}}),
+            // Accepted-and-ignored is the defect class of #204: xerj cannot
+            // honour slop on a phrase_prefix, so it must refuse it.
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "phrase_prefix", "slop": 2}}),
+        ] {
+            assert!(
+                parse_query(&bad).is_err(),
+                "expected a parse error for {bad}"
+            );
+        }
     }
 
     // ── term ──────────────────────────────────────────────────────────────────
