@@ -99,19 +99,27 @@ pub struct Pipeline {
 impl Pipeline {
     /// Build a [`Pipeline`] from a [`PipelineConfig`].
     ///
-    /// Returns [`WasmError::InvalidConfig`] if an unknown stage type is
-    /// encountered or a plugin-specific config is malformed.
+    /// Returns [`WasmError::InvalidConfig`] when a plugin-specific config is
+    /// malformed, and [`WasmError::UnsupportedStage`] when the stage type
+    /// itself is one xerj does not implement.
+    ///
+    /// Those two are deliberately distinct (issue #204). A malformed config is
+    /// a caller error and the definition must be refused. An unimplemented
+    /// stage type is a *xerj capability gap*: the caller wrote something
+    /// legitimate that we cannot run, and the honest answer is to say so at the
+    /// point of use rather than pretend either way.
     pub fn from_config(name: impl Into<String>, config: &PipelineConfig) -> Result<Self> {
         let name = name.into();
         let mut stages: Vec<Arc<dyn TransformPlugin>> = Vec::new();
 
         for stage_cfg in &config.stages {
             let plugin =
-                build_plugin(&stage_cfg.stage_type, &stage_cfg.config).map_err(|reason| {
-                    WasmError::InvalidConfig {
+                build_plugin(&stage_cfg.stage_type, &stage_cfg.config).map_err(|e| match e {
+                    StageBuildError::Unsupported(stage) => WasmError::UnsupportedStage { stage },
+                    StageBuildError::Config(reason) => WasmError::InvalidConfig {
                         plugin: stage_cfg.stage_type.clone(),
                         reason,
-                    }
+                    },
                 })?;
             stages.push(plugin);
         }
@@ -181,11 +189,31 @@ impl std::fmt::Debug for Pipeline {
 
 // ── Plugin factory ────────────────────────────────────────────────────────────
 
+/// Why [`build_plugin`] refused a stage.
+///
+/// Split in two on purpose (issue #204): `Config` is the caller's mistake and
+/// must be refused at definition time; `Unsupported` is xerj's gap and has to
+/// be reported as such so callers are not told their processor is invalid when
+/// it is merely unimplemented here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StageBuildError {
+    /// The stage type is not implemented by this build.
+    Unsupported(String),
+    /// The stage type exists but its config cannot be honoured.
+    Config(String),
+}
+
+impl From<String> for StageBuildError {
+    fn from(reason: String) -> Self {
+        Self::Config(reason)
+    }
+}
+
 /// Instantiate a built-in plugin by name.
 fn build_plugin(
     stage_type: &str,
     config: &Value,
-) -> std::result::Result<Arc<dyn TransformPlugin>, String> {
+) -> std::result::Result<Arc<dyn TransformPlugin>, StageBuildError> {
     match stage_type {
         "json_parse" => {
             let field = str_field(config, "field")?;
@@ -262,12 +290,13 @@ fn build_plugin(
                         return Err(format!(
                             "unknown grok pattern '{s}' (known patterns: {})",
                             GROK_PATTERN_NAMES.join(", ")
-                        ));
+                        )
+                        .into());
                     }
                     s.clone()
                 }
                 Some(other) => {
-                    return Err(format!("'pattern' must be a string, got {other}"));
+                    return Err(format!("'pattern' must be a string, got {other}").into());
                 }
             };
             Ok(Arc::new(GrokPlugin::new(field, pattern_name)))
@@ -285,7 +314,8 @@ fn build_plugin(
                             return Err(format!(
                                 "unknown pii type '{t}' (known types: {})",
                                 PII_TYPE_NAMES.join(", ")
-                            ));
+                            )
+                            .into());
                         }
                     }
                     requested
@@ -309,7 +339,8 @@ fn build_plugin(
                 return Err(format!(
                     "unknown convert target type '{target_type}' (known types: {})",
                     CONVERT_TARGET_TYPES.join(", ")
-                ));
+                )
+                .into());
             }
             Ok(Arc::new(ConvertTypePlugin::new(field, target_type)))
         }
@@ -356,7 +387,7 @@ fn build_plugin(
 
         unknown => {
             warn!(stage_type = unknown, "unknown pipeline stage type");
-            Err(format!("unknown stage type '{unknown}'"))
+            Err(StageBuildError::Unsupported(unknown.to_string()))
         }
     }
 }
@@ -514,6 +545,32 @@ mod fallback_regression_tests {
                 timeout_ms: 0,
             },
         )
+    }
+
+    /// A stage type this build does not implement and a stage type whose
+    /// config we refuse are different answers, and callers act on the
+    /// difference: the first is xerj's gap (accept the definition, refuse the
+    /// writes), the second is the caller's mistake (refuse the definition).
+    /// Collapsing them was what let an unimplemented processor be silently
+    /// dropped in the first place.
+    #[test]
+    fn an_unimplemented_stage_type_is_distinguishable_from_a_bad_config() {
+        let err = build("pipeline", serde_json::json!({ "name": "other" }))
+            .expect_err("unimplemented stage type must not build");
+        assert!(
+            matches!(&err, WasmError::UnsupportedStage { stage } if stage == "pipeline"),
+            "expected UnsupportedStage, got: {err:?}"
+        );
+
+        let err = build(
+            "convert",
+            serde_json::json!({ "field": "f", "type": "int" }),
+        )
+        .expect_err("bad config must not build");
+        assert!(
+            matches!(err, WasmError::InvalidConfig { .. }),
+            "a known stage with a bad config is InvalidConfig, got: {err:?}"
+        );
     }
 
     #[test]

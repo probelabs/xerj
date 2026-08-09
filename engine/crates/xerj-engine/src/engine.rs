@@ -275,6 +275,14 @@ pub struct Engine {
     pub scrolls: Arc<DashMap<String, ScrollContext>>,
     /// pipeline_id → pipeline definition JSON
     pub pipelines: Arc<DashMap<String, Value>>,
+    /// pipeline_id → why the stored definition has no compiled counterpart.
+    ///
+    /// Issue #204. A definition that carries a stage type this build does not
+    /// implement is still stored (Elasticsearch accepts it, and
+    /// `_ingest/pipeline/{id}/_simulate` still walks it), but nothing may be
+    /// ingested through it: `process_through_pipeline` refuses with the reason
+    /// recorded here instead of quietly indexing the untransformed document.
+    pub unrunnable_pipelines: Arc<DashMap<String, String>>,
     /// index_name → open/closed state (true = closed)
     pub closed_indices: Arc<DashMap<String, bool>>,
     /// data stream name → DataStream
@@ -434,6 +442,7 @@ impl Engine {
             templates: Arc::new(DashMap::new()),
             scrolls: Arc::new(DashMap::new()),
             pipelines: Arc::new(DashMap::new()),
+            unrunnable_pipelines: Arc::new(DashMap::new()),
             closed_indices: Arc::new(DashMap::new()),
             data_streams: Arc::new(DashMap::new()),
             ilm_policies: Arc::new(DashMap::new()),
@@ -1677,8 +1686,32 @@ impl Engine {
         let pipeline = xerj_wasm::pipeline::Pipeline::from_config(name, &cfg)?;
         self.pipelines.insert(name.to_string(), config_json);
         self.transform_pipelines.insert(name.to_string(), pipeline);
+        self.unrunnable_pipelines.remove(name);
         info!(name, "transform pipeline created");
         Ok(())
+    }
+
+    /// Store a pipeline definition that could not be compiled, together with
+    /// the reason, and make sure nothing stale is left behind.
+    ///
+    /// Issue #204. This exists for exactly one case: a definition xerj accepts
+    /// for wire compatibility (Elasticsearch does) but cannot execute, because
+    /// it names a processor this build does not implement. Storing it keeps
+    /// `GET`/`_simulate` truthful about what was submitted; recording the
+    /// reason is what stops [`Self::process_through_pipeline`] from silently
+    /// passing documents through untransformed. A previously-compiled pipeline
+    /// under the same id is REMOVED — re-defining a pipeline must not leave the
+    /// old stages quietly running under the new definition's name.
+    pub fn register_unrunnable_pipeline(&self, name: &str, definition: Value, reason: String) {
+        self.pipelines.insert(name.to_string(), definition);
+        self.transform_pipelines.remove(name);
+        self.unrunnable_pipelines
+            .insert(name.to_string(), reason.clone());
+        warn!(
+            name,
+            reason = reason.as_str(),
+            "ingest pipeline stored but NOT runnable — documents may not be ingested through it"
+        );
     }
 
     /// Run `docs` through a named pipeline, returning `(action, doc)` pairs.
@@ -1692,10 +1725,20 @@ impl Engine {
         mut docs: Vec<Value>,
     ) -> std::result::Result<Vec<(xerj_wasm::pipeline::ProcessAction, Value)>, xerj_wasm::WasmError>
     {
-        let pipeline = self
-            .transform_pipelines
-            .get(pipeline_name)
-            .ok_or_else(|| xerj_wasm::WasmError::PipelineNotFound(pipeline_name.to_string()))?;
+        let pipeline = self.transform_pipelines.get(pipeline_name).ok_or_else(|| {
+            // Issue #204: distinguish "no such pipeline" from "stored but this
+            // build cannot run it". Both must fail — what must not happen is a
+            // document being indexed untransformed — but reporting the second
+            // as the first sent operators hunting for a pipeline that is
+            // plainly there in `GET /_ingest/pipeline`.
+            match self.unrunnable_pipelines.get(pipeline_name) {
+                Some(reason) => xerj_wasm::WasmError::PipelineNotRunnable {
+                    pipeline: pipeline_name.to_string(),
+                    reason: reason.clone(),
+                },
+                None => xerj_wasm::WasmError::PipelineNotFound(pipeline_name.to_string()),
+            }
+        })?;
 
         let actions = pipeline.process_batch(&mut docs);
         Ok(actions.into_iter().zip(docs).collect())

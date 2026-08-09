@@ -52,6 +52,21 @@ pub enum WasmError {
     #[error("invalid plugin config for '{plugin}': {reason}")]
     InvalidConfig { plugin: String, reason: String },
 
+    /// The stage type is legitimate but this build does not implement it.
+    ///
+    /// Issue #204 keeps this separate from [`WasmError::InvalidConfig`]: a
+    /// caller who wrote a valid Elasticsearch processor xerj has not
+    /// implemented has not made a mistake, and must not be told they have.
+    /// What must never happen is the third option the code used to take —
+    /// accepting it and quietly running a shorter pipeline.
+    #[error("unsupported stage type '{stage}'")]
+    UnsupportedStage { stage: String },
+
+    /// The pipeline is registered but carries a stage this build cannot run,
+    /// so no document may pass through it.
+    #[error("pipeline '{pipeline}' is registered but cannot run: {reason}")]
+    PipelineNotRunnable { pipeline: String, reason: String },
+
     #[error("plugin error in '{plugin}': {reason}")]
     PluginError { plugin: String, reason: String },
 

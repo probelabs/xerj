@@ -1646,14 +1646,25 @@ pub async fn process_bulk_with_opts(
                     }
                     // Empty result set — index the original body unchanged.
                     Ok(_) => {}
-                    Err(_) => {
+                    Err(e) => {
+                        // A genuinely absent pipeline keeps ES's exact wording
+                        // (the conformance suite asserts it). A pipeline that
+                        // IS registered but carries a processor this build
+                        // cannot run reports that instead — issue #204: telling
+                        // an operator a pipeline "does not exist" when
+                        // `GET /_ingest/pipeline` plainly returns it sends them
+                        // hunting for the wrong problem.
+                        let reason = match &e {
+                            xerj_wasm::WasmError::PipelineNotRunnable { .. } => e.to_string(),
+                            _ => format!("pipeline with id [{pid}] does not exist"),
+                        };
                         items[item_idx] = Some(BulkItemResult {
                             action: action_type.to_string(),
                             index: target_index.clone(),
                             id: error_id.clone(),
                             status: 400,
                             result: None,
-                            error: Some(format!("pipeline with id [{pid}] does not exist")),
+                            error: Some(reason),
                             get_source: None,
                         });
                         errors = true;
