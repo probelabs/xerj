@@ -1811,6 +1811,12 @@ async fn async_main() -> Result<()> {
     // 8. Engine (opens existing indices from disk)
     let engine = Engine::new(cfg.clone()).context("initialise engine")?;
 
+    // This node's own cluster address, composed from the parsed bind IP.
+    // Needed twice — by the transport (8b) and by the console's node identity
+    // (9) — so it is derived once and the two cannot disagree. `None` only
+    // when `bind_address` is not an IP literal, which 8b refuses.
+    let cluster_listen_addr = cfg.socket_addr(cfg.cluster.port);
+
     // 8b. Cluster runner (if cluster mode is enabled)
     let _cluster_shutdown = if cfg.cluster.enabled {
         // Fail closed (issue #75). The cluster port carries Raft control
@@ -1846,12 +1852,18 @@ async fn async_main() -> Result<()> {
             }
         }
 
-        // Derive this node's listen address from the server bind address + cluster port.
-        let node_id = format!("{}:{}", cfg.server.bind_address, cfg.cluster.port);
-        let listen_addr: std::net::SocketAddr =
-            format!("{}:{}", cfg.server.bind_address, cfg.cluster.port)
-                .parse()
-                .context("parse cluster listen address")?;
+        // Derive this node's listen address from the server bind address +
+        // cluster port — from the *parsed* IP, never by formatting
+        // `"{bind}:{port}"`. That construction is the one that made
+        // `bind_address = "::1"` unbootable for the data listeners (see 11);
+        // it survived here because cluster mode is off by default, and it
+        // failed later and worse — `Error: parse cluster listen address` after
+        // the data directory and the first-run admin key already existed.
+        let listen_addr = cluster_listen_addr.with_context(|| bad_bind_address(&cfg))?;
+        // The node identifies itself by that address, so an IPv6 node is
+        // `[::1]:9300` — the bracketed form peer entries are parsed from
+        // (`SocketAddr::parse`, just above), not the unparseable `::1:9300`.
+        let node_id = listen_addr.to_string();
 
         let tick = std::time::Duration::from_millis(cfg.cluster.tick_ms);
 
@@ -1906,10 +1918,13 @@ async fn async_main() -> Result<()> {
     .await
     .context("xerj-console bootstrap")?;
 
-    let xerj_console_node_id: String = if cfg.cluster.enabled {
-        format!("{}:{}", cfg.server.bind_address, cfg.cluster.port)
-    } else {
-        "local".to_string()
+    let xerj_console_node_id: String = match (cfg.cluster.enabled, cluster_listen_addr) {
+        // The same string the cluster transport registered as this node's id.
+        (true, Some(addr)) => addr.to_string(),
+        // Unreachable: 8b refuses a cluster bind that has no socket address.
+        // Report the setting as written rather than invent an identity.
+        (true, None) => format!("{}:{}", cfg.server.bind_address, cfg.cluster.port),
+        (false, _) => "local".to_string(),
     };
     let xerj_console_cluster_mode = if cfg.cluster.enabled {
         ClusterMode::Raft

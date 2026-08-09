@@ -26,14 +26,20 @@ use std::time::{Duration, Instant};
 /// cleanly and keeps running instead of dying on an unrelated bind error,
 /// which would masquerade as a pass.
 fn three_free_ports() -> (u16, u16, u16) {
-    let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
-    let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
-    let l3 = TcpListener::bind("127.0.0.1:0").unwrap();
-    (
-        l1.local_addr().unwrap().port(),
-        l2.local_addr().unwrap().port(),
-        l3.local_addr().unwrap().port(),
-    )
+    let (a, b, c, _) = four_free_ports();
+    (a, b, c)
+}
+
+/// As above plus a fourth for the cluster transport.
+fn four_free_ports() -> (u16, u16, u16, u16) {
+    let held: Vec<TcpListener> = (0..4)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let p: Vec<u16> = held
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    (p[0], p[1], p[2], p[3])
 }
 
 /// TOML-safe rendering of a temp path (Windows backslashes would be escape
@@ -409,5 +415,90 @@ data_dir = "{data}"
         stderr.contains("10.0.0.7"),
         "the refusal must quote the address --bind supplied, proving the flag \
          reached the config; stderr:\n{stderr}"
+    );
+}
+
+/// The cluster transport must be reachable by the same IPv6 loopback spelling
+/// the data listeners accept.
+///
+/// `bind_address = "::1"` is a spelling operators reach for now that the
+/// default is loopback (#228), and the cluster listen address was the last
+/// place composing one by `format!("{bind}:{port}")` — `"::1:9300"` is not a
+/// socket address. The failure was worse than the data listeners': it lands at
+/// step 8b, *after* the data directory exists and a first-run admin key has
+/// been minted and printed, so the node leaves state behind and still cannot
+/// start.
+///
+/// Alive is the assertion. A regressed binary exits with
+/// `Error: parse cluster listen address`; the fixed one keeps running. If the
+/// environment has no usable IPv6 transport the binary logs the degraded
+/// single-node fallback and stays up — which still proves the address parsed,
+/// the only thing under test here.
+#[test]
+fn ipv6_loopback_bind_starts_the_cluster_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rest, grpc, es, cluster) = four_free_ports();
+    let config_path = dir.path().join("xerj.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+bind_address = "::1"
+rest_port = {rest}
+grpc_port = {grpc}
+es_compat_port = {es}
+data_dir = "{data}"
+
+[cluster]
+enabled = true
+port = {cluster}
+auth_secret = "0123456789abcdef0123456789abcdef"
+"#,
+            data = toml_path(&dir.path().join("data")),
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xerj"))
+        .arg("--config")
+        .arg(&config_path)
+        .env("XERJ_LOG", "info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn xerj");
+
+    // Long enough for engine init plus step 8b on a slow runner; the regressed
+    // binary dies well before this and the loop breaks out early.
+    let alive_until = Instant::now() + Duration::from_secs(20);
+    let mut exited = None;
+    while Instant::now() < alive_until {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    child.kill().ok();
+    child.wait().ok();
+
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr piped")
+        .read_to_string(&mut stderr)
+        .expect("read child stderr");
+
+    assert!(
+        !stderr.contains("parse cluster listen address"),
+        "the cluster listen address must be composed from the parsed bind IP, \
+         not from \"{{bind}}:{{port}}\"; stderr:\n{stderr}"
+    );
+    assert!(
+        exited.is_none(),
+        "bind_address = \"::1\" with cluster mode on must start; it exited \
+         with {exited:?}. stderr:\n{stderr}"
     );
 }
