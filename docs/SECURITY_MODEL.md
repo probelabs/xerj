@@ -353,6 +353,57 @@ Note that `ClientIp` is also used for audit fields on endpoints that are not
 rate limited, for example passkey enrolment (`auth/passkey.rs:168`). Only the
 three endpoints listed above charge a bucket.
 
+## Transport encryption, listener by listener
+
+`tls.enabled` does not mean "the node is encrypted". It covers two of the three
+data-plane listeners, and the third is cleartext by construction.
+
+| listener | default port | with `tls.enabled = true` |
+|---|---|---|
+| Native REST | 8080 | TLS (in-process rustls) |
+| ES-compat | 9200 | TLS (in-process rustls) |
+| gRPC `XerjSearch` | 8081 | **cleartext h2c — never TLS** |
+| Cluster control | 9300 | cleartext, authenticated only (see below) |
+
+REST and ES-compat are wrapped by `axum_server::bind_rustls`, which handshakes
+every accepted connection (`main.rs:788-810`). The gRPC listener is served by
+`tonic::transport::Server` with no TLS configuration at all
+(`grpc.rs:377-392`): tonic is deliberately built without its `tls` feature, so
+that a second crypto backend is not pulled in beside axum-server's `ring`. The
+consequence is that `tls.enabled` has no effect whatsoever on `:8081`.
+
+Auth is not the gap here — every RPC goes through the same API-key check as the
+HTTP surfaces (`GrpcAuth`, `grpc.rs:340-367`), so the port is not an open door.
+Confidentiality is the gap: the credential itself, and every document body,
+cross the wire in the clear.
+
+### The startup check (issue #229)
+
+Left alone, this is a silent mismatch. gRPC clients keep working whether or not
+TLS is on, so an operator who enabled TLS and expected three encrypted
+listeners gets no error, no failed connection, and no symptom of any kind.
+
+So startup refuses the dangerous combination. `Config::grpc_h2c_exposed_off_loopback`
+(`config.rs`) is true when TLS is enabled **and** `server.bind_address` is not
+loopback **and** `tls.allow_insecure_grpc_h2c` is unset; `main.rs` step 5b then
+aborts non-zero before binding anything or writing a certificate. Loopback
+binds are unaffected, and `--insecure` clears `tls.enabled` so it never trips.
+
+`0.0.0.0` and `::` count as exposed, not as "unset" — they bind every interface
+the host has, and `0.0.0.0` is the shipped default. Link-local addresses count
+as exposed too; they are reachable by every other host on the link. Both
+choices are pinned by tests in `xerj-common/src/config.rs`, and the refusal
+itself by `xerj-server/tests/grpc_h2c_fail_closed.rs`.
+
+The escape hatch, `tls.allow_insecure_grpc_h2c = true`, does not make anything
+safe — it records that you know, and it is what you set when a sidecar, mesh
+or reverse proxy terminates TLS for `:8081` on your behalf. The startup banner
+keeps naming the uncovered listener on every boot.
+
+Wiring tonic's own `tls` feature would close this properly. It is not done: it
+means a second TLS stack in the binary beside `axum-server` + `ring`, and that
+trade has not been made. Until it is, treat `:8081` as a plaintext port.
+
 ## Cluster control-frame authentication
 
 Cluster mode is off by default (`ClusterConfig::default`,
@@ -520,9 +571,13 @@ it is on a schedule this document can promise.
 - **Cluster traffic is unencrypted and membership-authenticated only.** No
   confidentiality, no per-node identity, no mTLS (`auth.rs:21-29`).
 - **TLS is off by default.** `TlsConfig` derives `Default`, so `tls.enabled` is
-  `false` (`config.rs:492-501`), and `--insecure` disables both TLS and auth
-  (`main.rs:345-349`). The startup banner prints the posture on every start
-  (`main.rs:302-319`).
+  `false`, and `--insecure` disables both TLS and auth. The startup banner
+  prints the posture on every start.
+- **The gRPC listener is never TLS.** `tls.enabled` covers REST and ES-compat
+  only; `:8081` is cleartext h2c in every configuration (`grpc.rs:377-392`).
+  Startup refuses the combination "TLS on + non-loopback bind" rather than let
+  that pass unnoticed — see
+  [Transport encryption](#transport-encryption-listener-by-listener).
 - **No encryption at rest at the engine level.** The startup banner says to use
   OS full-disk encryption or bucket-side encryption instead (`main.rs:318`).
 - **Rate limiting covers three Console auth endpoints only.** There is no
