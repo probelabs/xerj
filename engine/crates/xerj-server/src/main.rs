@@ -282,7 +282,13 @@ fn print_banner(cfg: &Config, startup_ms: u128) {
     println!();
     println!(" Native REST  :{} [{}]", cfg.server.rest_port, tls);
     println!(" ES-compat    :{} [{}]", cfg.server.es_compat_port, tls);
-    println!(" gRPC         :{} [h2c]", cfg.server.grpc_port);
+    // Never interpolated with `tls`: the gRPC listener is h2c whatever
+    // `[tls]` says (issue #229), and a line that read "TLS" here would be the
+    // exact false promise the startup check exists to prevent.
+    println!(
+        " gRPC         :{} [h2c — plaintext, no TLS]",
+        cfg.server.grpc_port
+    );
     println!(" Data dir     {}", cfg.server.data_dir);
     println!(" Started in   {}ms", startup_ms);
     println!();
@@ -306,6 +312,22 @@ fn print_banner(cfg: &Config, startup_ms: u128) {
     } else {
         println!(" │ ✓  TLS:    in-process rustls termination active (REST + ES-compat)");
         println!(" │           (self-signed by default — supply a CA cert for production)");
+        // The exposure the startup check refuses by default. Reaching here
+        // with a non-loopback bind means the operator set the opt-out, so
+        // say what it bought them rather than repeating the generic ✓.
+        if !cfg.bind_address_is_loopback() {
+            println!(
+                " │ ⚠  gRPC:   :{} is NOT covered by TLS — cleartext h2c on a non-loopback",
+                cfg.server.grpc_port
+            );
+            println!(" │           bind, allowed by tls.allow_insecure_grpc_h2c (issue #229).");
+            println!(" │           Terminate TLS for it at your proxy/mesh, or bind loopback.");
+        } else {
+            println!(
+                " │ ⚠  gRPC:   :{} is NOT covered by TLS — cleartext h2c, loopback-only",
+                cfg.server.grpc_port
+            );
+        }
     }
     if !cfg.auth.enabled {
         println!(" │ ⚠  Auth:   DISABLED (--insecure) — anyone on the network can write");
@@ -1588,6 +1610,35 @@ async fn async_main() -> Result<()> {
     init_tracing(&cfg.logging);
 
     info!("xerj v{} starting", env!("CARGO_PKG_VERSION"));
+
+    // 3b. gRPC h2c exposure — fail closed (issue #229). `grpc.rs` builds
+    //     tonic without its `tls` feature, so `server.grpc_port` speaks
+    //     cleartext h2c no matter what `[tls]` says. Enabling TLS and binding
+    //     off-loopback would therefore encrypt two listeners and quietly
+    //     leave the third in the clear on the same public interface — and
+    //     because gRPC clients keep working, the operator's only clue is a
+    //     banner they read once. Refuse instead, and name the one setting
+    //     that says the exposure is deliberate.
+    //
+    //     First thing after tracing, on purpose: a boot that is going to be
+    //     rejected must not create the data directory, mint and print a
+    //     first-run admin key, or generate a certificate. It is also after
+    //     `load_config`, so `--insecure` (which clears `tls.enabled`) has
+    //     already been applied and cannot be overruled from a config file.
+    if cfg.grpc_h2c_exposed_off_loopback() {
+        anyhow::bail!(
+            "tls.enabled = true but the gRPC listener on {}:{} speaks cleartext h2c — \
+             TLS covers the REST and ES-compat listeners only, and server.bind_address \
+             = \"{}\" is not loopback, so gRPC traffic (including API keys) would cross \
+             the network unencrypted while the node reports itself as TLS-enabled. \
+             Refusing to start. Fix by binding to loopback (server.bind_address = \
+             \"127.0.0.1\"), or terminate TLS for the gRPC port at a proxy, sidecar or \
+             service mesh and declare it: tls.allow_insecure_grpc_h2c = true.",
+            cfg.server.bind_address,
+            cfg.server.grpc_port,
+            cfg.server.bind_address,
+        );
+    }
 
     // 4. Data directory
     std::fs::create_dir_all(&cfg.server.data_dir)

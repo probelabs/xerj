@@ -19,6 +19,10 @@ static FAILPOINT_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Default)]
 struct MockState {
     docs: HashMap<String, Value>,
+    /// Catalog documents, kept apart from `docs` on purpose: `docs.len()` is
+    /// what `_count`/`_search` answer with, and the run verifies live data
+    /// counts against the journal (#195). Catalog rows are not data rows.
+    catalog_docs: HashMap<String, Value>,
     data_bulk_number: usize,
     fail_data_bulk: usize,
     failed_once: bool,
@@ -168,6 +172,35 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         .and_then(|index| index.as_str().map(str::to_owned))
         .is_some_and(|index| index != catalog::CATALOG_INDEX);
     if !is_data {
+        // Catalog bulks mix `index` and `delete` actions (stale aliases, and
+        // the junk sweep of #238), so walk the NDJSON rather than assuming
+        // action/document pairs — a delete carries no document line.
+        let mut locked = state.lock().unwrap();
+        let mut line = 0;
+        while line < lines.len() {
+            let Ok(action) = serde_json::from_slice::<Value>(lines[line]) else {
+                line += 1;
+                continue;
+            };
+            if action.pointer("/delete/_index").and_then(Value::as_str)
+                == Some(catalog::CATALOG_INDEX)
+            {
+                if let Some(id) = action.pointer("/delete/_id").and_then(Value::as_str) {
+                    locked.catalog_docs.remove(id);
+                }
+                line += 1;
+            } else if action.pointer("/index/_index").and_then(Value::as_str)
+                == Some(catalog::CATALOG_INDEX)
+                && line + 1 < lines.len()
+            {
+                let id = action.pointer("/index/_id").unwrap().as_str().unwrap();
+                let doc: Value = serde_json::from_slice(lines[line + 1]).unwrap();
+                locked.catalog_docs.insert(id.to_owned(), doc);
+                line += 2;
+            } else {
+                line += 1;
+            }
+        }
         return json!({"errors": false, "items": []});
     }
 
@@ -820,6 +853,98 @@ fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
         .docs
         .values()
         .all(|doc| doc["value"].as_str() == Some("rewritten")));
+}
+
+/// #238: a file added after the plan was frozen is skipped and reported in the
+/// catalog. That report used to be immortal — `new_unplanned` was a per-run
+/// `Vec`, so once the file left the corpus nothing remembered the document had
+/// ever been written and no run could remove it. The catalog is the data map
+/// every `map`/`status`/agent query reads; it must not keep advertising a file
+/// that is gone.
+#[test]
+fn an_added_then_deleted_file_leaves_no_immortal_catalog_entry() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("planned.csv"),
+        "id,value\n0,planned\n1,planned\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    // Appears after the plan froze: not indexed, but reported as skipped.
+    fs::write(
+        corpus.path().join("added.csv"),
+        "id,value\n2,added\n3,added\n",
+    )
+    .unwrap();
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    let skipped_id = {
+        let locked = endpoint.state.lock().unwrap();
+        let (id, doc) = locked
+            .catalog_docs
+            .iter()
+            .find(|(_, doc)| doc["path"].as_str() == Some("added.csv"))
+            .expect("a file skipped for being post-freeze is reported in the catalog");
+        assert_eq!(doc["status"].as_str(), Some("skipped"));
+        assert_eq!(doc["doc_kind"].as_str(), Some("file"));
+        id.clone()
+    };
+
+    // The durable plan is the only record that the document exists. Without
+    // it no later run can ever delete it.
+    let replay = state::Journal::open(
+        state_dir.path(),
+        &config.root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    assert!(
+        replay
+            .plan
+            .as_ref()
+            .unwrap()
+            .junk_files
+            .iter()
+            .any(|junk| junk.rel == "added.csv"),
+        "the skipped file must be recorded in the durable plan"
+    );
+    drop(replay);
+
+    // Delete it: the catalog entry goes with it, and the run is clean again.
+    fs::remove_file(corpus.path().join("added.csv")).unwrap();
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    {
+        let locked = endpoint.state.lock().unwrap();
+        assert!(
+            !locked.catalog_docs.contains_key(&skipped_id),
+            "the catalog entry for a deleted skipped file must not survive"
+        );
+        assert!(
+            locked
+                .catalog_docs
+                .values()
+                .all(|doc| doc["path"].as_str() != Some("added.csv")),
+            "no catalog document may still name the deleted file"
+        );
+        // The file that is still there keeps its entry.
+        assert!(locked
+            .catalog_docs
+            .values()
+            .any(|doc| doc["path"].as_str() == Some("planned.csv")));
+    }
+
+    // Converged: nothing left to add or sweep, so no further plan is appended.
+    let plans_before = event_count(state_dir.path(), "plan");
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(event_count(state_dir.path(), "plan"), plans_before);
 }
 
 #[test]

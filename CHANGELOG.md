@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autoindex` no longer leaves immortal catalog entries for skipped files**
+  ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the
+  resume plan was frozen is skipped and reported in the catalog — but that
+  report was written from a per-run `Vec` that nothing durable remembered, so
+  once the file left the corpus no run could ever remove its `file:{key}`
+  document. The catalog is the data map every `map`, `status` and agent query
+  reads, and it kept advertising files that were gone. Skipped files are now
+  recorded in the durable plan and swept from the catalog when they leave the
+  corpus. The sweep is safe to do completely because a skipped file is never
+  indexed and never enters the graph corpus — that one catalog document is its
+  entire live footprint. Ordering is deliberate: the plan entry is added only
+  after the document is written and dropped only after the delete has landed,
+  so a failed catalog bulk is retried by the next run instead of stranding the
+  document. This does **not** implement add/change/delete reconciliation for
+  *indexed* files, which remains open.
+
 - **The installer is now fail-closed on checksum *verification*, not just on
   checksum *download*.** `landing/get` printed
   `warning: sha256sum/shasum not found — skipping checksum verification` and
