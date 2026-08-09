@@ -65,6 +65,22 @@ The sequence an agent should follow when handed a pile of files:
 
 Verified (all numbers trace to recorded runs, 2026-07-09): 80/81 ground-truth checks on a 1,995-file / 518 MB / 25-format corpus with a secret manifest (the one miss: a Shift-JIS file indexed as mojibake); 518 MB → 31 datasets / 2,018,398 records in ~38–51 s across runs; whole-pipeline 33.7k records/s on 923 MB (server-bound, not extractor-bound); client memory flat ~250 MB peak at 5× input growth; `kill -9` mid-run + re-run converged to identical counts across all datasets.
 
+## Running an index for a human (read this before you autoindex someone's folder)
+
+If you are an AI coding agent driving XERJ on a person's machine, indexing is the one operation that can occupy their laptop for minutes. They cannot see your tool output — they see you go quiet. Treat it as a job you are running on their behalf: **estimate, tell them, ask if it is big, report progress while it runs, report the real time when it finishes.**
+
+- **Plan before you index.** `xerj autoindex <folder> --dry-run` walks, sniffs and samples every file, prints the plan, and writes nothing. Its first line is the size of the job — `autoindex: 40 files (0 MB) under /path` — followed by the datasets it would create and the junk/skipped counts. It needs a running node. Report that line to your user before you commit their machine to anything.
+- **Estimate honestly, from two signals.** (a) The dry run performs the *full* phase-A pass, so its own wall-clock is a floor for the real run, never the whole cost. (b) Recorded reference throughput on one machine: 518 MB / 1,995 files → ~38–51 s; 33.7k records/s on 923 MB (server-bound). Hardware varies widely — Apple Silicon laptops, cold caches, and PDF-heavy or SQL-dump-heavy corpora are much slower per byte than source code. Give the user a range and say it is an estimate; never state a confident single number you have not measured on their machine.
+- **If it is going to be long, ask instead of deciding for them.** Present the real trade-off:
+  * **Full** — everything: binary/hostile format extraction (PDF, DOCX, SQLite, gzip…), inferred types, embedded body fields, relationship edges.
+  * **Fast** — `--no-semantic --no-graph`: skips embedding-backed body fields and relationship detection. You still get typed, queryable BM25 + keyword indices over the same files — a better-than-grep experience for a fraction of the time. (Note: XERJ's default embedder is lexical feature-hashing, not neural, so `--no-semantic` costs you less than the word "semantic" suggests unless the node runs `--embed-mode neural`.)
+  * **Narrower** — index the subdirectory that matters, or skip `node_modules`/`vendor`/`target`/build outputs. Usually the biggest win available.
+  * Also useful when their machine must stay usable: `--workers N` and `--pdf-workers N` bound the CPU XERJ takes.
+- **Never run a long index as one silent blocking call.** Start it in the background, then poll `xerj autoindex status --state-dir <dir>` — it prints `N files done, M records, in progress` (or `FINISHED`) plus live per-index doc counts — and relay that to your user periodically. `status` has **no** `--json` (only `map` does); parse its text, or poll `GET /_cat/indices` / `GET /ax-*/_count` for machine-readable counts.
+- **Stopping is safe, so offer it.** The resume journal plus idempotent `_id`s mean an interrupted run resumes where it stopped and never duplicates. A user may abort a long index without losing the work already done.
+- **Read the exit code correctly.** `0` complete · **`3` completed-with-junk — this is SUCCESS**, junk records are recorded and never fatal; do not report it as a failure · `2` usage error · `1` endpoint unreachable, which almost always means the node is not running yet.
+- **Close the loop.** When it finishes, tell the user the actual elapsed time, how many records landed, and what they can now ask — `xerj autoindex map` is the briefing to summarize from.
+
 ## Use cases
 
 Copy-pasteable, live-validated guides — this is first-class documentation, not marketing. Full catalog: [Recipes index](https://xerj.org/docs/recipes/index.html).
