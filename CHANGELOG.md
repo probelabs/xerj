@@ -211,6 +211,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document. This does **not** implement add/change/delete reconciliation for
   *indexed* files, which remains open.
 
+- **Repeated `autoindex` scans keep agent-facing map metadata durable.**
+  Dataset source bytes, parser-junk counts and coercion-drop notes now derive
+  from committed per-file journal records instead of invocation-local worker
+  counters, so an unchanged resume does not overwrite them with zero. Run
+  timestamps now distinguish invocation start (`started`) from summary
+  generation (`summary_generated_at`), and `junk_records_total` on the run
+  document is the same durable sum the per-dataset `junk_records` reports
+  rather than an invocation-local counter that read `0` after a no-op resume.
+  Existing catalogs whose historical `started` field was dynamically mapped
+  as text remain usable: the additive mapping upgrade no longer attempts an
+  incompatible text-to-date type change.
+
+  Two consequences worth knowing before you upgrade:
+
+  - **`bytes` is redefined.** It used to be the bytes the latest invocation
+    processed, credited to the first dataset a file was assigned to. It is now
+    the complete canonical source size, counted once in **every** distinct
+    dataset that source is assigned to. Per-dataset values therefore get
+    larger, and summing `bytes` across datasets can exceed the corpus size
+    when one source feeds several datasets — exactly as one source already
+    contributed to several dataset-local file counts. It is a dataset-local
+    source footprint, not a partition of physical storage.
+  - **Journals written before this release carry no per-dataset coercion
+    record**, because the new `dropped_by_dataset` field defaults to empty
+    when an older journal is replayed. Byte and junk counts reconstruct fine
+    (their journal fields already existed), but a dataset whose files are all
+    unchanged loses its `N field values dropped by coercion` note on the first
+    resume after upgrading, and only regains it once one of its files is
+    reprocessed. Re-run with `--fresh` if the note matters more than the
+    rescan.
+
 - **The installer is now fail-closed on checksum *verification*, not just on
   checksum *download*.** `landing/get` printed
   `warning: sha256sum/shasum not found — skipping checksum verification` and
