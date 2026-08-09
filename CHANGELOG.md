@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — `server.bind_address` now defaults to `127.0.0.1`, and a
+  cleartext node refuses to publish itself to the network**
+  ([#228](https://github.com/xerj-org/xerj/issues/228)). The old default was
+  `0.0.0.0` while TLS is off by default, so an out-of-the-box node accepted its
+  admin API key over plain HTTP on every interface the host had — verified on a
+  stock boot, where `curl -H "Authorization: ApiKey …" http://<lan-ip>:9200/…`
+  answered `200` and the same URL over `https` had no listener to hand shake
+  with. Auth being on did not help: the credential *is* the thing on the wire.
+
+  A fresh node is now reachable from its own host and nowhere else. Exposing it
+  is two statements, not zero: set `server.bind_address` (or `--bind` /
+  `XERJ_BIND_ADDRESS`), and — while `tls.enabled = false` — also set
+  `server.allow_insecure_network_bind = true` (env
+  `XERJ_ALLOW_INSECURE_NETWORK_BIND`). Without the second, startup exits
+  non-zero before the data directory is created or a first-run admin key is
+  minted. `--insecure` does not evade it; it clears `tls.enabled`, which is
+  exactly what the check keys on. Same fail-closed shape as
+  [#229](https://github.com/xerj-org/xerj/issues/229), whose TLS-on gRPC check
+  is untouched and cannot be relaxed by this opt-out.
+
+  **Upgrading:** a deployment that relied on the old default becomes
+  unreachable from other hosts until it sets both; one that already wrote
+  `bind_address = "0.0.0.0"` without TLS now fails to start with a message
+  naming the setting that unblocks it. The shipped Docker image, compose file
+  and Helm chart set both, because a container's network namespace is the
+  boundary and its published port is where TLS belongs.
+
+  Two documentation claims that were false as written are now true: the CLI and
+  security pages both said `--insecure` "refuses to run with a non-loopback
+  bind", and it did not — a `--insecure` node on `0.0.0.0` accepted an
+  unauthenticated `PUT /leak/_doc/1` from the LAN (`201`). The startup banner
+  also prints the bind address on every listener line, so a loopback node and a
+  world-facing one no longer look identical.
+
 ### Fixed
 
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**

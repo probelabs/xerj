@@ -106,6 +106,7 @@ mod ingest_memory_trace;
 struct CliArgs {
     config: Option<PathBuf>,
     data_dir: Option<String>,
+    bind: Option<String>,
     insecure: bool,
     embed_mode: Option<String>,
     onnx_model: Option<String>,
@@ -118,6 +119,7 @@ fn parse_args() -> CliArgs {
     let mut args = std::env::args().skip(1);
     let mut config = None;
     let mut data_dir = None;
+    let mut bind = None;
     let mut insecure = false;
     let mut embed_mode = None;
     let mut onnx_model = None;
@@ -132,6 +134,9 @@ fn parse_args() -> CliArgs {
             }
             "--data-dir" | "-d" => {
                 data_dir = args.next();
+            }
+            "--bind" | "-b" => {
+                bind = args.next();
             }
             "--insecure" | "-k" => {
                 insecure = true;
@@ -161,6 +166,7 @@ fn parse_args() -> CliArgs {
     CliArgs {
         config,
         data_dir,
+        bind,
         insecure,
         embed_mode,
         onnx_model,
@@ -180,6 +186,14 @@ fn print_help() {
          OPTIONS:\n\
              --config,   -c <PATH>  Path to TOML config file\n\
              --data-dir, -d <PATH>  Override data directory\n\
+             --bind,     -b <ADDR>  Interface to bind every listener to. Default 127.0.0.1 —\n\
+                                      loopback only, reachable from this machine and nowhere\n\
+                                      else. Pass 0.0.0.0 (or a specific address) to expose the\n\
+                                      node; with TLS off that also needs\n\
+                                      server.allow_insecure_network_bind = true (or\n\
+                                      XERJ_ALLOW_INSECURE_NETWORK_BIND=true), because every\n\
+                                      request — API key included — would cross the network in\n\
+                                      cleartext. Env: XERJ_BIND_ADDRESS\n\
              --insecure, -k         Disable TLS\n\
              --embed-mode <MODE>    Embedding backend: lexical | neural | proxy | auto |\n\
                                       onnx-experimental\n\
@@ -265,6 +279,27 @@ fn print_help() {
 // Startup banner
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Why a bind address could not be turned into a listener. One message for all
+/// three listeners: they share the one setting, so three different phrasings of
+/// the same fault would only obscure it.
+fn bad_bind_address(cfg: &Config) -> String {
+    format!(
+        "server.bind_address = {:?} is not an IP address — it must be an IPv4 or \
+         IPv6 literal such as \"127.0.0.1\" (the default), \"0.0.0.0\" or \"::1\". \
+         Host names are not resolved.",
+        cfg.server.bind_address
+    )
+}
+
+/// `bind_address` in a form that can be pasted into a URL: IPv6 literals need
+/// brackets (`http://[::1]:9200`), IPv4 and host names do not.
+fn url_host(bind: &str) -> String {
+    match bind.trim().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
+        _ => bind.trim().to_string(),
+    }
+}
+
 fn print_banner(cfg: &Config, startup_ms: u128) {
     let tls = if cfg.tls.enabled { "TLS " } else { "plain" };
     println!();
@@ -280,14 +315,24 @@ fn print_banner(cfg: &Config, startup_ms: u128) {
     println!();
     println!(" the unified search engine for AI — connect, autoindex, query");
     println!();
-    println!(" Native REST  :{} [{}]", cfg.server.rest_port, tls);
-    println!(" ES-compat    :{} [{}]", cfg.server.es_compat_port, tls);
+    // The bind address belongs on every listener line (issue #228). Printing
+    // bare `:9200` left the one fact that decides who can reach this node off
+    // the only screen most operators ever read, and made a loopback-bound node
+    // and a world-bound node look identical.
+    // Bracketed for IPv6 so `host:port` stays unambiguous.
+    let bind_hostport = url_host(&cfg.server.bind_address);
+    let bind = bind_hostport.as_str();
+    println!(" Native REST  {}:{} [{}]", bind, cfg.server.rest_port, tls);
+    println!(
+        " ES-compat    {}:{} [{}]",
+        bind, cfg.server.es_compat_port, tls
+    );
     // Never interpolated with `tls`: the gRPC listener is h2c whatever
     // `[tls]` says (issue #229), and a line that read "TLS" here would be the
     // exact false promise the startup check exists to prevent.
     println!(
-        " gRPC         :{} [h2c — plaintext, no TLS]",
-        cfg.server.grpc_port
+        " gRPC         {}:{} [h2c — plaintext, no TLS]",
+        bind, cfg.server.grpc_port
     );
     println!(" Data dir     {}", cfg.server.data_dir);
     println!(" Started in   {}ms", startup_ms);
@@ -306,6 +351,21 @@ fn print_banner(cfg: &Config, startup_ms: u128) {
     // an operator sees it on every start. Suppress nothing — these lines
     // map 1:1 to items on the path-to-100% plan.
     println!(" ┌─ Deployment posture (see PATH_TO_100_PCT_v0.6.0_to_v1.0.md) ──");
+    // Reach, before anything else: it decides whether the rest of this block
+    // is a local-development note or a production exposure (issue #228).
+    if cfg.bind_address_is_loopback() {
+        println!(" │ ✓  Bind:   {bind} — loopback only; nothing off this host can reach the");
+        println!(" │           listeners. Pass --bind 0.0.0.0 to expose the node.");
+    } else if !cfg.tls.enabled {
+        // Reaching here means the operator set the opt-out, so say what it
+        // bought them rather than printing a generic warning.
+        println!(" │ ⚠  Bind:   {bind} — network-reachable AND TLS is off. API keys and");
+        println!(" │           document bodies cross the network in cleartext, allowed by");
+        println!(" │           server.allow_insecure_network_bind (issue #228). Terminate");
+        println!(" │           TLS in front of this node, or bind loopback.");
+    } else {
+        println!(" │ ⚠  Bind:   {bind} — network-reachable on every listed port.");
+    }
     if !cfg.tls.enabled {
         println!(" │ ⚠  TLS:    listener is plain TCP — terminate TLS at a reverse proxy");
         println!(" │           (or enable in-process TLS: tls.enabled = true)");
@@ -362,6 +422,42 @@ fn load_config(args: &CliArgs) -> Result<Config> {
 
     if let Some(dir) = &args.data_dir {
         cfg.server.data_dir = dir.clone();
+    }
+
+    // Bind address override: `--bind` flag or `XERJ_BIND_ADDRESS` env (flag
+    // wins). Both exist because the default is loopback (#228): without a way
+    // to say "expose me" that is not a TOML file, a container image or a
+    // one-off `xerj -b 0.0.0.0` would have no path at all.
+    if let Some(addr) = args
+        .bind
+        .clone()
+        .or_else(|| std::env::var("XERJ_BIND_ADDRESS").ok())
+    {
+        let addr = addr.trim().to_string();
+        if addr.is_empty() {
+            anyhow::bail!("--bind / XERJ_BIND_ADDRESS is empty; pass an IP address");
+        }
+        info!("server.bind_address = {addr} (from CLI/env)");
+        cfg.server.bind_address = addr;
+    }
+
+    // The #228 opt-out, also settable from the environment so a container can
+    // declare its exposure without shipping a config file. Parsed strictly: a
+    // value we cannot read is refused rather than treated as `false`, because
+    // silently falling back to the safe value here means a boot that refuses
+    // with a message about a setting the operator believes they set.
+    if let Ok(raw) = std::env::var("XERJ_ALLOW_INSECURE_NETWORK_BIND") {
+        let v = raw.trim();
+        let parsed = match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => anyhow::bail!(
+                "XERJ_ALLOW_INSECURE_NETWORK_BIND={raw:?} is not a boolean; \
+                 use true or false"
+            ),
+        };
+        info!("server.allow_insecure_network_bind = {parsed} (from env)");
+        cfg.server.allow_insecure_network_bind = parsed;
     }
 
     if args.insecure {
@@ -979,6 +1075,9 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
     let fake_cli = CliArgs {
         config: cmd.config.clone(),
         data_dir: cmd.data_dir.clone(),
+        // In-process CLI indexing binds no listener at all, so the bind
+        // address is irrelevant here — take whatever the config says.
+        bind: None,
         insecure: true,
         embed_mode: None,
         onnx_model: None,
@@ -1640,6 +1739,40 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    // 3c. Cleartext network exposure — fail closed (issue #228). The TLS-off
+    //     twin of 3b, and the larger of the two: with `tls.enabled = false`
+    //     it is not one uncovered listener but every listener, carrying the
+    //     `Authorization: ApiKey` header of every request in the clear.
+    //
+    //     Auth being on by default does not help. It is precisely the
+    //     credential that is on the wire, and it is on the wire on every
+    //     interface the host happens to have — which used to include whatever
+    //     the machine picked up from DHCP, because `0.0.0.0` was the default
+    //     bind. That default is now loopback, so this fires only for a bind
+    //     that someone actually wrote down, and it asks them to write down
+    //     the consequence too.
+    //
+    //     Placed with 3b, before the data directory, the first-run admin key
+    //     and the certificate, so a rejected boot leaves nothing behind.
+    if cfg.cleartext_exposed_off_loopback() {
+        anyhow::bail!(
+            "server.bind_address = \"{}\" is not loopback and tls.enabled = false, so every \
+             listener ({}, {}, {}) would serve plain HTTP on a network-reachable interface — \
+             the API key in every Authorization header, and every document body, would cross \
+             the network in cleartext. Refusing to start. Fix by binding to loopback \
+             (server.bind_address = \"127.0.0.1\", the default) and putting a proxy in front, \
+             or by enabling TLS (tls.enabled = true with cert_path + key_path). If something \
+             already terminates TLS in front of this node — reverse proxy, sidecar, service \
+             mesh, ingress, or a container network namespace — declare it: \
+             server.allow_insecure_network_bind = true (env: \
+             XERJ_ALLOW_INSECURE_NETWORK_BIND=true).",
+            cfg.server.bind_address,
+            cfg.server.rest_port,
+            cfg.server.es_compat_port,
+            cfg.server.grpc_port,
+        );
+    }
+
     // 4. Data directory
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir))?;
@@ -1756,9 +1889,12 @@ async fn async_main() -> Result<()> {
     let xerj_console_bind_url = format!(
         "http://{}:{}",
         if cfg.server.bind_address == "0.0.0.0" || cfg.server.bind_address == "::" {
-            "localhost"
+            "localhost".to_string()
         } else {
-            cfg.server.bind_address.as_str()
+            // Bracketed for IPv6 — an unbracketed `http://::1:9200/…` is not a
+            // URL any browser will open, and this string is printed in the
+            // first-launch console link.
+            url_host(&cfg.server.bind_address)
         },
         cfg.server.es_compat_port,
     );
@@ -1837,17 +1973,19 @@ async fn async_main() -> Result<()> {
     info!("startup complete in {}ms", startup_ms);
     print_banner(&cfg, startup_ms);
 
-    // 11. Bind addresses
-    let bind = &cfg.server.bind_address;
-    let rest_addr: SocketAddr = format!("{}:{}", bind, cfg.server.rest_port)
-        .parse()
-        .context("parse REST bind address")?;
-    let es_addr: SocketAddr = format!("{}:{}", bind, cfg.server.es_compat_port)
-        .parse()
-        .context("parse ES-compat bind address")?;
-    let grpc_addr: SocketAddr = format!("{}:{}", bind, cfg.server.grpc_port)
-        .parse()
-        .context("parse gRPC bind address")?;
+    // 11. Bind addresses. Composed from the parsed IP, never by formatting
+    //     `"{bind}:{port}"` — that string is unparseable for every IPv6
+    //     literal (`"::1:9200"`), which made `bind_address = "::1"` a node
+    //     that could not start at all.
+    let rest_addr: SocketAddr = cfg
+        .socket_addr(cfg.server.rest_port)
+        .with_context(|| bad_bind_address(&cfg))?;
+    let es_addr: SocketAddr = cfg
+        .socket_addr(cfg.server.es_compat_port)
+        .with_context(|| bad_bind_address(&cfg))?;
+    let grpc_addr: SocketAddr = cfg
+        .socket_addr(cfg.server.grpc_port)
+        .with_context(|| bad_bind_address(&cfg))?;
 
     // 12. Background flush timer
     let flusher = spawn_periodic_flusher(

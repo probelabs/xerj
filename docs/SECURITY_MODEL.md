@@ -353,6 +353,68 @@ Note that `ClientIp` is also used for audit fields on endpoints that are not
 rate limited, for example passkey enrolment (`auth/passkey.rs:168`). Only the
 three endpoints listed above charge a bucket.
 
+## Reach: what a fresh node exposes (issue #228)
+
+`server.bind_address` defaults to **`127.0.0.1`**. A node you start without
+configuring anything is reachable from the machine it runs on and from nowhere
+else.
+
+That default is chosen against the one that used to ship, `0.0.0.0`. Auth is on
+by default and the admin key is generated 0600 on first start, which is the
+part that is genuinely good — but TLS is *off* by default, so binding every
+interface meant the admin API key travelled in an `Authorization` header over
+plain HTTP to anything that could route to the host. Nothing about the
+experience said so: `curl` worked, the health endpoint answered, and the key
+was accepted. `user-feedback/09-security/insecure-defaults.md` collects the
+field reports this is aimed at — a list of eight-and-nine-figure record
+exposures whose common factor is a search node reachable from the internet in
+whatever state it shipped in. A shipped default is the configuration most
+installs will ever run.
+
+### Exposing the node is a two-part statement
+
+Set `server.bind_address` (or `--bind` / `XERJ_BIND_ADDRESS`) to `0.0.0.0` or a
+specific address. With `tls.enabled = false`, startup then **refuses** unless
+`server.allow_insecure_network_bind = true` (env:
+`XERJ_ALLOW_INSECURE_NETWORK_BIND`).
+
+`Config::cleartext_exposed_off_loopback` (`config.rs`) is true when TLS is off
+**and** the bind address is not loopback **and** the opt-out is unset; `main.rs`
+step 3c aborts non-zero before the data directory is created, before a first-run
+admin key is minted and printed, and before any listener exists.
+
+```
+Error: server.bind_address = "0.0.0.0" is not loopback and tls.enabled = false,
+so every listener (8080, 9200, 8081) would serve plain HTTP on a
+network-reachable interface — the API key in every Authorization header, and
+every document body, would cross the network in cleartext. Refusing to start.
+…declare it: server.allow_insecure_network_bind = true (env:
+XERJ_ALLOW_INSECURE_NETWORK_BIND=true).
+```
+
+Scope of the refusal, all pinned by tests:
+
+- **`0.0.0.0` and `::` count as exposed**, not as "unset" — they bind every
+  interface the host has.
+- **Link-local counts as exposed too** — still reachable by every other host on
+  the link.
+- **Loopback binds are untouched**, so local development, the quickstarts and
+  the ES-YAML conformance harness keep working with TLS off.
+- **`--insecure` does not evade it.** It clears `tls.enabled`, so it trips the
+  check like any other cleartext configuration — and it drops auth as well, so
+  the configuration it would otherwise produce is an unauthenticated node on
+  every interface.
+- **The opt-out relaxes only this check.** With TLS on it is not consulted at
+  all; the residual gRPC h2c exposure stays governed by
+  `tls.allow_insecure_grpc_h2c` (#229).
+
+The escape hatch does not make anything safe. It records that you know, and it
+is what you set when a reverse proxy, sidecar, mesh or ingress terminates TLS in
+front of the node — or when the boundary is a container's network namespace,
+which is why the shipped Docker image and Helm chart set it. The startup banner
+then names the exposure on every boot, and every listener line carries the bind
+address so a loopback node and a world-facing one no longer look identical.
+
 ## Transport encryption, listener by listener
 
 `tls.enabled` does not mean "the node is encrypted". It covers two of the three
@@ -390,8 +452,10 @@ aborts non-zero before binding anything or writing a certificate. Loopback
 binds are unaffected, and `--insecure` clears `tls.enabled` so it never trips.
 
 `0.0.0.0` and `::` count as exposed, not as "unset" — they bind every interface
-the host has, and `0.0.0.0` is the shipped default. Link-local addresses count
-as exposed too; they are reachable by every other host on the link. Both
+the host has. (They were also the shipped default until #228 made it loopback;
+either way this check fires on what the config says, not on what it omits.)
+Link-local addresses count as exposed too; they are reachable by every other
+host on the link. Both
 choices are pinned by tests in `xerj-common/src/config.rs`, and the refusal
 itself by `xerj-server/tests/grpc_h2c_fail_closed.rs`.
 
@@ -572,7 +636,13 @@ it is on a schedule this document can promise.
   confidentiality, no per-node identity, no mTLS (`auth.rs:21-29`).
 - **TLS is off by default.** `TlsConfig` derives `Default`, so `tls.enabled` is
   `false`, and `--insecure` disables both TLS and auth. The startup banner
-  prints the posture on every start.
+  prints the posture on every start. The mitigation is reach, not encryption:
+  the default bind is loopback and exposing the node in cleartext has to be
+  declared — see [Reach](#reach-what-a-fresh-node-exposes-issue-228).
+- **A declared cleartext exposure is still cleartext.** Nothing about
+  `server.allow_insecure_network_bind = true` encrypts anything; it only means
+  the operator said so. Every deployment that publishes a port — including the
+  shipped Docker image and Helm chart — needs TLS terminated in front of it.
 - **The gRPC listener is never TLS.** `tls.enabled` covers REST and ES-compat
   only; `:8081` is cleartext h2c in every configuration (`grpc.rs:377-392`).
   Startup refuses the combination "TLS on + non-loopback bind" rather than let
