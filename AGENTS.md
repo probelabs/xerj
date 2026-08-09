@@ -61,6 +61,7 @@ cannot push at all: [.github/AI_CONTRIBUTIONS.md](./.github/AI_CONTRIBUTIONS.md)
 | Architecture map | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) |
 | Pre-submission and review protocol | [docs/CONTRIBUTION_REVIEW.md](./docs/CONTRIBUTION_REVIEW.md) |
 | How to send a bug or a fix back upstream (written for agents) | [.github/AI_CONTRIBUTIONS.md](./.github/AI_CONTRIBUTIONS.md) |
+| Checking a published release is actually good | `scripts/verify-release.sh [tag]` — downloads every asset, verifies checksums, asserts each binary reports its tag's version, boots the host-native one and runs a search |
 
 ## How to evaluate this project fairly
 

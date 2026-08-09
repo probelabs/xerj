@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# verify-release.sh — post-release check on the PUBLISHED artifacts.
+#
+# Not a build check. This downloads what a user actually downloads and asserts
+# the things a green CI run cannot: that every archive has a checksum and
+# matches it, that every binary reports the version its tag promises, and that
+# the binary for this host boots on a clean data dir and answers a real search.
+#
+# It exists because v1.0.0-rc.10 shipped binaries that print "xerj v1.0.0-rc.9".
+# The tag was cut at a commit where engine/Cargo.toml still held the old
+# version: asset FILENAMES come from the git tag, the banner comes from
+# CARGO_PKG_VERSION, and nothing made the two agree. Every test passed. The
+# only way to see it is to run the artifact. Still reproducible today:
+#
+#   scripts/verify-release.sh v1.0.0-rc.10   ->  FAIL (version drift)
+#   scripts/verify-release.sh v1.0.0-rc.13   ->  PASS
+#
+# Checks, in order:
+#   1. every archive has a .sha256 companion, and matches it
+#   2. every archive contains the binary + LICENSE + README
+#   3. every binary — including the ones this host cannot execute — carries the
+#      tag's version in its startup banner, and carries no other version
+#   4. the host-native binary: --version, boot on a clean data dir, health
+#      green, index a doc, search it back, run a terms aggregation
+#
+# Usage:
+#   scripts/verify-release.sh                  # latest release
+#   scripts/verify-release.sh v1.0.0-rc.13     # a specific tag
+#   scripts/verify-release.sh --keep           # keep the download dir
+#   scripts/verify-release.sh --no-smoke       # checksums + versions only
+#
+# Requires: gh (authenticated), curl, tar, sha256sum|shasum. unzip for the
+# Windows archives (skipped with a warning if absent).
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+REPO="${XERJ_REPO:-xerj-org/xerj}"
+TAG=""
+KEEP=0
+DO_SMOKE=1
+WORKDIR=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --keep)     KEEP=1 ;;
+    --no-smoke) DO_SMOKE=0 ;;
+    --repo)     REPO="$2"; shift ;;
+    -h|--help)  sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)         echo "unknown flag: $1" >&2; exit 2 ;;
+    *)          TAG="$1" ;;
+  esac
+  shift
+done
+
+BOLD=''; DIM=''; RED=''; GRN=''; YEL=''; RST=''
+if [ -t 1 ]; then
+  BOLD=$(printf '\033[1m'); DIM=$(printf '\033[2m'); RED=$(printf '\033[31m')
+  GRN=$(printf '\033[32m'); YEL=$(printf '\033[33m'); RST=$(printf '\033[0m')
+fi
+
+FAILURES=0
+pass() { printf '  %sPASS%s  %s\n' "$GRN" "$RST" "$1"; }
+fail() { printf '  %sFAIL%s  %s\n' "$RED" "$RST" "$1"; FAILURES=$((FAILURES + 1)); }
+warn() { printf '  %sSKIP%s  %s\n' "$YEL" "$RST" "$1"; }
+step() { printf '\n%s%s%s\n' "$BOLD" "$1" "$RST"; }
+
+cleanup() {
+  [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null || true
+  if [ "$KEEP" = 0 ] && [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
+    rm -rf "$WORKDIR"
+  elif [ -n "$WORKDIR" ]; then
+    printf '\n%skept: %s%s\n' "$DIM" "$WORKDIR" "$RST"
+  fi
+}
+trap cleanup EXIT
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum   >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  else echo "no sha256sum or shasum on PATH" >&2; exit 2
+  fi
+}
+
+# The version a binary claims, read from its startup banner. Works on binaries
+# this host cannot execute, which is the whole point — the drift we are hunting
+# can just as easily land in the macOS or Windows artifact, and executing them
+# is not an option on a Linux runner.
+banner_versions() {
+  LC_ALL=C grep -a -o -E 'xerj v[0-9][0-9A-Za-z.+-]* starting' "$1" 2>/dev/null \
+    | sed 's/^xerj v//; s/ starting$//' | sort -u
+}
+
+free_port() {
+  python3 - <<'PY' 2>/dev/null || echo "$((20000 + RANDOM % 20000))"
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+command -v gh >/dev/null 2>&1 || { echo "gh is required" >&2; exit 2; }
+
+# ── resolve the tag ──────────────────────────────────────────────────────────
+if [ -z "$TAG" ]; then
+  TAG=$(gh release view --repo "$REPO" --json tagName --jq .tagName)
+fi
+EXPECTED="${TAG#v}"
+
+printf '%srelease verification%s  %s  tag %s%s%s\n' "$BOLD" "$RST" "$REPO" "$BOLD" "$TAG" "$RST"
+
+WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/xerj-verify-XXXXXX")
+cd "$WORKDIR"
+
+step "1. download every published asset"
+gh release download "$TAG" --repo "$REPO" --dir "$WORKDIR" --clobber >/dev/null
+ARCHIVES=$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sed 's|^\./||' | sort)
+[ -n "$ARCHIVES" ] || { fail "no .tar.gz or .zip assets on $TAG"; exit 1; }
+printf '  %s%s archives%s\n' "$DIM" "$(printf '%s\n' "$ARCHIVES" | wc -l | tr -d ' ')" "$RST"
+
+step "2. checksums"
+for a in $ARCHIVES; do
+  if [ ! -f "$a.sha256" ]; then
+    fail "$a — no .sha256 companion published"
+    continue
+  fi
+  want=$(cut -d' ' -f1 < "$a.sha256")
+  got=$(sha256_of "$a")
+  if [ "$want" = "$got" ]; then
+    pass "$a  ${got:0:16}…"
+  else
+    fail "$a — published $want, downloaded $got"
+  fi
+done
+
+step "3. archive contents"
+for a in $ARCHIVES; do
+  d="unpack/${a%.tar.gz}"; d="${d%.zip}"
+  mkdir -p "$d"
+  case "$a" in
+    *.tar.gz) tar -xzf "$a" -C "$d" ;;
+    *.zip)
+      if command -v unzip >/dev/null 2>&1; then unzip -q -o "$a" -d "$d"
+      else warn "$a — unzip not on PATH"; continue; fi ;;
+  esac
+  bin=$(find "$d" -type f \( -name xerj -o -name xerj.exe \) | head -1)
+  missing=""
+  [ -n "$bin" ] || missing="$missing binary"
+  [ -n "$(find "$d" -type f -name LICENSE  | head -1)" ] || missing="$missing LICENSE"
+  [ -n "$(find "$d" -type f -name 'README*' | head -1)" ] || missing="$missing README"
+  if [ -n "$missing" ]; then fail "$a — missing:$missing"; else pass "$a  binary + LICENSE + README"; fi
+done
+
+step "4. version string matches the tag, on every target"
+# The rc.10 check. A binary whose banner disagrees with its own filename is the
+# defect; a binary carrying two different versions is a stale-artifact defect.
+for a in $ARCHIVES; do
+  d="unpack/${a%.tar.gz}"; d="${d%.zip}"
+  bin=$(find "$d" -type f \( -name xerj -o -name xerj.exe \) 2>/dev/null | head -1)
+  [ -n "$bin" ] || continue
+  target=$(printf '%s' "$a" | sed "s/^xerj-$EXPECTED-//; s/\.tar\.gz$//; s/\.zip$//")
+  found=$(banner_versions "$bin" | tr '\n' ' ' | sed 's/ $//')
+  if [ -z "$found" ]; then
+    fail "$target — no version banner found in the binary"
+  elif [ "$found" = "$EXPECTED" ]; then
+    pass "$target  reports $EXPECTED"
+  else
+    fail "$target — tag says $EXPECTED, binary says: $found"
+  fi
+done
+
+# ── 5. run the one we can actually run ───────────────────────────────────────
+HOST_OS=$(uname -s); HOST_ARCH=$(uname -m)
+case "$HOST_OS" in
+  Linux)  host_glob="*${HOST_ARCH}-unknown-linux-*" ;;
+  Darwin) host_glob="*${HOST_ARCH}-apple-darwin*" ;;
+  *)      host_glob="" ;;
+esac
+
+HOST_BIN=""
+if [ -n "$host_glob" ]; then
+  # shellcheck disable=SC2086
+  HOST_BIN=$(find unpack -type f -name xerj -path "$host_glob" 2>/dev/null | head -1)
+fi
+
+# Whether a live search was actually executed. The verdict line must not claim
+# it when it did not happen — a cross-arch runner or --no-smoke leaves this 0.
+SMOKED=0
+
+step "5. run the host-native artifact"
+if [ -z "$HOST_BIN" ]; then
+  warn "no artifact for $HOST_OS/$HOST_ARCH — nothing to execute here"
+elif [ "$DO_SMOKE" = 0 ]; then
+  warn "--no-smoke"
+else
+  SMOKED=1
+  chmod +x "$HOST_BIN"
+  reported=$("$HOST_BIN" --version 2>&1 || true)
+  if [ "$reported" = "xerj v$EXPECTED" ]; then
+    pass "--version  ->  $reported"
+  else
+    fail "--version  ->  '$reported', expected 'xerj v$EXPECTED'"
+  fi
+
+  ES_PORT=$(free_port); REST_PORT=$(free_port); GRPC_PORT=$(free_port)
+  mkdir -p smoke/data
+  cat > smoke/xerj.toml <<EOF
+[server]
+rest_port = $REST_PORT
+grpc_port = $GRPC_PORT
+es_compat_port = $ES_PORT
+bind_address = "127.0.0.1"
+EOF
+  "$HOST_BIN" --config "$WORKDIR/smoke/xerj.toml" --data-dir "$WORKDIR/smoke/data" \
+      --insecure > "$WORKDIR/smoke/server.log" 2>&1 &
+  SERVER_PID=$!
+
+  B="http://127.0.0.1:$ES_PORT"
+  health=""
+  for _ in $(seq 1 60); do
+    health=$(curl -s -m 2 "$B/_cluster/health" 2>/dev/null || true)
+    [ -n "$health" ] && break
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 1
+  done
+
+  if [ -z "$health" ]; then
+    fail "server never answered on :$ES_PORT — see $WORKDIR/smoke/server.log"
+  else
+    case "$health" in
+      *'"status":"green"'*) pass "boots on a clean data dir, cluster green" ;;
+      *) fail "cluster not green: $health" ;;
+    esac
+
+    curl -s -X POST "$B/xerj-verify/_doc/1?refresh=true" \
+      -H 'Content-Type: application/json' \
+      -d '{"title":"release verification","body":"published artifact booted and searched"}' \
+      > smoke/index.json 2>&1 || true
+    case "$(cat smoke/index.json)" in
+      *'"result":"created"'*) pass "indexes a document" ;;
+      *) fail "index failed: $(cat smoke/index.json)" ;;
+    esac
+
+    curl -s -X POST "$B/xerj-verify/_search" -H 'Content-Type: application/json' \
+      -d '{"query":{"match":{"body":"published artifact"}}}' > smoke/search.json 2>&1 || true
+    case "$(cat smoke/search.json)" in
+      *'"total":{"value":1'*) pass "searches it back  ($(sed 's/.*"max_score":\([0-9.]*\).*/max_score \1/' smoke/search.json))" ;;
+      *) fail "search returned no hit: $(head -c 300 smoke/search.json)" ;;
+    esac
+
+    curl -s -X POST "$B/xerj-verify/_search" -H 'Content-Type: application/json' \
+      -d '{"size":0,"aggs":{"t":{"terms":{"field":"title.keyword"}}}}' > smoke/agg.json 2>&1 || true
+    case "$(cat smoke/agg.json)" in
+      *'"key":"release verification","doc_count":1'*) pass "terms aggregation buckets it" ;;
+      *) fail "aggregation wrong: $(head -c 300 smoke/agg.json)" ;;
+    esac
+  fi
+
+  kill "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+  SERVER_PID=""
+fi
+
+step "verdict"
+if [ "$FAILURES" -eq 0 ]; then
+  if [ "$SMOKED" = 1 ]; then
+    scope="checksums, versions and a live search all verified"
+  else
+    scope="checksums and versions verified — NO binary was executed, so nothing here says it runs"
+  fi
+  printf '  %sPASS%s  %s: %s\n' "$GRN" "$RST" "$TAG" "$scope"
+  exit 0
+fi
+printf '  %sFAIL%s  %s: %s check(s) failed — do not announce this release\n' "$RED" "$RST" "$TAG" "$FAILURES"
+exit 1
