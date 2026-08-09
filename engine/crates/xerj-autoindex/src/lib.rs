@@ -14,6 +14,8 @@ pub mod esclient;
 pub mod extract;
 pub mod ids;
 pub mod infer;
+pub mod pool;
+pub mod resources;
 pub mod sniff;
 pub mod state;
 pub mod walk;
@@ -391,7 +393,9 @@ mod phase_a_grouping_tests {
             url: "http://unused.invalid".into(),
             api_key: None,
             workers: 1,
+            scan_workers: 1,
             pdf_workers: 1,
+            resource_notes: Vec::new(),
             pdf_timeout_secs: 10,
             bulk_mb: 1,
             bulk_timeout_secs: 10,
@@ -591,10 +595,14 @@ fn build_phase_a(
     cfg: &IndexCfg,
 ) -> (Plan, Vec<dataset::Cluster>) {
     use rayon::prelude::*;
-    let scans: Vec<FileScan> = files
-        .par_iter()
-        .map(|f| scan_file(&f.path, f.size, cfg.sample, cfg.max_file_gb))
-        .collect();
+    // Same pool as the digest phase: sniffing and sampling are the other half
+    // of the CPU-bound phase `--workers` has to bound (#240 §2).
+    let scans: Vec<FileScan> = crate::pool::install(|| {
+        files
+            .par_iter()
+            .map(|f| scan_file(&f.path, f.size, cfg.sample, cfg.max_file_gb))
+            .collect()
+    });
 
     let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
     let scopes = compute_scopes(root, &rels);
@@ -905,10 +913,27 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
 /// `None` when the run ended before a plan produced one (empty folder,
 /// `--dry-run`).
 pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
+    // Fix the phase-A pool width BEFORE anything parallel starts: hashing and
+    // sniffing are the CPU-bound phase, and they used to take every core no
+    // matter what the caller asked for (#240 §2).
+    pool::configure(cfg.scan_workers);
     extract::pdf::configure_workers(cfg.pdf_workers);
     extract::pdf::configure_timeout(cfg.pdf_timeout_secs);
     let t0 = Instant::now();
     if !cfg.quiet {
+        // What this run decided to take from the machine, before it takes it.
+        eprintln!(
+            "autoindex: {} scan threads, {} index workers, {} pdf workers, --bulk-mb {} \
+             [{}]",
+            cfg.scan_workers,
+            cfg.workers,
+            cfg.pdf_workers,
+            cfg.bulk_mb,
+            xerj_common::resource::describe(),
+        );
+        for note in &cfg.resource_notes {
+            eprintln!("autoindex: {note}");
+        }
         eprintln!(
             "autoindex: bulk HTTP request timeout: {}s",
             cfg.bulk_timeout_secs
@@ -2373,6 +2398,14 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "records_submitted_this_run": records_total.load(Ordering::Relaxed),
         "wall_seconds": (wall * 10.0).round() / 10.0,
         "workers": cfg.workers,
+        // The whole resource decision, so a run can be explained after the
+        // fact from its own summary rather than from the machine it ran on.
+        "scan_workers": cfg.scan_workers,
+        "pdf_workers": cfg.pdf_workers,
+        "bulk_mb": cfg.bulk_mb,
+        "cores_available": xerj_common::resource::cores(),
+        "memory_safe_zone_mb": xerj_common::resource::memory_safe_zone_bytes() / (1024 * 1024),
+        "resource_notes": cfg.resource_notes,
         "semantic": !cfg.no_semantic,
     });
     if let Some(g) = &graph_summary {

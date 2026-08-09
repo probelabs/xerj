@@ -246,7 +246,8 @@ curl localhost:9200/ax-*/_search -H 'Content-Type: application/json' \
 ```
 
 Useful knobs (all optional): `--url` for a non-default endpoint, `--workers N`
-(default min(cores, 8)), `--prefix` to namespace the indices (default `ax`),
+(default: every core, reduced when the memory safe zone cannot pay for that
+many in-flight bulk buffers; bounds both the scan and the indexing phase), `--prefix` to namespace the indices (default `ax`),
 `--no-semantic` for pure BM25+keyword without vector fields, `--dry-run` to
 print the inferred plan without indexing anything, `--follow-symlinks`
 (loop-safe), `--sample N` records per file for inference (default 500).

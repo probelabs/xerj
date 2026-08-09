@@ -426,6 +426,13 @@ impl Engine {
         // Arc-wrapped.
         crate::governor::init(&config);
 
+        // Install the engine's pool widths from `engine.{flush,merge,search}
+        // _workers` before any pool is built. Idempotent, same as the governor
+        // above: the first engine in a process fixes the widths, and a later
+        // engine asking for different ones is told its request was ignored
+        // rather than left to assume it took effect (#240 §4).
+        crate::pools::init(&config.engine);
+
         let engine = Self {
             config: Arc::new(config),
             indices: Arc::new(DashMap::new()),

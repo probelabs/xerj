@@ -2,13 +2,24 @@
 
 use std::path::PathBuf;
 
+/// Largest `--bulk-mb` accepted. Past this a single bulk body stops being a
+/// unit of work and starts being a memory incident on the server.
+pub const MAX_BULK_MB: usize = 24;
+
 #[derive(Debug, Clone)]
 pub struct IndexCfg {
     pub root: PathBuf,
     pub url: String,
     pub api_key: Option<String>,
+    /// Phase-B index workers (concurrent bulk senders).
     pub workers: usize,
+    /// Phase-A scan pool width (content hashing, sniffing, sampling). Both come
+    /// from `--workers`; they differ only when the memory safe zone cannot pay
+    /// for as many in-flight bulk buffers as the machine has cores.
+    pub scan_workers: usize,
     pub pdf_workers: usize,
+    /// What the machine forced on this run, printed once at start-up.
+    pub resource_notes: Vec<String>,
     pub pdf_timeout_secs: u64,
     pub bulk_mb: usize,
     pub bulk_timeout_secs: u64,
@@ -65,8 +76,12 @@ pub fn print_help() {
          OPTIONS:\n\
              --url <U>            ES-compat endpoint (default http://localhost:9200)\n\
              --api-key <K>        Authorization header (or env XERJ_API_KEY)\n\
-             --workers <N>        extract workers (default min(cores,8))\n\
-             --pdf-workers <N>    concurrent PDF parser processes (default min(cores,4); max 4)\n\
+             --workers <N>        workers for BOTH phases — content hashing/sniffing and\n\
+                                  indexing (default: every core, reduced if the memory\n\
+                                  safe zone cannot pay for that many bulk buffers;\n\
+                                  valid range 1..=1024)\n\
+             --pdf-workers <N>    concurrent PDF parser processes (default min(cores,4); max 4,\n\
+                                  reduced further on a machine with little free memory)\n\
              --pdf-timeout-secs <N> per-PDF parser timeout (default 120; max 3600)\n\
              --bulk-mb <N>        bulk cut size in MB (default 8)\n\
              --bulk-timeout-secs <N>\n\
@@ -121,14 +136,11 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
 
     let mut url = "http://localhost:9200".to_string();
     let mut api_key = std::env::var("XERJ_API_KEY").ok().filter(|s| !s.is_empty());
-    let mut workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
-        .min(8);
-    let mut pdf_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(4);
+    // Worker counts are decided by `crate::resources::plan` once every flag is
+    // known, because the answer depends on --bulk-mb and on the machine. `None`
+    // here means "the user did not ask for a number".
+    let mut workers: Option<usize> = None;
+    let mut pdf_workers: Option<usize> = None;
     let mut pdf_timeout_secs = 120u64;
     let mut bulk_mb = 8usize;
     let mut bulk_timeout_secs = 300u64;
@@ -152,17 +164,29 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--url" => url = it.next().ok_or("--url needs a value")?,
             "--api-key" => api_key = it.next(),
             "--workers" => {
-                workers = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("--workers needs a number")?
+                // Refused, not clamped: `--workers 0` used to become 1 and
+                // `--workers 100000` was taken at face value, both without a
+                // word to the user (#204's class).
+                workers = Some(
+                    it.next()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|n| (1..=crate::resources::MAX_WORKERS).contains(n))
+                        .ok_or(format!(
+                            "--workers needs a number from 1 to {}",
+                            crate::resources::MAX_WORKERS
+                        ))?,
+                )
             }
             "--pdf-workers" => {
-                pdf_workers = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .filter(|n| (1..=4).contains(n))
-                    .ok_or("--pdf-workers needs a number from 1 to 4")?
+                pdf_workers = Some(
+                    it.next()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|n| (1..=crate::resources::MAX_PDF_WORKERS).contains(n))
+                        .ok_or(format!(
+                            "--pdf-workers needs a number from 1 to {}",
+                            crate::resources::MAX_PDF_WORKERS
+                        ))?,
+                )
             }
             "--pdf-timeout-secs" => {
                 pdf_timeout_secs = it
@@ -172,10 +196,14 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     .ok_or("--pdf-timeout-secs needs a number from 1 to 3600")?
             }
             "--bulk-mb" => {
+                // Was silently clamped into 1..=24 at the end of parsing, so
+                // `--bulk-mb 512` ran at 24 and `--bulk-mb 0` at 1, in both
+                // cases without telling anyone.
                 bulk_mb = it
                     .next()
                     .and_then(|s| s.parse().ok())
-                    .ok_or("--bulk-mb needs a number")?
+                    .filter(|n| (1..=MAX_BULK_MB).contains(n))
+                    .ok_or(format!("--bulk-mb needs a number from 1 to {MAX_BULK_MB}"))?
             }
             "--bulk-timeout-secs" => {
                 bulk_timeout_explicit = true;
@@ -257,28 +285,33 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             prefix,
             state_dir,
         })),
-        (None, Some(root)) => Ok(Cmd::Index(IndexCfg {
-            root,
-            url,
-            api_key,
-            workers: workers.max(1),
-            pdf_workers,
-            pdf_timeout_secs,
-            bulk_mb: bulk_mb.clamp(1, 24),
-            bulk_timeout_secs,
-            prefix,
-            state_dir,
-            fresh,
-            follow_symlinks,
-            max_file_gb,
-            sample: sample.max(50),
-            no_semantic,
-            brain,
-            no_graph,
-            dry_run,
-            json,
-            quiet,
-        })),
+        (None, Some(root)) => {
+            let plan = crate::resources::plan(workers, pdf_workers, bulk_mb);
+            Ok(Cmd::Index(IndexCfg {
+                root,
+                url,
+                api_key,
+                workers: plan.index_workers,
+                scan_workers: plan.scan_threads,
+                pdf_workers: plan.pdf_workers,
+                resource_notes: plan.notes,
+                pdf_timeout_secs,
+                bulk_mb,
+                bulk_timeout_secs,
+                prefix,
+                state_dir,
+                fresh,
+                follow_symlinks,
+                max_file_gb,
+                sample: sample.max(50),
+                no_semantic,
+                brain,
+                no_graph,
+                dry_run,
+                json,
+                quiet,
+            }))
+        }
         _ => Ok(Cmd::Help),
     }
 }
@@ -292,6 +325,38 @@ mod tests {
             Cmd::Index(cfg) => cfg,
             other => panic!("expected index config, got {other:?}"),
         }
+    }
+
+    fn err(args: &[&str]) -> String {
+        parse(args.iter().map(|s| s.to_string()).collect()).expect_err("must be refused")
+    }
+
+    /// #240 §1/§2: `--workers` capped itself at 8 for no recorded reason and
+    /// governed only phase B. It now governs both phases and defaults to the
+    /// machine.
+    #[test]
+    fn workers_defaults_to_the_machine_and_governs_both_phases() {
+        let cfg = index(&["data"]);
+        let cores = xerj_common::resource::cores();
+        assert_eq!(cfg.scan_workers, cores, "phase A gets the whole machine");
+        assert!(cfg.workers <= cores && cfg.workers >= 1);
+        let asked = index(&["data", "--workers", "3"]);
+        assert_eq!(asked.scan_workers, 3, "--workers must bound phase A");
+        assert_eq!(asked.workers, 3, "--workers must bound phase B");
+    }
+
+    /// An unusable count is a typo. Clamping it silently is the
+    /// accepted-and-ignored class this repo keeps re-finding (#204).
+    #[test]
+    fn unusable_worker_and_bulk_values_are_refused_not_clamped() {
+        assert!(err(&["data", "--workers", "0"]).contains("--workers needs a number from 1 to"));
+        assert!(err(&["data", "--workers", "99999"]).contains("--workers"));
+        assert!(err(&["data", "--workers", "eight"]).contains("--workers"));
+        assert!(err(&["data", "--pdf-workers", "8"]).contains("--pdf-workers"));
+        // `--bulk-mb 0` used to become 1 and `--bulk-mb 512` used to become 24.
+        assert!(err(&["data", "--bulk-mb", "0"]).contains("--bulk-mb needs a number from 1 to 24"));
+        assert!(err(&["data", "--bulk-mb", "512"]).contains("--bulk-mb"));
+        assert_eq!(index(&["data", "--bulk-mb", "24"]).bulk_mb, 24);
     }
 
     #[test]
