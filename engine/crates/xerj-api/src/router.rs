@@ -461,6 +461,11 @@ pub fn build_es_compat_router(state: AppState) -> Router {
                 .get(es_compat::get_component_template)
                 .delete(es_compat::delete_component_template),
         )
+        // ── Query Workbench data connections (honest empty list) ────────────
+        .route(
+            "/_plugins/_query/_datasources",
+            get(es_compat::query_workbench_datasources),
+        )
         // ── Cluster state ──────────────────────────────────────────────────
         .route("/_cluster/state", get(es_compat::cluster_state))
         // ── Cluster allocation explain ─────────────────────────────────────

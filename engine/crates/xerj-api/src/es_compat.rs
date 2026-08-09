@@ -23283,6 +23283,32 @@ mod data_stream_wildcard_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    /// OSD's Index Management pages call `/api/dataconnections` on every
+    /// load, which proxies straight through to this route; it was entirely
+    /// unregistered (404), which OSD's own backend turned into an opaque
+    /// 500 and a stray "Not Found" toast even on pages unrelated to Query
+    /// Workbench. xerj has no external-data-connection subsystem, so an
+    /// honest empty list (not a 404) is the correct answer.
+    #[tokio::test]
+    async fn query_workbench_datasources_is_an_honest_empty_list_not_404() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::get("/_plugins/_query/_datasources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, json!([]));
+    }
 }
 
 pub async fn delete_data_stream(
@@ -23428,6 +23454,28 @@ pub async fn delete_component_template(
             xerj_common::XerjError::index_not_found(format!("component template [{name}] missing"));
         ApiError::new(e).into_response()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /_plugins/_query/_datasources
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Real OpenSearch's Query Workbench / async-query plugin lists configured
+/// EXTERNAL data connections (S3, Prometheus, Security Lake, ...) here.
+/// xerj has no such pluggable-connector subsystem, so the honest answer —
+/// same principle as `cat_plugins`/`cat_pending_tasks` returning empty
+/// rather than fabricating entries — is zero connections, not a 404.
+///
+/// Found missing while diffing OpenSearch Dashboards' Index Management
+/// pages against a real OpenSearch node: this route was entirely
+/// unregistered (404), which OSD's own `/api/dataconnections` backend
+/// proxy turns into an opaque 500 ("Issue in fetching data sources:
+/// StatusCodeError: Not Found" in its own logs) — every Index Management
+/// page calls it on load regardless of which tab is open, so the missing
+/// route surfaced as a stray "Not Found" toast even on pages that have
+/// nothing to do with Query Workbench.
+pub async fn query_workbench_datasources() -> impl IntoResponse {
+    Json(Vec::<Value>::new())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
