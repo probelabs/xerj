@@ -449,6 +449,7 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         )
         .route("/:name/_rollover", post(es_compat::rollover_data_stream))
         // ── ILM ────────────────────────────────────────────────────────────
+        .route("/_ilm/policy", get(es_compat::list_ilm_policies))
         .route(
             "/_ilm/policy/:name",
             put(es_compat::put_ilm_policy)

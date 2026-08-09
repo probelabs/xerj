@@ -22787,16 +22787,30 @@ pub async fn put_ilm_policy(
     }
 }
 
+// GET _ilm/policy (no name segment) — the form Kibana's own ILM UI calls to
+// populate the "Index Lifecycle Policies" list page. Real ES returns every
+// policy from this bare path; we had only ever wired up the `*`/`_all`
+// wildcard under `/_ilm/policy/:name`, so the bare path 404'd (no route
+// matched it at all) and the UI silently rendered its "no policies" empty
+// state even when policies existed — same bug class as the ISM list-form gap.
+pub async fn list_ilm_policies(State(state): State<AppState>) -> impl IntoResponse {
+    all_ilm_policies_response(&state)
+}
+
+fn all_ilm_policies_response(state: &AppState) -> Response {
+    let mut result = serde_json::Map::new();
+    for entry in state.engine.ilm_policies.iter() {
+        result.insert(entry.key().clone(), entry.value().clone());
+    }
+    Json(Value::Object(result)).into_response()
+}
+
 pub async fn get_ilm_policy(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     if name == "*" || name == "_all" {
-        let mut result = serde_json::Map::new();
-        for entry in state.engine.ilm_policies.iter() {
-            result.insert(entry.key().clone(), entry.value().clone());
-        }
-        return Json(Value::Object(result)).into_response();
+        return all_ilm_policies_response(&state);
     }
     match state.engine.ilm_policies.get(&name) {
         Some(policy) => {
@@ -22820,6 +22834,56 @@ pub async fn delete_ilm_policy(
     } else {
         let e = xerj_common::XerjError::index_not_found(format!("policy [{name}] not found"));
         ApiError::new(e).into_response()
+    }
+}
+
+#[cfg(test)]
+mod ilm_policy_list_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test]
+    async fn bare_get_ilm_policy_lists_every_policy() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/_ilm/policy/kibana-verify-policy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"policy": {"phases": {"hot": {"actions": {}}}}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        // Real ES's `GET _ilm/policy` (no name segment) lists every policy —
+        // this is the exact form Kibana's UI calls for its policy list page.
+        let list = app
+            .oneshot(Request::get("/_ilm/policy").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(list.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("kibana-verify-policy").is_some());
     }
 }
 
