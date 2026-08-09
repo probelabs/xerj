@@ -28,7 +28,6 @@ mod sync_executor;
 pub mod walk;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, Write};
@@ -214,7 +213,10 @@ fn begin_non_graph_generation(
             version: 1,
             backend: "disabled".into(),
             identity_sha256: "0".repeat(64),
-            dimensions: 1,
+            // A disabled embedding execution has no vector width at all. `None`
+            // says exactly that; any number here would be a fiction the
+            // generation contract would then hold future runs to.
+            dimensions: None,
             semantic_contract: "disabled-no-semantic-fields-v1".into(),
             resumable: true,
             non_resumable_reason: None,
@@ -316,10 +318,10 @@ struct CliErrorRoute {
 
 fn route_cli_error(error: &anyhow::Error, json_output: bool) -> CliErrorRoute {
     if json_output {
-        if let Some(delta) = error.downcast_ref::<UnsupportedInventoryDeltaError>() {
+        if let Some(unsafe_fresh) = error.downcast_ref::<UnsafeFreshGenerationError>() {
             return CliErrorRoute {
                 exit_code: 1,
-                stdout: Some(delta.to_json().to_string()),
+                stdout: Some(unsafe_fresh.to_json().to_string()),
                 stderr: None,
             };
         }
@@ -821,6 +823,7 @@ mod phase_a_grouping_tests {
             pdf_timeout_secs: 10,
             bulk_mb: 1,
             bulk_timeout_secs: 10,
+            snapshot_max_bytes: 64 << 30,
             prefix: "t".into(),
             state_dir: None,
             fresh: true,
@@ -1398,156 +1401,69 @@ fn select_resume_plan_keys(
     Ok(selected)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct InventoryDeltaEntry {
-    file_key: String,
-    path: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct UnsupportedInventoryDelta {
-    added_content_groups: Vec<InventoryDeltaEntry>,
-    vanished_content_groups: Vec<InventoryDeltaEntry>,
-}
-
+/// `--fresh` was asked to discard a durable corpus *generation*.
+///
+/// The generated `--no-graph` path keeps its authority in a committed
+/// manifest plus sealed snapshots under the state directory. `--fresh` deletes
+/// `journal.ndjson`, and the `gc_snapshots` call that follows every open then
+/// sees an empty protected set and removes every sealed snapshot directory —
+/// so by the time any later gate could object, the manifest, the pending
+/// replay evidence, and the alias/path/stale-record knowledge needed to
+/// reconcile the destination are already gone. Refuse before anything is
+/// touched.
+///
+/// This carries no inventory delta on purpose: nothing has been compared yet,
+/// and printing empty `added`/`vanished` arrays (as an earlier revision did)
+/// is worse than saying plainly which durable state is in the way.
 #[derive(Debug)]
-struct UnsupportedInventoryDeltaError {
-    delta: UnsupportedInventoryDelta,
-    fresh_existing_plan: bool,
+struct UnsafeFreshGenerationError {
+    /// Committed generation number, or `None` when the blocker is an
+    /// uncommitted pending generation.
+    committed_generation: Option<u64>,
 }
 
-impl UnsupportedInventoryDeltaError {
+impl UnsafeFreshGenerationError {
     fn to_json(&self) -> Value {
         json!({
-            "schema": "xerj.autoindex.unsupported_sync_delta.v1",
+            "schema": "xerj.autoindex.unsafe_fresh_generation.v1",
             "status": "error",
-            "error": if self.fresh_existing_plan {
-                "unsafe_fresh_existing_plan"
-            } else {
-                "unsupported_inventory_delta"
+            "error": "unsafe_fresh_existing_generation",
+            "message": "this attempt made no remote mutations; --fresh cannot discard a durable corpus generation under the same destination because the committed manifest, sealed replay evidence, and alias, path and stale-record cleanup knowledge would be lost",
+            "blocking_state": match self.committed_generation {
+                Some(generation) => json!({"kind": "committed_generation", "generation": generation}),
+                None => json!({"kind": "pending_generation"}),
             },
-            "message": if self.fresh_existing_plan {
-                "this attempt made no remote mutations; --fresh cannot discard an existing plan under the same destination because alias, path, graph, and stale-record cleanup knowledge would be lost; the existing destination may already be partial or stale"
-            } else {
-                "this attempt made no remote mutations because this autoindex plan cannot safely reconcile corpus membership changes; the existing destination may already be partial or stale"
-            },
-            "added_content_groups": self.delta.added_content_groups,
-            "vanished_content_groups": self.delta.vanished_content_groups,
             "recovery": {
-                "exact_rebuild": "index with a new --state-dir, new --prefix, and (when graph detection is enabled) new --brain; alternatively add --no-graph. Validate the isolated target before switching readers",
+                "resume": "run the same command WITHOUT --fresh: a generated --no-graph journal reconciles additions, changes, deletions and renames incrementally, and replays a pending generation",
+                "exact_rebuild": "index with a new --state-dir and a new --prefix. Validate the isolated target before switching readers",
                 "warning": "--fresh is not recovery or destination reconciliation. The global autoindex-catalog and old target are not cleaned automatically; validate and clean them explicitly"
             }
         })
     }
 }
 
-impl std::fmt::Display for UnsupportedInventoryDeltaError {
+impl std::fmt::Display for UnsafeFreshGenerationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let render = |entries: &[InventoryDeltaEntry]| {
-            entries
-                .iter()
-                .map(|entry| format!("{} ({})", entry.path, entry.file_key))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let reason = if self.fresh_existing_plan {
-            "`--fresh` cannot discard an existing plan under the same destination because alias, \
-             path, graph, and stale-record cleanup knowledge would be lost"
-        } else {
-            "corpus membership synchronization is not yet supported"
+        let blocker = match self.committed_generation {
+            Some(generation) => format!("committed corpus generation {generation}"),
+            None => "an uncommitted pending corpus generation".to_owned(),
         };
         write!(
             formatter,
-            "this attempt made no remote mutations; the existing destination may already be \
-             partial or stale. {reason}. Added \
-             content groups [{}]; vanished content groups [{}]. For an exact rebuild, index the \
-             current folder with a new --state-dir, a new --prefix, and, when graph detection is \
-             enabled, a new --brain (or use --no-graph). Validate the isolated target before \
-             switching readers. `--fresh` is not recovery or destination reconciliation; the \
-             global autoindex-catalog and old target require explicit validated cleanup",
-            render(&self.delta.added_content_groups),
-            render(&self.delta.vanished_content_groups)
+            "this attempt made no remote mutations. `--fresh` cannot discard {blocker} under the \
+             same destination: the committed manifest, sealed replay evidence, and the alias, \
+             path and stale-record cleanup knowledge would be lost, and the existing destination \
+             may already be partial or stale. Re-run the same command without `--fresh` — a \
+             generated `--no-graph` journal reconciles additions, changes, deletions and renames \
+             incrementally. For an exact rebuild, index the current folder with a new \
+             --state-dir and a new --prefix, and validate the isolated target before switching \
+             readers. `--fresh` is not recovery or destination reconciliation; the global \
+             autoindex-catalog and old target require explicit validated cleanup"
         )
     }
 }
 
-impl std::error::Error for UnsupportedInventoryDeltaError {}
-
-impl UnsupportedInventoryDelta {
-    fn between(files: &[walk::FileEntry], keys: &[String], plan: &Plan) -> Self {
-        let current_keys: std::collections::HashSet<&str> = keys
-            .iter()
-            .filter(|key| !key.is_empty())
-            .map(String::as_str)
-            .collect();
-        let durable_keys: std::collections::HashSet<&str> = plan
-            .files
-            .keys()
-            .map(String::as_str)
-            .chain(plan.junk_files.iter().map(|junk| junk.file_key.as_str()))
-            .collect();
-
-        let mut added_content_groups: Vec<InventoryDeltaEntry> = files
-            .iter()
-            .zip(keys)
-            .filter(|(_, key)| !key.is_empty() && !durable_keys.contains(key.as_str()))
-            .map(|(file, key)| InventoryDeltaEntry {
-                file_key: key.clone(),
-                path: file.rel.clone(),
-            })
-            .collect();
-        let mut vanished_content_groups: Vec<InventoryDeltaEntry> = plan
-            .files
-            .iter()
-            .filter(|(key, _)| !current_keys.contains(key.as_str()))
-            .map(|(key, assignment)| InventoryDeltaEntry {
-                file_key: key.clone(),
-                path: assignment.rel.clone(),
-            })
-            .collect();
-        vanished_content_groups.extend(
-            plan.junk_files
-                .iter()
-                .filter(|junk| !current_keys.contains(junk.file_key.as_str()))
-                .map(|junk| InventoryDeltaEntry {
-                    file_key: junk.file_key.clone(),
-                    path: junk.rel.clone(),
-                }),
-        );
-
-        let stable_order = |left: &InventoryDeltaEntry, right: &InventoryDeltaEntry| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.file_key.cmp(&right.file_key))
-        };
-        added_content_groups.sort_by(stable_order);
-        vanished_content_groups.sort_by(stable_order);
-        Self {
-            added_content_groups,
-            vanished_content_groups,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.added_content_groups.is_empty() && self.vanished_content_groups.is_empty()
-    }
-
-    fn into_error(self) -> anyhow::Error {
-        UnsupportedInventoryDeltaError {
-            delta: self,
-            fresh_existing_plan: false,
-        }
-        .into()
-    }
-
-    fn into_fresh_error(self) -> anyhow::Error {
-        UnsupportedInventoryDeltaError {
-            delta: self,
-            fresh_existing_plan: true,
-        }
-        .into()
-    }
-}
+impl std::error::Error for UnsafeFreshGenerationError {}
 
 fn alias_keys_to_reindex(
     previous: &[state::DuplicateFile],
@@ -1854,20 +1770,34 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         .committed_manifest
         .as_ref()
         .is_some_and(|manifest| manifest.generation == 0 && manifest.groups.is_empty());
-    // `--fresh` must be refused before the journal is opened. `open_after_
-    // preflight` deletes journal.ndjson whenever `fresh` is set, and the
-    // `gc_snapshots` call that follows every open then sees an empty protected
-    // set and removes every sealed snapshot directory. The legacy plan gate
-    // further down cannot save a generated corpus: both generated branches are
-    // evaluated before it, so the committed manifest and any pending replay
-    // evidence would already be gone. Fail here, before anything is touched, so
-    // that `--fresh` really is "accepted only when the selected state directory
-    // has no durable plan" as the CLI help and docs state.
-    if cfg.fresh
-        && (preflight.pending_sync.is_some()
-            || (preflight.committed_manifest.is_some() && !genesis_recovery))
-    {
-        return Err(UnsupportedInventoryDelta::default().into_fresh_error());
+    // `--fresh` must be refused before the journal is opened, and only for a
+    // durable *generation*. `open_after_preflight` deletes journal.ndjson
+    // whenever `fresh` is set, and the `gc_snapshots` call that follows every
+    // open then sees an empty protected set and removes every sealed snapshot
+    // directory — so nothing evaluated later can save a generated corpus.
+    //
+    // Scope matters here. A legacy (non-generated) journal keeps `--fresh`
+    // exactly as it has always behaved: it is a crash-resume boundary, not a
+    // generation, and `xerj brain` documents and depends on `--fresh` to
+    // re-index a folder whose server-side data was wiped (brain.rs). Only
+    // generated state — a pending sync, or a committed manifest past genesis —
+    // has authority that `--fresh` would silently destroy.
+    let blocking_generation = if !cfg.fresh {
+        None
+    } else if preflight.pending_sync.is_some() {
+        Some(None)
+    } else {
+        preflight
+            .committed_manifest
+            .as_ref()
+            .filter(|_| !genesis_recovery)
+            .map(|manifest| Some(manifest.generation))
+    };
+    if let Some(committed_generation) = blocking_generation {
+        return Err(UnsafeFreshGenerationError {
+            committed_generation,
+        }
+        .into());
     }
     // A durable sync_begin owns the desired generation. Never rediscover and
     // replan from a mutable source tree while that transaction is pending.
@@ -1942,6 +1872,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             .as_ref()
             .context("generated journal lost its committed manifest")?
             .clone();
+<<<<<<< HEAD
         // Phase A's scan runs in the run's own pool and reports every file it
         // touches, exactly as the legacy route does: `--workers` has to bound
         // the CPU-bound phase for the knob to mean anything (#240 §2), and no
@@ -1980,7 +1911,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 })
                 .collect()
         });
-        let plan = reconcile_plan::reconcile_plan(&inventory, &base.plan, scans)?;
+        let plan = reconcile_plan::reconcile_plan(&inventory, &base.plan, scans, cfg.sample)?;
         if serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)? {
             if let Some(expected) = &base.execution {
                 let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
@@ -2083,37 +2014,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
              authentication",
             rebuild_argv
         );
-    }
-    if !genesis_recovery {
-        if let Some(prior_plan) = preflight.plan.as_ref() {
-            let comparison_keys = if cfg.fresh {
-                inventory.keys.clone()
-            } else {
-                // Ordinary resume preserves planned-key identity for supported
-                // same-path replacement and legacy plans.
-                select_resume_plan_keys(
-                    &inventory.files,
-                    &inventory.keys,
-                    prior_plan,
-                    &state_dir.join("journal.ndjson"),
-                )?
-                .into_iter()
-                .zip(inventory.keys.iter())
-                .map(|(planned, current)| planned.unwrap_or_else(|| current.clone()))
-                .collect()
-            };
-            let delta =
-                UnsupportedInventoryDelta::between(&inventory.files, &comparison_keys, prior_plan);
-            if cfg.fresh {
-                // Even an apparently unchanged content-key set can have alias,
-                // path, graph, catalog, or partial-publication history that only
-                // the old plan can reconcile. Route 1 cannot safely discard it.
-                return Err(delta.into_fresh_error());
-            }
-            if !delta.is_empty() {
-                return Err(delta.into_error());
-            }
-        }
     }
     let mut journal = state::Journal::open_after_preflight(
         preflight,
@@ -2352,20 +2252,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         clusters_rt = Some(clusters);
         plan
     };
-
-    // A durable plan is a crash-resume boundary, not a folder-sync
-    // generation. Fail before index creation/mapping, replacement intent,
-    // graph invalidation, delete-by-query, bulk publication, refresh, or
-    // catalog writes when the current inventory adds or removes an entire
-    // canonical content group. Continuing would either silently skip new
-    // data or leave vanished source records searchable. Existing planned-key
-    // content replacement and crash repair remain supported.
-    if resumed_with_plan {
-        let delta = UnsupportedInventoryDelta::between(&files, &keys, &plan);
-        if !delta.is_empty() {
-            return Err(delta.into_error());
-        }
-    }
 
     // ── stale junk-catalog sweep (#238) ──────────────────────────────────
     //
@@ -4274,105 +4160,39 @@ mod section_label_tests {
 }
 
 #[cfg(test)]
-mod inventory_delta_tests {
+mod unsafe_fresh_generation_tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn file(path: &str) -> walk::FileEntry {
-        walk::FileEntry {
-            path: PathBuf::from(path),
-            rel: path.to_owned(),
-            rel_id: format!("id:{path}"),
-            is_symlink: false,
-            size: 1,
-        }
-    }
-
-    fn assignment(path: &str) -> FileAssignment {
-        FileAssignment {
-            rel: path.to_owned(),
-            path_id: format!("id:{path}"),
-            is_symlink: Some(false),
-            family: "csv".into(),
-            gzip: false,
-            content_digest: Some(format!("digest:{path}")),
-            assignments: vec![(None, "rows".into())],
-        }
-    }
-
-    #[test]
-    fn classifier_is_empty_for_noop_and_sorts_added_and_vanished_groups() {
-        let mut plan = Plan::default();
-        plan.files.insert("keep".into(), assignment("keep.csv"));
-        assert!(
-            UnsupportedInventoryDelta::between(&[file("keep.csv")], &["keep".into()], &plan)
-                .is_empty()
-        );
-        plan.junk_files.push(JunkFile {
-            file_key: "junk".into(),
-            rel: "broken.pdf".into(),
-            format: "pdf".into(),
-            status: "junk".into(),
-            reason: "fixture".into(),
-            bytes: 1,
-        });
-        assert!(
-            UnsupportedInventoryDelta::between(
-                &[file("keep.csv"), file("broken.pdf")],
-                &["keep".into(), "junk".into()],
-                &plan,
-            )
-            .is_empty(),
-            "unchanged durable junk is not newly added content"
-        );
-
-        plan.files.insert("old-z".into(), assignment("z-old.csv"));
-        plan.files.insert("old-a".into(), assignment("a-old.csv"));
-        let delta = UnsupportedInventoryDelta::between(
-            &[
-                file("keep.csv"),
-                file("broken.pdf"),
-                file("z-new.csv"),
-                file("m-new.csv"),
-            ],
-            &["keep".into(), "junk".into(), "new-z".into(), "new-m".into()],
-            &plan,
-        );
-        assert_eq!(
-            delta
-                .added_content_groups
-                .iter()
-                .map(|entry| entry.path.as_str())
-                .collect::<Vec<_>>(),
-            ["m-new.csv", "z-new.csv"]
-        );
-        assert_eq!(
-            delta
-                .vanished_content_groups
-                .iter()
-                .map(|entry| entry.path.as_str())
-                .collect::<Vec<_>>(),
-            ["a-old.csv", "z-old.csv"]
-        );
-    }
 
     #[test]
     fn cli_error_routing_separates_typed_json_from_unrelated_human_errors() {
-        let typed = UnsupportedInventoryDelta {
-            added_content_groups: vec![InventoryDeltaEntry {
-                file_key: "key".into(),
-                path: "new.csv".into(),
-            }],
-            vanished_content_groups: Vec::new(),
+        let typed: anyhow::Error = UnsafeFreshGenerationError {
+            committed_generation: Some(7),
         }
-        .into_error();
+        .into();
         let route = route_cli_error(&typed, true);
         assert_eq!(route.exit_code, 1);
         assert!(route.stderr.is_none());
         let stdout = route.stdout.unwrap();
         let value: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(value["schema"], "xerj.autoindex.unsupported_sync_delta.v1");
-        assert_eq!(value["error"], "unsupported_inventory_delta");
+        assert_eq!(value["schema"], "xerj.autoindex.unsafe_fresh_generation.v1");
+        assert_eq!(value["error"], "unsafe_fresh_existing_generation");
+        assert_eq!(value["blocking_state"]["kind"], "committed_generation");
+        assert_eq!(value["blocking_state"]["generation"], 7);
+        // The refusal must never print an empty inventory delta it never
+        // computed: it names the durable state that is in the way instead.
+        assert!(value.get("added_content_groups").is_none());
+        assert!(format!("{typed:#}").contains("committed corpus generation 7"));
+
+        let pending: anyhow::Error = UnsafeFreshGenerationError {
+            committed_generation: None,
+        }
+        .into();
+        let pending_value: Value =
+            serde_json::from_str(&route_cli_error(&pending, true).stdout.unwrap()).unwrap();
+        assert_eq!(
+            pending_value["blocking_state"]["kind"],
+            "pending_generation"
+        );
 
         let unrelated = anyhow::anyhow!("endpoint unavailable");
         let route = route_cli_error(&unrelated, true);

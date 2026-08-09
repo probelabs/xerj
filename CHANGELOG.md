@@ -386,19 +386,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prints the funnel on demand, including which repo-level numbers are
   contaminated and why.
 
-### Changed — fail-closed autoindex restart semantics
+### Added — incremental `--no-graph` corpus reconciliation
 
-- **`autoindex --fresh` no longer discards a durable resume plan.** A durable
-  plan contains the alias, path, graph, and stale-record knowledge needed for
-  safe reconciliation. `--fresh` is accepted only when the selected state
-  directory has no durable plan and never cleans the destination. An
-  independent rebuild must use a new state directory, new prefix, and new brain
-  namespace when graph detection is enabled (or disable graph writes), be
-  validated, and only then replace the old reader target. The shared catalog
-  and old target require explicit, validated cleanup. Generated journals with
-  `--no-graph` reconcile additions, changes, deletions, renames, and no-op
-  reruns. Legacy journals and graph-enabled generations refuse membership
-  changes before remote mutation.
+- **`xerj autoindex --no-graph` now reconciles a changed folder instead of
+  re-deriving it.** A `--no-graph` run commits a durable *corpus generation*: a
+  manifest of content groups (stable group identity, content digest and byte
+  length, canonical path plus aliases, dataset assignment, validated output
+  counts) plus a sealed source snapshot of the prepared records. A later run
+  projects the current inventory onto the committed manifest and publishes only
+  the difference — additions, content changes, deletions, renames, junk
+  transitions and duplicate-alias moves all converge, and a no-op re-run issues
+  no data bulk and appends no new generation. A run interrupted mid-generation
+  replays from its own sealed snapshot, so the result never depends on whether
+  the source tree changed after the crash. Dataset and mapping identity is
+  frozen at generation 1: a file that would need a *new* dataset or a mapping
+  change is refused before any remote mutation rather than silently widening
+  the schema.
+
+  Scope, plainly: only `--no-graph`. Graph-enabled runs are unchanged, and each
+  changed generation still copies and prepares the full corpus (O(N) staging) —
+  the win is in what gets published and verified, not yet in what gets read.
+  `--snapshot-max-gb` (default 64) caps the logical staged payload; it is a
+  payload budget, not a disk-space or peak-memory guarantee.
+
+### Changed — `autoindex --fresh` is refused on a durable generation
+
+- **`--fresh` no longer silently destroys a committed corpus generation.**
+  `--fresh` deletes the resume journal, and the snapshot GC that follows every
+  journal open then sees an empty protected set and removes every sealed
+  snapshot — so on a generated state directory `--fresh` would discard the
+  committed manifest, the pending replay evidence, and the alias/path/
+  stale-record knowledge, while cleaning nothing at the destination. It is now
+  refused up front, naming the generation that blocks it, and pointing at the
+  plain re-run (which reconciles the change) or at an isolated rebuild with a
+  new `--state-dir` and `--prefix`.
+
+  **Unchanged for everyone else.** On a legacy (non-generated) journal —
+  including every graph-enabled corpus and anything `xerj brain` writes —
+  `--fresh` behaves exactly as before: it ignores the journal and restarts,
+  which is what `xerj brain`'s documented self-heal for a wiped data directory
+  depends on.
+
+### Migration — pre-generation `--no-graph` state directories must be rebuilt
+
+- **A `--no-graph` state directory written before this release cannot be
+  adopted as generation zero, and the first `--no-graph` run against it will
+  refuse with a followable rebuild command.** This is a deliberate, versioned
+  format boundary (`sync::GENERATION_FORMAT_VERSION = 1`), not a validation
+  failure: a pre-generation resume plan records no stable group identity, no
+  content byte length and no validated per-group output counts, so no amount of
+  evidence in it could reconstruct a manifest group. The refusal prints the
+  exact `xerj autoindex` argv for an isolated rebuild into a new `--state-dir`
+  and `--prefix`; the old target and the shared `autoindex-catalog` are left
+  alone and require explicit, validated cleanup once the new target is
+  verified. Nothing is migrated in place and no destination data is touched by
+  the refusal. Graph-enabled state directories are not affected.
 
 ## [1.0.0-rc.13] - 2026-08-08
 

@@ -87,6 +87,7 @@ fn assignment(path: &str) -> FileAssignment {
         gzip: false,
         content_digest: Some(format!("digest-{path}")),
         assignments: vec![(None, "reports".into())],
+        as_document: false,
     }
 }
 
@@ -137,7 +138,7 @@ fn execution(generation_id: &str) -> ExecutionIdentity {
         chunker_identity: "prepared-records-v1".into(),
         embedding_identity_sha256: "a".repeat(64),
         embedding_backend: "lexical".into(),
-        embedding_dimension: 384,
+        embedding_dimension: Some(384),
         embedding_semantic_contract: "semantic_text-derived-vector.v1".into(),
         embedding_resumable: true,
         graph_enabled: false,

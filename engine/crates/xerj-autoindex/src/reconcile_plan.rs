@@ -12,6 +12,31 @@ use crate::FileScan;
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+/// Field shape of a file as the *document* renderer sees it.
+///
+/// The mirror of the demoted-file re-sampling loop in `build_phase_a`: a
+/// demoted config file's committed mapping was inferred from
+/// `extract::extract_as_document`, so that is the only extractor whose output
+/// may be compared against it. An unreadable file yields an empty shape, which
+/// is trivially compatible — it junks at phase B like any other, and the
+/// projection only needs the shape.
+fn document_sample(path: &Path, gzip: bool, sample: usize) -> HashMap<String, FieldAcc> {
+    let mut fields: HashMap<String, FieldAcc> = HashMap::new();
+    let mut sampled = 0usize;
+    let mut sink = |record: crate::extract::RawRecord| -> bool {
+        if sampled < sample {
+            for (name, value) in &record.fields {
+                fields.entry(name.clone()).or_default().add(value);
+            }
+        }
+        sampled += 1;
+        sampled < sample
+    };
+    let _ = crate::extract::extract_as_document(path, gzip, &mut sink);
+    fields
+}
 
 /// Project the current, byte-verified inventory onto committed dataset schemas.
 ///
@@ -22,6 +47,7 @@ pub(crate) fn reconcile_plan(
     inventory: &Inventory,
     previous: &Plan,
     scans: Vec<FileScan>,
+    sample: usize,
 ) -> Result<Plan> {
     anyhow::ensure!(
         inventory.files.len() == inventory.keys.len()
@@ -117,8 +143,26 @@ pub(crate) fn reconcile_plan(
         }
         let retained = content_owner.or_else(|| path_owner.map(|(_, assignment)| assignment));
 
+        // A demoted one-off config file (#173) is committed to a *docs*
+        // dataset and indexed through `extract::extract_as_document`, not its
+        // family extractor. Its frozen mapping therefore describes the fixed
+        // document shape, never the file's own flattened fields — so the scan
+        // sketches (which come from the family extractor) are the wrong thing
+        // to compare against it. Re-sample the file through the same document
+        // renderer `build_phase_a` uses, exactly as the fresh path does, and
+        // carry the committed `as_document` decision forward. Losing it would
+        // index flattened records into a document mapping.
+        let as_document = retained.is_some_and(|owner| owner.as_document);
+        let document_fields = if as_document {
+            Some(document_sample(&file.path, sniffed.gzip, sample))
+        } else {
+            None
+        };
+
         let mut assignments = Vec::with_capacity(scan.sketches.len());
-        for (group, fields, _records) in &scan.sketches {
+        for sketch in &scan.sketches {
+            let group = &sketch.group;
+            let fields = document_fields.as_ref().unwrap_or(&sketch.fields);
             let slug = if let Some(owner) = retained {
                 retained_slug(owner, group, sniffed.family.as_str(), fields, &datasets)
                     .with_context(|| format!("project retained file {}", file.rel))?
@@ -145,6 +189,7 @@ pub(crate) fn reconcile_plan(
                 gzip: sniffed.gzip,
                 content_digest: Some(content_digest.clone()),
                 assignments,
+                as_document,
             },
         );
         anyhow::ensure!(
@@ -416,7 +461,12 @@ mod tests {
                 csv: None,
                 encoding: "utf-8",
             }),
-            sketches: vec![(None, fields, 1)],
+            sketches: vec![crate::GroupSketch {
+                group: None,
+                fields,
+                key_fields: std::collections::HashSet::new(),
+                records: 1,
+            }],
             junk: None,
         }
     }
@@ -439,6 +489,7 @@ mod tests {
             gzip: false,
             content_digest: Some("old-digest".into()),
             assignments: vec![(None, slug.into())],
+            as_document: false,
         }
     }
 
@@ -462,6 +513,7 @@ mod tests {
             &inventory("a.jsonl", "unix:61", "new"),
             &previous,
             vec![scan(fields)],
+            50,
         )
         .unwrap();
         assert_eq!(
@@ -494,6 +546,7 @@ mod tests {
             &inventory("new.jsonl", "unix:6e", "new"),
             &previous,
             vec![scan(fields)],
+            50,
         )
         .unwrap();
         assert_eq!(plan.files["new"].assignments, vec![(None, "winner".into())]);
@@ -518,6 +571,7 @@ mod tests {
             &inventory("new.jsonl", "unix:6e", "new"),
             &previous,
             vec![scan(fields)],
+            50,
         )
         .unwrap_err();
         let message = format!("{error:#}");
@@ -543,6 +597,7 @@ mod tests {
             &inventory("new.jsonl", "unix:6e", "new"),
             &previous,
             vec![scan(unknown)],
+            50,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("unsupported dataset/schema evolution"));
@@ -558,6 +613,7 @@ mod tests {
             &inventory("new.jsonl", "unix:6e", "new"),
             &previous,
             vec![scan(object_field)],
+            50,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("unsupported dataset/schema evolution"));
@@ -567,6 +623,7 @@ mod tests {
             &inventory("new.jsonl", "unix:6e", "new"),
             &previous,
             vec![scan(wrong_type)],
+            50,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("unsupported dataset/schema evolution"));
@@ -591,7 +648,7 @@ mod tests {
             bytes: 10,
         });
         let fields = HashMap::from([("id".into(), acc(&[json!(7)]))]);
-        let plan = reconcile_plan(&current, &previous, vec![scan(fields)]).unwrap();
+        let plan = reconcile_plan(&current, &previous, vec![scan(fields)], 50).unwrap();
         assert_eq!(plan.files["same"].rel, "renamed.jsonl");
         assert_eq!(plan.datasets[0].file_count, 1);
         assert_eq!(plan.duplicate_files.len(), 1);
@@ -612,7 +669,7 @@ mod tests {
         let fields = || HashMap::from([("id".into(), acc(&[json!(7)]))]);
 
         let conflict = inventory("a.jsonl", "unix:62", "content-a");
-        let error = reconcile_plan(&conflict, &previous, vec![scan(fields())]).unwrap_err();
+        let error = reconcile_plan(&conflict, &previous, vec![scan(fields())], 50).unwrap_err();
         assert!(format!("{error:#}").contains("conflicting committed content and path owners"));
 
         let duplicate = Inventory {
@@ -621,8 +678,13 @@ mod tests {
             digests: vec!["digest".into(), "digest".into()],
             duplicates: vec![],
         };
-        let error = reconcile_plan(&duplicate, &previous, vec![scan(fields()), scan(fields())])
-            .unwrap_err();
+        let error = reconcile_plan(
+            &duplicate,
+            &previous,
+            vec![scan(fields()), scan(fields())],
+            50,
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("duplicate content identity"));
     }
 }

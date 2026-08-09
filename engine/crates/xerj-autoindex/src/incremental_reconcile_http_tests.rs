@@ -21,6 +21,12 @@ struct HttpState {
     requests: Vec<(String, String)>,
     data_bulk_requests: usize,
     fail_next_data_bulk: bool,
+    /// Apply the first half of the next data bulk's items and *then* report
+    /// `errors: true`. This is the dangerous backend shape the legacy
+    /// replacement transaction was hardened against (visibility changed, but
+    /// the durable record must not be): `no_graph` corpora take the generated
+    /// executor now, so the shape has to be proven here too.
+    partially_apply_next_data_bulk: bool,
     fail_embedding_identity: bool,
     stop: bool,
     embedding_identity_sha256: String,
@@ -236,8 +242,17 @@ fn bulk_http(body: &[u8], state: &Arc<Mutex<HttpState>>) -> (u16, Value) {
             );
         }
     }
+    // Half-applied bulk: apply the leading actions, then report failure.
+    let applied_limit = if is_data && std::mem::take(&mut locked.partially_apply_next_data_bulk) {
+        Some(lines.len() / 2)
+    } else {
+        None
+    };
     let mut cursor = 0;
     while cursor < lines.len() {
+        if applied_limit.is_some_and(|limit| cursor >= limit) {
+            break;
+        }
         let action: Value = serde_json::from_slice(lines[cursor]).unwrap();
         cursor += 1;
         if let Some(meta) = action.get("delete") {
@@ -260,6 +275,21 @@ fn bulk_http(body: &[u8], state: &Arc<Mutex<HttpState>>) -> (u16, Value) {
             let target = target.as_object_mut().unwrap();
             target.extend(patch.clone());
         }
+    }
+    if applied_limit.is_some() {
+        return (
+            200,
+            json!({
+                "errors": true,
+                "items": [{"index": {
+                    "status": 500,
+                    "error": {
+                        "type": "injected_failure",
+                        "reason": "partial bulk applied before failing"
+                    }
+                }}]
+            }),
+        );
     }
     (200, json!({"errors": false, "items": []}))
 }
@@ -584,6 +614,72 @@ fn pending_generation_replays_sealed_source_after_live_source_mutates() {
     assert!(!rendered.contains("mutated-after-sync-begin"), "{rendered}");
 }
 
+/// Crash/resume with a *partially applied* data bulk, on `--no-graph`.
+///
+/// `failure_resume_http_tests` used to run its whole injected-failure matrix
+/// with `no_graph: true`; since `--no-graph` now takes the generated executor,
+/// that module keeps the legacy graph-enabled transaction and this test carries
+/// the no-graph half of the coverage. The endpoint applies half of a bulk and
+/// *then* reports failure — visibility has changed, so the generation must stay
+/// uncommitted, and the retry must converge on exactly the new content with no
+/// duplicate or stale document surviving the half-applied attempt.
+#[test]
+fn partially_applied_data_bulk_leaves_the_generation_pending_and_the_retry_converges() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let source = corpus.path().join("rows.csv");
+    fs::write(&source, "id,value\n1,first\n").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    fs::write(
+        &source,
+        "id,value\n1,replaced\n2,second\n3,third\n4,fourth\n",
+    )
+    .unwrap();
+    endpoint
+        .state
+        .lock()
+        .unwrap()
+        .partially_apply_next_data_bulk = true;
+    assert!(
+        run_index(config.clone()).is_err(),
+        "a partially applied bulk must fail the run, not be absorbed"
+    );
+    assert_eq!(
+        journal_events(state_dir.path(), "sync_begin"),
+        2,
+        "the generation was begun"
+    );
+    assert_eq!(
+        journal_events(state_dir.path(), "sync_commit"),
+        1,
+        "a partially applied bulk must never commit the generation"
+    );
+
+    // Retry: the sealed source replays, and the destination converges exactly.
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
+    let docs = endpoint.data_docs();
+    assert_eq!(paths(&docs), ["rows.csv"]);
+    assert_eq!(
+        docs.len(),
+        4,
+        "exactly the four new records survive — no half-applied duplicate, no stale first record"
+    );
+    let rendered = serde_json::to_string(&docs).unwrap();
+    assert!(rendered.contains("replaced"), "{rendered}");
+    assert!(rendered.contains("fourth"), "{rendered}");
+    assert!(
+        !rendered.contains("\"value\":\"first\""),
+        "the replaced record must not survive: {rendered}"
+    );
+}
+
 #[test]
 fn pending_semantic_identity_drift_rejects_before_any_further_bulk() {
     let _guard = HTTP_E2E_LOCK.lock().unwrap();
@@ -662,8 +758,12 @@ fn fresh_cannot_destroy_a_committed_generation() {
     let error = run_index(config.clone()).unwrap_err();
     let message = format!("{error:#}");
     assert!(
-        message.contains("`--fresh` cannot discard an existing plan under the same destination"),
-        "{message}"
+        message.contains("`--fresh` cannot discard committed corpus generation 1"),
+        "the refusal must name the durable state that blocks it: {message}"
+    );
+    assert!(
+        message.contains("without `--fresh`"),
+        "the refusal must point at the incremental path that does work: {message}"
     );
 
     assert_eq!(
@@ -767,8 +867,8 @@ fn fresh_cannot_destroy_a_pending_generation() {
     let error = run_index(config.clone()).unwrap_err();
     let message = format!("{error:#}");
     assert!(
-        message.contains("`--fresh` cannot discard an existing plan under the same destination"),
-        "{message}"
+        message.contains("`--fresh` cannot discard an uncommitted pending corpus generation"),
+        "the refusal must name the durable state that blocks it: {message}"
     );
     assert_eq!(
         fs::read(&journal_path).unwrap(),

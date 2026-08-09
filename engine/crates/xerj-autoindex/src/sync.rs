@@ -12,6 +12,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub const EXECUTION_IDENTITY_VERSION: u32 = 2;
 
+/// On-disk version of the durable corpus-generation format.
+///
+/// Bumping it declares that state directories written by older versions cannot
+/// be adopted in place — `CommittedManifest::bootstrap_legacy` names this
+/// version in the refusal, and the CLI turns that into a followable rebuild.
+/// Version 1 is the first format: everything before it is a pre-generation
+/// resume `Plan`.
+pub const GENERATION_FORMAT_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ManifestPath {
     /// Reversible platform-native path identity (`unix:`/`windows:` encoding).
@@ -70,7 +79,14 @@ pub struct ExecutionIdentity {
     /// space. Autoindex must never synthesize model/tokenizer labels.
     pub embedding_identity_sha256: String,
     pub embedding_backend: String,
-    pub embedding_dimension: usize,
+    /// Vector width, exactly as the server reported it. `None` is the honest
+    /// record for a backend whose width the server does not pin (`neural`,
+    /// `proxy` — see `esclient::EmbeddingExecutionIdentity::dimensions`) and
+    /// for the synthetic `disabled` identity a no-semantic plan pins. It must
+    /// never be coerced to a number: a generation that recorded "unknown" and
+    /// one that recorded 384 are different execution spaces.
+    #[serde(default)]
+    pub embedding_dimension: Option<usize>,
     pub embedding_semantic_contract: String,
     pub embedding_resumable: bool,
     pub graph_enabled: bool,
@@ -129,28 +145,45 @@ impl CommittedManifest {
         Ok(())
     }
 
+    /// Adopt a pre-generation resume `Plan` as generation zero, or state — once,
+    /// by name and version — that it cannot be adopted.
+    ///
+    /// A non-empty legacy plan can *never* be adopted, and that is a deliberate,
+    /// versioned format boundary rather than an accident of validation: a
+    /// `Plan` records no stable group ID, no content byte length, and no
+    /// validated per-group output counts, so no amount of per-file evidence
+    /// could reconstruct a `ManifestGroup`. Every existing `--no-graph` state
+    /// directory written before `GENERATION_FORMAT_VERSION` therefore requires
+    /// an explicit rebuild into a new state directory and prefix.
+    ///
+    /// Saying that once, with the version in it, is the point. An earlier
+    /// revision pushed one identical "no complete manifest group" line *per
+    /// file key* — an O(files) refusal string (megabytes on a large corpus)
+    /// that read as a pile of per-file validation failures rather than as the
+    /// single migration decision it is. redb makes exactly this distinction:
+    /// an old on-disk format returns a named, versioned `UpgradeRequired(v)`,
+    /// kept separate from `Corrupted`, so the operator is told to migrate
+    /// rather than handed evidence to debug (redb,
+    /// `src/tree_store/page_store/header.rs:480-492` and
+    /// `src/error.rs:212-213, 244-252`, Apache-2.0/MIT — approach only, no
+    /// code taken).
     pub fn bootstrap_legacy(plan: Plan) -> Result<LegacyBootstrap> {
-        let mut reasons = Vec::new();
-        for (file_key, file) in &plan.files {
-            if file.content_digest.is_none() {
-                reasons.push(format!("{file_key}: missing full content digest"));
-            }
-            if !native_path_id_supported(&file.path_id) {
-                reasons.push(format!(
-                    "{file_key}: missing or lossy native canonical path identity"
-                ));
-            }
-            if file.is_symlink.is_none() {
-                reasons.push(format!(
-                    "{file_key}: legacy plan did not persist canonical symlink rank"
-                ));
-            }
-            // A Plan is not itself a generation manifest: it has no stable
-            // group ID, content byte length, or validated output counts.
-            reasons.push(format!(
-                "{file_key}: legacy plan has no complete manifest group"
-            ));
+        if !plan.files.is_empty() {
+            return Ok(LegacyBootstrap::MigrationRequired {
+                reasons: vec![format!(
+                    "this state directory holds a pre-generation autoindex resume plan \
+                     ({} planned files); the durable corpus-generation format \
+                     (v{GENERATION_FORMAT_VERSION}) requires a stable group identity, content \
+                     byte length, and validated output counts that a resume plan never recorded, \
+                     so it cannot be adopted in place and must be rebuilt",
+                    plan.files.len()
+                )],
+            });
         }
+        // An empty legacy plan is genesis: there is nothing to migrate. Alias
+        // records without canonical files are the only remaining evidence that
+        // could be malformed, so they are still checked individually.
+        let mut reasons = Vec::new();
         for alias in &plan.duplicate_files {
             if !native_path_id_supported(&alias.path_id) {
                 reasons.push(format!(
@@ -697,8 +730,8 @@ fn validate_manifest(manifest: &GenerationManifest, legacy: bool) -> Result<()> 
             "embedding execution identity must be a lowercase SHA-256 digest"
         );
         anyhow::ensure!(
-            execution.embedding_dimension > 0,
-            "embedding execution dimension must be positive"
+            execution.embedding_dimension != Some(0),
+            "embedding execution dimension must be positive when the server pins one"
         );
         anyhow::ensure!(
             execution.embedding_resumable,
@@ -1209,6 +1242,7 @@ mod tests {
                 gzip: false,
                 content_digest: Some("digest".into()),
                 assignments: Vec::new(),
+                as_document: false,
             },
         );
         assert!(matches!(
@@ -1233,6 +1267,7 @@ mod tests {
                         gzip: false,
                         content_digest: Some(format!("digest-{key}")),
                         assignments: Vec::new(),
+                        as_document: false,
                     },
                 );
             }
@@ -1264,7 +1299,7 @@ mod tests {
             chunker_identity: "chunker-v1".into(),
             embedding_identity_sha256: "a".repeat(64),
             embedding_backend: "lexical".into(),
-            embedding_dimension: 384,
+            embedding_dimension: Some(384),
             embedding_semantic_contract: "semantic_text-derived-vector.v1".into(),
             embedding_resumable: true,
             graph_enabled: false,

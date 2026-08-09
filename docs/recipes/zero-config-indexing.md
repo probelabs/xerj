@@ -228,14 +228,16 @@ live indices at http://localhost:9280:
   autoindex-catalog                                 9 docs
 ```
 
-`--fresh` starts without resume state only when the selected state directory
-has no durable plan; it never removes stale destination records. For an
-independent rebuild, use a new `--state-dir`, new `--prefix`, and new
-`--brain` when graph detection is enabled (or add `--no-graph`). Validate
-before switching readers. The shared `autoindex-catalog` and old target require
-explicit, validated cleanup. Generated journals with `--no-graph` reconcile
-additions, changes, deletions, renames, and no-op reruns. Legacy journals and
-graph-enabled generations refuse membership changes before remote mutation.
+`--fresh` ignores the resume journal and restarts (ids stay idempotent). It
+never removes stale records from the destination, and it is refused once the
+state directory holds a durable corpus generation — re-run without it and the
+generated `--no-graph` path reconciles additions, changes, deletions, renames
+and no-op reruns incrementally. For an independent rebuild, use a new
+`--state-dir` and a new `--prefix`, plus a new `--brain` when graph detection
+is enabled (or add `--no-graph`). Validate before switching readers; the shared
+`autoindex-catalog` and old target require explicit, validated cleanup. A
+`--no-graph` state directory written before the generation format cannot be
+adopted in place and must be rebuilt the same way.
 
 ## Reproduce it yourself
 

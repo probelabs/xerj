@@ -74,11 +74,12 @@ pub enum Cmd {
 }
 
 const FRESH_HELP: &str =
-    "start without resume state only when the selected state directory has no \
-durable plan; an existing plan is refused and destination records are never reset";
+    "ignore an existing resume journal and restart (ids stay idempotent); refused when the \
+state directory holds a durable corpus generation, and it never resets destination records";
 const RESUME_POLICY_HELP: &str =
     "generated --no-graph journals reconcile add, change, delete, rename, and no-op runs; \
-legacy journals and graph-enabled generations refuse membership changes before remote mutation";
+a --no-graph state directory written before the generation format must be rebuilt into a new \
+--state-dir and --prefix; graph-enabled journals keep the existing crash-resume behaviour";
 
 pub fn print_help() {
     println!(
@@ -185,14 +186,16 @@ pub fn print_help() {
          \n\
          RESUME POLICY:\n\
              {resume_policy_help}.\n\
-             If a legacy or graph-enabled journal refuses a change, do not use --fresh as\n\
-             cleanup. Restore its original destination, or rebuild with a new --state-dir and\n\
-             new --prefix plus a new --brain when graph is enabled (or use --no-graph).\n\
+             --fresh is not cleanup and is not destination reconciliation: it never removes\n\
+             stale records from the destination, and it is refused outright once a durable\n\
+             corpus generation exists (re-run without it — the generated path reconciles the\n\
+             change incrementally). For an independent rebuild use a new --state-dir and a\n\
+             new --prefix, plus a new --brain when graph is enabled (or --no-graph).\n\
              Validate before switching readers; explicitly clean the shared\n\
              autoindex-catalog and old target only after validation.\n\
          \n\
          EXIT CODES: 0 complete; 3 completed-with-junk (junk recorded, never fatal);\n\
-                     2 usage; 1 endpoint/journal failure or unsupported corpus delta\n",
+                     2 usage; 1 endpoint/journal failure or a refused unsafe state transition\n",
         fresh_help = FRESH_HELP,
         resume_policy_help = RESUME_POLICY_HELP
     );
@@ -522,21 +525,21 @@ mod tests {
     }
 
     #[test]
-    fn fresh_help_warns_that_it_is_not_destination_reconciliation() {
-        assert!(super::FRESH_HELP.contains("no durable plan"));
-        assert!(super::FRESH_HELP.contains("existing plan is refused"));
-        assert!(super::FRESH_HELP.contains("destination records are never reset"));
+    fn fresh_help_scopes_the_refusal_and_denies_being_cleanup() {
+        let help = super::FRESH_HELP;
+        assert!(help.contains("ignore an existing resume journal and restart"));
+        assert!(help.contains("durable corpus generation"));
+        assert!(help.contains("never resets destination records"));
     }
 
     #[test]
-    fn resume_policy_help_distinguishes_supported_and_refused_state() {
+    fn resume_policy_help_distinguishes_generated_legacy_and_graph_state() {
         let help = super::RESUME_POLICY_HELP;
         for claim in [
             "generated --no-graph journals",
             "add, change, delete, rename, and no-op",
-            "legacy journals",
-            "graph-enabled generations",
-            "before remote mutation",
+            "written before the generation format must be rebuilt",
+            "graph-enabled journals keep the existing crash-resume behaviour",
         ] {
             assert!(help.contains(claim), "missing resume-policy claim: {claim}");
         }
