@@ -205,14 +205,20 @@ Complete and machine-checked the same way, from
 metric path — `cardinality` is a true distinct count, not an HLL estimate, and
 `terms` `doc_count` is precise.
 
-The **sampling family is the deliberate exception**, and it is a sample by
-definition: `run_sampler` sorts the matched documents by `_score` and keeps the
-first `shard_size` (default 200), so every sub-aggregation under `sampler` or
-`random_sampler` is computed over that slice rather than the whole match set.
-`diversified_sampler` truncates the same way and additionally caps how many
-documents may share a `field` value (`max_docs_per_value`, default 1).
-`random_sampler` shares the `sampler` implementation and does not read ES's
-`probability`.
+There are two deliberate exceptions. The first is the **sampling family**,
+which is a sample by definition: `run_sampler` sorts the matched documents by
+`_score` and keeps the first `shard_size` (default 200), so every
+sub-aggregation under `sampler` or `random_sampler` is computed over that slice
+rather than the whole match set. `diversified_sampler` truncates the same way
+and additionally caps how many documents may share a `field` value
+(`max_docs_per_value`, default 1). `random_sampler` shares the `sampler`
+implementation and does not read ES's `probability`.
+
+The second is `percentiles` with the **`hdr`** option, which returns
+HdrHistogram-quantized values on purpose, so that ES's own outputs reproduce.
+The default `tdigest` path is not a t-digest at all: it sorts every matched
+value and interpolates linearly between the neighbours, reading the whole value
+set (O(N) memory) instead of a sketch.
 
 <!-- generated:agg-types -->
 Metric — `avg`, `sum`, `min`, `max`, `stats`, `extended_stats`, `value_count`,

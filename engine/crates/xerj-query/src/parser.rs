@@ -5641,8 +5641,11 @@ mod tests {
     }
 
     /// Behavioural half: the manifest's two halves must actually behave the
-    /// way they are labelled. A supported type must not answer
-    /// `unknown query type`, and a rejected type must refuse.
+    /// way they are labelled — in **both** directions. A supported type must
+    /// neither answer `unknown query type` nor refuse with a `not supported`
+    /// message, and a rejected type must refuse with exactly that message.
+    /// Checking only the first of those let a recognised-and-refused type be
+    /// relabelled supported with the whole manifest suite green.
     #[test]
     fn manifest_labels_match_observed_behaviour() {
         // `{ "<type>": {} }` — the minimal body that reaches the dispatch arm.
@@ -5656,9 +5659,27 @@ mod tests {
 
         for name in SUPPORTED_QUERY_TYPES {
             let err = parse_query(&bare(name)).err();
-            if let Some(QueryError::Parse(ParseError::UnknownQueryType(t))) = err {
+            if let Some(QueryError::Parse(ParseError::UnknownQueryType(t))) = &err {
                 panic!(
                     "`{name}` is listed as supported but parse_query rejects it as unknown: {t}"
+                );
+            }
+            // The unknown-query-type check alone does not prove the *supported*
+            // label: a type that is recognised and then refused with a 400 —
+            // exactly what `has_child` does — never produces
+            // `UnknownQueryType`, so moving it into SUPPORTED_QUERY_TYPES used
+            // to pass here and then oblige the docs guard to publish it as a
+            // capability. That is the #211 defect in the direction this test
+            // exists to catch, so the refusal wording is checked too: the
+            // phrase REJECTED_QUERY_TYPES is required to carry is the phrase
+            // SUPPORTED_QUERY_TYPES is forbidden to carry.
+            if let Some(e) = &err {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("not supported"),
+                    "`{name}` is listed as supported but refuses with a not-supported \
+                     message: {msg}\n  A recognised-and-refused type belongs in \
+                     REJECTED_QUERY_TYPES, or the docs will advertise a query that 400s."
                 );
             }
         }

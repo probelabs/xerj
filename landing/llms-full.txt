@@ -483,12 +483,14 @@ track_total_hits, and (via dedicated endpoints) scroll and point-in-time.
 
 Aggregations (complete; no probabilistic sketch in the metric path — cardinality
 is a true distinct count, not an HLL estimate, and terms doc_count is precise).
-The Sampling family below is the deliberate exception: sampler and
+Two deliberate exceptions. (1) The Sampling family below: sampler and
 random_sampler keep only the top `shard_size` matched docs by _score (default
 200) and diversified_sampler additionally caps docs per field value, so
 sub-aggregations under any of the three run over that sample, not the whole
 match set — and random_sampler shares the sampler implementation and ignores
-ES's `probability`:
+ES's `probability`. (2) percentiles with the `hdr` option returns
+HdrHistogram-quantized values, deliberately, to reproduce ES's own outputs; the
+default `tdigest` path sorts every value and interpolates instead:
 
 <!-- generated:agg-types -->
 Metric     `avg`, `sum`, `min`, `max`, `stats`, `extended_stats`, `value_count`,

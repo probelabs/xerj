@@ -622,10 +622,18 @@ fn every_query_clause_in_a_published_sample_is_a_real_query_type() {
 /// Unlike the list regions, a file may carry the same count section more than
 /// once (the pricing page prints the figure in a plan bullet and again in the
 /// comparison table); every occurrence is checked.
+///
+/// `ROADMAP.md` is markdown rather than HTML, and was originally left out —
+/// which re-created the defect inside its own fix: it published `50 query
+/// types` and `62 aggregation types` as hand-typed literals, so adding query
+/// type 51 would have left it silently saying 50 with every test green.
+/// HTML comments are invisible in rendered markdown, so the same marker works
+/// there unchanged.
 const COUNT_DOCS: &[&str] = &[
     "landing/docs/migration-from-es.html",
     "landing/pricing/index.html",
     "landing/demo/index.html",
+    "ROADMAP.md",
 ];
 
 /// The count sections and where each number comes from.
@@ -684,7 +692,7 @@ fn published_capability_counts_match_the_constants() {
     }
 
     assert!(
-        seen >= 5,
+        seen >= 9,
         "only {seen} marked counts found across {COUNT_DOCS:?} — a page dropped its \
          markers and its number is now unchecked"
     );
