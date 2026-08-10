@@ -29,6 +29,7 @@ pub mod memtable;
 pub mod painless;
 pub mod pools;
 pub mod rbac;
+pub mod secret_hash;
 pub mod segment_cache_budget;
 pub mod segment_cache_estimates;
 pub mod slow_query;

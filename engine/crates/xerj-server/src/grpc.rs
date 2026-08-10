@@ -700,15 +700,7 @@ mod tests {
     fn mint_key(state: &AppState, id: &str, roles: Vec<xerj_engine::rbac::Role>) -> String {
         state.engine.persist_api_key(
             id.to_string(),
-            xerj_engine::engine::ApiKeyRecord {
-                name: id.to_string(),
-                secret: "s3cret".into(),
-                creation_ms: 0,
-                expiration_ms: None,
-                invalidated: false,
-                invalidation_ms: None,
-                roles,
-            },
+            xerj_engine::engine::ApiKeyRecord::new(id, "s3cret", 0, None, roles),
         );
         format!("ApiKey {}", b64(&format!("{id}:s3cret")))
     }

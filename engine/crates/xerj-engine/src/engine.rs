@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use xerj_common::config::Config;
 use xerj_common::types::{IndexName, Schema};
 
@@ -204,13 +204,46 @@ pub struct DataStream {
 /// restarts — before this, the map was in-memory only and every restart
 /// silently invalidated all minted keys (Kibana/agents would 401 until re-set).
 /// Serialized as JSON, so the fields must stay `serde`-round-trippable.
+///
+/// # The secret is a hash (issue #201)
+///
+/// It used to be the credential itself, in the clear, in a file. 0600 and an
+/// atomic rename are the right handling for a secret *while the process owns
+/// it*, but a file has more readers than a process has: a backup, a volume
+/// snapshot, a container layer, a support bundle, a decommissioned disk. Any
+/// one of those handed over every live credential on the node.
+///
+/// Now only [`crate::secret_hash`]'s salted-SHA-256 digest is stored, and the
+/// secret fields are **private**: outside this module the struct cannot be
+/// built with a struct literal at all, so the only way to make a record is
+/// [`ApiKeyRecord::new`], which hashes. That is deliberate — it makes storing
+/// plaintext again a compile error rather than a code-review catch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
     /// Caller-supplied key name (informational).
     pub name: String,
-    /// The secret half of the credential — the `api_key` value returned to
-    /// the caller, i.e. the part after `id:` in the decoded `ApiKey` header.
-    pub secret: String,
+    /// Salted hash of the secret half of the credential (the `api_key` value
+    /// returned to the caller, i.e. the part after `id:` in the decoded
+    /// `ApiKey` header). Never the secret itself.
+    ///
+    /// `#[serde(default)]` so a pre-#201 `api_keys.json` — which has `secret`
+    /// and no `secret_hash` — still deserializes; [`Engine::load_persisted_api_keys`]
+    /// then migrates it. Anything here that
+    /// [`crate::secret_hash::is_usable_hash`] rejects — empty (never migrated), or
+    /// present but unparseable (truncated write, hand edit, a scheme this
+    /// build does not know) — means "no usable credential": the load path
+    /// drops such a record and [`ApiKeyRecord::verify_secret`] denies it if
+    /// one ever reaches the auth path anyway.
+    #[serde(default)]
+    secret_hash: String,
+    /// Pre-#201 plaintext secret, read only so it can be migrated away.
+    ///
+    /// Deserialized from the old `secret` field, never written back: the load
+    /// path hashes it into `secret_hash`, clears this, and rewrites the file,
+    /// after which the plaintext exists nowhere. `skip_serializing_if` means
+    /// even a partially-migrated in-memory record never re-emits plaintext.
+    #[serde(default, rename = "secret", skip_serializing_if = "Option::is_none")]
+    legacy_plaintext_secret: Option<String>,
     /// Creation time in epoch milliseconds.
     pub creation_ms: u64,
     /// Absolute expiration in epoch milliseconds, or `None` if the key never
@@ -241,6 +274,99 @@ pub struct ApiKeyRecord {
     /// safe reading of "was minted when nothing was enforced".
     #[serde(default)]
     pub roles: Vec<crate::rbac::Role>,
+}
+
+impl ApiKeyRecord {
+    /// Build a live key record from the plaintext secret handed to the caller.
+    ///
+    /// The plaintext is hashed here and dropped on return — this function is
+    /// the only way to construct a record, so there is no path by which a
+    /// secret reaches [`Engine::flush_api_keys`] and therefore the disk.
+    pub fn new(
+        name: impl Into<String>,
+        secret: &str,
+        creation_ms: u64,
+        expiration_ms: Option<u64>,
+        roles: Vec<crate::rbac::Role>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            secret_hash: crate::secret_hash::hash_secret(secret),
+            legacy_plaintext_secret: None,
+            creation_ms,
+            expiration_ms,
+            invalidated: false,
+            invalidation_ms: None,
+            roles,
+        }
+    }
+
+    /// Does `presented` match this record's secret?
+    ///
+    /// Fail-closed on a record that carries no usable hash — never migrated
+    /// (empty), or present but not one of our encodings.
+    /// [`Engine::load_persisted_api_keys`] drops those before they can reach
+    /// here, but if one ever did, "no usable stored hash" must mean "no",
+    /// never "yes". [`crate::secret_hash::is_usable_hash`] is the discriminator,
+    /// the same one the load path uses, so the two cannot disagree about what
+    /// counts as a credential.
+    pub fn verify_secret(&self, presented: &str) -> bool {
+        if !crate::secret_hash::is_usable_hash(&self.secret_hash) {
+            return false;
+        }
+        crate::secret_hash::verify_secret(presented, &self.secret_hash)
+    }
+
+    /// Migrate a record loaded from a pre-#201 `api_keys.json`.
+    ///
+    /// Returns `true` when the record changed and the store must be rewritten.
+    /// `Err(())` means the record carries no usable credential in either form
+    /// and must be dropped rather than kept as a key that silently never
+    /// authenticates.
+    ///
+    /// "Usable credential" is [`crate::secret_hash::is_usable_hash`], which is
+    /// a full decode — **not** `!secret_hash.is_empty()`, and not a check of
+    /// the `$ssha256$` tag either. A `secret_hash` that carries the tag but
+    /// does not decode (`"$ssha256$truncated"` from a hand edit, a scheme a
+    /// future build writes and this one cannot read) is denied by every
+    /// verifier, so a record holding only that can never authenticate.
+    /// Restoring it would leave a key `GET /_security/api_key` lists as live
+    /// while nothing can ever use it — the accept-then-ignore shape issue #204
+    /// tracks, and exactly what dropping the empty case already avoids. Only
+    /// the two shapes that really are credentials survive:
+    ///
+    /// * a `secret_hash` that decodes — the post-#201 shape, and the winner
+    ///   whenever both forms are present;
+    /// * a non-empty `secret` and **no** `secret_hash` at all — the exact
+    ///   pre-#201 shape, which is what migration is for.
+    ///
+    /// Anything else is dropped rather than repaired. A record carrying both a
+    /// plaintext and a hash-shaped value that does not decode is a store
+    /// nobody can explain; deriving a live credential from the half of it that
+    /// #201 exists to delete is the fail-open reading of an ambiguous record,
+    /// and this is a credential path.
+    ///
+    /// The drop is in memory. `load_persisted_api_keys` only rewrites the file
+    /// when something migrated, so a dropped record normally stays on disk for
+    /// the operator to inspect after the error log points at it.
+    fn migrate_from_plaintext(&mut self) -> std::result::Result<bool, ()> {
+        let plaintext = self.legacy_plaintext_secret.take();
+        if crate::secret_hash::is_usable_hash(&self.secret_hash) {
+            // The hash is the credential. A leftover plaintext beside it is
+            // discarded — dropping it is the whole point, and re-deriving from
+            // it could silently swap which secret the record authenticates.
+            // `Some` means the file still held plaintext, so it must be
+            // rewritten.
+            return Ok(plaintext.is_some());
+        }
+        match plaintext {
+            Some(plain) if !plain.is_empty() && self.secret_hash.is_empty() => {
+                self.secret_hash = crate::secret_hash::hash_secret(&plain);
+                Ok(true)
+            }
+            _ => Err(()),
+        }
+    }
 }
 
 /// Atomically write a **secret** file (API-key store) with owner-only (0600)
@@ -497,7 +623,14 @@ impl Engine {
                 crate::slow_query::DEFAULT_SLOW_QUERY_CAPACITY,
                 crate::slow_query::DEFAULT_SLOW_QUERY_MS,
             ),
-            audit: crate::audit::AuditLog::new(crate::audit::DEFAULT_AUDIT_CAPACITY),
+            // Issue #201: durable, so the evidence outlives the incident it
+            // is evidence of. Falls back to in-memory (with a warning) if the
+            // file cannot be opened — an unwritable audit log must not stop
+            // the node booting.
+            audit: crate::audit::AuditLog::open(
+                crate::audit::DEFAULT_AUDIT_CAPACITY,
+                data_dir.join("audit.jsonl"),
+            ),
             roles: crate::rbac::RoleStore::new(),
             // Single-node default: 1 shard, "local" owner. Writes never
             // forward; multi-node mode overrides these via the Raft
@@ -1024,7 +1157,7 @@ impl Engine {
     /// the old behavior rather than regressing key creation.
     pub fn persist_api_key(&self, id: String, record: ApiKeyRecord) {
         self.api_keys.insert(id, record);
-        self.flush_api_keys();
+        self.flush_api_keys_best_effort();
     }
 
     /// Invalidate (revoke) minted API keys by id — issue #208's missing half.
@@ -1060,28 +1193,34 @@ impl Engine {
             // re-iterates the map below.
         }
         if !invalidated.is_empty() {
-            self.flush_api_keys();
+            self.flush_api_keys_best_effort();
         }
         (invalidated, previously)
     }
 
     /// Serialize the current `api_keys` map to `<data_dir>/api_keys.json`
-    /// atomically with owner-only (0600) permissions — the file holds key
-    /// secrets, so it must never be group/world readable.
-    fn flush_api_keys(&self) {
+    /// atomically with owner-only (0600) permissions.
+    ///
+    /// Since #201 the file holds only salted hashes, but 0600 stays: a hash
+    /// plus a key id is still an offline target and still tells a reader
+    /// exactly which credentials exist.
+    fn flush_api_keys(&self) -> std::io::Result<()> {
         let snapshot: std::collections::HashMap<String, ApiKeyRecord> = self
             .api_keys
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
-        let bytes = match serde_json::to_vec_pretty(&snapshot) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "failed to serialize api_keys for persistence");
-                return;
-            }
-        };
-        if let Err(e) = write_secret_file_atomic(&self.api_keys_path(), &bytes) {
+        let bytes = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        write_secret_file_atomic(&self.api_keys_path(), &bytes)
+    }
+
+    /// [`Self::flush_api_keys`] for the mutation paths, where a persistence
+    /// failure must not fail the request: the key still works until the next
+    /// restart, which is the pre-persistence behaviour rather than a
+    /// regression of key creation.
+    fn flush_api_keys_best_effort(&self) {
+        if let Err(e) = self.flush_api_keys() {
             warn!(error = %e, "failed to persist api_keys.json (keys work until restart)");
         }
     }
@@ -1090,6 +1229,25 @@ impl Engine {
     /// in-memory map on boot. A missing file is normal (fresh node / no keys
     /// ever minted); a corrupt file is logged and ignored (the node still
     /// boots — the admin key path is unaffected).
+    ///
+    /// # Migration off plaintext (issue #201)
+    ///
+    /// A store written before #201 holds `"secret": "<the credential>"`. Those
+    /// records are hashed here and the file is rewritten **during boot**,
+    /// before the server accepts a request, so an upgraded node stops leaking
+    /// on first start rather than on first key rotation. The migration is
+    /// one-way and needs no flag day: [`crate::secret_hash::is_usable_hash`]
+    /// is the discriminator ([`ApiKeyRecord::migrate_from_plaintext`] calls
+    /// it), so a store whose hashes decode is untouched, and only the exact
+    /// pre-#201 shape — a `secret` and no `secret_hash` at all — is migrated.
+    ///
+    /// A record that is neither of those two shapes is **dropped with an
+    /// error**, not kept: keeping it would leave an entry that `GET
+    /// /_security/api_key` lists as a live credential while nothing can ever
+    /// authenticate as it — precisely the accept-then-ignore behaviour that
+    /// issue #204 tracks. Since "usable" is a full decode, a `secret_hash`
+    /// that is present but unparseable is dropped exactly like an absent one;
+    /// both are equally unauthenticatable.
     fn load_persisted_api_keys(&self) {
         let path = self.api_keys_path();
         let Ok(bytes) = std::fs::read(&path) else {
@@ -1097,12 +1255,58 @@ impl Engine {
         };
         match serde_json::from_slice::<std::collections::HashMap<String, ApiKeyRecord>>(&bytes) {
             Ok(map) => {
-                let n = map.len();
-                for (id, rec) in map {
-                    self.api_keys.insert(id, rec);
+                let mut restored = 0usize;
+                let mut migrated = 0usize;
+                let mut dropped = 0usize;
+                for (id, mut rec) in map {
+                    match rec.migrate_from_plaintext() {
+                        Ok(changed) => {
+                            if changed {
+                                migrated += 1;
+                            }
+                            restored += 1;
+                            self.api_keys.insert(id, rec);
+                        }
+                        Err(()) => {
+                            dropped += 1;
+                            error!(
+                                key_id = %id,
+                                "api_keys.json record is not a credential this build can \
+                                 use: its secret_hash does not decode (absent, truncated, \
+                                 or an encoding this build does not know) and it is not \
+                                 the pre-#201 plaintext shape either — dropping it; \
+                                 nothing could ever authenticate as this key and listing \
+                                 it would be a lie"
+                            );
+                        }
+                    }
                 }
-                if n > 0 {
-                    info!(count = n, "restored persisted API keys");
+                if restored > 0 {
+                    info!(count = restored, "restored persisted API keys");
+                }
+                if migrated > 0 {
+                    // Rewrite immediately: until this lands, the plaintext is
+                    // still on disk. A failure here is not cosmetic, so it is
+                    // an error, not a warning — the operator has to know the
+                    // node is still leaking and why.
+                    match self.flush_api_keys() {
+                        Ok(()) => info!(
+                            count = migrated,
+                            "migrated API key secrets to salted hashes; plaintext removed \
+                             from api_keys.json"
+                        ),
+                        Err(e) => error!(
+                            error = %e,
+                            count = migrated,
+                            path = %path.display(),
+                            "could not rewrite api_keys.json after hashing — PLAINTEXT API \
+                             KEY SECRETS REMAIN ON DISK. Fix the permissions/space problem \
+                             and restart, or rotate the keys."
+                        ),
+                    }
+                }
+                if dropped > 0 {
+                    error!(count = dropped, "dropped unusable API key records");
                 }
             }
             Err(e) => {
@@ -2467,5 +2671,117 @@ mod snapshot_path_security_tests {
         let err2 = validate_snapshot_path(&repo, "s1", &snap, data.path(), &["/".to_string()])
             .expect_err("`..` must be rejected even with a permissive allowlist");
         assert!(err2.to_string().contains(".."), "unexpected error: {err2}");
+    }
+}
+
+#[cfg(test)]
+mod api_key_record_migration_tests {
+    use super::ApiKeyRecord;
+
+    /// A record as it comes off disk, before the load path touches it.
+    fn loaded(secret_hash: &str, plaintext: Option<&str>) -> ApiKeyRecord {
+        ApiKeyRecord {
+            name: "loaded".to_string(),
+            secret_hash: secret_hash.to_string(),
+            legacy_plaintext_secret: plaintext.map(str::to_string),
+            creation_ms: 1_753_600_000_000,
+            expiration_ms: None,
+            invalidated: false,
+            invalidation_ms: None,
+            roles: Vec::new(),
+        }
+    }
+
+    /// The discriminator is `is_usable_hash`, not `is_empty` and not a check
+    /// of the `$ssha256$` tag: a `secret_hash` that does not decode can never
+    /// verify against anything, so a record carrying only that is as unusable
+    /// as one carrying nothing and must be dropped, not restored as a live
+    /// key. Three of these carry the tag — a prefix test would call them
+    /// migrated and keep them.
+    #[test]
+    fn an_unparseable_hash_with_no_plaintext_is_dropped() {
+        for stored in [
+            "",
+            "$ssha256$",
+            "$ssha256$truncated",
+            "$ssha256$deadbeef$cafe",
+            "$argon2id$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA",
+            "left-over-plaintext",
+        ] {
+            for plaintext in [None, Some("")] {
+                let mut rec = loaded(stored, plaintext);
+                assert_eq!(
+                    rec.migrate_from_plaintext(),
+                    Err(()),
+                    "{stored:?} + {plaintext:?} must be dropped, not restored"
+                );
+            }
+        }
+    }
+
+    /// A plaintext beside a hash-shaped value that does not decode is a store
+    /// nobody can explain — not the pre-#201 shape (that has no `secret_hash`
+    /// at all), and not a migrated one. Deriving a live credential from the
+    /// half of it #201 exists to delete is the fail-open reading, so the
+    /// record is dropped instead.
+    #[test]
+    fn a_plaintext_beside_an_unparseable_hash_is_dropped_not_repaired() {
+        for stored in [
+            "$ssha256$truncated",
+            "$argon2id$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA",
+            "left-over-plaintext",
+        ] {
+            let mut rec = loaded(stored, Some("the-plaintext"));
+            assert_eq!(
+                rec.migrate_from_plaintext(),
+                Err(()),
+                "{stored:?} + a plaintext is ambiguous and must be dropped"
+            );
+        }
+    }
+
+    /// A usable hash still wins over a leftover plaintext, and the plaintext is
+    /// discarded — re-deriving there could silently swap which secret the
+    /// record authenticates.
+    #[test]
+    fn a_usable_hash_wins_over_a_leftover_plaintext() {
+        let hash = crate::secret_hash::hash_secret("hashed-secret");
+        let mut rec = loaded(&hash, Some("stale-plaintext"));
+        assert_eq!(rec.migrate_from_plaintext(), Ok(true));
+        assert_eq!(rec.secret_hash, hash);
+        assert!(rec.legacy_plaintext_secret.is_none());
+        assert!(rec.verify_secret("hashed-secret"));
+        assert!(!rec.verify_secret("stale-plaintext"));
+    }
+
+    /// An already-migrated record is left alone and reports no rewrite.
+    #[test]
+    fn an_already_hashed_record_is_untouched() {
+        let hash = crate::secret_hash::hash_secret("s");
+        let mut rec = loaded(&hash, None);
+        assert_eq!(rec.migrate_from_plaintext(), Ok(false));
+        assert_eq!(rec.secret_hash, hash);
+    }
+
+    /// The pre-#201 shape: plaintext only.
+    #[test]
+    fn a_pre_201_plaintext_record_is_hashed() {
+        let mut rec = loaded("", Some("legacy-secret"));
+        assert_eq!(rec.migrate_from_plaintext(), Ok(true));
+        assert!(crate::secret_hash::is_usable_hash(&rec.secret_hash));
+        assert!(rec.verify_secret("legacy-secret"));
+    }
+
+    /// Even if one reached the auth path unmigrated, an unusable hash denies.
+    #[test]
+    fn verify_secret_denies_an_unusable_hash() {
+        for stored in ["", "$ssha256$truncated", "plaintext-secret"] {
+            let rec = loaded(stored, None);
+            assert!(
+                !rec.verify_secret(stored),
+                "{stored:?} must not verify against itself"
+            );
+            assert!(!rec.verify_secret("anything"));
+        }
     }
 }
