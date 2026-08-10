@@ -1213,3 +1213,85 @@ fn quiet_runs_emit_no_progress_stream_at_all() {
         String::from_utf8_lossy(&buffer.lock().unwrap())
     );
 }
+
+/// Where #240 (the resource policy) and #241 (the progress stream) meet.
+///
+/// Two rules have to hold at once, and each is easy to break while honouring
+/// the other:
+///
+///  * The resource decision is **announced on the progress surface**, not on a
+///    bare `eprintln!` gated on `!quiet`. A raw write would survive
+///    `--progress none` — which promises silence — and would inject a
+///    non-JSON line into the middle of `--progress json`, which promises one
+///    parseable stream. (`quiet_runs_emit_no_progress_stream_at_all` above is
+///    the other side of this assertion: it fails if any of these lines escape
+///    the surface.)
+///  * The numbers announced are the ones the run **got**, not the ones it
+///    asked for. `pool::configure` is first-call-wins, because rayon pools
+///    cannot be resized, so a process that already indexed once — `xerj
+///    brain` does exactly that — keeps its original phase-A width. Reporting
+///    the request there would make the stream and the run summary a record of
+///    an intention rather than of a run.
+///
+/// The second rule is made observable by asking for a width this process
+/// provably cannot grant: the pool is built before the run, then one more
+/// thread than it has is requested.
+#[test]
+fn the_resource_plan_is_announced_on_the_progress_surface_with_the_width_it_got() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("rows.csv"),
+        "id,value\n0,alpha\n1,beta\n",
+    )
+    .unwrap();
+
+    // Build the process-global scan pool first, so the width below is one this
+    // run cannot possibly be granted.
+    let installed = crate::pool::scan_pool().current_num_threads();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+    config.progress_interval = Some(std::time::Duration::from_secs(1));
+    config.scan_workers = installed + 1;
+    config.workers = 3;
+    config.resource_notes = vec!["memory safe zone 256 MiB allows 3 index workers".to_string()];
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (_code, report) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+
+    assert!(
+        stream.contains(&format!("{installed} scan threads")),
+        "the run must announce the phase-A width it actually got, not {}: {stream}",
+        installed + 1
+    );
+    assert!(
+        !stream.contains(&format!("{} scan threads", installed + 1)),
+        "a width the pool refused must never be reported as fact: {stream}"
+    );
+    assert!(
+        stream.contains("3 index workers"),
+        "phase B must name the count the policy chose: {stream}"
+    );
+    assert!(
+        stream.contains("memory safe zone 256 MiB allows 3 index workers"),
+        "what the machine forced on the run belongs in the same stream: {stream}"
+    );
+    assert!(
+        stream.contains(&format!("with {installed} threads")),
+        "the phase-A banner must carry the real width too: {stream}"
+    );
+
+    // The summary is read after the fact by agents and by `xerj brain`; it has
+    // to agree with the stream rather than repeat the request.
+    let report = report.expect("a completed run produces a summary");
+    assert_eq!(report["scan_workers"], serde_json::json!(installed));
+    assert_eq!(report["workers"], serde_json::json!(3));
+}

@@ -47,8 +47,8 @@ pub fn resolve_reporting(
 ) -> Result<Inventory> {
     // Phase A belongs to the run's scan pool, not to rayon's global pool:
     // `--workers` has to bound the CPU-bound phase to mean anything (#240 §2).
-    // The progress callback therefore fires from scan-pool threads, which is
-    // also the pool whose width the ETA is computed against (#241).
+    // The progress callback therefore fires from scan-pool threads — the ones
+    // actually doing the hashing — rather than from rayon's global pool (#241).
     let digests: Vec<Result<String>> = crate::pool::install(|| {
         files
             .par_iter()
