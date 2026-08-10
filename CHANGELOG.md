@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0-rc.15] - 2026-08-10
 
+### Known issues in this release
+
+Both were found by adversarial review *after* their pull requests merged, so
+they are present in these binaries. Fixes are in flight for rc.16.
+
+- **A crafted filename can forge records on the agent progress stream.** The
+  in-flight path is rendered onto the progress surface without control-character
+  sanitisation, so a filename containing a newline can inject something that
+  looks like a genuine `xerj-progress` or `xerj-done` record — including a false
+  `ok=true` completion — into the stream this release tells AI agents to parse.
+  Indexing a repository whose filenames you do not control is enough to trigger
+  it. Until the fix lands, do not treat that stream as trustworthy when the
+  corpus is untrusted.
+- **An outer repository's `.gitignore` judges files inside a nested checkout.**
+  The ignore lookup walks every layer with no repository-boundary stop, unlike
+  git itself, so a vendored or submoduled repository is filtered by rules that
+  have no authority over it. Files you expect to be indexed may be skipped.
+  `--no-ignore` bypasses it.
+
+Also unfixed and worth knowing: `--progress json` does not pace the bar (a JSON
+consumer sees roughly ten times as many bar lines as a plain consumer), and the
+documented "at most one bar per 15 s" floor is really 12.5 s.
+
+
 ### Added
 
 - **Index lifecycle policies are executed, not just stored**
