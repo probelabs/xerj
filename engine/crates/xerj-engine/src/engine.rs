@@ -542,6 +542,14 @@ impl Engine {
                     }
                     Err(e) => {
                         warn!(name = name_str.as_str(), error = %e, "failed to open index");
+                        // The mapping blob lives beside the data, not inside
+                        // the store, so it is readable even when the store
+                        // refuses to open. Load it so the metadata surfaces
+                        // (`GET /{index}`, `GET /{index}/_mapping`) can still
+                        // tell the operator what was in the index they are
+                        // trying to recover. Propagation into the (absent)
+                        // handle no-ops.
+                        engine.load_persisted_es_mapping(&name_str);
                         engine.record_failed_index(&name_str, e.to_string());
                     }
                 }
@@ -1227,7 +1235,24 @@ impl Engine {
             ));
         }
         match self.indices.remove(name).map(|(_, v)| v) {
-            Some(idx) => idx.delete_all_data().await?,
+            Some(idx) => {
+                // The handle is pulled out of the map first so no write can
+                // land in a directory that is being removed — but if the
+                // removal then fails (read-only mount, EACCES, EROFS), the
+                // name has been freed while the bytes are still there. That
+                // is exactly the stuck state issue #206 is about, arrived at
+                // from the other side: `Engine::indices` no longer holds it,
+                // `failed_indices` never did, so `_cat/indices` cannot show
+                // it, `DELETE` answers 404 and none of the three recovery
+                // levers this module adds can name it. Put the handle back so
+                // a delete that did not happen leaves the index addressable
+                // and the operator can retry it.
+                if let Err(e) = idx.delete_all_data().await {
+                    self.indices.insert(name.to_string(), idx);
+                    warn!(name, error = %e, "index delete failed; index left in service");
+                    return Err(e);
+                }
+            }
             None => {
                 // Not open. If it is a known failed index, its bytes are still
                 // on disk and removing them is exactly what the operator asked

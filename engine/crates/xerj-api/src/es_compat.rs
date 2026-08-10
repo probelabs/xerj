@@ -151,10 +151,15 @@ pub struct ClusterHealthParams {
     /// `cluster` (default), `indices`, `shards`.
     #[serde(default)]
     pub level: Option<String>,
-    /// Passthroughs — accepted for compatibility and surfaced as `timed_out`
-    /// only if we actually time out (we don't — local single-node).
+    /// The status the caller is waiting for (`green` / `yellow` / `red`).
+    /// Consulted: on a **red** cluster a request for `green` or `yellow` is
+    /// unmet and the response carries `timed_out: true` / 408. See
+    /// `wait_for_status_unmet` in `cluster_health_inner` for why the check is
+    /// deliberately narrowed to the red case.
     #[serde(default)]
     pub wait_for_status: Option<String>,
+    /// Passthroughs — accepted for compatibility and surfaced as `timed_out`
+    /// only if we actually time out (we don't — local single-node).
     #[serde(default)]
     pub wait_for_no_relocating_shards: Option<String>,
     #[serde(default)]
@@ -429,6 +434,39 @@ async fn cluster_health_inner(
             .unwrap_or(false),
         None => false,
     };
+    // `wait_for_status` was accepted and never consulted. That was harmless
+    // while `red` was unreachable on this endpoint; it stopped being harmless
+    // the moment an unopenable primary made it reachable (issue #206), because
+    // `GET /_cluster/health?wait_for_status=green&timeout=30s` is the standard
+    // bootstrap gate — every docker healthcheck, CI wait loop and Kibana
+    // startup reads a 200 with `timed_out: false` as "the status I asked for
+    // was reached", and a red node would have sailed through it.
+    //
+    // ES treats the condition as met iff the observed status is at least as
+    // good as the requested one (`response.getStatus().value() <=
+    // request.waitForStatus().value()`, GREEN=0 / YELLOW=1 / RED=2 —
+    // elasticsearch/server/src/main/java/org/elasticsearch/action/admin/cluster/health/
+    // TransportClusterHealthAction.java:398; approach only, ES is AGPL/SSPL/
+    // Elastic-2.0 and nothing is copied from it). Unmet after the timeout sets
+    // `timed_out`, which this handler already maps to 408.
+    //
+    // Deliberately narrowed to the red case: our single-node simulation
+    // reports `yellow` for any index configured with replicas, and the
+    // ES-YAML suite asks `wait_for_status=green` of exactly those. Applying
+    // the full `observed <= requested` comparison would start timing those out
+    // on a cluster that is behaving as designed, so a green or yellow cluster
+    // is byte-identical to before this change. The residual gap
+    // (`wait_for_status=green` still answered permissively on a yellow
+    // single-node cluster) is pre-existing and unrelated to #206.
+    let wait_for_status_unmet = status == "red"
+        && matches!(
+            params
+                .wait_for_status
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("green") | Some("yellow")
+        );
     // When the caller explicitly requests `wait_for_nodes>=N`, we
     // satisfy it by reporting `N` as the declared cluster size so
     // the multinode smoke suite converges. But if the caller also
@@ -456,7 +494,9 @@ async fn cluster_health_inner(
             .map(|_| wait_for_nodes)
             .unwrap_or(1)
     };
-    let timed_out = wait_for_active_shards_unmet || (aggressive_timeout && wait_for_nodes > 1);
+    let timed_out = wait_for_active_shards_unmet
+        || wait_for_status_unmet
+        || (aggressive_timeout && wait_for_nodes > 1);
 
     let mut resp = json!({
         "cluster_name": "xerj",
@@ -1609,23 +1649,44 @@ async fn get_index_inner(
         .any(|w| w == "open" || w == "all");
 
     let all = state.engine.list_indices().await;
+    // An index whose directory refused to open still EXISTS — this endpoint
+    // is the metadata read, not a shard read. ES resolves it out of cluster
+    // metadata and never consults a shard
+    // (elasticsearch/server/src/main/java/org/elasticsearch/action/admin/
+    // indices/get/TransportGetIndexAction.java:107 `localClusterStateOperation`
+    // → :113 `concreteIndexNames(state.metadata(), request)` then
+    // `project.findMappings/findAllAliases/settings`; approach only, nothing
+    // copied — ES is AGPL/SSPL/Elastic-2.0), so a red index answers 200 with
+    // its metadata there. Answering 404 `index_not_found` here was the same
+    // lie issue #206 is about, and it contradicted every other surface in the
+    // same run: `_cat/indices` printed a red row for the name while
+    // `GET /{name}` said it did not exist.
+    //
+    // `list_failed_indices` is visibility-filtered, so a failed brain a scoped
+    // key may not read stays invisible to it here too.
+    let failed_names: Vec<String> = state
+        .engine
+        .list_failed_indices()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
 
     // Resolve the selector into concrete names.
     let mut selected: Vec<String> = Vec::new();
     let mut had_missing = false;
     for part in index.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if part == "_all" || part == "*" {
-            for info in &all {
-                if !selected.contains(&info.name) {
-                    selected.push(info.name.clone());
+            for name in all.iter().map(|i| &i.name).chain(failed_names.iter()) {
+                if !selected.contains(name) {
+                    selected.push(name.clone());
                 }
             }
             continue;
         }
         if part.contains('*') {
-            for info in &all {
-                if glob_match_simple(part, &info.name) && !selected.contains(&info.name) {
-                    selected.push(info.name.clone());
+            for name in all.iter().map(|i| &i.name).chain(failed_names.iter()) {
+                if glob_match_simple(part, name) && !selected.contains(name) {
+                    selected.push(name.clone());
                 }
             }
             continue;
@@ -1640,7 +1701,8 @@ async fn get_index_inner(
                     selected.push(n.clone());
                 }
             }
-        } else if all.iter().any(|info| info.name == part) {
+        } else if all.iter().any(|info| info.name == part) || failed_names.iter().any(|n| n == part)
+        {
             if !selected.contains(&part.to_string()) {
                 selected.push(part.to_string());
             }
@@ -1691,8 +1753,13 @@ async fn get_index_inner(
 
     let mut body = serde_json::Map::new();
     for name in &selected {
+        // `None` = the name exists but has no open handle (a failed index).
+        // Its metadata is still served — the schema-derived mapping fallback
+        // is the only part that needs a live index, and a failed index falls
+        // back to the mapping blob persisted next to its data instead.
         let idx = match state.engine.get_index(name) {
-            Ok(i) => i,
+            Ok(i) => Some(i),
+            Err(_) if failed_names.iter().any(|n| n == name) => None,
             Err(_) => continue,
         };
 
@@ -1714,13 +1781,17 @@ async fn get_index_inner(
         // Mappings: prefer the raw blob written at create; fall back to the
         // schema-derived properties (which tracks subsequent put_mapping).
         let stored_mappings = state.engine.index_mappings.get(name).map(|v| v.clone());
-        let mappings = match stored_mappings {
-            Some(m) if !m.is_null() => m,
-            _ => {
-                let schema = idx.schema().await;
+        let mappings = match (stored_mappings, &idx) {
+            (Some(m), _) if !m.is_null() => m,
+            (_, Some(i)) => {
+                let schema = i.schema().await;
                 let properties = schema_to_es_properties(&schema);
                 json!({ "properties": properties })
             }
+            // Failed index with no persisted mapping blob: report an empty
+            // mapping rather than inventing one. Nothing is known about its
+            // fields until it opens.
+            (_, None) => json!({ "properties": {} }),
         };
 
         // Settings: replay what was written (normalized to strings), merged
@@ -2229,8 +2300,21 @@ pub async fn get_mapping(
     }
     let mut out = serde_json::Map::new();
     for name in &targets {
+        // `None` = a failed index (issue #206): no open handle, but its
+        // persisted mapping blob is still readable and is exactly what an
+        // operator needs while recovering it. Only the schema-derived
+        // fallback below requires a live index.
         let idx = match state.engine.get_index(name) {
-            Ok(i) => i,
+            Ok(i) => Some(i),
+            Err(_)
+                if state
+                    .engine
+                    .list_failed_indices()
+                    .iter()
+                    .any(|f| &f.name == name) =>
+            {
+                None
+            }
             Err(_) => continue,
         };
         let stored = state
@@ -2240,9 +2324,14 @@ pub async fn get_mapping(
             .map(|v| v.clone())
             .unwrap_or(Value::Null);
         let mut mappings = if stored.is_null() {
-            let schema = idx.schema().await;
-            let properties = schema_to_es_properties(&schema);
-            json!({ "properties": properties })
+            match &idx {
+                Some(i) => {
+                    let schema = i.schema().await;
+                    let properties = schema_to_es_properties(&schema);
+                    json!({ "properties": properties })
+                }
+                None => json!({ "properties": {} }),
+            }
         } else {
             stored
         };
@@ -23144,10 +23233,26 @@ pub async fn head_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    match state.engine.get_index(&index) {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    if state.engine.get_index(&index).is_ok() {
+        return StatusCode::OK.into_response();
     }
+    // This is the existence probe every ES client's `indices.exists()` calls,
+    // and existence is a metadata question. An index whose directory refused
+    // to open still occupies its name and still has bytes on disk, so 404 here
+    // was the same lie `GET /{index}` told (issue #206) — and a client that
+    // did HEAD (404) then PUT (503 `no_shard_available_action_exception`) got
+    // two incompatible answers about one name. Visibility-filtered via
+    // `list_failed_indices`, so a scoped key cannot probe for another brain's
+    // failed index either.
+    if state
+        .engine
+        .list_failed_indices()
+        .iter()
+        .any(|f| f.name == index)
+    {
+        return StatusCode::OK.into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

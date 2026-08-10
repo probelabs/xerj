@@ -228,11 +228,25 @@ curl -s -XDELETE localhost:9200/broken
 ```
 
 A retry that does not work returns `503` with the *current* reason, not the
-one recorded at boot. While an index is in this state, reads and writes to it
-return `503 no_shard_available_action_exception` naming the open error —
+one recorded at boot. While an index is in this state, searches and writes to
+it return `503 no_shard_available_action_exception` naming the open error —
 **not** `404 index_not_found`, which would be a lie: the name is taken and the
 data is still on disk. Creating an index over that name is refused for the
 same reason.
+
+Existence is answered separately from data, the way ES answers it: `GET
+/broken`, `HEAD /broken` (the `indices.exists()` your client library calls),
+`GET /broken/_mapping` and `GET /broken/_settings` all return `200` and report
+the index as existing, because those read metadata and never touch a shard. So
+a client that probes before writing gets one consistent answer — the name is
+taken — instead of a `404` from `HEAD` followed by a `503` from the `PUT`.
+
+Watch for the failure on the health surfaces, not the existence probes:
+`_cat/health` and `_cluster/health` both report `red` with
+`unassigned_primary_shards: 1`, and the two conditions that gate on it are
+honoured — `wait_for_status=green` and `wait_for_active_shards=all` answer
+`408` with `"timed_out": true` rather than reporting success on a red node, so
+a startup gate written against real ES behaves the same here.
 
 ### gRPC posture
 

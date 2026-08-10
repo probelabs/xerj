@@ -157,6 +157,110 @@ async fn all_four_health_surfaces_agree_that_the_node_is_red() {
     assert_eq!(waited["timed_out"], true, "{waited}");
 }
 
+/// `wait_for_status` is the standard bootstrap gate — the docker healthcheck,
+/// the CI wait loop and Kibana's startup all issue
+/// `GET /_cluster/health?wait_for_status=green&timeout=30s` and read a 200 with
+/// `timed_out: false` as "the status I asked for was reached". It used to be
+/// accepted and never consulted, which was invisible while `red` was
+/// unreachable on this endpoint and actively wrong the moment an unopenable
+/// primary made it reachable: a red node sailed through every one of those
+/// gates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_for_status_does_not_report_success_on_a_red_node() {
+    let (state, _dir) = node_with_one_broken_index().await;
+    let es = build_es_compat_router(state);
+
+    for requested in ["green", "yellow", "GREEN"] {
+        let uri = format!("/_cluster/health?wait_for_status={requested}&timeout=30s");
+        let (status, body) = send_json(&es, "GET", &uri).await;
+        assert_eq!(
+            status,
+            StatusCode::REQUEST_TIMEOUT,
+            "wait_for_status={requested} on a red node: {body}"
+        );
+        assert_eq!(body["timed_out"], true, "{body}");
+        assert_eq!(body["status"], "red", "{body}");
+    }
+
+    // `wait_for_status=red` IS satisfied by a red cluster — ES's rule is
+    // "observed at least as good as requested", not "observed equals green".
+    let (status, body) = send_json(&es, "GET", "/_cluster/health?wait_for_status=red").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["timed_out"], false, "{body}");
+
+    // …and a healthy node is untouched: no wait_for_status request on a green
+    // cluster may start timing out because of this.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = Config::default();
+    config.server.data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = Engine::new(config.clone()).expect("clean boot");
+    engine.create_index("fine", Schema::empty()).unwrap();
+    let green = build_es_compat_router(AppState::new(
+        config,
+        engine,
+        Metrics::new().expect("metrics"),
+    ));
+    for requested in ["green", "yellow", "red"] {
+        let uri = format!("/_cluster/health?wait_for_status={requested}&timeout=30s");
+        let (status, body) = send_json(&green, "GET", &uri).await;
+        assert_eq!(status, StatusCode::OK, "{requested}: {body}");
+        assert_eq!(body["timed_out"], false, "{requested}: {body}");
+        assert_eq!(body["status"], "green", "{requested}: {body}");
+    }
+}
+
+/// `GET /{index}` and `HEAD /{index}` are the two canonical existence probes —
+/// `indices.exists()` in every ES client is the HEAD. Both answered
+/// `404 index_not_found_exception "no such index [broken]"` for a failed index,
+/// which contradicted `_cat/indices` (a red row for the same name) and
+/// `_settings` (200) in the same run, and left a client that did HEAD (404)
+/// then PUT (503) with two incompatible answers about one name.
+///
+/// ES resolves both out of cluster metadata and never touches a shard
+/// (`TransportGetIndexAction.localClusterStateOperation` →
+/// `concreteIndexNames(state.metadata(), request)`), so a red index answers
+/// 200 with its metadata there. It does here now too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_index_exists_on_the_existence_probes() {
+    let (state, _dir) = node_with_one_broken_index().await;
+    let app = build_es_compat_router(state);
+
+    let (status, _) = send(&app, "HEAD", "/broken").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "HEAD /{{index}} is indices.exists(); the name IS taken"
+    );
+
+    let (status, body) = send_json(&app, "GET", "/broken").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["broken"]["settings"]["index"]["uuid"].is_string(),
+        "the metadata read must return the index, not an empty object: {body}"
+    );
+
+    // A wildcard/_all metadata read enumerates it for the same reason.
+    let (status, body) = send_json(&app, "GET", "/_all").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["broken"].is_object(), "{body}");
+    assert!(body["healthy"].is_object(), "{body}");
+
+    // A name that never existed is still an honest 404 on both.
+    let (status, _) = send(&app, "HEAD", "/never-existed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = send_json(&app, "GET", "/never-existed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // The *data* doors still refuse: existing-but-unservable is 503, which is
+    // the distinction the 404 destroyed.
+    let (status, body) = send_json(&app, "GET", "/broken/_search").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"]["type"], "no_shard_available_action_exception",
+        "{body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_state_carries_the_failed_index_as_an_unassigned_primary() {
     let (state, _dir) = node_with_one_broken_index().await;

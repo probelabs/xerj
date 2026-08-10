@@ -159,6 +159,77 @@ async fn a_failed_index_can_be_deleted_without_a_restart() {
     assert!(matches!(e, XerjError::IndexNotFound { .. }), "{e:?}");
 }
 
+/// The failed-index arm of `delete_index` drops its bookkeeping only after the
+/// bytes are gone. The **open**-index arm did the opposite: the handle was
+/// pulled out of `Engine::indices` before `delete_all_data`, so a removal that
+/// failed left the name freed and the directory alive — no handle, no
+/// `failed_indices` entry, nothing on `_cat/indices`, `DELETE` answering 404
+/// and none of the three recovery levers able to name it. That is issue #206's
+/// stuck state reached from the other side, and it only became
+/// operator-visible once `DELETE` started propagating the error instead of
+/// dropping it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_that_failed_leaves_the_index_addressable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, good) = data_dir_with_one_broken_index(&["keeper"], "keeper").await;
+    // Undo the corruption — this test is about a healthy, open index whose
+    // *bytes* refuse to go away, not about a failed one.
+    std::fs::write(dir.path().join("keeper").join("snapshot.json"), &good).unwrap();
+    let engine = Engine::new(config_for(&dir)).expect("boot");
+    assert!(engine.get_index("keeper").is_ok());
+
+    // Make the removal fail: with the index directory read-only its entries
+    // cannot be unlinked, so `remove_dir_all` returns EACCES.
+    let index_dir = dir.path().join("keeper");
+    let original = std::fs::metadata(&index_dir).unwrap().permissions();
+    std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Skip rather than lie if the platform/user does not enforce the mode
+    // (running as root, or an fs that ignores it) — the assertion below would
+    // be vacuous there.
+    let enforced = std::fs::write(index_dir.join(".perm-probe"), b"x").is_err();
+    if !enforced {
+        let _ = std::fs::remove_file(index_dir.join(".perm-probe"));
+        std::fs::set_permissions(&index_dir, original).unwrap();
+        eprintln!("skipping: directory permissions are not enforced for this user");
+        return;
+    }
+
+    let err = engine
+        .delete_index("keeper")
+        .await
+        .expect_err("a delete whose bytes cannot be removed must fail");
+    assert!(
+        index_dir.exists(),
+        "the directory survived the failed delete"
+    );
+
+    // The point of the test: the name did not become a dead end.
+    assert!(
+        engine.get_index("keeper").is_ok(),
+        "a delete that did not happen must leave the index addressable ({err})"
+    );
+    assert!(
+        engine
+            .list_indices()
+            .await
+            .iter()
+            .any(|i| i.name == "keeper"),
+        "and still enumerable, or no surface can show it"
+    );
+
+    // Once the cause is fixed the operator's retry works — no restart.
+    std::fs::set_permissions(&index_dir, original).unwrap();
+    engine
+        .delete_index("keeper")
+        .await
+        .expect("retrying the delete after fixing the cause must work");
+    assert!(!index_dir.exists());
+    assert!(engine.list_indices().await.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_reports_the_live_reason_and_succeeds_once_the_cause_is_fixed() {
     let (dir, good) = data_dir_with_one_broken_index(&["broken"], "broken").await;
