@@ -328,6 +328,71 @@ async fn a_failed_index_can_still_be_deleted() {
     assert!(engine.get_index("removable").is_ok());
 }
 
+/// The third recovery door, and the only one where #202 had to change the
+/// engine: restoring the index from a snapshot must also *clear* the recorded
+/// failure.
+///
+/// The restore loop reopens the index and puts it back in `indices`, but the
+/// entry this change writes into `failed_indices` at boot is what cluster
+/// health reads. Leave it behind and the repair works while `/_cluster/health`
+/// stays red and `/health/ready` keeps reporting a failed index — a node that
+/// is fine but says it is not, with no way to correct it short of a restart.
+#[tokio::test]
+async fn restoring_from_a_snapshot_clears_the_recorded_failure() {
+    let dir = TempDir::new().unwrap();
+    // The repository has to live under `data_dir` — an external snapshot root
+    // is refused unless it is in `limits.snapshot_repo_allowlist`. It has no
+    // `wal/` child, so the boot scan skips it rather than reading it as an
+    // index.
+    let repo_path = dir.path().join("snap_repo").to_str().unwrap().to_string();
+    create_mapped_index(&dir, "snap_back").await;
+
+    // Snapshot the index while it is still intact.
+    {
+        let engine = Engine::new(config_for(&dir)).expect("engine::new");
+        engine
+            .create_snapshot(&repo_path, "s1", Some(vec!["snap_back".to_string()]))
+            .await
+            .expect("create_snapshot");
+    }
+
+    // Now tear the sidecar: the node boots red with the index unserved.
+    let path = dir.path().join("snap_back").join("schema.json");
+    let good = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &good[..good.len() / 2]).unwrap();
+
+    let engine = Engine::new(config_for(&dir)).expect("engine::new");
+    assert_eq!(engine.health().await.status, "red");
+    assert!(engine.failed_indices.contains_key("snap_back"));
+
+    engine
+        .restore_snapshot(&repo_path, "s1", Some(vec!["snap_back".to_string()]))
+        .await
+        .expect("restoring over a failed index must succeed — it is the repair");
+
+    assert!(
+        !engine.failed_indices.contains_key("snap_back"),
+        "a successful restore must clear the recorded failure, or health stays \
+         red after the repair actually worked"
+    );
+    assert_eq!(
+        engine.health().await.status,
+        "green",
+        "health must follow the repair"
+    );
+
+    // And it is the snapshot's mapping that is being served, not a re-inferred
+    // one — restoring must not be a second route to the #202 mapping loss.
+    let index = engine
+        .get_index("snap_back")
+        .expect("the restored index must serve");
+    assert_eq!(
+        index.schema().await.field("code").map(|f| f.field_type),
+        Some(FieldType::Keyword),
+        "the restored index must carry the mapping the snapshot was taken with"
+    );
+}
+
 // ── the writer must not manufacture what the reader now refuses ───────────────
 
 /// Refusing a torn sidecar is only safe if our own writer cannot produce one.

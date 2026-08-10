@@ -19,9 +19,13 @@
 //! side that stops a corrupt-metadata index from being visible, deletable and
 //! survivable on `:9200` fails here rather than in production.
 //!
-//! Every case below quarantines an index by truncating its `schema.json` —
-//! the #202 trigger — and then asserts the #206 contract over
-//! `build_es_compat_router`.
+//! Nine of the eleven cases below quarantine an index by truncating its
+//! `schema.json` — the #202 trigger — and then assert the #206 contract over
+//! `build_es_compat_router`. The other two are controls that pin the negative
+//! half of that contract, and deliberately corrupt nothing:
+//! `cluster_health_is_not_red_without_a_failed_index` (an intact node must not
+//! be dragged red by the code that reports failures) and `an_empty_node_is_ready`
+//! (a fresh pod with no indices at all must still join the Service).
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

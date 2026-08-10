@@ -52,8 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now boots **red** with that index unserved, where it previously came up green
   with an empty mapping. It joins the failed set
   [#206](https://github.com/xerj-org/xerj/issues/206) introduced, so every
-  surface that set feeds already reports it — measured on a two-index node with
-  one truncated `schema.json`:
+  surface that set feeds already reports it — measured on a node holding two
+  user indices, `victim` with a truncated `schema.json`:
 
   ```
   GET  /_cluster/health          -> red, unassigned_primary_shards: 1
@@ -66,15 +66,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
                                  -> 503 no_shard_available_action_exception
                                     carrying that same reason
   GET  /health/ready             -> 200 "ready (degraded): 1 of 2 indices
-                                    serving, 1 failed to open"
+                                    serving, 1 failed to open; see GET
+                                    /_cluster/indices/failed"
   POST /healthy/_search          -> 200
   ```
 
-  Recovery is the three doors #206 added, both verified end to end here: repair
-  the file and `POST /_cluster/indices/failed/{index}/_retry` (503 while it is
-  still torn, `200 {"reopened": true}` once it is not, health back to green), or
-  restore the index from a snapshot, or `DELETE /{index}`. The node stays in
-  kubelet rotation as long as any index is still serving.
+  The readiness counts above are the two-index test router's. A running node
+  also holds its internal `.xerj_*` indices, so the same condition on the shipped
+  binary reads `ready (degraded): 15 of 16 indices serving, 1 failed to open` —
+  the 200 and its meaning are unchanged, only the totals move with what else the
+  node holds.
+
+  Recovery is the three doors #206 added. Two were measured end to end on the
+  shipped binary: repair the file and
+  `POST /_cluster/indices/failed/{index}/_retry` (503 while it is still torn,
+  `200 {"reopened": true}` once it is not, health back to green), and
+  `DELETE /{index}` (200, directory removed, health back to green). The third —
+  restore the index from a snapshot — is the path this change touches (a
+  successful restore now clears the recorded failure, which it has to or health
+  would stay red after the repair worked); it is covered by an engine-level
+  test rather than measured over HTTP. The node stays in kubelet rotation as
+  long as any index is still serving.
 
 - **Concurrent sidecar writes can no longer manufacture the torn file the reader
   now refuses.** `write_file_atomic` staged every write in
