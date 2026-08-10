@@ -253,7 +253,7 @@ async fn engine_startup_reports_red_for_a_corrupt_schema() {
     let reason = engine
         .failed_indices
         .get("torn_boot")
-        .map(|r| r.value().clone())
+        .map(|r| r.value().reason.clone())
         .expect("the failure must be recorded in failed_indices");
     assert!(
         reason.contains("schema.json"),
