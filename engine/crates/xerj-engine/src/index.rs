@@ -36440,11 +36440,7 @@ mod date_detection_tests {
         assert!(matches!(kind.fields[0].field_type, FieldType::Keyword));
 
         // Multi-level nesting: object -> object -> leaf.
-        let fc = dynamic_field_config(
-            "a",
-            &serde_json::json!({"b": {"c": 1}}),
-            true,
-        );
+        let fc = dynamic_field_config("a", &serde_json::json!({"b": {"c": 1}}), true);
         let b = &fc.fields[0];
         assert_eq!(b.name, "b");
         assert!(matches!(b.field_type, FieldType::Object));
@@ -36493,7 +36489,11 @@ mod date_detection_tests {
             true,
         );
         assert!(matches!(fc.field_type, FieldType::Object));
-        assert_eq!(fc.fields.len(), 1, "only the first element's keys are discovered");
+        assert_eq!(
+            fc.fields.len(),
+            1,
+            "only the first element's keys are discovered"
+        );
         assert_eq!(fc.fields[0].name, "kind");
     }
 
