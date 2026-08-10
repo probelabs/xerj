@@ -625,15 +625,15 @@ log "ES comparison: elasticsearch.yml has 3000+ documented properties"
 log ""
 
 # The shipped file sets the commonly tuned subset; the engine's full surface is
-# 104 settings, every one optional — measured by `count_user_facing_settings`
+# 105 settings, every one optional — measured by `count_user_facing_settings`
 # (xerj-common/src/config.rs), which counts leaf keys of a serialised
 # `Config::default()`. This bound is on the FILE, and it is deliberately not the
 # published headline: quoting a number nobody counted is what issue #207 was
 # filed about.
 USER_SETTINGS=$(grep -v "^#\|^$\|^\[" "$DEFAULT_TOML" | grep "=" | wc -l || echo 0)
-info "Key=value lines in xerj.default.toml: $USER_SETTINGS (of 104 settings in total)"
+info "Key=value lines in xerj.default.toml: $USER_SETTINGS (of 105 settings in total)"
 [ "$USER_SETTINGS" -le 60 ] \
-  && pass "The shipped config sets $USER_SETTINGS keys; XERJ has 104 settings in total, all optional (Elasticsearch has 3000+)" \
+  && pass "The shipped config sets $USER_SETTINGS keys; XERJ has 105 settings in total, all optional (Elasticsearch has 3000+)" \
   || fail "The shipped config sets $USER_SETTINGS keys (expected ≤ 60)"
 
 # Verify every setting has a comment above it

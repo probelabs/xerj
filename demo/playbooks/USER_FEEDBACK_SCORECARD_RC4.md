@@ -91,7 +91,7 @@ These are the strategic decisions for rc5, stated without spin.
 - Dynamic-mapping `strict` + field-limit accepted but not enforced on the ingest path — mapping explosion not prevented.
 - `role_descriptors` accepted then ignored — every API key is effectively superuser.
 - ~~No `cargo-audit`/`cargo-deny` gate (528 unscanned dep crates) and no `cargo-fuzz` harnesses.~~
-  **CLOSED 2026-08-09 (#207):** CI job `security-audit` runs `cargo audit` on every push and PR, and job `fuzz` builds and runs the libFuzzer harnesses in `engine/fuzz/` (ES DSL, `query_string`, date math, index-name date math, SQL, Painless). `cargo-deny` is still absent.
+  **CLOSED 2026-08-09 (#207):** CI job `security-audit` runs `cargo audit` on every push and PR, and job `fuzz` builds and runs the libFuzzer harnesses in `engine/fuzz/` (ES DSL, `query_string`, date math, index-name date math, SQL, Painless, and the aggregation script tokenisers). `cargo-deny` is still absent.
 - Binary/RaBitQ (BBQ) quantization unimplemented; `bbq_*`/`int4_*` mappings silently keep full f32 (no memory saving) — HNSW RAM wall only 4× mitigated by SQ8, no DiskANN.
 
 **Marketing numbers to reconcile with measured reality (honesty-posture debt):**
@@ -140,7 +140,7 @@ Ranking = severity × reach (how many pain points / clusters it closes) × inver
 | Candidate | Sev | Effort | Closes |
 |---|---|---|---|
 | ~~**Add `cargo-audit` + `cargo-deny` advisory gate to CI**~~ — `cargo-audit` DONE 2026-08-09 (#207), `cargo-deny` still open | MED | S | security dependency-scanning GAP (528 unscanned crates) |
-| ~~**Ship `cargo-fuzz` harnesses** for ES-DSL / query_string / bulk parsers~~ — DONE 2026-08-09 (#207): `engine/fuzz/`, 6 targets, run by CI. Bulk NDJSON is not among them | MED | M | security fuzz-testing GAP (the untrusted-input surfaces) |
+| ~~**Ship `cargo-fuzz` harnesses** for ES-DSL / query_string / bulk parsers~~ — DONE 2026-08-09 (#207): `engine/fuzz/`, 7 targets, run by CI. Bulk NDJSON is not among them | MED | M | security fuzz-testing GAP (the untrusted-input surfaces) |
 | **TLS on-by-default via auto self-signed cert** (or first-run prompt) | MED | M | resolves the "secure/TLS by default" overclaim across resource-cost + security |
 | **Enforce API-key `role_descriptors`** (real per-index/per-field RBAC) | MED | L | security RBAC PARTIAL — every key is superuser today; turns ES's paid-gate into an XERJ win |
 | **Tamper-evident (WORM/append-only) audit log** | LOW | L | security audit PARTIAL (roadmap v0.9) — ES gates real audit behind Enterprise |

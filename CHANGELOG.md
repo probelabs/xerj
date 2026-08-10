@@ -126,14 +126,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     could not fail whatever `Config` held. There was a second copy of the same
     non-test in `config.rs` itself (`count_user_facing_settings`, `61 == 61`).
     Both now serialise `Config::default()` and count leaf keys, section by
-    section. The measured figure is **104** (103 when this work was done; the
-    rc.14 `server.allow_insecure_network_bind` key makes it 104), and 38 / 50 /
+    section. The measured figure is **105** (103 when this work was done; the
+    rc.14 `server.allow_insecure_network_bind` key made it 104 and #247's
+    `lifecycle.tick_interval_secs` makes it 105 — which is the point: it is
+    measured, so it moves with the code), and 38 / 50 /
     56 / 60 / 61 / "<50"
     are corrected in `config.rs`, `xerj-common/src/lib.rs`, `engine/README.md`,
     `xerj.default.toml` and the feedback responses, along with the stale
     per-sub-config annotations (limits 3 → 13, storage 5 → 10, embedding 4 → 19,
     merge 5 → 8, cluster 4 → 5, tls 3 → 4, auth 2 → 3). This closes item 10 of
-    `user-feedback/ROADMAP-TO-GA.md`. 104 versus 3,000+ is still the winning
+    `user-feedback/ROADMAP-TO-GA.md`. 105 versus 3,000+ is still the winning
     story, told truthfully.
   - *Wire-compatibility test framing.* `journey_es_migration` was described as
     proving "the same curl commands" work. It calls the Rust engine API

@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **104 settings** versus
+//! Configuration is intentionally minimal: **105 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -52,7 +52,7 @@ use crate::error::XerjError;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Network and data directory settings — 6 settings.
+    /// Network and data directory settings — 7 settings.
     pub server: ServerConfig,
     /// Authentication — 3 settings.
     pub auth: AuthConfig,
@@ -94,7 +94,7 @@ pub struct Config {
     pub lifecycle: LifecycleConfig,
 }
 
-// 19 sub-configs, 104 leaf settings in total. Do not maintain that sum by hand
+// 20 sub-configs, 105 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -394,7 +394,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (104 user-facing settings total; counted by
+// Sub-configs  (105 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1861,7 +1861,7 @@ mod tests {
             drift.join("\n  ")
         );
 
-        // …and the file's own header quotes how many of the 104 it sets. That
+        // …and the file's own header quotes how many of the 105 it sets. That
         // number was 38, then 56, and never once the truth (#207), so count the
         // assignments instead of trusting the sentence.
         let set_here = toml_src
@@ -2225,6 +2225,7 @@ mod tests {
         ("search_context", 7),
         ("logging", 2),
         ("compat", 2),
+        ("lifecycle", 1),
     ];
 
     /// Count the settings by *counting them*.
@@ -2267,7 +2268,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 104,
+            total, 105,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \
