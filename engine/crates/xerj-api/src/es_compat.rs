@@ -15879,14 +15879,61 @@ pub async fn refresh_index(
         Ok(h) => h,
         Err(e) => return ApiError::new(e).into_response(),
     };
-    for (_, idx) in &handles {
-        let _ = idx.flush().await;
+    let total = handles.len() as u64;
+    let mut successful = 0u64;
+    let mut failures = Vec::new();
+    let mut response_status = StatusCode::OK;
+    for (name, idx) in &handles {
+        match idx.flush().await {
+            Ok(()) => successful += 1,
+            Err(error) => {
+                let rendered = ApiError::new(xerj_common::XerjError::from(error)).into_value();
+                let status = rendered
+                    .get("status")
+                    .and_then(Value::as_u64)
+                    .and_then(|code| StatusCode::from_u16(code as u16).ok())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                if failures.is_empty() {
+                    response_status = status;
+                }
+                let reason = rendered
+                    .pointer("/error/root_cause/0")
+                    .or_else(|| rendered.pointer("/error"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "exception", "reason": "refresh failed" }));
+                let status_name = status
+                    .canonical_reason()
+                    .unwrap_or("Internal Server Error")
+                    .to_ascii_uppercase()
+                    .replace([' ', '-'], "_");
+                failures.push(json!({
+                    "shard": 0,
+                    "index": name,
+                    "status": status_name,
+                    "reason": reason,
+                }));
+            }
+        }
     }
-    let n = handles.len() as u32;
-    Json(json!({
-        "_shards": { "total": n, "successful": n, "failed": 0 }
-    }))
-    .into_response()
+    let failed = failures.len() as u64;
+    let mut body = json!({
+        "_shards": { "total": total, "successful": successful, "failed": failed }
+    });
+    if failed > 0 {
+        body["_shards"]["failures"] = Value::Array(failures);
+    }
+
+    // Refresh is a synchronous publication barrier. Tantivy's analogous
+    // blocking commit contract returns its publication error to the caller
+    // (`tantivy/src/indexer/index_writer.rs:651-666`, MIT); dropping it here
+    // would turn "not published" into an affirmative success response.
+    // Match the refresh-specific ES 8.13.4 wire contract, whose REST handler
+    // uses `BaseBroadcastResponse::getStatus`: any failed shard makes the HTTP
+    // response use the first shard's status, even if another shard succeeded
+    // (`RestRefreshAction.java:47-52`, `BaseBroadcastResponse.java:114-122`;
+    // semantics only, no ES code). The body still reports every attempted
+    // shard (`RestActions.java:79-103`).
+    (response_status, Json(body)).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
