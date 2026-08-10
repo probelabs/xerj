@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GET  /_cluster/health?level=indices
                                  -> victim red, unassigned_info.details = the
                                     absolute path of schema.json and the parse error
-  GET  /_cat/indices             -> "red open victim … 0 0 0b 0b 0b"
+  GET  /_cat/indices             -> "red open victim <uuid> 1 0 0 0 0b 0b 0b"
   GET  /_cluster/indices/failed  -> the reason, plus the retry and delete calls
   PUT  /victim, POST /victim/_doc, POST /victim/_search
                                  -> 503 no_shard_available_action_exception
