@@ -580,6 +580,25 @@ impl Progress {
     ///   is `panic = "abort"`, so unwinding never reaches `Drop`), cannot print
     ///   one — which is itself the signal that the process died abnormally.
     pub fn finish(&self, ok: bool, exit: i32, reason: &str, extra: &[(&str, u64)]) {
+        self.finish_with_flags(ok, exit, reason, extra, &[]);
+    }
+
+    /// [`Self::finish`] plus boolean fields.
+    ///
+    /// A count alone cannot say whether it is a total or a floor. When a
+    /// number on this line is budget-capped — `ignored_files_in_pruned_dirs`
+    /// is — the flag that says so has to travel with it, or an agent parsing
+    /// the line reads a floor as a total with nothing to warn it (#279). Flags
+    /// are real JSON booleans on the `--progress json` surface and
+    /// `key=true` / `key=false` on the text one.
+    pub fn finish_with_flags(
+        &self,
+        ok: bool,
+        exit: i32,
+        reason: &str,
+        extra: &[(&str, u64)],
+        flags: &[(&str, bool)],
+    ) {
         if self.reported.swap(true, Ordering::SeqCst) || !self.enabled() {
             return;
         }
@@ -600,6 +619,9 @@ impl Progress {
                 for (key, value) in extra {
                     doc.insert(sanitize(key, SAFE_PATH_MAX), (*value).into());
                 }
+                for (key, value) in flags {
+                    doc.insert((*key).to_string(), (*value).into());
+                }
                 let line = serde_json::Value::Object(doc);
                 self.sink.write(format!("{line}\n").as_bytes());
             }
@@ -615,6 +637,9 @@ impl Progress {
                 ));
                 for (key, value) in extra {
                     line.push_str(&format!(" {}={value}", sanitize(key, SAFE_PATH_MAX)));
+                }
+                for (key, value) in flags {
+                    line.push_str(&format!(" {key}={value}"));
                 }
                 line.push('\n');
                 self.sink.write(line.as_bytes());
@@ -1838,6 +1863,45 @@ mod tests {
         assert_eq!(last["exit"], 3);
         assert_eq!(last["reason"], "completed-with-junk");
         assert_eq!(last["files"], 1922);
+    }
+
+    /// #279. `ignored_files_in_pruned_dirs` is budget-capped, so on its own it
+    /// is a floor an agent cannot distinguish from a total. The flag that says
+    /// which one it is has to reach both surfaces — a real boolean in JSON, a
+    /// `key=false` token on the text line.
+    #[test]
+    fn a_capped_count_ships_with_the_flag_that_says_it_is_a_floor() {
+        let (progress, buffer) = Progress::capture(Surface::Json, Duration::from_secs(3600));
+        progress.finish_with_flags(
+            true,
+            0,
+            "dry-run",
+            &[("ignored_files_in_pruned_dirs", 1_000_000)],
+            &[("ignored_files_in_pruned_dirs_exact", false)],
+        );
+        let text = captured(&buffer);
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["ignored_files_in_pruned_dirs"], 1_000_000);
+        assert_eq!(
+            last["ignored_files_in_pruned_dirs_exact"],
+            serde_json::Value::Bool(false),
+            "must be a JSON boolean, not a 0/1 a consumer has to guess at: {text}"
+        );
+
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        progress.finish_with_flags(
+            true,
+            0,
+            "dry-run",
+            &[("ignored_files_in_pruned_dirs", 42)],
+            &[("ignored_files_in_pruned_dirs_exact", true)],
+        );
+        let text = captured(&buffer);
+        assert!(
+            text.contains("ignored_files_in_pruned_dirs=42")
+                && text.contains("ignored_files_in_pruned_dirs_exact=true"),
+            "{text}"
+        );
     }
 
     /// `--progress json` promises one object per line, so the relayable view
