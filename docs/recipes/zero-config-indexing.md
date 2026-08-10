@@ -228,17 +228,23 @@ live indices at http://localhost:9280:
   autoindex-catalog                                 9 docs
 ```
 
-`--fresh` ignores the journal and rebuilds the plan in place (ids stay
-idempotent), which is how you pick up files added since the last run.
+`--fresh` ignores the resume journal and restarts (ids stay idempotent), which on a
+graph-enabled or pre-generation state directory is how a rerun picks up files added
+since the last one. It never removes stale records from the destination, and it is
+refused once the state directory holds a durable corpus generation — re-run without it
+and the generated `--no-graph` path reconciles additions, changes, deletions, renames
+and no-op reruns incrementally.
 
-A rerun that resumes an existing plan indexes changed files and reports added
-ones as skipped. Deleting a file is refused: nothing here removes the
-documents it already published, so the rerun stops before touching the
-destination and names what is gone. Restore the file and rerun, or rebuild —
-in place by deleting the named indices and the state directory, or isolated
-under a new `--state-dir`, `--prefix` and `--brain` (or `--no-graph`),
-validated before you switch readers. The shared `autoindex-catalog` and the
-old target require explicit cleanup.
+On a graph-enabled or pre-generation journal, a rerun that resumes an existing plan
+indexes changed files and reports added ones as skipped. Deleting a file is refused
+there: nothing on that path removes the documents it already published, so the rerun
+stops before touching the destination and names what is gone — the first ten, then an
+`… and N more` tail, with `--json` carrying every entry. Restore the file and rerun, or
+rebuild — in place by deleting the named indices and the state directory, or isolated
+under a new `--state-dir`, `--prefix` and `--brain` (or `--no-graph`), validated before
+you switch readers. The shared `autoindex-catalog` and the old target require explicit
+cleanup. A `--no-graph` state directory written before the generation format cannot be
+adopted in place and must be rebuilt the same way.
 
 ## Reproduce it yourself
 

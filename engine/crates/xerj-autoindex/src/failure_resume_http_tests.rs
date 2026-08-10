@@ -135,7 +135,11 @@ impl MockEndpoint {
             match listener.accept() {
                 Ok((stream, _)) => handle(stream, &server_state),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if server_state.lock().unwrap().stop {
+                    if server_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .stop
+                    {
                         break;
                     }
                     thread::yield_now();
@@ -159,10 +163,13 @@ impl MockEndpoint {
 
 impl Drop for MockEndpoint {
     fn drop(&mut self) {
-        self.state.lock().unwrap().stop = true;
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop = true;
         // Wake the nonblocking listener even on heavily loaded test hosts.
         let _ = TcpStream::connect(self.url.trim_start_matches("http://"));
-        self.join.take().unwrap().join().unwrap();
+        let _ = self.join.take().unwrap().join();
     }
 }
 
@@ -278,6 +285,10 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
             .pointer("/query/term/ax_file")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let file_key = query
+            .pointer("/query/term/file_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let mut locked = state.lock().unwrap();
         locked.delete_calls += 1;
         if let Some(key) = ax_file {
@@ -285,17 +296,45 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                 .docs
                 .retain(|_, doc| doc.get("ax_file").and_then(Value::as_str) != Some(key.as_str()));
         }
+        if let Some(key) = file_key {
+            locked
+                .catalog_docs
+                .retain(|_, doc| doc.get("file_key").and_then(Value::as_str) != Some(key.as_str()));
+        }
         (200, json!({"deleted": 0, "failures": []}))
     } else if method == "GET" && path.ends_with("/_count") {
         (200, json!({"count": state.lock().unwrap().docs.len()}))
     } else if method == "POST" && path.ends_with("/_search") {
-        // Report the REAL number of stored docs: `run_index` now verifies
-        // live counts against the journal (#195), so a mock that always
-        // answered 0 hits would (rightly) fail every successful run.
-        let total = state.lock().unwrap().docs.len();
+        // Report the REAL number of stored docs: `run_index` verifies live
+        // counts against the journal (#195), so a mock that always answered 0
+        // hits would (rightly) fail every successful run. The generated path
+        // additionally reads back per-file and per-catalog projections, so the
+        // count is filtered by whichever identity the query names.
+        let query: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let ax_file = query
+            .pointer("/query/term/ax_file")
+            .or_else(|| query.pointer("/query/bool/must/0/term/ax_file"))
+            .and_then(Value::as_str);
+        let file_key = query
+            .pointer("/query/term/file_key")
+            .and_then(Value::as_str);
+        let locked = state.lock().unwrap();
+        let documents = if file_key.is_some() {
+            &locked.catalog_docs
+        } else {
+            &locked.docs
+        };
+        let count = documents
+            .values()
+            .filter(|doc| {
+                ax_file.is_none_or(|key| doc.get("ax_file").and_then(Value::as_str) == Some(key))
+                    && file_key
+                        .is_none_or(|key| doc.get("file_key").and_then(Value::as_str) == Some(key))
+            })
+            .count();
         (
             200,
-            json!({"hits":{"total":{"value":total},"hits":[]},"aggregations":{}}),
+            json!({"hits":{"total":{"value":count},"hits":[]},"aggregations":{}}),
         )
     } else {
         // ping, index creation/mapping, refresh, and catalog operations
@@ -323,6 +362,32 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         .and_then(|action| action.pointer("/index/_index").cloned())
         .and_then(|index| index.as_str().map(str::to_owned))
         .is_some_and(|index| index != catalog::CATALOG_INDEX);
+    // Graph edge bulks are accepted and discarded: this module counts *data*
+    // bulks to place injected failures, so edge bulks must not shift the
+    // numbering (the graph pipeline has its own e2e suite in detect::e2e).
+    //
+    // Read the target off whichever action verb the line carries. The brain
+    // meta document is written with `create`, not `index`, so keying on
+    // `/index/_index` alone let it fall through to the catalog branch and be
+    // recorded as fixture drift once this module started indexing with the
+    // graph enabled.
+    let is_graph = lines
+        .first()
+        .and_then(|line| serde_json::from_slice::<Value>(line).ok())
+        .and_then(|action| {
+            ["index", "create", "delete", "update"]
+                .iter()
+                .find_map(|verb| {
+                    action
+                        .pointer(&format!("/{verb}/_index"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+        })
+        .is_some_and(|index| index.ends_with("-edges"));
+    if is_graph {
+        return json!({"errors": false, "items": []});
+    }
     if !is_data {
         // Catalog bulks mix `index` and `delete` actions (stale aliases, and
         // the junk sweep of #238), so walk the NDJSON rather than assuming
@@ -445,6 +510,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         pdf_timeout_secs: 30,
         bulk_mb: 64,
         bulk_timeout_secs: 3_600,
+        snapshot_max_bytes: 64 << 30,
         prefix: "failure-test".into(),
         state_dir: Some(state_dir.to_owned()),
         fresh: false,
@@ -452,17 +518,27 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         max_file_gb: 1,
         sample: 50,
         no_semantic: true,
-        // These tests count data bulks to place injected failures; graph
-        // edge bulks would shift that numbering, so keep detection off here
-        // (the graph pipeline has its own e2e suite in detect::e2e).
+        // This module preserves legacy graph-enabled failure behavior;
+        // incremental non-graph behavior has its own HTTP suite.
         brain: None,
-        no_graph: true,
+        no_graph: false,
         dry_run: false,
         json: false,
         quiet: true,
         progress: crate::progress::ProgressMode::None,
         progress_interval: None,
     }
+}
+
+/// Row documents only — the file-level graph node document this module's
+/// graph-enabled config also publishes (`ax_locator: "file"`) is not part of
+/// any replacement transaction's subject.
+fn data_rows(state: &MockState) -> Vec<&Value> {
+    state
+        .docs
+        .values()
+        .filter(|doc| doc["ax_locator"].as_str() != Some("file"))
+        .collect()
 }
 
 fn file_done_count(state_dir: &Path) -> usize {
@@ -589,7 +665,12 @@ fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
     // absorb a file that appeared after it was written.
     assert_eq!(report["records_submitted_this_run"], 0, "{report}");
     assert_eq!(report["files_submitted_this_run"], 0, "{report}");
-    assert_eq!(report["records_total"], 1, "{report}");
+    // Two live documents for the one indexed source, not one: this module now
+    // indexes graph-enabled (`--no-graph` takes the generated executor), and a
+    // graph-enabled run publishes a file-level node document alongside the row.
+    // `second.csv` still published nothing — that is what the counters above
+    // pin.
+    assert_eq!(report["records_total"], 2, "{report}");
     {
         let locked = endpoint.state.lock().unwrap();
         let live: Vec<&str> = locked
@@ -836,9 +917,10 @@ fn deleting_one_path_of_a_duplicate_pair_is_not_a_removed_content_group() {
         "a surviving content group must not trip the removal gate: {result:?}"
     );
     let locked = endpoint.state.lock().unwrap();
-    let live: Vec<&str> = locked
-        .docs
-        .values()
+    // Row documents only: this module indexes graph-enabled, so the surviving
+    // source also carries a file-level node document under the same ax_path.
+    let live: Vec<&str> = data_rows(&locked)
+        .into_iter()
         .filter_map(|doc| doc["ax_path"].as_str())
         .collect();
     assert_eq!(live, ["b.csv"], "canonical path follows the surviving file");
@@ -957,6 +1039,47 @@ fn semantic_resume_rejects_embedding_identity_drift_before_another_bulk() {
         bulks_before,
         "identity drift must fail before another data bulk"
     );
+}
+
+/// `--fresh` must keep working on a graph-enabled (legacy) journal.
+///
+/// `xerj brain` documents `--fresh` as "ignore the resume journal, re-walk
+/// everything" (brain.rs), and its self-heal path depends on it: when the
+/// resume journal says a folder is indexed but the server has none of it (a
+/// wiped data dir), `brain` sets `fresh = true` and re-runs `run_index_report`
+/// to converge. The durable-generation refusal added alongside incremental
+/// `--no-graph` reconciliation is deliberately scoped so it cannot reach this
+/// path — `brain` always runs graph-enabled, which never commits a generation.
+#[test]
+fn fresh_restarts_a_completed_graph_enabled_journal_the_way_brain_self_heal_needs() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("records.csv"),
+        "id,value\n0,indexed\n1,indexed\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let plans_before = event_count(state_dir.path(), "plan");
+
+    // The server lost everything; brain's recovery is exactly this.
+    endpoint.state.lock().unwrap().docs.clear();
+    config.fresh = true;
+    assert_eq!(
+        run_index(config).unwrap(),
+        0,
+        "--fresh must not be refused on a legacy graph-enabled journal"
+    );
+    assert_eq!(
+        event_count(state_dir.path(), "plan"),
+        plans_before,
+        "--fresh restarts from a discarded journal, so it writes exactly one fresh plan"
+    );
+    assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 2);
 }
 
 #[test]
@@ -1116,7 +1239,10 @@ fn deleted_path_bytes_remain_while_its_documents_remain_live() {
         dataset_catalog_docs(&endpoint)[0]["bytes"],
         durable_live_bytes
     );
-    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 4);
+    // Row documents only: this module indexes graph-enabled now that
+    // `--no-graph` takes the generated executor, so each source also publishes
+    // one file-level node document.
+    assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 4);
 
     fs::remove_file(&removed).unwrap();
     // Autoindex still does not reconcile a missing canonical path: its indexed
@@ -1133,7 +1259,10 @@ fn deleted_path_bytes_remain_while_its_documents_remain_live() {
             &[],
             &["removed.csv"],
         );
-        assert_eq!(endpoint.state.lock().unwrap().docs.len(), 4);
+        // Row documents only: this module indexes graph-enabled now that
+        // `--no-graph` takes the generated executor, so each source also
+        // publishes one file-level node document.
+        assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 4);
         assert_eq!(
             dataset_catalog_docs(&endpoint)[0]["bytes"],
             durable_live_bytes
@@ -1489,25 +1618,44 @@ fn existing_completion_is_invalidated_and_partial_visibility_is_deleted_on_resum
         {
             let locked = endpoint.state.lock().unwrap();
             assert!(locked.failed_once);
-            assert!(locked.docs.len() < rows);
+            assert!(
+                locked
+                    .docs
+                    .values()
+                    .filter(|doc| doc.get("value").is_some())
+                    .count()
+                    < rows
+            );
         }
 
         assert_eq!(run_index(config).unwrap(), 0);
         assert_eq!(file_done_count(state_dir.path()), 2);
         let locked = endpoint.state.lock().unwrap();
-        assert_eq!(locked.docs.len(), rows);
+        assert_eq!(
+            locked
+                .docs
+                .values()
+                .filter(|doc| doc.get("value").is_some())
+                .count(),
+            rows
+        );
         assert_eq!(
             locked.delete_calls, 2,
             "fresh publication skips delete; replacement and repair each clean once"
         );
-        assert!(locked.docs.values().all(|doc| {
-            doc["value"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("replacement-"))
-        }));
+        assert!(locked
+            .docs
+            .values()
+            .filter(|doc| doc.get("value").is_some())
+            .all(|doc| {
+                doc["value"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("replacement-"))
+            }));
         let mut locators: Vec<usize> = locked
             .docs
             .values()
+            .filter(|doc| doc.get("value").is_some())
             .map(|doc| {
                 doc["ax_locator"]
                     .as_str()
@@ -1566,12 +1714,24 @@ fn resume_repairs_kills_after_plan_delete_and_final_bulk_before_file_done() {
 
         assert_eq!(run_index(config).unwrap(), 0);
         let locked = endpoint.state.lock().unwrap();
-        assert_eq!(locked.docs.len(), rows, "boundary {boundary}");
-        assert!(locked.docs.values().all(|doc| {
-            doc["value"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("new-"))
-        }));
+        assert_eq!(
+            locked
+                .docs
+                .values()
+                .filter(|doc| doc.get("value").is_some())
+                .count(),
+            rows,
+            "boundary {boundary}"
+        );
+        assert!(locked
+            .docs
+            .values()
+            .filter(|doc| doc.get("value").is_some())
+            .all(|doc| {
+                doc["value"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("new-"))
+            }));
     }
 }
 
@@ -1589,7 +1749,7 @@ fn file_done_append_and_fsync_failures_are_fatal_and_resume_repairs() {
         assert_eq!(run_index(config.clone()).unwrap(), 0);
         fs::write(&path, "id,value\n0,new\n1,new\n").unwrap();
 
-        state::fail_next_file_done_io(io_boundary);
+        state::fail_next_file_done_io(io_boundary, &state_dir.path().join("journal.ndjson"));
         let error = run_index(config.clone()).unwrap_err();
         let message = format!("{error:#}");
         assert!(
@@ -1621,10 +1781,18 @@ fn file_done_append_and_fsync_failures_are_fatal_and_resume_repairs() {
 
         assert_eq!(run_index(config).unwrap(), 0);
         let locked = endpoint.state.lock().unwrap();
-        assert_eq!(locked.docs.len(), 2);
+        assert_eq!(
+            locked
+                .docs
+                .values()
+                .filter(|doc| doc.get("value").is_some())
+                .count(),
+            2
+        );
         assert!(locked
             .docs
             .values()
+            .filter(|doc| doc.get("value").is_some())
             .all(|doc| doc["value"].as_str() == Some("new")));
     }
 }
@@ -1692,10 +1860,18 @@ fn pending_generation_b_is_superseded_when_source_changes_to_c() {
     assert_eq!(starts.last().copied(), Some(committed_generation));
     drop(replay_c);
     let locked = endpoint.state.lock().unwrap();
-    assert_eq!(locked.docs.len(), 2);
+    assert_eq!(
+        locked
+            .docs
+            .values()
+            .filter(|doc| doc.get("value").is_some())
+            .count(),
+        2
+    );
     assert!(locked
         .docs
         .values()
+        .filter(|doc| doc.get("value").is_some())
         .all(|doc| doc["value"].as_str() == Some("generation-c")));
 }
 
@@ -1728,10 +1904,18 @@ fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
     assert_eq!(run_index(config.clone()).unwrap(), 3);
     {
         let locked = endpoint.state.lock().unwrap();
-        assert_eq!(locked.docs.len(), 2);
-        assert!(locked.docs.values().all(|doc| {
+        // Graph detection is enabled in this module, so a.csv also carries a
+        // file-level node document (`ax_locator: "file"`, no row fields). The
+        // replacement transaction's subject is the row documents.
+        let rows: Vec<&Value> = data_rows(&locked);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|doc| {
             doc["ax_path"].as_str() == Some("a.csv") && doc["value"].as_str() == Some("rewritten")
         }));
+        assert!(locked
+            .docs
+            .values()
+            .all(|doc| doc["ax_path"].as_str() == Some("a.csv")));
     }
     let replay = state::Journal::open(
         state_dir.path(),
@@ -1758,10 +1942,10 @@ fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
     assert_eq!(run_index(config).unwrap(), 3);
     assert_eq!(event_count(state_dir.path(), "plan"), plans_before);
     let locked = endpoint.state.lock().unwrap();
-    assert_eq!(locked.docs.len(), 2);
-    assert!(locked
-        .docs
-        .values()
+    let rows = data_rows(&locked);
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
         .all(|doc| doc["value"].as_str() == Some("rewritten")));
 }
 
@@ -1771,6 +1955,7 @@ fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
 /// ever been written and no run could remove it. The catalog is the data map
 /// every `map`/`status`/agent query reads; it must not keep advertising a file
 /// that is gone.
+
 #[test]
 fn an_added_then_deleted_file_leaves_no_immortal_catalog_entry() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
@@ -1922,7 +2107,7 @@ fn partial_file_done_is_rolled_back_before_another_worker_commits() {
 
     fs::write(corpus.path().join("a.csv"), "id,value\n0,a-new\n1,a-new\n").unwrap();
     fs::write(corpus.path().join("b.csv"), "id,value\n2,b-new\n3,b-new\n").unwrap();
-    state::fail_next_file_done_io(3);
+    state::fail_next_file_done_io(3, &state_dir.path().join("journal.ndjson"));
     let error = run_index(config.clone()).unwrap_err();
     assert!(format!("{error:#}").contains("partial file_done write"));
 
@@ -1944,12 +2129,23 @@ fn partial_file_done_is_rolled_back_before_another_worker_commits() {
 
     assert_eq!(run_index(config).unwrap(), 0);
     let locked = endpoint.state.lock().unwrap();
-    assert_eq!(locked.docs.len(), 4);
-    assert!(locked.docs.values().all(|doc| {
-        doc["value"]
-            .as_str()
-            .is_some_and(|value| value.ends_with("-new"))
-    }));
+    assert_eq!(
+        locked
+            .docs
+            .values()
+            .filter(|doc| doc.get("value").is_some())
+            .count(),
+        4
+    );
+    assert!(locked
+        .docs
+        .values()
+        .filter(|doc| doc.get("value").is_some())
+        .all(|doc| {
+            doc["value"]
+                .as_str()
+                .is_some_and(|value| value.ends_with("-new"))
+        }));
 }
 
 /// #195: an index write block rejects every bulk item with status 403 (the
@@ -1987,7 +2183,7 @@ fn write_block_rejections_are_backend_fatal_and_the_file_stays_pending() {
     endpoint.state.lock().unwrap().block_writes = false;
     assert_eq!(run_index(config).unwrap(), 0);
     assert_eq!(file_done_count(state_dir.path()), 1);
-    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 2);
+    assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 2);
 }
 
 /// Pins WHY the run document carries no backend-rejection count, so nobody
@@ -2322,7 +2518,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     assert_eq!(run_index(config).unwrap(), 0);
     assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
     assert_eq!(file_done_count(state_dir.path()), 1);
-    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+    assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 1);
 }
 
 #[cfg(unix)]
@@ -2381,7 +2577,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     assert_eq!(code, 0);
     assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
     assert_eq!(file_done_count(state_dir.path()), 1);
-    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+    assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 1);
     let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
     assert_eq!(reuse["reservations_started"], 0);
     assert_eq!(reuse["capacity_fallbacks"], 1);
@@ -2667,7 +2863,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
         PDFS,
         "each unique PDF must be parsed once in Phase A and replayed in Phase B"
     );
-    assert_eq!(endpoint.state.lock().unwrap().docs.len(), PDFS);
+    assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), PDFS);
     let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
     assert_eq!(reuse["reservations_started"], PDFS);
     assert_eq!(
@@ -2730,7 +2926,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
     let (code, report) = run_index_report(config).unwrap();
     assert_eq!(code, 0);
     assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
-    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+    assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 1);
     assert_eq!(file_done_count(state_dir.path()), 1);
     assert!(crate::extract::pdf::corrupted_replay_reservation_was_dropped());
     let reuse = report.unwrap()["pdf_extraction_reuse"].clone();

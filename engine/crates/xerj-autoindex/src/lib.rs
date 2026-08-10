@@ -12,13 +12,19 @@ pub mod dataset;
 pub mod detect;
 pub mod esclient;
 pub mod extract;
+mod generation_catalog;
+#[cfg(test)]
+mod generation_catalog_http_tests;
 pub mod ids;
 pub mod infer;
 pub mod pool;
 pub mod progress;
+mod reconcile_plan;
 pub mod resources;
 pub mod sniff;
 pub mod state;
+mod sync;
+mod sync_executor;
 pub mod walk;
 
 use anyhow::{Context, Result};
@@ -40,6 +46,370 @@ use progress::Progress;
 use sniff::{Family, Sniffed};
 use state::{DuplicateFile, FileAssignment, FileDone, JunkFile, Plan, PlanDataset};
 
+const PREPARED_RECORDS_IDENTITY: &str = "prepared-records-v1";
+const DOCUMENT_IDS_IDENTITY: &str = "document-ids-v1";
+const DETECTOR_DISABLED_IDENTITY: &str = "disabled";
+
+fn prepared_records_identity(cfg: &IndexCfg) -> Result<String> {
+    let value = json!({
+        "contract": PREPARED_RECORDS_IDENTITY,
+        "sample": cfg.sample,
+        "max_file_gb": cfg.max_file_gb,
+        "no_semantic": cfg.no_semantic,
+        // Worker counts are operational only. The timeout can change whether
+        // a PDF yields records, so it is part of the semantic contract.
+        "pdf_timeout_secs": cfg.pdf_timeout_secs,
+    });
+    Ok(format!(
+        "{}-{:032x}",
+        PREPARED_RECORDS_IDENTITY,
+        xxhash_rust::xxh3::xxh3_128(&serde_json::to_vec(&value)?)
+    ))
+}
+
+fn preparation_contract_digest(cfg: &IndexCfg, plan: &Plan) -> Result<String> {
+    let (schema_identity, index_identity) = generation_contract_identities(plan)?;
+    let encoded = serde_json::to_vec(&json!({
+        "prepared_records": prepared_records_identity(cfg)?,
+        "document_ids": DOCUMENT_IDS_IDENTITY,
+        "schema_identity": schema_identity,
+        "index_identity": index_identity,
+        "plan": plan,
+    }))?;
+    Ok(format!(
+        "axpc1-{:032x}",
+        xxhash_rust::xxh3::xxh3_128(&encoded)
+    ))
+}
+
+pub(crate) fn generation_contract_identities(plan: &Plan) -> Result<(String, String)> {
+    let mut datasets = plan.datasets.iter().collect::<Vec<_>>();
+    datasets.sort_by(|left, right| {
+        left.slug
+            .cmp(&right.slug)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    let schema = datasets
+        .iter()
+        .map(|dataset| {
+            json!({
+                "slug": dataset.slug,
+                "family": dataset.family,
+                "group": dataset.group,
+                "specs": dataset.specs,
+                "time_field": dataset.time_field,
+                "semantic_field": dataset.semantic_field,
+            })
+        })
+        .collect::<Vec<_>>();
+    let indices = datasets
+        .iter()
+        .map(|dataset| {
+            json!({
+                "index": dataset.index,
+                "mapping": build_mapping(&dataset.specs),
+            })
+        })
+        .collect::<Vec<_>>();
+    let digest = |label: &str, value: Value| -> Result<String> {
+        let bytes = serde_json::to_vec(&json!({"contract": label, "value": value}))?;
+        Ok(format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&bytes)))
+    };
+    Ok((
+        digest(PREPARED_RECORDS_IDENTITY, Value::Array(schema))?,
+        digest(
+            DOCUMENT_IDS_IDENTITY,
+            json!({
+                "datasets": indices,
+                "catalog_index": catalog::CATALOG_INDEX,
+                "catalog_mapping": catalog::catalog_mapping(),
+                "document_ids": DOCUMENT_IDS_IDENTITY,
+            }),
+        )?,
+    ))
+}
+
+pub(crate) fn ensure_generation_mappings(es: &Es, plan: &Plan) -> Result<()> {
+    for dataset in &plan.datasets {
+        let mut create_body = build_mapping(&dataset.specs);
+        create_body["mappings"]["properties"]["ax_paths"] = json!({"type": "keyword"});
+        let update_body = json!({
+            "properties": create_body["mappings"]["properties"].clone()
+        });
+        es.ensure_index(&dataset.index, &create_body)
+            .with_context(|| format!("create generation index {}", dataset.index))?;
+        es.update_mapping(&dataset.index, &update_body)
+            .with_context(|| format!("install generation mapping for {}", dataset.index))?;
+    }
+    let mut catalog_create_body = catalog::catalog_mapping();
+    catalog_create_body["mappings"]["properties"]["duplicate_of"] = json!({"type": "keyword"});
+    let catalog_update_body = json!({
+        "properties": catalog_create_body["mappings"]["properties"].clone()
+    });
+    es.ensure_index(catalog::CATALOG_INDEX, &catalog_create_body)?;
+    es.update_mapping(catalog::CATALOG_INDEX, &catalog_update_body)
+        .context("install generation catalog mapping")
+}
+
+/// Project the current inventory onto a committed plan.
+///
+/// Pure by design and deliberately shared: `--dry-run` prints exactly the plan
+/// the real reconcile would act on, because it is produced by this same call
+/// rather than by a parallel implementation that could drift away from it.
+///
+/// The scan itself obeys the same two policies the legacy phase A does. It runs
+/// inside the run's own pool, because `--workers` has to bound the CPU-bound
+/// phase for the knob to mean anything (#240 §2), and it opens a per-file
+/// progress guard, because a file this route touches must not drop out of the
+/// progress denominator (#241). Run-local PDF artifact reuse is deliberately
+/// disabled here: the generated route publishes from its own sealed snapshot
+/// and never reaches the legacy phase B, so a retained artifact could never be
+/// replayed (#248).
+fn project_reconcile_plan(
+    inventory: &content::Inventory,
+    base_plan: &Plan,
+    cfg: &IndexCfg,
+    state_dir: &Path,
+    pr: &Progress,
+) -> Result<Plan> {
+    let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
+    let ctx = PhaseAContext {
+        state_dir,
+        budget: &budget,
+        capacity_warning: None,
+        progress: pr,
+    };
+    pr.phase(
+        "scan",
+        inventory.files.len() as u64,
+        inventory.files.iter().map(|file| file.size).sum(),
+    );
+    let scans: Vec<FileScan> = crate::pool::install(|| {
+        use rayon::prelude::*;
+        inventory
+            .files
+            .par_iter()
+            .zip(inventory.digests.par_iter())
+            .map(|(file, digest)| {
+                let _in_flight = pr.file(&file.rel, file.size);
+                scan_file(
+                    &file.path,
+                    file.size,
+                    digest,
+                    &ctx,
+                    cfg.sample,
+                    cfg.max_file_gb,
+                )
+            })
+            .collect()
+    });
+    reconcile_plan::reconcile_plan(inventory, base_plan, scans, cfg.sample)
+}
+
+/// Exit code for a run that committed (or confirmed) a corpus generation.
+///
+/// `3` is "completed with junk — recorded, never fatal", the same contract the
+/// legacy path publishes (`cli.rs` EXIT CODES, and CLAUDE.md's own indexing
+/// workflow treats 3 as success). The generated path returned a flat `0`, which
+/// silently downgraded that signal for `--no-graph`. Both inputs come from the
+/// committed generation's own run document, so a no-op re-run over a corpus
+/// that still contains junk reports 3 again instead of flapping to 0.
+fn generated_exit_code(summary: &Value) -> i32 {
+    let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+    if count("junk_records_total") > 0 || count("files_junk") > 0 {
+        3
+    } else {
+        0
+    }
+}
+
+/// Terminal progress line for a run that ends on the generated `--no-graph`
+/// path.
+///
+/// Every exit closes the stream itself (#241). `Ticker::drop` reports
+/// `ok=false` for a run that never called `finish`, so a generated run that
+/// merely returned would print an aborted line straight after a successful
+/// commit — the one place the two landed changes could contradict each other.
+/// Exit 3 is success ("completed, some input was unusable"), so it is spelled
+/// out in words rather than left as a bare number.
+fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
+    let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+    pr.finish(
+        true,
+        code,
+        if code == 3 {
+            "completed-with-junk"
+        } else {
+            "completed"
+        },
+        &[
+            ("files", count("files_indexed")),
+            ("records", count("records_total")),
+            ("generation", count("generation")),
+        ],
+    );
+}
+
+fn begin_non_graph_generation(
+    es: &Es,
+    journal: &mut state::Journal,
+    state_dir: &Path,
+    cfg: &IndexCfg,
+    root_identity: &str,
+    inventory: &content::Inventory,
+    plan: Plan,
+) -> Result<()> {
+    anyhow::ensure!(
+        cfg.no_graph,
+        "non-graph generation cutover requires --no-graph"
+    );
+    anyhow::ensure!(
+        journal.pending_sync.is_none(),
+        "cannot prepare over an existing pending generation"
+    );
+    if journal.committed_manifest.is_none() {
+        journal.sync_bootstrap_genesis()?;
+    }
+    let base = journal
+        .committed_manifest
+        .as_ref()
+        .context("generation cutover has no committed base")?
+        .clone();
+    let tx_id = format!("{}-g{}", journal.run_id, base.generation + 1);
+    let preparation_contract = preparation_contract_digest(cfg, &plan)?;
+    let snapshot = sync_executor::create_prepared_snapshot(
+        state_dir,
+        &tx_id,
+        inventory,
+        &plan,
+        &preparation_contract,
+        cfg.snapshot_max_bytes,
+    )?;
+    let chunker_identity = prepared_records_identity(cfg)?;
+    let semantic = plan
+        .datasets
+        .iter()
+        .any(|dataset| dataset.semantic_field.is_some());
+    let identity = if semantic {
+        let identity = es
+            .embedding_execution_identity()
+            .context("generation cutover could not pin the server embedding execution identity")?;
+        anyhow::ensure!(
+            identity.resumable,
+            "generation cutover requires a resumable embedding execution identity: {}",
+            identity
+                .non_resumable_reason
+                .as_deref()
+                .unwrap_or("the server did not provide an immutable identity")
+        );
+        journal.pin_embedding_identity(
+            &identity.identity_sha256,
+            identity.resumable,
+            identity.non_resumable_reason.as_deref(),
+        )?;
+        identity
+    } else {
+        crate::esclient::EmbeddingExecutionIdentity {
+            version: 1,
+            backend: "disabled".into(),
+            identity_sha256: "0".repeat(64),
+            // A disabled embedding execution has no vector width at all. `None`
+            // says exactly that; any number here would be a fiction the
+            // generation contract would then hold future runs to.
+            dimensions: None,
+            semantic_contract: "disabled-no-semantic-fields-v1".into(),
+            resumable: true,
+            non_resumable_reason: None,
+        }
+    };
+
+    let aliases_by_content = plan.duplicate_files.iter().fold(
+        HashMap::<&str, Vec<sync::ManifestPath>>::new(),
+        |mut aliases, alias| {
+            aliases
+                .entry(alias.file_key.as_str())
+                .or_default()
+                .push(sync::ManifestPath {
+                    path_id: alias.path_id.clone(),
+                    rel: alias.rel.clone(),
+                    is_symlink: alias.is_symlink.unwrap_or(false),
+                });
+            aliases
+        },
+    );
+    let file_by_content = inventory
+        .keys
+        .iter()
+        .zip(&inventory.files)
+        .zip(&inventory.digests)
+        .map(|((key, file), digest)| (key.as_str(), (file, digest)))
+        .collect::<HashMap<_, _>>();
+    let mut candidates = Vec::with_capacity(plan.files.len());
+    for (content_id, assignment) in &plan.files {
+        let (file, digest) = file_by_content
+            .get(content_id.as_str())
+            .with_context(|| format!("planned content {content_id} is absent from inventory"))?;
+        let mut paths = vec![sync::ManifestPath {
+            path_id: assignment.path_id.clone(),
+            rel: assignment.rel.clone(),
+            is_symlink: assignment.is_symlink.unwrap_or(file.is_symlink),
+        }];
+        paths.extend(
+            aliases_by_content
+                .get(content_id.as_str())
+                .cloned()
+                .unwrap_or_default(),
+        );
+        candidates.push(sync::DesiredContentGroup {
+            content_id: content_id.clone(),
+            content_digest: (*digest).clone(),
+            content_size: file.size,
+            dataset_slugs: assignment
+                .assignments
+                .iter()
+                .map(|(_, slug)| slug.clone())
+                .collect(),
+            paths,
+            expected_records: 0,
+            expected_passages: 0,
+            expected_vectors: 0,
+            expected_junk_records: 0,
+        });
+    }
+    let mut groups = sync::reconcile_groups(&base.groups, candidates)?;
+    sync_executor::bind_prepared_counts(&mut groups, &snapshot, &inventory.keys)?;
+    let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
+    let desired = sync::GenerationManifest {
+        generation: base.generation + 1,
+        execution: Some(sync::ExecutionIdentity {
+            version: sync::EXECUTION_IDENTITY_VERSION,
+            root_identity: root_identity.to_owned(),
+            url: cfg.url.clone(),
+            prefix: cfg.prefix.clone(),
+            follow_symlinks: cfg.follow_symlinks,
+            chunker_identity,
+            embedding_identity_sha256: identity.identity_sha256,
+            embedding_backend: identity.backend,
+            embedding_dimension: identity.dimensions,
+            embedding_semantic_contract: identity.semantic_contract,
+            embedding_resumable: identity.resumable,
+            graph_enabled: false,
+            brain: "disabled".into(),
+            detector_identity: DETECTOR_DISABLED_IDENTITY.into(),
+            schema_identity,
+            index_identity,
+            source_policy: sync::SourceExecutionPolicy::DurableSnapshot {
+                reference: format!("sync-snapshots/{tx_id}"),
+                snapshot_digest: snapshot.snapshot_digest,
+            },
+        }),
+        plan,
+        groups,
+    };
+    let pending = sync::PendingSync::new(tx_id, &base, desired)?;
+    journal.sync_begin(&pending)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CliErrorRoute {
     exit_code: i32,
@@ -49,6 +419,20 @@ struct CliErrorRoute {
 
 fn route_cli_error(error: &anyhow::Error, json_output: bool) -> CliErrorRoute {
     if json_output {
+        // Two distinct refusals reach the JSON route, and both must keep it.
+        // `UnsafeFreshGenerationError` guards durable *generation* state on the
+        // `--no-graph` path; `UnsupportedInventoryDeltaError` (#254) guards the
+        // legacy graph-enabled path against a rerun that would strand live
+        // documents. Neither supersedes the other — they protect different
+        // destinations — so routing only one would silently drop the other's
+        // machine-readable rendering back to a prose stderr line.
+        if let Some(unsafe_fresh) = error.downcast_ref::<UnsafeFreshGenerationError>() {
+            return CliErrorRoute {
+                exit_code: 1,
+                stdout: Some(unsafe_fresh.to_json().to_string()),
+                stderr: None,
+            };
+        }
         if let Some(delta) = error.downcast_ref::<UnsupportedInventoryDeltaError>() {
             return CliErrorRoute {
                 exit_code: 1,
@@ -554,6 +938,7 @@ mod phase_a_grouping_tests {
             pdf_timeout_secs: 10,
             bulk_mb: 1,
             bulk_timeout_secs: 10,
+            snapshot_max_bytes: 64 << 30,
             prefix: "t".into(),
             state_dir: None,
             fresh: true,
@@ -949,6 +1334,7 @@ fn build_phase_a(
                 .or_insert_with(|| FileAssignment {
                     rel: files[m].rel.clone(),
                     path_id: files[m].rel_id.clone(),
+                    is_symlink: Some(files[m].is_symlink),
                     family: family.as_str().to_string(),
                     gzip,
                     content_digest: Some(digests[m].clone()),
@@ -1040,8 +1426,10 @@ fn select_resume_plan_keys(
     for (key, assignment) in &plan.files {
         if let Some(previous) = planned_by_rel.insert(&assignment.rel, key) {
             anyhow::bail!(
-                "resume plan assigns path {} to both {} and {}; use --fresh after verifying the \
-                 existing index",
+                "resume plan assigns path {} to both {} and {}; refusing to discard history under \
+                 the same destination. For an isolated rebuild use a new --state-dir, new \
+                 --prefix, and new --brain when graph detection is enabled (or --no-graph); \
+                 explicitly validate and clean the shared catalog and old target",
                 assignment.rel,
                 previous,
                 key
@@ -1050,8 +1438,11 @@ fn select_resume_plan_keys(
         if !assignment.path_id.is_empty() {
             if let Some(previous) = planned_by_path_id.insert(&assignment.path_id, key) {
                 anyhow::bail!(
-                    "resume plan assigns one native path identity to both {} and {}; use --fresh \
-                     after verifying the existing index",
+                    "resume plan assigns one native path identity to both {} and {}; refusing to \
+                     discard history under the same destination. For an isolated rebuild use a \
+                     new --state-dir, new --prefix, and new --brain when graph detection is \
+                     enabled (or --no-graph); explicitly validate and clean the shared catalog \
+                     and old target",
                     previous,
                     key
                 );
@@ -1089,9 +1480,11 @@ fn select_resume_plan_keys(
                     anyhow::bail!(
                         "{} collides with legacy resume key {} already owned by {}. No documents \
                          were changed; remove or move one of these two files out of the corpus \
-                         and rerun — every other file keeps its resume state. Deleting the \
-                         journal at {} (or rerunning with --fresh) also clears the collision, \
-                         but re-extracts and re-embeds the entire corpus",
+                         and rerun — every other file keeps its resume state. Refusing to discard \
+                         history under the same destination. For an isolated rebuild use a new \
+                         --state-dir, new --prefix, and new --brain when graph detection is \
+                         enabled (or --no-graph); explicitly validate and clean the shared \
+                         catalog and old target. Journal: {}",
                         file.rel,
                         legacy_key,
                         assignment.rel,
@@ -1122,6 +1515,70 @@ fn select_resume_plan_keys(
     }
     Ok(selected)
 }
+
+/// `--fresh` was asked to discard a durable corpus *generation*.
+///
+/// The generated `--no-graph` path keeps its authority in a committed
+/// manifest plus sealed snapshots under the state directory. `--fresh` deletes
+/// `journal.ndjson`, and the `gc_snapshots` call that follows every open then
+/// sees an empty protected set and removes every sealed snapshot directory —
+/// so by the time any later gate could object, the manifest, the pending
+/// replay evidence, and the alias/path/stale-record knowledge needed to
+/// reconcile the destination are already gone. Refuse before anything is
+/// touched.
+///
+/// This carries no inventory delta on purpose: nothing has been compared yet,
+/// and printing empty `added`/`vanished` arrays (as an earlier revision did)
+/// is worse than saying plainly which durable state is in the way.
+#[derive(Debug)]
+struct UnsafeFreshGenerationError {
+    /// Committed generation number, or `None` when the blocker is an
+    /// uncommitted pending generation.
+    committed_generation: Option<u64>,
+}
+
+impl UnsafeFreshGenerationError {
+    fn to_json(&self) -> Value {
+        json!({
+            "schema": "xerj.autoindex.unsafe_fresh_generation.v1",
+            "status": "error",
+            "error": "unsafe_fresh_existing_generation",
+            "message": "this attempt made no remote mutations; --fresh cannot discard a durable corpus generation under the same destination because the committed manifest, sealed replay evidence, and alias, path and stale-record cleanup knowledge would be lost",
+            "blocking_state": match self.committed_generation {
+                Some(generation) => json!({"kind": "committed_generation", "generation": generation}),
+                None => json!({"kind": "pending_generation"}),
+            },
+            "recovery": {
+                "resume": "run the same command WITHOUT --fresh: a generated --no-graph journal reconciles additions, changes, deletions and renames incrementally, and replays a pending generation",
+                "exact_rebuild": "index with a new --state-dir and a new --prefix. Validate the isolated target before switching readers",
+                "warning": "--fresh is not recovery or destination reconciliation. The global autoindex-catalog and old target are not cleaned automatically; validate and clean them explicitly"
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for UnsafeFreshGenerationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let blocker = match self.committed_generation {
+            Some(generation) => format!("committed corpus generation {generation}"),
+            None => "an uncommitted pending corpus generation".to_owned(),
+        };
+        write!(
+            formatter,
+            "this attempt made no remote mutations. `--fresh` cannot discard {blocker} under the \
+             same destination: the committed manifest, sealed replay evidence, and the alias, \
+             path and stale-record cleanup knowledge would be lost, and the existing destination \
+             may already be partial or stale. Re-run the same command without `--fresh` — a \
+             generated `--no-graph` journal reconciles additions, changes, deletions and renames \
+             incrementally. For an exact rebuild, index the current folder with a new \
+             --state-dir and a new --prefix, and validate the isolated target before switching \
+             readers. `--fresh` is not recovery or destination reconciliation; the global \
+             autoindex-catalog and old target require explicit validated cleanup"
+        )
+    }
+}
+
+impl std::error::Error for UnsafeFreshGenerationError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct InventoryDeltaEntry {
@@ -1509,6 +1966,118 @@ fn invocation_report_timestamps(
     (started.to_rfc3339(), summary_generated_at.to_rfc3339())
 }
 
+fn pin_pending_embedding_identity(
+    es: &Es,
+    journal: &mut state::Journal,
+    pending: &sync::PendingSync,
+) -> Result<()> {
+    if !pending
+        .desired
+        .plan
+        .datasets
+        .iter()
+        .any(|dataset| dataset.semantic_field.is_some())
+    {
+        return Ok(());
+    }
+    let expected = pending
+        .desired
+        .execution
+        .as_ref()
+        .context("pending semantic generation has no execution identity")?;
+    let current = es.embedding_execution_identity().context(
+        "pending semantic generation cannot verify the server embedding execution identity",
+    )?;
+    anyhow::ensure!(
+        current.resumable,
+        "pending semantic generation cannot resume because the current embedding backend is not \
+         resumable: {}; restore the original backend, or rebuild with a new --state-dir and a new \
+         --prefix",
+        current
+            .non_resumable_reason
+            .as_deref()
+            .unwrap_or("the server did not provide a stable execution identity")
+    );
+    anyhow::ensure!(
+        current.identity_sha256 == expected.embedding_identity_sha256
+            && current.backend == expected.embedding_backend
+            && current.dimensions == expected.embedding_dimension
+            && current.semantic_contract == expected.embedding_semantic_contract
+            && current.resumable == expected.embedding_resumable,
+        "pending semantic generation was prepared for a different embedding execution identity; \
+         no remote mutation was attempted. Restore the original embedding backend, or rebuild with \
+         a new --state-dir and a new --prefix. --fresh cannot discard this pending generation"
+    );
+    journal.pin_embedding_identity(
+        &current.identity_sha256,
+        current.resumable,
+        current.non_resumable_reason.as_deref(),
+    )
+}
+
+fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -> Result<Value> {
+    let committed = journal
+        .committed_manifest
+        .as_ref()
+        .context("generated run finished without committed generation authority")?;
+    let execution = committed
+        .execution
+        .as_ref()
+        .context("generated run finished without execution identity")?;
+    let generation = committed.generation;
+    let dataset_count = committed.plan.datasets.len();
+    let sync::SourceExecutionPolicy::DurableSnapshot { reference, .. } = &execution.source_policy
+    else {
+        anyhow::bail!("generated run does not reference a durable snapshot");
+    };
+    let run_id = reference
+        .strip_prefix("sync-snapshots/")
+        .context("generated run snapshot reference is not state-relative")?
+        .to_owned();
+    let response = es.search(
+        catalog::CATALOG_INDEX,
+        &json!({
+            "size": 2,
+            "query": {"bool": {"filter": [
+                {"term": {"run_id": &run_id}},
+                {"term": {"doc_kind": "run"}}
+            ]}}
+        }),
+    )?;
+    let hits = response
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .context("generated run summary query has no hits")?;
+    anyhow::ensure!(
+        hits.len() == 1,
+        "generated run summary query returned {} documents; expected exactly one",
+        hits.len()
+    );
+    let summary = hits[0]
+        .get("_source")
+        .cloned()
+        .context("generated run summary hit has no _source")?;
+    anyhow::ensure!(
+        summary.get("generation").and_then(Value::as_u64) == Some(generation),
+        "generated run summary generation disagrees with committed authority"
+    );
+    journal.finish(&summary)?;
+    if cfg.json {
+        println!("{summary}");
+    } else if !cfg.quiet {
+        println!(
+            "generation {} committed — {} datasets, {} records live",
+            generation,
+            dataset_count,
+            summary
+                .get("records_total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        );
+    }
+    Ok(summary)
+}
+
 fn run_index(cfg: IndexCfg) -> Result<i32> {
     run_index_report(cfg).map(|(code, _)| code)
 }
@@ -1591,6 +2160,39 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // publishing or replacing the durable plan.
     let preflight =
         state::Journal::preflight(&state_dir, &root_str, &cfg.url, &cfg.prefix, cfg.fresh)?;
+    let genesis_recovery = preflight
+        .committed_manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.generation == 0 && manifest.groups.is_empty());
+    // `--fresh` must be refused before the journal is opened, and only for a
+    // durable *generation*. `open_after_preflight` deletes journal.ndjson
+    // whenever `fresh` is set, and the `gc_snapshots` call that follows every
+    // open then sees an empty protected set and removes every sealed snapshot
+    // directory — so nothing evaluated later can save a generated corpus.
+    //
+    // Scope matters here. A legacy (non-generated) journal keeps `--fresh`
+    // exactly as it has always behaved: it is a crash-resume boundary, not a
+    // generation, and `xerj brain` documents and depends on `--fresh` to
+    // re-index a folder whose server-side data was wiped (brain.rs). Only
+    // generated state — a pending sync, or a committed manifest past genesis —
+    // has authority that `--fresh` would silently destroy.
+    let blocking_generation = if !cfg.fresh {
+        None
+    } else if preflight.pending_sync.is_some() {
+        Some(None)
+    } else {
+        preflight
+            .committed_manifest
+            .as_ref()
+            .filter(|_| !genesis_recovery)
+            .map(|manifest| Some(manifest.generation))
+    };
+    if let Some(committed_generation) = blocking_generation {
+        return Err(UnsafeFreshGenerationError {
+            committed_generation,
+        }
+        .into());
+    }
     if let Some(reason) = preflight.unreadable_plan.as_deref() {
         // Only reachable under --fresh; without it the preflight would have
         // returned this as an error. It goes through the progress surface, not
@@ -1603,6 +2205,64 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             state_dir.join("journal.ndjson").display()
         ));
     }
+    // `--dry-run` has to be decided *before* the generated branches, not after
+    // them. Both of those branches publish and commit, and both return before
+    // control ever reaches the legacy `cfg.dry_run` check further down — so on
+    // any already-generated state directory the flag was accepted, ignored, and
+    // the destination mutated anyway. A projection-only flag that writes is
+    // worse than one that errors, so this branch is placed where nothing has
+    // been opened for write yet: the journal is still only preflighted, and
+    // `gc_snapshots` (which deletes unprotected snapshot directories) has not
+    // run.
+    if cfg.dry_run {
+        if let Some(pending) = &preflight.pending_sync {
+            println!("{}", serde_json::to_string_pretty(&pending.desired.plan)?);
+            // stdout is the RESULT, stderr is PROGRESS — so this explanation
+            // goes through the progress surface, never a bare `eprintln!`
+            // that `--progress none` could not silence and `--progress json`
+            // could not parse (#241).
+            pr.note(&format!(
+                "(dry run — nothing indexed; corpus generation {} is already sealed and pending \
+                 replay from its own durable snapshot. Re-run without --dry-run to finish it.)",
+                pending.desired.generation
+            ));
+            pr.finish(true, 0, "dry-run", &[]);
+            return Ok((0, None));
+        }
+    }
+    // A durable sync_begin owns the desired generation. Never rediscover and
+    // replan from a mutable source tree while that transaction is pending.
+    // Operation handlers are deliberately not enabled by this foundation
+    // slice; fail with the exact durable transaction rather than accidentally
+    // executing a different folder snapshot.
+    if preflight.pending_sync.is_some() {
+        let mut journal = state::Journal::open_after_preflight(
+            preflight,
+            &root_str,
+            &cfg.url,
+            &cfg.prefix,
+            cfg.bulk_timeout_secs,
+            cfg.fresh,
+        )?;
+        sync_executor::gc_snapshots(&state_dir, &journal)?;
+        let pending = journal
+            .pending_sync
+            .as_ref()
+            .context("preflight reported a pending generation but authoritative replay did not")?
+            .clone();
+        pin_pending_embedding_identity(&es, &mut journal, &pending)?;
+        pr.phase("replay", 0, 0);
+        let mut backend = sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20);
+        sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
+        // Through the progress surface, never a bare `eprintln!`: stderr
+        // belongs to that surface, so `--progress none` stays silent and
+        // `--progress json` stays one parseable stream (#241).
+        pr.note("autoindex: resumed and committed pending corpus generation from durable source");
+        let summary = finish_generated_run(&es, &mut journal, &cfg)?;
+        let code = generated_exit_code(&summary);
+        finish_generated_progress(&pr, code, &summary);
+        return Ok((code, Some(summary)));
+    }
     // Totals are unknown until the walk returns, so this phase honestly
     // reports `pct=unknown` and proves liveness with the clock alone.
     pr.phase("walk", 0, 0);
@@ -1614,6 +2274,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         discovered_bytes / (1 << 20),
         root_str
     ));
+    // An empty folder is only "nothing to do" when there is also no durable
+    // state: with a journal present, zero files is a deletion of the whole
+    // corpus and has to be reconciled, not shrugged off.
     if discovered_files.is_empty() && !preflight.journal_exists {
         println!("no files found under {}", cfg.root.display());
         pr.finish(true, 0, "no-files", &[]);
@@ -1627,6 +2290,162 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // real work, and before #241 it was minutes with no output at all.
     pr.phase("hash", discovered_files.len() as u64, discovered_bytes);
     let mut inventory = content::resolve_reporting(discovered_files, &|bytes| pr.item_done(bytes))?;
+    if cfg.no_graph && preflight.committed_manifest.is_some() && !genesis_recovery {
+        if cfg.dry_run {
+            let base = preflight
+                .committed_manifest
+                .as_ref()
+                .context("branch guard proved a committed manifest")?;
+            let plan = project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr)?;
+            let unchanged = serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+            // stdout is the RESULT, stderr is PROGRESS: the projection above is
+            // the result, this explanation is progress and goes out through the
+            // surface that `--progress none` silences (#241).
+            pr.note(&format!(
+                "(dry run — nothing indexed; {})",
+                if unchanged {
+                    format!(
+                        "committed generation {} already describes this folder",
+                        base.generation
+                    )
+                } else {
+                    format!(
+                        "this is the plan a real run would commit as generation {}",
+                        base.generation + 1
+                    )
+                }
+            ));
+            pr.finish(
+                true,
+                0,
+                "dry-run",
+                &[("files", inventory.files.len() as u64)],
+            );
+            return Ok((0, None));
+        }
+        let mut journal = state::Journal::open_after_preflight(
+            preflight,
+            &root_str,
+            &cfg.url,
+            &cfg.prefix,
+            cfg.bulk_timeout_secs,
+            cfg.fresh,
+        )?;
+        sync_executor::gc_snapshots(&state_dir, &journal)?;
+        let base = journal
+            .committed_manifest
+            .as_ref()
+            .context("generated journal lost its committed manifest")?
+            .clone();
+        let plan = project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr)?;
+        if serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)? {
+            if let Some(expected) = &base.execution {
+                let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
+                anyhow::ensure!(
+                    expected.root_identity == root_str
+                        && expected.url == cfg.url
+                        && expected.prefix == cfg.prefix
+                        && expected.follow_symlinks == cfg.follow_symlinks
+                        && expected.chunker_identity == prepared_records_identity(&cfg)?
+                        && !expected.graph_enabled
+                        && expected.brain == "disabled"
+                        && expected.detector_identity == DETECTOR_DISABLED_IDENTITY
+                        && expected.schema_identity == schema_identity
+                        && expected.index_identity == index_identity,
+                    "autoindex execution configuration changed since the committed generation; \
+                     rebuild with a new --state-dir and a new --prefix"
+                );
+                if plan
+                    .datasets
+                    .iter()
+                    .any(|dataset| dataset.semantic_field.is_some())
+                {
+                    let current = es.embedding_execution_identity()?;
+                    anyhow::ensure!(
+                        current.resumable
+                            && current.identity_sha256 == expected.embedding_identity_sha256
+                            && current.backend == expected.embedding_backend
+                            && current.dimensions == expected.embedding_dimension
+                            && current.semantic_contract == expected.embedding_semantic_contract,
+                        "embedding execution identity changed since this autoindex journal was \
+                         created; refusing to mix vector spaces. No remote mutation was attempted. \
+                         Restore the original identity, or rebuild with a new --state-dir and a \
+                         new --prefix"
+                    );
+                }
+            }
+            let summary = finish_generated_run(&es, &mut journal, &cfg)?;
+            let code = generated_exit_code(&summary);
+            finish_generated_progress(&pr, code, &summary);
+            return Ok((code, Some(summary)));
+        }
+        begin_non_graph_generation(
+            &es,
+            &mut journal,
+            &state_dir,
+            &cfg,
+            &root_str,
+            &inventory,
+            plan,
+        )?;
+        let mut backend = sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20);
+        sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
+        let summary = finish_generated_run(&es, &mut journal, &cfg)?;
+        let code = generated_exit_code(&summary);
+        finish_generated_progress(&pr, code, &summary);
+        return Ok((code, Some(summary)));
+    }
+    if cfg.no_graph && preflight.plan.is_some() && !genesis_recovery {
+        let replacement_state = state_dir.with_extension("generation-v1");
+        let replacement_prefix = format!("{}-generation-v1", cfg.prefix);
+        let reasons = if preflight.legacy_migration_reasons.is_empty() {
+            "legacy journal has no complete generated-manifest authority".to_owned()
+        } else {
+            preflight.legacy_migration_reasons.join("; ")
+        };
+        let mut rebuild_argv = vec![
+            "xerj".to_owned(),
+            "autoindex".to_owned(),
+            cfg.root.to_string_lossy().into_owned(),
+            "--no-graph".to_owned(),
+            "--url".to_owned(),
+            cfg.url.clone(),
+            "--state-dir".to_owned(),
+            replacement_state.to_string_lossy().into_owned(),
+            "--prefix".to_owned(),
+            replacement_prefix,
+            "--workers".to_owned(),
+            cfg.workers.to_string(),
+            "--pdf-workers".to_owned(),
+            cfg.pdf_workers.to_string(),
+            "--pdf-timeout-secs".to_owned(),
+            cfg.pdf_timeout_secs.to_string(),
+            "--bulk-mb".to_owned(),
+            cfg.bulk_mb.to_string(),
+            "--bulk-timeout-secs".to_owned(),
+            cfg.bulk_timeout_secs.to_string(),
+            "--snapshot-max-gb".to_owned(),
+            (cfg.snapshot_max_bytes >> 30).to_string(),
+            "--max-file-gb".to_owned(),
+            cfg.max_file_gb.to_string(),
+            "--sample".to_owned(),
+            cfg.sample.to_string(),
+        ];
+        if cfg.no_semantic {
+            rebuild_argv.push("--no-semantic".to_owned());
+        }
+        if cfg.follow_symlinks {
+            rebuild_argv.push("--follow-symlinks".to_owned());
+        }
+        anyhow::bail!(
+            "this state directory contains a legacy nonempty plan that cannot become generation \
+             authority: {reasons}. Start an independent rebuild using this argv JSON (no shell \
+             quoting required): {:?}. Keep XERJ_API_KEY set when the endpoint requires \
+             authentication",
+            rebuild_argv
+        );
+    }
     if let Some(prior_plan) = preflight.plan.as_ref() {
         let comparison_keys = if cfg.fresh {
             inventory.keys.clone()
@@ -1661,7 +2480,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         cfg.bulk_timeout_secs,
         cfg.fresh,
     )?;
-    let resumed_with_plan = journal.plan.is_some();
+    sync_executor::gc_snapshots(&state_dir, &journal)?;
+    let resumed_with_plan = journal.plan.is_some() && !genesis_recovery;
     if inventory.files.is_empty() && !resumed_with_plan {
         println!("no files found under {}", cfg.root.display());
         pr.finish(true, 0, "no-files", &[]);
@@ -1798,10 +2618,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         plan.duplicate_files = inventory.duplicates.clone();
     }
     alias_paths_to_replace.extend(inventory.duplicates.iter().map(|alias| alias.rel.clone()));
-    let files = inventory.files;
-    let keys = inventory.keys;
-    let digests = inventory.digests;
-    let duplicate_files = inventory.duplicates;
+    let files = inventory.files.clone();
+    let keys = inventory.keys.clone();
+    let digests = inventory.digests.clone();
+    let duplicate_files = inventory.duplicates.clone();
     let paths_discovered = files.len() + duplicate_files.len();
     let planned_bytes: u64 = files.iter().map(|f| f.size).sum();
     if !duplicate_files.is_empty() {
@@ -1831,20 +2651,32 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // open, phase-B workers are what hold bulk buffers. Reserving for the
     // larger of the two can only make this optional accelerator hand capacity
     // back — never take headroom the run still needs.
-    let (pdf_spool_budget, pdf_spool_capacity_warning) =
+    //
+    // `--no-graph` is the exception, and it is a decision this rebase had to
+    // make between two landed changes. #248's artifact is a phase A→B
+    // accelerator, but every `--no-graph` route below returns from the
+    // generated path — which publishes from its own sealed snapshot and never
+    // reaches the legacy phase B. A retained artifact could therefore never be
+    // replayed, so admission is disabled instead of spooling gigabytes nothing
+    // will read. Nothing observable changes: the generated run document does
+    // not carry `pdf_extraction_reuse`.
+    let (pdf_spool_budget, pdf_spool_capacity_warning) = if cfg.no_graph {
+        (extract::pdf::ExtractionSpoolBudget::new(0, 0), None)
+    } else {
         extract::pdf::ExtractionSpoolBudget::for_state_dir(
             &state_dir,
             cfg.workers.max(scan_threads),
             cfg.pdf_workers,
             cfg.bulk_mb,
-        );
+        )
+    };
     let phase_a_context = PhaseAContext {
         state_dir: &state_dir,
         budget: &pdf_spool_budget,
         capacity_warning: pdf_spool_capacity_warning.as_deref(),
         progress: &pr,
     };
-    let mut plan: Plan = if let Some(p) = journal.plan.clone() {
+    let mut plan: Plan = if let Some(p) = journal.plan.clone().filter(|_| !genesis_recovery) {
         p
     } else {
         pr.phase("scan", files.len() as u64, planned_bytes);
@@ -1930,6 +2762,24 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         pr.note("(dry run — nothing indexed)");
         pr.finish(true, 0, "dry-run", &[("files", files.len() as u64)]);
         return Ok((0, None));
+    }
+
+    if cfg.no_graph && !resumed_with_plan {
+        begin_non_graph_generation(
+            &es,
+            &mut journal,
+            &state_dir,
+            &cfg,
+            &root_str,
+            &inventory,
+            plan,
+        )?;
+        let mut backend = sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20);
+        sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
+        let summary = finish_generated_run(&es, &mut journal, &cfg)?;
+        let code = generated_exit_code(&summary);
+        finish_generated_progress(&pr, code, &summary);
+        return Ok((code, Some(summary)));
     }
 
     if plan
@@ -3687,6 +4537,9 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
         let mut done = 0u64;
         let mut records = 0u64;
         let mut finished = false;
+        let mut generation: Option<u64> = None;
+        let mut generation_files: Option<u64> = None;
+        let mut generation_records: Option<u64> = None;
         let mut graph_line: Option<String> = None;
         if let Ok(f) = std::fs::File::open(&jp) {
             use std::io::BufRead;
@@ -3702,10 +4555,17 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
                         }
                         Some("finish") => {
                             finished = true;
+                            generation = v.pointer("/summary/generation").and_then(Value::as_u64);
+                            generation_files =
+                                v.pointer("/summary/files_indexed").and_then(Value::as_u64);
+                            generation_records =
+                                v.pointer("/summary/records_total").and_then(Value::as_u64);
                             // Latest finish wins — the summary embeds the run
                             // doc, whose `graph` block is the edge count of
                             // record for this journal.
-                            if let Some(g) = v.pointer("/summary/graph") {
+                            if let Some(g) =
+                                v.pointer("/summary/graph").filter(|graph| !graph.is_null())
+                            {
                                 graph_line = Some(format!(
                                     "graph: {} edges written to {} (brain {})",
                                     g.get("edges_written").and_then(Value::as_u64).unwrap_or(0),
@@ -3720,12 +4580,15 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
             }
         }
         println!(
-            "journal {} — root {} — {} files done, {} records, {}",
+            "journal {} — root {} — {} files done, {} records, {}{}",
             jp.display(),
             root,
-            done,
-            records,
-            if finished { "FINISHED" } else { "in progress" }
+            generation_files.unwrap_or(done),
+            generation_records.unwrap_or(records),
+            if finished { "FINISHED" } else { "in progress" },
+            generation
+                .map(|generation| format!(" (generation {generation})"))
+                .unwrap_or_default()
         );
         if let Some(line) = graph_line {
             println!("  {line}");
@@ -3772,6 +4635,49 @@ mod section_label_tests {
 }
 
 #[cfg(test)]
+mod unsafe_fresh_generation_tests {
+    use super::*;
+
+    #[test]
+    fn cli_error_routing_separates_typed_json_from_unrelated_human_errors() {
+        let typed: anyhow::Error = UnsafeFreshGenerationError {
+            committed_generation: Some(7),
+        }
+        .into();
+        let route = route_cli_error(&typed, true);
+        assert_eq!(route.exit_code, 1);
+        assert!(route.stderr.is_none());
+        let stdout = route.stdout.unwrap();
+        let value: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["schema"], "xerj.autoindex.unsafe_fresh_generation.v1");
+        assert_eq!(value["error"], "unsafe_fresh_existing_generation");
+        assert_eq!(value["blocking_state"]["kind"], "committed_generation");
+        assert_eq!(value["blocking_state"]["generation"], 7);
+        // The refusal must never print an empty inventory delta it never
+        // computed: it names the durable state that is in the way instead.
+        assert!(value.get("added_content_groups").is_none());
+        assert!(format!("{typed:#}").contains("committed corpus generation 7"));
+
+        let pending: anyhow::Error = UnsafeFreshGenerationError {
+            committed_generation: None,
+        }
+        .into();
+        let pending_value: Value =
+            serde_json::from_str(&route_cli_error(&pending, true).stdout.unwrap()).unwrap();
+        assert_eq!(
+            pending_value["blocking_state"]["kind"],
+            "pending_generation"
+        );
+
+        let unrelated = anyhow::anyhow!("endpoint unavailable");
+        let route = route_cli_error(&unrelated, true);
+        assert_eq!(route.exit_code, 1);
+        assert!(route.stdout.is_none());
+        assert_eq!(route.stderr.as_deref(), Some("error: endpoint unavailable"));
+    }
+}
+
+#[cfg(test)]
 mod inventory_delta_tests {
     use super::*;
     use std::path::PathBuf;
@@ -3795,6 +4701,7 @@ mod inventory_delta_tests {
             content_digest: Some(format!("digest:{path}")),
             assignments: vec![(None, "rows".into())],
             as_document: false,
+            is_symlink: Some(false),
         }
     }
 
@@ -3990,6 +4897,7 @@ mod duplicate_integration_tests {
         FileAssignment {
             rel: rel.to_string(),
             path_id: String::new(),
+            is_symlink: None,
             family: "txt".to_string(),
             gzip: false,
             content_digest: None,
@@ -4029,11 +4937,11 @@ mod duplicate_integration_tests {
         .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("collides with legacy resume key"));
-        // Recovery advice must stay scoped to the two colliding files and be
-        // honest that discarding the journal re-embeds the whole corpus.
+        // Recovery advice must stay scoped to the two colliding files and
+        // keep an exact rebuild isolated from the old destination.
         assert!(message.contains("remove or move one of these two files"));
         assert!(message.contains("/state/journal.ndjson"));
-        assert!(message.contains("re-extracts and re-embeds the entire corpus"));
+        assert!(message.contains("new --state-dir, new --prefix, and new --brain"));
     }
 
     #[test]
@@ -4080,6 +4988,7 @@ mod duplicate_integration_tests {
             file_key: file_key.to_string(),
             rel: rel.to_string(),
             path_id: format!("id:{rel}"),
+            is_symlink: Some(false),
             duplicate_of: format!("{file_key}.txt"),
             bytes: 10,
         };
@@ -4242,6 +5151,7 @@ mod map_metadata_tests {
         FileAssignment {
             rel: "report.dat".into(),
             path_id: "path:report.dat".into(),
+            is_symlink: Some(false),
             family: "json".into(),
             gzip: false,
             content_digest: Some("digest".into()),
@@ -4374,4 +5284,56 @@ mod map_metadata_tests {
 }
 
 #[cfg(test)]
+mod generation_contract_identity_tests {
+    use super::*;
+
+    fn dataset(slug: &str, index: &str, family: &str) -> PlanDataset {
+        PlanDataset {
+            slug: slug.into(),
+            index: index.into(),
+            family: family.into(),
+            group: None,
+            specs: Vec::new(),
+            time_field: None,
+            semantic_field: None,
+            sampled_records: 0,
+            file_count: 0,
+        }
+    }
+
+    #[test]
+    fn contract_identities_are_order_independent_and_change_with_contracts() {
+        let mut first = Plan {
+            datasets: vec![
+                dataset("b", "prefix-b", "csv"),
+                dataset("a", "prefix-a", "json"),
+            ],
+            ..Plan::default()
+        };
+        let expected = generation_contract_identities(&first).unwrap();
+        first.datasets.reverse();
+        assert_eq!(generation_contract_identities(&first).unwrap(), expected);
+
+        first.datasets[0].family = "text".into();
+        let schema_changed = generation_contract_identities(&first).unwrap();
+        assert_ne!(schema_changed.0, expected.0);
+
+        first.datasets[0].family = "json".into();
+        first.datasets[0].index = "different-a".into();
+        let index_changed = generation_contract_identities(&first).unwrap();
+        assert_eq!(index_changed.0, expected.0);
+        assert_ne!(index_changed.1, expected.1);
+    }
+
+    #[test]
+    fn internal_contract_versions_are_explicit() {
+        assert_eq!(PREPARED_RECORDS_IDENTITY, "prepared-records-v1");
+        assert_eq!(DOCUMENT_IDS_IDENTITY, "document-ids-v1");
+        assert_eq!(DETECTOR_DISABLED_IDENTITY, "disabled");
+    }
+}
+
+#[cfg(test)]
 mod failure_resume_http_tests;
+#[cfg(test)]
+mod incremental_reconcile_http_tests;
