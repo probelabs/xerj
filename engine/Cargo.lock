@@ -6464,6 +6464,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "walkdir",
+ "xerj-common",
  "xxhash-rust",
  "zip 2.4.2",
 ]
@@ -6501,6 +6502,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
+ "libc",
  "prometheus",
  "serde",
  "serde_json",

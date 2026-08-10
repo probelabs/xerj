@@ -1111,9 +1111,7 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
 
     let batch_size = cmd.batch.max(1);
     let workers = if cmd.workers == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
+        xerj_common::resource::threads_for(xerj_common::resource::Workload::Latency)
     } else {
         cmd.workers
     };
@@ -1548,9 +1546,9 @@ fn main() -> Result<()> {
     if matches!(std::env::args().nth(1).as_deref(), Some("__extract-pdf")) {
         std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
     }
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
+    // Cores from the resource policy, so `XERJ_NUM_CPUS` and a container CPU
+    // quota reach the async runtime the same way they reach every pool (#240).
+    let cores = xerj_common::resource::cores();
     // ~8× cores, clamped to a sane band; env override wins.
     let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
         .ok()

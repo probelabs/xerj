@@ -1079,9 +1079,7 @@ impl Default for EmbeddingConfig {
             onnx_model_path: String::new(),
             onnx_tokenizer_path: String::new(),
             onnx_scheduling_window: 64,
-            onnx_intra_threads: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
+            onnx_intra_threads: crate::resource::threads_for(crate::resource::Workload::Latency),
             onnx_session_pool_size: 1,
             onnx_max_pending: 4096,
             onnx_max_batch: 64,
@@ -1268,29 +1266,41 @@ pub struct EngineConfig {
     /// Doubling shards roughly doubles sustained ingest throughput (linear
     /// scaling) until memory bandwidth is saturated.
     pub ingest_shards: usize,
-    /// Maximum concurrent flush tasks across all shards (default: `max(1, num_cpus / 4)`).
+    /// Maximum concurrent shard flush finalizations (default: the maintenance
+    /// share of the machine, `max(2, num_cpus / 8)` — see
+    /// [`crate::resource::threads_for`]).  `XERJ_FIN_CONC` overrides it for
+    /// one run.
     pub flush_workers: usize,
-    /// Background merge threads (default: `2`).
+    /// Threads in the background merge pool (default: the maintenance share of
+    /// the machine, `max(2, num_cpus / 8)`).  Merges are the one pool that is
+    /// deliberately kept narrow: nobody waits on a merge, and an all-core merge
+    /// pass was measured stalling ingest for 17.5 s.
     pub merge_workers: usize,
-    /// Parallel segment scan threads for search (default: `max(1, num_cpus / 4)`).
+    /// Threads available to search segment fan-out — rayon's global pool
+    /// (default: every core).  Search is the path a user waits on, so it gets
+    /// the whole machine unless you deliberately hold cores back.
     pub search_workers: usize,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        use crate::resource::{threads_for, Workload};
+        let cpus = crate::resource::cores();
         Self {
             ingest_shards: (cpus / 2).max(1).next_power_of_two(),
-            flush_workers: (cpus / 4).max(1),
-            merge_workers: 2,
-            search_workers: (cpus / 4).max(1),
+            flush_workers: threads_for(Workload::Maintenance),
+            merge_workers: threads_for(Workload::Maintenance),
+            search_workers: threads_for(Workload::Latency),
         }
     }
 }
 
 impl EngineConfig {
+    /// Upper bound on any of the worker knobs. Threads are not free: past this
+    /// the request is far more likely to be a typo than an intention, and a
+    /// silently clamped typo is the bug class in #204.
+    pub const MAX_WORKERS: usize = 4096;
+
     pub fn validate(&self) -> Result<(), crate::XerjError> {
         if self.ingest_shards == 0 || !self.ingest_shards.is_power_of_two() {
             return Err(crate::XerjError::config(format!(
@@ -1304,10 +1314,20 @@ impl EngineConfig {
                 self.ingest_shards
             )));
         }
-        if self.flush_workers == 0 {
-            return Err(crate::XerjError::config(
-                "engine.flush_workers must be >= 1",
-            ));
+        // Every worker knob is validated, because every worker knob is now
+        // wired to a pool: an out-of-range value must be refused at startup
+        // rather than accepted and quietly replaced with something else.
+        for (name, value) in [
+            ("engine.flush_workers", self.flush_workers),
+            ("engine.merge_workers", self.merge_workers),
+            ("engine.search_workers", self.search_workers),
+        ] {
+            if value == 0 || value > Self::MAX_WORKERS {
+                return Err(crate::XerjError::config(format!(
+                    "{name} must be in the range 1..={}, got {value}",
+                    Self::MAX_WORKERS
+                )));
+            }
         }
         Ok(())
     }

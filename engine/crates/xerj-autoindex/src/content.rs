@@ -19,15 +19,47 @@ pub struct Inventory {
     pub duplicates: Vec<DuplicateFile>,
 }
 
+/// Test-only witness: which pool the digest phase actually ran on. Phase A is
+/// where `--workers` was silently disconnected (#240), and the pool a task
+/// lands on is only observable from inside the task.
+#[cfg(test)]
+pub(crate) static OBSERVED_DIGEST_POOL_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set when any digest ran on a thread that is not one of the scan pool's.
+#[cfg(test)]
+pub(crate) static DIGEST_RAN_OFF_THE_SCAN_POOL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Hash each file once, group equal digests, then byte-verify only digest peers.
 ///
 /// This is linear in corpus bytes for adversarial common-prefix inputs rather
 /// than pairwise O(n² × file_size).
 pub fn resolve(files: Vec<FileEntry>) -> Result<Inventory> {
-    let digests: Vec<Result<String>> = files
-        .par_iter()
-        .map(|file| full_digest(&file.path, file.size))
-        .collect();
+    // Phase A belongs to the run's scan pool, not to rayon's global pool:
+    // `--workers` has to bound the CPU-bound phase to mean anything (#240 §2).
+    let digests: Vec<Result<String>> = crate::pool::install(|| {
+        files
+            .par_iter()
+            .map(|file| {
+                #[cfg(test)]
+                {
+                    OBSERVED_DIGEST_POOL_THREADS.fetch_max(
+                        rayon::current_num_threads(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let on_scan_pool = std::thread::current()
+                        .name()
+                        .is_some_and(|n| n.starts_with("xerj-scan-"));
+                    if !on_scan_pool {
+                        DIGEST_RAN_OFF_THE_SCAN_POOL
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                full_digest(&file.path, file.size)
+            })
+            .collect()
+    });
     let digests: Vec<String> = digests.into_iter().collect::<Result<_>>()?;
     resolve_with_digests(files, digests)
 }
@@ -181,6 +213,31 @@ fn read_chunk(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> 
 mod tests {
     use super::*;
     use std::fs;
+
+    /// #240 §2: the digest phase ran on rayon's default global pool — every
+    /// core on the machine — so `--workers` never bounded it. It must run on
+    /// the run's own scan pool, whose width the CLI sets.
+    #[test]
+    fn the_digest_phase_runs_on_the_runs_scan_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..32 {
+            fs::write(dir.path().join(format!("f{i}.txt")), format!("body {i}\n")).unwrap();
+        }
+        OBSERVED_DIGEST_POOL_THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
+        DIGEST_RAN_OFF_THE_SCAN_POOL.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        resolve(crate::walk::walk(dir.path(), false).unwrap()).unwrap();
+
+        assert!(
+            !DIGEST_RAN_OFF_THE_SCAN_POOL.load(std::sync::atomic::Ordering::Relaxed),
+            "phase A must not run on rayon's global pool"
+        );
+        assert_eq!(
+            OBSERVED_DIGEST_POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed),
+            crate::pool::scan_pool().current_num_threads(),
+            "the digest phase must see exactly the scan pool the run configured"
+        );
+    }
 
     #[test]
     fn identical_paths_become_one_content_file_and_an_alias() {
