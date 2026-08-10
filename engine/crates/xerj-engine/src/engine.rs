@@ -851,6 +851,11 @@ impl Engine {
         // actually present, and before the server accepts requests.
         engine.load_cluster_state();
 
+        // Then say plainly which `.ds-*` indices no restored stream claims.
+        // Nothing is deleted — see the doc comment; this is the log line that
+        // stops an unreachable backing index from being invisible.
+        engine.warn_orphaned_backing_indices();
+
         // Restore ISM/ILM policies and managed-index execution state so a
         // policy attached before a restart keeps running afterward instead
         // of silently going idle. Separate files (`ism_policies.json`,
@@ -2095,6 +2100,69 @@ impl Engine {
         }
     }
 
+    /// Name every `.ds-*` index on disk that no restored data stream claims.
+    ///
+    /// This does **not** reconcile anything — nothing is deleted, adopted or
+    /// repaired, because an orphan may hold the only copy of somebody's data.
+    /// It exists so the state is not *silent*: an orphaned backing index is
+    /// unreachable through the data-stream API (`GET` and `DELETE` on the
+    /// stream answer 404, while `PUT /_data_stream/<name>` answers
+    /// `409 resource_already_exists_exception` naming the orphan), so without
+    /// a line in the boot log the operator has no way to learn the name they
+    /// have to pass to `DELETE /<backing-index>` to clear it.
+    ///
+    /// Expected sources: a data dir written by a build that predates
+    /// `cluster_state.json` (data streams were not persisted at all then), or
+    /// a `DELETE /_data_stream` interrupted by a build that recorded the
+    /// removal before destroying the backing indices. Skipped entirely when
+    /// the cluster state did not load — then every stream is unknown and
+    /// every backing index would look orphaned.
+    fn warn_orphaned_backing_indices(&self) {
+        if !self
+            .cluster_state_loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        // Snapshot both maps before comparing them: nothing here may hold a
+        // shard guard on one map while taking one on the other.
+        let backing: Vec<String> = self
+            .indices
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|n| n.starts_with(".ds-"))
+            .collect();
+        if backing.is_empty() {
+            return;
+        }
+        let streams: Vec<(String, Vec<String>)> = self
+            .data_streams
+            .iter()
+            .map(|s| (s.key().clone(), s.value().backing_indices.clone()))
+            .collect();
+        let claimed = |index: &str| {
+            streams.iter().any(|(stream, indices)| {
+                indices.iter().any(|b| b == index)
+                    || index
+                        .strip_prefix(&format!(".ds-{stream}-"))
+                        .is_some_and(|gen| gen.parse::<u64>().is_ok())
+            })
+        };
+        let mut orphans: Vec<String> = backing.into_iter().filter(|n| !claimed(n)).collect();
+        if orphans.is_empty() {
+            return;
+        }
+        orphans.sort();
+        warn!(
+            count = orphans.len(),
+            indices = orphans.join(","),
+            "backing indices on disk belong to no known data stream — they are \
+             unreachable through the data-stream API and are NOT deleted \
+             automatically; remove each with DELETE /<index> once you have \
+             confirmed the data is not wanted"
+        );
+    }
+
     /// Insert into a persisted map and durably record the result, rolling the
     /// in-memory change back if the write fails so a 500 never leaves a
     /// change that only this process can see.
@@ -2856,27 +2924,81 @@ impl Engine {
             .map(|(_, v)| v)
             .ok_or_else(|| EngineError::Common(xerj_common::XerjError::index_not_found(name)))?;
 
-        // Record the removal before any backing index is destroyed: if the
-        // process dies mid-delete, a boot that still believes in the stream
-        // is recoverable (it warns about the missing backing indices), while
-        // one that has forgotten it leaves orphaned `.ds-*` directories no
-        // API can reach. A write failure here aborts the delete outright —
-        // nothing has been destroyed yet, so the stream is put back intact.
+        // Destroy the backing indices FIRST, and only then record the removal.
+        // The two orderings fail differently and only one of them is
+        // recoverable:
+        //
+        //   destroy → record (this one): a crash in the window leaves
+        //   `cluster_state.json` still describing the stream while some of its
+        //   `.ds-*` directories are already gone. The next boot restores the
+        //   stream and warns `restored data stream references backing indices
+        //   that are not present in the data dir` (see `load_cluster_state`),
+        //   `GET /_data_stream/<name>` still answers, and re-issuing the
+        //   DELETE finishes the job.
+        //
+        //   record → destroy: a crash in the window strands
+        //   `.ds-<name>-00000N` directories that no data-stream API can reach
+        //   — GET and DELETE answer 404 while `PUT /_data_stream/<name>`
+        //   answers `409 resource_already_exists_exception` forever, and boot
+        //   does not reconcile it. That is the same permanent wedge this PR
+        //   fixes for an interrupted rollover, so it is not the ordering to
+        //   ship.
+        //
+        // A backing index that cannot be destroyed therefore aborts the
+        // delete: the stream is put back and the caller gets the error, so
+        // the operator can retry rather than be told `acknowledged` about
+        // data that is still on disk. A retry is safe — an already-deleted
+        // backing index is simply absent from `self.indices` on the next
+        // pass.
+        let mut delete_err: Option<EngineError> = None;
+        for backing in &ds.backing_indices {
+            let Some((_, idx)) = self.indices.remove(backing) else {
+                // Not open: nothing left to destroy under this name (a
+                // previous attempt already removed it).
+                continue;
+            };
+            match idx.delete_all_data().await {
+                Ok(()) => {}
+                // `remove_dir_all` reports an already-absent directory as
+                // NotFound, which is the outcome we were asking for.
+                Err(EngineError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(
+                        data_stream = name,
+                        backing = backing.as_str(), error = %e,
+                        "backing index could not be deleted — the data stream \
+                         is left in place so the DELETE can be retried"
+                    );
+                    // Put it back so a retry can try again, and so the stream
+                    // we are about to restore does not point at an index the
+                    // engine has forgotten how to reach.
+                    self.indices.insert(backing.clone(), idx);
+                    if delete_err.is_none() {
+                        delete_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = delete_err {
+            self.data_streams.insert(name.to_string(), ds);
+            return Err(e);
+        }
+
+        // Only now is the removal safe to make durable. A write failure here
+        // means the data is gone but the document still names the stream —
+        // the recoverable half of the window above, so put the stream back in
+        // memory as well, keeping memory and disk saying the same thing, and
+        // report the error instead of acknowledging.
         if let Err(e) = self.flush_cluster_state() {
             self.data_streams.insert(name.to_string(), ds);
             return Err(e);
         }
 
-        // Remove the alias.
+        // Remove the alias. Last, so a failure anywhere above leaves the
+        // stream fully addressable for the retry.
         self.aliases.remove(name);
         self.flush_aliases();
 
-        // Delete every backing index.
-        for backing in &ds.backing_indices {
-            if let Ok(idx) = self.indices.remove(backing).map(|(_, v)| v).ok_or(()) {
-                let _ = idx.delete_all_data().await;
-            }
-        }
         info!(name, "data stream deleted");
         Ok(())
     }

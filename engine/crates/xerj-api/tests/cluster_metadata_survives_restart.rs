@@ -594,3 +594,147 @@ async fn concurrent_writes_do_not_corrupt_the_store() {
         );
     }
 }
+
+/// `DELETE /_data_stream/<name>` must not leave a backing index behind.
+///
+/// Now that the stream is persisted, the *order* of the two destructive steps
+/// decides whether a crash mid-delete is recoverable. Recording the removal
+/// first and destroying the backing indices second leaves `.ds-<name>-00000N`
+/// directories that no data-stream API can reach: GET and DELETE answer 404
+/// while `PUT /_data_stream/<name>` answers `409
+/// resource_already_exists_exception` — permanently, which is the same wedge
+/// the interrupted-rollover test above exists to prevent.
+///
+/// This test pins the observable end state of a clean delete: nothing left on
+/// disk, nothing left in the document, and the name immediately reusable
+/// after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_data_stream_leaves_no_backing_index_behind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let app = app_over(dir.path());
+        let (st, body) = put_json(&app, "/_data_stream/events", json!({})).await;
+        assert_eq!(st, StatusCode::OK, "PUT _data_stream: {body}");
+        for _ in 0..2 {
+            let (st, body) = post(&app, "/events/_rollover", json!({})).await;
+            assert_eq!(st, StatusCode::OK, "rollover: {body}");
+        }
+        assert!(
+            dir.path().join(".ds-events-000003").is_dir(),
+            "fixture is wrong: three generations should exist"
+        );
+
+        let (st, body) = delete(&app, "/_data_stream/events").await;
+        assert_eq!(st, StatusCode::OK, "DELETE _data_stream: {body}");
+    }
+
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("read data dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".ds-events-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a delete that answered 200 left backing indices on disk: {leftovers:?}"
+    );
+
+    let state: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("cluster_state.json")).expect("read"),
+    )
+    .expect("parse");
+    assert!(
+        state["data_streams"]["events"].is_null(),
+        "the removal did not reach disk: {state}"
+    );
+
+    // The name must be reusable — the wedge shows up here as a 409 naming a
+    // backing index the operator can no longer see.
+    let app = app_over(dir.path());
+    let (st, body) = put_json(&app, "/_data_stream/events", json!({})).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the stream name must be free after a delete + restart: {body}"
+    );
+}
+
+/// A backing index that cannot be destroyed must abort the delete, not be
+/// acknowledged.
+///
+/// This is the ordering above stated as a property rather than an outcome: the
+/// removal is only recorded once every backing index is really gone. The
+/// failure is injected where it actually happens in the field — the directory
+/// cannot be unlinked (read-only mount, EACCES after a uid change, EIO) —
+/// and the assertions are that the operator is told, that the stream is still
+/// fully addressable, that the document on disk still names it, and that the
+/// retry after the cause is fixed completes the job.
+///
+/// Unix-only, and skipped when the process can write through a `chmod 555`
+/// (i.e. running as root), where the failure cannot be injected this way.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backing_index_that_cannot_be_deleted_aborts_the_delete() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_over(dir.path());
+    let (st, body) = put_json(&app, "/_data_stream/orders", json!({})).await;
+    assert_eq!(st, StatusCode::OK, "PUT _data_stream: {body}");
+
+    let backing = dir.path().join(".ds-orders-000001");
+    assert!(backing.is_dir(), "fixture is wrong: no backing index");
+    let before = std::fs::read_to_string(dir.path().join("cluster_state.json")).expect("read");
+
+    // Make the backing index's own contents un-unlinkable. Nothing inside is
+    // destroyed, and the data dir stays writable — so a flush would succeed
+    // if the code reached one, which is what makes the assertion below about
+    // the document meaningful.
+    std::fs::set_permissions(&backing, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+    if std::fs::File::create(backing.join("root-probe")).is_ok() {
+        let _ = std::fs::remove_file(backing.join("root-probe"));
+        std::fs::set_permissions(&backing, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755");
+        eprintln!("skipped: permissions do not deny this process (running as root?)");
+        return;
+    }
+
+    let (st, body) = delete(&app, "/_data_stream/orders").await;
+    std::fs::set_permissions(&backing, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    assert_eq!(
+        st,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a delete that could not destroy a backing index must report it, not \
+         answer acknowledged: {body}"
+    );
+
+    let (st, body) = get(&app, "/_data_stream/orders").await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the stream must stay addressable after a failed delete, or the \
+         operator has no way to retry it: {body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("cluster_state.json")).expect("read"),
+        before,
+        "the removal must not have been recorded while the data is still there"
+    );
+
+    // The cause is fixed; the retry finishes the job.
+    let (st, body) = delete(&app, "/_data_stream/orders").await;
+    assert_eq!(st, StatusCode::OK, "retry after the cause is fixed: {body}");
+    assert!(
+        !backing.exists(),
+        "the retry left the backing index on disk"
+    );
+    let state: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("cluster_state.json")).expect("read"),
+    )
+    .expect("parse");
+    assert!(
+        state["data_streams"]["orders"].is_null(),
+        "the retry did not record the removal: {state}"
+    );
+}

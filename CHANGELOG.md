@@ -456,6 +456,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service and addressable and the operator can retry the delete once the cause
   is fixed.
 
+- **Index templates, ingest pipelines, data streams and ILM policies survive a
+  restart** ([#203](https://github.com/xerj-org/xerj/issues/203)). Index
+  templates, legacy (v1) templates, component templates, ingest pipelines, data
+  streams and ILM policies lived only in memory: `PUT /_index_template/logs`
+  answered `{"acknowledged": true}` and `GET` answered 404 after the next
+  restart, and the next index that should have matched the template was created
+  without it — with no error anywhere. All six are now persisted together in
+  `<data_dir>/cluster_state.json`, written atomically (tmp → fsync → rename →
+  fsync the parent directory) so the write is committed at the request, not in
+  a shutdown hook, and restored in `Engine::new` before the listeners come up.
+  A write that fails is rolled back in memory and answered with a 500 instead
+  of `acknowledged`. Restored pipelines are recompiled, not just re-read —
+  storing the definition alone would have left `?pipeline=x` accepted and
+  silently inert after a restart.
+
+  Four defects found while verifying it, each reproduced first:
+
+  - Concurrent management writes corrupted each other (all flushes staged
+    through one fixed `.tmp` path — 32 parallel template PUTs returned
+    `store_exception`). Snapshot-and-write is now serialized.
+  - A rollover interrupted between "backing index created" and "generation
+    persisted" wedged the data stream forever: every later rollover recomputed
+    the same name and got `409 resource_already_exists_exception`. Boot now
+    adopts the highest generation actually present on disk, warns, and persists
+    the repair once.
+  - A `cluster_state.json` that could not be **read** (EACCES after a uid
+    change on a container volume, a backup tool's chmod, EIO) came up as empty
+    maps, and the next management write renamed a snapshot of those empty maps
+    over a file whose bytes were perfectly good. The load failure now latches:
+    every management mutation is refused with a 500 naming the file, and the
+    file is not touched, until a boot loads it cleanly. The corrupt-parse arm
+    refuses too, and still keeps a `cluster_state.corrupt.json` copy.
+  - `DELETE /_data_stream/<name>` recorded the removal before destroying the
+    backing indices, so a crash in that window stranded `.ds-<name>-00000N`
+    directories that no data-stream API could reach — GET and DELETE answered
+    404 while `PUT /_data_stream/<name>` answered
+    `409 resource_already_exists_exception` permanently. The order is reversed:
+    the removal is recorded only once every backing index is gone, and a
+    backing index that cannot be deleted now aborts the DELETE with a 500
+    (it was previously swallowed and answered `acknowledged`) so the operator
+    can retry.
+
+  **Known gaps, deliberately not closed here.** `.ds-*` indices that no data
+  stream claims — left by a data dir written before this change, or by a
+  DELETE interrupted by an older build — are **not** cleaned up or adopted
+  automatically; boot now names them in a warning and the recovery is
+  `DELETE /<backing-index>` per index, because an orphan may hold the only copy
+  of real data. And `aliases.json` still has the read-error shape that was
+  fixed here for `cluster_state.json`: an unreadable aliases file is swallowed
+  at boot and overwritten by the next alias write. That is pre-existing
+  behaviour, not introduced here, and is tracked separately.
+
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**
   ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the
   resume plan was frozen is skipped and reported in the catalog — but that
