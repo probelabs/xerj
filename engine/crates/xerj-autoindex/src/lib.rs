@@ -1183,6 +1183,43 @@ impl RefusalTargets {
     }
 }
 
+/// The #195 zero-live verification failure, as a type rather than a string.
+///
+/// The journal claims records were made visible; the destination answers with
+/// none. That is always a failure, but not always the *same* failure: for a
+/// composing caller like `xerj brain` a resume journal that outlived a wiped
+/// data directory has a specific, executable recovery (`--fresh` in place),
+/// while a write-blocked or unreachable server does not. Only a typed error
+/// lets the caller tell them apart — `anyhow::bail!` forces it to either
+/// string-match the prose or reprint it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZeroLiveVerificationError {
+    /// Records the resume journal says were published.
+    pub journal_records: u64,
+    /// Completed files those records came from.
+    pub files_done_journaled: usize,
+    /// Dataset indices that answered with zero live documents.
+    pub dataset_indices: usize,
+}
+
+impl std::fmt::Display for ZeroLiveVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "autoindex verification failed: the resume journal records {} \
+             record(s) from {} completed file(s), but 0 documents are \
+             live across the {} dataset index(es). The indices exist and look healthy but \
+             hold nothing — a server-side write rejection (e.g. a disk flood-stage or \
+             index write block), deleted indices, or an unreadable server can all cause \
+             this. Fix the server-side condition, then rerun with --fresh to re-index \
+             from scratch",
+            self.journal_records, self.files_done_journaled, self.dataset_indices
+        )
+    }
+}
+
+impl std::error::Error for ZeroLiveVerificationError {}
+
 #[derive(Debug)]
 struct UnsupportedInventoryDeltaError {
     delta: UnsupportedInventoryDelta,
@@ -2940,16 +2977,21 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     };
     let live_records: u64 = ds_counts.values().sum();
     if journal_records > 0 && live_records == 0 {
-        anyhow::bail!(
-            "autoindex verification failed: the resume journal records {journal_records} \
-             record(s) from {files_done_journaled} completed file(s), but 0 documents are \
-             live across the {} dataset index(es). The indices exist and look healthy but \
-             hold nothing — a server-side write rejection (e.g. a disk flood-stage or \
-             index write block), deleted indices, or an unreadable server can all cause \
-             this. Fix the server-side condition, then rerun with --fresh to re-index \
-             from scratch",
-            plan.datasets.len()
-        );
+        // Typed, not `bail!`: a caller that composes this pipeline can only
+        // tell "the journal outlived its destination" from "the server
+        // rejected our writes" if the condition carries a type. `xerj brain`
+        // downcasts it (brain.rs) to offer the in-place rebuild instead of
+        // printing this text raw. Peer precedent for classifying a
+        // recoverable condition rather than folding it into a generic error:
+        // redb's `Database::do_repair` returns `DatabaseError::RepairAborted`
+        // as its own variant (redb/src/db.rs:994, Apache-2.0/MIT) so the
+        // caller can distinguish it from ordinary corruption.
+        return Err(ZeroLiveVerificationError {
+            journal_records,
+            files_done_journaled,
+            dataset_indices: plan.datasets.len(),
+        }
+        .into());
     }
 
     // correlations
