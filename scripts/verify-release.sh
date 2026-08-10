@@ -25,11 +25,17 @@
 #   4. every binary — including the ones this host cannot execute — carries the
 #      tag's version in its startup banner, and carries no other version
 #   5. the host-native binary: --version, boot on a clean data dir, health
-#      green, index a doc, search it back, run a terms aggregation
+#      green, index a doc, search it back, run a terms aggregation. Runs on
+#      Linux and macOS hosts (both architectures). It is NOT run on a Windows
+#      host — those archives are checksum- and version-checked like every
+#      other target, but this script never boots the .exe.
 #
-# A target this host cannot unpack (no unzip for the Windows .zip) is counted
-# and reported, never silently dropped: the run then exits non-zero, because a
-# partially-checked release is not a verified release.
+# Anything this run could not check is counted and reported, never silently
+# dropped, and the run then exits non-zero — a partially-checked release is not
+# a verified release. That covers a target this host cannot unpack (no unzip
+# for the Windows .zip) and a check-5 smoke (printed as "step 6" at run time)
+# that never executed because this host has no runnable artifact. The one
+# narrowing that still exits 0 is --no-smoke, because the operator asked for it.
 #
 # Usage:
 #   scripts/verify-release.sh                  # latest release
@@ -87,6 +93,9 @@ FAILURES=0
 # this host). Counted separately from failures: not a defect in the release, but
 # not a verification either, and the verdict must never round it up to PASS.
 SKIPPED_TARGETS=0
+# Set when step 6 did not execute anything for a reason the operator did NOT
+# ask for (no runnable artifact for this host). --no-smoke does not set it.
+SKIPPED_SMOKE=0
 pass() { printf '  %sPASS%s  %s\n' "$GRN" "$RST" "$1"; }
 fail() { printf '  %sFAIL%s  %s\n' "$RED" "$RST" "$1"; FAILURES=$((FAILURES + 1)); }
 warn() { printf '  %sSKIP%s  %s\n' "$YEL" "$RST" "$1"; }
@@ -183,11 +192,14 @@ for a in $ARCHIVES; do
       if command -v unzip >/dev/null 2>&1; then unzip -q -o "$a" -d "$d"
       else warn "$a — unzip not on PATH, contents NOT checked"; continue; fi ;;
   esac
-  bin=$(find "$d" -type f \( -name xerj -o -name xerj.exe \) | head -1)
+  # `|| true`: under `set -o pipefail`, find killed by SIGPIPE once head exits
+  # returns 141 for the whole pipeline and `set -e` would abort the verifier
+  # mid-run rather than report anything.
+  bin=$(find "$d" -type f \( -name xerj -o -name xerj.exe \) | head -1 || true)
   missing=""
   [ -n "$bin" ] || missing="$missing binary"
-  [ -n "$(find "$d" -type f -name LICENSE  | head -1)" ] || missing="$missing LICENSE"
-  [ -n "$(find "$d" -type f -name 'README*' | head -1)" ] || missing="$missing README"
+  [ -n "$(find "$d" -type f -name LICENSE  | head -1 || true)" ] || missing="$missing LICENSE"
+  [ -n "$(find "$d" -type f -name 'README*' | head -1 || true)" ] || missing="$missing README"
   if [ -n "$missing" ]; then fail "$a — missing:$missing"; else pass "$a  binary + LICENSE + README"; fi
 done
 
@@ -197,7 +209,7 @@ step "5. version string matches the tag, on every target"
 for a in $ARCHIVES; do
   d="unpack/${a%.tar.gz}"; d="${d%.zip}"
   target=$(printf '%s' "$a" | sed "s/^xerj-$EXPECTED-//; s/\.tar\.gz$//; s/\.zip$//")
-  bin=$(find "$d" -type f \( -name xerj -o -name xerj.exe \) 2>/dev/null | head -1)
+  bin=$(find "$d" -type f \( -name xerj -o -name xerj.exe \) 2>/dev/null | head -1 || true)
   if [ -z "$bin" ]; then
     # Step 4 could not unpack this archive (typically: no unzip for a Windows
     # .zip). Dropping it here would leave this section headed "on every target"
@@ -217,28 +229,52 @@ for a in $ARCHIVES; do
 done
 
 # ── 6. run the one we can actually run ───────────────────────────────────────
-HOST_OS=$(uname -s); HOST_ARCH=$(uname -m)
+HOST_OS=$(uname -s); HOST_ARCH=$(uname -m); HOST_ARCH_RAW="$HOST_ARCH"
+# `uname -m` and the Rust target triple disagree about the same CPU: an Apple
+# Silicon Mac says `arm64` where the artifact is named `aarch64-apple-darwin`.
+# Without this normalization the glob matched zero files on exactly the host a
+# maintainer is most likely to verify a release from, step 6 was skipped, and
+# the run still printed PASS — "everything green, nobody ran the artifact",
+# which is the rc.10 shape this script exists to catch.
+case "$HOST_ARCH" in
+  arm64|armv8b|armv8l) HOST_ARCH=aarch64 ;;
+  amd64)               HOST_ARCH=x86_64 ;;
+esac
 case "$HOST_OS" in
   Linux)  host_glob="*${HOST_ARCH}-unknown-linux-*" ;;
   Darwin) host_glob="*${HOST_ARCH}-apple-darwin*" ;;
+  # Windows (MSYS/MinGW/Cygwin) and everything else: the .zip is checksum- and
+  # version-checked like every other target, but this script does not boot the
+  # .exe, so there is no host binary to run here.
   *)      host_glob="" ;;
 esac
 
 HOST_BIN=""
 if [ -n "$host_glob" ]; then
   # shellcheck disable=SC2086
-  HOST_BIN=$(find unpack -type f -name xerj -path "$host_glob" 2>/dev/null | head -1)
+  HOST_BIN=$(find unpack -type f -name xerj -path "$host_glob" 2>/dev/null | head -1 || true)
 fi
 
 # Whether a live search was actually executed. The verdict line must not claim
-# it when it did not happen — a cross-arch runner or --no-smoke leaves this 0.
+# it when it did not happen: --no-smoke leaves this 0 and still passes, any
+# other reason leaves it 0 and sets SKIPPED_SMOKE, which fails the run.
 SMOKED=0
 
 step "6. run the host-native artifact"
-if [ -z "$HOST_BIN" ]; then
-  warn "no artifact for $HOST_OS/$HOST_ARCH — nothing to execute here"
-elif [ "$DO_SMOKE" = 0 ]; then
-  warn "--no-smoke"
+if [ "$DO_SMOKE" = 0 ]; then
+  # The operator asked for this narrowing, so it does not fail the run — but
+  # the verdict below still refuses to claim a live search it never ran.
+  warn "--no-smoke — no binary was executed"
+elif [ -z "$HOST_BIN" ]; then
+  # Not "no artifact for this platform": on a Windows host the archive for it
+  # was published, downloaded and version-checked by this very run. Say which
+  # of the two actually happened, and count it — nobody asked for it.
+  if [ -z "$host_glob" ]; then
+    warn "this script does not boot a release binary on $HOST_OS/$HOST_ARCH_RAW (Linux and macOS hosts only) — the artifacts for it, if any, were still checksum- and version-checked above"
+  else
+    warn "no unpacked binary matched $host_glob — the archive for this host was not unpacked (see step 4), so nothing was executed"
+  fi
+  SKIPPED_SMOKE=1
 else
   SMOKED=1
   chmod +x "$HOST_BIN"
@@ -310,19 +346,24 @@ fi
 
 step "verdict"
 # PASS is only ever printed for a release where every declared target was
-# actually checked. --no-smoke narrows the verdict text because the operator
-# asked for it; a skipped target is not something anyone asked for, so it fails
-# closed rather than being rounded up into a PASS this run did not earn.
-if [ "$FAILURES" -eq 0 ] && [ "$SKIPPED_TARGETS" -eq 0 ]; then
+# actually checked AND the host-native binary actually ran. --no-smoke narrows
+# the verdict text because the operator asked for it; a skipped target, or a
+# step 6 that silently never executed, is not something anyone asked for, so it
+# fails closed rather than being rounded up into a PASS this run did not earn.
+if [ "$FAILURES" -eq 0 ] && [ "$SKIPPED_TARGETS" -eq 0 ] && [ "$SKIPPED_SMOKE" -eq 0 ]; then
   if [ "$SMOKED" = 1 ]; then
     scope="checksums and versions verified on $TOTAL_TARGETS/$TOTAL_TARGETS targets, plus a live search"
   else
-    scope="checksums and versions verified on $TOTAL_TARGETS/$TOTAL_TARGETS targets — NO binary was executed, so nothing here says it runs"
+    scope="checksums and versions verified on $TOTAL_TARGETS/$TOTAL_TARGETS targets — NO binary was executed (--no-smoke), so nothing here says it runs"
   fi
   printf '  %sPASS%s  %s: %s\n' "$GRN" "$RST" "$TAG" "$scope"
   exit 0
 fi
 
+if [ "$SKIPPED_SMOKE" -gt 0 ]; then
+  printf '  %sFAIL%s  %s: nothing was executed — no binary ran on this host and nobody asked for that (see SKIP at step 6); re-run on a host this release ships a runnable binary for, or pass --no-smoke to accept a checksums-and-versions-only check\n' \
+    "$RED" "$RST" "$TAG"
+fi
 if [ "$SKIPPED_TARGETS" -gt 0 ]; then
   printf '  %sFAIL%s  %s: %s of %s target(s) NOT verified (see SKIP above) — install the missing tool (unzip, for the Windows .zip archives) and re-run; do not announce a partially checked release\n' \
     "$RED" "$RST" "$TAG" "$SKIPPED_TARGETS" "$TOTAL_TARGETS"
