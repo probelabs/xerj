@@ -1996,12 +1996,28 @@ mod tests {
                     continue;
                 };
                 let key = key.trim();
-                if section.is_empty()
-                    || key.is_empty()
+                if key.is_empty()
                     || !key
                         .bytes()
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
                 {
+                    continue;
+                }
+                if section.is_empty() {
+                    // Skipping quietly here is how a whole block escapes the
+                    // check. Only a line that names a real setting matters, so
+                    // report exactly those and stay quiet about `key = value`
+                    // text that is not config at all.
+                    if defaults
+                        .as_object()
+                        .is_some_and(|cfg| cfg.values().any(|s| s.get(key).is_some()))
+                    {
+                        drift.push(format!(
+                            "example: `{key} = …` sits in a block with no [section] header \
+                             above it, so nothing can check it against Config::default() — \
+                             add the header"
+                        ));
+                    }
                     continue;
                 }
                 let Some(actual) = defaults.get(&section).and_then(|s| s.get(key)) else {
