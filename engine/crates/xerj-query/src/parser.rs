@@ -616,7 +616,7 @@ fn parse_match_phrase(params: &Value) -> Result<QueryNode> {
         .get("query")
         .and_then(scalar_to_string)
         .ok_or_else(|| qerr("`match_phrase.query` must be a non-empty scalar"))?;
-    let slop = vobj.get("slop").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let slop = parse_phrase_slop(vobj.get("slop"), "match_phrase")?;
     let analyzer = vobj
         .get("analyzer")
         .and_then(|v| v.as_str())
@@ -636,6 +636,100 @@ fn parse_match_phrase(params: &Value) -> Result<QueryNode> {
     };
     Ok(maybe_named(node, name))
 }
+
+/// Coerce a JSON scalar to an integer the way ES's `XContentParser.intValue()`
+/// does under its default number policy (`DEFAULT_NUMBER_COERCE_POLICY = true`):
+/// an integer is taken as written, a **float is truncated** toward zero, and a
+/// numeric **string** is read as a double and then narrowed
+/// (`libs/x-content/src/main/java/org/elasticsearch/xcontent/support/AbstractXContentParser.java`:
+/// `:70` — "the 3rd party parsers we rely on are known to silently truncate
+/// fractions", guarding `ensureNumberConversion` at `:74`, which only raises
+/// when `coerce == false`; `:171` `intValue(coerce)`, whose `VALUE_STRING`
+/// arm calls `:162` `parseInt`, itself a `Double.parseDouble` narrowed with
+/// `(int)`; AGPL, read for semantics only, nothing copied).
+///
+/// Why it exists: JSON encoders that carry every number as a double emit
+/// `"slop": 2.0`, and ES answers that query with slop 2. Reading it with
+/// `as_i64()` alone leaves two bad options — a 400 on a request ES answers, or
+/// a silent fall back to the default, which is the accept-and-ignore (#204)
+/// this parser exists to remove.
+///
+/// The `as i64` cast saturates on an out-of-range float, so an absurd value
+/// lands on the bound and the caller's range check turns it into a 400 rather
+/// than a wrapped, silently honoured small number.
+fn coerce_es_int(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    let d = match v {
+        Value::Number(_) => v.as_f64()?,
+        Value::String(s) => s.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    d.is_finite().then(|| d.trunc() as i64)
+}
+
+/// Parse the `slop` parameter of a phrase-shaped query, identically at each of
+/// the three entry points that accept one and lower it to a phrase:
+/// `match_phrase`, `match_phrase_prefix`, `multi_match`.  Sharing it is the
+/// point: the same JSON value must produce the same answer whichever of those
+/// three wraps it, or a client gets a 400 from one spelling and a silently
+/// different answer from the semantically identical other.
+///
+/// Deliberately **not** covered: `span_near`, which also takes a `slop` and
+/// keeps its own `as_u64().unwrap_or(0)` read (see `parse_span_near`).  ES
+/// applies no validation there either — `SpanNearQueryBuilder` stores the int
+/// unchecked (`.../index/query/SpanNearQueryBuilder.java:62`), so a negative
+/// `span_near` slop is a query ES *answers*, and routing it through here would
+/// turn a 200 into a 400.  XERJ still coerces it to 0 instead of honouring it,
+/// which is a real (pre-existing) gap — recorded in `parse_span_near`, not
+/// papered over here.
+///
+/// ES rejects a negative slop from all three phrase builders
+/// (`MatchPhraseQueryBuilder.slop` / `MatchPhrasePrefixQueryBuilder.slop:103`
+/// / `MultiMatchQueryBuilder.slop:350` all throw "No negative slop allowed";
+/// AGPL, read for semantics only).  `u32::try_from` rather than `as u32`
+/// because a wrapping cast turns an out-of-range slop into a small honoured
+/// one — a silently wrong answer, which is worse than a 400.
+fn parse_phrase_slop(v: Option<&Value>, ctx: &str) -> Result<u32> {
+    match v {
+        None | Some(Value::Null) => Ok(0),
+        Some(v) => match coerce_es_int(v) {
+            Some(n) if n < 0 => invalid(format!("`{ctx}.slop` must not be negative")),
+            Some(n) => u32::try_from(n).map_err(|_| qerr(format!("`{ctx}.slop` is out of range"))),
+            None => invalid(format!("`{ctx}.slop` must be a number")),
+        },
+    }
+}
+
+/// Parse `max_expansions`, with the same refusal-to-ignore as
+/// [`parse_phrase_slop`]: a value XERJ cannot read is a 400, never a silent
+/// fall back to the default of 50.
+///
+/// The floor differs between the two entry points, and that asymmetry is ES's
+/// rather than an oversight here: `MultiMatchQueryBuilder.maxExpansions`
+/// throws on `<= 0` (`.../index/query/MultiMatchQueryBuilder.java:389`) while
+/// `MatchPhrasePrefixQueryBuilder.maxExpansions` throws only on `< 0`
+/// (`.../index/query/MatchPhrasePrefixQueryBuilder.java:118`, "No negative
+/// maxExpansions allowed").  So `0` is a 400 on `multi_match` and an accepted
+/// (expand-nothing) value on `match_phrase_prefix`; `allow_zero` carries that
+/// distinction instead of us inventing one ES does not have.
+fn parse_max_expansions(v: Option<&Value>, ctx: &str, allow_zero: bool) -> Result<u32> {
+    match v {
+        None | Some(Value::Null) => Ok(DEFAULT_MAX_EXPANSIONS),
+        Some(v) => match coerce_es_int(v) {
+            Some(n) if n < 0 => invalid(format!("`{ctx}.max_expansions` must not be negative")),
+            Some(0) if !allow_zero => invalid(format!("`{ctx}.max_expansions` must be positive")),
+            Some(n) => u32::try_from(n)
+                .map_err(|_| qerr(format!("`{ctx}.max_expansions` is out of range"))),
+            None => invalid(format!("`{ctx}.max_expansions` must be a number")),
+        },
+    }
+}
+
+/// ES's `FuzzyQuery.defaultMaxExpansions`, which both phrase-prefix builders
+/// default to.
+const DEFAULT_MAX_EXPANSIONS: u32 = 50;
 
 /// ES `combined_fields` query — introduced in 7.13, treats N text fields as a
 /// single virtual field for term-frequency scoring. Our approximation routes
@@ -681,6 +775,45 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("best_fields");
+
+    // `slop` / `max_expansions` are the phrase parameters of `multi_match`.
+    // They used to be dropped here, so `{"type":"phrase","slop":2}` was
+    // accepted and silently evaluated as slop 0 (issue #230) — parse them
+    // and reject the values ES rejects instead of quietly mis-answering.
+    // ES: negative slop and non-positive max_expansions are 400s, and
+    // `slop` is not allowed with `type: bool_prefix`.
+    let slop: u32 = parse_phrase_slop(obj.get("slop"), "multi_match")?;
+    let max_expansions: u32 =
+        parse_max_expansions(obj.get("max_expansions"), "multi_match", false)?;
+    if slop != 0 && type_str == "bool_prefix" {
+        // ES's own wording — `310_match_bool_prefix.yml` catches this exact
+        // regex. The suite's runner only checks that the call is allowed to
+        // fail, so this arm passed while XERJ silently ignored `slop`.
+        return invalid("[slop] not allowed for type [bool_prefix]");
+    }
+    // `slop` with `type: phrase_prefix` is ACCEPTED and HONOURED, because ES
+    // honours it: `MultiMatchQueryBuilder` rejects slop only for
+    // `bool_prefix` (…/index/query/MultiMatchQueryBuilder.java:673) and
+    // `TextFieldMapper.createPhrasePrefixQuery` calls
+    // `MultiPhrasePrefixQuery.setSlop(slop)` (…/index/mapper/
+    // TextFieldMapper.java:2019, `setSlop` at :2028, reached from the
+    // `phrasePrefixQuery` entry at :1269 — AGPL, read for semantics only).
+    // Both XERJ
+    // evaluators now carry it: `PhrasePrefixQuery.slop` on the segment side
+    // and the sloppy prefix walk in the stored-doc scan. Refusing it here
+    // would have been a wire-compat break on a query ES answers, and would
+    // have left the semantically identical single-field
+    // `{"match_phrase_prefix": {"f": {"query": …, "slop": N}}}` — which
+    // `parse_match_phrase_prefix` accepts — answering a different query.
+    //
+    // `slop` on the FIELD-CENTRIC types (best_fields / most_fields /
+    // cross_fields) is accepted and unused, which is also what ES does:
+    // those types lower to a BOOLEAN match query, and only the PHRASE and
+    // PHRASE_PREFIX types lower to a phrase query that reads slop
+    // (`MultiMatchQueryBuilder.Type`, elasticsearch/server/src/main/java/
+    // org/elasticsearch/index/query/MultiMatchQueryBuilder.java:91 — AGPL,
+    // read for semantics only). Same answer as ES, so there is nothing to
+    // fail loudly about.
 
     // bool_prefix: rewrite to a Bool::should over per-field match_bool_prefix
     // clauses. Tokens except the last become Match queries, the last becomes
@@ -847,6 +980,8 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
         operator,
         analyzer,
         boost,
+        slop,
+        max_expansions,
     })
 }
 
@@ -1994,6 +2129,7 @@ fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
             field,
             query,
             max_expansions: 50,
+            slop: 0,
         });
     }
 
@@ -2009,15 +2145,32 @@ fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
         .get("query")
         .and_then(scalar_to_string)
         .ok_or_else(|| qerr("`match_phrase_prefix.query` must be a non-empty scalar"))?;
-    let max_expansions = inner
-        .get("max_expansions")
-        .and_then(Value::as_u64)
-        .unwrap_or(50) as u32;
+    // `max_expansions` used to be read with `as_u64().unwrap_or(50)`, so
+    // `-1`, `"7"` and `7.0` all silently became 50 — the same accept-and-ignore
+    // (#204) as the dropped `slop` below, one line apart. It is now the shared
+    // parse: a value we cannot read is a 400, and `0` stays accepted because
+    // ES accepts it *here* (it rejects it on `multi_match`; the asymmetry is
+    // ES's own, see `parse_max_expansions`).
+    let max_expansions = parse_max_expansions(
+        inner.get("max_expansions"),
+        "match_phrase_prefix",
+        /* allow_zero */ true,
+    )?;
+    // `slop` used to be read nowhere here, so
+    // `{"match_phrase_prefix": {"f": {"query": …, "slop": 2}}}` was accepted
+    // and answered as slop 0 — accept-and-ignore (#204 class), and a silent
+    // disagreement with the `multi_match` form of the same query. ES parses
+    // and honours it (`MatchPhrasePrefixQueryBuilder.fromXContent` →
+    // `MatchQueryParser.setPhraseSlop`), and both XERJ evaluators now carry
+    // it: `PhrasePrefixQuery.slop` on segments, the sloppy prefix walk in
+    // the stored-doc scan.
+    let slop = parse_phrase_slop(inner.get("slop"), "match_phrase_prefix")?;
 
     Ok(QueryNode::MatchPhrasePrefix {
         field,
         query,
         max_expansions,
+        slop,
     })
 }
 
@@ -2143,6 +2296,8 @@ fn make_simple_query_node(term: &str, fields: &[String]) -> QueryNode {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         }
     }
 }
@@ -3456,6 +3611,20 @@ fn parse_span_near(params: &Value) -> Result<QueryNode> {
         return Ok(QueryNode::MatchNone);
     }
 
+    // KNOWN GAP (pre-existing, deliberately not changed by #230): this read
+    // accepts anything and silently substitutes 0 — `slop: -1`, `slop: 2.0`
+    // and `slop: "2"` all answer as slop 0. It is NOT routed through
+    // `parse_phrase_slop`, and the phrase work in #230 does not cover it.
+    //
+    // It is left alone rather than "fixed" because ES applies no validation
+    // here either: `SpanNearQueryBuilder` takes the int unchecked
+    // (`.../index/query/SpanNearQueryBuilder.java:62`, no negative test)
+    // while every phrase builder throws on a negative slop. So a negative
+    // `span_near` slop is a query ES answers, and rejecting it would be a
+    // wire-compat break on a request that works today. Closing it properly
+    // means honouring the value (float coercion via `coerce_es_int`, and a
+    // decision about what a negative span slop should match), which is a
+    // span-query change, not a phrase one.
     let slop = obj.get("slop").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let in_order = obj
         .get("in_order")
@@ -4427,6 +4596,161 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// #230 — `slop` and `max_expansions` are phrase parameters of
+    /// `multi_match`. They used to be dropped here, so `{"type":"phrase",
+    /// "slop":2}` was accepted and silently answered as an exact phrase.
+    #[test]
+    fn test_multi_match_phrase_params_are_parsed() {
+        let node = q(json!({
+            "multi_match": {
+                "query": "quick fox", "fields": ["body"],
+                "type": "phrase", "slop": 3
+            }
+        }));
+        assert!(matches!(
+            node,
+            QueryNode::MultiMatch {
+                match_type: MultiMatchType::Phrase,
+                slop: 3,
+                max_expansions: 50,
+                ..
+            }
+        ));
+
+        let node = q(json!({
+            "multi_match": {
+                "query": "quick fo", "fields": ["body"],
+                "type": "phrase_prefix", "max_expansions": 7
+            }
+        }));
+        assert!(matches!(
+            node,
+            QueryNode::MultiMatch {
+                match_type: MultiMatchType::PhrasePrefix,
+                slop: 0,
+                max_expansions: 7,
+                ..
+            }
+        ));
+    }
+
+    /// Values ES rejects must be rejected here too, not silently coerced.
+    #[test]
+    fn test_multi_match_phrase_params_are_validated() {
+        for bad in [
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "phrase", "slop": -1}}),
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "phrase", "slop": 4294967296i64}}),
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "phrase_prefix", "max_expansions": 0}}),
+            // ES rejects slop for bool_prefix ONLY
+            // (MultiMatchQueryBuilder.java:673).
+            json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                   "type": "bool_prefix", "slop": 2}}),
+            // The same values are rejected on the single-field phrase
+            // entry points — one JSON value, one answer, whichever query
+            // wraps it.
+            json!({"match_phrase": {"body": {"query": "a b", "slop": -1}}}),
+            json!({"match_phrase_prefix": {"body": {"query": "a b", "slop": -1}}}),
+            json!({"match_phrase_prefix": {"body": {"query": "a b", "slop": 4294967296i64}}}),
+            // `max_expansions` used to be read here as
+            // `as_u64().unwrap_or(50)`, so both of these were accepted and
+            // silently answered with 50 (#204 class).  ES throws "No negative
+            // maxExpansions allowed" (MatchPhrasePrefixQueryBuilder.java:118).
+            json!({"match_phrase_prefix": {"body": {"query": "a b", "max_expansions": -1}}}),
+            json!({"match_phrase_prefix": {"body": {"query": "a b", "max_expansions": "many"}}}),
+            json!({"match_phrase": {"body": {"query": "a b", "slop": "two"}}}),
+        ] {
+            assert!(
+                parse_query(&bad).is_err(),
+                "expected a parse error for {bad}"
+            );
+        }
+    }
+
+    /// Values ES *accepts by coercing* must be accepted here too. ES reads
+    /// `slop` and `max_expansions` with `XContentParser.intValue()` under the
+    /// default coercing policy, which truncates a float token and narrows a
+    /// numeric string (`AbstractXContentParser.java:171` `intValue(coerce)`,
+    /// `:162` `parseInt`, `:70`), so
+    /// `{"slop": 2.0}` is a request ES answers with slop 2. Refusing it would
+    /// be a new 400 on a query that works today, and reading it as 0 would be
+    /// the accept-and-ignore this parser exists to remove — both are wrong.
+    #[test]
+    fn test_phrase_params_are_coerced_like_es() {
+        for (v, want) in [(json!(2.0), 2u32), (json!(2.9), 2), (json!("2"), 2)] {
+            let node = q(json!({"match_phrase": {"body": {"query": "a b", "slop": v}}}));
+            assert!(
+                matches!(node, QueryNode::MatchPhrase { slop, .. } if slop == want),
+                "slop {v} must coerce to {want}, parsed to {node:?}"
+            );
+            let node = q(json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                                "type": "phrase", "slop": v}}));
+            assert!(
+                matches!(node, QueryNode::MultiMatch { slop, .. } if slop == want),
+                "multi_match slop {v} must coerce to {want}, parsed to {node:?}"
+            );
+        }
+
+        // `max_expansions: 0` is a 400 on `multi_match`
+        // (MultiMatchQueryBuilder.java:389 rejects `<= 0`) and ACCEPTED on
+        // `match_phrase_prefix` (MatchPhrasePrefixQueryBuilder.java:118
+        // rejects only `< 0`). The asymmetry is ES's; XERJ mirrors it rather
+        // than inventing a rule ES does not have.
+        let node = q(json!({"match_phrase_prefix": {"body": {"query": "a b",
+                                                             "max_expansions": 0}}}));
+        assert!(
+            matches!(node, QueryNode::MatchPhrasePrefix { max_expansions, .. }
+                     if max_expansions == 0),
+            "ES accepts max_expansions 0 on match_phrase_prefix, parsed to {node:?}"
+        );
+        assert!(
+            parse_query(&json!({"multi_match": {"query": "a b", "fields": ["body"],
+                                                "type": "phrase_prefix",
+                                                "max_expansions": 0}}))
+            .is_err(),
+            "ES rejects max_expansions 0 on multi_match"
+        );
+    }
+
+    /// `slop` + `type: phrase_prefix` is ACCEPTED and carried, at BOTH
+    /// entry points. ES honours it (`MultiMatchQueryBuilder` rejects slop
+    /// only for `bool_prefix`; `TextFieldMapper.createPhrasePrefixQuery`
+    /// calls `MultiPhrasePrefixQuery.setSlop`), so refusing it would be a
+    /// wire-compat break — and dropping it, as `parse_match_phrase_prefix`
+    /// used to, is the accept-and-ignore defect class of #204.
+    #[test]
+    fn test_phrase_prefix_slop_is_carried_at_both_entry_points() {
+        let node = q(json!({
+            "multi_match": {"query": "quick fo", "fields": ["body"],
+                            "type": "phrase_prefix", "slop": 2}
+        }));
+        assert!(
+            matches!(
+                node,
+                QueryNode::MultiMatch {
+                    match_type: MultiMatchType::PhrasePrefix,
+                    slop: 2,
+                    ..
+                }
+            ),
+            "multi_match phrase_prefix must carry slop, got {node:?}"
+        );
+
+        let node = q(json!({
+            "match_phrase_prefix": {"body": {"query": "quick fo", "slop": 2}}
+        }));
+        assert!(
+            matches!(node, QueryNode::MatchPhrasePrefix { slop: 2, .. }),
+            "match_phrase_prefix must carry slop, got {node:?}"
+        );
+
+        // Absent slop is 0 at both entry points.
+        let node = q(json!({"match_phrase_prefix": {"body": "quick fo"}}));
+        assert!(matches!(node, QueryNode::MatchPhrasePrefix { slop: 0, .. }));
     }
 
     // ── term ──────────────────────────────────────────────────────────────────
