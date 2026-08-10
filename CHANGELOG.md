@@ -91,7 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `landing/docs/storage.html` said the WAL rolls at 512 MiB;
   `landing/docs/vectors.html` called `scalar8` "the default" and listed a
   `scalar4` mode that no config or mapping value can reach; and
-  `engine/README.md` put `flush_size_mb` at 256 MiB. All four are corrected.
+  `engine/README.md` put `flush_size_mb` at 256 MiB. All four are corrected,
+  along with the docs search-index blob duplicated across 44 landing pages,
+  which offered `scalar4` as a selectable quantization mode.
   A second guard, `the_docs_site_config_page_agrees_with_the_real_defaults`,
   now diffs *both* halves of that page — every DEFAULT cell in the reference
   table and every assignment in the example blocks — against
