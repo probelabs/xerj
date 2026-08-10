@@ -196,6 +196,10 @@ struct FileScan {
     sniffed: Option<Sniffed>,
     sketches: Vec<GroupSketch>,
     junk: Option<(String, String)>, // (status, reason)
+    /// Run-local PDF extraction produced during sampling. This is consumed by
+    /// Phase B only when it is bound to the same full-content generation.
+    pdf_spool: Option<extract::pdf::ExtractionSpool>,
+    pdf_spool_fallbacks: Vec<extract::pdf::SpoolFallback>,
 }
 
 /// One sampled group within a file: every field it produced, plus the names
@@ -208,11 +212,53 @@ struct GroupSketch {
     records: u64,
 }
 
-fn scan_file(path: &Path, size: u64, sample: usize, max_file_gb: u64) -> FileScan {
+fn take_pdf_spool_if_indexable<T>(
+    spool: &mut Option<T>,
+    is_junk: bool,
+    budget: &extract::pdf::ExtractionSpoolBudget,
+) -> Option<T> {
+    if is_junk {
+        if spool.is_some() {
+            budget.record_discarded_before_replay();
+        }
+        spool.take();
+        None
+    } else {
+        spool.take()
+    }
+}
+
+/// Everything phase A needs beyond the file list and the run config: where a
+/// run-local PDF artifact may live, the shared admission budget, the one-line
+/// capacity explanation reported when files fall back — and the progress
+/// surface those lines go out through, because phase A now reports every file
+/// it touches (#241) as well as every artifact it could not keep.
+///
+/// Grouped so `scan_file` and `build_phase_a` each take one parameter instead
+/// of four.
+struct PhaseAContext<'a> {
+    state_dir: &'a Path,
+    budget: &'a std::sync::Arc<extract::pdf::ExtractionSpoolBudget>,
+    capacity_warning: Option<&'a str>,
+    progress: &'a Progress,
+}
+
+fn scan_file(
+    path: &Path,
+    size: u64,
+    digest: &str,
+    ctx: &PhaseAContext<'_>,
+    sample: usize,
+    max_file_gb: u64,
+) -> FileScan {
+    let state_dir = ctx.state_dir;
+    let pdf_spool_budget = ctx.budget;
     let mut out = FileScan {
         sniffed: None,
         sketches: Vec::new(),
         junk: None,
+        pdf_spool: None,
+        pdf_spool_fallbacks: Vec::new(),
     };
     let sn = match sniff::sniff(path) {
         Ok(s) => s,
@@ -282,7 +328,53 @@ fn scan_file(path: &Path, size: u64, sample: usize, max_file_gb: u64) -> FileSca
             (entry.1 as usize) < sample
         }
     };
-    match extract::extract(path, &sn, limit, &mut sink) {
+    let extraction = if sn.family == Family::Pdf {
+        match extract::pdf::extract_and_spool(
+            path,
+            state_dir,
+            size,
+            digest,
+            pdf_spool_budget,
+            &mut sink,
+        ) {
+            Ok((stats, spool, fallback)) => {
+                // The inventory digest was computed before Phase A. Only hand
+                // bytes to Phase B when the source still matches that exact
+                // generation after the parser has finished reading it.
+                // If no reusable artifact exists, avoid a second full-file
+                // read: Phase B performs the authoritative generation check
+                // immediately before its ordinary reparse.
+                if spool.is_none() {
+                    out.pdf_spool_fallbacks.extend(fallback);
+                } else {
+                    match content::verify(path, size, digest) {
+                        Ok(()) => {
+                            out.pdf_spool = spool;
+                            out.pdf_spool_fallbacks.extend(fallback);
+                        }
+                        Err(error) => {
+                            if spool.is_some() {
+                                pdf_spool_budget.record_discarded_before_replay();
+                            }
+                            pdf_spool_budget.record_source_generation_changed();
+                            out.pdf_spool_fallbacks.extend(fallback);
+                            out.pdf_spool_fallbacks.push(extract::pdf::SpoolFallback {
+                                category: "source_generation_changed",
+                                message: format!(
+                                    "source generation changed after extraction: {error:#}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                Ok(stats)
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        extract::extract(path, &sn, limit, &mut sink)
+    };
+    match extraction {
         Ok(stats) => {
             if groups.is_empty() {
                 out.junk = Some((
@@ -323,7 +415,17 @@ mod clustering_key_tests {
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
-        scan_file(&path, size, 500, 2)
+        // Clustering keys are decided by extraction, not by PDF artifact
+        // reuse: a zero budget keeps these cases on the plain parse path.
+        let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
+        let progress = Progress::silent();
+        let ctx = PhaseAContext {
+            state_dir: dir,
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        };
+        scan_file(&path, size, "d0", &ctx, 500, 2)
     }
 
     /// The #178 mechanism, from the extractor to the clustering key: a source
@@ -438,16 +540,26 @@ mod phase_a_grouping_tests {
             .map(|f| ids::file_key(&f.path, f.size).unwrap())
             .collect();
         let digests: Vec<String> = (0..files.len()).map(|i| format!("d{i}")).collect();
-        let (plan, _) = build_phase_a(
+        // Planning is what these cases assert on; a zero budget keeps every
+        // file on the plain parse path so no artifact is ever retained.
+        let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
+        let progress = Progress::silent();
+        let ctx = PhaseAContext {
+            state_dir: root,
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        };
+        build_phase_a(
             root,
             &files,
             &keys,
             &digests,
             Vec::new(),
+            &ctx,
             &cfg_for(root),
-            &Progress::silent(),
-        );
-        plan
+        )
+        .plan
     }
 
     const CODE: &str = "// The event loop dispatches every ready connection to a worker.\n\
@@ -608,6 +720,77 @@ fn compute_scopes(root: &Path, rels: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// What phase A produces: the frozen plan, the clusters phase B needs, and
+/// the run-local PDF artifacts (index-aligned with `files`) that phase B may
+/// replay instead of parsing again. A spool is always optional — every entry
+/// may legitimately be `None`.
+struct PhaseA {
+    plan: Plan,
+    clusters: Vec<dataset::Cluster>,
+    pdf_spools: Vec<Option<extract::pdf::ExtractionSpool>>,
+}
+
+/// Record and report why individual PDFs could not retain a run-local
+/// artifact. Reuse is an accelerator, so this is purely informational: every
+/// listed file is parsed again by the normal phase B path. Recording is kept
+/// even when the budget is globally disabled — the stored examples are the
+/// only place the `--json` report explains *why* nothing was reused, and they
+/// are already capped at three.
+///
+/// Reporting goes out through the progress surface, never a bare `eprintln!`:
+/// stderr belongs to that surface, so `--progress none` stays silent and
+/// `--progress json` stays a single parseable stream (#241).
+fn report_pdf_spool_fallbacks(
+    files: &[walk::FileEntry],
+    scans: &[FileScan],
+    ctx: &PhaseAContext<'_>,
+) {
+    let pdf_spool_budget = ctx.budget;
+    let pr = ctx.progress;
+    let reasons: Vec<(&str, &extract::pdf::SpoolFallback)> = scans
+        .iter()
+        .enumerate()
+        .flat_map(|(index, scan)| {
+            scan.pdf_spool_fallbacks
+                .iter()
+                .map(move |fallback| (files[index].rel.as_str(), fallback))
+        })
+        .collect();
+    for (path, fallback) in &reasons {
+        pdf_spool_budget.record_fallback_example(path, fallback.category, &fallback.message);
+    }
+    if reasons.is_empty() {
+        return;
+    }
+    if pdf_spool_budget.platform_reuse_is_unavailable() {
+        pr.note(
+            "phase A: run-local PDF extraction reuse is unavailable on this platform; \
+             phase B will use the normal parser",
+        );
+        return;
+    }
+    pr.note(&format!(
+        "phase A: {} PDF extraction(s) could not retain a bounded run-local artifact; \
+         phase B will parse them again safely",
+        reasons.len()
+    ));
+    if let Some(warning) = ctx.capacity_warning {
+        pr.note(&format!("  PDF reuse capacity: {warning}"));
+    }
+    for (path, fallback) in reasons.iter().take(3) {
+        pr.note(&format!(
+            "  PDF reuse fallback for {path}: {}",
+            fallback.message
+        ));
+    }
+    if reasons.len() > 3 {
+        pr.note(&format!(
+            "  … and {} more PDF reuse fallback(s)",
+            reasons.len() - 3
+        ));
+    }
+}
+
 /// Sniff + sample every file, cluster into datasets, and assemble the plan.
 /// Pure planning: reads the tree, never the server — which is what makes the
 /// #173/#196 grouping behaviour testable end-to-end without a cluster.
@@ -617,23 +800,30 @@ fn build_phase_a(
     keys: &[String],
     digests: &[String],
     duplicate_files: Vec<DuplicateFile>,
+    ctx: &PhaseAContext<'_>,
     cfg: &IndexCfg,
-    pr: &Progress,
-) -> (Plan, Vec<dataset::Cluster>) {
+) -> PhaseA {
     use rayon::prelude::*;
+    let pdf_spool_budget = ctx.budget;
+    let pr = ctx.progress;
     // Same pool as the digest phase: sniffing and sampling are the other half
     // of the CPU-bound phase `--workers` has to bound (#240 §2). Progress is
     // reported from inside that pool, so the straggler the ticker names is the
-    // file a scan-pool thread is genuinely sitting on (#241).
+    // file a scan-pool thread is genuinely sitting on (#241). Retaining a PDF
+    // artifact happens inside that same guard, so a file whose extraction is
+    // spooled is counted exactly like a plainly parsed one.
     let scans: Vec<FileScan> = crate::pool::install(|| {
         files
             .par_iter()
-            .map(|f| {
+            .zip(digests.par_iter())
+            .map(|(f, digest)| {
                 let _in_flight = pr.file(&f.rel, f.size);
-                scan_file(&f.path, f.size, cfg.sample, cfg.max_file_gb)
+                scan_file(&f.path, f.size, digest, ctx, cfg.sample, cfg.max_file_gb)
             })
             .collect()
     });
+
+    report_pdf_spool_fallbacks(files, &scans, ctx);
 
     let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
     let scopes = compute_scopes(root, &rels);
@@ -645,12 +835,18 @@ fn build_phase_a(
         .collect();
     let mut sketches = Vec::new();
     let mut junk_files = Vec::new();
-    for (i, sc) in scans.into_iter().enumerate() {
+    let mut pdf_spools: Vec<Option<extract::pdf::ExtractionSpool>> =
+        (0..files.len()).map(|_| None).collect();
+    for (i, mut sc) in scans.into_iter().enumerate() {
         let family = sc
             .sniffed
             .as_ref()
             .map(|s| s.family)
             .unwrap_or(Family::Binary);
+        // A file that phase A junks is never indexed, so its artifact is
+        // refunded here rather than held to the phase A→B boundary.
+        pdf_spools[i] =
+            take_pdf_spool_if_indexable(&mut sc.pdf_spool, sc.junk.is_some(), pdf_spool_budget);
         if let Some((status, reason)) = sc.junk {
             junk_files.push(JunkFile {
                 file_key: keys[i].clone(),
@@ -759,7 +955,11 @@ fn build_phase_a(
         duplicate_files,
         alias_paths_indexed: true,
     };
-    (plan, clusters)
+    PhaseA {
+        plan,
+        clusters,
+        pdf_spools,
+    }
 }
 
 // ─── mapping builder ─────────────────────────────────────────────────────
@@ -1259,6 +1459,27 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     // ── Phase A: inference (skipped when a frozen plan exists) ──────────
     let mut clusters_rt: Option<Vec<dataset::Cluster>> = None;
+    let mut pdf_spools: Vec<Option<extract::pdf::ExtractionSpool>> =
+        (0..files.len()).map(|_| None).collect();
+    // Both worker widths come from the one resource policy (#240), and since
+    // that policy may set them apart, the spool's headroom is sized for the
+    // wider phase: phase-A scan threads are what hold artifact descriptors
+    // open, phase-B workers are what hold bulk buffers. Reserving for the
+    // larger of the two can only make this optional accelerator hand capacity
+    // back — never take headroom the run still needs.
+    let (pdf_spool_budget, pdf_spool_capacity_warning) =
+        extract::pdf::ExtractionSpoolBudget::for_state_dir(
+            &state_dir,
+            cfg.workers.max(scan_threads),
+            cfg.pdf_workers,
+            cfg.bulk_mb,
+        );
+    let phase_a_context = PhaseAContext {
+        state_dir: &state_dir,
+        budget: &pdf_spool_budget,
+        capacity_warning: pdf_spool_capacity_warning.as_deref(),
+        progress: &pr,
+    };
     let mut plan: Plan = if let Some(p) = journal.plan.clone() {
         p
     } else {
@@ -1270,15 +1491,20 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             "phase A: sniffing + sampling {} files with {scan_threads} threads…",
             files.len()
         ));
-        let (plan, clusters) = build_phase_a(
+        let PhaseA {
+            plan,
+            clusters,
+            pdf_spools: spools,
+        } = build_phase_a(
             &cfg.root,
             &files,
             &keys,
             &digests,
             duplicate_files.clone(),
+            &phase_a_context,
             &cfg,
-            &pr,
         );
+        pdf_spools = spools;
         pr.note(&format!(
             "phase A: {} datasets inferred, {} junk/skipped files",
             plan.datasets.len(),
@@ -1474,6 +1700,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         // genuinely fresh and skip the delete round trip.
         cleanup_required.extend(todo.iter().map(|&i| keys[i].clone()));
     }
+    let todo_set: std::collections::HashSet<usize> = todo.iter().copied().collect();
+    for (index, spool) in pdf_spools.iter_mut().enumerate() {
+        if spool.is_none() {
+            continue;
+        }
+        if todo_set.contains(&index) {
+            pdf_spool_budget.record_phase_b_eligible();
+        } else {
+            pdf_spool_budget.record_discarded_before_replay();
+            spool.take();
+        }
+    }
     // Every publication, including a fresh one, receives durable intent
     // before its first bulk. A failed fresh publication therefore skips the
     // unnecessary delete now but is recognized as pending and cleaned on the
@@ -1647,14 +1885,35 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // Percent and ETA are bytes-based, never file-count-based. The queue is
     // biggest-first, so a files-done percent races to ~100% and then sits
     // there for minutes on the one big file still in flight (#241 §5/§6).
+    // A replayed PDF still costs its own bytes to stage and send, so a spooled
+    // file counts toward the same denominator as a parsed one.
     let todo_bytes: u64 = todo.iter().map(|&i| files[i].size).sum();
+    let n_pdf_spools = todo
+        .iter()
+        .filter(|&&index| pdf_spools[index].is_some())
+        .count();
     pr.phase("index", n_todo as u64, todo_bytes);
     pr.note(&format!(
         "phase B: indexing {} files with {} workers → {}",
         n_todo, cfg.workers, cfg.url
     ));
+    if n_pdf_spools > 0 {
+        pr.note(&format!(
+            "phase B: reusing {n_pdf_spools} run-local PDF extraction(s); these PDFs will not be \
+             parsed a second time"
+        ));
+    }
 
-    let queue = Mutex::new(todo);
+    // Move each optional artifact into its sole Phase-B job. A replay cannot
+    // be retried or retained accidentally after staging begins.
+    let queue = Mutex::new(
+        todo.into_iter()
+            .map(|index| {
+                let spool = pdf_spools[index].take();
+                (index, spool)
+            })
+            .collect::<Vec<_>>(),
+    );
     let mut paths_by_key: HashMap<String, Vec<String>> = files
         .iter()
         .zip(keys.iter())
@@ -1679,8 +1938,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         for _ in 0..cfg.workers.min(n_todo.max(1)) {
             scope.spawn(|| {
                 loop {
-                    let i = match queue.lock().unwrap().pop() {
-                        Some(i) => i,
+                    let (i, pdf_spool) = match queue.lock().unwrap().pop() {
+                        Some(job) => job,
                         None => break,
                     };
                     let f = &files[i];
@@ -1882,8 +2141,53 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                         // Demoted one-off config files (#173) index as
                         // documents — their key sets are configuration, not a
                         // schema (see `dataset` module docs).
+                        //
+                        // `as_document` deliberately outranks artifact replay.
+                        // It decides the record *shape*: phase A built this
+                        // dataset's mapping by re-sampling the file through
+                        // `extract_as_document`, whereas an artifact replays
+                        // PDF-parser page records. Replaying here would publish
+                        // records the frozen plan does not describe. Today no
+                        // PDF can reach this branch (`demotable_family` is
+                        // JSON/YAML/XML only), so this is a guard that keeps
+                        // the precedence right if that set ever widens — the
+                        // artifact is refunded rather than replayed.
                         let res = if fa.as_document {
+                            if pdf_spool.is_some() {
+                                pdf_spool_budget.record_discarded_before_replay();
+                            }
+                            drop(pdf_spool);
                             extract::extract_as_document(&f.path, sn.gzip, &mut sink)
+                        } else if sn.family == Family::Pdf {
+                            match pdf_spool {
+                                Some(spool) => {
+                                    match spool.replay(f.size, expected_digest, &mut sink) {
+                                        Ok(stats) => Ok(stats),
+                                        Err(replay_error) => {
+                                            // Replay verifies the complete
+                                            // artifact before `deliver`
+                                            // invokes the sink, so falling
+                                            // back here cannot duplicate a
+                                            // partially staged record stream.
+                                            pdf_spool_budget
+                                                .record_replay_fallback(&f.rel, &replay_error);
+                                            pdf_spool_budget.record_reparse();
+                                            extract::extract(&f.path, &sn, None, &mut sink)
+                                                .with_context(|| {
+                                                    format!(
+                                                        "reparse {} after run-local PDF artifact \
+                                                         verification failed: {replay_error:#}",
+                                                        f.rel
+                                                    )
+                                                })
+                                        }
+                                    }
+                                }
+                                None => {
+                                    pdf_spool_budget.record_reparse();
+                                    extract::extract(&f.path, &sn, None, &mut sink)
+                                }
+                            }
                         } else {
                             extract::extract(&f.path, &sn, None, &mut sink)
                         };
@@ -2659,6 +2963,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "bulk_congestion_events": es.bulk_congestion_events(),
         "resource_notes": cfg.resource_notes,
         "semantic": !cfg.no_semantic,
+        "pdf_extraction_reuse": pdf_spool_budget.report(),
     });
     if let Some(g) = &graph_summary {
         run_doc["graph"] = g.clone();
