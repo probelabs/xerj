@@ -93,10 +93,23 @@ fn replacement_failpoint(_boundary: u8) -> Result<()> {
     Ok(())
 }
 
+/// Send one bulk body and fold its per-item rejections into
+/// `rejected_records`.
+///
+/// This counter is deliberately NOT the parser-junk counter. A record the
+/// *backend* refused and a record the *parser* could not read are different
+/// failures with different lifetimes: parser junk is durable (journaled per
+/// file and replayed on every resume), a backend rejection is not (no
+/// `FileDone` records a document that was never accepted). Adding both to one
+/// number is what let `junk_records_total` mean two things at once.
+///
+/// Note where this number can and cannot surface. Any non-zero value here also
+/// puts an entry in `bulk_errors`, which aborts the run before the run
+/// document exists — so it is reported in the abort message and nowhere else.
 fn record_bulk_outcome(
     es: &Es,
     body: Vec<u8>,
-    junk_records: &AtomicU64,
+    rejected_records: &AtomicU64,
     bulk_errors: &Mutex<Vec<String>>,
     send_err: &mut Option<String>,
 ) -> bool {
@@ -115,7 +128,7 @@ fn record_bulk_outcome(
                 return true;
             }
             if outcome.item_errors > 0 {
-                junk_records.fetch_add(outcome.item_errors, Ordering::Relaxed);
+                rejected_records.fetch_add(outcome.item_errors, Ordering::Relaxed);
                 if let Some(error) = outcome.first_error {
                     let mut errors = bulk_errors.lock().unwrap();
                     if errors.len() < 5 {
@@ -920,6 +933,66 @@ pub fn derive_brain_name(root: &Path) -> String {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DurableDatasetStats {
+    bytes: u64,
+    junk: u64,
+    dropped: u64,
+}
+
+/// Source metadata durably represented by each dataset.
+///
+/// `FileDone` is the commit record for a successfully published canonical
+/// source. A source can feed more than one inferred dataset (for example, a
+/// workbook or database with multiple tables), so each distinct assigned
+/// dataset reports the complete source bytes it depends on. Repeated groups
+/// within the same dataset count the source only once. Parser-level junk has
+/// no group after extraction rejects it, so it retains the historical
+/// attribution to the file's first assigned dataset. Coercion drops retain
+/// their exact dataset captured in the completion record.
+fn durable_dataset_stats(
+    plan: &Plan,
+    done: &HashMap<String, FileDone>,
+) -> HashMap<String, DurableDatasetStats> {
+    let mut stats_by_dataset: HashMap<String, DurableDatasetStats> = HashMap::new();
+    for (file_key, completed) in done {
+        let Some(assignment) = plan.files.get(file_key) else {
+            continue;
+        };
+        let assigned_datasets: std::collections::HashSet<&str> = assignment
+            .assignments
+            .iter()
+            .map(|(_, slug)| slug.as_str())
+            .collect();
+        for slug in assigned_datasets {
+            let stats = stats_by_dataset.entry(slug.to_string()).or_default();
+            stats.bytes = stats.bytes.saturating_add(completed.bytes);
+        }
+        if let Some((_, slug)) = assignment.assignments.first() {
+            let stats = stats_by_dataset.entry(slug.clone()).or_default();
+            stats.junk = stats.junk.saturating_add(completed.junk);
+        }
+        for (slug, dropped) in &completed.dropped_by_dataset {
+            if assignment
+                .assignments
+                .iter()
+                .any(|(_, assigned)| assigned == slug)
+            {
+                let stats = stats_by_dataset.entry(slug.clone()).or_default();
+                stats.dropped = stats.dropped.saturating_add(*dropped);
+            }
+        }
+    }
+    stats_by_dataset
+}
+
+fn invocation_report_timestamps(
+    started: chrono::DateTime<chrono::Utc>,
+    summary_generated_at: chrono::DateTime<chrono::Utc>,
+) -> (String, String) {
+    (started.to_rfc3339(), summary_generated_at.to_rfc3339())
+}
+
 fn run_index(cfg: IndexCfg) -> Result<i32> {
     run_index_report(cfg).map(|(code, _)| code)
 }
@@ -932,6 +1005,9 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
 /// `None` when the run ended before a plan produced one (empty folder,
 /// `--dry-run`).
 pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
+    // The very first statement of the function, deliberately: `started` must
+    // be when this invocation began, not when its summary was built.
+    let invocation_started = chrono::Utc::now();
     // Fix the phase-A pool width BEFORE anything parallel starts: hashing and
     // sniffing are the CPU-bound phase, and they used to take every core no
     // matter what the caller asked for (#240 §2).
@@ -1281,9 +1357,24 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     es.ensure_index(catalog::CATALOG_INDEX, &catalog::catalog_mapping())?;
     es.update_mapping(
         catalog::CATALOG_INDEX,
-        &json!({"properties": {"duplicate_of": {"type": "keyword"}}}),
+        &json!({"properties": {
+            "duplicate_of": {"type": "keyword"},
+            // `started` intentionally stays out of this additive upgrade. A
+            // catalog written by v1.0.0-rc.4 has a dynamically inferred TEXT
+            // `started`, and asking the engine to add it as `date` is refused
+            // 400 — which `es.update_mapping` turns into an `Err`, aborting
+            // the run before any document work. `catalog::catalog_mapping`
+            // declares it `date` for a fresh catalog, so the field is
+            // permanently bimodal across installs; its doc comment carries the
+            // full tripwire and the measured refusal.
+            "summary_generated_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+            "invocation_telemetry_scope": {"type": "keyword"},
+            // Safe to add here, unlike `started`: no release ever wrote this
+            // field, so no existing catalog has a conflicting inferred type.
+            "junk_records_this_run": {"type": "long"}
+        }}),
     )
-    .context("upgrade autoindex catalog mapping for duplicate aliases")?;
+    .context("upgrade autoindex catalog mapping")?;
     // A replacement transaction starts before the effective new plan is
     // persisted and before live visibility changes. If the process dies at
     // any later boundary, journal replay removes the older file_done and
@@ -1335,9 +1426,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         index: String,
         plan: HashMap<String, coerce::Coerce>,
         records: AtomicU64,
-        junk: AtomicU64,
-        dropped: AtomicU64,
-        bytes: AtomicU64,
     }
     let mut ds_rt: HashMap<String, DsRt> = HashMap::new();
     for d in &plan.datasets {
@@ -1347,9 +1435,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 index: d.index.clone(),
                 plan: coerce::plan_from_specs(&d.specs),
                 records: AtomicU64::new(0),
-                junk: AtomicU64::new(0),
-                dropped: AtomicU64::new(0),
-                bytes: AtomicU64::new(0),
             },
         );
     }
@@ -1412,7 +1497,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // replacement invalidation can only ever see prior-generation edges —
     // running it later would invalidate this run's own fresh edges.
     let bulk_cut = cfg.bulk_mb << 20;
+    // Parser junk this invocation read out of source files (durable: it is
+    // journaled per file and replayed on resume).
     let junk_records = AtomicU64::new(0);
+    // Records the backend refused in a bulk response (invocation-local: no
+    // journal record exists for a document that was never accepted).
+    let rejected_records = AtomicU64::new(0);
     let bulk_errors = Mutex::new(Vec::<String>::new());
     let graph: Option<GraphRt> = if cfg.no_graph {
         None
@@ -1515,7 +1605,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     && record_bulk_outcome(
                         &es,
                         std::mem::take(&mut buf),
-                        &junk_records,
+                        &rejected_records,
                         &bulk_errors,
                         &mut send_err,
                     )
@@ -1524,7 +1614,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 }
             }
             if send_err.is_none() && !buf.is_empty() {
-                record_bulk_outcome(&es, buf, &junk_records, &bulk_errors, &mut send_err);
+                record_bulk_outcome(&es, buf, &rejected_records, &bulk_errors, &mut send_err);
             }
             if let Some(e) = send_err {
                 anyhow::bail!("write structural graph edges to {edges_index}: {e}");
@@ -1620,6 +1710,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     };
                     let mut file_records = 0u64;
                     let mut file_junk = 0u64;
+                    let mut file_dropped_by_dataset: HashMap<String, u64> = HashMap::new();
                     let mut send_err: Option<String> = None;
                     // Edges this file teaches — buffered apart from the node
                     // staging file (different target index) and sent only
@@ -1722,7 +1813,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             let mut fields = rec.fields;
                             let dropped = coerce::coerce_record(&mut fields, &rt.plan);
                             if dropped > 0 {
-                                rt.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+                                let durable =
+                                    file_dropped_by_dataset.entry(slug.clone()).or_default();
+                                *durable = durable.saturating_add(dropped as u64);
                             }
                             fields.insert("ax_path".into(), Value::String(f.rel.clone()));
                             fields.insert(
@@ -1915,7 +2008,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                 && record_bulk_outcome(
                                     &es,
                                     std::mem::take(&mut buf),
-                                    &junk_records,
+                                    &rejected_records,
                                     &bulk_errors,
                                     &mut send_err,
                                 )
@@ -1931,7 +2024,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             record_bulk_outcome(
                                 &es,
                                 buf,
-                                &junk_records,
+                                &rejected_records,
                                 &bulk_errors,
                                 &mut send_err,
                             );
@@ -1956,7 +2049,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                     && record_bulk_outcome(
                                         &es,
                                         std::mem::take(&mut ebuf),
-                                        &junk_records,
+                                        &rejected_records,
                                         &bulk_errors,
                                         &mut send_err,
                                     )
@@ -1968,7 +2061,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                 record_bulk_outcome(
                                     &es,
                                     ebuf,
-                                    &junk_records,
+                                    &rejected_records,
                                     &bulk_errors,
                                     &mut send_err,
                                 );
@@ -1998,15 +2091,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     }
                     records_total.fetch_add(file_records, Ordering::Relaxed);
                     junk_records.fetch_add(file_junk, Ordering::Relaxed);
-                    if let Some(rt) = fa.assignments.first().and_then(|(_, slug)| ds_rt.get(slug)) {
-                        rt.bytes.fetch_add(
-                            f.size / fa.assignments.len().max(1) as u64,
-                            Ordering::Relaxed,
-                        );
-                        if file_junk > 0 {
-                            rt.junk.fetch_add(file_junk, Ordering::Relaxed);
-                        }
-                    }
                     let (commit_result, journal_path) = {
                         let mut journal = journal_mx.lock().unwrap();
                         let path = journal.path().display().to_string();
@@ -2016,6 +2100,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             records: file_records,
                             junk: file_junk,
                             bytes: f.size,
+                            dropped_by_dataset: file_dropped_by_dataset,
                             generation: Some(expected_digest.clone()),
                         });
                         (result, path)
@@ -2071,7 +2156,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                         && record_bulk_outcome(
                             &es,
                             std::mem::take(&mut buf),
-                            &junk_records,
+                            &rejected_records,
                             &bulk_errors,
                             &mut send_err,
                         )
@@ -2080,7 +2165,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     }
                 }
                 if send_err.is_none() && !buf.is_empty() {
-                    record_bulk_outcome(&es, buf, &junk_records, &bulk_errors, &mut send_err);
+                    record_bulk_outcome(&es, buf, &rejected_records, &bulk_errors, &mut send_err);
                 }
                 match send_err {
                     Some(e) => bulk_errors
@@ -2100,11 +2185,24 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     let bulk_errs = bulk_errors.into_inner().unwrap();
     if !bulk_errs.is_empty() {
+        // `bulk_errors` keeps only the first five distinct errors, so without
+        // the counter the operator cannot tell one refused document from ten
+        // thousand. That is the whole reason backend rejections are counted
+        // apart from parser junk: this is the only place the number is ever
+        // reported, because a run that gets here writes no run document and
+        // no map.
+        let rejected = rejected_records.load(Ordering::Relaxed);
+        let scale = if rejected > 0 {
+            format!(" The backend refused {rejected} record(s).")
+        } else {
+            String::new()
+        };
         anyhow::bail!(
-            "autoindex stopped with bulk/backend failures: {}. Failed source files were not \
+            "autoindex stopped with bulk/backend failures: {}.{} Failed source files were not \
              journaled complete; fix the reported server or embedding configuration and rerun \
              the same command to resume safely",
-            bulk_errs.join(" | ")
+            bulk_errs.join(" | "),
+            scale
         );
     }
 
@@ -2301,11 +2399,25 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     // dataset docs
     let mut junk_records_by_run: u64 = junk_records.load(Ordering::Relaxed);
+    let (dataset_stats, durable_junk_records) = {
+        let journal = journal_mx.lock().unwrap();
+        let stats = durable_dataset_stats(&plan, &journal.done);
+        // One definition of "junk records" per map. The dataset docs below
+        // report the durable per-file commits, so the run doc must too:
+        // reporting the invocation-local counter there made a no-op resume
+        // publish `junk_records_total: 0` next to dataset docs that showed
+        // the real number, in the same `xerj autoindex map` output. The
+        // per-dataset values are this same total attributed to each file's
+        // first assigned dataset, so they sum back to it for every file the
+        // frozen plan still describes.
+        let durable_junk: u64 = journal.done.values().map(|done| done.junk).sum();
+        (stats, durable_junk)
+    };
     for d in &plan.datasets {
-        let rt = &ds_rt[&d.slug];
         let sample_queries = catalog::build_sample_queries(d, &key_corrs);
         let mut notes = Vec::new();
-        let dropped = rt.dropped.load(Ordering::Relaxed);
+        let durable = dataset_stats.get(&d.slug).copied().unwrap_or_default();
+        let dropped = durable.dropped;
         if dropped > 0 {
             notes.push(format!(
                 "{dropped} field values could not be coerced to the inferred types and were dropped (records still indexed)"
@@ -2338,8 +2450,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         let (id, doc) = catalog::dataset_doc(&catalog::DatasetDocInput {
             pd: d,
             record_count: *ds_counts.get(&d.slug).unwrap_or(&0),
-            junk_records: rt.junk.load(Ordering::Relaxed),
-            bytes: rt.bytes.load(Ordering::Relaxed),
+            junk_records: durable.junk,
+            bytes: durable.bytes,
             file_count: d.file_count,
             formats,
             time_min: tmin,
@@ -2443,6 +2555,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     }
 
     let wall = t0.elapsed().as_secs_f64();
+    let (started, summary_generated_at) =
+        invocation_report_timestamps(invocation_started, chrono::Utc::now());
     let total_records: u64 = ds_counts.values().sum();
     // Run-summary honesty (§6.6.4): what the detectors wrote AND what they
     // could not resolve — a dangling [[link]] is a fact about the corpus, not
@@ -2475,20 +2589,46 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             "edges_invalidated": gr.invalidated,
         })
     });
+    // A resume intentionally reuses and upserts the durable run id. Timing
+    // and detector counters therefore describe this latest invocation,
+    // while corpus descriptors describe the durable live run state.
     let mut run_doc = json!({
         "doc_kind": "run",
         "run_id": run_id,
         "root": root_str,
         "url": cfg.url,
         "prefix": cfg.prefix,
-        "started": chrono::Utc::now().to_rfc3339(),
+        "started": started,
+        "summary_generated_at": summary_generated_at,
+        "invocation_telemetry_scope": "latest_invocation_of_durable_run",
         "files_total": paths_discovered,
         "unique_content_files": files.len(),
         "files_indexed": journal_mx.lock().unwrap().done.len(),
         "duplicate_files": plan.duplicate_files.len(),
         "files_junk": junk_file_count,
         "records_total": total_records,
-        "junk_records_total": junk_records_by_run,
+        // Two numbers, one definition each, neither of them overlapping.
+        //
+        // `junk_records_total` is the durable corpus descriptor: the same
+        // definition as every dataset doc's `junk_records`, summed over every
+        // `FileDone` in the journal. It survives a no-op resume.
+        //
+        // `junk_records_this_run` is the same *kind* of failure narrowed to
+        // the files this invocation actually parsed. It is the NARROWER of the
+        // two, not the wider: every file counted here also committed a
+        // `FileDone` that the total sums. On an unchanged resume it reads 0
+        // while the total stays non-zero — which is the whole defect this
+        // change exists to fix, seen from the other side.
+        //
+        // Backend rejections are deliberately absent. They are a different
+        // failure, and they can never be reported here anyway: a per-item
+        // rejection populates `bulk_errors`, which aborts the run above,
+        // before this document exists. Publishing a
+        // `records_rejected_by_backend` field would ship a number that is
+        // provably always 0 — see `record_bulk_outcome` and
+        // `backend_rejected_records_abort_the_run_before_any_map_is_written`.
+        "junk_records_total": durable_junk_records,
+        "junk_records_this_run": junk_records_by_run,
         // This-run submission accounting (#195): what THIS invocation sent
         // and had accepted, vs `records_total` above which is the live
         // server-side count. A healthy run keeps these consistent; a
@@ -2617,6 +2757,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             cfg.url, cfg.prefix
         );
     }
+    // Exit 3 means "completed, some input was unusable". Backend rejections
+    // are not consulted and must not be: a rejected item aborts the run with
+    // an error long before this line, so `rejected_records` is provably 0
+    // here. Splitting them out of `junk_total_records` therefore changes no
+    // exit code.
     let code = if junk_total_records > 0 || junk_file_count > 0 {
         3
     } else {
@@ -3083,6 +3228,7 @@ mod duplicate_integration_tests {
                 records,
                 junk: 0,
                 bytes: inventory.files[0].size,
+                dropped_by_dataset: HashMap::new(),
                 generation: Some(inventory.digests[0].clone()),
             })
             .unwrap();
@@ -3161,6 +3307,145 @@ mod duplicate_integration_tests {
         })
         .unwrap();
         assert_eq!(live, HashSet::from(["r0".into(), "r1".into()]));
+    }
+}
+
+#[cfg(test)]
+mod map_metadata_tests {
+    use super::*;
+
+    fn assignment(slugs: &[&str]) -> FileAssignment {
+        FileAssignment {
+            rel: "report.dat".into(),
+            path_id: "path:report.dat".into(),
+            family: "json".into(),
+            gzip: false,
+            content_digest: Some("digest".into()),
+            assignments: slugs
+                .iter()
+                .enumerate()
+                .map(|(group, slug)| (Some(format!("group-{group}")), (*slug).to_string()))
+                .collect(),
+            as_document: false,
+        }
+    }
+
+    #[test]
+    fn unchanged_resume_keeps_durable_assignment_aware_dataset_bytes() {
+        let _guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let plan = Plan {
+            files: HashMap::from([
+                (
+                    "shared".into(),
+                    assignment(&["quarterly", "quarterly", "annual"]),
+                ),
+                ("quarterly-only".into(), assignment(&["quarterly"])),
+            ]),
+            ..Plan::default()
+        };
+        let mut initial = state::Journal::open(
+            state_dir.path(),
+            "corpus",
+            "http://engine",
+            "ax",
+            300,
+            false,
+        )
+        .unwrap();
+        initial.write_plan(&plan).unwrap();
+        initial
+            .file_done(&FileDone {
+                file_key: "shared".into(),
+                path: "report.dat".into(),
+                records: 10,
+                junk: 5,
+                bytes: 100,
+                dropped_by_dataset: HashMap::from([("quarterly".into(), 7), ("annual".into(), 3)]),
+                generation: Some("digest".into()),
+            })
+            .unwrap();
+        initial
+            .file_done(&FileDone {
+                file_key: "quarterly-only".into(),
+                path: "quarterly.json".into(),
+                records: 2,
+                junk: 2,
+                bytes: 23,
+                dropped_by_dataset: HashMap::from([("quarterly".into(), 11)]),
+                generation: Some("digest-2".into()),
+            })
+            .unwrap();
+        let before_resume = durable_dataset_stats(&plan, &initial.done);
+        drop(initial);
+
+        // Opening the same durable run appends only an invocation-level
+        // resume record. No source is processed and no FileDone is appended.
+        let resumed = state::Journal::open(
+            state_dir.path(),
+            "corpus",
+            "http://engine",
+            "ax",
+            300,
+            false,
+        )
+        .unwrap();
+        let after_unchanged_resume =
+            durable_dataset_stats(resumed.plan.as_ref().unwrap(), &resumed.done);
+
+        assert_eq!(before_resume, after_unchanged_resume);
+        assert_eq!(after_unchanged_resume["quarterly"].bytes, 123);
+        assert_eq!(after_unchanged_resume["annual"].bytes, 100);
+        assert_eq!(after_unchanged_resume["quarterly"].junk, 7);
+        assert_eq!(after_unchanged_resume["annual"].junk, 0);
+        assert_eq!(after_unchanged_resume["quarterly"].dropped, 18);
+        assert_eq!(after_unchanged_resume["annual"].dropped, 3);
+    }
+
+    #[test]
+    fn invocation_started_is_not_derived_from_summary_generation() {
+        let started = chrono::DateTime::parse_from_rfc3339("2026-08-04T00:29:05.673023686Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let summary_generated_at =
+            chrono::DateTime::parse_from_rfc3339("2026-08-04T00:31:37.937589283Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        let (reported_started, reported_summary_generated_at) =
+            invocation_report_timestamps(started, summary_generated_at);
+
+        assert_eq!(reported_started, "2026-08-04T00:29:05.673023686+00:00");
+        assert_eq!(
+            reported_summary_generated_at,
+            "2026-08-04T00:31:37.937589283+00:00"
+        );
+        assert_ne!(reported_started, reported_summary_generated_at);
+    }
+
+    #[test]
+    fn catalog_mapping_declares_latest_invocation_telemetry_fields() {
+        let mapping = catalog::catalog_mapping();
+        assert_eq!(
+            mapping.pointer("/mappings/properties/started/type"),
+            Some(&json!("date"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/summary_generated_at/type"),
+            Some(&json!("date"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/invocation_telemetry_scope/type"),
+            Some(&json!("keyword"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/started/format"),
+            Some(&json!("strict_date_optional_time||epoch_millis"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/summary_generated_at/format"),
+            Some(&json!("strict_date_optional_time||epoch_millis"))
+        );
     }
 }
 

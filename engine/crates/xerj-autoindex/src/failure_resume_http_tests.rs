@@ -27,6 +27,22 @@ struct MockState {
     fail_data_bulk: usize,
     failed_once: bool,
     delete_calls: usize,
+    response_delay_ms: u64,
+    catalog_preexists: bool,
+    catalog_mapping_upgraded: bool,
+    catalog_bulk_before_upgrade: bool,
+    /// Set if the additive mapping upgrade ever asks for `started`. This is
+    /// the executable half of `catalog::catalog_mapping`'s tripwire: against a
+    /// legacy (v1.0.0-rc.4) catalog that request is refused 400 and aborts the
+    /// run, so the product must never send it. Asserted false rather than left
+    /// to the 400 branch below, which a correct product never reaches.
+    started_mapping_requested: bool,
+    /// Catalog bulk actions the fixture does not model. Recorded rather than
+    /// panicked on: this runs inside the server thread while the state guard
+    /// is held, so a panic here would poison the `Mutex` and turn
+    /// `MockEndpoint::drop`'s `join().unwrap()` into a second, misleading
+    /// panic. Tests assert on it from the test thread instead.
+    unexpected_catalog_actions: Vec<String>,
     stop: bool,
     embedding_identity_sha256: String,
     /// Reject every data-bulk item with a 403 explicit write-block error
@@ -36,6 +52,12 @@ struct MockState {
     /// Accept every data bulk (`errors: false`) but persist nothing — the
     /// shape of any rejection path the client-side classifier misses.
     swallow_data_bulks: bool,
+    /// Refuse the FIRST document of every data bulk with a per-item 400 and
+    /// apply the rest. This is the one bulk shape that produces an
+    /// `item_error` without a `server_error`: status is neither 429 nor 5xx
+    /// and the type is not a block, so the run continues and must still
+    /// report the rejection.
+    reject_first_data_item: bool,
 }
 
 struct MockEndpoint {
@@ -46,11 +68,16 @@ struct MockEndpoint {
 
 impl MockEndpoint {
     fn start(fail_data_bulk: usize) -> Self {
+        Self::start_with_delay(fail_data_bulk, 0)
+    }
+
+    fn start_with_delay(fail_data_bulk: usize, response_delay_ms: u64) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(MockState {
             fail_data_bulk,
+            response_delay_ms,
             embedding_identity_sha256: "a".repeat(64),
             ..MockState::default()
         }));
@@ -72,6 +99,12 @@ impl MockEndpoint {
             state,
             join: Some(join),
         }
+    }
+
+    fn start_with_existing_catalog() -> Self {
+        let endpoint = Self::start(usize::MAX);
+        endpoint.state.lock().unwrap().catalog_preexists = true;
+        endpoint
     }
 }
 
@@ -111,19 +144,80 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+    let response_delay_ms = state.lock().unwrap().response_delay_ms;
+    if response_delay_ms > 0 {
+        thread::sleep(std::time::Duration::from_millis(response_delay_ms));
+    }
 
-    let response = if method == "GET" && path == "/v1/embedding/identity" {
+    let (status, response) = if method == "GET" && path == "/v1/embedding/identity" {
         let identity = state.lock().unwrap().embedding_identity_sha256.clone();
-        json!({"data": {
-            "version": 1,
-            "backend": "lexical",
-            "identity_sha256": identity,
-            "dimensions": 384,
-            "semantic_contract": "semantic_text-derived-vector.v1",
-            "resumable": true
-        }, "took_ms": 0, "request_id": "test"})
+        (
+            200,
+            json!({"data": {
+                "version": 1,
+                "backend": "lexical",
+                "identity_sha256": identity,
+                "dimensions": 384,
+                "semantic_contract": "semantic_text-derived-vector.v1",
+                "resumable": true
+            }, "took_ms": 0, "request_id": "test"}),
+        )
+    } else if method == "PUT" && path == "/autoindex-catalog" {
+        if state.lock().unwrap().catalog_preexists {
+            (
+                400,
+                json!({"error": {"type": "resource_already_exists_exception"}}),
+            )
+        } else {
+            (200, json!({"acknowledged": true}))
+        }
+    } else if method == "PUT" && path == "/autoindex-catalog/_mapping" {
+        let mapping: Value = serde_json::from_slice(&body).unwrap();
+        let started_requested = mapping.pointer("/properties/started").is_some();
+        let required = ["summary_generated_at", "invocation_telemetry_scope"];
+        let upgraded = required.iter().all(|field| {
+            mapping
+                .pointer(&format!("/properties/{field}/type"))
+                .and_then(Value::as_str)
+                .is_some()
+        });
+        let mut locked = state.lock().unwrap();
+        locked.started_mapping_requested |= started_requested;
+        if locked.catalog_preexists && started_requested {
+            // The shape a real engine returns when the additive upgrade asks
+            // for `started` on a legacy (v1.0.0-rc.4) catalog, where `started`
+            // was dynamically inferred as `text`. Measured against a live
+            // v1.0.0-rc.13 engine, not read off the handler: the request falls
+            // past the `illegal_argument_exception` guard — that one only sees
+            // *declared* mappings, and `started` was never declared — and is
+            // refused by the `idx.schema()` guard, which returns
+            // `XerjError::invalid_mapping` and therefore a 400
+            // `mapper_parsing_exception`.
+            //
+            // A correct product never reaches this branch (see
+            // `started_mapping_requested`, asserted false in
+            // `existing_catalog_is_upgraded_before_new_run_metadata_is_written`).
+            // It is kept, and kept accurate, so that adding `started` to the
+            // additive upgrade fails here with the message the operator would
+            // really see rather than passing silently.
+            let reason = "field [started] already exists as [text], cannot add [date]";
+            (
+                400,
+                json!({
+                    "error": {
+                        "root_cause": [{"type": "mapper_parsing_exception", "reason": reason}],
+                        "type": "mapper_parsing_exception",
+                        "reason": reason,
+                    },
+                    "status": 400,
+                }),
+            )
+        } else {
+            locked.catalog_mapping_upgraded = upgraded;
+            (200, json!({"acknowledged": true}))
+        }
     } else if method == "POST" && path == "/_bulk" {
-        bulk_response(&body, state)
+        (200, bulk_response(&body, state))
     } else if method == "POST" && path.contains("/_delete_by_query") {
         let query: Value = serde_json::from_slice(&body).unwrap();
         let ax_file = query
@@ -137,23 +231,27 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                 .docs
                 .retain(|_, doc| doc.get("ax_file").and_then(Value::as_str) != Some(key.as_str()));
         }
-        json!({"deleted": 0, "failures": []})
+        (200, json!({"deleted": 0, "failures": []}))
     } else if method == "GET" && path.ends_with("/_count") {
-        json!({"count": state.lock().unwrap().docs.len()})
+        (200, json!({"count": state.lock().unwrap().docs.len()}))
     } else if method == "POST" && path.ends_with("/_search") {
         // Report the REAL number of stored docs: `run_index` now verifies
         // live counts against the journal (#195), so a mock that always
         // answered 0 hits would (rightly) fail every successful run.
         let total = state.lock().unwrap().docs.len();
-        json!({"hits":{"total":{"value":total},"hits":[]},"aggregations":{}})
+        (
+            200,
+            json!({"hits":{"total":{"value":total},"hits":[]},"aggregations":{}}),
+        )
     } else {
         // ping, index creation/mapping, refresh, and catalog operations
-        json!({"acknowledged": true})
+        (200, json!({"acknowledged": true}))
     };
     let bytes = response.to_string();
+    let reason = if status == 200 { "OK" } else { "Bad Request" };
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         bytes.len(),
         bytes
     )
@@ -176,6 +274,9 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         // the junk sweep of #238), so walk the NDJSON rather than assuming
         // action/document pairs — a delete carries no document line.
         let mut locked = state.lock().unwrap();
+        if locked.catalog_preexists && !locked.catalog_mapping_upgraded {
+            locked.catalog_bulk_before_upgrade = true;
+        }
         let mut line = 0;
         while line < lines.len() {
             let Ok(action) = serde_json::from_slice::<Value>(lines[line]) else {
@@ -198,6 +299,14 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
                 locked.catalog_docs.insert(id.to_owned(), doc);
                 line += 2;
             } else {
+                // Fixture drift, not a product signal. Recorded rather than
+                // panicked on: this runs on the server thread with the state
+                // guard held, so a panic here poisons the `Mutex` and turns
+                // `MockEndpoint::drop`'s `join().unwrap()` into a second,
+                // misleading panic. Tests assert on it from the test thread.
+                locked
+                    .unexpected_catalog_actions
+                    .push(format!("unexpected catalog bulk action: {action}"));
                 line += 1;
             }
         }
@@ -225,6 +334,27 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
     }
     if locked.swallow_data_bulks {
         return json!({"errors": false, "items": []});
+    }
+    if locked.reject_first_data_item {
+        let mut items = Vec::new();
+        for (nth, pair) in lines.chunks_exact(2).enumerate() {
+            if nth == 0 {
+                items.push(json!({"index": {
+                    "status": 400,
+                    "error": {
+                        "type": "document_parsing_exception",
+                        "reason": "refused: value could not be parsed"
+                    }
+                }}));
+                continue;
+            }
+            let action: Value = serde_json::from_slice(pair[0]).unwrap();
+            let doc: Value = serde_json::from_slice(pair[1]).unwrap();
+            let id = action.pointer("/index/_id").unwrap().as_str().unwrap();
+            locked.docs.insert(id.to_owned(), doc);
+            items.push(json!({"index": {"status": 201}}));
+        }
+        return json!({"errors": true, "items": items});
     }
     let fail = !locked.failed_once && locked.data_bulk_number == locked.fail_data_bulk;
     let pairs = lines.chunks_exact(2);
@@ -305,6 +435,25 @@ fn event_count(state_dir: &Path, kind: &str) -> usize {
         .count()
 }
 
+fn dataset_catalog_docs(endpoint: &MockEndpoint) -> Vec<Value> {
+    let mut docs: Vec<Value> = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .catalog_docs
+        .values()
+        .filter(|doc| doc.get("doc_kind").and_then(Value::as_str) == Some("dataset"))
+        .cloned()
+        .collect();
+    docs.sort_by_key(|doc| {
+        doc.get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    });
+    docs
+}
+
 #[test]
 fn semantic_resume_rejects_embedding_identity_drift_before_another_bulk() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
@@ -349,21 +498,293 @@ fn fresh_publication_skips_delete_and_noop_resume_does_not_append_plan() {
         "id,value\n0,fresh\n1,fresh\n",
     )
     .unwrap();
-    let endpoint = MockEndpoint::start(usize::MAX);
+    // A fixed endpoint delay makes the start/summary chronology
+    // deterministic instead of relying on scheduler timing.
+    let endpoint = MockEndpoint::start_with_delay(usize::MAX, 5);
     let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
 
-    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let (initial_code, initial_summary) = run_index_report(config.clone()).unwrap();
+    assert_eq!(initial_code, 0);
     assert_eq!(endpoint.state.lock().unwrap().delete_calls, 0);
     assert_eq!(event_count(state_dir.path(), "plan"), 1);
     assert_eq!(event_count(state_dir.path(), "file_replace_start"), 1);
+    let source_bytes = fs::metadata(corpus.path().join("records.csv"))
+        .unwrap()
+        .len();
+    let initial_dataset = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .catalog_docs
+        .values()
+        .find(|doc| doc.get("doc_kind").and_then(Value::as_str) == Some("dataset"))
+        .cloned()
+        .expect("dataset catalog document");
+    let initial_dataset_bytes = initial_dataset
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .unwrap();
+    assert_eq!(initial_dataset_bytes, source_bytes);
+    let initial_summary = initial_summary.unwrap();
+    assert_eq!(
+        initial_summary["invocation_telemetry_scope"],
+        json!("latest_invocation_of_durable_run")
+    );
+    let initial_started =
+        chrono::DateTime::parse_from_rfc3339(initial_summary["started"].as_str().unwrap()).unwrap();
+    let initial_summary_generated_at = chrono::DateTime::parse_from_rfc3339(
+        initial_summary["summary_generated_at"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        initial_summary_generated_at - initial_started >= chrono::Duration::milliseconds(5),
+        "started must be captured before work, not synthesized with the summary"
+    );
 
-    assert_eq!(run_index(config).unwrap(), 0);
+    let (resume_code, resume_summary) = run_index_report(config).unwrap();
+    assert_eq!(resume_code, 0);
     assert_eq!(endpoint.state.lock().unwrap().delete_calls, 0);
     assert_eq!(
         event_count(state_dir.path(), "plan"),
         1,
         "an identical resume must reuse the durable plan"
     );
+    let resumed_dataset = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .catalog_docs
+        .values()
+        .find(|doc| doc.get("doc_kind").and_then(Value::as_str) == Some("dataset"))
+        .cloned()
+        .expect("dataset catalog document after resume");
+    assert_eq!(
+        resumed_dataset["bytes"],
+        json!(source_bytes),
+        "an unchanged resume must not replace durable dataset bytes with zero"
+    );
+    assert_eq!(
+        resume_summary.unwrap()["invocation_telemetry_scope"],
+        json!("latest_invocation_of_durable_run")
+    );
+}
+
+#[test]
+fn changed_source_replaces_durable_dataset_bytes_across_reopen() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let path = corpus.path().join("records.csv");
+    fs::write(&path, "id,value\n0,old\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let initial_bytes = fs::metadata(&path).unwrap().len();
+    assert_eq!(dataset_catalog_docs(&endpoint)[0]["bytes"], initial_bytes);
+
+    fs::write(
+        &path,
+        "id,value,description\n0,new,a longer replacement source\n1,new,second row\n",
+    )
+    .unwrap();
+    let replacement_bytes = fs::metadata(&path).unwrap().len();
+    assert_ne!(replacement_bytes, initial_bytes);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    // Reopen the durable journal independently of the product invocation.
+    let root = config.root.canonicalize().unwrap();
+    let reopened = state::Journal::open(
+        state_dir.path(),
+        &root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    assert_eq!(reopened.done.len(), 1);
+    assert_eq!(
+        reopened.done.values().next().unwrap().bytes,
+        replacement_bytes
+    );
+    drop(reopened);
+
+    // A following unchanged product rescan must publish the replacement
+    // generation's durable bytes, not zero and not the historical size.
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(
+        dataset_catalog_docs(&endpoint)[0]["bytes"],
+        replacement_bytes
+    );
+}
+
+#[test]
+fn deleted_path_bytes_remain_while_its_documents_remain_live() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let removed = corpus.path().join("removed.csv");
+    let retained = corpus.path().join("retained.csv");
+    fs::write(&removed, "id,value\n0,removed\n1,removed\n").unwrap();
+    fs::write(&retained, "id,value\n2,retained\n3,retained\n").unwrap();
+    let durable_live_bytes =
+        fs::metadata(&removed).unwrap().len() + fs::metadata(&retained).unwrap().len();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    assert_eq!(
+        dataset_catalog_docs(&endpoint)[0]["bytes"],
+        durable_live_bytes
+    );
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 4);
+
+    fs::remove_file(&removed).unwrap();
+    // Current autoindex semantics do not reconcile a missing canonical path:
+    // its indexed documents and FileDone remain live. Dataset bytes must
+    // describe that durable live index rather than silently pretend deletion.
+    for _ in 0..2 {
+        assert_eq!(run_index(config.clone()).unwrap(), 0);
+        assert_eq!(endpoint.state.lock().unwrap().docs.len(), 4);
+        assert_eq!(
+            dataset_catalog_docs(&endpoint)[0]["bytes"],
+            durable_live_bytes
+        );
+    }
+}
+
+#[test]
+fn product_path_counts_shared_source_once_per_distinct_dataset() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let path = corpus.path().join("finance.sqlite");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE quarterly (quarter TEXT, revenue INTEGER);
+             INSERT INTO quarterly VALUES ('2026-Q1', 100);
+             CREATE TABLE annual (year INTEGER, filing TEXT);
+             INSERT INTO annual VALUES (2026, '10-K');",
+        )
+        .unwrap();
+    }
+    let source_bytes = fs::metadata(&path).unwrap().len();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let root = config.root.canonicalize().unwrap();
+    let mut journal = state::Journal::open(
+        state_dir.path(),
+        &root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    let mut plan = journal.plan.clone().unwrap();
+    assert_eq!(plan.datasets.len(), 2);
+    let assignment = plan.files.values_mut().next().unwrap();
+    assert_eq!(assignment.assignments.len(), 2);
+    // Model a compatible historical plan that repeated one group assignment.
+    // Catalog accounting must deduplicate it by dataset slug.
+    assignment
+        .assignments
+        .push(assignment.assignments[0].clone());
+    journal.write_plan(&plan).unwrap();
+    drop(journal);
+
+    assert_eq!(run_index(config).unwrap(), 0);
+    let datasets = dataset_catalog_docs(&endpoint);
+    assert_eq!(datasets.len(), 2);
+    assert!(datasets
+        .iter()
+        .all(|dataset| dataset["bytes"] == json!(source_bytes)));
+}
+
+#[test]
+fn existing_catalog_is_upgraded_before_new_run_metadata_is_written() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("records.csv"), "id,value\n0,one\n").unwrap();
+    let endpoint = MockEndpoint::start_with_existing_catalog();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    let (code, summary) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    let summary = summary.unwrap();
+    assert!(summary["started"].is_string());
+    assert!(summary["summary_generated_at"].is_string());
+    assert_eq!(
+        summary["invocation_telemetry_scope"],
+        json!("latest_invocation_of_durable_run")
+    );
+    let state = endpoint.state.lock().unwrap();
+    assert!(state.catalog_mapping_upgraded);
+    assert!(
+        !state.started_mapping_requested,
+        "the additive upgrade asked a legacy catalog for `started`; a real v1.0.0-rc.4 catalog \
+         answers that with 400 mapper_parsing_exception (\"field [started] already exists as \
+         [text], cannot add [date]\") and the run aborts before any document work — see the \
+         tripwire on catalog::catalog_mapping"
+    );
+    assert!(
+        !state.catalog_bulk_before_upgrade,
+        "new run metadata must not reach a legacy catalog before its additive mapping upgrade"
+    );
+    assert!(
+        state.unexpected_catalog_actions.is_empty(),
+        "fixture does not model these catalog bulk actions: {:?}",
+        state.unexpected_catalog_actions
+    );
+}
+
+#[test]
+fn unchanged_resume_keeps_durable_dataset_junk_and_coercion_notes() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("records.csv"), "id,value\n0,one\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let root = config.root.canonicalize().unwrap();
+    let mut journal = state::Journal::open(
+        state_dir.path(),
+        &root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    let plan = journal.plan.clone().unwrap();
+    let slug = plan.datasets[0].slug.clone();
+    let mut completion = journal.done.values().next().unwrap().clone();
+    completion.junk = 7;
+    completion.dropped_by_dataset.insert(slug.clone(), 3);
+    journal.file_done(&completion).unwrap();
+    drop(journal);
+
+    assert_eq!(run_index(config).unwrap(), 0);
+    let dataset = dataset_catalog_docs(&endpoint)
+        .into_iter()
+        .find(|doc| doc["slug"] == slug)
+        .unwrap();
+    assert_eq!(dataset["junk_records"], 7);
+    assert!(dataset["notes"].as_array().unwrap().iter().any(|note| note
+        .as_str()
+        .is_some_and(|text| { text.contains("3 field values could not be coerced") })));
 }
 
 #[test]
@@ -1075,6 +1496,66 @@ fn write_block_rejections_are_backend_fatal_and_the_file_stays_pending() {
     assert_eq!(run_index(config).unwrap(), 0);
     assert_eq!(file_done_count(state_dir.path()), 1);
     assert_eq!(endpoint.state.lock().unwrap().docs.len(), 2);
+}
+
+/// Pins WHY the run document carries no backend-rejection count, so nobody
+/// "restores" one that could only ever read 0.
+///
+/// Making `junk_records_total` durable narrowed it: it no longer folds in the
+/// per-item rejections that `record_bulk_outcome` counts. That looks like a
+/// lost signal, and it would be one — except that a single per-item rejection
+/// also lands in `bulk_errors`, which aborts the run before the run document,
+/// the map, the summary line and the exit code exist at all. So the narrowed
+/// number was unreachable in any published map either way.
+///
+/// The rejection count is therefore reported in the one place a rejected run
+/// ever reaches: the abort message, where it supplies the scale that
+/// `bulk_errors`' first-five sample cannot.
+#[test]
+fn backend_rejected_records_abort_the_run_before_any_map_is_written() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("records.csv"),
+        "id,value\n0,kept\n1,kept\n2,kept\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    endpoint.state.lock().unwrap().reject_first_data_item = true;
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    // A per-item 400 is NOT a server error (not 429, not 5xx, not a block), so
+    // it is the weakest rejection the classifier recognises — and even it is
+    // fatal.
+    let error = format!("{:#}", run_index_report(config).unwrap_err());
+    assert!(
+        error.contains("document_parsing_exception"),
+        "the refusal itself must be quoted: {error}"
+    );
+    assert!(
+        error.contains("The backend refused 1 record(s)."),
+        "the abort must state how many records were refused, not just sample the errors: {error}"
+    );
+
+    // Measured, and deliberately pinned even though it is NOT what the abort
+    // message implies: `record_bulk_outcome` treats a per-item rejection as
+    // non-fatal to the worker (only `server_errors` set `send_err`), so the
+    // file is journaled COMPLETE and the run aborts only at the end. A rerun
+    // therefore resumes past this file and never retries the refused record,
+    // while the message says failed sources "were not journaled complete".
+    //
+    // That divergence predates this branch — it is `main`'s behaviour for the
+    // item-error class — and fixing it means changing when a worker treats a
+    // rejection as fatal, which is a resume-semantics change with nothing to
+    // do with map metadata. Recorded here so the next reader finds the fact
+    // rather than the assumption; tracked in the PR body as a known gap.
+    assert_eq!(
+        file_done_count(state_dir.path()),
+        1,
+        "pre-existing: a per-item rejection still journals the source complete"
+    );
 }
 
 /// #195 last-resort gate: a backend that ACCEPTS every bulk but persists
