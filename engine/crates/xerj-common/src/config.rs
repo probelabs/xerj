@@ -84,9 +84,11 @@ pub struct Config {
     pub logging: LoggingConfig,
     /// Elasticsearch/OpenSearch wire-compatibility identity — 2 settings.
     pub compat: CompatConfig,
+    /// ISM/ILM index-lifecycle-management background execution — 1 setting.
+    pub lifecycle: LifecycleConfig,
 }
 
-// Total: 5+3+2+3+10+5+3+1+6+2+4+3+4+3+2 = 56 fields (incl. cors: 2, auth: 3,
+// Total: 5+3+2+3+10+5+3+1+6+2+4+3+4+3+2+1 = 57 fields (incl. cors: 2, auth: 3,
 // logging: 2). `Default` is derived — every field is a sub-config that
 // implements `Default`, so the derive produces exactly the same all-defaults
 // value the manual impl used to build by hand.
@@ -1486,6 +1488,28 @@ impl Default for PitConfig {
             default_keep_alive_secs: 300,
             max_keep_alive_secs: 86_400,
             sweep_interval_secs: 30,
+        }
+    }
+}
+
+/// ISM/ILM index-lifecycle-management background execution.
+///
+/// Drives `xerj_engine::lifecycle`'s tick: for every managed index, run the
+/// current state's pending actions, then evaluate transitions in order and
+/// move to the first one whose conditions are met.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LifecycleConfig {
+    /// How often the background job ticks (default: 300 seconds = 5
+    /// minutes — the same default OpenSearch ISM itself uses for
+    /// `plugins.index_state_management.job_interval`).
+    pub tick_interval_secs: u64,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval_secs: 300,
         }
     }
 }
