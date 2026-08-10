@@ -80,6 +80,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An index whose metadata will not parse is refused instead of silently
+  reopened with an empty mapping**
+  ([#202](https://github.com/xerj-org/xerj/issues/202)). `Index::open` treated
+  "this file is not there" and "this file does not parse" as the same thing:
+  `load_schema`/`load_settings` mapped ENOENT, EACCES, EIO and malformed JSON
+  alike to one anonymous error, and the caller answered all of them with a
+  fresh dynamic mapping. Measured on a field deliberately mapped `keyword`:
+  after `schema.json` was truncated to half its bytes the index still opened
+  `Ok` with `field_count = 0`, the field came back `None`, and one further
+  document re-inferred it as `long` — a mapping silently replaced by a
+  different one, with nothing in any response saying so. Absent stays absent
+  (indices predating create-time schema persistence legitimately have no
+  `schema.json`); present-but-unparseable now fails the open with an error
+  naming the file. `es_mapping.json` — the full-fidelity mapping behind
+  `GET /_mapping` — was logged-and-ignored on a parse failure and now fails the
+  index too, on the boot scan, on snapshot restore and on a retry.
+
+  **Visible on upgrade:** a node whose data dir already holds a corrupt sidecar
+  now boots **red** with that index unserved, where it previously came up green
+  with an empty mapping. It joins the failed set
+  [#206](https://github.com/xerj-org/xerj/issues/206) introduced, so every
+  surface that set feeds already reports it — measured on a node holding two
+  user indices, `victim` with a truncated `schema.json`:
+
+  ```
+  GET  /_cluster/health          -> red, unassigned_primary_shards: 1
+  GET  /_cluster/health?level=indices
+                                 -> victim red, unassigned_info.details = the
+                                    absolute path of schema.json and the parse error
+  GET  /_cat/indices             -> "red open victim <uuid> 1 0 0 0 0b 0b 0b"
+  GET  /_cluster/indices/failed  -> the reason, plus the retry and delete calls
+  PUT  /victim, POST /victim/_doc, POST /victim/_search
+                                 -> 503 no_shard_available_action_exception
+                                    carrying that same reason
+  GET  /health/ready             -> 200 "ready (degraded): 1 of 2 indices
+                                    serving, 1 failed to open; see GET
+                                    /_cluster/indices/failed"
+  POST /healthy/_search          -> 200
+  ```
+
+  The readiness counts above are the two-index test router's. A running node
+  also holds its internal `.xerj_*` indices, so the same condition on the shipped
+  binary reads `ready (degraded): 15 of 16 indices serving, 1 failed to open` —
+  the 200 and its meaning are unchanged, only the totals move with what else the
+  node holds.
+
+  Recovery is the three doors #206 added. Two were measured end to end on the
+  shipped binary: repair the file and
+  `POST /_cluster/indices/failed/{index}/_retry` (503 while it is still torn,
+  `200 {"reopened": true}` once it is not, health back to green), and
+  `DELETE /{index}` (200, directory removed, health back to green). The third —
+  restore the index from a snapshot — is the path this change touches (a
+  successful restore now clears the recorded failure, which it has to or health
+  would stay red after the repair worked); it is covered by an engine-level
+  test rather than measured over HTTP. The node stays in kubelet rotation as
+  long as any index is still serving.
+
+- **Concurrent sidecar writes can no longer manufacture the torn file the reader
+  now refuses.** `write_file_atomic` staged every write in
+  `path.with_extension("tmp")` — one shared name for all writers of that file —
+  so two concurrent writers of one sidecar (`PUT /{index}/_settings` racing
+  another settings update, two API-key mints for `api_keys.json`) both opened it
+  `O_TRUNC`, interleaved their bytes, and each renamed it into place. The rename
+  is atomic; the content being renamed was not one writer's. Measured with the
+  old shared name, 4 threads × two different-length settings bodies × 200
+  rounds, over four runs: **86–294 of 800 writes failed with ENOENT** (the loser
+  renaming a file the winner had already moved) and, with those errors swallowed
+  as the callers did, **1–16 of 200 rounds left an unparseable `settings.json`**.
+  The counts are race-dependent and vary with machine load; what does not vary is
+  that both are non-zero on every run with the shared name and **0 and 0** on
+  every run with a unique staging name. Each write now stages
+  in its own sibling file (`<file>.tmp.<pid>.<seq>`) in the target's directory
+  and removes its own debris on failure — which for `api_keys.json` is key
+  material. `update_settings` also writes `settings.json` through
+  `write_file_atomic` rather than a plain `fs::write`; it was the last
+  non-atomic sidecar writer left.
+
 - **`index` on the mapping is now honoured instead of silently ignored**
   ([#204](https://github.com/xerj-org/xerj/issues/204)). `"index": false` was
   accepted by `PUT /{index}`, echoed back verbatim by `GET /{index}/_mapping`,

@@ -415,8 +415,12 @@ impl ApiKeyRecord {
 /// default. Mirrors `index::write_file_atomic` but hardens the mode.
 fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    {
+    // Unique staging name, for the same reason as `index::write_file_atomic`:
+    // two concurrent key mints sharing one `api_keys.tmp` can interleave into a
+    // key store that no longer parses, and a corrupt key store silently drops
+    // every persisted key at the next boot.
+    let tmp = crate::index::staging_path(path);
+    let staged = (|| -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -427,14 +431,19 @@ fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        // Belt and braces: pin 0600 even if the platform ignored the open mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    // Never leave a staging file behind on failure — it holds key material.
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    // Tighten an already-existing tmp inode too (create() reuses perms).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
@@ -801,8 +810,14 @@ impl Engine {
                         // Restore the raw ES mapping blob (analyzers, formats,
                         // dims — full fidelity) BEFORE any ingest/query can run,
                         // so GET /_mapping and mapping-dependent code paths see
-                        // the same mapping as pre-restart.
-                        engine.load_persisted_es_mapping(&name_str);
+                        // the same mapping as pre-restart. A corrupt blob fails
+                        // the index (#202) rather than serving it with a
+                        // silently reduced mapping.
+                        if let Err(e) = engine.load_persisted_es_mapping(&name_str) {
+                            warn!(name = name_str.as_str(), error = %e, "failed to open index");
+                            engine.record_failed_index(&name_str, e.to_string());
+                            continue;
+                        }
                         // The index isn't registered yet, so the propagation
                         // inside load can't find it — set the toggles on the
                         // local handle instead.
@@ -820,8 +835,19 @@ impl Engine {
                         // (`GET /{index}`, `GET /{index}/_mapping`) can still
                         // tell the operator what was in the index they are
                         // trying to recover. Propagation into the (absent)
-                        // handle no-ops.
-                        engine.load_persisted_es_mapping(&name_str);
+                        // handle no-ops. Since #202 this load can itself fail
+                        // (unreadable/unparseable `es_mapping.json`); the index
+                        // is already being quarantined for the store error, so
+                        // the extra failure is reported rather than dropped —
+                        // it tells the operator a second file needs repairing.
+                        if let Err(map_err) = engine.load_persisted_es_mapping(&name_str) {
+                            warn!(
+                                name = name_str.as_str(),
+                                error = %map_err,
+                                "es_mapping.json is also unreadable; the mapping surfaces \
+                                 cannot show what this index held"
+                            );
+                        }
                         engine.record_failed_index(&name_str, e.to_string());
                     }
                 }
@@ -1163,9 +1189,11 @@ impl Engine {
         }
 
         // The name is taken by an index that exists on disk but would not
-        // open. Creating over it would run the store open again and surface a
-        // storage error that says nothing about the operator's options, so
-        // refuse here with the recorded reason instead (issue #206).
+        // open. Creating over it would run `Index::create` across the existing
+        // store and overwrite `schema.json` with an empty mapping — the very
+        // mapping loss #202 is about, reached through the other door, and it
+        // would destroy the evidence too. Refuse here with the recorded reason
+        // instead (issue #206).
         if let Some(f) = self.failed_indices.get(name) {
             return Err(EngineError::Common(
                 xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
@@ -1283,19 +1311,36 @@ impl Engine {
     /// (re)opened from disk — boot scan and snapshot restore.  A missing
     /// file is fine (pre-fix indices, dynamic-only indices): readers fall
     /// back to schema-derived properties from `schema.json`.
-    fn load_persisted_es_mapping(&self, name: &str) {
+    ///
+    /// A file that is present but unreadable or unparseable is **not** fine and
+    /// is no longer logged-and-ignored (#202). This blob is the full-fidelity
+    /// mapping — analyzers, date formats, `dense_vector` dims — and is what
+    /// `GET /{index}/_mapping` answers with; dropping it leaves the index
+    /// serving a quietly emptier mapping than the one its own data was written
+    /// under. The caller fails the index instead, which turns cluster health
+    /// red and keeps the corrupt index out of the served set.
+    fn load_persisted_es_mapping(&self, name: &str) -> Result<()> {
         let path = self.data_dir.join(name).join("es_mapping.json");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(EngineError::CorruptIndexMetadata {
+                    file: path.display().to_string(),
+                    reason: e.to_string(),
+                })
+            }
         };
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(mapping) => {
                 self.propagate_date_detection(name, &mapping);
                 self.index_mappings.insert(name.to_string(), mapping);
+                Ok(())
             }
-            Err(e) => {
-                warn!(index = name, error = %e, "ignoring corrupt es_mapping.json");
-            }
+            Err(e) => Err(EngineError::CorruptIndexMetadata {
+                file: path.display().to_string(),
+                reason: format!("{e} ({} bytes on disk)", bytes.len()),
+            }),
         }
     }
 
@@ -2538,7 +2583,19 @@ impl Engine {
         let index_name = IndexName::new(name).map_err(EngineError::Common)?;
         match Index::open(index_name, &self.config, &self.data_dir) {
             Ok(idx) => {
-                self.load_persisted_es_mapping(name);
+                // The store opened, but the full-fidelity mapping blob is part
+                // of what makes this index serveable (#202). Putting the index
+                // back with a silently reduced mapping is exactly the defect
+                // the open refusal exists to prevent, so a retry that cannot
+                // read `es_mapping.json` stays failed and says why.
+                if let Err(e) = self.load_persisted_es_mapping(name) {
+                    let reason = e.to_string();
+                    self.record_failed_index(name, reason.clone());
+                    warn!(name, error = %reason, "retry of failed index did not succeed");
+                    return Err(EngineError::Common(
+                        xerj_common::XerjError::index_unavailable(name, reason),
+                    ));
+                }
                 if let Some(m) = self.index_mappings.get(name) {
                     Engine::apply_date_mapping_flags(&idx, m.value());
                 }
@@ -3418,11 +3475,22 @@ impl Engine {
                 Ok(idx) => {
                     // Snapshot dirs carry es_mapping.json — reload it so the
                     // restored index serves the same mapping it was saved with.
-                    self.load_persisted_es_mapping(idx_name);
+                    // A corrupt blob in the snapshot fails the restore of that
+                    // index instead of restoring it with a reduced mapping.
+                    if let Err(e) = self.load_persisted_es_mapping(idx_name) {
+                        warn!(index = idx_name, error = %e, "failed to reopen restored index");
+                        self.record_failed_index(idx_name, e.to_string());
+                        continue;
+                    }
                     if let Some(m) = self.index_mappings.get(idx_name) {
                         Engine::apply_date_mapping_flags(&idx, m.value());
                     }
                     self.indices.insert(idx_name.clone(), idx);
+                    // Restoring from a snapshot is *the* repair for an index
+                    // that failed to open, so clear the recorded failure —
+                    // otherwise cluster health stays red after the repair
+                    // actually worked.
+                    self.failed_indices.remove(idx_name);
                     info!(index = idx_name, "index restored from snapshot");
                 }
                 Err(e) => {
