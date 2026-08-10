@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.15] - 2026-08-10
+
+### Added
+
+- **Index lifecycle policies are executed, not just stored**
+  ([#199](https://github.com/xerj-org/xerj/issues/199), contributed by
+  @Vinz2168). A single internal engine modeled on OpenSearch's ISM state machine
+  — named states, ordered actions, ordered transitions — exposed through two
+  REST surfaces: native ISM at `_plugins/_ism/*` and the Elasticsearch-shaped
+  `_ilm/*`. `spawn_lifecycle_manager()` runs the tick on
+  `lifecycle.tick_interval_secs` (default 300s, matching OpenSearch ISM's own
+  job interval), and the managed-index cursor survives restart. Retention now
+  actually deletes and rolls over instead of being acknowledged and forgotten.
+  One documented divergence: `min_age` is measured from when an index entered
+  its current state rather than from rollover time, so a policy that rolls over
+  *and* has a downstream phase meant to be measured from the rollover will
+  advance on a different clock than Elasticsearch uses.
+
+- **`xerj autoindex` honours `.gitignore` and `.xerjignore`**
+  ([#276](https://github.com/xerj-org/xerj/issues/276)). Nested ignore files and
+  negation patterns follow git's own precedence, with build-output defaults
+  (`node_modules`, `vendor`, `target`, `dist`, `build`, `.venv`, `__pycache__`)
+  on top; `--no-ignore` and `--no-default-ignores` turn them off. Pointing xerj
+  directly at an ignored path still indexes it — an explicit instruction beats a
+  rule the user did not write for this purpose. `--dry-run` reports what was
+  skipped and by which rule, because a user whose files did not appear needs to
+  know why. Measured on this repository: 274,826 files walked in 1.18s becomes
+  1,385 in 0.25s.
+
+- **Progress is relayed to an AI agent as a drawn bar.** The stream surface
+  carries a rendered bar alongside its machine-readable `key=value` fields, so
+  an agent driving `xerj autoindex` on someone's machine can show a real
+  progress line rather than going silent for minutes. `--progress json` keeps a
+  single parseable stream; `--quiet` still writes nothing on either.
+
+### Fixed
+
+- **Tied scores have one total order — a bounded page is a prefix of the full
+  page** ([#191](https://github.com/xerj-org/xerj/issues/191)). A `size:5` page
+  and a `size:1000` page disagreed about which tied document came back. The
+  memtable's bounded candidates are now ranked by the same page key as the
+  segment path, so the two agree. The remaining `constant_score` and post-sort
+  re-sort cases are tracked separately in
+  [#270](https://github.com/xerj-org/xerj/issues/270).
+
+- **`date_histogram` no longer aborts the process on a multi-byte `time_zone`**
+  ([#272](https://github.com/xerj-org/xerj/issues/272), contributed by
+  @Vinz2168). `aggs::parse_time_zone_offset` sliced a `&str` on a byte index
+  that could land mid-character, and with `panic=abort` that took the whole node
+  down — an unauthenticated request was enough.
+
+- **The legacy path-parameter form of scroll continuation works again**
+  (contributed by @Vinz2168), and **`_cat/*?format=json` plus `_data_stream/**`
+  wildcards** are supported (also @Vinz2168) — both are shapes real
+  Elasticsearch clients send.
+
 ### Changed
 
 - **`autoindex` parses each PDF once per fresh run instead of twice.** Phase A
