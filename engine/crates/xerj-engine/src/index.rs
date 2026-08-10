@@ -26932,14 +26932,24 @@ fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig
 /// are not searchable (`acceptAllTypes = isSimpleMatchPattern(spec) == false`
 /// in `server/src/main/java/org/elasticsearch/index/search/QueryParserHelper.java:115-150`,
 /// read for semantics only — ES is AGPL/SSPL/Elastic-2.0 and no code from it
-/// is reproduced here). So `fields: ["note"]` is rejected exactly like
-/// `match` on `note`, and `fields: ["*"]` keeps working over the searchable
-/// fields. Without this, the same user intent got two different answers:
-/// `simple_query_string {"fields":["note"]}` and `query_string
-/// {"default_field":"note"}` already 400ed because the parser lowers a
-/// single-field form to `Match`, while `multi_match {"fields":["note"]}` —
-/// and either of those with two fields — returned the document *through* the
-/// unsearchable field.
+/// is reproduced here). So a named `fields: ["note"]` is rejected exactly like
+/// `match` on `note`, and a pattern spec is never an error. Without this, the
+/// same user intent got two different answers: `simple_query_string
+/// {"fields":["note"]}` and `query_string {"default_field":"note"}` already
+/// 400ed because the parser lowers a single-field form to `Match`, while
+/// `multi_match {"fields":["note"]}` — and either of those with two fields —
+/// returned the document *through* the unsearchable field.
+///
+/// `query_string`'s `fields` array reaches these arms only because the parser
+/// now reads it (`parser::parse_query_string`); until then the key was
+/// accepted and ignored, so `{"fields":["note"]}` searched everything and
+/// disagreed with `{"default_field":"note"}`. An unqualified clause is now
+/// lowered onto those fields (a `dis_max` when there is more than one), which
+/// is what brings it here. One residue is left, and is not claimed shut: a
+/// query string this parser declines to lower (an unterminated quote, say)
+/// falls back to the opaque `QueryString` node, where a one-element `fields`
+/// is carried across as `default_field` and a longer list is not represented
+/// at all.
 ///
 /// `more_like_this` needs no arm here: with an explicit `fields` list the
 /// parser lowers it to a `bool.should` of `match` clauses, which the leaf arms
@@ -26948,13 +26958,17 @@ fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig
 /// gap below.
 ///
 /// One gap remains open here, stated rather than papered over. The FTS route
-/// for these queries no longer projects a clause onto an unsearchable field
+/// no longer projects a clause onto an unsearchable field
 /// (`text_fields`/`exact_fields` in `search_inner` apply ES's `isSearchable()`
-/// rule), but the stored-doc scan's FIELD-LESS arms are schema-free: they walk
-/// every non-`_` key of `_source`, so a token living only in an unsearchable
-/// field still matches when no field is named at all — `query_string
-/// {"query": "…"}` and a `more_like_this` with no `fields` both still return
-/// the document. Measured, not assumed. That divergence from the FTS
+/// rule — measured: `multi_match {"fields":["*","body"]}` finds nothing in an
+/// unsearchable `note`), but the stored-doc scan's FIELD-LESS arms are
+/// schema-free: they walk every non-`_` key of `_source`, so a token living
+/// only in an unsearchable field still matches when no field is named at all.
+/// `query_string {"query": "…"}` and a `more_like_this` with no `fields` both
+/// still return the document — and so does a *wildcard* spec in
+/// `query_string` / `simple_query_string`, because `fields: ["*"]` lowers to
+/// that same field-less `"*"` placeholder rather than to an expansion over the
+/// searchable fields. Measured, not assumed. That divergence from the FTS
 /// projection predates this change and is called out in its own comment in
 /// `doc_matches_query`; making it schema-aware means threading a schema
 /// through ~79 call sites and is left as its own change.
@@ -26968,6 +26982,13 @@ fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig
 /// `server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java:1534-1546`)
 /// which it raises whether or not `index: false` was declared — a wider
 /// divergence than this change, and one this error message would misreport.
+///
+/// And one surface never reaches this function at all: `_validate/query`
+/// (`xerj-api/src/es_compat.rs::validate_query`) answers from the parse alone
+/// and never opens the index, so it still reports `{"valid": true}` for a body
+/// `_search` refuses. That is its behaviour on `main` too — this change did
+/// not alter it — but it now disagrees with `_search`, so it is written down
+/// here and in the CHANGELOG instead of being left to surprise someone.
 fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
     let check = |field: &str| -> Option<String> {
         let fc = declared_field(schema, field)?;
