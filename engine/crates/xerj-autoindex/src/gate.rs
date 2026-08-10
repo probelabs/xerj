@@ -14,11 +14,16 @@
 //!   only see 1 would have to parse prose to tell "your endpoint is down" from
 //!   "I need you to choose". Anything that has to be distinguished
 //!   programmatically gets its own code.
-//! * **Never block on stdin.** The prompt is offered only when stdin is a
-//!   terminal — i.e. only when a person is actually there to type. A run
-//!   started by an agent, a CI job, or a pipe emits the payload and exits;
-//!   waiting for an answer that cannot arrive is how an agent deadlocks, and
-//!   it is a failure mode nobody can see from the outside.
+//! * **Never wait on stdin for a question the user cannot see.** The prompt is
+//!   offered only when someone can answer it (stdin is a terminal) *and* the
+//!   question actually reached a screen (stderr is a terminal, and the progress
+//!   surface is not silenced). A run started by an agent, a CI job, a pipe, or
+//!   with `--quiet` emits the payload and exits; waiting for an answer that
+//!   cannot arrive is how an agent deadlocks, and an invisible prompt is
+//!   indistinguishable from a hang — the worst possible failure for a feature
+//!   whose whole purpose is to say "this is going to take a while".
+//!   [`prompt_blocked_by`] owns that decision and [`answer_from_terminal`]
+//!   never opens stdin when it says no.
 //! * **Options carry their measured cost, or say they were not measured.**
 //!   `narrower` names the heaviest directories in this corpus with real byte
 //!   counts and re-costs the run without them using the same measured rates.
@@ -172,6 +177,11 @@ pub struct DecisionRequest<'a> {
     pub total_datasets: usize,
     /// Files relationship detection would run over under the current flags.
     pub graph_files: u64,
+    /// Why this run did not stop to ask at a terminal, when it did not.
+    /// Carried in the payload because stdout is the one channel `--quiet`
+    /// leaves open: a user who silenced stderr still has to be able to find
+    /// out that a question existed and why they were not asked it.
+    pub prompt_blocked: Option<NoPrompt>,
 }
 
 impl DecisionRequest<'_> {
@@ -189,6 +199,8 @@ impl DecisionRequest<'_> {
             "priority_order": self.bands,
             "heaviest_directories": self.heaviest,
             "options": self.options(),
+            "prompt_offered": self.prompt_blocked.is_none(),
+            "prompt_not_offered_because": self.prompt_blocked.map(NoPrompt::explain),
             "how_to_answer":
                 "re-invoke the identical command with --approve <id> (--yes is an alias for \
                  --approve proceed). Without an answer nothing has been indexed and nothing has \
@@ -344,17 +356,120 @@ impl DecisionRequest<'_> {
              proceed). Nothing has been indexed."
                 .to_string(),
         );
+        // Say why nobody was asked, where that can still be read. A log that
+        // shows the question but not the reason it went unasked is the same
+        // guessing game one layer up.
+        if let Some(blocked) = self.prompt_blocked {
+            lines.push(format!("  {}", blocked.explain()));
+        }
         lines
     }
 }
 
-/// Is there a human who can answer right now?
+/// Why no terminal prompt was offered. `None` from [`prompt_blocked_by`] means
+/// one was.
 ///
-/// Both halves matter: stdin is where an answer would come from, stderr is
-/// where the question is printed. A run with a redirected stdin has nobody to
-/// ask, and blocking on it is the deadlock this gate exists to avoid.
-pub fn can_prompt() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+/// This exists as a value rather than a bare `bool` because the reason is
+/// printed: a run that stops without asking has to be able to say why it did
+/// not ask, or the silence is just another thing for the user to guess at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoPrompt {
+    /// stdin is a pipe, a file, or closed — an agent, a CI job, a script.
+    /// Nobody is at the keyboard, so there is no answer to wait for.
+    StdinNotTerminal,
+    /// stderr is redirected. The question would land in a log nobody is
+    /// watching while the process sat waiting for a reply to it.
+    StderrNotTerminal,
+    /// `--quiet` / `--progress none` silenced the surface the question is
+    /// printed on. Someone *is* at the keyboard, but they were never shown
+    /// anything to answer — this is the case that made the run look hung.
+    QuestionSilenced,
+}
+
+impl NoPrompt {
+    /// One sentence, for the decision payload and the prose.
+    pub fn explain(self) -> &'static str {
+        match self {
+            NoPrompt::StdinNotTerminal => {
+                "no terminal prompt: stdin is not a terminal, so no answer could be typed. Re-run \
+                 with --approve proceed|fast|cancel"
+            }
+            NoPrompt::StderrNotTerminal => {
+                "no terminal prompt: stderr is not a terminal, so the question would not have \
+                 reached a screen. Re-run with --approve proceed|fast|cancel"
+            }
+            NoPrompt::QuestionSilenced => {
+                "no terminal prompt: --quiet / --progress none silences the question, and this run \
+                 will never wait on stdin for something it did not print. The decision request \
+                 below is on stdout, which --quiet does not silence. Re-run with --approve \
+                 proceed|fast|cancel, or without --quiet to be asked"
+            }
+        }
+    }
+}
+
+/// Should this run stop to ask, and if not, why not?
+///
+/// Three conditions, and all three have to hold before autoindex touches
+/// stdin:
+///
+/// * `stdin_tty` — someone can type an answer;
+/// * `stderr_tty` — the question reaches a screen rather than a log file;
+/// * `question_visible` — the progress surface actually printed it. This is
+///   the one the first cut of the gate missed. `--quiet` / `--progress none`
+///   routes [`crate::progress::Progress::note`] to nothing, so the prose and
+///   the prompt vanished while the process still sat on `read_line`. Measured
+///   before the fix: a pty run with `--progress none` printed **zero bytes**
+///   and was still blocked at 220 s. An invisible prompt is a hang.
+///
+/// Pure, so the whole rule is testable without a terminal — the same shape as
+/// [`crate::progress::resolve`].
+pub fn prompt_blocked_by(
+    stdin_tty: bool,
+    stderr_tty: bool,
+    question_visible: bool,
+) -> Option<NoPrompt> {
+    if !stdin_tty {
+        return Some(NoPrompt::StdinNotTerminal);
+    }
+    if !stderr_tty {
+        return Some(NoPrompt::StderrNotTerminal);
+    }
+    if !question_visible {
+        return Some(NoPrompt::QuestionSilenced);
+    }
+    None
+}
+
+/// [`prompt_blocked_by`] against this process's real streams.
+///
+/// `question_visible` is the caller's progress surface
+/// ([`crate::progress::Progress::enabled`]) — gate has no business inspecting
+/// the surface itself, and passing the fact in keeps this testable.
+pub fn detect_prompt_block(question_visible: bool) -> Option<NoPrompt> {
+    prompt_blocked_by(
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+        question_visible,
+    )
+}
+
+/// Ask, but only when [`prompt_blocked_by`] said it was safe to.
+///
+/// `open_stdin` is a closure and not a reader on purpose: when the prompt is
+/// blocked it is **never called**, so there is no path on which this function
+/// can end up holding — let alone reading — the process's stdin. That is the
+/// invariant, and `a_question_that_cannot_be_seen_is_never_asked` asserts it by
+/// handing in a reader that panics if anyone touches it.
+pub fn answer_from_terminal<R: std::io::BufRead>(
+    blocked: Option<NoPrompt>,
+    open_stdin: impl FnOnce() -> R,
+    echo: impl FnMut(&str),
+) -> Option<Approval> {
+    if blocked.is_some() {
+        return None;
+    }
+    read_answer(&mut open_stdin(), echo)
 }
 
 /// Read one answer from a terminal. `None` means "no answer" — EOF, an
@@ -525,6 +640,7 @@ mod tests {
             semantic_datasets: vec!["docs".into()],
             total_datasets: 3,
             graph_files: 10,
+            prompt_blocked: None,
         };
         let payload = request.to_json();
         assert_eq!(payload["xerj"], "autoindex-decision-request");
@@ -668,6 +784,129 @@ mod tests {
         assert_eq!(
             read_answer(&mut std::io::Cursor::new(b"a\nb\nc0\nd\n"), |_| noise += 1),
             None
+        );
+    }
+
+    /// A reader that fails the test if anything reads it. Standing in for the
+    /// process's real stdin, which has no EOF and no answer coming.
+    struct NeverRead;
+
+    impl std::io::Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("stdin was read for a question the user was never shown");
+        }
+    }
+
+    impl std::io::BufRead for NeverRead {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            panic!("stdin was read for a question the user was never shown");
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    /// THE regression test.
+    ///
+    /// `--quiet` / `--progress none` silences `Progress::note`, which is where
+    /// both the gate's prose and its prompt are printed — but the first cut of
+    /// the gate decided whether to ask from the two tty checks alone. So a
+    /// person at a terminal who passed `--quiet` was asked a question that was
+    /// never printed, and the process sat on `read_line` forever. Measured on
+    /// the pre-fix binary: a pty run with `--progress none` over the threshold
+    /// emitted **0 bytes** and was still blocked when it was killed at 220 s.
+    /// From the outside that is indistinguishable from a hang, in the one
+    /// feature whose entire job is to say "this will take a while".
+    ///
+    /// The reader panics if it is touched, so the invariant asserted here is
+    /// the real one — not "an answer was not returned" but "stdin was not
+    /// read".
+    #[test]
+    fn a_question_that_cannot_be_seen_is_never_asked() {
+        // Someone IS at the keyboard and both streams are terminals — the one
+        // thing missing is that the surface printed nothing.
+        let blocked = prompt_blocked_by(true, true, false);
+        assert_eq!(
+            blocked,
+            Some(NoPrompt::QuestionSilenced),
+            "a silenced surface must block the prompt on its own"
+        );
+        let mut echoed = Vec::new();
+        // Panics unless the fix is present: pre-fix this opened and read stdin.
+        let answer =
+            answer_from_terminal(blocked, || NeverRead, |line| echoed.push(line.to_string()));
+        assert_eq!(answer, None, "an unaskable question is never consent");
+        assert!(
+            echoed.is_empty(),
+            "nothing may be echoed to a surface that prints nothing: {echoed:?}"
+        );
+
+        // …and the run still says so where it can be read. stdout is not
+        // silenced by --quiet, so the payload has to carry the reason.
+        let estimate = estimate(10, 1_000);
+        let request = DecisionRequest {
+            root: "/data".into(),
+            estimate: &estimate,
+            max_minutes: 1,
+            bands: Vec::new(),
+            heaviest: Vec::new(),
+            without_generated: None,
+            semantic_datasets: Vec::new(),
+            total_datasets: 1,
+            graph_files: 0,
+            prompt_blocked: blocked,
+        };
+        let payload = request.to_json();
+        assert_eq!(payload["prompt_offered"], false);
+        let why = payload["prompt_not_offered_because"].as_str().unwrap();
+        assert!(why.contains("--quiet"), "{why}");
+        assert!(why.contains("stdout"), "{why}");
+        assert!(why.contains("--approve"), "{why}");
+        // The exit code is unchanged: a quiet run behaves exactly like the
+        // agent-driven one it now matches.
+        assert_eq!(payload["exit_code"], EXIT_NEEDS_DECISION);
+    }
+
+    /// The other three ways in, so the rule is pinned end to end rather than
+    /// only at the case that was broken.
+    #[test]
+    fn the_prompt_is_offered_only_when_all_three_conditions_hold() {
+        // A terminal, a visible surface: this is the one case that asks.
+        assert_eq!(prompt_blocked_by(true, true, true), None);
+        // Agent, CI, pipe: nobody to type. Checked first because it is the
+        // reason that stays true however the surface is configured.
+        assert_eq!(
+            prompt_blocked_by(false, true, true),
+            Some(NoPrompt::StdinNotTerminal)
+        );
+        assert_eq!(
+            prompt_blocked_by(false, false, false),
+            Some(NoPrompt::StdinNotTerminal)
+        );
+        // stderr redirected to a log: the question would not reach a screen.
+        assert_eq!(
+            prompt_blocked_by(true, false, true),
+            Some(NoPrompt::StderrNotTerminal)
+        );
+        // Every reason names a way out, and none of them is "wait".
+        for reason in [
+            NoPrompt::StdinNotTerminal,
+            NoPrompt::StderrNotTerminal,
+            NoPrompt::QuestionSilenced,
+        ] {
+            let text = reason.explain();
+            assert!(text.contains("--approve"), "{text}");
+            // Every blocked path must leave stdin alone, not merely decline to
+            // return an answer.
+            assert_eq!(
+                answer_from_terminal(Some(reason), || NeverRead, |_| {}),
+                None
+            );
+        }
+
+        // A visible terminal really does read the answer — the fix must not
+        // have turned the prompt off for everyone.
+        assert_eq!(
+            answer_from_terminal(None, || std::io::Cursor::new(b"f\n"), |_| {}),
+            Some(Approval::Fast)
         );
     }
 

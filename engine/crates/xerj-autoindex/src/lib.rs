@@ -2947,6 +2947,13 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             .filter(|dataset| dataset.semantic_field.is_some())
             .map(|dataset| dataset.slug.clone())
             .collect();
+        // Decided once, before anything is printed, and used for both halves:
+        // whether to touch stdin at all, and what the payload says about why
+        // nobody was asked. `pr.enabled()` is the missing third condition —
+        // `--quiet` / `--progress none` routes every `pr.note` below to
+        // nothing, so without it the gate printed no question and then waited
+        // on stdin for the answer to it.
+        let prompt_blocked = gate::detect_prompt_block(pr.enabled());
         let request = gate::DecisionRequest {
             root: root_str.clone(),
             estimate: &run_estimate,
@@ -2966,6 +2973,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             } else {
                 pending.len() as u64
             },
+            prompt_blocked,
         };
         match cfg.approve {
             Some(answer) => pr.note(&format!(
@@ -2982,16 +2990,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 for line in request.prose() {
                     pr.note(&line);
                 }
-                // Ask only where an answer can arrive. A pipe, a CI job or an
-                // agent has no one at the keyboard, and blocking on stdin
-                // there is an invisible deadlock — the failure this gate was
-                // added to prevent, not to introduce.
-                let answer = if gate::can_prompt() {
-                    let stdin = std::io::stdin();
-                    gate::read_answer(&mut stdin.lock(), |line| pr.note(line))
-                } else {
-                    None
-                };
+                // Ask only where an answer can arrive AND the question was
+                // actually shown. A pipe, a CI job or an agent has no one at
+                // the keyboard; a quiet run has someone at the keyboard who
+                // was shown nothing. Blocking on stdin in either case is an
+                // invisible deadlock — the failure this gate was added to
+                // prevent, not to introduce. When it is blocked, stdin is not
+                // opened at all.
+                let answer = gate::answer_from_terminal(
+                    prompt_blocked,
+                    || std::io::stdin().lock(),
+                    |line| pr.note(line),
+                );
                 match answer {
                     Some(gate::Approval::Proceed) => pr.note("gate: proceeding"),
                     Some(gate::Approval::Fast) => {

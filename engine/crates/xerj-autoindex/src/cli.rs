@@ -157,7 +157,12 @@ pub fn help_text() -> String {
                                   progress cadence, 1..=3600 (default 1 on a terminal,\n\
                                   5 otherwise). This is the guaranteed upper bound on\n\
                                   silence between phases.\n\
-             --quiet              errors only (implies --progress none)\n\
+             --quiet              errors only (implies --progress none). The decision gate\n\
+                                  NEVER prompts under this flag, even at a terminal — the\n\
+                                  question would be silenced with everything else. It emits\n\
+                                  the JSON decision request on stdout and exits 4 instead,\n\
+                                  exactly like an agent-driven run. See ESTIMATE + DECISION\n\
+                                  GATE.\n\
              --dataset <SLUG>     (map) show a single dataset\n\
              --help, -h           this help\n\
          \n\
@@ -237,8 +242,15 @@ pub fn help_text() -> String {
              given, nothing is indexed: a JSON decision request goes to stdout and the\n\
              process exits 4 (a code of its own — 1 is the catch-all for real failures).\n\
              Answer by re-running the same command with --approve proceed|fast|cancel.\n\
-             A person at a terminal is prompted instead; a piped or agent-driven run is\n\
-             never blocked on stdin.\n\
+             A person at a terminal is prompted instead — but ONLY when the question can\n\
+             actually be seen. All three must hold: stdin is a terminal, stderr is a\n\
+             terminal, and the progress surface is on. --quiet / --progress none silences\n\
+             the question, so those runs are never prompted and never wait on stdin; a\n\
+             piped or agent-driven run is not prompted either. Every un-prompted run\n\
+             behaves identically: the JSON decision request goes to stdout (which --quiet\n\
+             does NOT silence) and the process exits 4. The payload's\n\
+             `prompt_not_offered_because` says which of the three was missing.\n\
+             autoindex never waits on stdin for a question it did not print.\n\
          \n\
          WORK ORDER:\n\
              Phase B drains source and documents first, then configuration, then\n\
@@ -938,6 +950,11 @@ mod tests {
             "WORK ORDER:",
             "vendored/generated/minified",
             "CLIENT-SIDE EXTRACTION only",
+            // A run that silently stops asking has to say so where the user
+            // looks: --quiet is the flag, the gate section is the rule.
+            "NEVER prompts under this flag",
+            "never waits on stdin for a question it did not print",
+            "prompt_not_offered_because",
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");
         }
