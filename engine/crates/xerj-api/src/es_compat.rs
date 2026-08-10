@@ -24150,11 +24150,23 @@ pub async fn delete_ilm_policy(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    // Remove the verbatim document first: that is the guarded, persisted
-    // path, so a failure there is a 500 with nothing removed anywhere. Only
-    // once it is gone from `cluster_state.json` is the translated executor
-    // policy dropped, so the two files can never disagree in the direction
-    // that keeps running a policy `GET _ilm/policy` reports as deleted.
+    // Two files now back this one request — the verbatim document in
+    // `cluster_state.json` (issue #203) and the translated executor policy in
+    // `ism_policies.json` (issue #199) — so the order matters. The verbatim
+    // document goes first because that is the guarded, persisted, *fallible*
+    // step: if it cannot be written the request is a 500 and nothing has been
+    // removed from either file, rather than an executor policy already
+    // dropped for a document that is still on disk and still served by GET.
+    //
+    // That leaves one window this does not close, stated rather than implied:
+    // a crash between the two calls leaves an `ism_policies.json` entry no
+    // `_ilm/policy` path can reach any more (the retry answers 404, because
+    // the verbatim document really is gone) and the executor keeps driving
+    // any index still attached to it. It is reachable and removable through
+    // the ISM door it was written by — `DELETE /_plugins/_ism/policies/{id}`,
+    // which `GET /_plugins/_ism/explain/{index}` still names — and closing it
+    // properly means one write covering both files, which is a change to the
+    // lifecycle engine's storage rather than to this handler.
     match state.engine.delete_ilm_policy(&name) {
         Ok(true) => {
             state.engine.remove_ism_policy(&name);
