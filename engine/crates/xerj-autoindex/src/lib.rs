@@ -16,6 +16,7 @@ mod generation_catalog;
 #[cfg(test)]
 mod generation_catalog_http_tests;
 pub mod ids;
+pub mod ignore_rules;
 pub mod infer;
 pub mod pool;
 pub mod progress;
@@ -943,6 +944,7 @@ mod phase_a_grouping_tests {
             state_dir: None,
             fresh: true,
             follow_symlinks: false,
+            ignore: crate::ignore_rules::IgnoreOptions::default(),
             max_file_gb: 2,
             sample: 500,
             no_semantic: false,
@@ -2266,7 +2268,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // Totals are unknown until the walk returns, so this phase honestly
     // reports `pct=unknown` and proves liveness with the clock alone.
     pr.phase("walk", 0, 0);
-    let discovered_files = walk::walk(&cfg.root, cfg.follow_symlinks)?;
+    let (discovered_files, ignore_report) =
+        walk::walk_reporting(&cfg.root, cfg.follow_symlinks, cfg.ignore)?;
     let discovered_bytes: u64 = discovered_files.iter().map(|f| f.size).sum();
     pr.note(&format!(
         "autoindex: {} files ({} MB) under {}",
@@ -2274,6 +2277,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         discovered_bytes / (1 << 20),
         root_str
     ));
+    // "Where did my files go?" is answered here, on every run — the rules are
+    // named, not just the totals (#276).
+    for line in ignore_report.summary_lines() {
+        pr.note(&format!("autoindex: {line}"));
+    }
     // An empty folder is only "nothing to do" when there is also no durable
     // state: with a journal present, zero files is a deletion of the whole
     // corpus and has to be reconciled, not shrugged off.
@@ -2320,7 +2328,15 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 true,
                 0,
                 "dry-run",
-                &[("files", inventory.files.len() as u64)],
+                &[
+                    ("files", inventory.files.len() as u64),
+                    ("ignored_files", ignore_report.files_skipped),
+                    ("ignored_dirs", ignore_report.dirs_pruned),
+                    (
+                        "ignored_files_in_pruned_dirs",
+                        ignore_report.files_inside_pruned_dirs,
+                    ),
+                ],
             );
             return Ok((0, None));
         }
@@ -2760,7 +2776,20 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     if cfg.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         pr.note("(dry run — nothing indexed)");
-        pr.finish(true, 0, "dry-run", &[("files", files.len() as u64)]);
+        pr.finish(
+            true,
+            0,
+            "dry-run",
+            &[
+                ("files", files.len() as u64),
+                ("ignored_files", ignore_report.files_skipped),
+                ("ignored_dirs", ignore_report.dirs_pruned),
+                (
+                    "ignored_files_in_pruned_dirs",
+                    ignore_report.files_inside_pruned_dirs,
+                ),
+            ],
+        );
         return Ok((0, None));
     }
 
