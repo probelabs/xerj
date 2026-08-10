@@ -627,6 +627,37 @@ pub struct Engine {
     ///
     /// Never taken while holding a `DashMap` guard.
     cluster_state_write: Arc<parking_lot::Mutex<()>>,
+
+    /// False once `<data_dir>/cluster_state.json` was found on disk and could
+    /// not be loaded — unreadable (`EACCES` after a uid change on a container
+    /// volume, `EIO`, `EMFILE` at boot) or unparseable. While false,
+    /// `flush_cluster_state` refuses to write and every management PUT
+    /// answers 500.
+    ///
+    /// Without this the failure is silent *and* destructive. The maps boot
+    /// empty, so the first `PUT /_index_template/...` snapshots six empty
+    /// maps and `write_file_atomic` renames `cluster_state.tmp` over the
+    /// target — and `rename(2)` needs only write permission on the
+    /// *directory*, so an unreadable-but-perfectly-intact document is
+    /// unlinked by a write that answers `{"acknowledged": true}`. Every
+    /// trigger listed above is transient or trivially repairable *until*
+    /// xerj overwrites the file, which is the one outcome that is not.
+    ///
+    /// Refusing is also the honest answer rather than merely the safe one:
+    /// the node is running without the templates that shape new indices and
+    /// the pipelines `?pipeline=x` names, so accepting more configuration on
+    /// top of a config that is silently a subset is the same
+    /// accepted-and-ignored shape issue #204 tracks.
+    ///
+    /// Cleared only by a boot that loads cleanly — fix or move the file
+    /// aside and restart. redb takes the same position after a failed
+    /// integrity check or a failed I/O: an `AtomicBool` on the backend makes
+    /// every later write return `StorageError::PreviousIo`, whose message is
+    /// "Please close and re-open the database"
+    /// (`redb/src/tree_store/page_store/cached_file.rs:125-145`,
+    /// `redb/src/error.rs:65`; Apache-2.0/MIT, shape adapted, no code
+    /// copied).
+    cluster_state_loaded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Engine {
@@ -739,6 +770,7 @@ impl Engine {
             )),
             _node_lock: node_lock,
             cluster_state_write: Arc::new(parking_lot::Mutex::new(())),
+            cluster_state_loaded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
         // Scan data_dir for existing index directories.
@@ -1753,6 +1785,40 @@ impl Engine {
         self.data_dir.join("cluster_state.json")
     }
 
+    /// `Err` when boot found `cluster_state.json` and could not load it — see
+    /// `cluster_state_loaded` for why that has to latch.
+    ///
+    /// Every management mutation calls this, not only the ones that reach
+    /// `flush_cluster_state` with something to write. A `DELETE` consults the
+    /// in-memory map first, and while the load has failed that map is empty,
+    /// so an unguarded delete answers `404 not found` about an object that is
+    /// sitting in the document on disk — the same lie in a different shape.
+    /// A 500 that names the file is the only honest answer while the node
+    /// cannot see the operator's configuration.
+    fn ensure_cluster_state_writable(&self) -> Result<()> {
+        if self
+            .cluster_state_loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let path = self.cluster_state_path();
+        error!(
+            path = %path.display(),
+            "refusing a cluster-metadata write: this node could not load \
+             cluster_state.json at boot, so its management state is not the \
+             operator's. Recover or move the file aside, then restart."
+        );
+        Err(EngineError::Common(xerj_common::XerjError::storage(
+            format!(
+                "refusing to write {} — it could not be loaded at boot, so \
+                 writing now would destroy cluster configuration that is still \
+                 on disk; recover or move it aside and restart xerj",
+                path.display()
+            ),
+        )))
+    }
+
     /// Snapshot every persisted management map into one document.
     fn cluster_state_snapshot(&self) -> PersistedClusterState {
         fn dump<V: Clone>(map: &DashMap<String, V>) -> std::collections::BTreeMap<String, V> {
@@ -1778,7 +1844,14 @@ impl Engine {
     /// `{"acknowledged": true}` for a change it cannot keep. Callers roll the
     /// in-memory change back and surface a 500, so the operator finds out at
     /// the moment of the write instead of at the next restart.
+    ///
+    /// Refuses outright when boot could not load the existing document — see
+    /// `cluster_state_loaded`. The snapshot below is taken from the live maps,
+    /// which in that state hold only what this process was told after boot, so
+    /// writing it would rename an empty-ish document over configuration that is
+    /// still intact on disk.
     fn flush_cluster_state(&self) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
         // One writer at a time — see `cluster_state_write`. Snapshotting
         // inside the lock also means the bytes that land are never older
         // than a rewrite that has already returned.
@@ -1812,9 +1885,12 @@ impl Engine {
     /// Load `<data_dir>/cluster_state.json` back into the management maps.
     ///
     /// A missing file is normal (fresh node, or a data dir written by a build
-    /// that predates this). A corrupt file is loud: it means the operator's
-    /// templates, pipelines and data streams are *not* coming back, which is
-    /// exactly the silence this whole mechanism exists to remove.
+    /// that predates this). A file that is present but does not load is loud
+    /// *and* latching: it means the operator's templates, pipelines and data
+    /// streams are not coming back, which is exactly the silence this whole
+    /// mechanism exists to remove, so `cluster_state_loaded` goes false and
+    /// every subsequent management write is refused rather than allowed to
+    /// rename a snapshot of empty maps over the document on disk.
     fn load_cluster_state(&self) {
         // An interrupted rewrite can leave a partial `cluster_state.tmp`
         // behind. It is never read (the rename is the commit point), but
@@ -1835,10 +1911,20 @@ impl Engine {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
+                // The file is *there* and its bytes are almost certainly fine
+                // — `EACCES` after a uid change on a container volume, a
+                // backup tool's chmod, `EIO`, `EMFILE` at boot. Do not copy it
+                // aside (we cannot read it) and do not touch it: mark the load
+                // failed so no later write can rename a snapshot of empty maps
+                // over configuration that is still perfectly recoverable.
+                self.cluster_state_loaded
+                    .store(false, std::sync::atomic::Ordering::Release);
                 error!(
                     path = %path.display(), error = %e,
-                    "could not read cluster_state.json — index templates, ingest \
-                     pipelines, data streams and ILM policies are NOT restored"
+                    "could not READ cluster_state.json — index templates, ingest \
+                     pipelines, data streams and ILM policies are NOT restored, \
+                     and management writes will be refused until a boot loads it \
+                     (the file itself is left untouched)"
                 );
                 return;
             }
@@ -1846,20 +1932,30 @@ impl Engine {
         let state: PersistedClusterState = match serde_json::from_slice(&bytes) {
             Ok(s) => s,
             Err(e) => {
+                // Same position as the read error above: the load failed, so
+                // the live maps are not the operator's configuration and
+                // nothing may be written over the document on disk. Refusing
+                // rather than salvaging-then-overwriting also closes the
+                // second-corruption hole in the `!salvage.exists()` guard
+                // below — with an overwrite still allowed, a second damaged
+                // document would be destroyed *and* not copied, because the
+                // copy from the first one is already there.
+                self.cluster_state_loaded
+                    .store(false, std::sync::atomic::Ordering::Release);
                 error!(
                     path = %path.display(), error = %e,
                     "cluster_state.json is corrupt — index templates, ingest \
-                     pipelines, data streams and ILM policies are NOT restored"
+                     pipelines, data streams and ILM policies are NOT restored, \
+                     and management writes will be refused until a boot loads it"
                 );
-                // Keep a copy before the node runs on. The maps are empty
-                // now, so the very next `PUT /_index_template/...` rewrites
-                // this file and takes whatever was still legible in it with
-                // it — and hand-recovering a template out of a damaged
-                // document is the operator's last option, not one to destroy
-                // silently. The original is deliberately left in place so
-                // every boot keeps logging the error above until someone
-                // deals with it, and an existing copy is never clobbered:
-                // the first corruption is the informative one.
+                // Keep a copy anyway. The original is now safe from xerj, but
+                // un-wedging the node means moving it aside by hand, and
+                // hand-recovering a template out of a damaged document is the
+                // operator's last option — leave them something to recover
+                // from that survives that step. The original is deliberately
+                // left in place so every boot keeps logging the error above
+                // until someone deals with it, and an existing copy is never
+                // clobbered: the first corruption is the informative one.
                 let salvage = path.with_extension("corrupt.json");
                 if !salvage.exists() {
                     match std::fs::write(&salvage, &bytes) {
@@ -2008,6 +2104,7 @@ impl Engine {
         name: String,
         value: V,
     ) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
         let previous = map.insert(name.clone(), value);
         if let Err(e) = self.flush_cluster_state() {
             match previous {
@@ -2023,6 +2120,10 @@ impl Engine {
     /// `false` when there was nothing to remove (the caller answers 404);
     /// an `Err` means the removal did not reach disk and was undone.
     fn persisted_remove<V: Clone>(&self, map: &DashMap<String, V>, name: &str) -> Result<bool> {
+        // Before the map lookup: an empty map after a failed load would
+        // otherwise turn "I cannot see your configuration" into "it does not
+        // exist" — see `ensure_cluster_state_writable`.
+        self.ensure_cluster_state_writable()?;
         let Some((key, removed)) = map.remove(name) else {
             return Ok(false);
         };
@@ -2107,6 +2208,9 @@ impl Engine {
         config: Value,
         keep_if_uncompilable: Option<Value>,
     ) -> Result<Option<xerj_wasm::WasmError>> {
+        // Up front, so a refused write never disturbs the compiled form of a
+        // pipeline that is still running.
+        self.ensure_cluster_state_writable()?;
         let previous_doc = self.pipelines.get(id).map(|v| v.value().clone());
         // Taken out up front so a failed compile cannot leave a stale
         // executable behind; put back verbatim on every abort path.
@@ -2668,6 +2772,10 @@ impl Engine {
 
     /// Create a new data stream with its first backing index.
     pub fn create_data_stream(&self, name: &str) -> Result<()> {
+        // Before `create_index` below, not just before the flush: refusing
+        // after the backing index exists would leave a `.ds-*` directory with
+        // no stream in front of it.
+        self.ensure_cluster_state_writable()?;
         if self.data_streams.contains_key(name) {
             return Err(EngineError::Common(
                 xerj_common::XerjError::index_already_exists(name),
@@ -2694,6 +2802,10 @@ impl Engine {
 
     /// Roll over a data stream: create the next backing index and update the alias.
     pub fn rollover_data_stream(&self, name: &str) -> Result<String> {
+        // Same reason as `create_data_stream`, plus: the generation counter is
+        // the one value that must never be handed out twice, so a rollover
+        // that cannot record it must not create its backing index at all.
+        self.ensure_cluster_state_writable()?;
         let mut ds = self
             .data_streams
             .get_mut(name)
@@ -2734,6 +2846,10 @@ impl Engine {
 
     /// Delete a data stream and all its backing indices.
     pub async fn delete_data_stream(&self, name: &str) -> Result<()> {
+        // Before the map lookup, so an unloaded state cannot answer
+        // `index_not_found` for a stream that is recorded on disk — and, more
+        // importantly, cannot go on to destroy its backing indices.
+        self.ensure_cluster_state_writable()?;
         let ds = self
             .data_streams
             .remove(name)

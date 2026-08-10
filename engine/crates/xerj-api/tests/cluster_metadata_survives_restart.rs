@@ -338,10 +338,12 @@ async fn a_rollover_interrupted_before_its_flush_does_not_wedge_the_stream() {
 
 /// A corrupt `cluster_state.json` must not be destroyed by the next write.
 ///
-/// The node boots with empty maps and logs the failure, so the first
-/// `PUT /_index_template/...` rewrites the file — taking whatever was still
-/// legible in it along. Hand-recovery out of a damaged document is the
-/// operator's last option; it should not be silently removed.
+/// The node boots with empty maps and logs the failure, so without this the
+/// first `PUT /_index_template/...` rewrote the file — taking whatever was
+/// still legible in it along. Hand-recovery out of a damaged document is the
+/// operator's last option; it should not be silently removed. The write is
+/// refused (the original stays where it is) *and* a copy is kept, because
+/// un-wedging the node means moving the original aside by hand.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -367,13 +369,18 @@ async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
     );
 
     // The write that would have destroyed the evidence.
-    let (st, _) = put_json(
+    let (st, body) = put_json(
         &app,
         "/_index_template/fresh",
         json!({ "index_patterns": ["fresh-*"] }),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "PUT after corrupt load");
+    assert_eq!(
+        st,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a management write on top of a state that did not load must be \
+         refused, not acknowledged: {body}"
+    );
 
     let salvage = dir.path().join("cluster_state.corrupt.json");
     assert!(
@@ -385,11 +392,153 @@ async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
         truncated,
         "the preserved copy must be the bytes that were found, unmodified"
     );
+    assert_eq!(
+        std::fs::read_to_string(&state_path).expect("read state"),
+        truncated,
+        "the live document must be left exactly as it was found — the copy is \
+         a convenience, not a licence to overwrite the original"
+    );
+
+    // Moving the damaged file aside is the documented recovery, and it must
+    // actually work: the next boot loads cleanly and writes are accepted again.
+    drop(app);
+    std::fs::remove_file(&state_path).expect("operator moves the file aside");
+    let app = app_over(dir.path());
+    let (st, body) = put_json(
+        &app,
+        "/_index_template/fresh",
+        json!({ "index_patterns": ["fresh-*"] }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "PUT after the operator recovered: {body}"
+    );
     assert!(
         std::fs::read_to_string(&state_path)
             .expect("read state")
             .contains("fresh-*"),
-        "the live document must have moved on"
+        "the live document must have moved on once the node loaded cleanly"
+    );
+}
+
+/// An **intact but unreadable** `cluster_state.json` must survive untouched,
+/// and the node must refuse management writes until a boot can load it.
+///
+/// This is the worse half of the corrupt case and it was missed on the first
+/// pass: the bytes are perfectly good, only the `read(2)` failed — a uid
+/// change on a container volume, a backup tool's chmod, `EIO`, `EMFILE` at
+/// boot. The maps come up empty, and `write_file_atomic` renames
+/// `cluster_state.tmp` over the target; `rename(2)` needs write permission on
+/// the *directory*, not on the file, so a `PUT` answering
+/// `{"acknowledged": true}` unlinked a fully recoverable document. Measured
+/// on this test before the fix, with `chmod 000` for the boot only:
+///
+/// ```text
+/// PUT /_index_template/fresh -> 200 {"acknowledged":true}
+/// cluster_state.corrupt.json exists: false
+/// live file still contains "logs-*": false     <-- the operator's templates
+/// ```
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_cluster_state_is_never_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let app = app_over(dir.path());
+        write_all_the_config(&app).await;
+    }
+
+    let state_path = dir.path().join("cluster_state.json");
+    let original = std::fs::read_to_string(&state_path).expect("read state");
+    assert!(original.contains("logs-*"), "fixture must be on disk");
+
+    // Unreadable for the boot only; restored immediately afterwards so the
+    // assertions below read the file the node was left holding, and so a
+    // failure cannot be blamed on the test's own permissions.
+    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 000");
+    let app = app_over(dir.path());
+    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod 644");
+
+    let (st, _) = get(&app, "/_index_template/logs").await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "a document that could not be read cannot be restored — that part is \
+         honest already"
+    );
+
+    // The write that used to destroy it.
+    let (st, body) = put_json(
+        &app,
+        "/_index_template/fresh",
+        json!({ "index_patterns": ["fresh-*"] }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a management write must be refused while the persisted state is \
+         unloaded, not acknowledged: {body}"
+    );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be loaded at boot"),
+        "the 500 must say why, so the operator can act on it: {body}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&state_path).expect("read state"),
+        original,
+        "the intact document must still be on disk, byte for byte"
+    );
+    assert!(
+        !dir.path().join("cluster_state.tmp").exists(),
+        "a refused write must not even stage a temp file"
+    );
+
+    // And the refusal is not a one-off: the in-memory map must not be left
+    // holding a change that was reported as failed.
+    let (st, _) = get(&app, "/_index_template/fresh").await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "a refused PUT must roll its in-memory change back"
+    );
+    let (st, _) = delete(&app, "/_ilm/policy/hot-warm").await;
+    assert_eq!(
+        st,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "deletes are writes too — they must be refused as well"
+    );
+
+    // Recovery path: the file was readable all along, so a plain restart is
+    // the whole fix.
+    drop(app);
+    let app = app_over(dir.path());
+    let (st, body) = get(&app, "/_index_template/logs").await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a restart once the file is readable must restore everything: {body}"
+    );
+    let (st, _) = put_json(
+        &app,
+        "/_index_template/fresh",
+        json!({ "index_patterns": ["fresh-*"] }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "and writes must work again — the refusal must not be sticky across a \
+         clean boot"
     );
 }
 
