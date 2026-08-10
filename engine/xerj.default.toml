@@ -31,7 +31,10 @@ es_compat_port = 9200
 # Ensure this path has sufficient disk space and fast I/O.
 data_dir = "./data"
 
-# IP address to bind all listeners to.
+# IP address to bind all listeners to. An IPv4 or IPv6 literal — "127.0.0.1",
+# "0.0.0.0", "::1". Host names are NOT resolved; a name is refused at startup
+# before anything is created, rather than resolving to a different interface on
+# every host.
 #
 # Defaults to loopback: a fresh node is reachable from the machine it runs on
 # and nowhere else. TLS is off by default, so a node that bound every interface

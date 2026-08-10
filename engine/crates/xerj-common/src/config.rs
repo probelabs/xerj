@@ -303,8 +303,17 @@ impl Config {
     /// Only a loopback literal counts. `0.0.0.0` and `::` are *unspecified*,
     /// not loopback — they bind every interface the host has, which is the
     /// exposure this predicate exists to detect. An address that does not
-    /// parse is reported as not confined: it fails closed here, and the bind
-    /// itself rejects it a moment later anyway.
+    /// parse is reported as not confined — it fails closed here, because a
+    /// predicate that guards an exposure must never answer "safe" about a
+    /// value it does not understand.
+    ///
+    /// That fail-closed answer is correct and is *not* a message: on its own
+    /// it would have the startup refusals tell an operator who wrote
+    /// `bind_address = "localhost"` that localhost "is not loopback", which is
+    /// false, and prescribe an opt-out that only defers the failure. So
+    /// `xerj-server/src/main.rs` rejects a non-IP `bind_address` at step 3a
+    /// with [`Config::bind_ip`], before either exposure check runs; by the
+    /// time this predicate is consulted there, the address is known to parse.
     pub fn bind_address_is_loopback(&self) -> bool {
         self.bind_ip()
             .map(crate::net::canonical_ip)

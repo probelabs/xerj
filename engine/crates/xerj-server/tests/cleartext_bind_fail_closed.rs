@@ -51,9 +51,9 @@ fn toml_path(p: &std::path::Path) -> String {
 /// Run the real binary against `config_body` (plus `extra_args`) and return
 /// `(success, stderr)`.
 ///
-/// The fixed binary rejects at step 3c of startup — before the data directory,
-/// the first-run admin key, or any listener — so well under a second even on a
-/// 2-core CI runner; 60 s is pure headroom.
+/// The fixed binary rejects at step 3a or 3c of startup — before the data
+/// directory, the first-run admin key, or any listener — so well under a
+/// second even on a 2-core CI runner; 60 s is pure headroom.
 fn run_until_exit(config_body: &str, dir: &std::path::Path, extra_args: &[&str]) -> (bool, String) {
     let config_path = dir.join("xerj.toml");
     std::fs::write(&config_path, config_body).unwrap();
@@ -75,9 +75,10 @@ fn run_until_exit(config_body: &str, dir: &std::path::Path, extra_args: &[&str])
                 child.kill().ok();
                 child.wait().ok();
                 panic!(
-                    "xerj kept running with a non-loopback bind_address and tls.enabled \
-                     = false — it is serving plain HTTP on a network-reachable interface, \
-                     so every API key it accepts crosses the wire in cleartext"
+                    "xerj kept running on a bind_address the startup checks must \
+                     refuse — with tls.enabled = false that means plain HTTP on a \
+                     network-reachable interface, so every API key it accepts \
+                     crosses the wire in cleartext"
                 );
             }
             None => std::thread::sleep(Duration::from_millis(100)),
@@ -500,5 +501,147 @@ auth_secret = "0123456789abcdef0123456789abcdef"
         exited.is_none(),
         "bind_address = \"::1\" with cluster mode on must start; it exited \
          with {exited:?}. stderr:\n{stderr}"
+    );
+}
+
+/// A `bind_address` that is not an IP literal must be told the truth about
+/// itself, and must be told it before anything is created.
+///
+/// `Config::bind_address_is_loopback` fails closed on a value it cannot parse
+/// — correct for a predicate guarding an exposure, and the reason `localhost`
+/// used to be refused by step 3c with a message asserting that localhost "is
+/// not loopback" and "would serve plain HTTP on a network-reachable
+/// interface". Both false. Worse, the remedy that refusal named
+/// (`allow_insecure_network_bind = true`) fixed nothing: it silenced 3c and
+/// let the boot run to the bind at step 11, so the operator following the
+/// instructions got a data directory, `.xerj_*` system indices, a master key,
+/// a printed first-run `admin.key` — and then the same failure anyway.
+///
+/// Both halves are asserted here: the message is the true one, and the
+/// declared-exposure path (the one the old message pointed at) refuses in the
+/// same place rather than deferring.
+#[test]
+fn non_ip_bind_address_is_refused_early_and_truthfully() {
+    for opt_out in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let (rest, grpc, es) = three_free_ports();
+        let opt_out_line = if opt_out {
+            "allow_insecure_network_bind = true\n"
+        } else {
+            ""
+        };
+        let body = format!(
+            r#"
+[server]
+bind_address = "localhost"
+{opt_out_line}rest_port = {rest}
+grpc_port = {grpc}
+es_compat_port = {es}
+data_dir = "{data}"
+"#,
+            data = toml_path(&data_dir),
+        );
+
+        let (ok, stderr) = run_until_exit(&body, dir.path(), &[]);
+
+        assert!(
+            !ok,
+            "a bind_address that is not an IP literal must exit non-zero \
+             (allow_insecure_network_bind = {opt_out}); stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("is not an IP address") && stderr.contains("localhost"),
+            "the exit reason must name the real fault and quote the value \
+             (allow_insecure_network_bind = {opt_out}); stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("is not loopback"),
+            "localhost IS loopback — the refusal must not assert otherwise; \
+             stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("allow_insecure_network_bind"),
+            "the refusal must not prescribe an opt-out that does not fix the \
+             fault and only defers the failure past the data directory; \
+             stderr:\n{stderr}"
+        );
+        // The point of moving this to step 3a: with the opt-out set, the old
+        // code reached step 11 and died there, leaving the data dir, the
+        // system indices and a first-run admin key behind.
+        assert!(
+            !data_dir.exists(),
+            "a rejected boot must create nothing (allow_insecure_network_bind \
+             = {opt_out}); found {}. stderr:\n{stderr}",
+            data_dir.display()
+        );
+    }
+}
+
+/// The same guard, reached through `--bind`. The flag is applied after the
+/// config file is validated, so a check that lived in `Config::validate`
+/// would never see it — this pins that the rejection is on the boot path both
+/// sources funnel through.
+#[test]
+fn non_ip_bind_flag_is_refused_before_the_data_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let (rest, grpc, es) = three_free_ports();
+    let config_path = dir.path().join("xerj.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+rest_port = {rest}
+grpc_port = {grpc}
+es_compat_port = {es}
+data_dir = "{data}"
+"#,
+            data = toml_path(&data_dir),
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xerj"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--bind")
+        .arg("db.internal.example")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn xerj");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait().expect("poll child") {
+            Some(status) => break status,
+            None if Instant::now() > deadline => {
+                child.kill().ok();
+                child.wait().ok();
+                panic!("--bind db.internal.example must be refused, not served");
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr piped")
+        .read_to_string(&mut stderr)
+        .expect("read child stderr");
+
+    assert!(!status.success(), "must exit non-zero; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("is not an IP address") && stderr.contains("db.internal.example"),
+        "host names are not resolved, and the refusal must say so while \
+         quoting the value; stderr:\n{stderr}"
+    );
+    assert!(
+        !data_dir.exists(),
+        "a rejected boot must create nothing; found {}. stderr:\n{stderr}",
+        data_dir.display()
     );
 }

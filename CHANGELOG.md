@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also prints the bind address on every listener line, so a loopback node and a
   world-facing one no longer look identical.
 
+  A `bind_address` that is not an IP literal is rejected first, ahead of both
+  exposure checks, with the fault it actually has. Host names have never been
+  resolved — the pre-#228 code parsed `"{bind}:{port}"` as a socket address and
+  failed on them too — but the exposure predicates fail closed on anything they
+  cannot parse, so without that ordering `bind_address = "localhost"` was
+  refused with a message asserting that localhost "is not loopback" and would
+  "serve plain HTTP on a network-reachable interface", and pointed at an opt-out
+  that fixed nothing: setting it let the boot run on to the bind and fail there
+  instead, after the data directory, the `.xerj_*` system indices, the master
+  key and a printed first-run `admin.key` already existed.
+
 ### Fixed
 
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**

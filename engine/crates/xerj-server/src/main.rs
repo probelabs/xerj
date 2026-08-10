@@ -1710,6 +1710,46 @@ async fn async_main() -> Result<()> {
 
     info!("xerj v{} starting", env!("CARGO_PKG_VERSION"));
 
+    // 3a. `server.bind_address` must be an IP literal — and must be rejected
+    //     *here*, ahead of the two exposure checks that follow.
+    //
+    //     Both of those keep on `Config::bind_address_is_loopback`, which
+    //     fails closed on a value it cannot parse. That is the right answer
+    //     for a security predicate and the wrong one for a message: without
+    //     this guard, `bind_address = "localhost"` is refused by 3c with
+    //     «"localhost" is not loopback … would serve plain HTTP on a
+    //     network-reachable interface», two statements that are simply untrue
+    //     of localhost — and the remedy that refusal prescribes,
+    //     `allow_insecure_network_bind = true`, does not fix anything. It only
+    //     silences 3c, so the boot then runs to step 11 and dies on the bind
+    //     *after* the data directory, the `.xerj_*` system indices, the master
+    //     key and a first-run `admin.key` exist and the console setup link has
+    //     been printed. That is the exact late-and-worse failure shape the
+    //     cluster-transport commit on this branch was written to remove; this
+    //     closes the same hole on the data-listener path.
+    //
+    //     Rejecting first means the loopback predicate only ever runs on a
+    //     value that is known to be an IP, so 3b and 3c can only ever say
+    //     something true — and the one honest error arrives with the other
+    //     startup refusals, before anything is written to disk.
+    //
+    //     Host names are deliberately not resolved. Nothing regresses: the
+    //     pre-#228 code composed listeners with
+    //     `format!("{bind}:{port}").parse::<SocketAddr>()`, which never
+    //     resolved names either — it just failed at step 11 instead of here.
+    //     Keeping it that way also keeps the exposure predicates
+    //     deterministic: a name resolves to different addresses on different
+    //     hosts and at different times, so "is this node about to publish
+    //     itself off-loopback?" would stop having a fixed answer. meilisearch
+    //     took the other branch — `DEFAULT_HTTP_ADDR = "localhost:7700"`
+    //     (`crates/meilisearch/src/option.rs:97`, MIT) is a name, resolved by
+    //     actix's `bind()` — and pays for it with a bind that happens at
+    //     `crates/meilisearch/src/main.rs:199-201`, after the index scheduler
+    //     and database are already open. Approach compared, no code taken.
+    if cfg.bind_ip().is_none() {
+        anyhow::bail!(bad_bind_address(&cfg));
+    }
+
     // 3b. gRPC h2c exposure — fail closed (issue #229). `grpc.rs` builds
     //     tonic without its `tls` feature, so `server.grpc_port` speaks
     //     cleartext h2c no matter what `[tls]` says. Enabling TLS and binding
@@ -1719,11 +1759,12 @@ async fn async_main() -> Result<()> {
     //     banner they read once. Refuse instead, and name the one setting
     //     that says the exposure is deliberate.
     //
-    //     First thing after tracing, on purpose: a boot that is going to be
-    //     rejected must not create the data directory, mint and print a
-    //     first-run admin key, or generate a certificate. It is also after
-    //     `load_config`, so `--insecure` (which clears `tls.enabled`) has
-    //     already been applied and cannot be overruled from a config file.
+    //     Immediately after tracing and the 3a bind parse, on purpose: a boot
+    //     that is going to be rejected must not create the data directory,
+    //     mint and print a first-run admin key, or generate a certificate —
+    //     and 3a creates nothing either. It is also after `load_config`, so
+    //     `--insecure` (which clears `tls.enabled`) has already been applied
+    //     and cannot be overruled from a config file.
     if cfg.grpc_h2c_exposed_off_loopback() {
         anyhow::bail!(
             "tls.enabled = true but the gRPC listener on {}:{} speaks cleartext h2c — \
@@ -1992,6 +2033,12 @@ async fn async_main() -> Result<()> {
     //     `"{bind}:{port}"` — that string is unparseable for every IPv6
     //     literal (`"::1:9200"`), which made `bind_address = "::1"` a node
     //     that could not start at all.
+    //
+    //     `socket_addr` cannot be `None` here: step 3a rejected an
+    //     unparseable `bind_address` before the data directory existed, which
+    //     is where that failure belongs. The context is kept as a backstop so
+    //     that if a future edit reorders or drops 3a, this still names the
+    //     setting rather than surfacing a bare `Option` unwrap.
     let rest_addr: SocketAddr = cfg
         .socket_addr(cfg.server.rest_port)
         .with_context(|| bad_bind_address(&cfg))?;

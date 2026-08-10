@@ -407,6 +407,22 @@ Scope of the refusal, all pinned by tests:
 - **The opt-out relaxes only this check.** With TLS on it is not consulted at
   all; the residual gRPC h2c exposure stays governed by
   `tls.allow_insecure_grpc_h2c` (#229).
+- **The bind address must be an IP literal.** Host names are not resolved, and
+  a node given one is refused at `main.rs` step 3a — *before* either exposure
+  check runs, so neither can describe an address it could not parse. Without
+  that ordering, `bind_address = "localhost"` was refused by 3c with a message
+  claiming localhost "is not loopback", and the opt-out that message names
+  merely deferred the same failure past the data directory and a printed
+  first-run admin key. Resolution is deliberately not attempted: a name maps to
+  different addresses on different hosts and at different times, so "which
+  interfaces did this node just publish itself on?" would stop having a fixed
+  answer.
+
+```
+Error: server.bind_address = "localhost" is not an IP address — it must be an
+IPv4 or IPv6 literal such as "127.0.0.1" (the default), "0.0.0.0" or "::1".
+Host names are not resolved.
+```
 
 The escape hatch does not make anything safe. It records that you know, and it
 is what you set when a reverse proxy, sidecar, mesh or ingress terminates TLS in
