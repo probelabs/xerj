@@ -237,6 +237,42 @@ const JS_Q: &str = r#"
 (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @function value: (arrow_function))))
 "#;
 
+// The last pattern is #170's failure mode in the language where it is most
+// common. Modern TypeScript declares most of a module's public surface as
+// `export const x = someBuilder(...)` — schema/table definitions, routers,
+// config objects. That is not an `arrow_function`, so the arrow-valued pattern
+// above missed it, and a module made entirely of such declarations extracted
+// ZERO symbols.
+//
+// Scoped to EXPORTED module constants, deliberately, and narrower than the
+// obvious fix:
+//
+//   * `program > export_statement` only. A bare `program > lexical_declaration`
+//     would also pick up module-private constants. That was measured and
+//     dropped — see the note below — because `defs` is a cross-file retrieval
+//     surface: what another module can name is what another module can search
+//     for. A private constant is found by `body` search, by a caller who is
+//     already in the right file.
+//   * Anchored, not free-floating: `lexical_declaration` is the same node
+//     inside a function body, so an unanchored pattern would fill `defs` with
+//     every function-local `const` — the 90%-locals trap measured for C in #170.
+//   * `"const"` token matched, so `let` stays out: `lexical_declaration` covers
+//     both, and a mutable module binding is state, not a constant.
+//
+// Measured, and the reason for the narrower scope: on a private TypeScript
+// monorepo (~1,600 TS-family files) the broad form was benchmarked against the
+// unpatched engine across 8 retrieval tasks and produced no token improvement
+// (+1.8%, inside a per-task spread of -11%..+12%), at unchanged answer accuracy.
+// It did cut search round-trips by 19%, but every extra symbol is paid for on
+// every response that carries the array. With no demonstrated retrieval gain,
+// the private half of the capture was not worth its weight; the exported half
+// is what closes the zero-symbol hole.
+//
+// An arrow-valued exported const is captured twice on purpose — `@function` by
+// the pattern above and `@const` here. `defs` dedups on (kind, name), so the
+// file becomes reachable by both `function Button` and `const Button`, which is
+// what a caller searching for either would expect; suppressing one would mean
+// choosing which of the two true statements to hide.
 const TS_Q: &str = r#"
 (function_declaration name: (identifier) @function)
 (class_declaration name: (type_identifier) @class)
@@ -245,6 +281,7 @@ const TS_Q: &str = r#"
 (type_alias_declaration name: (type_identifier) @type)
 (enum_declaration name: (identifier) @enum)
 (variable_declarator name: (identifier) @function value: (arrow_function))
+(program (export_statement declaration: (lexical_declaration "const" (variable_declarator name: (identifier) @const))))
 "#;
 
 // `const_item` / `static_item` are captured because a file whose whole content
@@ -485,6 +522,51 @@ mod tests {
         assert!(has(&s, "C", "class"));
         assert!(has(&s, "m", "method"));
         assert!(has(&s, "f", "function"));
+    }
+
+    /// Exported module constants. `export const x = someBuilder(...)` is the
+    /// dominant way modern TypeScript declares a module's public surface
+    /// (schema/table/router builders, config objects). It is not an
+    /// `arrow_function`, so before this the only const pattern (arrow-valued)
+    /// missed it and a module consisting of such declarations extracted ZERO
+    /// symbols — #170's failure mode, in the language where it is most common.
+    /// The negative assertions below are the scope boundary, not omissions.
+    #[test]
+    fn typescript_module_const() {
+        let s = syms(
+            "typescript",
+            "export const users = pgTable(\"users\", {});\n\
+             export const ROUTES = [\"a\", \"b\"];\n\
+             const MAX_BODY_CHARS = 30_000;\n\
+             export let mutableState = 2;\n\
+             function f(){ const local = 1; return local; }\n",
+        );
+        assert!(has(&s, "users", "const"), "got {s:?}");
+        assert!(has(&s, "ROUTES", "const"), "got {s:?}");
+        // Module-PRIVATE const stays out. Not an oversight: `defs` is the
+        // cross-file retrieval surface, and the broad form that also captured
+        // these showed no retrieval gain while adding weight to every response
+        // that carries the array — see the note on TS_Q.
+        assert!(
+            !has(&s, "MAX_BODY_CHARS", "const"),
+            "captured a module-private const: {s:?}"
+        );
+        // Function-local `const` must NOT be captured, or `defs` fills with
+        // locals — the same trap measured at 90% noise for C in #170.
+        assert!(!has(&s, "local", "const"), "captured a local: {s:?}");
+        // `let` is mutable module state, not a constant, even when exported.
+        assert!(!has(&s, "mutableState", "const"), "captured a let: {s:?}");
+    }
+
+    /// Pins the deliberate overlap documented on TS_Q: an arrow-valued module
+    /// const is both a function and a const, and is captured as both so either
+    /// search term reaches the file. If a future edit suppresses one, this
+    /// fails and the reader is sent to the comment explaining the choice.
+    #[test]
+    fn typescript_arrow_const_is_both_kinds() {
+        let s = syms("typescript", "export const Button = () => 1;\n");
+        assert!(has(&s, "Button", "function"), "got {s:?}");
+        assert!(has(&s, "Button", "const"), "got {s:?}");
     }
     #[test]
     fn rust() {
