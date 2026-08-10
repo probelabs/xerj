@@ -221,9 +221,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than an invocation-local counter that read `0` after a no-op resume.
   Existing catalogs whose historical `started` field was dynamically mapped
   as text remain usable: the additive mapping upgrade no longer attempts an
-  incompatible text-to-date type change.
+  incompatible text-to-date type change. Concretely, this is catalogs written
+  by **v1.0.0-rc.4** — the one release that had `autoindex` but not yet
+  dynamic ISO-date inference (added in rc.5). Measured against a live engine,
+  adding `started` as `date` to such a catalog is refused 400
+  `mapper_parsing_exception` (*"field [started] already exists as [text],
+  cannot add [date]"*), which aborts the invocation before any document work.
+  Catalogs written by rc.5 or later already inferred `started` as `date` and
+  were never affected.
 
-  Two consequences worth knowing before you upgrade:
+  Three consequences worth knowing before you upgrade:
 
   - **`bytes` is redefined.** It used to be the bytes the latest invocation
     processed, credited to the first dataset a file was assigned to. It is now
@@ -241,6 +248,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     resume after upgrading, and only regains it once one of its files is
     reprocessed. Re-run with `--fresh` if the note matters more than the
     rescan.
+  - **`junk_records_total` is narrower than the number it replaces**, and one
+    class of failure has left it. It used to be an invocation counter that
+    also folded in records the *backend* refused per bulk item; it is now
+    parser junk only, so `xerj autoindex map`'s header counts exactly what the
+    per-dataset `junk_records` values count. No signal is lost in practice: a
+    single per-item rejection already aborts the run with
+    `autoindex stopped with bulk/backend failures`, before any run document or
+    map is written, so the folded-in number was never observable in a map.
+    That abort message now also states how many records were refused, which
+    the first-five error sample could not convey.
 
 - **The installer is now fail-closed on checksum *verification*, not just on
   checksum *download*.** `landing/get` printed

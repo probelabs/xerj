@@ -31,6 +31,12 @@ struct MockState {
     catalog_preexists: bool,
     catalog_mapping_upgraded: bool,
     catalog_bulk_before_upgrade: bool,
+    /// Set if the additive mapping upgrade ever asks for `started`. This is
+    /// the executable half of `catalog::catalog_mapping`'s tripwire: against a
+    /// legacy (v1.0.0-rc.4) catalog that request is refused 400 and aborts the
+    /// run, so the product must never send it. Asserted false rather than left
+    /// to the 400 branch below, which a correct product never reaches.
+    started_mapping_requested: bool,
     /// Catalog bulk actions the fixture does not model. Recorded rather than
     /// panicked on: this runs inside the server thread while the state guard
     /// is held, so a panic here would poison the `Mutex` and turn
@@ -46,6 +52,12 @@ struct MockState {
     /// Accept every data bulk (`errors: false`) but persist nothing — the
     /// shape of any rejection path the client-side classifier misses.
     swallow_data_bulks: bool,
+    /// Refuse the FIRST document of every data bulk with a per-item 400 and
+    /// apply the rest. This is the one bulk shape that produces an
+    /// `item_error` without a `server_error`: status is neither 429 nor 5xx
+    /// and the type is not a block, so the run continues and must still
+    /// report the rejection.
+    reject_first_data_item: bool,
 }
 
 struct MockEndpoint {
@@ -170,18 +182,31 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                 .is_some()
         });
         let mut locked = state.lock().unwrap();
+        locked.started_mapping_requested |= started_requested;
         if locked.catalog_preexists && started_requested {
-            // The literal shape `PUT /_mapping` returns for an incompatible
-            // type change (`xerj-api/src/es_compat.rs`): 400
-            // `illegal_argument_exception`, not `mapper_parsing_exception`,
-            // which is reserved for a malformed mapping body.
-            let reason = "mapper [started] cannot be changed from type [text] to [date]";
+            // The shape a real engine returns when the additive upgrade asks
+            // for `started` on a legacy (v1.0.0-rc.4) catalog, where `started`
+            // was dynamically inferred as `text`. Measured against a live
+            // v1.0.0-rc.13 engine, not read off the handler: the request falls
+            // past the `illegal_argument_exception` guard — that one only sees
+            // *declared* mappings, and `started` was never declared — and is
+            // refused by the `idx.schema()` guard, which returns
+            // `XerjError::invalid_mapping` and therefore a 400
+            // `mapper_parsing_exception`.
+            //
+            // A correct product never reaches this branch (see
+            // `started_mapping_requested`, asserted false in
+            // `existing_catalog_is_upgraded_before_new_run_metadata_is_written`).
+            // It is kept, and kept accurate, so that adding `started` to the
+            // additive upgrade fails here with the message the operator would
+            // really see rather than passing silently.
+            let reason = "field [started] already exists as [text], cannot add [date]";
             (
                 400,
                 json!({
                     "error": {
-                        "root_cause": [{"type": "illegal_argument_exception", "reason": reason}],
-                        "type": "illegal_argument_exception",
+                        "root_cause": [{"type": "mapper_parsing_exception", "reason": reason}],
+                        "type": "mapper_parsing_exception",
                         "reason": reason,
                     },
                     "status": 400,
@@ -309,6 +334,27 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
     }
     if locked.swallow_data_bulks {
         return json!({"errors": false, "items": []});
+    }
+    if locked.reject_first_data_item {
+        let mut items = Vec::new();
+        for (nth, pair) in lines.chunks_exact(2).enumerate() {
+            if nth == 0 {
+                items.push(json!({"index": {
+                    "status": 400,
+                    "error": {
+                        "type": "document_parsing_exception",
+                        "reason": "refused: value could not be parsed"
+                    }
+                }}));
+                continue;
+            }
+            let action: Value = serde_json::from_slice(pair[0]).unwrap();
+            let doc: Value = serde_json::from_slice(pair[1]).unwrap();
+            let id = action.pointer("/index/_id").unwrap().as_str().unwrap();
+            locked.docs.insert(id.to_owned(), doc);
+            items.push(json!({"index": {"status": 201}}));
+        }
+        return json!({"errors": true, "items": items});
     }
     let fail = !locked.failed_once && locked.data_bulk_number == locked.fail_data_bulk;
     let pairs = lines.chunks_exact(2);
@@ -683,6 +729,13 @@ fn existing_catalog_is_upgraded_before_new_run_metadata_is_written() {
     );
     let state = endpoint.state.lock().unwrap();
     assert!(state.catalog_mapping_upgraded);
+    assert!(
+        !state.started_mapping_requested,
+        "the additive upgrade asked a legacy catalog for `started`; a real v1.0.0-rc.4 catalog \
+         answers that with 400 mapper_parsing_exception (\"field [started] already exists as \
+         [text], cannot add [date]\") and the run aborts before any document work — see the \
+         tripwire on catalog::catalog_mapping"
+    );
     assert!(
         !state.catalog_bulk_before_upgrade,
         "new run metadata must not reach a legacy catalog before its additive mapping upgrade"
@@ -1443,6 +1496,66 @@ fn write_block_rejections_are_backend_fatal_and_the_file_stays_pending() {
     assert_eq!(run_index(config).unwrap(), 0);
     assert_eq!(file_done_count(state_dir.path()), 1);
     assert_eq!(endpoint.state.lock().unwrap().docs.len(), 2);
+}
+
+/// Pins WHY the run document carries no backend-rejection count, so nobody
+/// "restores" one that could only ever read 0.
+///
+/// Making `junk_records_total` durable narrowed it: it no longer folds in the
+/// per-item rejections that `record_bulk_outcome` counts. That looks like a
+/// lost signal, and it would be one — except that a single per-item rejection
+/// also lands in `bulk_errors`, which aborts the run before the run document,
+/// the map, the summary line and the exit code exist at all. So the narrowed
+/// number was unreachable in any published map either way.
+///
+/// The rejection count is therefore reported in the one place a rejected run
+/// ever reaches: the abort message, where it supplies the scale that
+/// `bulk_errors`' first-five sample cannot.
+#[test]
+fn backend_rejected_records_abort_the_run_before_any_map_is_written() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("records.csv"),
+        "id,value\n0,kept\n1,kept\n2,kept\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    endpoint.state.lock().unwrap().reject_first_data_item = true;
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    // A per-item 400 is NOT a server error (not 429, not 5xx, not a block), so
+    // it is the weakest rejection the classifier recognises — and even it is
+    // fatal.
+    let error = format!("{:#}", run_index_report(config).unwrap_err());
+    assert!(
+        error.contains("document_parsing_exception"),
+        "the refusal itself must be quoted: {error}"
+    );
+    assert!(
+        error.contains("The backend refused 1 record(s)."),
+        "the abort must state how many records were refused, not just sample the errors: {error}"
+    );
+
+    // Measured, and deliberately pinned even though it is NOT what the abort
+    // message implies: `record_bulk_outcome` treats a per-item rejection as
+    // non-fatal to the worker (only `server_errors` set `send_err`), so the
+    // file is journaled COMPLETE and the run aborts only at the end. A rerun
+    // therefore resumes past this file and never retries the refused record,
+    // while the message says failed sources "were not journaled complete".
+    //
+    // That divergence predates this branch — it is `main`'s behaviour for the
+    // item-error class — and fixing it means changing when a worker treats a
+    // rejection as fatal, which is a resume-semantics change with nothing to
+    // do with map metadata. Recorded here so the next reader finds the fact
+    // rather than the assumption; tracked in the PR body as a known gap.
+    assert_eq!(
+        file_done_count(state_dir.path()),
+        1,
+        "pre-existing: a per-item rejection still journals the source complete"
+    );
 }
 
 /// #195 last-resort gate: a backend that ACCEPTS every bulk but persists

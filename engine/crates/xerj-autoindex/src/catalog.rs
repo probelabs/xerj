@@ -11,23 +11,42 @@ pub const CATALOG_INDEX: &str = "autoindex-catalog";
 /// Explicit mapping for a **freshly created** catalog index.
 ///
 /// Tripwire — `started` is bimodal across installs, on purpose. This function
-/// declares it `date`, but the additive upgrade in `run_index_report`
-/// deliberately omits it: catalogs created before this mapping existed have a
-/// dynamically inferred `text` `started`, and asking the engine to change an
-/// existing `text` field to `date` is refused with a 400
-/// `illegal_argument_exception` (`xerj-api/src/es_compat.rs:1792`) and aborts
-/// the whole invocation. So a catalog created from here sorts `started`
-/// server-side, and an upgraded legacy catalog does not.
+/// declares it `date`; the additive upgrade in `run_index_report` deliberately
+/// omits it. No release before this one declared `started` at all, so every
+/// existing catalog got it from dynamic inference, and which type that produced
+/// depends on which release wrote the catalog:
 ///
-/// Nothing may rely on `started` being a `date`: `run_map` sorts runs
-/// client-side, which is what keeps the split benign. Any future server-side
-/// range query, `sort`, or date aggregation on `started` must first migrate
-/// legacy catalogs by reindexing them — not by adding `started` to the
-/// additive upgrade, which is exactly the abort described above.
+/// - **v1.0.0-rc.4** — the only release with `autoindex` (0f3ef60d, 2026-07-09)
+///   but without dynamic ISO-date inference (a0f872ac, 2026-07-25, first in
+///   rc.5). Its catalogs inferred `started` as **`text`**. Adding `started` as
+///   `date` to those is refused **400 `mapper_parsing_exception`** — *"field
+///   [started] already exists as [text], cannot add [date]"* — from the
+///   `idx.schema()` guard in `xerj-api/src/es_compat.rs` (the
+///   `XerjError::invalid_mapping` arm; `InvalidMapping` maps to
+///   `mapper_parsing_exception` in `xerj-api/src/error.rs`). `es.update_mapping`
+///   surfaces that as an `Err`, which aborts the invocation before any document
+///   work.
+/// - **v1.0.0-rc.5 and later** — inference already produced `date`, so the same
+///   upgrade would simply be acknowledged 200.
+///
+/// It is specifically NOT the `illegal_argument_exception` *"mapper [started]
+/// cannot be changed from type [text] to [date]"* guard earlier in the same
+/// handler. That one reads `state.engine.index_mappings`, which holds only
+/// *declared* mappings, and `started` was never declared — so for a legacy
+/// catalog it cannot fire. (Measured against a live engine, v1.0.0-rc.13: text
+/// inferred → `mapper_parsing_exception`; text declared →
+/// `illegal_argument_exception`; date inferred → 200 acknowledged.)
+///
+/// So a catalog created from here sorts `started` server-side, an rc.4 catalog
+/// does not, and nothing may rely on `started` being a `date`: `run_map` sorts
+/// runs client-side, which is what keeps the split benign. Any future
+/// server-side range query, `sort`, or date aggregation on `started` must first
+/// migrate legacy catalogs by reindexing them — not by adding `started` to the
+/// additive upgrade, which is exactly the abort above.
 pub fn catalog_mapping() -> Value {
-    // The three run-metadata fields are inserted after the literal rather than
-    // written inside it: `serde_json::json!` recurses once per key, and at 40
-    // properties the macro exceeds the default `recursion_limit = 128` and
+    // The trailing run-metadata fields are inserted after the literal rather
+    // than written inside it: `serde_json::json!` recurses once per key, and at
+    // 40 properties the macro exceeds the default `recursion_limit = 128` and
     // fails to compile. Adding another field here must use this same tail, not
     // the literal.
     let mut mapping = json!({
@@ -88,6 +107,7 @@ pub fn catalog_mapping() -> Value {
         "invocation_telemetry_scope".into(),
         json!({"type": "keyword"}),
     );
+    properties.insert("junk_records_this_run".into(), json!({"type": "long"}));
     mapping
 }
 

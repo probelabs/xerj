@@ -93,10 +93,23 @@ fn replacement_failpoint(_boundary: u8) -> Result<()> {
     Ok(())
 }
 
+/// Send one bulk body and fold its per-item rejections into
+/// `rejected_records`.
+///
+/// This counter is deliberately NOT the parser-junk counter. A record the
+/// *backend* refused and a record the *parser* could not read are different
+/// failures with different lifetimes: parser junk is durable (journaled per
+/// file and replayed on every resume), a backend rejection is not (no
+/// `FileDone` records a document that was never accepted). Adding both to one
+/// number is what let `junk_records_total` mean two things at once.
+///
+/// Note where this number can and cannot surface. Any non-zero value here also
+/// puts an entry in `bulk_errors`, which aborts the run before the run
+/// document exists — so it is reported in the abort message and nowhere else.
 fn record_bulk_outcome(
     es: &Es,
     body: Vec<u8>,
-    junk_records: &AtomicU64,
+    rejected_records: &AtomicU64,
     bulk_errors: &Mutex<Vec<String>>,
     send_err: &mut Option<String>,
 ) -> bool {
@@ -115,7 +128,7 @@ fn record_bulk_outcome(
                 return true;
             }
             if outcome.item_errors > 0 {
-                junk_records.fetch_add(outcome.item_errors, Ordering::Relaxed);
+                rejected_records.fetch_add(outcome.item_errors, Ordering::Relaxed);
                 if let Some(error) = outcome.first_error {
                     let mut errors = bulk_errors.lock().unwrap();
                     if errors.len() < 5 {
@@ -1346,14 +1359,19 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         catalog::CATALOG_INDEX,
         &json!({"properties": {
             "duplicate_of": {"type": "keyword"},
-            // `started` intentionally stays out of this additive upgrade.
-            // Older catalogs dynamically mapped it as text, and asking the
-            // engine to change that existing field to date aborts every run.
-            // `catalog::catalog_mapping` declares it `date` for a fresh
-            // catalog, so the field is permanently bimodal across installs;
-            // its doc comment carries the full tripwire.
+            // `started` intentionally stays out of this additive upgrade. A
+            // catalog written by v1.0.0-rc.4 has a dynamically inferred TEXT
+            // `started`, and asking the engine to add it as `date` is refused
+            // 400 — which `es.update_mapping` turns into an `Err`, aborting
+            // the run before any document work. `catalog::catalog_mapping`
+            // declares it `date` for a fresh catalog, so the field is
+            // permanently bimodal across installs; its doc comment carries the
+            // full tripwire and the measured refusal.
             "summary_generated_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
-            "invocation_telemetry_scope": {"type": "keyword"}
+            "invocation_telemetry_scope": {"type": "keyword"},
+            // Safe to add here, unlike `started`: no release ever wrote this
+            // field, so no existing catalog has a conflicting inferred type.
+            "junk_records_this_run": {"type": "long"}
         }}),
     )
     .context("upgrade autoindex catalog mapping")?;
@@ -1479,7 +1497,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // replacement invalidation can only ever see prior-generation edges —
     // running it later would invalidate this run's own fresh edges.
     let bulk_cut = cfg.bulk_mb << 20;
+    // Parser junk this invocation read out of source files (durable: it is
+    // journaled per file and replayed on resume).
     let junk_records = AtomicU64::new(0);
+    // Records the backend refused in a bulk response (invocation-local: no
+    // journal record exists for a document that was never accepted).
+    let rejected_records = AtomicU64::new(0);
     let bulk_errors = Mutex::new(Vec::<String>::new());
     let graph: Option<GraphRt> = if cfg.no_graph {
         None
@@ -1582,7 +1605,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     && record_bulk_outcome(
                         &es,
                         std::mem::take(&mut buf),
-                        &junk_records,
+                        &rejected_records,
                         &bulk_errors,
                         &mut send_err,
                     )
@@ -1591,7 +1614,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 }
             }
             if send_err.is_none() && !buf.is_empty() {
-                record_bulk_outcome(&es, buf, &junk_records, &bulk_errors, &mut send_err);
+                record_bulk_outcome(&es, buf, &rejected_records, &bulk_errors, &mut send_err);
             }
             if let Some(e) = send_err {
                 anyhow::bail!("write structural graph edges to {edges_index}: {e}");
@@ -1985,7 +2008,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                 && record_bulk_outcome(
                                     &es,
                                     std::mem::take(&mut buf),
-                                    &junk_records,
+                                    &rejected_records,
                                     &bulk_errors,
                                     &mut send_err,
                                 )
@@ -2001,7 +2024,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             record_bulk_outcome(
                                 &es,
                                 buf,
-                                &junk_records,
+                                &rejected_records,
                                 &bulk_errors,
                                 &mut send_err,
                             );
@@ -2026,7 +2049,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                     && record_bulk_outcome(
                                         &es,
                                         std::mem::take(&mut ebuf),
-                                        &junk_records,
+                                        &rejected_records,
                                         &bulk_errors,
                                         &mut send_err,
                                     )
@@ -2038,7 +2061,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                 record_bulk_outcome(
                                     &es,
                                     ebuf,
-                                    &junk_records,
+                                    &rejected_records,
                                     &bulk_errors,
                                     &mut send_err,
                                 );
@@ -2133,7 +2156,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                         && record_bulk_outcome(
                             &es,
                             std::mem::take(&mut buf),
-                            &junk_records,
+                            &rejected_records,
                             &bulk_errors,
                             &mut send_err,
                         )
@@ -2142,7 +2165,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     }
                 }
                 if send_err.is_none() && !buf.is_empty() {
-                    record_bulk_outcome(&es, buf, &junk_records, &bulk_errors, &mut send_err);
+                    record_bulk_outcome(&es, buf, &rejected_records, &bulk_errors, &mut send_err);
                 }
                 match send_err {
                     Some(e) => bulk_errors
@@ -2162,11 +2185,24 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 
     let bulk_errs = bulk_errors.into_inner().unwrap();
     if !bulk_errs.is_empty() {
+        // `bulk_errors` keeps only the first five distinct errors, so without
+        // the counter the operator cannot tell one refused document from ten
+        // thousand. That is the whole reason backend rejections are counted
+        // apart from parser junk: this is the only place the number is ever
+        // reported, because a run that gets here writes no run document and
+        // no map.
+        let rejected = rejected_records.load(Ordering::Relaxed);
+        let scale = if rejected > 0 {
+            format!(" The backend refused {rejected} record(s).")
+        } else {
+            String::new()
+        };
         anyhow::bail!(
-            "autoindex stopped with bulk/backend failures: {}. Failed source files were not \
+            "autoindex stopped with bulk/backend failures: {}.{} Failed source files were not \
              journaled complete; fix the reported server or embedding configuration and rerun \
              the same command to resume safely",
-            bulk_errs.join(" | ")
+            bulk_errs.join(" | "),
+            scale
         );
     }
 
@@ -2571,9 +2607,26 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "duplicate_files": plan.duplicate_files.len(),
         "files_junk": junk_file_count,
         "records_total": total_records,
-        // Durable corpus descriptor, same definition as every dataset doc's
-        // `junk_records`; `junk_records_this_run` below is the invocation
-        // counter, which also includes records the backend itself rejected.
+        // Two numbers, one definition each, neither of them overlapping.
+        //
+        // `junk_records_total` is the durable corpus descriptor: the same
+        // definition as every dataset doc's `junk_records`, summed over every
+        // `FileDone` in the journal. It survives a no-op resume.
+        //
+        // `junk_records_this_run` is the same *kind* of failure narrowed to
+        // the files this invocation actually parsed. It is the NARROWER of the
+        // two, not the wider: every file counted here also committed a
+        // `FileDone` that the total sums. On an unchanged resume it reads 0
+        // while the total stays non-zero — which is the whole defect this
+        // change exists to fix, seen from the other side.
+        //
+        // Backend rejections are deliberately absent. They are a different
+        // failure, and they can never be reported here anyway: a per-item
+        // rejection populates `bulk_errors`, which aborts the run above,
+        // before this document exists. Publishing a
+        // `records_rejected_by_backend` field would ship a number that is
+        // provably always 0 — see `record_bulk_outcome` and
+        // `backend_rejected_records_abort_the_run_before_any_map_is_written`.
         "junk_records_total": durable_junk_records,
         "junk_records_this_run": junk_records_by_run,
         // This-run submission accounting (#195): what THIS invocation sent
@@ -2704,6 +2757,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             cfg.url, cfg.prefix
         );
     }
+    // Exit 3 means "completed, some input was unusable". Backend rejections
+    // are not consulted and must not be: a rejected item aborts the run with
+    // an error long before this line, so `rejected_records` is provably 0
+    // here. Splitting them out of `junk_total_records` therefore changes no
+    // exit code.
     let code = if junk_total_records > 0 || junk_file_count > 0 {
         3
     } else {
