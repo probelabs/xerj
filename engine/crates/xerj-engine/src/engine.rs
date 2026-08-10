@@ -206,9 +206,12 @@ pub struct ApiKeyRecord {
     ///
     /// `#[serde(default)]` so a pre-#201 `api_keys.json` — which has `secret`
     /// and no `secret_hash` — still deserializes; [`Engine::load_persisted_api_keys`]
-    /// then migrates it. An empty value here means "not migrated yet", and a
-    /// record that reaches the auth path with one cannot authenticate (see
-    /// [`ApiKeyRecord::verify_secret`]).
+    /// then migrates it. Anything here that
+    /// [`crate::secret_hash::is_usable_hash`] rejects — empty (never migrated), or
+    /// present but unparseable (truncated write, hand edit, a scheme this
+    /// build does not know) — means "no usable credential": the load path
+    /// drops such a record and [`ApiKeyRecord::verify_secret`] denies it if
+    /// one ever reaches the auth path anyway.
     #[serde(default)]
     secret_hash: String,
     /// Pre-#201 plaintext secret, read only so it can be migrated away.
@@ -278,12 +281,15 @@ impl ApiKeyRecord {
 
     /// Does `presented` match this record's secret?
     ///
-    /// Fail-closed on a record that was never migrated (empty `secret_hash`):
+    /// Fail-closed on a record that carries no usable hash — never migrated
+    /// (empty), or present but not one of our encodings.
     /// [`Engine::load_persisted_api_keys`] drops those before they can reach
-    /// here, but if one ever did, "no stored hash" must mean "no", never
-    /// "yes".
+    /// here, but if one ever did, "no usable stored hash" must mean "no",
+    /// never "yes". [`crate::secret_hash::is_usable_hash`] is the discriminator,
+    /// the same one the load path uses, so the two cannot disagree about what
+    /// counts as a credential.
     pub fn verify_secret(&self, presented: &str) -> bool {
-        if self.secret_hash.is_empty() {
+        if !crate::secret_hash::is_usable_hash(&self.secret_hash) {
             return false;
         }
         crate::secret_hash::verify_secret(presented, &self.secret_hash)
@@ -295,21 +301,48 @@ impl ApiKeyRecord {
     /// `Err(())` means the record carries no usable credential in either form
     /// and must be dropped rather than kept as a key that silently never
     /// authenticates.
+    ///
+    /// "Usable credential" is [`crate::secret_hash::is_usable_hash`], which is
+    /// a full decode — **not** `!secret_hash.is_empty()`, and not a check of
+    /// the `$ssha256$` tag either. A `secret_hash` that carries the tag but
+    /// does not decode (`"$ssha256$truncated"` from a hand edit, a scheme a
+    /// future build writes and this one cannot read) is denied by every
+    /// verifier, so a record holding only that can never authenticate.
+    /// Restoring it would leave a key `GET /_security/api_key` lists as live
+    /// while nothing can ever use it — the accept-then-ignore shape issue #204
+    /// tracks, and exactly what dropping the empty case already avoids. Only
+    /// the two shapes that really are credentials survive:
+    ///
+    /// * a `secret_hash` that decodes — the post-#201 shape, and the winner
+    ///   whenever both forms are present;
+    /// * a non-empty `secret` and **no** `secret_hash` at all — the exact
+    ///   pre-#201 shape, which is what migration is for.
+    ///
+    /// Anything else is dropped rather than repaired. A record carrying both a
+    /// plaintext and a hash-shaped value that does not decode is a store
+    /// nobody can explain; deriving a live credential from the half of it that
+    /// #201 exists to delete is the fail-open reading of an ambiguous record,
+    /// and this is a credential path.
+    ///
+    /// The drop is in memory. `load_persisted_api_keys` only rewrites the file
+    /// when something migrated, so a dropped record normally stays on disk for
+    /// the operator to inspect after the error log points at it.
     fn migrate_from_plaintext(&mut self) -> std::result::Result<bool, ()> {
-        match self.legacy_plaintext_secret.take() {
-            // Both forms present: a half-written or hand-edited file. The hash
-            // wins and the plaintext is discarded — dropping it is the whole
-            // point, and re-deriving from plaintext could silently swap the
-            // credential the record authenticates.
-            Some(_) if !self.secret_hash.is_empty() => Ok(true),
-            Some(plain) if !plain.is_empty() => {
+        let plaintext = self.legacy_plaintext_secret.take();
+        if crate::secret_hash::is_usable_hash(&self.secret_hash) {
+            // The hash is the credential. A leftover plaintext beside it is
+            // discarded — dropping it is the whole point, and re-deriving from
+            // it could silently swap which secret the record authenticates.
+            // `Some` means the file still held plaintext, so it must be
+            // rewritten.
+            return Ok(plaintext.is_some());
+        }
+        match plaintext {
+            Some(plain) if !plain.is_empty() && self.secret_hash.is_empty() => {
                 self.secret_hash = crate::secret_hash::hash_secret(&plain);
                 Ok(true)
             }
-            // No plaintext, and no (or empty) hash: nothing to authenticate
-            // against, in either direction.
-            _ if self.secret_hash.is_empty() => Err(()),
-            _ => Ok(false),
+            _ => Err(()),
         }
     }
 }
@@ -1153,14 +1186,18 @@ impl Engine {
     /// records are hashed here and the file is rewritten **during boot**,
     /// before the server accepts a request, so an upgraded node stops leaking
     /// on first start rather than on first key rotation. The migration is
-    /// one-way and needs no flag day: [`crate::secret_hash::is_hashed`]
-    /// distinguishes the two forms, and an already-migrated store is untouched.
+    /// one-way and needs no flag day: [`crate::secret_hash::is_usable_hash`]
+    /// is the discriminator ([`ApiKeyRecord::migrate_from_plaintext`] calls
+    /// it), so a store whose hashes decode is untouched, and only the exact
+    /// pre-#201 shape — a `secret` and no `secret_hash` at all — is migrated.
     ///
-    /// A record with neither a hash nor a plaintext secret is **dropped with an
+    /// A record that is neither of those two shapes is **dropped with an
     /// error**, not kept: keeping it would leave an entry that `GET
     /// /_security/api_key` lists as a live credential while nothing can ever
     /// authenticate as it — precisely the accept-then-ignore behaviour that
-    /// issue #204 tracks.
+    /// issue #204 tracks. Since "usable" is a full decode, a `secret_hash`
+    /// that is present but unparseable is dropped exactly like an absent one;
+    /// both are equally unauthenticatable.
     fn load_persisted_api_keys(&self) {
         let path = self.api_keys_path();
         let Ok(bytes) = std::fs::read(&path) else {
@@ -1184,9 +1221,12 @@ impl Engine {
                             dropped += 1;
                             error!(
                                 key_id = %id,
-                                "api_keys.json record has neither a hashed nor a plaintext \
-                                 secret — dropping it; nothing could ever authenticate as \
-                                 this key and listing it would be a lie"
+                                "api_keys.json record is not a credential this build can \
+                                 use: its secret_hash does not decode (absent, truncated, \
+                                 or an encoding this build does not know) and it is not \
+                                 the pre-#201 plaintext shape either — dropping it; \
+                                 nothing could ever authenticate as this key and listing \
+                                 it would be a lie"
                             );
                         }
                     }
@@ -2414,5 +2454,117 @@ mod snapshot_path_security_tests {
         let err2 = validate_snapshot_path(&repo, "s1", &snap, data.path(), &["/".to_string()])
             .expect_err("`..` must be rejected even with a permissive allowlist");
         assert!(err2.to_string().contains(".."), "unexpected error: {err2}");
+    }
+}
+
+#[cfg(test)]
+mod api_key_record_migration_tests {
+    use super::ApiKeyRecord;
+
+    /// A record as it comes off disk, before the load path touches it.
+    fn loaded(secret_hash: &str, plaintext: Option<&str>) -> ApiKeyRecord {
+        ApiKeyRecord {
+            name: "loaded".to_string(),
+            secret_hash: secret_hash.to_string(),
+            legacy_plaintext_secret: plaintext.map(str::to_string),
+            creation_ms: 1_753_600_000_000,
+            expiration_ms: None,
+            invalidated: false,
+            invalidation_ms: None,
+            roles: Vec::new(),
+        }
+    }
+
+    /// The discriminator is `is_usable_hash`, not `is_empty` and not a check
+    /// of the `$ssha256$` tag: a `secret_hash` that does not decode can never
+    /// verify against anything, so a record carrying only that is as unusable
+    /// as one carrying nothing and must be dropped, not restored as a live
+    /// key. Three of these carry the tag — a prefix test would call them
+    /// migrated and keep them.
+    #[test]
+    fn an_unparseable_hash_with_no_plaintext_is_dropped() {
+        for stored in [
+            "",
+            "$ssha256$",
+            "$ssha256$truncated",
+            "$ssha256$deadbeef$cafe",
+            "$argon2id$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA",
+            "left-over-plaintext",
+        ] {
+            for plaintext in [None, Some("")] {
+                let mut rec = loaded(stored, plaintext);
+                assert_eq!(
+                    rec.migrate_from_plaintext(),
+                    Err(()),
+                    "{stored:?} + {plaintext:?} must be dropped, not restored"
+                );
+            }
+        }
+    }
+
+    /// A plaintext beside a hash-shaped value that does not decode is a store
+    /// nobody can explain — not the pre-#201 shape (that has no `secret_hash`
+    /// at all), and not a migrated one. Deriving a live credential from the
+    /// half of it #201 exists to delete is the fail-open reading, so the
+    /// record is dropped instead.
+    #[test]
+    fn a_plaintext_beside_an_unparseable_hash_is_dropped_not_repaired() {
+        for stored in [
+            "$ssha256$truncated",
+            "$argon2id$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA",
+            "left-over-plaintext",
+        ] {
+            let mut rec = loaded(stored, Some("the-plaintext"));
+            assert_eq!(
+                rec.migrate_from_plaintext(),
+                Err(()),
+                "{stored:?} + a plaintext is ambiguous and must be dropped"
+            );
+        }
+    }
+
+    /// A usable hash still wins over a leftover plaintext, and the plaintext is
+    /// discarded — re-deriving there could silently swap which secret the
+    /// record authenticates.
+    #[test]
+    fn a_usable_hash_wins_over_a_leftover_plaintext() {
+        let hash = crate::secret_hash::hash_secret("hashed-secret");
+        let mut rec = loaded(&hash, Some("stale-plaintext"));
+        assert_eq!(rec.migrate_from_plaintext(), Ok(true));
+        assert_eq!(rec.secret_hash, hash);
+        assert!(rec.legacy_plaintext_secret.is_none());
+        assert!(rec.verify_secret("hashed-secret"));
+        assert!(!rec.verify_secret("stale-plaintext"));
+    }
+
+    /// An already-migrated record is left alone and reports no rewrite.
+    #[test]
+    fn an_already_hashed_record_is_untouched() {
+        let hash = crate::secret_hash::hash_secret("s");
+        let mut rec = loaded(&hash, None);
+        assert_eq!(rec.migrate_from_plaintext(), Ok(false));
+        assert_eq!(rec.secret_hash, hash);
+    }
+
+    /// The pre-#201 shape: plaintext only.
+    #[test]
+    fn a_pre_201_plaintext_record_is_hashed() {
+        let mut rec = loaded("", Some("legacy-secret"));
+        assert_eq!(rec.migrate_from_plaintext(), Ok(true));
+        assert!(crate::secret_hash::is_usable_hash(&rec.secret_hash));
+        assert!(rec.verify_secret("legacy-secret"));
+    }
+
+    /// Even if one reached the auth path unmigrated, an unusable hash denies.
+    #[test]
+    fn verify_secret_denies_an_unusable_hash() {
+        for stored in ["", "$ssha256$truncated", "plaintext-secret"] {
+            let rec = loaded(stored, None);
+            assert!(
+                !rec.verify_secret(stored),
+                "{stored:?} must not verify against itself"
+            );
+            assert!(!rec.verify_secret("anything"));
+        }
     }
 }

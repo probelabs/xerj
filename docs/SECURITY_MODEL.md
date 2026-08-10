@@ -274,6 +274,20 @@ secret under that record's salt and compares digests in constant time
 on boot — hashed, and the file rewritten without the plaintext — before the
 server accepts a request.
 
+Exactly two on-disk shapes are credentials: a `secret_hash` that decodes (the
+post-#201 form, and the winner whenever both are present), and a non-empty
+`secret` with no `secret_hash` at all (the pre-#201 form, which is what
+migration is for). Every other record is **dropped on load with an error** —
+including one whose `secret_hash` carries the `$ssha256$` tag but does not
+decode, from a hand edit or an encoding a later build wrote. Nothing could ever
+authenticate as such a record, so restoring it and listing it through
+`GET /_security/api_key` would be a lie about which credentials exist. The
+discriminator is `secret_hash::is_usable_hash`, a full decode rather than a tag
+check, and both the load path and `verify_secret` use that one function so they
+cannot disagree about what counts as a credential. The drop is in memory: the
+file is only rewritten when something migrated, so a dropped record normally
+stays on disk for inspection.
+
 The hash is deliberately *fast*, not a password hash. The secret is two v4
 UUIDs of CSPRNG output (244 bits), never chosen or reused by a human, so an
 offline guessing attack is not the threat; a per-request Argon2/scrypt would
@@ -301,11 +315,32 @@ would be true. Before #201 this endpoint answered `superuser` for every caller.
 One deliberate divergence from ES: ES reports `roles: []` for an API-key call
 and expects the client to read `GET /_security/api_key` for the descriptors.
 xerj reports the names instead, because it has no named-role store to point at.
-The divergence is additive and never over-states a key's reach.
+
+Because those names are caller-chosen free text, `superuser` and `unscoped` —
+the two labels xerj assigns on its own authority — are **not mintable from a
+`role_descriptors` key**. A descriptor named `superuser` is reported as
+`api_key_role:superuser` (`es_compat.rs`, `reported_role_label`), so a key
+confined to `logs-*` by that descriptor cannot be handed back a `roles` array
+that reads as the superuser. Without that guard the divergence would re-open
+the exact drift this endpoint was fixed for: one `POST /_security/api_key` with
+the right descriptor name and `_authenticate` says `{"roles":["superuser"]}`
+for a read-only key. With it, the divergence is additive and no key is
+described as holding more than it holds. The guarantee is specifically that no
+caller-chosen name yields `superuser` or `unscoped`; the qualified form is not
+itself reserved, so a descriptor literally named `api_key_role:superuser` comes
+back verbatim — that collides with another caller's name, not with a label xerj
+assigns.
 
 `POST /_security/user/_has_privileges` is **not** fixed: it still answers `true`
 to every privilege named in the request, which is wrong for a scoped key. Treat
 it as a stub, not as an authorization oracle.
+
+Neither are the Kibana user-profile routes (`POST /_security/profile/_activate`,
+`GET /_security/profile/{uid}`): they return one fixed built-in profile whose
+`user.roles` is `["superuser"]` for every caller, because xerj has a single
+owner identity and these exist to get Kibana's bootstrap past a 404. They
+describe that owner, not the credential that called them. `_authenticate` is
+the endpoint that answers "who am I".
 
 ### Privileges that exist but are not decided
 

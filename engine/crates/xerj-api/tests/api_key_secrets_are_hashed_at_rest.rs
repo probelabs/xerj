@@ -300,6 +300,56 @@ async fn authenticate_describes_the_credential_that_called_it() {
     assert_eq!(me["authentication_type"], "api_key");
 }
 
+/// A `role_descriptors` key is caller-chosen free text, and `_authenticate`
+/// reports those names in `roles` — so nothing may stop a caller from *naming*
+/// a descriptor `superuser` and being handed `{"roles":["superuser"]}` back for
+/// a key confined to `logs-*`. That is the same "you are more privileged than
+/// you are" drift #201 exists to remove, re-entered through a name.
+///
+/// `superuser` and `unscoped` are the two labels xerj assigns itself in this
+/// field; a caller-chosen descriptor must never be able to produce either.
+#[tokio::test]
+async fn a_descriptor_name_cannot_forge_a_xerj_assigned_role_label() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = state_over(dir.path().to_str().unwrap());
+    let app = build_es_compat_router(state);
+
+    for forged in ["superuser", "unscoped"] {
+        let (_id, _secret, auth) = mint(
+            &app,
+            &format!(
+                r#"{{"name":"pretender-{forged}","role_descriptors":{{"{forged}":{{"indices":[
+                     {{"names":["logs-*"],"privileges":["read"]}}]}}}}}}"#
+            ),
+        )
+        .await;
+
+        let (status, me) = send(&app, "GET", "/_security/_authenticate", &auth, "").await;
+        assert_eq!(status, StatusCode::OK);
+        let roles = me["roles"].as_array().expect("roles array");
+        assert!(
+            !roles.iter().any(|r| r == forged),
+            "a key confined to logs-* reported the reserved label {forged:?}: {me}"
+        );
+
+        // The grant itself is unaffected — this is about what the key is
+        // *told* it holds, not about narrowing what it holds. A read inside
+        // the granted pattern still works; one outside it is still refused.
+        let (status, body) = send(&app, "GET", "/logs-app/_search", &auth, "").await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the logs-* grant must survive the label fix: {body}"
+        );
+        let (status, body) = send(&app, "GET", "/.xerj-memory-alice/_search", &auth, "").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a logs-* key must not reach the reserved namespace: {body}"
+        );
+    }
+}
+
 /// `GET /_security/api_key` must describe a key with the descriptor names the
 /// caller minted it with. It used to key `role_descriptors` by the internal
 /// per-entry role name, so one `reader` descriptor over two index sets came
@@ -353,6 +403,67 @@ async fn listing_a_key_reports_the_descriptors_it_was_minted_with() {
         entries[1]["privileges"],
         serde_json::json!(["read", "write"])
     );
+}
+
+/// A record that carries a `secret_hash` which is *present but not a hash*
+/// (truncated by a half-written file, mangled by a hand edit, written by a
+/// future scheme this build does not know) can never authenticate: every
+/// verifier in `secret_hash.rs` denies what it cannot decode. Keeping such a
+/// record would list it through `GET /_security/api_key` as a live credential
+/// that nothing can ever use — the accept-then-ignore shape issue #204 tracks,
+/// and exactly what the empty-hash case is already dropped to avoid.
+///
+/// The discriminator is `secret_hash::is_usable_hash`, not `is_empty`.
+#[tokio::test]
+async fn an_unusable_secret_hash_is_dropped_not_listed_as_live() {
+    for (case, stored) in [
+        ("empty", ""),
+        ("truncated", "$ssha256$truncated"),
+        ("wrong-scheme", "$argon2id$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA"),
+        ("bare-plaintext-leftover", "not-a-hash-at-all"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = "99999999-8888-7777-6666-555555555555";
+        std::fs::write(
+            dir.path().join("api_keys.json"),
+            format!(
+                r#"{{"{id}":{{"name":"bricked-{case}","secret_hash":"{stored}",
+                     "creation_ms":1753600000000,"expiration_ms":null,
+                     "invalidated":false}}}}"#
+            ),
+        )
+        .expect("seed store");
+
+        let state = state_over(dir.path().to_str().unwrap());
+        let app = build_es_compat_router(state);
+
+        let (status, body) = send(&app, "GET", "/_security/api_key", &admin(), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["api_keys"].as_array().map(Vec::len),
+            Some(0),
+            "[{case}] a record that can never authenticate was listed as a live key: {body}"
+        );
+
+        // And it must not authenticate either — including with the stored
+        // string presented as if it were the secret.
+        for presented in [stored, "anything"] {
+            let encoded = b64(&format!("{id}:{presented}"));
+            let (status, _) = send(
+                &app,
+                "GET",
+                "/_cluster/health",
+                &format!("ApiKey {encoded}"),
+                "",
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "[{case}] a record with an unusable hash authenticated"
+            );
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -36,8 +36,10 @@
 //!
 //! `$ssha256$<32 hex salt chars>$<64 hex digest chars>` — self-describing, so
 //! a future algorithm can be added without a migration flag day and old
-//! records keep verifying. [`is_hashed`] is the discriminator that tells a
-//! stored hash apart from a pre-#201 plaintext secret.
+//! records keep verifying. [`is_usable_hash`] is the discriminator the load
+//! path uses to tell a credential this build can actually check apart from a
+//! pre-#201 plaintext secret — or from a corrupt record that can never
+//! authenticate at all.
 
 use sha2::{Digest, Sha256};
 
@@ -73,15 +75,22 @@ pub fn verify_secret(presented: &str, stored: &str) -> bool {
     constant_time_eq(&digest(&salt, presented), &expected)
 }
 
-/// Does `stored` look like one of our hash encodings (as opposed to a
-/// pre-#201 plaintext secret)?
+/// Is `stored` a hash this build can actually verify a secret against?
 ///
-/// Used by the load path to decide whether a persisted record needs
-/// migrating. It only inspects the scheme tag: a value that starts with the
-/// tag but is malformed is still *not* plaintext, and must not be re-hashed
-/// as if it were a secret.
-pub fn is_hashed(stored: &str) -> bool {
-    stored.starts_with(SSHA256_PREFIX)
+/// The discriminator the load path uses
+/// (`Engine::load_persisted_api_keys` → `ApiKeyRecord::migrate_from_plaintext`)
+/// and the same one `ApiKeyRecord::verify_secret` fails closed on, so the two
+/// cannot disagree about what counts as a credential.
+///
+/// It is a **full parse**, not a scheme-tag check, and that distinction is
+/// load-bearing: `"$ssha256$truncated"` carries the tag but decodes to
+/// nothing, so [`verify_secret`] denies it against every input. A prefix test
+/// would call that record "already hashed" and restore it — leaving a key
+/// that `GET /_security/api_key` lists as live while nothing can ever
+/// authenticate as it, which is exactly the accept-then-ignore shape issue
+/// #204 tracks. "Tagged" is not "usable"; only "decodes" is.
+pub fn is_usable_hash(stored: &str) -> bool {
+    decode(stored).is_some()
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
@@ -158,7 +167,7 @@ mod tests {
     #[test]
     fn round_trips() {
         let stored = hash_secret("s3cr3t");
-        assert!(is_hashed(&stored));
+        assert!(is_usable_hash(&stored));
         assert!(verify_secret("s3cr3t", &stored));
         assert!(!verify_secret("s3cr3T", &stored));
         assert!(!verify_secret("", &stored));
@@ -196,8 +205,16 @@ mod tests {
                 !verify_secret("plaintext-secret", stored),
                 "unrecognised stored form {stored:?} must not verify"
             );
+            // The two must agree exactly: anything that can never verify is
+            // also not a usable hash, so the load path drops it instead of
+            // restoring a key nothing can authenticate as. Three of these
+            // carry the `$ssha256$` tag, which is why "usable" is a full
+            // decode and not a prefix test.
+            assert!(
+                !is_usable_hash(stored),
+                "{stored:?} can never verify, so it must not count as a usable hash"
+            );
         }
-        assert!(!is_hashed("plaintext-secret"));
     }
 
     /// A record whose digest hex is valid but whose salt is wrong must fail —

@@ -25970,6 +25970,13 @@ pub async fn xpack_usage(State(state): State<AppState>) -> impl IntoResponse {
 /// caller that only checks for `"superuser"` behaves identically, and no key
 /// is described as holding more than it holds.
 ///
+/// That last sentence is only true because of [`reported_role_label`]: a
+/// `role_descriptors` key is caller-chosen free text, so without a guard
+/// `POST /_security/api_key {"role_descriptors":{"superuser":{"indices":
+/// [{"names":["logs-*"],...}]}}}` would make this endpoint answer
+/// `{"roles":["superuser"]}` for a key confined to `logs-*` — the exact drift
+/// this handler exists to remove, re-entered through a name.
+///
 /// Deliberately *not* fixed here: `POST /_security/user/_has_privileges` still
 /// answers `true` to everything (see its own handler). Reporting honest roles
 /// beside a lying privilege oracle is an improvement, not a completion.
@@ -25988,8 +25995,14 @@ pub async fn security_authenticate(
         // `indices` entries becomes three internal `Role`s named `r[0]`,
         // `r[1]`, `r[2]` (`rbac::roles_from_role_descriptors`), and reporting
         // that encoding back would describe roles the caller never named.
+        // Names that collide with a label xerj assigns itself are qualified
+        // first — see `reported_role_label`.
         Principal::Scoped { key_id, roles } => (
-            dedup_in_order(roles.iter().map(|r| r.descriptor_name())),
+            dedup_in_order(
+                roles
+                    .iter()
+                    .map(|r| reported_role_label(r.descriptor_name())),
+            ),
             Some((key_id.clone(), key_name(&state, key_id))),
         ),
         // A key minted without usable `role_descriptors`. Reporting `[]` would
@@ -26061,14 +26074,59 @@ fn key_name(state: &AppState, key_id: &str) -> String {
 /// repeats. Role lists here are single digits long, so the linear `contains`
 /// is cheaper than a set and keeps the output deterministic — a response that
 /// reordered its own roles between calls would be a nuisance to diff.
-fn dedup_in_order<'a>(items: impl Iterator<Item = &'a str>) -> Vec<String> {
+fn dedup_in_order<'a>(items: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for item in items {
-        if !out.iter().any(|seen| seen == item) {
-            out.push(item.to_string());
+        if !out.iter().any(|seen| seen.as_str() == item.as_ref()) {
+            out.push(item.into_owned());
         }
     }
     out
+}
+
+/// Labels `security_authenticate` assigns on xerj's own authority, and which
+/// therefore mean something in every response: `superuser` is the admin
+/// credential (or open mode), `unscoped` is a key minted without usable
+/// `role_descriptors`. Keep in step with the match arms above — these are
+/// exactly the strings those arms emit.
+const XERJ_ASSIGNED_ROLE_LABELS: [&str; 2] = ["superuser", "unscoped"];
+
+/// Prefix applied to a caller-chosen descriptor name that collides with one of
+/// [`XERJ_ASSIGNED_ROLE_LABELS`].
+const QUALIFIED_DESCRIPTOR_PREFIX: &str = "api_key_role:";
+
+/// What a scoped key's `role_descriptors` name is reported as in `roles`.
+///
+/// A descriptor name is free text the caller chose at mint time, and `roles`
+/// is read by clients as an authorization summary. Reporting it verbatim lets
+/// a caller name a descriptor `superuser`, be confined to `logs-*` by that
+/// very descriptor, and then be told by `GET /_security/_authenticate` that it
+/// holds `["superuser"]` — the "you are more privileged than you are" drift
+/// issue #201 removes, re-entered through a name. So the two labels xerj
+/// assigns on its own authority are not mintable from caller input: a
+/// descriptor named `superuser` or `unscoped` is reported qualified, as
+/// `api_key_role:superuser`, which is still the name the caller wrote (nothing
+/// is hidden) but can no longer be mistaken for the label xerj hands out.
+///
+/// Elasticsearch never has this problem because it reports `roles: []` for an
+/// API-key call at all (`ApiKeyService.java:1641`) while keeping `superuser`
+/// in a platform-owned store a caller cannot write into
+/// (`ReservedRolesStore.java:188`, both APPROACH-ONLY reads — AGPL/Elastic, no
+/// code taken). xerj answers the more useful question instead, so it has to
+/// own the namespace explicitly; this is that ownership.
+///
+/// The guarantee is precisely "no caller-chosen name yields a label from
+/// [`XERJ_ASSIGNED_ROLE_LABELS`]". It is *not* that the qualified form is
+/// itself reserved: a caller may name a descriptor `api_key_role:superuser`
+/// and get it back verbatim. That collides with another caller-chosen name,
+/// not with a label xerj assigns, so it cannot make a key look like the
+/// superuser.
+fn reported_role_label(descriptor_name: &str) -> std::borrow::Cow<'_, str> {
+    if XERJ_ASSIGNED_ROLE_LABELS.contains(&descriptor_name) {
+        std::borrow::Cow::Owned(format!("{QUALIFIED_DESCRIPTOR_PREFIX}{descriptor_name}"))
+    } else {
+        std::borrow::Cow::Borrowed(descriptor_name)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
