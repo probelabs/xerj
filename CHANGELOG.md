@@ -78,6 +78,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   group at once, so the uncapped listing was one rendered entry per journalled
   file. `--json` still carries every entry.
 
+### Fixed
+
+- **`index` on the mapping is now honoured instead of silently ignored**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)). `"index": false` was
+  accepted by `PUT /{index}`, echoed back verbatim by `GET /{index}/_mapping`,
+  and then had no effect at all: the field kept a full inverted index and
+  `match`, `term`, `match_phrase`, `prefix` and `wildcard` against it all
+  returned the document, where Elasticsearch answers 400. It is the sibling of
+  the `doc_values` fix in rc.12 and follows its shape.
+
+  The line is drawn where ES draws it. Since 8.1, `"index": false` on a
+  keyword / numeric / date / boolean / ip field keeps the doc-values column and
+  stays queryable — `MappedFieldType.isSearchable()` is "has postings **or** has
+  doc values" — so those queries keep working here, unchanged. Only a field with
+  neither (a `text` field, or anything with an explicit `"doc_values": false`)
+  is unsearchable, and a query naming one is now rejected with ES's own
+  sentence, `Cannot search on field [f] since it is not indexed nor has doc
+  values.`, as a 400 `search_phase_execution_exception` /
+  `query_shard_exception`. The check lives in one place — `search_inner` — and
+  these surfaces were each measured reporting the rejection rather than
+  absorbing it, including the three that were swallowing it: `_search`,
+  `_count` on all four selectors (single index, `logs-*`, a comma list and the
+  cluster-wide `POST /_count`), `_msearch`, `_msearch/template`, `_explain`,
+  `_delete_by_query` and `_rank_eval`. `_explain` answers the 400 instead of a
+  confident `"matched": false` for a query it never ran; `_msearch` and
+  `_msearch/template` render it as a per-response 400 envelope with `type` and
+  `root_cause`, leaving the sibling sub-requests in the batch untouched; and
+  `_rank_eval` records the refused request under `failures` instead of dropping
+  it from `details` *and* `failures`. It still publishes a `metric_score`, and
+  that number is still the mean over the requests that actually ran — which is
+  ES's behaviour too — but the batch no longer shrinks silently underneath it:
+  a two-request batch in which one is refused now answers `details: {good}`,
+  `failures: {bad}`, `metric_score: 1.0` (measured), so a relevance gate reading
+  a clean score can see what did not contribute to it.
+
+  A multi-index `_count` follows ES's broadcast rule rather than failing
+  outright: the failure status is returned only when **no** index answered
+  (`RestStatus.status`, semantics only), so `/t/_count` and a `logs-*` whose
+  indices all carry the offending mapping both 400 exactly as `_search` does,
+  while a mixed selector returns 200 with the partial count and the refusal
+  visible as `_shards.failed: 1` plus a `_shards.failures` entry carrying the
+  `query_shard_exception`. What it will not do any more is what it did before:
+  report `count: 0` with `"successful": 2, "failed": 0`.
+
+  `exists` is unaffected and still returns zero hits rather than an error, which
+  is also what ES does.
+
+  The multi-field query types follow ES's own split rather than a blanket rule.
+  An explicitly *named* field is rejected like any other named field —
+  `multi_match` / `simple_query_string` / `query_string` with
+  `"fields": ["note"]`, and `query_string` with `"default_field": "note"` —
+  while a *wildcard* spec such as `"fields": ["*"]` is never an error, because
+  ES expands a pattern over the searchable fields and silently drops the rest
+  (`QueryParserHelper.resolveMappingField`). Before this, the same user intent
+  got two different answers: the `simple_query_string` form was rejected (the
+  parser lowers it to a `match`) while the `multi_match` form returned the
+  document through the unsearchable field.
+
+  Reaching the `query_string` half of that meant fixing a second
+  accepted-and-ignored key in the same family: **`query_string`'s `fields`
+  array was never read by the parser**, so `{"query":"x","fields":["title"]}`
+  searched every field, and — once `index: false` became a real rejection —
+  disagreed with `{"default_field":"title"}`, which is the same request written
+  the other way. `fields` now selects the targets for a clause that named no
+  field of its own (a `dis_max` over one leaf per field when there is more than
+  one, `^boost` honoured) — the same job `simple_query_string`'s `fields` list
+  was already doing. A clause that does name its own field keeps it, as in ES.
+
+  The field is dropped from the full-text index at flush and merge only where
+  the stored-doc fallback is *equivalent* — a non-indexed `text` field. An
+  exact-typed field that kept its doc values keeps its whole-value postings,
+  because the fallback scan splits on non-alphanumerics and would start matching
+  `192.168.0.1` against `192.168.0.2`. So no byte-saving claim is made for this
+  change: for those types the footprint the option implies is knowingly forgone
+  rather than bought with wrong answers.
+
+  Known gaps, measured and left open rather than claimed shut. **Aggregations
+  and sort do not inherit the check**: only the `query` clause is walked, so
+  `{"size":0,"aggs":{"a":{"terms":{"field":"note"}}}}` still answers 200 with a
+  bucket built from `_source`, and `{"sort":[{"note":"asc"}]}` still answers 200.
+  ES rejects those too, but for an unrelated reason and with an unrelated
+  sentence — `Fielddata is disabled on [f] in [i]…`, which it raises for *any*
+  `text` field whether or not `index: false` was declared — so reusing this
+  error there would misreport a wider divergence as this one. **The field-less
+  arms of the stored-document scan are schema-free**, walking every `_source`
+  key, so a token living only in an unsearchable field can still match when
+  **no** field is named: `query_string {"query":"…"}` and `more_like_this` with
+  no `fields` both still return the document. (Their *named* forms are
+  rejected — `more_like_this` with `fields` lowers to a `bool.should` of
+  `match` at parse time and inherits the check.) **A wildcard `fields` spec
+  reaches that same field-less arm**: `simple_query_string` / `query_string`
+  with `"fields": ["*"]` lowers to the `"*"` placeholder and is answered by the
+  schema-free scan, so it can still match through an unsearchable field. It is
+  never an *error*, which is ES's rule and deliberate — but it is not "answered
+  over the searchable fields" either, and that is a pre-existing property of
+  wildcard expansion, identical on `main`. (`multi_match` with a pattern is
+  different: it is answered by the FTS projection, which does apply
+  `isSearchable()`, and finds nothing in an unsearchable field.) **The opaque
+  `query_string` fallback still ignores a multi-field `fields` list**: a query
+  string the parser declines to lower keeps the whole string for the FTS path,
+  where a one-element `fields` is carried across as `default_field` and a
+  longer list has nowhere to go. And **`_validate/query` never opens the
+  index** — it answers from the parse alone, so it reports `{"valid": true}`
+  for a body `_search` refuses. That too is unchanged from `main`, but it now
+  disagrees with `_search`, so it is written down rather than left to be
+  discovered. Every one of these gaps is pinned by an assertion in
+  `index_false_is_honoured::documented_gaps_are_still_open_and_still_documented`,
+  so closing one fails the test that says it is open.
 
 ## [1.0.0-rc.14] - 2026-08-10
 
