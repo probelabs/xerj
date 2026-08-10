@@ -30,6 +30,12 @@ Create `xerj.toml`:
 [server]
 es_compat_port = 9200          # Elasticsearch-wire clients point here
 data_dir       = "/var/lib/xerj"
+
+# The default is "127.0.0.1" — loopback only, so a node you have not thought
+# about cannot be reached from the network. Exposing it is deliberate. With
+# tls.enabled = false a non-loopback bind refuses to start unless you also set
+# server.allow_insecure_network_bind = true; the TLS block below is what makes
+# it unnecessary here.
 bind_address   = "0.0.0.0"
 
 [auth]
@@ -225,9 +231,54 @@ Three ways out, in the order you should prefer them:
 3. **Accept plaintext gRPC on a trusted network** — same setting, and the
    startup banner will keep saying `:8081` is uncovered on every boot.
 
-`--insecure` never trips this: it clears `tls.enabled`, so nothing is claiming
-the port is encrypted in the first place. The check only fires when TLS is on,
-which is exactly when the mismatch is invisible.
+`--insecure` never trips *this* check: it clears `tls.enabled`, so nothing is
+claiming the port is encrypted in the first place. This one only fires when TLS
+is on, which is exactly when the mismatch is invisible.
+
+It trips the other one instead. See
+[cleartext exposure](#cleartext-exposure-issue-228) below: with TLS off, a
+non-loopback bind refuses to start for a broader reason — not one uncovered
+listener but all of them.
+
+### Cleartext exposure (issue #228)
+
+`server.bind_address` defaults to `127.0.0.1`. A node started without a config
+file is reachable only from its own host, because TLS is off by default and a
+world-facing cleartext node would publish its admin API key to every interface.
+
+Exposing the node is therefore two statements, not one:
+
+```toml
+[server]
+bind_address = "0.0.0.0"
+# Required whenever bind_address is not loopback AND tls.enabled = false.
+# Unnecessary in the section-1 config above, which enables TLS.
+allow_insecure_network_bind = true
+```
+
+Without the second line, startup aborts non-zero before creating the data
+directory or minting a first-run admin key:
+
+```
+Error: server.bind_address = "0.0.0.0" is not loopback and tls.enabled = false,
+so every listener (8080, 9200, 8081) would serve plain HTTP on a
+network-reachable interface — the API key in every Authorization header, and
+every document body, would cross the network in cleartext. Refusing to start.
+```
+
+Three ways out, in the order you should prefer them:
+
+1. **Enable TLS** (section 1). Then this check is not consulted at all.
+2. **Bind loopback** and let a proxy on the same host own the public ports.
+3. **Declare the exposure** with `allow_insecure_network_bind = true` when
+   something in front of the node already terminates TLS — ingress, sidecar,
+   mesh — or when the boundary is a container network namespace. The startup
+   banner keeps naming it on every boot.
+
+Two conveniences exist because the default is loopback: `--bind 0.0.0.0` /
+`XERJ_BIND_ADDRESS`, and `XERJ_ALLOW_INSECURE_NETWORK_BIND`, so a container can
+express both without shipping a TOML file. The Docker image and the Helm chart
+set exactly these.
 
 ### Behind a reverse proxy: `server.trusted_proxies`
 

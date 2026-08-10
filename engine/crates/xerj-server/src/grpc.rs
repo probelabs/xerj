@@ -338,7 +338,8 @@ impl XerjSearch for GrpcService {
 /// shared [`xerj_api::auth::is_authorized`] decision. Without it the gRPC
 /// listener was fully unauthenticated even with `auth.enabled = true`: any
 /// client on the network could read, write, and delete documents (the listener
-/// binds `server.bind_address`, default `0.0.0.0`).
+/// binds `server.bind_address`, which since issue #228 defaults to loopback —
+/// but is `0.0.0.0` in every deployment that exposes the node at all).
 ///
 /// The credential is read from the `authorization` request metadata
 /// (`ApiKey <key>` or `Bearer <key>`), mirroring the HTTP `Authorization`
