@@ -21,7 +21,9 @@
 #      the release page, so a release that lost a matrix leg fails instead of
 #      quietly verifying the targets that did make it
 #   2. every archive has a .sha256 companion, and matches it
-#   3. every archive contains the binary + LICENSE + README
+#   3. every archive contains the binary + LICENSE + README. An archive that
+#      matched its published checksum and still will not extract is a defect in
+#      the release, so it FAILS rather than being skipped
 #   4. every binary — including the ones this host cannot execute — carries the
 #      tag's version in its startup banner, and carries no other version
 #   5. the host-native binary: --version, boot on a clean data dir, health
@@ -96,6 +98,10 @@ SKIPPED_TARGETS=0
 # Set when step 6 did not execute anything for a reason the operator did NOT
 # ask for (no runnable artifact for this host). --no-smoke does not set it.
 SKIPPED_SMOKE=0
+# Archives that were present and checksum-clean but would not extract. Already
+# counted in FAILURES at step 4; tracked so step 5 does not ALSO count them as
+# skipped targets and hand the operator the wrong remedy.
+UNPACKABLE=""
 pass() { printf '  %sPASS%s  %s\n' "$GRN" "$RST" "$1"; }
 fail() { printf '  %sFAIL%s  %s\n' "$RED" "$RST" "$1"; FAILURES=$((FAILURES + 1)); }
 warn() { printf '  %sSKIP%s  %s\n' "$YEL" "$RST" "$1"; }
@@ -186,11 +192,27 @@ step "4. archive contents"
 for a in $ARCHIVES; do
   d="unpack/${a%.tar.gz}"; d="${d%.zip}"
   mkdir -p "$d"
+  # An archive that matched its published checksum and still will not extract is
+  # a defect in the RELEASE, not a gap in this host's tooling — so it is a FAIL,
+  # not a SKIP. Guarding the extractor also keeps `set -e` from ending the run
+  # right here with the extractor's own error and no verdict at all, which is
+  # the one way this script could stop short of the promise in its header that
+  # everything it could not check is counted and reported.
   case "$a" in
-    *.tar.gz) tar -xzf "$a" -C "$d" ;;
+    *.tar.gz)
+      if ! tar -xzf "$a" -C "$d"; then
+        fail "$a — matched its published checksum but did not extract"
+        UNPACKABLE="$UNPACKABLE $a"
+        continue
+      fi ;;
     *.zip)
-      if command -v unzip >/dev/null 2>&1; then unzip -q -o "$a" -d "$d"
-      else warn "$a — unzip not on PATH, contents NOT checked"; continue; fi ;;
+      if ! command -v unzip >/dev/null 2>&1; then
+        warn "$a — unzip not on PATH, contents NOT checked"; continue
+      elif ! unzip -q -o "$a" -d "$d"; then
+        fail "$a — matched its published checksum but did not extract"
+        UNPACKABLE="$UNPACKABLE $a"
+        continue
+      fi ;;
   esac
   # `|| true`: under `set -o pipefail`, find killed by SIGPIPE once head exits
   # returns 141 for the whole pipeline and `set -e` would abort the verifier
@@ -211,11 +233,20 @@ for a in $ARCHIVES; do
   target=$(printf '%s' "$a" | sed "s/^xerj-$EXPECTED-//; s/\.tar\.gz$//; s/\.zip$//")
   bin=$(find "$d" -type f \( -name xerj -o -name xerj.exe \) 2>/dev/null | head -1 || true)
   if [ -z "$bin" ]; then
-    # Step 4 could not unpack this archive (typically: no unzip for a Windows
-    # .zip). Dropping it here would leave this section headed "on every target"
-    # quietly checking fewer targets than it names.
-    warn "$target — no binary unpacked, version NOT checked"
-    SKIPPED_TARGETS=$((SKIPPED_TARGETS + 1))
+    case " $UNPACKABLE " in
+      *" $a "*)
+        # Step 4 already counted this one as a FAIL: the archive is broken, and
+        # the run is already failing closed for the right reason. Counting it a
+        # second time as a skipped target would add the "install unzip" remedy
+        # to the verdict, which is the wrong advice for a defective release.
+        warn "$target — version NOT checked (archive did not extract, see step 4)" ;;
+      *)
+        # Step 4 could not unpack this archive (typically: no unzip for a
+        # Windows .zip). Dropping it here would leave this section headed "on
+        # every target" quietly checking fewer targets than it names.
+        warn "$target — no binary unpacked, version NOT checked"
+        SKIPPED_TARGETS=$((SKIPPED_TARGETS + 1)) ;;
+    esac
     continue
   fi
   found=$(banner_versions "$bin" | tr '\n' ' ' | sed 's/ $//')
