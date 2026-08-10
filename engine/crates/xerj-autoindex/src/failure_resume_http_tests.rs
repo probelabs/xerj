@@ -16,6 +16,52 @@ use std::thread;
 
 static FAILPOINT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Owns the process-global PDF worker environment for the duration of one
+/// test. `XERJ_PDF_WORKER_BIN` is read inside `spawn_worker`, so a test that
+/// sets it silently rewrites what every concurrently running test in this
+/// binary observes — including the unit tests in `extract::pdf`. Acquire this
+/// **before** the first `set_var`; the shared lock is the only thing that
+/// makes those two suites safe to run at the default thread count.
+#[cfg(unix)]
+struct PdfWorkerEnvGuard {
+    /// Held, never read: dropping it after the environment is cleared is the
+    /// whole point.
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl PdfWorkerEnvGuard {
+    fn acquire() -> Self {
+        Self {
+            _lock: crate::extract::pdf::WORKER_BIN_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PdfWorkerEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("XERJ_PDF_WORKER_BIN");
+        std::env::remove_var("XERJ_TEST_PDF_COUNT");
+    }
+}
+
+fn inject_pdf_spool_capacity(state_dir: &Path) {
+    for (name, value) in [
+        ("available-bytes", 16_u64 << 30),
+        ("fd-limit", 4096),
+        ("fd-open", 16),
+    ] {
+        fs::write(
+            state_dir.join(format!(".autoindex-test-pdf-spool-{name}")),
+            value.to_string(),
+        )
+        .unwrap();
+    }
+}
+
 #[derive(Default)]
 struct MockState {
     docs: HashMap<String, Value>,
@@ -23,10 +69,29 @@ struct MockState {
     /// what `_count`/`_search` answer with, and the run verifies live data
     /// counts against the journal (#195). Catalog rows are not data rows.
     catalog_docs: HashMap<String, Value>,
+    /// Every (method, path) the run issued. The refusal tests assert on the
+    /// ABSENCE of remote mutations, which no document count can express.
+    requests: Vec<(String, String)>,
     data_bulk_number: usize,
     fail_data_bulk: usize,
     failed_once: bool,
     delete_calls: usize,
+    response_delay_ms: u64,
+    catalog_preexists: bool,
+    catalog_mapping_upgraded: bool,
+    catalog_bulk_before_upgrade: bool,
+    /// Set if the additive mapping upgrade ever asks for `started`. This is
+    /// the executable half of `catalog::catalog_mapping`'s tripwire: against a
+    /// legacy (v1.0.0-rc.4) catalog that request is refused 400 and aborts the
+    /// run, so the product must never send it. Asserted false rather than left
+    /// to the 400 branch below, which a correct product never reaches.
+    started_mapping_requested: bool,
+    /// Catalog bulk actions the fixture does not model. Recorded rather than
+    /// panicked on: this runs inside the server thread while the state guard
+    /// is held, so a panic here would poison the `Mutex` and turn
+    /// `MockEndpoint::drop`'s `join().unwrap()` into a second, misleading
+    /// panic. Tests assert on it from the test thread instead.
+    unexpected_catalog_actions: Vec<String>,
     stop: bool,
     embedding_identity_sha256: String,
     /// Reject every data-bulk item with a 403 explicit write-block error
@@ -36,6 +101,12 @@ struct MockState {
     /// Accept every data bulk (`errors: false`) but persist nothing — the
     /// shape of any rejection path the client-side classifier misses.
     swallow_data_bulks: bool,
+    /// Refuse the FIRST document of every data bulk with a per-item 400 and
+    /// apply the rest. This is the one bulk shape that produces an
+    /// `item_error` without a `server_error`: status is neither 429 nor 5xx
+    /// and the type is not a block, so the run continues and must still
+    /// report the rejection.
+    reject_first_data_item: bool,
 }
 
 struct MockEndpoint {
@@ -46,11 +117,16 @@ struct MockEndpoint {
 
 impl MockEndpoint {
     fn start(fail_data_bulk: usize) -> Self {
+        Self::start_with_delay(fail_data_bulk, 0)
+    }
+
+    fn start_with_delay(fail_data_bulk: usize, response_delay_ms: u64) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(MockState {
             fail_data_bulk,
+            response_delay_ms,
             embedding_identity_sha256: "a".repeat(64),
             ..MockState::default()
         }));
@@ -72,6 +148,12 @@ impl MockEndpoint {
             state,
             join: Some(join),
         }
+    }
+
+    fn start_with_existing_catalog() -> Self {
+        let endpoint = Self::start(usize::MAX);
+        endpoint.state.lock().unwrap().catalog_preexists = true;
+        endpoint
     }
 }
 
@@ -111,19 +193,85 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+    state
+        .lock()
+        .unwrap()
+        .requests
+        .push((method.to_owned(), path.to_owned()));
+    let response_delay_ms = state.lock().unwrap().response_delay_ms;
+    if response_delay_ms > 0 {
+        thread::sleep(std::time::Duration::from_millis(response_delay_ms));
+    }
 
-    let response = if method == "GET" && path == "/v1/embedding/identity" {
+    let (status, response) = if method == "GET" && path == "/v1/embedding/identity" {
         let identity = state.lock().unwrap().embedding_identity_sha256.clone();
-        json!({"data": {
-            "version": 1,
-            "backend": "lexical",
-            "identity_sha256": identity,
-            "dimensions": 384,
-            "semantic_contract": "semantic_text-derived-vector.v1",
-            "resumable": true
-        }, "took_ms": 0, "request_id": "test"})
+        (
+            200,
+            json!({"data": {
+                "version": 1,
+                "backend": "lexical",
+                "identity_sha256": identity,
+                "dimensions": 384,
+                "semantic_contract": "semantic_text-derived-vector.v1",
+                "resumable": true
+            }, "took_ms": 0, "request_id": "test"}),
+        )
+    } else if method == "PUT" && path == "/autoindex-catalog" {
+        if state.lock().unwrap().catalog_preexists {
+            (
+                400,
+                json!({"error": {"type": "resource_already_exists_exception"}}),
+            )
+        } else {
+            (200, json!({"acknowledged": true}))
+        }
+    } else if method == "PUT" && path == "/autoindex-catalog/_mapping" {
+        let mapping: Value = serde_json::from_slice(&body).unwrap();
+        let started_requested = mapping.pointer("/properties/started").is_some();
+        let required = ["summary_generated_at", "invocation_telemetry_scope"];
+        let upgraded = required.iter().all(|field| {
+            mapping
+                .pointer(&format!("/properties/{field}/type"))
+                .and_then(Value::as_str)
+                .is_some()
+        });
+        let mut locked = state.lock().unwrap();
+        locked.started_mapping_requested |= started_requested;
+        if locked.catalog_preexists && started_requested {
+            // The shape a real engine returns when the additive upgrade asks
+            // for `started` on a legacy (v1.0.0-rc.4) catalog, where `started`
+            // was dynamically inferred as `text`. Measured against a live
+            // v1.0.0-rc.13 engine, not read off the handler: the request falls
+            // past the `illegal_argument_exception` guard — that one only sees
+            // *declared* mappings, and `started` was never declared — and is
+            // refused by the `idx.schema()` guard, which returns
+            // `XerjError::invalid_mapping` and therefore a 400
+            // `mapper_parsing_exception`.
+            //
+            // A correct product never reaches this branch (see
+            // `started_mapping_requested`, asserted false in
+            // `existing_catalog_is_upgraded_before_new_run_metadata_is_written`).
+            // It is kept, and kept accurate, so that adding `started` to the
+            // additive upgrade fails here with the message the operator would
+            // really see rather than passing silently.
+            let reason = "field [started] already exists as [text], cannot add [date]";
+            (
+                400,
+                json!({
+                    "error": {
+                        "root_cause": [{"type": "mapper_parsing_exception", "reason": reason}],
+                        "type": "mapper_parsing_exception",
+                        "reason": reason,
+                    },
+                    "status": 400,
+                }),
+            )
+        } else {
+            locked.catalog_mapping_upgraded = upgraded;
+            (200, json!({"acknowledged": true}))
+        }
     } else if method == "POST" && path == "/_bulk" {
-        bulk_response(&body, state)
+        (200, bulk_response(&body, state))
     } else if method == "POST" && path.contains("/_delete_by_query") {
         let query: Value = serde_json::from_slice(&body).unwrap();
         let ax_file = query
@@ -137,23 +285,27 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                 .docs
                 .retain(|_, doc| doc.get("ax_file").and_then(Value::as_str) != Some(key.as_str()));
         }
-        json!({"deleted": 0, "failures": []})
+        (200, json!({"deleted": 0, "failures": []}))
     } else if method == "GET" && path.ends_with("/_count") {
-        json!({"count": state.lock().unwrap().docs.len()})
+        (200, json!({"count": state.lock().unwrap().docs.len()}))
     } else if method == "POST" && path.ends_with("/_search") {
         // Report the REAL number of stored docs: `run_index` now verifies
         // live counts against the journal (#195), so a mock that always
         // answered 0 hits would (rightly) fail every successful run.
         let total = state.lock().unwrap().docs.len();
-        json!({"hits":{"total":{"value":total},"hits":[]},"aggregations":{}})
+        (
+            200,
+            json!({"hits":{"total":{"value":total},"hits":[]},"aggregations":{}}),
+        )
     } else {
         // ping, index creation/mapping, refresh, and catalog operations
-        json!({"acknowledged": true})
+        (200, json!({"acknowledged": true}))
     };
     let bytes = response.to_string();
+    let reason = if status == 200 { "OK" } else { "Bad Request" };
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         bytes.len(),
         bytes
     )
@@ -176,6 +328,9 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         // the junk sweep of #238), so walk the NDJSON rather than assuming
         // action/document pairs — a delete carries no document line.
         let mut locked = state.lock().unwrap();
+        if locked.catalog_preexists && !locked.catalog_mapping_upgraded {
+            locked.catalog_bulk_before_upgrade = true;
+        }
         let mut line = 0;
         while line < lines.len() {
             let Ok(action) = serde_json::from_slice::<Value>(lines[line]) else {
@@ -198,6 +353,14 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
                 locked.catalog_docs.insert(id.to_owned(), doc);
                 line += 2;
             } else {
+                // Fixture drift, not a product signal. Recorded rather than
+                // panicked on: this runs on the server thread with the state
+                // guard held, so a panic here poisons the `Mutex` and turns
+                // `MockEndpoint::drop`'s `join().unwrap()` into a second,
+                // misleading panic. Tests assert on it from the test thread.
+                locked
+                    .unexpected_catalog_actions
+                    .push(format!("unexpected catalog bulk action: {action}"));
                 line += 1;
             }
         }
@@ -225,6 +388,27 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
     }
     if locked.swallow_data_bulks {
         return json!({"errors": false, "items": []});
+    }
+    if locked.reject_first_data_item {
+        let mut items = Vec::new();
+        for (nth, pair) in lines.chunks_exact(2).enumerate() {
+            if nth == 0 {
+                items.push(json!({"index": {
+                    "status": 400,
+                    "error": {
+                        "type": "document_parsing_exception",
+                        "reason": "refused: value could not be parsed"
+                    }
+                }}));
+                continue;
+            }
+            let action: Value = serde_json::from_slice(pair[0]).unwrap();
+            let doc: Value = serde_json::from_slice(pair[1]).unwrap();
+            let id = action.pointer("/index/_id").unwrap().as_str().unwrap();
+            locked.docs.insert(id.to_owned(), doc);
+            items.push(json!({"index": {"status": 201}}));
+        }
+        return json!({"errors": true, "items": items});
     }
     let fail = !locked.failed_once && locked.data_bulk_number == locked.fail_data_bulk;
     let pairs = lines.chunks_exact(2);
@@ -305,6 +489,447 @@ fn event_count(state_dir: &Path, kind: &str) -> usize {
         .count()
 }
 
+fn dataset_catalog_docs(endpoint: &MockEndpoint) -> Vec<Value> {
+    let mut docs: Vec<Value> = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .catalog_docs
+        .values()
+        .filter(|doc| doc.get("doc_kind").and_then(Value::as_str) == Some("dataset"))
+        .cloned()
+        .collect();
+    docs.sort_by_key(|doc| {
+        doc.get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    });
+    docs
+}
+
+fn assert_unsupported_delta_without_remote_mutation(
+    endpoint: &MockEndpoint,
+    config: IndexCfg,
+    expected_added: &[&str],
+    expected_vanished: &[&str],
+) {
+    let request_start = endpoint.state.lock().unwrap().requests.len();
+    let journal_path = config.state_dir.as_ref().unwrap().join("journal.ndjson");
+    let journal_before = fs::read(&journal_path).unwrap();
+    let error = run_index(config).unwrap_err();
+    let attempted_requests = endpoint.state.lock().unwrap().requests[request_start..].to_vec();
+    assert_eq!(
+        attempted_requests,
+        [("GET".to_owned(), "/".to_owned())],
+        "a refused attempt may perform only the endpoint-readiness GET"
+    );
+    assert_eq!(
+        fs::read(journal_path).unwrap(),
+        journal_before,
+        "preflight refusal must not append a resume event or rewrite the journal"
+    );
+    let message = format!("{error:#}");
+    assert!(message.contains("made no remote mutations"), "{message}");
+    assert!(
+        message.contains("no longer exist in the folder"),
+        "{message}"
+    );
+    assert!(
+        message.contains("restore the removed file(s) and rerun"),
+        "{message}"
+    );
+    assert!(
+        message.contains("rebuild in place by deleting the indices"),
+        "{message}"
+    );
+    assert!(
+        message.contains("new --state-dir, a new --prefix"),
+        "{message}"
+    );
+    assert!(message.contains("new --brain"), "{message}");
+    for path in expected_added {
+        assert!(
+            message.contains(path),
+            "missing added path {path}: {message}"
+        );
+    }
+    for path in expected_vanished {
+        assert!(
+            message.contains(path),
+            "missing vanished path {path}: {message}"
+        );
+    }
+}
+
+/// The documented headline workflow: point autoindex at a folder, add a file,
+/// rerun. The rerun must not fail, must say plainly that the added file was
+/// not indexed, and `--fresh` must then absorb it in place.
+#[test]
+fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("first.csv"), "id,value\n1,first\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
+    // 3 = completed-with-junk: the added file is reported as skipped, not
+    // indexed, because the frozen plan cannot absorb it.
+    let (code, report) = run_index_report(config.clone()).unwrap();
+    assert_eq!(code, 3);
+    let report = report.unwrap();
+    assert_eq!(report["files_junk"], 1, "{report}");
+    // `records_total` is the live server-side count (#195), so it still reports
+    // the record the first run published. What must be zero is the run-local
+    // counter: this rerun indexed nothing, because the frozen plan cannot
+    // absorb a file that appeared after it was written.
+    assert_eq!(report["records_submitted_this_run"], 0, "{report}");
+    assert_eq!(report["files_submitted_this_run"], 0, "{report}");
+    assert_eq!(report["records_total"], 1, "{report}");
+    {
+        let locked = endpoint.state.lock().unwrap();
+        let live: Vec<&str> = locked
+            .docs
+            .values()
+            .filter_map(|doc| doc["ax_path"].as_str())
+            .collect();
+        assert!(
+            live.iter().all(|path| *path == "first.csv"),
+            "the added file must not be published by a plan that predates it: {live:?}"
+        );
+    }
+
+    // --fresh rebuilds the plan in place and picks the new file up.
+    config.fresh = true;
+    assert_eq!(run_index(config).unwrap(), 0);
+    let locked = endpoint.state.lock().unwrap();
+    let indexed: std::collections::HashSet<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["ax_path"].as_str())
+        .collect();
+    assert!(indexed.contains("first.csv"), "{indexed:?}");
+    assert!(indexed.contains("second.csv"), "{indexed:?}");
+}
+
+#[test]
+fn completed_plan_rejects_vanished_content_group_before_remote_mutation() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("first.csv"), "id,value\n1,first\n").unwrap();
+    fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::remove_file(corpus.path().join("second.csv")).unwrap();
+    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &[], &["second.csv"]);
+}
+
+#[test]
+fn completed_plan_rejects_mixed_membership_delta_in_stable_order() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("b-old.csv"), "id,value\n1,b\n").unwrap();
+    fs::write(corpus.path().join("a-old.csv"), "id,value\n2,a\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::remove_file(corpus.path().join("b-old.csv")).unwrap();
+    fs::remove_file(corpus.path().join("a-old.csv")).unwrap();
+    fs::write(corpus.path().join("z-new.csv"), "id,value\n3,z\n").unwrap();
+    fs::write(corpus.path().join("m-new.csv"), "id,value\n4,m\n").unwrap();
+    config.json = true;
+    let request_start = endpoint.state.lock().unwrap().requests.len();
+    let error = run_index(config).unwrap_err();
+    assert_eq!(
+        endpoint.state.lock().unwrap().requests[request_start..],
+        [("GET".to_owned(), "/".to_owned())]
+    );
+
+    let typed = error
+        .downcast_ref::<UnsupportedInventoryDeltaError>()
+        .unwrap();
+    let value = typed.to_json();
+    assert_eq!(value["schema"], "xerj.autoindex.unsupported_sync_delta.v1");
+    assert_eq!(value["status"], "error");
+    let added: Vec<&str> = value["added_content_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect();
+    let vanished: Vec<&str> = value["vanished_content_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(added, ["m-new.csv", "z-new.csv"]);
+    assert_eq!(vanished, ["a-old.csv", "b-old.csv"]);
+}
+
+/// An in-place EDIT is a replacement, not a removal. `--fresh` is the route
+/// the refusal itself recommends for picking up added and changed files, so
+/// the gate must not classify the edited file's superseded content key as a
+/// vanished group — the path is still there, and the pipeline republishes it.
+#[test]
+fn fresh_absorbs_an_edited_file_instead_of_calling_it_a_removal() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("notes.csv"), "id,value\n1,before\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::write(corpus.path().join("notes.csv"), "id,value\n1,after\n").unwrap();
+    config.fresh = true;
+    assert_eq!(
+        run_index(config).unwrap(),
+        0,
+        "an edited file is a same-path replacement, not a vanished content group"
+    );
+    let locked = endpoint.state.lock().unwrap();
+    assert!(
+        locked
+            .docs
+            .values()
+            .any(|doc| doc["value"].as_str() == Some("after")),
+        "the new content is live: {:?}",
+        locked.docs
+    );
+    // Documented, and NOT what this gate is for: `--fresh` rebuilds the plan,
+    // it does not reconcile the destination. Document ids derive from the
+    // content key (`ids::doc_id`), so the pre-edit record stays live beside
+    // the new one — the same outcome `--fresh` has always had. An ordinary
+    // rerun is the clean route for an edit: it keeps the planned key and runs
+    // a delete-before-replace transaction on it. What must never happen is
+    // this run being REFUSED by a message claiming a file that is sitting in
+    // the folder has vanished.
+    assert!(
+        locked
+            .docs
+            .values()
+            .any(|doc| doc["value"].as_str() == Some("before")),
+        "known --fresh gap: superseded records are not deleted: {:?}",
+        locked.docs
+    );
+}
+
+/// The clean route for the same edit: an ordinary rerun keeps the planned key
+/// and replaces its records, so nothing is stranded. This is the contrast that
+/// makes the `--fresh` gap above a documented trade-off rather than a silent
+/// one.
+#[test]
+fn an_ordinary_rerun_replaces_an_edited_file_without_stranding_records() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("notes.csv"), "id,value\n1,before\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::write(corpus.path().join("notes.csv"), "id,value\n1,after\n").unwrap();
+    assert_eq!(run_index(config).unwrap(), 0);
+    let locked = endpoint.state.lock().unwrap();
+    let values: Vec<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["value"].as_str())
+        .collect();
+    assert_eq!(values, ["after"], "the superseded record is replaced");
+}
+
+/// The composite workflow the run's own stderr recommends: index, then add one
+/// file and edit another, rerun (added file reported and skipped by the frozen
+/// plan), then `--fresh` to absorb both.
+#[test]
+fn fresh_absorbs_an_addition_and_an_edit_after_a_reported_rerun() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("first.csv"), "id,value\n1,before\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::write(corpus.path().join("first.csv"), "id,value\n1,after\n").unwrap();
+    fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
+    // 3 = completed-with-junk: the frozen plan cannot absorb the added file,
+    // so the rerun reports it as skipped rather than refusing.
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+
+    config.fresh = true;
+    assert_eq!(
+        run_index(config).unwrap(),
+        0,
+        "--fresh is the documented way out of exactly this state"
+    );
+    let locked = endpoint.state.lock().unwrap();
+    let live: std::collections::HashSet<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["ax_path"].as_str())
+        .collect();
+    assert!(live.contains("first.csv"), "{live:?}");
+    assert!(live.contains("second.csv"), "{live:?}");
+    assert!(
+        locked
+            .docs
+            .values()
+            .any(|doc| doc["value"].as_str() == Some("after")),
+        "the edited file's new content is live: {:?}",
+        locked.docs
+    );
+}
+
+#[test]
+fn fresh_cannot_erase_the_plan_and_bypass_the_removal_gate() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("old.csv"), "id,value\n1,old\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::remove_file(corpus.path().join("old.csv")).unwrap();
+    fs::write(corpus.path().join("new.csv"), "id,value\n2,new\n").unwrap();
+    config.fresh = true;
+    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &["new.csv"], &["old.csv"]);
+}
+
+#[test]
+fn deleting_one_path_of_a_duplicate_pair_is_not_a_removed_content_group() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let bytes = "id,value\n1,same\n";
+    fs::write(corpus.path().join("a.csv"), bytes).unwrap();
+    fs::write(corpus.path().join("b.csv"), bytes).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    // b.csv becomes canonical under the same content key: the group survives
+    // the deletion, so no document is stranded and the rerun is allowed.
+    fs::remove_file(corpus.path().join("a.csv")).unwrap();
+    let result = run_index(config);
+    assert!(
+        result.is_ok(),
+        "a surviving content group must not trip the removal gate: {result:?}"
+    );
+    let locked = endpoint.state.lock().unwrap();
+    let live: Vec<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["ax_path"].as_str())
+        .collect();
+    assert_eq!(live, ["b.csv"], "canonical path follows the surviving file");
+}
+
+#[test]
+fn unchanged_planned_junk_is_not_reported_as_added_content() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("rows.csv"), "id,value\n1,kept\n").unwrap();
+    fs::write(
+        corpus.path().join("opaque.bin"),
+        [0_u8, 159, 146, 150, 0, 255],
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    let result = run_index(config);
+    assert!(
+        result.is_ok(),
+        "unchanged durable junk must not trip the membership gate: {result:?}"
+    );
+}
+
+#[test]
+fn deleted_planned_junk_is_swept_rather_than_refused() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("rows.csv"), "id,value\n1,kept\n").unwrap();
+    fs::write(
+        corpus.path().join("opaque.bin"),
+        [0_u8, 159, 146, 150, 0, 255],
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+
+    // A junk file publishes exactly one catalog row and nothing else, and the
+    // #238 sweep deletes that row. Nothing is stranded, so the removal gate
+    // must not fire — refusing here would block a case the pipeline handles
+    // completely. Only a file that published DOCUMENTS refuses a rerun.
+    fs::remove_file(corpus.path().join("opaque.bin")).unwrap();
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    {
+        let locked = endpoint.state.lock().unwrap();
+        assert!(
+            locked
+                .catalog_docs
+                .values()
+                .all(|doc| doc["path"].as_str() != Some("opaque.bin")),
+            "the deleted junk file's catalog row must be swept, not left immortal"
+        );
+        assert!(
+            locked
+                .catalog_docs
+                .values()
+                .any(|doc| doc["path"].as_str() == Some("rows.csv")),
+            "the surviving indexed file keeps its entry"
+        );
+    }
+
+    // Deleting the INDEXED file is still refused: its documents are live.
+    fs::remove_file(corpus.path().join("rows.csv")).unwrap();
+    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &[], &["rows.csv"]);
+}
+
+#[test]
+fn completed_plan_rejects_empty_current_folder_before_remote_mutation() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("only.csv"), "id,value\n1,only\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::remove_file(corpus.path().join("only.csv")).unwrap();
+    assert_unsupported_delta_without_remote_mutation(&endpoint, config.clone(), &[], &["only.csv"]);
+    // Even `--fresh` must not erase the only durable inventory evidence and
+    // then report success while the destination still contains the document.
+    config.fresh = true;
+    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &[], &["only.csv"]);
+}
+
 #[test]
 fn semantic_resume_rejects_embedding_identity_drift_before_another_bulk() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
@@ -349,21 +974,302 @@ fn fresh_publication_skips_delete_and_noop_resume_does_not_append_plan() {
         "id,value\n0,fresh\n1,fresh\n",
     )
     .unwrap();
-    let endpoint = MockEndpoint::start(usize::MAX);
+    // A fixed endpoint delay makes the start/summary chronology
+    // deterministic instead of relying on scheduler timing.
+    let endpoint = MockEndpoint::start_with_delay(usize::MAX, 5);
     let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
 
-    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let (initial_code, initial_summary) = run_index_report(config.clone()).unwrap();
+    assert_eq!(initial_code, 0);
     assert_eq!(endpoint.state.lock().unwrap().delete_calls, 0);
     assert_eq!(event_count(state_dir.path(), "plan"), 1);
     assert_eq!(event_count(state_dir.path(), "file_replace_start"), 1);
+    let source_bytes = fs::metadata(corpus.path().join("records.csv"))
+        .unwrap()
+        .len();
+    let initial_dataset = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .catalog_docs
+        .values()
+        .find(|doc| doc.get("doc_kind").and_then(Value::as_str) == Some("dataset"))
+        .cloned()
+        .expect("dataset catalog document");
+    let initial_dataset_bytes = initial_dataset
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .unwrap();
+    assert_eq!(initial_dataset_bytes, source_bytes);
+    let initial_summary = initial_summary.unwrap();
+    assert_eq!(
+        initial_summary["invocation_telemetry_scope"],
+        json!("latest_invocation_of_durable_run")
+    );
+    let initial_started =
+        chrono::DateTime::parse_from_rfc3339(initial_summary["started"].as_str().unwrap()).unwrap();
+    let initial_summary_generated_at = chrono::DateTime::parse_from_rfc3339(
+        initial_summary["summary_generated_at"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        initial_summary_generated_at - initial_started >= chrono::Duration::milliseconds(5),
+        "started must be captured before work, not synthesized with the summary"
+    );
 
-    assert_eq!(run_index(config).unwrap(), 0);
+    let (resume_code, resume_summary) = run_index_report(config).unwrap();
+    assert_eq!(resume_code, 0);
     assert_eq!(endpoint.state.lock().unwrap().delete_calls, 0);
     assert_eq!(
         event_count(state_dir.path(), "plan"),
         1,
         "an identical resume must reuse the durable plan"
     );
+    let resumed_dataset = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .catalog_docs
+        .values()
+        .find(|doc| doc.get("doc_kind").and_then(Value::as_str) == Some("dataset"))
+        .cloned()
+        .expect("dataset catalog document after resume");
+    assert_eq!(
+        resumed_dataset["bytes"],
+        json!(source_bytes),
+        "an unchanged resume must not replace durable dataset bytes with zero"
+    );
+    assert_eq!(
+        resume_summary.unwrap()["invocation_telemetry_scope"],
+        json!("latest_invocation_of_durable_run")
+    );
+}
+
+#[test]
+fn changed_source_replaces_durable_dataset_bytes_across_reopen() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let path = corpus.path().join("records.csv");
+    fs::write(&path, "id,value\n0,old\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let initial_bytes = fs::metadata(&path).unwrap().len();
+    assert_eq!(dataset_catalog_docs(&endpoint)[0]["bytes"], initial_bytes);
+
+    fs::write(
+        &path,
+        "id,value,description\n0,new,a longer replacement source\n1,new,second row\n",
+    )
+    .unwrap();
+    let replacement_bytes = fs::metadata(&path).unwrap().len();
+    assert_ne!(replacement_bytes, initial_bytes);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    // Reopen the durable journal independently of the product invocation.
+    let root = config.root.canonicalize().unwrap();
+    let reopened = state::Journal::open(
+        state_dir.path(),
+        &root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    assert_eq!(reopened.done.len(), 1);
+    assert_eq!(
+        reopened.done.values().next().unwrap().bytes,
+        replacement_bytes
+    );
+    drop(reopened);
+
+    // A following unchanged product rescan must publish the replacement
+    // generation's durable bytes, not zero and not the historical size.
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(
+        dataset_catalog_docs(&endpoint)[0]["bytes"],
+        replacement_bytes
+    );
+}
+
+#[test]
+fn deleted_path_bytes_remain_while_its_documents_remain_live() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let removed = corpus.path().join("removed.csv");
+    let retained = corpus.path().join("retained.csv");
+    fs::write(&removed, "id,value\n0,removed\n1,removed\n").unwrap();
+    fs::write(&retained, "id,value\n2,retained\n3,retained\n").unwrap();
+    let durable_live_bytes =
+        fs::metadata(&removed).unwrap().len() + fs::metadata(&retained).unwrap().len();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    assert_eq!(
+        dataset_catalog_docs(&endpoint)[0]["bytes"],
+        durable_live_bytes
+    );
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 4);
+
+    fs::remove_file(&removed).unwrap();
+    // Autoindex still does not reconcile a missing canonical path: its indexed
+    // documents and FileDone stay live, so dataset bytes must keep describing
+    // that durable live index rather than silently pretend deletion (#249).
+    // What changed is the exit: the rerun that used to return 0 while leaving
+    // those documents stranded now refuses before any remote mutation. Run
+    // twice — a refusal is a stop, not a state change, so the second attempt
+    // must see exactly what the first one saw.
+    for _ in 0..2 {
+        assert_unsupported_delta_without_remote_mutation(
+            &endpoint,
+            config.clone(),
+            &[],
+            &["removed.csv"],
+        );
+        assert_eq!(endpoint.state.lock().unwrap().docs.len(), 4);
+        assert_eq!(
+            dataset_catalog_docs(&endpoint)[0]["bytes"],
+            durable_live_bytes
+        );
+    }
+}
+
+#[test]
+fn product_path_counts_shared_source_once_per_distinct_dataset() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let path = corpus.path().join("finance.sqlite");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE quarterly (quarter TEXT, revenue INTEGER);
+             INSERT INTO quarterly VALUES ('2026-Q1', 100);
+             CREATE TABLE annual (year INTEGER, filing TEXT);
+             INSERT INTO annual VALUES (2026, '10-K');",
+        )
+        .unwrap();
+    }
+    let source_bytes = fs::metadata(&path).unwrap().len();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let root = config.root.canonicalize().unwrap();
+    let mut journal = state::Journal::open(
+        state_dir.path(),
+        &root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    let mut plan = journal.plan.clone().unwrap();
+    assert_eq!(plan.datasets.len(), 2);
+    let assignment = plan.files.values_mut().next().unwrap();
+    assert_eq!(assignment.assignments.len(), 2);
+    // Model a compatible historical plan that repeated one group assignment.
+    // Catalog accounting must deduplicate it by dataset slug.
+    assignment
+        .assignments
+        .push(assignment.assignments[0].clone());
+    journal.write_plan(&plan).unwrap();
+    drop(journal);
+
+    assert_eq!(run_index(config).unwrap(), 0);
+    let datasets = dataset_catalog_docs(&endpoint);
+    assert_eq!(datasets.len(), 2);
+    assert!(datasets
+        .iter()
+        .all(|dataset| dataset["bytes"] == json!(source_bytes)));
+}
+
+#[test]
+fn existing_catalog_is_upgraded_before_new_run_metadata_is_written() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("records.csv"), "id,value\n0,one\n").unwrap();
+    let endpoint = MockEndpoint::start_with_existing_catalog();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    let (code, summary) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    let summary = summary.unwrap();
+    assert!(summary["started"].is_string());
+    assert!(summary["summary_generated_at"].is_string());
+    assert_eq!(
+        summary["invocation_telemetry_scope"],
+        json!("latest_invocation_of_durable_run")
+    );
+    let state = endpoint.state.lock().unwrap();
+    assert!(state.catalog_mapping_upgraded);
+    assert!(
+        !state.started_mapping_requested,
+        "the additive upgrade asked a legacy catalog for `started`; a real v1.0.0-rc.4 catalog \
+         answers that with 400 mapper_parsing_exception (\"field [started] already exists as \
+         [text], cannot add [date]\") and the run aborts before any document work — see the \
+         tripwire on catalog::catalog_mapping"
+    );
+    assert!(
+        !state.catalog_bulk_before_upgrade,
+        "new run metadata must not reach a legacy catalog before its additive mapping upgrade"
+    );
+    assert!(
+        state.unexpected_catalog_actions.is_empty(),
+        "fixture does not model these catalog bulk actions: {:?}",
+        state.unexpected_catalog_actions
+    );
+}
+
+#[test]
+fn unchanged_resume_keeps_durable_dataset_junk_and_coercion_notes() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("records.csv"), "id,value\n0,one\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let root = config.root.canonicalize().unwrap();
+    let mut journal = state::Journal::open(
+        state_dir.path(),
+        &root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    let plan = journal.plan.clone().unwrap();
+    let slug = plan.datasets[0].slug.clone();
+    let mut completion = journal.done.values().next().unwrap().clone();
+    completion.junk = 7;
+    completion.dropped_by_dataset.insert(slug.clone(), 3);
+    journal.file_done(&completion).unwrap();
+    drop(journal);
+
+    assert_eq!(run_index(config).unwrap(), 0);
+    let dataset = dataset_catalog_docs(&endpoint)
+        .into_iter()
+        .find(|doc| doc["slug"] == slug)
+        .unwrap();
+    assert_eq!(dataset["junk_records"], 7);
+    assert!(dataset["notes"].as_array().unwrap().iter().any(|note| note
+        .as_str()
+        .is_some_and(|text| { text.contains("3 field values could not be coerced") })));
 }
 
 #[test]
@@ -969,13 +1875,20 @@ fn deleting_an_entire_duplicate_group_strands_no_pending_replacement() {
     assert_eq!(run_index(config.clone()).unwrap(), 0);
     let starts = event_count(state_dir.path(), "file_replace_start");
 
-    // The whole duplicate group disappears. There is no current file left to
-    // republish its key, so no replacement intent may be journaled — a
-    // stranded intent would be re-appended forever without ever committing.
+    // The whole duplicate group disappears: its documents stay live with no
+    // source file, so the rerun is refused. The original invariant still
+    // holds and is still checked — a key with no current file must never get
+    // a replacement intent journaled, which would be re-appended forever
+    // without ever committing.
     fs::remove_file(corpus.path().join("dup-a.csv")).unwrap();
     fs::remove_file(corpus.path().join("dup-b.csv")).unwrap();
     for _ in 0..2 {
-        assert_eq!(run_index(config.clone()).unwrap(), 0);
+        assert_unsupported_delta_without_remote_mutation(
+            &endpoint,
+            config.clone(),
+            &[],
+            &["dup-a.csv"],
+        );
         assert_eq!(
             event_count(state_dir.path(), "file_replace_start"),
             starts,
@@ -1075,6 +1988,66 @@ fn write_block_rejections_are_backend_fatal_and_the_file_stays_pending() {
     assert_eq!(run_index(config).unwrap(), 0);
     assert_eq!(file_done_count(state_dir.path()), 1);
     assert_eq!(endpoint.state.lock().unwrap().docs.len(), 2);
+}
+
+/// Pins WHY the run document carries no backend-rejection count, so nobody
+/// "restores" one that could only ever read 0.
+///
+/// Making `junk_records_total` durable narrowed it: it no longer folds in the
+/// per-item rejections that `record_bulk_outcome` counts. That looks like a
+/// lost signal, and it would be one — except that a single per-item rejection
+/// also lands in `bulk_errors`, which aborts the run before the run document,
+/// the map, the summary line and the exit code exist at all. So the narrowed
+/// number was unreachable in any published map either way.
+///
+/// The rejection count is therefore reported in the one place a rejected run
+/// ever reaches: the abort message, where it supplies the scale that
+/// `bulk_errors`' first-five sample cannot.
+#[test]
+fn backend_rejected_records_abort_the_run_before_any_map_is_written() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("records.csv"),
+        "id,value\n0,kept\n1,kept\n2,kept\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    endpoint.state.lock().unwrap().reject_first_data_item = true;
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    // A per-item 400 is NOT a server error (not 429, not 5xx, not a block), so
+    // it is the weakest rejection the classifier recognises — and even it is
+    // fatal.
+    let error = format!("{:#}", run_index_report(config).unwrap_err());
+    assert!(
+        error.contains("document_parsing_exception"),
+        "the refusal itself must be quoted: {error}"
+    );
+    assert!(
+        error.contains("The backend refused 1 record(s)."),
+        "the abort must state how many records were refused, not just sample the errors: {error}"
+    );
+
+    // Measured, and deliberately pinned even though it is NOT what the abort
+    // message implies: `record_bulk_outcome` treats a per-item rejection as
+    // non-fatal to the worker (only `server_errors` set `send_err`), so the
+    // file is journaled COMPLETE and the run aborts only at the end. A rerun
+    // therefore resumes past this file and never retries the refused record,
+    // while the message says failed sources "were not journaled complete".
+    //
+    // That divergence predates this branch — it is `main`'s behaviour for the
+    // item-error class — and fixing it means changing when a worker treats a
+    // rejection as fatal, which is a resume-semantics change with nothing to
+    // do with map metadata. Recorded here so the next reader finds the fact
+    // rather than the assumption; tracked in the PR body as a known gap.
+    assert_eq!(
+        file_done_count(state_dir.path()),
+        1,
+        "pre-existing: a per-item rejection still journals the source complete"
+    );
 }
 
 /// #195 last-resort gate: a backend that ACCEPTS every bulk but persists
@@ -1294,4 +2267,518 @@ fn the_resource_plan_is_announced_on_the_progress_surface_with_the_width_it_got(
     let report = report.expect("a completed run produces a summary");
     assert_eq!(report["scan_workers"], serde_json::json!(installed));
     assert_eq!(report["workers"], serde_json::json!(3));
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_pdf_is_parsed_once_and_failed_publication_retry_reparses_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("quarterly-report.pdf");
+    fs::write(
+        &pdf,
+        b"%PDF-1.4\nfake bytes consumed by the isolated test worker\n",
+    )
+    .unwrap();
+    fs::copy(&pdf, corpus.path().join("quarterly-report-copy.pdf")).unwrap();
+
+    let count = tools.path().join("worker-count");
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let endpoint = MockEndpoint::start(1);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let _env = PdfWorkerEnvGuard::acquire();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
+
+    let first = run_index(config.clone()).unwrap_err();
+    assert!(format!("{first:#}").contains("bulk backend failed"));
+    assert_eq!(
+        fs::read_to_string(&count).unwrap().lines().count(),
+        1,
+        "Phase A's extraction must be replayed in Phase B, not parsed again"
+    );
+    assert_eq!(file_done_count(state_dir.path()), 0);
+
+    // The process-local spool is intentionally not journal state. A retry has
+    // a frozen plan, performs exactly one fresh extraction in Phase B, and
+    // commits only after the backend accepts it.
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
+    assert_eq!(file_done_count(state_dir.path()), 1);
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_pdf_spool_reparses_and_reports_fallback_without_weakening_publication() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("quarterly-report.pdf"),
+        b"%PDF-1.4\nfake bytes consumed by the isolated test worker\n",
+    )
+    .unwrap();
+    fs::write(
+        state_dir
+            .path()
+            .join(".autoindex-test-pdf-spool-available-bytes"),
+        ((4_u64 << 30) + (32 << 20) - 1).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        state_dir.path().join(".autoindex-test-pdf-spool-fd-limit"),
+        "4096",
+    )
+    .unwrap();
+    fs::write(
+        state_dir.path().join(".autoindex-test-pdf-spool-fd-open"),
+        "16",
+    )
+    .unwrap();
+
+    let count = tools.path().join("worker-count");
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let endpoint = MockEndpoint::start(0);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let _env = PdfWorkerEnvGuard::acquire();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
+
+    let (code, report) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
+    assert_eq!(file_done_count(state_dir.path()), 1);
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+    let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
+    assert_eq!(reuse["reservations_started"], 0);
+    assert_eq!(reuse["capacity_fallbacks"], 1);
+    assert_eq!(reuse["phase_b_pdf_parses"], 1);
+    assert_eq!(reuse["replay_verified"], 0);
+    assert_eq!(reuse["artifacts_not_created"], 1);
+    assert_eq!(reuse["phase_a_pdf_parser_responses"], 1);
+    assert_eq!(reuse["capacity_status"], "disabled");
+    assert_eq!(
+        reuse["fallback_examples"][0]["path"],
+        "quarterly-report.pdf"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_spool_does_not_pay_a_second_phase_a_source_hash() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("quarterly-report.pdf");
+    fs::write(&pdf, b"%PDF-1.4\nsame-size-source-generation\n").unwrap();
+    let size = fs::metadata(&pdf).unwrap().len();
+    let digest = content::resolve_reporting(
+        vec![crate::walk::FileEntry {
+            path: pdf.clone(),
+            rel: "quarterly-report.pdf".into(),
+            rel_id: "quarterly-report.pdf".into(),
+            is_symlink: false,
+            size,
+        }],
+        &|_| {},
+    )
+    .unwrap()
+    .digests
+    .remove(0);
+
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'Z' | dd of="$2" bs=1 seek=10 conv=notrunc 2>/dev/null
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    let _env = PdfWorkerEnvGuard::acquire();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+
+    let budget = crate::extract::pdf::ExtractionSpoolBudget::new(0, 0);
+    let progress = Progress::silent();
+    let scan = scan_file(
+        &pdf,
+        size,
+        &digest,
+        &PhaseAContext {
+            state_dir: state_dir.path(),
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        },
+        100,
+        1,
+    );
+    assert!(scan.pdf_spool.is_none());
+    assert_eq!(scan.pdf_spool_fallbacks.len(), 1);
+    for fallback in &scan.pdf_spool_fallbacks {
+        budget.record_fallback_example(
+            "quarterly-report.pdf",
+            fallback.category,
+            &fallback.message,
+        );
+    }
+    let report = budget.report();
+    assert_eq!(report["artifacts_created"], 0);
+    assert_eq!(report["phase_b_eligible_artifacts"], 0);
+    assert_eq!(report["artifacts_discarded_before_replay"], 0);
+    assert_eq!(report["fallback_categories"]["artifact_count_ceiling"], 1);
+    assert!(report["fallback_categories"]
+        .get("source_generation_changed")
+        .is_none());
+}
+
+/// The other half of the branch above: with capacity available the artifact
+/// *is* created, and phase A must then throw it away because the source moved
+/// underneath the parser. Without this the source-generation arm of
+/// `scan_file` has no test at all — its sibling above deliberately runs with a
+/// zero budget, so it never reaches the `content::verify` comparison.
+#[cfg(unix)]
+#[test]
+fn source_changed_during_phase_a_discards_the_artifact_and_names_the_reason() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("quarterly-report.pdf");
+    fs::write(&pdf, b"%PDF-1.4\nsame-size-source-generation\n").unwrap();
+    let size = fs::metadata(&pdf).unwrap().len();
+    let digest = content::resolve_reporting(
+        vec![crate::walk::FileEntry {
+            path: pdf.clone(),
+            rel: "quarterly-report.pdf".into(),
+            rel_id: "quarterly-report.pdf".into(),
+            is_symlink: false,
+            size,
+        }],
+        &|_| {},
+    )
+    .unwrap()
+    .digests
+    .remove(0);
+
+    // Same trick as the sibling test: the worker rewrites one byte of its own
+    // input, so the file keeps its length and changes its digest.
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'Z' | dd of="$2" bs=1 seek=10 conv=notrunc 2>/dev/null
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    let _env = PdfWorkerEnvGuard::acquire();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+
+    let (budget, _) =
+        crate::extract::pdf::ExtractionSpoolBudget::for_state_dir(state_dir.path(), 1, 1, 8);
+    let progress = Progress::silent();
+    let scan = scan_file(
+        &pdf,
+        size,
+        &digest,
+        &PhaseAContext {
+            state_dir: state_dir.path(),
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        },
+        100,
+        1,
+    );
+
+    assert!(
+        scan.pdf_spool.is_none(),
+        "an artifact bound to a superseded source generation must not reach phase B"
+    );
+    let categories: Vec<&str> = scan
+        .pdf_spool_fallbacks
+        .iter()
+        .map(|fallback| fallback.category)
+        .collect();
+    assert_eq!(categories, vec!["source_generation_changed"]);
+    let report = budget.report();
+    assert_eq!(report["artifacts_created"], 1);
+    assert_eq!(report["artifacts_discarded_before_replay"], 1);
+    assert_eq!(report["phase_b_eligible_artifacts"], 0);
+    assert_eq!(report["current_live_artifacts"], 0);
+    assert_eq!(report["current_retained_or_reserved_bytes"], 0);
+    assert_eq!(
+        report["fallback_categories"]["source_generation_changed"],
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("empty-report.pdf");
+    fs::write(&pdf, b"%PDF-1.4\nempty test input\n").unwrap();
+    let size = fs::metadata(&pdf).unwrap().len();
+    let digest = content::resolve_reporting(
+        vec![crate::walk::FileEntry {
+            path: pdf.clone(),
+            rel: "empty-report.pdf".into(),
+            rel_id: "empty-report.pdf".into(),
+            is_symlink: false,
+            size,
+        }],
+        &|_| {},
+    )
+    .unwrap()
+    .digests
+    .remove(0);
+    let worker = tools.path().join("pdf-worker");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' '{{\"schema\":1,\"extractor\":\"xerj-autoindex/{}\",\"parser\":\"pdf_oxide/0.3.75\",\"containment\":\"test worker\",\"records\":[]}}'\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    fs::write(&worker, script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    let _env = PdfWorkerEnvGuard::acquire();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+
+    let (budget, _) =
+        crate::extract::pdf::ExtractionSpoolBudget::for_state_dir(state_dir.path(), 1, 1, 8);
+    let progress = Progress::silent();
+    let mut scan = scan_file(
+        &pdf,
+        size,
+        &digest,
+        &PhaseAContext {
+            state_dir: state_dir.path(),
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+        },
+        100,
+        1,
+    );
+    assert!(scan.junk.is_some());
+    assert!(scan.pdf_spool.is_some());
+    assert!(take_pdf_spool_if_indexable(&mut scan.pdf_spool, true, &budget).is_none());
+    let report = budget.report();
+    assert_eq!(report["artifacts_created"], 1);
+    assert_eq!(report["artifacts_discarded_before_replay"], 1);
+    assert_eq!(report["phase_b_eligible_artifacts"], 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_pdf_run_reuses_every_artifact_and_reports_exact_success_counters() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
+    let tools = tempfile::tempdir().unwrap();
+    const PDFS: usize = 6;
+    for index in 0..PDFS {
+        fs::write(
+            corpus.path().join(format!("quarterly-report-{index}.pdf")),
+            format!("%PDF-1.4\nunique isolated worker input {index}\n"),
+        )
+        .unwrap();
+    }
+
+    let count = tools.path().join("worker-count");
+    let worker = tools.path().join("pdf-worker");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"title":"quarterly-report","page":1,"body":"Quarterly revenue increased while operating margin improved.","pdf_pages_total":1,"pdf_pages_with_text":1,"pdf_pages_omitted":0},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let endpoint = MockEndpoint::start(0);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    config.workers = 8;
+    config.pdf_workers = 2;
+    let _env = PdfWorkerEnvGuard::acquire();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
+    let (code, report) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(
+        fs::read_to_string(&count).unwrap().lines().count(),
+        PDFS,
+        "each unique PDF must be parsed once in Phase A and replayed in Phase B"
+    );
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), PDFS);
+    let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
+    assert_eq!(reuse["reservations_started"], PDFS);
+    assert_eq!(
+        reuse["cumulative_reserved_bytes"],
+        PDFS as u64 * (32_u64 << 20)
+    );
+    assert_eq!(reuse["artifacts_created"], PDFS);
+    assert_eq!(reuse["artifacts_not_created"], 0);
+    assert_eq!(reuse["phase_b_eligible_artifacts"], PDFS);
+    assert_eq!(reuse["artifacts_discarded_before_replay"], 0);
+    assert!(reuse["exact_artifact_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(reuse["current_retained_or_reserved_bytes"], 0);
+    assert!(reuse["peak_retained_or_reserved_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(reuse["current_live_artifacts"], 0);
+    assert!(reuse["peak_live_artifacts"].as_u64().unwrap() > 0);
+    assert_eq!(reuse["phase_a_pdf_parser_responses"], PDFS);
+    assert_eq!(reuse["capacity_fallbacks"], 0);
+    assert_eq!(reuse["io_fallbacks"], 0);
+    assert_eq!(reuse["replay_verified"], PDFS);
+    assert_eq!(reuse["replay_integrity_failures"], 0);
+    assert_eq!(reuse["phase_b_pdf_parses"], 0);
+    assert_eq!(reuse["fallback_examples"].as_array().unwrap().len(), 0);
+    assert_eq!(reuse["fallback_examples_truncated"], false);
+    assert_eq!(reuse["fallback_categories"].as_object().unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn corrupted_pdf_replay_reparses_without_blaming_the_source_or_backend() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    inject_pdf_spool_capacity(state_dir.path());
+    let tools = tempfile::tempdir().unwrap();
+    let pdf = corpus.path().join("report.pdf");
+    fs::write(&pdf, b"%PDF-1.4\ntest worker input\n").unwrap();
+    let worker = tools.path().join("pdf-worker");
+    let count = tools.path().join("worker-count");
+    let worker_script = String::from_utf8(
+        br#"#!/bin/sh
+printf 'parse\n' >> "$XERJ_TEST_PDF_COUNT"
+printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":"pdf_oxide/0.3.75","containment":"test worker","records":[{"fields":{"body":"Quarterly revenue increased while operating margin improved."},"locator":"p1-s0","group":null,"origin":"extractor"}]}'
+"#
+        .to_vec(),
+    )
+    .unwrap()
+    .replace("__XERJ_VERSION__", env!("CARGO_PKG_VERSION"));
+    fs::write(&worker, worker_script).unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let endpoint = MockEndpoint::start(0);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let _env = PdfWorkerEnvGuard::acquire();
+    std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+    std::env::set_var("XERJ_TEST_PDF_COUNT", &count);
+    crate::extract::pdf::corrupt_replay_for_source_size(fs::metadata(&pdf).unwrap().len());
+
+    let (code, report) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
+    assert_eq!(endpoint.state.lock().unwrap().docs.len(), 1);
+    assert_eq!(file_done_count(state_dir.path()), 1);
+    assert!(crate::extract::pdf::corrupted_replay_reservation_was_dropped());
+    let reuse = report.unwrap()["pdf_extraction_reuse"].clone();
+    assert_eq!(reuse["replay_verified"], 0);
+    assert_eq!(reuse["replay_integrity_failures"], 1);
+    assert_eq!(
+        reuse["io_fallbacks"], 0,
+        "a corrupted artifact is an integrity failure, not an I/O failure"
+    );
+    assert_eq!(reuse["phase_b_pdf_parses"], 1);
+    assert_eq!(reuse["current_live_artifacts"], 0);
+    assert_eq!(reuse["current_retained_or_reserved_bytes"], 0);
+    assert_eq!(reuse["fallback_categories"]["replay_verification"], 1);
+    assert_eq!(
+        reuse["fallback_examples"][0]["category"],
+        "replay_verification"
+    );
+}
+
+#[test]
+fn junk_scan_drops_its_spool_before_indexable_spools_are_retained() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let budget = crate::extract::pdf::ExtractionSpoolBudget::new(1, 1);
+    let mut junk = Some(DropProbe(Arc::clone(&drops)));
+    assert!(take_pdf_spool_if_indexable(&mut junk, true, &budget).is_none());
+    assert!(junk.is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    let mut indexable = Some(DropProbe(Arc::clone(&drops)));
+    let retained = take_pdf_spool_if_indexable(&mut indexable, false, &budget);
+    assert!(retained.is_some());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let report = budget.report();
+    assert_eq!(report["artifacts_discarded_before_replay"], 1);
+    assert_eq!(
+        report["phase_b_eligible_artifacts"], 0,
+        "eligibility is recorded only after the final todo set is known"
+    );
+    drop(retained);
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
 }

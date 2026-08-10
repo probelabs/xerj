@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`autoindex` parses each PDF once per fresh run instead of twice.** Phase A
+  already paid a *complete* parse for every PDF — `extract::extract` routes
+  `Family::Pdf` straight to the isolated worker and drops the sampling limit,
+  so only delivery ever stopped early — and phase B then spawned the worker
+  again for the same bytes. Phase A now retains each validated worker response
+  in an anonymous temporary file under `--state-dir` and phase B replays it.
+  Reuse is an optional accelerator, never correctness-critical state: it is
+  bounded to 384 MiB of retained-plus-in-flight bytes and to an artifact-handle
+  cap derived from live `RLIMIT_NOFILE` and open-descriptor counts, both
+  re-probed at every admission; a 4 GiB-or-half-free filesystem floor is
+  reserved for the journal and phase-B staging first; and every artifact is
+  verified (physical length, content digest, JSON decode, worker-protocol
+  identity) before a single record is published. Anything that cannot be
+  measured conservatively declines and reparses — which is why the optimization
+  is **Linux-only** today: other platforms have no live descriptor evidence.
+  A restart has a frozen plan but no trusted handle, so it parses again; the
+  spool is deliberately not journal state. `--json` gains a
+  `pdf_extraction_reuse` block so the behaviour is observable rather than
+  inferred from timing. Original work by Leonid Bugaev (@buger).
+
+### Changed — autoindex refuses reruns that would strand documents
+
+- **Deleting an indexed file and rerunning `xerj autoindex` now fails instead
+  of exiting 0.** Nothing in the pipeline removes the documents, aliases,
+  graph edges or catalog entries that the deleted file published, so a rerun
+  that ignored the deletion left them live and searchable with no source file
+  behind them. The rerun is now refused before any remote call other than the
+  endpoint-readiness ping: no mapping, delete-by-query, bulk, refresh, graph
+  or catalog write is attempted, and the journal is not appended to. The error
+  names the removed files and their content keys — the first ten, then an
+  `… and N more` tail, since a whole unmounted subtree can vanish at once —
+  and gives three recovery routes: restore the files and rerun, rebuild in
+  place by deleting the named indices and the state directory, or rebuild
+  under a new state directory, prefix and brain. `--fresh` is refused for the
+  same case, because it does not delete those documents either. `--json` emits
+  the same facts — every removed entry, uncapped — as
+  `xerj.autoindex.unsupported_sync_delta.v1` on stdout with exit 1. Deleting a
+  file that was only ever *skipped* is not refused: a junk file publishes no
+  documents, and the stale junk-catalog sweep removes its one catalog row, so
+  nothing is stranded.
+- **Files added after a plan was frozen are now called out on stderr.** They
+  are still not indexed by a rerun that resumes an existing plan — the plan is
+  a crash-resume boundary, not a folder-sync generation — but the run now
+  lists them, records them as skipped (exit 3, completed-with-junk) and points
+  at `--fresh`, which rebuilds the plan in place and picks them up. Adding or
+  changing files and rerunning keeps working; only removals are refused.
+- **`xerj brain` no longer turns an absent or zero node-count probe into an
+  automatic reset.** Journal/server disagreement now fails with the journal,
+  URL, prefix, and brain identity plus recovery instructions, including the
+  explicit `--fresh` rerun for a genuinely wiped data directory. Probe
+  transport and malformed-response failures remain errors instead of being
+  reported as an empty destination. A nodes index that was deleted out from
+  under a surviving brain meta doc reads as absence and reaches that recovery
+  text, rather than surfacing as a raw HTTP 404.
+- **`--fresh` still recovers a state directory whose journal cannot be
+  parsed.** The rerun gate reads the durable plan before the run starts, and a
+  plan that is malformed, or recorded for a different root/URL/prefix, is fatal
+  to a resume — but not to `--fresh`, which deletes that journal unread. The
+  preflight is now no more fatal than the open it precedes: under `--fresh` the
+  unreadable plan is reported on stderr and rebuilt from the current folder.
+  Without `--fresh` the refusal is unchanged. Because the removal gate has no
+  comparison basis in that case, the warning says so: documents already
+  published for files that are now gone cannot be identified from an unreadable
+  plan and are not deleted.
+- **Refusal and skip listings are capped at ten entries plus an "and N more"
+  tail.** Unmounting a bind mount under an indexed root vanishes every content
+  group at once, so the uncapped listing was one rendered entry per journalled
+  file. `--json` still carries every entry.
+
+
 ## [1.0.0-rc.14] - 2026-08-10
 
 ### Changed
@@ -210,6 +282,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a failed catalog bulk is retried by the next run instead of stranding the
   document. This does **not** implement add/change/delete reconciliation for
   *indexed* files, which remains open.
+
+- **Repeated `autoindex` scans keep agent-facing map metadata durable.**
+  Dataset source bytes, parser-junk counts and coercion-drop notes now derive
+  from committed per-file journal records instead of invocation-local worker
+  counters, so an unchanged resume does not overwrite them with zero. Run
+  timestamps now distinguish invocation start (`started`) from summary
+  generation (`summary_generated_at`), and `junk_records_total` on the run
+  document is the same durable sum the per-dataset `junk_records` reports
+  rather than an invocation-local counter that read `0` after a no-op resume.
+  Existing catalogs whose historical `started` field was dynamically mapped
+  as text remain usable: the additive mapping upgrade no longer attempts an
+  incompatible text-to-date type change. Concretely, this is catalogs written
+  by **v1.0.0-rc.4** — the one release that had `autoindex` but not yet
+  dynamic ISO-date inference (added in rc.5). Measured against a live engine,
+  adding `started` as `date` to such a catalog is refused 400
+  `mapper_parsing_exception` (*"field [started] already exists as [text],
+  cannot add [date]"*), which aborts the invocation before any document work.
+  Catalogs written by rc.5 or later already inferred `started` as `date` and
+  were never affected.
+
+  Three consequences worth knowing before you upgrade:
+
+  - **`bytes` is redefined.** It used to be the bytes the latest invocation
+    processed, credited to the first dataset a file was assigned to. It is now
+    the complete canonical source size, counted once in **every** distinct
+    dataset that source is assigned to. Per-dataset values therefore get
+    larger, and summing `bytes` across datasets can exceed the corpus size
+    when one source feeds several datasets — exactly as one source already
+    contributed to several dataset-local file counts. It is a dataset-local
+    source footprint, not a partition of physical storage.
+  - **Journals written before this release carry no per-dataset coercion
+    record**, because the new `dropped_by_dataset` field defaults to empty
+    when an older journal is replayed. Byte and junk counts reconstruct fine
+    (their journal fields already existed), but a dataset whose files are all
+    unchanged loses its `N field values dropped by coercion` note on the first
+    resume after upgrading, and only regains it once one of its files is
+    reprocessed. Re-run with `--fresh` if the note matters more than the
+    rescan.
+  - **`junk_records_total` is narrower than the number it replaces**, and one
+    class of failure has left it. It used to be an invocation counter that
+    also folded in records the *backend* refused per bulk item; it is now
+    parser junk only, so `xerj autoindex map`'s header counts exactly what the
+    per-dataset `junk_records` values count. No signal is lost in practice: a
+    single per-item rejection already aborts the run with
+    `autoindex stopped with bulk/backend failures`, before any run document or
+    map is written, so the folded-in number was never observable in a map.
+    That abort message now also states how many records were refused, which
+    the first-five error sample could not convey.
 
 - **The installer is now fail-closed on checksum *verification*, not just on
   checksum *download*.** `landing/get` printed
