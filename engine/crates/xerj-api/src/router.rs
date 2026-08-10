@@ -388,6 +388,18 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             "/_search/scroll",
             post(es_compat::next_scroll).delete(es_compat::clear_scroll),
         )
+        // Legacy path-parameter form of scroll continuation — a real,
+        // documented ES/OpenSearch REST variant, not a client mistake.
+        // Found missing while investigating why OpenSearch Dashboards
+        // 3.7.0's saved-objects migration crashes: it continues its scroll
+        // this way, hits a bare 404 (no route matched at all), and treats
+        // that as fatal.
+        .route(
+            "/_search/scroll/:scroll_id",
+            get(es_compat::next_scroll_path)
+                .post(es_compat::next_scroll_path)
+                .delete(es_compat::clear_scroll_path),
+        )
         // ── Reindex ────────────────────────────────────────────────────────
         .route("/_reindex", post(es_compat::reindex))
         // ── Field Capabilities ─────────────────────────────────────────────
