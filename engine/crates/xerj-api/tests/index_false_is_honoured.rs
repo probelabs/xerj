@@ -1004,6 +1004,18 @@ async fn rank_eval_records_a_refused_request_in_failures() {
         Some("query_shard_exception"),
         "{body}"
     );
+
+    // The score is still published, and it is still the mean over the requests
+    // that ran — `bad` contributes nothing rather than counting as a zero, and
+    // ES computes it the same way. This is asserted because the CHANGELOG
+    // states the number: a reader has to be able to check the claim, and the
+    // point of the fix is that the batch no longer shrinks *silently*, not that
+    // the score changed.
+    assert_eq!(
+        body.get("metric_score").and_then(Value::as_f64),
+        Some(1.0),
+        "the surviving request's precision is the published score: {body}"
+    );
 }
 
 /// `query_string`'s `fields` array is read, and a named unsearchable field in

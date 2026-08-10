@@ -57,7 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_msearch/template` render it as a per-response 400 envelope with `type` and
   `root_cause`, leaving the sibling sub-requests in the batch untouched; and
   `_rank_eval` records the refused request under `failures` instead of dropping
-  it from `details` *and* `failures` while still publishing a `metric_score`.
+  it from `details` *and* `failures`. It still publishes a `metric_score`, and
+  that number is still the mean over the requests that actually ran — which is
+  ES's behaviour too — but the batch no longer shrinks silently underneath it:
+  a two-request batch in which one is refused now answers `details: {good}`,
+  `failures: {bad}`, `metric_score: 1.0` (measured), so a relevance gate reading
+  a clean score can see what did not contribute to it.
 
   A multi-index `_count` follows ES's broadcast rule rather than failing
   outright: the failure status is returned only when **no** index answered
