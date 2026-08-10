@@ -142,7 +142,7 @@
     └── snapshots/</pre>
 
   <h2>WAL</h2>
-  <p>Append-only per index. Generation-rotated at <code class="inline">wal_max_size_mb</code> (default <strong>512 MiB</strong>). Retained until the flush checkpoint passes the tail generation, then the old file is released. Fsync policy is controlled by <code class="inline">[storage] wal_sync</code>:</p>
+  <p>Append-only per index. Generation-rotated at <code class="inline">wal_max_size_mb</code> (default <strong>1024 MiB</strong>). Retained until the flush checkpoint passes the tail generation, then the old file is released. Fsync policy is controlled by <code class="inline">[storage] wal_sync</code>:</p>
   <ul>
     <li><strong>sync</strong> — fsync <em>before</em> acknowledging each write (one fsync per <code class="inline">_bulk</code> request = group commit). <strong>Power-loss durable</strong>, matching Elasticsearch's default <code class="inline">index.translog.durability: request</code>. Lowest throughput; financial or compliance workloads.</li>
     <li><strong>batched</strong> (default) — writes reach the kernel immediately, so an XERJ <strong>process crash loses nothing</strong>; a background loop fsyncs every <code class="inline">wal_batch_ms</code> (default 100 ms), so a <strong>power loss or kernel panic</strong> can lose at most the last ~100 ms of acknowledged writes. Deliberately <em>below</em> Elasticsearch's request-fsync default in exchange for throughput — set <code class="inline">wal_sync = "sync"</code> when you need power-loss durability.</li>

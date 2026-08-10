@@ -150,13 +150,13 @@
   </div>
 
   <h2 id="quantization">Quantization</h2>
-  <p>XERJ supports four quantization modes. <code class="inline">scalar8</code> (SQ8) is the default and gives ~4× memory reduction with almost no recall loss on typical embedding spaces.</p>
+  <p><strong>Quantization is off by default</strong> — <code class="inline">[vector] default_quantization = "none"</code>, full-precision f32. Opt in per field with <code class="inline">index_options.type: int8_hnsw</code> (or <code class="inline">int8_flat</code>) on the mapping, or index-wide by setting the key.</p>
   <ul>
-    <li><strong>none</strong> — full-precision f32. Use when recall matters more than RAM.</li>
-    <li><strong>scalar8</strong> — 8-bit per dimension. Default. ~4× smaller. Recall impact typically under 1%.</li>
-    <li><strong>scalar4</strong> — 4-bit per dimension. ~8× smaller. Noticeable recall hit on fine-grained spaces.</li>
-    <li><strong>binary</strong> — 1-bit per dimension with Hamming distance. ~32× smaller. Use only if you know the embedding space tolerates it.</li>
+    <li><strong>none</strong> — full-precision f32. <em>The default.</em> Use when recall matters more than RAM.</li>
+    <li><strong>scalar8</strong> — 8-bit per dimension. ~4× smaller vectors, 1–2% recall loss. The one quantizer the serving path reads.</li>
+    <li><strong>binary</strong> — 1-bit per dimension. Not implemented: the server <strong>refuses to start</strong> on <code class="inline">default_quantization = "binary"</code> rather than silently storing full precision while claiming a 32× saving.</li>
   </ul>
+  <p>A 4-bit quantizer exists in the vector crate but no config or mapping value reaches it, so <code class="inline">scalar4</code> is not a mode you can select in this build.</p>
 
   <h2 id="knn-query">KNN query</h2>
 <pre class="code">{

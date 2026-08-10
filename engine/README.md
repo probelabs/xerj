@@ -236,7 +236,7 @@ data/
     schema.json   Field mapping definition
 ```
 
-Documents are written to the WAL and an in-memory memtable first. The memtable is flushed to a durable segment when it exceeds `flush_size_mb` (default 256 MiB) or `flush_interval_secs` (default 30 s). Segments are periodically merged in the background.
+Documents are written to the WAL and an in-memory memtable first. The memtable is flushed to a durable segment when it exceeds `flush_size_mb` (default 512 MiB) or `flush_interval_secs` (default 30 s). Segments are periodically merged in the background.
 
 ## Security
 

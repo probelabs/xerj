@@ -1740,6 +1740,180 @@ mod tests {
         );
     }
 
+    /// Undo the four HTML entities the docs pages actually use.
+    fn html_unescape(s: &str) -> String {
+        s.replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    }
+
+    /// Render a serialised default the way `config.html` writes it: strings
+    /// quoted, empty arrays as `[]`, numbers and bools bare.
+    fn as_documented(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(s) => format!("\"{s}\""),
+            serde_json::Value::Array(items) if items.is_empty() => "[]".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The reference table on `landing/docs/config.html`, as
+    /// `(section, key, documented default)` in page order.
+    fn docs_default_table(page: &str) -> Vec<(String, String, String)> {
+        const GROUP: &str = "<div class=\"group\" id=\"";
+        const CELL_K: &str = "<div class=\"cell k\">";
+        const CELL_D: &str = "<div class=\"cell d\">";
+
+        let mut rows = Vec::new();
+        let mut section = String::new();
+        let mut rest = page;
+        loop {
+            let group_at = rest.find(GROUP);
+            let key_at = rest.find(CELL_K);
+            let take_group = match (group_at, key_at) {
+                (Some(g), Some(k)) => g < k,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if take_group {
+                let after = &rest[group_at.unwrap() + GROUP.len()..];
+                let (id, tail) = after.split_once('"').expect("group id must be quoted");
+                section = id.to_string();
+                rest = tail;
+            } else if let Some(k) = key_at {
+                let after = &rest[k + CELL_K.len()..];
+                let (key, tail) = after.split_once("</div>").expect("cell k must close");
+                let d = tail
+                    .find(CELL_D)
+                    .expect("every key cell has a default cell");
+                let (default, tail) = tail[d + CELL_D.len()..]
+                    .split_once("</div>")
+                    .expect("cell d must close");
+                rows.push((
+                    section.clone(),
+                    key.trim().to_string(),
+                    html_unescape(default).trim().to_string(),
+                ));
+                rest = tail;
+            } else {
+                return rows;
+            }
+        }
+    }
+
+    /// Split `"batched"    # durability knob` into value and comment, without
+    /// mistaking a `#` inside a quoted string for the comment marker.
+    fn split_value_and_comment(rhs: &str) -> (&str, &str) {
+        let rhs = rhs.trim();
+        let end = if let Some(inner) = rhs.strip_prefix('"') {
+            inner.find('"').map(|i| i + 2).unwrap_or(rhs.len())
+        } else {
+            rhs.find('#').unwrap_or(rhs.len())
+        };
+        let (value, comment) = rhs.split_at(end);
+        (value.trim(), comment.trim())
+    }
+
+    /// The docs site is the *other* copy of the defaults, and it drifted
+    /// exactly the way `xerj.default.toml` did (#207).
+    ///
+    /// `landing/docs/config.html` shipped `wal_max_size_mb = 512`,
+    /// `flush_size_mb = 256` and `default_quantization = "scalar8"` in its
+    /// copy-pasteable `[storage]` and `[vector]` blocks while its own DEFAULT
+    /// table — thirty lines above, on the same page — said 1024, 512 and
+    /// `"none"`. An operator pasting the `[vector]` block switched on 8-bit
+    /// quantization and its 1–2% recall loss without asking for it.
+    /// `shipped_default_config_documents_the_real_defaults` did not catch it
+    /// because it only reads the TOML, so read the page too:
+    ///
+    /// 1. every DEFAULT cell in the reference table must equal
+    ///    `Config::default()`, and
+    /// 2. every assignment in an example block must equal the real default —
+    ///    unless its comment says `not a default`, which is how the blocks
+    ///    that exist to *turn something on* (TLS, cluster, embedding) declare
+    ///    themselves to the reader as well as to this test.
+    #[test]
+    fn the_docs_site_config_page_agrees_with_the_real_defaults() {
+        let page = include_str!("../../../../landing/docs/config.html");
+        let defaults = serde_json::to_value(Config::default()).unwrap();
+        let table = docs_default_table(page);
+        assert!(
+            table.len() > 40,
+            "only parsed {} rows out of the config.html reference table — the page's \
+             markup changed and this guard is no longer reading it",
+            table.len()
+        );
+
+        let mut drift: Vec<String> = Vec::new();
+        for (section, key, documented) in &table {
+            match defaults.get(section).and_then(|s| s.get(key)) {
+                None => drift.push(format!(
+                    "table: [{section}] {key} is documented but is not a key in Config"
+                )),
+                Some(actual) => {
+                    let real = as_documented(actual);
+                    if &real != documented {
+                        drift.push(format!(
+                            "table: [{section}] {key} says {documented}, code says {real}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        for block in page.split("<pre class=\"code\">").skip(1) {
+            let block = html_unescape(block.split("</pre>").next().unwrap_or_default());
+            let mut section = String::new();
+            for line in block.lines() {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    continue;
+                }
+                if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                    section = name.to_string();
+                    continue;
+                }
+                let Some((key, rhs)) = line.split_once('=') else {
+                    continue;
+                };
+                let key = key.trim();
+                if section.is_empty()
+                    || key.is_empty()
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                {
+                    continue;
+                }
+                let Some(actual) = defaults.get(&section).and_then(|s| s.get(key)) else {
+                    drift.push(format!(
+                        "example: [{section}] {key} is not a key in Config — a reader pasting \
+                         this block gets `unknown field` and no server"
+                    ));
+                    continue;
+                };
+                let (value, comment) = split_value_and_comment(rhs);
+                let real = as_documented(actual);
+                if value != real && !comment.contains("not a default") {
+                    drift.push(format!(
+                        "example: [{section}] {key} = {value} contradicts the real default \
+                         {real} and does not say so — add `# not a default ({real})` to the \
+                         line if the example means it"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            drift.is_empty(),
+            "landing/docs/config.html disagrees with Config::default() in {} place(s):\n  {}",
+            drift.len(),
+            drift.join("\n  ")
+        );
+    }
+
     /// `merge.strategy = "log_structured"` used to parse, validate and then run
     /// size-tiered merging anyway — nothing in the tree reads the field (#207).
     /// An operator who picks a levelled policy for its read amplification must

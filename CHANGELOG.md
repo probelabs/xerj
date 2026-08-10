@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stops running, if a fuzz target ships without a seed corpus, or if the
     "all input parsing paths" overclaim reappears in any prose file.
   - The claim itself is now specific about what is and is not covered.
+  - **Known gap, stated because the point of this entry is not to overclaim
+    again:** seven harnesses are seven parsers, not the engine's whole input
+    surface, and one parser outside them is already known to abort.
+    `aggs::parse_time_zone_offset` slices a `time_zone` string at byte 2 after
+    a *byte*-length check, so a `date_histogram` with `"time_zone": "+中a"` in
+    an unauthenticated `_search` body dies on a character boundary. It is
+    pre-existing, is not touched by this change, and is tracked in
+    [#272](https://github.com/xerj-org/xerj/issues/272) with a fix and a
+    proposed harness for the aggregation date parsers.
 
 - **Fixed two high-severity advisories in the document-ingest XML parser.**
   Turning the audit gate on found `quick-xml` 0.36.2 in `xerj-autoindex`, which
@@ -72,8 +81,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   xerj.toml`, the documented first step, silently changed four engine behaviours
   including turning on 8-bit vector quantization. The file is corrected and
   `shipped_default_config_documents_the_real_defaults` now diffs every leaf key
-  against `Config::default()`, so it cannot drift again. The docs site carried
-  the same four stale defaults and is corrected too.
+  against `Config::default()`, so it cannot drift again.
+
+- **The docs site had drifted the same way, and now has the same guard.**
+  `landing/docs/config.html` shipped `wal_max_size_mb = 512`,
+  `flush_size_mb = 256` and `default_quantization = "scalar8"` in its
+  copy-pasteable `[storage]` and `[vector]` blocks while its own DEFAULT
+  table — thirty lines up, on the same page — said 1024, 512 and `"none"`;
+  `landing/docs/storage.html` said the WAL rolls at 512 MiB;
+  `landing/docs/vectors.html` called `scalar8` "the default" and listed a
+  `scalar4` mode that no config or mapping value can reach; and
+  `engine/README.md` put `flush_size_mb` at 256 MiB. All four are corrected.
+  A second guard, `the_docs_site_config_page_agrees_with_the_real_defaults`,
+  now diffs *both* halves of that page — every DEFAULT cell in the reference
+  table and every assignment in the example blocks — against
+  `Config::default()`. An example that deliberately differs (the blocks whose
+  point is switching TLS or cluster mode on) has to carry `# not a default` on
+  the line, so the reader is told as well as the test.
 
 - **Four other claims from [#207](https://github.com/xerj-org/xerj/issues/207)
   now match the source.**
