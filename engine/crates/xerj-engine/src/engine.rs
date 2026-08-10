@@ -508,6 +508,23 @@ pub struct Engine {
     /// action, timestamps). Presence in this map is what "managed" means —
     /// an index with no entry here is not touched by the background job.
     pub managed_indices: Arc<DashMap<String, crate::lifecycle::ManagedIndexState>>,
+    /// Persisted detach tombstones (issue #282, ported from #262): an index
+    /// name lands here when an operator explicitly detached it — `PUT
+    /// /{index}/_settings {"index.lifecycle.name": null}`, `POST
+    /// /{index}/_ilm/remove`, or `POST /_plugins/_ism/remove/{index}`. An
+    /// acknowledged detach must be authoritative across restarts: mere
+    /// *absence* from `managed_indices` cannot distinguish "never managed"
+    /// from "operator said stop", and any future code path that re-derives
+    /// attachments (e.g. from persisted index settings, which may still
+    /// carry a stale `index.lifecycle.name`) MUST consult this set first.
+    /// Cleared by an explicit re-attach or by deleting the index. Persisted
+    /// in `ism_managed_indices.json` alongside the cursors.
+    pub lifecycle_detached: Arc<DashMap<String, ()>>,
+    /// Operator kill switch for lifecycle execution (`POST /_ilm/stop` /
+    /// `/_ilm/start`): while false, `lifecycle::tick` returns without
+    /// acting. In-memory only, matching #262's rc — a restart resumes
+    /// execution, which errs on the side of retention running.
+    pub lifecycle_running: Arc<std::sync::atomic::AtomicBool>,
     /// index name → creation time (epoch ms), for `min_index_age` and for
     /// `GET /{index}`'s `creation_date` (previously synthesized as
     /// `Utc::now()` on every request — see `record_index_created_at`).
@@ -732,6 +749,8 @@ impl Engine {
             ilm_policies: Arc::new(DashMap::new()),
             ism_policies: Arc::new(DashMap::new()),
             managed_indices: Arc::new(DashMap::new()),
+            lifecycle_detached: Arc::new(DashMap::new()),
+            lifecycle_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             index_created_at: Arc::new(DashMap::new()),
             component_templates: Arc::new(DashMap::new()),
             snapshot_repos: Arc::new(DashMap::new()),
@@ -1690,15 +1709,28 @@ impl Engine {
         }
     }
 
-    /// Persist the whole `managed_indices` map. Called by `lifecycle::tick`
-    /// after any change, and by the attach/detach handlers.
+    /// Persist the whole `managed_indices` map plus the detach tombstones
+    /// (issue #282). Called by `lifecycle::tick` after any change, and by
+    /// the attach/detach handlers.
+    ///
+    /// On-disk shape is an envelope — `{"managed": {...}, "detached":
+    /// [...]}` — so the acknowledged detaches survive a restart alongside
+    /// the cursors. `load_persisted_managed_indices` still accepts the
+    /// pre-#282 bare-map form.
     pub fn persist_managed_indices(&self) {
-        let snapshot: std::collections::HashMap<String, crate::lifecycle::ManagedIndexState> = self
+        let managed: std::collections::HashMap<String, crate::lifecycle::ManagedIndexState> = self
             .managed_indices
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
-        let bytes = match serde_json::to_vec_pretty(&snapshot) {
+        let mut detached: Vec<String> = self
+            .lifecycle_detached
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        detached.sort();
+        let envelope = serde_json::json!({ "managed": managed, "detached": detached });
+        let bytes = match serde_json::to_vec_pretty(&envelope) {
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "failed to serialize managed_indices for persistence");
@@ -1714,21 +1746,88 @@ impl Engine {
         let Ok(bytes) = std::fs::read(self.managed_indices_path()) else {
             return;
         };
-        match serde_json::from_slice::<
-            std::collections::HashMap<String, crate::lifecycle::ManagedIndexState>,
-        >(&bytes)
-        {
-            Ok(map) => {
-                let n = map.len();
-                for (index_name, state) in map {
-                    self.managed_indices.insert(index_name, state);
-                }
-                if n > 0 {
-                    info!(count = n, "restored persisted ISM managed-index state");
-                }
-            }
-            Err(e) => warn!(error = %e, "ignoring corrupt ism_managed_indices.json"),
+        // `deny_unknown_fields` is what keeps the two on-disk shapes
+        // unambiguous: without it, a pre-#282 bare-map file (index names as
+        // top-level keys) would "successfully" parse as an envelope with
+        // every cursor silently ignored as an unknown field — the exact
+        // accepted-and-ignored class this issue removes.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Envelope {
+            #[serde(default)]
+            managed: std::collections::HashMap<String, crate::lifecycle::ManagedIndexState>,
+            #[serde(default)]
+            detached: Vec<String>,
         }
+        let (map, detached) = match serde_json::from_slice::<Envelope>(&bytes) {
+            Ok(env) => (env.managed, env.detached),
+            Err(_) => match serde_json::from_slice::<
+                std::collections::HashMap<String, crate::lifecycle::ManagedIndexState>,
+            >(&bytes)
+            {
+                Ok(map) => (map, Vec::new()),
+                Err(e) => {
+                    warn!(error = %e, "ignoring corrupt ism_managed_indices.json");
+                    return;
+                }
+            },
+        };
+        let n = map.len();
+        for (index_name, state) in map {
+            self.managed_indices.insert(index_name, state);
+        }
+        for index_name in detached {
+            self.lifecycle_detached.insert(index_name, ());
+        }
+        if n > 0 {
+            info!(count = n, "restored persisted ISM managed-index state");
+        }
+    }
+
+    /// Detach `index` from lifecycle management and record a persisted
+    /// tombstone for it (issue #282). This is THE detach path — `PUT
+    /// /{index}/_settings {"index.lifecycle.name": null}`, `POST
+    /// /{index}/_ilm/remove` and `POST /_plugins/_ism/remove/{index}` all
+    /// land here, so a detach is recorded once and the executor cannot
+    /// disagree with the operator about which route it honoured (#262's
+    /// `set_index_lifecycle_policy` made the same call).
+    ///
+    /// Also scrubs `index.lifecycle.name` from the stored display settings:
+    /// ES drops the setting on removal rather than reporting a name that is
+    /// no longer in force, and a stale name here is exactly the input a
+    /// future settings-derived re-attach would trip over.
+    ///
+    /// Returns whether the index was managed before the call.
+    pub fn detach_lifecycle(&self, index: &str) -> bool {
+        let was_managed = self.managed_indices.remove(index).is_some();
+        self.lifecycle_detached.insert(index.to_string(), ());
+        if let Some(mut stored) = self.index_settings.get_mut(index) {
+            let v = stored.value_mut();
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("index.lifecycle.name");
+            }
+            if let Some(lifecycle) = v
+                .pointer_mut("/index/lifecycle")
+                .and_then(Value::as_object_mut)
+            {
+                lifecycle.remove("name");
+            }
+        }
+        self.persist_managed_indices();
+        was_managed
+    }
+
+    /// Whether `lifecycle::tick` is allowed to act — the `POST /_ilm/stop`
+    /// kill switch (issue #282).
+    pub fn lifecycle_execution_running(&self) -> bool {
+        self.lifecycle_running
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `POST /_ilm/start` / `POST /_ilm/stop`.
+    pub fn set_lifecycle_execution_running(&self, running: bool) {
+        self.lifecycle_running
+            .store(running, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Spawn the background lifecycle-execution job: every
@@ -2498,6 +2597,16 @@ impl Engine {
         self.index_settings.remove(name);
         self.index_mappings.remove(name);
         self.index_alias_metadata.remove(name);
+
+        // Lifecycle bookkeeping: a deleted index needs neither an execution
+        // cursor nor a detach tombstone (#282) — and clearing the tombstone
+        // here means a *recreated* index with the same name starts fresh
+        // rather than inheriting a years-old "operator said stop".
+        let had_lifecycle_state = self.managed_indices.remove(name).is_some()
+            | self.lifecycle_detached.remove(name).is_some();
+        if had_lifecycle_state {
+            self.persist_managed_indices();
+        }
     }
 
     /// Remove `<data_dir>/<name>` from disk, refusing anything that does not
@@ -2923,6 +3032,25 @@ impl Engine {
         self.persisted_insert(&self.data_streams, name.to_string(), ds)?;
         info!(name, "data stream created");
         Ok(())
+    }
+
+    /// Drop a deleted backing index from its data stream's generation list
+    /// so the stream does not keep advertising an index that no longer
+    /// exists (#282, ported from #262's `detach_data_stream_backing_index`)
+    /// — and persist the shrunken list, or a restart would reload the
+    /// deleted generation from `cluster_state.json` as an orphan.
+    pub(crate) fn detach_data_stream_backing_index(&self, index: &str) {
+        let mut changed = false;
+        for mut entry in self.data_streams.iter_mut() {
+            let before = entry.backing_indices.len();
+            entry.backing_indices.retain(|b| b != index);
+            changed |= entry.backing_indices.len() != before;
+        }
+        if changed {
+            if let Err(e) = self.flush_cluster_state() {
+                warn!(error = %e, "failed to persist data-stream state after lifecycle delete");
+            }
+        }
     }
 
     /// Roll over a data stream: create the next backing index and update the alias.

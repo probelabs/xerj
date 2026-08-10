@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`PUT /{index}/_settings {"index.lifecycle.name": null}` actually detaches
+  the index, and the detach survives a restart** (#282, ported from #262). The
+  null previously fell through a string-only settings reader, so the operator
+  got `200 acknowledged` while the index stayed attached — to a policy whose
+  delete phase then destroyed it. A detach now removes the execution cursor,
+  writes a persisted tombstone (`ism_managed_indices.json` grew a
+  `managed`/`detached` envelope; the old bare-map file is still read), and
+  scrubs the stale `index.lifecycle.name` from the stored settings.
+- **The lifecycle delete action gained #262's safety rails.** It now refuses —
+  visibly, in `explain`, never silently — to delete a dot-prefixed internal
+  index (`.ds-*` backing indices exempt), a data stream's current write index,
+  or an index whose age cannot be established from its execution cursor.
+- **An ILM policy naming an action the engine cannot execute is refused at PUT
+  time with the action named** (400), instead of being stored with the action
+  silently dropped — the accepted-and-ignored class (#204). Executable ILM
+  actions are `rollover`, `delete`, `readonly`.
+
+### Added
+
+- **`GET /_ilm/status`, `POST /_ilm/start`, `POST /_ilm/stop`** (#282): the
+  operator can halt lifecycle execution without stopping the node; a stopped
+  engine's tick touches nothing. The flag is in-memory — a restart resumes
+  execution — while the per-index detach tombstone is the durable stop.
+- **`POST /{index}/_ilm/remove`** (#282): ES's own detach verb; goes through
+  the same tombstoned detach path as the settings-null route. A literal name
+  that is not an index answers 404 rather than writing a tombstone for a
+  ghost.
+
 - **A crafted filename can no longer forge records on the agent progress
   stream** (the first rc.15 known issue below). Every externally-controlled
   string — in-flight paths, the paths and error text interpolated into human
