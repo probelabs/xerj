@@ -285,6 +285,57 @@ async fn phrase_slop_is_honoured() {
     .await;
 }
 
+/// PINS A KNOWN DIVERGENCE FROM ES, so nothing in this PR can be read as
+/// claiming it away: XERJ's sloppy phrase is **in-order only**, at every
+/// entry point and in both states.
+///
+/// Lucene's is not. `SloppyPhraseMatcher`'s class javadoc: «for query "a
+/// b"~2, a document "x a b a y" can be matched twice: once for "a b"
+/// (distance=0), and once for "b a" (distance=2)» — so ES answers
+/// `{"query": "policy merge", "slop": 2}` with docs 1 and 2, and XERJ
+/// answers with none. That is the pre-existing behaviour of
+/// `xerj_fts::search::phrase_positions_match` (which single-field
+/// `match_phrase` has always used) and the stored-scan walk added by #230
+/// mirrors it deliberately, because the two evaluators disagreeing is the
+/// flush-variance class this PR exists to remove.
+///
+/// It is NOT a regression: before #230 the `multi_match` phrase arms tested
+/// raw-substring containment, which does not match a transposition either.
+/// When the walk learns transpositions, both evaluators change together and
+/// this test flips — that is the point of pinning it.
+#[tokio::test]
+async fn sloppy_phrase_is_in_order_only_unlike_lucene() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let idx = seed(&engine, "mmpp_inorder").await;
+
+    assert_both_states(
+        &idx,
+        &[
+            (
+                json!({"multi_match": {"query": "policy merge", "fields": ["body"],
+                                       "type": "phrase", "slop": 2}}),
+                &[],
+                "transposed phrase, slop 2: ES matches, XERJ does not",
+            ),
+            (
+                json!({"match_phrase": {"body": {"query": "policy merge", "slop": 3}}}),
+                &[],
+                "transposed phrase, slop 3, single-field spelling: same answer",
+            ),
+            // The in-order control, so the case above cannot pass by
+            // accident (e.g. if slop stopped being honoured at all).
+            (
+                json!({"multi_match": {"query": "log policy", "fields": ["body"],
+                                       "type": "phrase", "slop": 2}}),
+                &["1"],
+                "in-order control at the same slop: matches",
+            ),
+        ],
+    )
+    .await;
+}
+
 /// A memtable phrase hit must also SCORE above zero — `score_query_against_doc`
 /// carried its own copy of the substring predicate, so a doc admitted by the
 /// (fixed) membership test would still score 0.0 and be dropped by scored paths.
@@ -392,7 +443,8 @@ fn negative_slop_is_rejected_at_the_three_phrase_entry_points() {
 /// A float-encoded `slop` (`2.0`) must be honoured as 2, not refused and not
 /// dropped. ES reads slop with `XContentParser.intValue()` under its default
 /// coercing policy, which truncates a float token and narrows a numeric string
-/// (`AbstractXContentParser.java:74`/`:162`/`:177`), so `{"slop": 2.0}` is a
+/// (`AbstractXContentParser.java:171` `intValue(coerce)` → `:162` `parseInt`,
+/// with the truncation note at `:70`), so `{"slop": 2.0}` is a
 /// query ES answers with slop 2.
 ///
 /// This test exists because an earlier revision of this branch tightened the

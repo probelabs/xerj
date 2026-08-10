@@ -28193,6 +28193,20 @@ fn phrase_positions_in_tokens(field_tokens: &[String], query_tokens: &[String], 
 /// Keeping one walk (rather than two look-alike ones) is deliberate: the
 /// two evaluators must not be able to drift apart the way the slop-0-only
 /// prefix walk had already drifted from the sloppy phrase walk.
+///
+/// KNOWN DIVERGENCE FROM ES, not closed by #230: this walk is **in-order
+/// only**.  Lucene's sloppy phrase admits a transposition at a distance
+/// cost — its own javadoc: «for query "a b"~2, a document "x a b a y" can
+/// be matched twice: once for "a b" (distance=0), and once for "b a"
+/// (distance=2)» (`lucene/core/.../search/SloppyPhraseMatcher.java`, class
+/// javadoc; Apache-2.0) — so ES answers `match_phrase {"query": "policy
+/// merge", "slop": 2}` on a document reading `merge policy`, and XERJ
+/// answers it with zero hits.  That is the pre-existing semantics of
+/// `xerj_fts::search::phrase_positions_match`, which the segment side has
+/// always used and which this walk deliberately mirrors: matching ES here
+/// means changing BOTH evaluators together, and mirroring the existing one
+/// is what keeps the hit set flush-invariant today.  Measured, not assumed
+/// (5-doc index, `"policy merge"` slop 2 and slop 3 → `[]` in both states).
 fn phrase_walk(
     field_tokens: &[String],
     query_tokens: &[String],

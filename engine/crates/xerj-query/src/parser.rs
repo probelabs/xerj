@@ -561,10 +561,12 @@ fn parse_match_phrase(params: &Value) -> Result<QueryNode> {
 /// does under its default number policy (`DEFAULT_NUMBER_COERCE_POLICY = true`):
 /// an integer is taken as written, a **float is truncated** toward zero, and a
 /// numeric **string** is read as a double and then narrowed
-/// (`libs/x-content/src/main/java/org/elasticsearch/xcontent/support/AbstractXContentParser.java:74`
-/// — "the 3rd party parsers we rely on are known to silently truncate
-/// fractions" — plus `:162` `parseInt` and `:177` `intValue`; AGPL, read for
-/// semantics only, nothing copied).
+/// (`libs/x-content/src/main/java/org/elasticsearch/xcontent/support/AbstractXContentParser.java`:
+/// `:70` — "the 3rd party parsers we rely on are known to silently truncate
+/// fractions", guarding `ensureNumberConversion` at `:74`, which only raises
+/// when `coerce == false`; `:171` `intValue(coerce)`, whose `VALUE_STRING`
+/// arm calls `:162` `parseInt`, itself a `Double.parseDouble` narrowed with
+/// `(int)`; AGPL, read for semantics only, nothing copied).
 ///
 /// Why it exists: JSON encoders that carry every number as a double emit
 /// `"slop": 2.0`, and ES answers that query with slop 2. Reading it with
@@ -714,7 +716,9 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
     // `bool_prefix` (…/index/query/MultiMatchQueryBuilder.java:673) and
     // `TextFieldMapper.createPhrasePrefixQuery` calls
     // `MultiPhrasePrefixQuery.setSlop(slop)` (…/index/mapper/
-    // TextFieldMapper.java:1269 — AGPL, read for semantics only). Both XERJ
+    // TextFieldMapper.java:2019, `setSlop` at :2028, reached from the
+    // `phrasePrefixQuery` entry at :1269 — AGPL, read for semantics only).
+    // Both XERJ
     // evaluators now carry it: `PhrasePrefixQuery.slop` on the segment side
     // and the sloppy prefix walk in the stored-doc scan. Refusing it here
     // would have been a wire-compat break on a query ES answers, and would
@@ -4590,7 +4594,8 @@ mod tests {
     /// Values ES *accepts by coercing* must be accepted here too. ES reads
     /// `slop` and `max_expansions` with `XContentParser.intValue()` under the
     /// default coercing policy, which truncates a float token and narrows a
-    /// numeric string (`AbstractXContentParser.java:74`/`:162`/`:177`), so
+    /// numeric string (`AbstractXContentParser.java:171` `intValue(coerce)`,
+    /// `:162` `parseInt`, `:70`), so
     /// `{"slop": 2.0}` is a request ES answers with slop 2. Refusing it would
     /// be a new 400 on a query that works today, and reading it as 0 would be
     /// the accept-and-ignore this parser exists to remove — both are wrong.

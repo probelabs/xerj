@@ -331,8 +331,9 @@ pub struct PhrasePrefixQuery {
     /// `match_phrase_prefix`: `TextFieldMapper.createPhrasePrefixQuery` builds
     /// a `MultiPhrasePrefixQuery` and calls `setSlop(slop)` alongside
     /// `setMaxExpansions` (elasticsearch/server/src/main/java/org/
-    /// elasticsearch/index/mapper/TextFieldMapper.java:1269 — AGPL, read for
-    /// semantics only, no code copied).  Defaults to 0 (adjacency), which is
+    /// elasticsearch/index/mapper/TextFieldMapper.java:2019, the two setters
+    /// at :2028-:2029, reached from `phrasePrefixQuery` at :1269 — AGPL, read
+    /// for semantics only, no code copied).  Defaults to 0 (adjacency), which is
     /// the pre-existing behaviour for every caller that does not set it.
     #[serde(default)]
     pub slop: u32,
