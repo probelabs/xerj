@@ -13,6 +13,9 @@ xerj-common = { path = "../xerj-common" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Durable sync_begin replay needs exact decimal-to-f64 recovery without
+# selecting serde_json's slower float parser for the whole server binary.
+simd-json.workspace = true
 chrono.workspace = true
 regex = "1"
 walkdir = "2"

@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time with the action named** (400), instead of being stored with the action
   silently dropped — the accepted-and-ignored class (#204). Executable ILM
   actions are `rollover`, `delete`, `readonly`.
+- **`autoindex` no longer rejects a resumed generation after journal replay
+  when inferred floating-point schema statistics need exact decimal
+  round-tripping.** Unchanged reruns and junk-bearing corpus shrink now replay
+  correctly; existing affected journals resume without a rebuild, while the
+  manifest format and integrity checks remain unchanged.
 
 ### Added
 

@@ -512,11 +512,10 @@ fn read_plan_for_preflight(
             // preflight accepts. It cannot be treated as durable here.
             break;
         }
-        let value: Value =
-            serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice()))
-                .with_context(|| {
-                    format!(
-                        "journal corruption at byte {record_start} in {}: malformed \
+        let record_bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice());
+        let value = crate::sync::decode_unique_durable_json(record_bytes).with_context(|| {
+            format!(
+                "journal corruption at byte {record_start} in {}: malformed \
                          newline-terminated record. Refusing to discard later records. Restore \
                          the journal from a backup, or truncate it to exactly {record_start} \
                          bytes to keep every completion recorded before the corruption. Deleting \
@@ -527,9 +526,9 @@ fn read_plan_for_preflight(
                          new --state-dir, new --prefix, and new --brain when graph detection \
                          is enabled (or --no-graph); explicitly validate and clean the shared \
                          catalog and old target",
-                        path.display()
-                    )
-                })?;
+                path.display()
+            )
+        })?;
         match value.get("kind").and_then(Value::as_str) {
             Some("run") => {
                 let recorded_root = value.get("root").and_then(Value::as_str).unwrap_or("");
@@ -565,7 +564,12 @@ fn read_plan_for_preflight(
                 }
             }
             Some(kind) if crate::sync::is_sync_record_kind(kind) => {
-                crate::sync::replay_record(&value, &mut committed_manifest, &mut pending_sync)?;
+                crate::sync::replay_durable_record(
+                    &value,
+                    record_bytes,
+                    &mut committed_manifest,
+                    &mut pending_sync,
+                )?;
                 if matches!(kind, "sync_bootstrap" | "sync_commit") {
                     plan = committed_manifest
                         .as_ref()
@@ -735,9 +739,8 @@ impl Journal {
                     break;
                 }
                 let newline_terminated = bytes.last() == Some(&b'\n');
-                match serde_json::from_slice::<Value>(
-                    bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice()),
-                ) {
+                let record_bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice());
+                match crate::sync::decode_unique_durable_json(record_bytes) {
                     Ok(v) if newline_terminated => {
                         valid_end += read as u64;
                         match v.get("kind").and_then(|k| k.as_str()) {
@@ -838,8 +841,9 @@ impl Journal {
                                 embedding_identity_resumable = resumable;
                             }
                             Some(kind) if crate::sync::is_sync_record_kind(kind) => {
-                                crate::sync::replay_record(
+                                crate::sync::replay_durable_record(
                                     &v,
+                                    record_bytes,
                                     &mut committed_manifest,
                                     &mut pending_sync,
                                 )?;
@@ -902,7 +906,7 @@ impl Journal {
                     Err(error) => {
                         anyhow::bail!(
                             "journal corruption at byte {record_start} in {}: malformed \
-                             newline-terminated record ({error}). Refusing to discard records \
+                            newline-terminated record ({error:#}). Refusing to discard records \
                              after corruption. Restore the journal from a backup, or truncate it \
                              to exactly {record_start} bytes to keep every completion recorded \
                              before the corruption (files journaled after that point are \
@@ -1393,6 +1397,144 @@ mod sync_journal_tests {
             },
         )
         .unwrap()
+    }
+
+    fn historical_issue_283_journal(sync_begin: &str) -> Vec<u8> {
+        let run = serde_json::json!({
+            "v": 1,
+            "kind": "run",
+            "root": "root",
+            "url": "url",
+            "prefix": "prefix",
+            "bulk_timeout_secs": 300,
+            "run_id": "run-issue-283-fixture",
+            "started": "2026-08-10T00:00:00Z"
+        });
+        let bootstrap = serde_json::json!({
+            "kind": "sync_bootstrap",
+            "manifest": crate::sync::CommittedManifest::genesis().unwrap(),
+        });
+        format!("{run}\n{bootstrap}\n{sync_begin}\n").into_bytes()
+    }
+
+    fn historical_issue_283_begin() -> String {
+        // Mechanical whitespace removal preserves the checked-in decimal
+        // token; parsing it here would erase the historical boundary.
+        include_str!("../tests/fixtures/issue_283_sync_begin.json")
+            .lines()
+            .collect()
+    }
+
+    fn assert_preflight_and_authoritative_open_reject(
+        valid_journal: &[u8],
+        invalid_journal: &[u8],
+        marker: &str,
+    ) {
+        let preflight_dir = tempfile::tempdir().unwrap();
+        std::fs::write(preflight_dir.path().join("journal.ndjson"), invalid_journal).unwrap();
+        let error = Journal::preflight(preflight_dir.path(), "root", "url", "prefix", false)
+            .err()
+            .expect("preflight must reject the raw durable mutation");
+        assert!(format!("{error:#}").contains(marker), "{error:#}");
+
+        // Pass preflight over valid bytes, then mutate the journal while its
+        // lock remains held. This directly exercises the authoritative replay
+        // in open_after_preflight rather than failing in preflight twice.
+        let open_dir = tempfile::tempdir().unwrap();
+        let path = open_dir.path().join("journal.ndjson");
+        std::fs::write(&path, valid_journal).unwrap();
+        let preflight =
+            Journal::preflight(open_dir.path(), "root", "url", "prefix", false).unwrap();
+        std::fs::write(&path, invalid_journal).unwrap();
+        let error = Journal::open_after_preflight(preflight, "root", "url", "prefix", 300, false)
+            .err()
+            .expect("authoritative open must reject the raw durable mutation");
+        assert!(format!("{error:#}").contains(marker), "{error:#}");
+    }
+
+    #[test]
+    fn raw_sync_begin_mutations_fail_at_preflight_and_authoritative_open() {
+        let begin = historical_issue_283_begin();
+        let valid = historical_issue_283_journal(&begin);
+        let cases = [
+            (
+                "desired payload",
+                begin.replacen("245.44444444444446", "245.44444444444449", 1),
+                "desired manifest digest does not match sync_begin payload",
+            ),
+            (
+                "operation list",
+                begin.replacen(
+                    "\"operations\": []",
+                    "\"operations\": [{\"operation_id\":\"delete:ghost\",\"kind\":\"delete\",\"group_id\":\"ghost\"}]",
+                    1,
+                ),
+                "sync operation list was not derived exactly",
+            ),
+            (
+                "desired digest",
+                begin.replacen(
+                    "axm1-5e314eb29c9617433af240313b94e544",
+                    "axm1-5e314eb29c9617433af240313b94e545",
+                    1,
+                ),
+                "desired manifest digest does not match sync_begin payload",
+            ),
+            (
+                "execution identity",
+                begin.replacen("\"chunker_identity\": \"chunker-v1\"", "\"chunker_identity\": \"chunker-v2\"", 1),
+                "desired manifest digest does not match sync_begin payload",
+            ),
+        ];
+        for (label, mutated, marker) in cases {
+            assert_ne!(mutated, begin, "mutation did not apply: {label}");
+            assert_preflight_and_authoritative_open_reject(
+                &valid,
+                &historical_issue_283_journal(&mutated),
+                marker,
+            );
+        }
+    }
+
+    #[test]
+    fn raw_content_identity_mutation_fails_at_preflight_and_authoritative_open() {
+        let source = tempfile::tempdir().unwrap();
+        let mut journal = journal_with_plan(source.path());
+        journal.sync_begin(&pending(&journal)).unwrap();
+        drop(journal);
+        let valid = std::fs::read(source.path().join("journal.ndjson")).unwrap();
+        let valid_text = String::from_utf8(valid.clone()).unwrap();
+        // Target only the ManifestGroup field. The plan's FileAssignment has
+        // the same digest text but a different following field.
+        let mutated_text = valid_text.replacen(
+            "\"content_digest\":\"digest-a\",\"content_size\":10,\"canonical\"",
+            "\"content_digest\":\"digest-b\",\"content_size\":10,\"canonical\"",
+            1,
+        );
+        assert_ne!(mutated_text, valid_text, "content mutation did not apply");
+        assert_preflight_and_authoritative_open_reject(
+            &valid,
+            mutated_text.as_bytes(),
+            "plan canonical projection disagrees with manifest group",
+        );
+    }
+
+    #[test]
+    fn duplicate_kind_is_rejected_before_last_key_can_bypass_sync_routing() {
+        let valid = concat!(
+            "{\"v\":1,\"kind\":\"run\",\"root\":\"root\",\"url\":\"url\",",
+            "\"prefix\":\"prefix\",\"run_id\":\"valid\"}\n"
+        );
+        let duplicate = concat!(
+            "{\"v\":1,\"kind\":\"sync_begin\",\"kind\":\"run\",",
+            "\"root\":\"root\",\"url\":\"url\",\"prefix\":\"prefix\",",
+            "\"run_id\":\"ambiguous\"}\n"
+        );
+        assert_preflight_and_authoritative_open_reject(
+            valid.as_bytes(),
+            duplicate.as_bytes(),
+            "duplicate JSON object key \"kind\"",
+        );
     }
 
     #[test]
