@@ -248,6 +248,25 @@ async fn cluster_health_inner(
         selected
     };
 
+    // Indices that failed to open (issue #202) are absent from `list_indices`,
+    // so the selector above cannot see them — yet they are exactly why
+    // `Engine::health` answers red. Reporting green here while the engine says
+    // red would leave the corruption invisible on the one endpoint every ES
+    // client, Kibana and monitoring dashboard polls. Resolve them against the
+    // same selector so `/_cluster/health/{other_index}` is not dragged red by
+    // an unrelated failure.
+    let failed_selected: Vec<String> = state
+        .engine
+        .failed_index_names()
+        .into_iter()
+        .filter(|name| match &index_filter {
+            None => true,
+            Some(sel) => sel.split(',').map(str::trim).any(|s| {
+                s == "_all" || s == "*" || s == name.as_str() || glob_match_simple(s, name)
+            }),
+        })
+        .collect();
+
     // Per-index shard count helper — defaults to 1 when unset.
     let shard_count = |name: &str| -> u32 {
         state
@@ -319,7 +338,15 @@ async fn cluster_health_inner(
     // keep the *cluster* status driven by replicas only. Our tests cover
     // both — we currently only track a single "closed" flag per index and
     // don't differentiate the closed-replication mode.
-    let status = if unassigned_replicas > 0 {
+    // An index that failed to open has an unassigned primary — there is no
+    // copy of its data being served anywhere — which is red in ES's own
+    // vocabulary and red in `Engine::health`. It dominates the replica-driven
+    // yellow. When nothing failed, `failed_selected` is empty and every number
+    // below is byte-identical to before.
+    let failed_primaries: u32 = failed_selected.iter().map(|n| shard_count(n)).sum();
+    let status = if !failed_selected.is_empty() {
+        "red"
+    } else if unassigned_replicas > 0 {
         "yellow"
     } else {
         "green"
@@ -412,13 +439,13 @@ async fn cluster_health_inner(
         "active_shards": active,
         "relocating_shards": 0,
         "initializing_shards": 0,
-        "unassigned_shards": unassigned_replicas,
-        "unassigned_primary_shards": 0,
+        "unassigned_shards": unassigned_replicas + failed_primaries,
+        "unassigned_primary_shards": failed_primaries,
         "delayed_unassigned_shards": 0,
         "number_of_pending_tasks": 0,
         "number_of_in_flight_fetch": 0,
         "task_max_waiting_in_queue_millis": 0,
-        "active_shards_percent_as_number": if idx_count == 0 { 100.0 } else { (active as f64) / (idx_count as f64) * 100.0 },
+        "active_shards_percent_as_number": if idx_count + failed_primaries == 0 { 100.0 } else { (active as f64) / ((idx_count + failed_primaries) as f64) * 100.0 },
     });
 
     // `level=indices` or `level=shards` — include a per-index breakdown.
@@ -474,6 +501,37 @@ async fn cluster_health_inner(
                 });
             }
             indices_map.insert(info.name.clone(), idx_obj);
+        }
+        // …and the ones that never opened, so `level=indices` names the index
+        // the operator has to repair instead of leaving a red cluster with no
+        // red index in it.
+        for name in &failed_selected {
+            let shards = shard_count(name);
+            let mut idx_obj = json!({
+                "status": "red",
+                "number_of_shards": shards,
+                "number_of_replicas": 0,
+                "active_primary_shards": 0,
+                "active_shards": 0,
+                "relocating_shards": 0,
+                "initializing_shards": 0,
+                "unassigned_shards": shards,
+                "unassigned_primary_shards": shards,
+            });
+            if level == "shards" {
+                idx_obj["shards"] = json!({
+                    "0": {
+                        "status": "red",
+                        "primary_active": false,
+                        "active_shards": 0,
+                        "relocating_shards": 0,
+                        "initializing_shards": 0,
+                        "unassigned_shards": shards,
+                        "unassigned_primary_shards": shards,
+                    }
+                });
+            }
+            indices_map.insert(name.clone(), idx_obj);
         }
         resp["indices"] = Value::Object(indices_map);
     }
@@ -1334,7 +1392,20 @@ pub async fn delete_index(
         .unwrap_or(true);
 
     let all = state.engine.list_indices().await;
-    let all_names: Vec<String> = all.iter().map(|i| i.name.clone()).collect();
+    let mut all_names: Vec<String> = all.iter().map(|i| i.name.clone()).collect();
+    // An index that failed to open (issue #202) is not in `indices` and so
+    // never appears in `list_indices`. Both branches below — the literal name
+    // and the `_all`/wildcard expansion — resolve out of `all_names`, so
+    // without this union `DELETE /{index}` answered 404 with the directory
+    // still on disk and `DELETE /_all` answered a bare
+    // `{"acknowledged": true}` while the corrupt index survived. Delete is the
+    // documented recovery path; it has to reach `Engine::delete_index`, which
+    // has the branch that removes a failed index's directory.
+    for name in state.engine.failed_index_names() {
+        if !all_names.contains(&name) {
+            all_names.push(name);
+        }
+    }
 
     let mut to_delete: Vec<String> = Vec::new();
     let parts: Vec<&str> = index
@@ -1395,11 +1466,25 @@ pub async fn delete_index(
         }
     }
 
+    // A delete that did not happen must never answer `{"acknowledged": true}`
+    // (the accepted-and-ignored class tracked in #204). The loop used to
+    // discard every error with `let _ =`; the case that makes it matter is a
+    // failed index whose directory cannot be removed — `delete_index` puts the
+    // failure back so health stays red, and the operator needs to be told why.
+    let mut first_error: Option<xerj_common::XerjError> = None;
     for name in &to_delete {
-        let _ = state.engine.delete_index(name).await;
+        if let Err(e) = state.engine.delete_index(name).await {
+            tracing::error!(index = %name, error = %e, "delete index failed");
+            if first_error.is_none() {
+                first_error = Some(e.into());
+            }
+        }
         // RC4-W4 item 5: drop the index's per-index metric label series so it
         // doesn't linger for the process lifetime after the index is gone.
         state.metrics.prune_index_labels(name);
+    }
+    if let Some(e) = first_error {
+        return ApiError::new(e).into_response();
     }
     Json(EsDeleteIndexResponse::ok()).into_response()
 }

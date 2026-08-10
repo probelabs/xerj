@@ -708,12 +708,24 @@ pub async fn embedding_execution_identity(State(state): State<AppState>) -> impl
 //   be a no-op — checking the engine here would create a feedback loop
 //   where a slow engine flapping flush causes constant pod restarts.
 //
-// - **readiness**: returns 200 only when the engine reports a non-`red`
-//   cluster status (i.e. at least one index is queryable).  kubelet uses
-//   this to decide whether to send traffic.  Until ready, the Service
-//   removes the pod from rotation but doesn't restart it — appropriate
-//   for "still replaying WAL" or "still loading 50 K segments" startup
-//   states that are transient but visible.
+// - **readiness**: returns 200 while this node can serve *something*.
+//   kubelet uses this to decide whether to send traffic.  Until ready, the
+//   Service removes the pod from rotation but doesn't restart it —
+//   appropriate for "still replaying WAL" or "still loading 50 K segments"
+//   startup states that are transient but visible.
+//
+//   Readiness is a traffic gate, not an alarm channel, and the two must not
+//   be conflated.  Since issue #202 `Engine::health` is red whenever *any*
+//   index failed to open, and that condition is not transient: one
+//   unparseable `schema.json` out of a hundred indices would take the pod out
+//   of rotation permanently while the other ninety-nine still answer
+//   perfectly — turning one broken index into a full-node outage, and
+//   (because `xerj brain` gates on this probe, `xerj-server/src/brain.rs:215`)
+//   breaking tooling that has nothing to do with the corrupt index.  So the
+//   probe fails only when the node genuinely has nothing to serve: red with
+//   no index open.  The alarm for a partial failure is
+//   `GET /_cluster/health` → `red`, which names the index, and the write path,
+//   which refuses by name.
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn liveness() -> impl IntoResponse {
@@ -722,10 +734,13 @@ pub async fn liveness() -> impl IntoResponse {
 
 pub async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     let h = state.engine.health().await;
-    if h.status == "red" {
+    // `index_count` is the number of indices that actually opened, so
+    // `red && index_count == 0` is exactly "every index on this node failed"
+    // (or "the only index there is failed"). Anything else can still serve.
+    if h.status == "red" && h.index_count == 0 {
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("not ready: cluster status = {}", h.status),
+            "not ready: cluster status = red and no index is serving".to_string(),
         )
             .into_response()
     } else {

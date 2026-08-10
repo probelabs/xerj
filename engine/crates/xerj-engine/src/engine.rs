@@ -1456,6 +1456,31 @@ impl Engine {
         list
     }
 
+    /// Names of the indices that failed to open, filtered to the current
+    /// request's visible set exactly like [`Engine::list_indices`].
+    ///
+    /// A failed index is deliberately *not* in `indices`, so every handler that
+    /// resolves names through `list_indices` is blind to it. For read paths
+    /// that is correct — there is nothing to read. For two surfaces it is not:
+    ///
+    /// * `DELETE /{index}` — the operator's escape hatch. Resolving it from
+    ///   `list_indices` alone made the name unopenable, uncreatable *and*
+    ///   undeletable over the ES API, the exact state
+    ///   [`Engine::delete_index`]'s own comment says must not happen.
+    /// * cluster health — a failed index is why [`Engine::health`] answers
+    ///   red, so the endpoint clients and dashboards poll has to see it.
+    ///
+    /// The visibility filter is applied here for the same reason it is applied
+    /// in `list_indices`: a scoped credential must not learn that an index it
+    /// cannot see exists, and `delete_index` re-checks the guard anyway.
+    pub fn failed_index_names(&self) -> Vec<String> {
+        self.failed_indices
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|name| crate::index_guard::visible(name))
+            .collect()
+    }
+
     /// Get the stats for a single index.
     pub async fn index_stats(&self, name: &str) -> Result<IndexStats> {
         let idx = self.get_index(name)?;
