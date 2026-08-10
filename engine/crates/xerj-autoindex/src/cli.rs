@@ -78,10 +78,12 @@ pub fn print_help() {
              --api-key <K>        Authorization header (or env XERJ_API_KEY)\n\
              --workers <N>        workers for BOTH phases — content hashing/sniffing and\n\
                                   indexing (default: every core, reduced if the memory\n\
-                                  safe zone cannot pay for that many bulk buffers;\n\
+                                  safe zone cannot pay for that many bulk buffers; a\n\
+                                  value you pass is honoured and only warned about;\n\
                                   valid range 1..=1024)\n\
              --pdf-workers <N>    concurrent PDF parser processes (default min(cores,4); max 4,\n\
-                                  reduced further on a machine with little free memory)\n\
+                                  the default reduced further on a machine with little\n\
+                                  free memory)\n\
              --pdf-timeout-secs <N> per-PDF parser timeout (default 120; max 3600)\n\
              --bulk-mb <N>        bulk cut size in MB (default 8)\n\
              --bulk-timeout-secs <N>\n\

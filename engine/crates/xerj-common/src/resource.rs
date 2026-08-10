@@ -472,19 +472,22 @@ fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
 /// Half of RAM as the ceiling follows the same reasoning meilisearch gives for
 /// its two-thirds indexing budget (`option.rs:1103-1106`) — a machine that is
 /// also serving its owner should not have its page cache evicted by a
-/// background indexer. When `total` is unknown the caller gets
-/// [`FALLBACK_SAFE_ZONE_BYTES`], which is deliberately small: an unknown
-/// machine is not an excuse to take an unknown amount of it.
-pub fn memory_safe_zone_bytes() -> u64 {
-    match total_memory_bytes() {
-        Some(total) => safe_zone(total, available_memory_bytes()),
-        None => FALLBACK_SAFE_ZONE_BYTES,
-    }
+/// background indexer.
+///
+/// `None` means **this machine's RAM is not knowable here** (Windows, FreeBSD,
+/// …: [`total_memory_bytes`] has no probe), and callers must read it as "no
+/// memory-derived limit", never as "a small limit". An earlier revision of this
+/// function returned a 1 GiB fallback instead, and the result was that a
+/// Windows box with 64 GB of RAM was budgeted as a 1 GiB machine — a phantom
+/// budget that no code on that platform enforces. meilisearch keeps the same
+/// shape for the same reason: `total_memory_bytes() -> Option<u64>` is `None`
+/// on an unsupported system (`crates/meilisearch/src/option.rs:1135`) and the
+/// derived per-thread budget stays an `Option` all the way down, where `None`
+/// means unbounded rather than minimal
+/// (`crates/milli/src/update/index_documents/helpers/grenad_helpers.rs:122`).
+pub fn memory_safe_zone_bytes() -> Option<u64> {
+    total_memory_bytes().map(|total| safe_zone(total, available_memory_bytes()))
 }
-
-/// The budget used when the machine's RAM cannot be probed at all: 1 GiB,
-/// small enough to be safe on the smallest machine XERJ is expected to run on.
-pub const FALLBACK_SAFE_ZONE_BYTES: u64 = GIB;
 
 /// Pure safe-zone rule — the tested half of [`memory_safe_zone_bytes`].
 fn safe_zone(total: u64, available: Option<u64>) -> u64 {
@@ -505,7 +508,7 @@ pub fn describe() -> String {
         cores(),
         mib(total_memory_bytes()),
         mib(available_memory_bytes()),
-        memory_safe_zone_bytes() / MIB,
+        mib(memory_safe_zone_bytes()),
     )
 }
 
@@ -643,7 +646,11 @@ mod tests {
         assert!((1..=4096).contains(&cores));
         if let Some(total) = total_memory_bytes() {
             assert!(total >= 256 * MIB, "implausible total RAM: {total}");
-            assert!(memory_safe_zone_bytes() <= total);
+            assert!(memory_safe_zone_bytes().expect("probeable RAM has a safe zone") <= total);
+        } else {
+            // Unknown must stay unknown: a fabricated small budget here is the
+            // Windows PDF-throttling bug this API shape exists to prevent.
+            assert_eq!(memory_safe_zone_bytes(), None);
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {

@@ -2409,7 +2409,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         "pdf_workers": cfg.pdf_workers,
         "bulk_mb": cfg.bulk_mb,
         "cores_available": xerj_common::resource::cores(),
-        "memory_safe_zone_mb": xerj_common::resource::memory_safe_zone_bytes() / (1024 * 1024),
+        // `null` on a platform with no RAM probe — the summary reports what the
+        // run actually knew, never a stand-in number (#240).
+        "memory_safe_zone_mb": xerj_common::resource::memory_safe_zone_bytes()
+            .map(|b| b / (1024 * 1024)),
         // What the server's backpressure did to the offered load. A final
         // limit below `workers` means this run met real congestion and
         // answered it, which is the difference between a slow run and a run
