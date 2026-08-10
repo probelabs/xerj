@@ -164,9 +164,22 @@ pub fn print_help() {
              (A run killed by a signal cannot print one either; a missing\n\
              terminal line after the process is gone means it died, not that it\n\
              finished.)\n\
-             --progress plain emits `xerj-progress phase=… pct=… eta_s=…` lines;\n\
+             --progress plain writes TWO lines per tick, in one write:\n\
+             xerj-bar [######################--] 93.4% | index | 8082/8083 items | eta 7s\n\
+             xerj-progress phase=index basis=bytes pct=93.4 items=8082/8083 eta_s=7.2 …\n\
+             `xerj-bar` is the DISPLAY line — self-contained, meant to be shown\n\
+             to a person verbatim by whatever is relaying the run. It is spaced\n\
+             at most one per 15s, plus one per phase change and never two closer\n\
+             than 2s, so it does not flood a transcript. Short phases therefore\n\
+             draw fewer bars than transitions — read the machine line for those.\n\
+             `xerj-progress` is the MACHINE line and keeps\n\
+             the --progress-interval cadence; parse that one. --progress json\n\
+             stays one object per line and carries the same rendered string in\n\
+             a `bar` field.\n\
              `pct`/`eta_s` are the literal word `unknown` (JSON null) whenever they\n\
-             cannot be computed honestly, never a filler number.\n\
+             cannot be computed honestly, never a filler number — and the drawn\n\
+             bar obeys the same rule: `[????…]` when there is no denominator,\n\
+             and a full bar only at a real 100%.\n\
          \n\
          RESUME POLICY:\n\
              A durable plan supports no-op resume and same-path content replacement.\n\

@@ -49,6 +49,45 @@ cannot push at all: [.github/AI_CONTRIBUTIONS.md](./.github/AI_CONTRIBUTIONS.md)
 - **Git discipline:** non-trivial changes land with full commit bodies (motivation, before/after numbers, root cause, file pointers) — the git history is the project's engineering log; read it before re-deriving decisions.
 - **Review discipline:** before submitting or updating a non-trivial change, run the applicable audit in [docs/CONTRIBUTION_REVIEW.md](./docs/CONTRIBUTION_REVIEW.md). In particular, audit the effective diff and ancestry, preserve existing workflows and recovery paths, test failure atomicity and durable-state transitions, and support user-visible or performance claims with repository-visible evidence.
 
+## Running an index on someone's machine
+
+`xerj autoindex` is the one command that can occupy a person's laptop for
+minutes while your tool output stays invisible to them. The binary is built to
+be driven by you on their behalf, so the loop is fixed:
+
+1. **Estimate.** `xerj autoindex <folder> --dry-run` walks, sniffs and samples
+   everything and indexes nothing. Report its job-size line
+   (`autoindex: 1995 files (518 MB) under /path`) and give a *range*, never a
+   confident single number for a machine you have not measured.
+2. **Ask, if it is big.** Where the binary has the estimate gate, a run whose
+   estimated upper bound exceeds `--max-minutes` stops before writing
+   anything, prints a JSON decision request on stdout and exits `4`; you put
+   its options to your user and answer with `--approve proceed|fast|cancel`
+   (`--yes` aliases `proceed`). Where it does not — check `--help` — *you* are
+   the gate. Either way, say that stopping is safe: the resume journal plus
+   idempotent `_id`s mean an aborted run resumes and never duplicates.
+3. **Relay the bar.** On a pipe (you), each tick writes two lines in one write:
+   `xerj-bar …` is a self-contained display line meant to be shown to a person
+   **verbatim** — a drawn bar, percent, items, rate, ETA and the file it is
+   waiting on — spaced at most one per 15 s, plus one per phase change and
+   never two closer than 2 s, so it will not flood your transcript.
+   `xerj-progress key=value …` is the machine record on the
+   `--progress-interval` cadence (5 s by default); parse that one.
+   `--progress json` keeps one JSON object per line and carries the same
+   rendered string in a `bar` field.
+4. **Close the loop.** Wait for the single `xerj-done ok=… exit=… reason=…
+   wall=…s` line (it is printed in every progress mode except `none`), then
+   tell the user the **real** elapsed time and what landed.
+
+Exit codes: `0` complete · `3` completed-with-junk — **this is success** · `2`
+usage · `1` any error at all (read the `error:` line before acting) · `4`
+needs a decision (gate above; answer with `--approve`, never a retry). Percent,
+ETA and the drawn bar are honest or absent: `unknown` / `[????…]` when there is
+no denominator, and a full bar only at a real 100%. The full contract, with
+verbatim samples and the failure modes, is under "Running an index for a human"
+in [landing/llms.txt](./landing/llms.txt) (published at
+https://xerj.org/llms.txt).
+
 ## Where to look
 
 | You want | Go to |
