@@ -60,7 +60,7 @@ The #1 complaint across all review platforms.
 - Single-node architecture in M1 eliminates all cluster coordination
 - No master election, no shard allocation, no cluster state broadcast
 - Single binary deployment: `./xerj --config config.toml`
-- 103 configuration settings, every one optional (ES has 3,000+)
+- 104 configuration settings, every one optional (ES has 3,000+)
 - No dedicated specialists needed for basic operation
 
 ## Sources

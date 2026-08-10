@@ -7,24 +7,26 @@
 //! ## Design philosophy
 //!
 //! Unlike Elasticsearch's 3000+ configuration knobs, xerj deliberately exposes
-//! **103 settings**, each meaningful and production-tested. Every default
+//! **104 settings**, each meaningful and production-tested. Every default
 //! is chosen so that a fresh deployment with zero configuration changes performs
 //! well for the majority of workloads.
 //!
 //! ## Modules
 //!
-//! - [`config`]  — TOML-based configuration (103 settings)
+//! - [`config`]  — TOML-based configuration (104 settings)
 //! - [`error`]   — Unified error type ([`XerjError`])
 //! - [`types`]   — Core domain types (documents, fields, IDs)
 //! - [`schema`]  — Index schema management and mapping evolution
 //! - [`metrics`] — Prometheus counters, histograms, and gauges
 //! - [`net`]     — Network trust primitives (trusted-proxy CIDR matching)
+//! - [`resource`] — The machine-resource policy: cores, memory budget, thread priority
 
 pub mod config;
 pub mod error;
 pub mod fsio;
 pub mod metrics;
 pub mod net;
+pub mod resource;
 pub mod schema;
 pub mod types;
 

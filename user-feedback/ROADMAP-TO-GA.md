@@ -111,10 +111,10 @@ destructive step (engine/crates/xerj-storage/src/index_store.rs:595-608, 772-778
 **Config sprawl — "3,000+ settings" (01-operational-complexity/learning-curve.md:18-20).** An empty
 or absent config file is valid; every setting has a production default; a typo'd key fails startup
 (`deny_unknown_fields`); schema-present-but-unwired features are rejected loudly at startup
-(config.rs:42-47, 94-108, 198-229). The true count is 103 serde-visible settings — measured by
+(config.rs:42-47, 94-108, 198-229). The true count is 104 serde-visible settings — measured by
 `count_user_facing_settings`, which serialises `Config::default()` and counts leaf keys, not by
 hand. The published "38"/"<50" figures were wrong; they were corrected with blocker 10
-(2026-08-09, #207). 103 vs 3,000+ is ~29x fewer (PROJECTED: 3000/103), told truthfully.
+(2026-08-09, #207). 104 vs 3,000+ is ~29x fewer (PROJECTED: 3000/104), told truthfully.
 
 **Shard sizing expertise (04-scaling-and-shards, cluster-management.md:11).** No up-front shard
 decision exists: ES `number_of_shards` is stored and echoed for wire-compat but never used as a
@@ -432,7 +432,8 @@ feature is experienced as a regression.
 ### 10. Correct the settings-count claim and make the count drift-proof (small) — DONE 2026-08-09 (#207)
 
 > Landed as described: the count test now serialises `Config::default()` and counts leaf
-> keys (`journey_zero_config`), the measured total is **103**, and the 38/56/60/`<50`
+> keys (`journey_zero_config`), the measured total was **103** at the time (104 since
+> rc.14 added `server.allow_insecure_network_bind`), and the 38/56/60/`<50`
 > figures are corrected across config.rs, xerj-common/src/lib.rs, engine/README.md,
 > xerj.default.toml and the feedback responses. Per-sub-config annotations are corrected
 > too (limits 3 → 13, storage 5 → 10, cluster 4 → 5, embedding 4 → 19, merge 5 → 8,
@@ -450,7 +451,7 @@ verifier disputed it to blocking under the repo's honest-claims rules — a publ
 doing it before GA, not waiving it. This roadmap adopts the verifier's position.]
 **Build.** Fix all inconsistent counts; replace the hand-written count test with introspection
 (serialize `Config::default()` to `toml::Value`, count leaf keys) so the number can never drift;
-sweep public docs and the feedback responses for the stale "<50"/"38". 103 vs 3,000+ is still the
+sweep public docs and the feedback responses for the stale "<50"/"38". 104 vs 3,000+ is still the
 winning story, told truthfully. [DONE 2026-08-09, #207 — the measured figure is 103.] Files: engine/crates/xerj-common/src/config.rs, docs, user-feedback
 response sections.
 **If shipped without.** A reviewer counts the TOML keys, finds 2.7x the claimed number, and every

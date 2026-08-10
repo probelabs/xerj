@@ -104,7 +104,7 @@ Based on all user feedback collected:
 5. **Instant write visibility** — no refresh delay
 6. **AI-native** — text + vector + hybrid in one query
 7. **WASM pipelines** — user-defined transforms at ingest speed
-8. **103 settings, not 3,000** — every one optional; works out of the box
+8. **104 settings, not 3,000** — every one optional; works out of the box
 9. **Serverless pricing** — pay per query, not per node
 10. **Zero-downtime everything** — upgrades, scaling, schema changes
 

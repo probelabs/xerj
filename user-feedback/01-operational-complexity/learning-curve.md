@@ -48,7 +48,7 @@ Appears in nearly every negative review across all platforms.
 - Minimal API surface: 10 REST endpoints, not hundreds
 - Native REST API with intuitive JSON (not deeply nested DSL)
 - ES-compat layer on port 9200 for teams already fluent in ES DSL
-- 103 config settings, every one optional, all with sensible defaults
+- 104 config settings, every one optional, all with sensible defaults
 - Single TOML config file (not elasticsearch.yml + jvm.options + log4j2.properties)
 - No shard/replica/JVM concepts to learn for M1
 
