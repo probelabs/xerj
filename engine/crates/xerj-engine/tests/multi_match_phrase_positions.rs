@@ -31,6 +31,7 @@ use tempfile::TempDir;
 use xerj_common::config::Config;
 use xerj_common::types::Schema;
 use xerj_engine::{Engine, Index};
+use xerj_query::ast::QueryNode;
 use xerj_query::parse_request;
 
 fn make_engine(dir: &TempDir) -> Engine {
@@ -357,12 +358,22 @@ async fn phrase_prefix_slop_is_honoured_at_both_entry_points() {
     .await;
 }
 
-/// A negative `slop` is a client error in ES from EVERY builder, so every
-/// entry point must answer alike — a 400 from one spelling and a silently
-/// coerced 0 from the other is the same accept-and-ignore defect wearing a
-/// different hat.
+/// A negative `slop` is a client error in ES from all three *phrase* builders
+/// (`MatchPhraseQueryBuilder` / `MatchPhrasePrefixQueryBuilder:103` /
+/// `MultiMatchQueryBuilder:350`, all "No negative slop allowed"), so all three
+/// must answer alike here — a 400 from one spelling and a silently coerced 0
+/// from the other is the same accept-and-ignore defect wearing a different hat.
+///
+/// SCOPE, stated so the name cannot be read as more than it is: these three
+/// query types are the whole of it. `span_near` also takes a `slop` and is
+/// **not** covered — it keeps `as_u64().unwrap_or(0)`, so `span_near` with
+/// `slop: -1` returns 200 with the value silently 0. That is a pre-existing
+/// gap, recorded at `parse_span_near`, and it is left alone because ES applies
+/// no validation to `span_near.slop` either
+/// (`SpanNearQueryBuilder.java:62`) — rejecting it would break a query ES
+/// answers.
 #[test]
-fn negative_slop_is_rejected_at_every_entry_point() {
+fn negative_slop_is_rejected_at_the_three_phrase_entry_points() {
     for bad in [
         json!({"multi_match": {"query": "merge policy", "fields": ["body"],
                                "type": "phrase", "slop": -1}}),
@@ -375,6 +386,54 @@ fn negative_slop_is_rejected_at_every_entry_point() {
             err.to_string().contains("slop"),
             "error should name the offending parameter, got: {err}"
         );
+    }
+}
+
+/// A float-encoded `slop` (`2.0`) must be honoured as 2, not refused and not
+/// dropped. ES reads slop with `XContentParser.intValue()` under its default
+/// coercing policy, which truncates a float token and narrows a numeric string
+/// (`AbstractXContentParser.java:74`/`:162`/`:177`), so `{"slop": 2.0}` is a
+/// query ES answers with slop 2.
+///
+/// This test exists because an earlier revision of this branch tightened the
+/// parse to `as_i64()` and turned `2.0` into a 400 — a new refusal on a
+/// request `main` answered, which is exactly the wire break this PR declined
+/// to make elsewhere. The two wrong answers are symmetrical: refusing the
+/// value, or silently substituting 0 as `main` did.
+#[test]
+fn float_and_string_encoded_slop_are_coerced_like_es() {
+    for (body, want) in [
+        (json!({"query": "merge policy", "slop": 2.0}), 2u32),
+        (json!({"query": "merge policy", "slop": 2.7}), 2),
+        (json!({"query": "merge policy", "slop": "2"}), 2),
+    ] {
+        let q = json!({"match_phrase": {"body": body.clone()}});
+        let parsed = parse_request(&json!({ "query": q }))
+            .unwrap_or_else(|e| panic!("ES coerces this slop, so it must parse: {body} -> {e}"));
+        match parsed.query {
+            QueryNode::MatchPhrase { slop, .. } => {
+                assert_eq!(slop, want, "expected slop {want} from {body}, got {slop}")
+            }
+            other => panic!("expected a MatchPhrase node, got {other:?}"),
+        }
+    }
+
+    // The same coercion, and the same refusal to ignore, on `max_expansions`:
+    // a float is read, and a value that cannot be read is a 400 rather than
+    // a silent fall back to 50 (which is what `main` did here).
+    let parsed = parse_request(&json!({"query": {"match_phrase_prefix": {
+        "body": {"query": "merge poli", "max_expansions": 7.0}}}}))
+    .expect("float max_expansions is coerced, not refused");
+    match parsed.query {
+        QueryNode::MatchPhrasePrefix { max_expansions, .. } => assert_eq!(max_expansions, 7),
+        other => panic!("expected a MatchPhrasePrefix node, got {other:?}"),
+    }
+    for bad in [
+        json!({"match_phrase_prefix": {"body": {"query": "merge poli", "max_expansions": -1}}}),
+        json!({"match_phrase_prefix": {"body": {"query": "merge poli",
+                                                "max_expansions": "seven"}}}),
+    ] {
+        parse_request(&json!({ "query": bad.clone() })).unwrap_err();
     }
 }
 
