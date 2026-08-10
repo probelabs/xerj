@@ -390,3 +390,302 @@ fn a_backticked_qualifier_inside_a_region_is_refused() {
         "<!-- generated:query-types -->\n`knn (HNSW-served)`\n<!-- /generated:query-types -->";
     documented(doc, "synthetic", "query-types");
 }
+
+// ---------------------------------------------------------------------------
+// Beyond the marked regions: the *examples*.
+//
+// The marked-region checks above only see a list that opted in. That left a
+// hole big enough for the original defect to survive the first fix: while
+// `landing/docs/queries.html` stopped advertising a `semantic_search` card,
+// `landing/docs/playbooks/vector-search.html` went on publishing
+// `{"semantic_search": {"field": …, "text": …}}` as *the* worked example for
+// the flagship AI-native feature, and `landing/docs/migration-from-es.html`
+// went on naming it in the migrator's "what works day one" list. Sent to a
+// live instance, that body answers
+// `unknown query type `semantic_search`` with a 400.
+//
+// So the guard now also reads the prose and the samples, over every published
+// surface rather than the three files that carry markers.
+// ---------------------------------------------------------------------------
+
+/// Every published surface whose text is scanned for capability *claims*
+/// (as opposed to the marked lists): the whole docs site, the agent-facing
+/// text files, and the two repository documents an evaluator reads first.
+fn doc_surfaces() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                let keep = p.extension().is_some_and(|x| x == "html")
+                    || p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("llms") && n.ends_with(".txt"));
+                if keep {
+                    out.push(p);
+                }
+            }
+        }
+    }
+
+    let root = repo_root();
+    let mut files = Vec::new();
+    walk(&root.join("landing"), &mut files);
+    files.push(root.join("engine/README.md"));
+    files.push(root.join("ROADMAP.md"));
+    files.sort();
+    assert!(
+        files.len() > 20,
+        "only {} published surfaces found — this check is reading nothing",
+        files.len()
+    );
+    files
+}
+
+fn known_query_types() -> BTreeSet<String> {
+    xerj_query::parser::SUPPORTED_QUERY_TYPES
+        .iter()
+        .chain(xerj_query::parser::REJECTED_QUERY_TYPES)
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// `true` when the byte at `at` starts a token — i.e. it is not preceded by a
+/// character that would make it part of a longer identifier. Keeps
+/// `xerj_semantic_search` (a real MCP tool) from reading as `semantic_search`
+/// (a query type that has never existed).
+fn at_token_start(text: &str, at: usize) -> bool {
+    text[..at]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+fn token_ends_at(text: &str, end: usize) -> bool {
+    text[end..]
+        .chars()
+        .next()
+        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+fn line_of(text: &str, byte: usize) -> usize {
+    text[..byte].matches('\n').count() + 1
+}
+
+/// Walk `text` from `from`, skipping whitespace, and require it to spell out
+/// `wanted` in order. Returns the byte offset just past the last character, or
+/// `None` the moment the text diverges.
+fn expect_seq(text: &str, from: usize, wanted: &[char]) -> Option<usize> {
+    let mut want = wanted.iter();
+    let mut next = want.next()?;
+    for (off, ch) in text[from..].char_indices() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch != *next {
+            return None;
+        }
+        match want.next() {
+            Some(n) => next = n,
+            None => return Some(from + off + ch.len_utf8()),
+        }
+    }
+    None
+}
+
+/// Query-type names the docs have published that the parser has never
+/// dispatched. `semantic_search` (the real clause is `semantic`) and `boosted`
+/// (the real clause is `boosting`) both shipped on the docs site; a reader who
+/// copied either got a 400.
+///
+/// This is a denylist rather than a general rule because prose is prose: there
+/// is no position in an English sentence that reliably marks a word as a
+/// capability claim. It is kept honest by
+/// [`the_phantom_list_only_holds_names_the_parser_really_lacks`], which retires
+/// an entry the moment the parser grows it.
+const PHANTOM_QUERY_TYPES: &[&str] = &["boosted", "semantic_search"];
+
+/// If XERJ ever implements one of these, the denylist must shrink, not silently
+/// forbid documenting a real feature.
+#[test]
+fn the_phantom_list_only_holds_names_the_parser_really_lacks() {
+    let known = known_query_types();
+    let wrong: Vec<_> = PHANTOM_QUERY_TYPES
+        .iter()
+        .filter(|p| known.contains(**p))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{wrong:?} are now dispatched by the parser — remove them from \
+         PHANTOM_QUERY_TYPES and document them instead of banning them"
+    );
+}
+
+/// No published surface may name a query type that does not exist — not in a
+/// list, not in a sentence, not in a copy-pasteable example.
+#[test]
+fn no_published_surface_names_a_phantom_query_type() {
+    let root = repo_root();
+    let mut hits = Vec::new();
+
+    for file in doc_surfaces() {
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        for phantom in PHANTOM_QUERY_TYPES {
+            for (at, _) in text.match_indices(phantom) {
+                if at_token_start(&text, at) && token_ends_at(&text, at + phantom.len()) {
+                    hits.push(format!(
+                        "{}:{} names `{phantom}`",
+                        file.strip_prefix(&root).unwrap_or(&file).display(),
+                        line_of(&text, at)
+                    ));
+                }
+            }
+        }
+    }
+
+    hits.sort();
+    assert!(
+        hits.is_empty(),
+        "the published docs name query types the parser has never had:\n  {}\n\
+         The real clauses are `semantic` (field + query, k defaults to 10) and \
+         `boosting`. A reader who copies a phantom gets `unknown query type`.",
+        hits.join("\n  ")
+    );
+}
+
+/// Anything in *query position* in a published sample must be a real query
+/// type. A clause sitting directly under a `"query": { … }` object is a query
+/// type by construction — that is the one place in an ES request body where the
+/// key's meaning is unambiguous — so it can be checked without a denylist.
+#[test]
+fn every_query_clause_in_a_published_sample_is_a_real_query_type() {
+    let root = repo_root();
+    let known = known_query_types();
+    let mut bad = Vec::new();
+    let mut checked = 0usize;
+
+    for file in doc_surfaces() {
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        for (at, _) in text.match_indices("\"query\"") {
+            // `"query"` `:` `{` `"<name>"` — anything else (a string value, as
+            // in `match` / `query_string` / `semantic`, or an array) is not a
+            // clause position and is skipped.
+            let Some(from) = expect_seq(&text, at + "\"query\"".len(), &[':', '{', '"']) else {
+                continue;
+            };
+            let Some(len) = text[from..].find('"') else {
+                continue;
+            };
+            let name = &text[from..from + len];
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                continue; // not an ES type name — a doc field, a label, prose
+            }
+            checked += 1;
+            if !known.contains(name) {
+                bad.push(format!(
+                    "{}:{} uses `{name}` in query position",
+                    file.strip_prefix(&root).unwrap_or(&file).display(),
+                    line_of(&text, at)
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked > 20,
+        "only {checked} query clauses found across the docs — this check is reading nothing"
+    );
+    bad.sort();
+    bad.dedup();
+    assert!(
+        bad.is_empty(),
+        "published request samples put a name in query position that \
+         `parse_query` does not dispatch:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// Published *counts* drift exactly like published lists, and were drifting in
+/// three different directions at once: `landing/docs/migration-from-es.html`
+/// said 32 query types, `landing/pricing/index.html` and
+/// `landing/demo/index.html` said 38, and the parser dispatches 50. So a number
+/// a reader is expected to trust now lives in a marked region too.
+///
+/// Unlike the list regions, a file may carry the same count section more than
+/// once (the pricing page prints the figure in a plan bullet and again in the
+/// comparison table); every occurrence is checked.
+const COUNT_DOCS: &[&str] = &[
+    "landing/docs/migration-from-es.html",
+    "landing/pricing/index.html",
+    "landing/demo/index.html",
+];
+
+/// The count sections and where each number comes from.
+fn count_source_of_truth(section: &str) -> usize {
+    match section {
+        "query-type-count" => xerj_query::parser::SUPPORTED_QUERY_TYPES.len(),
+        "rejected-query-type-count" => xerj_query::parser::REJECTED_QUERY_TYPES.len(),
+        "agg-type-count" => xerj_engine::aggs::SUPPORTED_AGG_TYPES.len(),
+        other => panic!("no source of truth wired up for count section `{other}`"),
+    }
+}
+
+const COUNT_SECTIONS: &[&str] = &[
+    "query-type-count",
+    "rejected-query-type-count",
+    "agg-type-count",
+];
+
+#[test]
+fn published_capability_counts_match_the_constants() {
+    let root = repo_root();
+    let mut seen = 0usize;
+
+    for rel in COUNT_DOCS {
+        let doc = std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+
+        for section in COUNT_SECTIONS {
+            let open = format!("<!-- generated:{section} -->");
+            let close = format!("<!-- /generated:{section} -->");
+            for (at, _) in doc.match_indices(&open) {
+                let from = at + open.len();
+                let len = doc[from..].find(&close).unwrap_or_else(|| {
+                    panic!(
+                        "{rel} opens `{open}` at line {} but never closes it",
+                        line_of(&doc, at)
+                    )
+                });
+                let raw = doc[from..from + len].trim();
+                let published: usize = raw.parse().unwrap_or_else(|_| {
+                    panic!(
+                        "{rel} section `{section}` holds `{raw}`, which is not a number. \
+                         The region is machine-checked and may hold only the count."
+                    )
+                });
+                assert_eq!(
+                    published,
+                    count_source_of_truth(section),
+                    "{rel}:{} publishes {published} for `{section}`; the source has {}",
+                    line_of(&doc, at),
+                    count_source_of_truth(section)
+                );
+                seen += 1;
+            }
+        }
+    }
+
+    assert!(
+        seen >= 5,
+        "only {seen} marked counts found across {COUNT_DOCS:?} — a page dropped its \
+         markers and its number is now unchecked"
+    );
+}

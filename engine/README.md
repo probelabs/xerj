@@ -63,8 +63,12 @@ to close — sharded flush thresholds + doc-values borrow refactor).
 
 ## Features
 
-- **100% ES API compatible** — drop-in replacement, existing clients work unchanged
-- **BM25 full-text search** with highlighting, aggregations, and all ES query types
+- **Broad ES 8.x wire compatibility** — point an existing client at port 9200 and
+  most of it just works. Wide, not total: the measured coverage and the gaps are
+  in [demo/playbooks/ES_COMPATIBILITY.md](../demo/playbooks/ES_COMPATIBILITY.md)
+- **BM25 full-text search** with highlighting, aggregations, and every query type
+  in [Query Types Supported](#query-types-supported) below — plus two more that
+  are recognised and deliberately refused with a 400 rather than answered wrongly
 - **Vector search** with HNSW, filtered ANN, and inline embedding
 - **SQL API** — query with SQL syntax
 - **WAL persistence** — crash recovery, data survives restarts
@@ -197,9 +201,18 @@ relationship). Any other query type answers `unknown query type`.
 ## Aggregation Types Supported
 
 Complete and machine-checked the same way, from
-`xerj_engine::aggs::SUPPORTED_AGG_TYPES`. All xerj aggregations are exact —
-`cardinality` is a true distinct count, not an HLL estimate, and `terms`
-`doc_count` is precise.
+`xerj_engine::aggs::SUPPORTED_AGG_TYPES`. No probabilistic sketch sits in the
+metric path — `cardinality` is a true distinct count, not an HLL estimate, and
+`terms` `doc_count` is precise.
+
+The **sampling family is the deliberate exception**, and it is a sample by
+definition: `run_sampler` sorts the matched documents by `_score` and keeps the
+first `shard_size` (default 200), so every sub-aggregation under `sampler` or
+`random_sampler` is computed over that slice rather than the whole match set.
+`diversified_sampler` truncates the same way and additionally caps how many
+documents may share a `field` value (`max_docs_per_value`, default 1).
+`random_sampler` shares the `sampler` implementation and does not read ES's
+`probability`.
 
 <!-- generated:agg-types -->
 Metric — `avg`, `sum`, `min`, `max`, `stats`, `extended_stats`, `value_count`,
