@@ -405,6 +405,10 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         no_semantic: !semantic,
         brain: None,
         no_graph: true,
+        // Gate off: these fixtures assert reconcile behaviour, not a
+        // timing-derived stop. See `gate_tests` and `cli::tests`.
+        max_minutes: 0,
+        approve: None,
         dry_run: false,
         json: false,
         quiet: true,

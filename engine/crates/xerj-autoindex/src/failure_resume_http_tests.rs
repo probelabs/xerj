@@ -522,6 +522,12 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         // incremental non-graph behavior has its own HTTP suite.
         brain: None,
         no_graph: false,
+        // The gate is switched off in these fixtures on purpose: they assert
+        // indexing, resume and edge behaviour, and a timing-derived stop would
+        // make them depend on how loaded the runner was. The gate's own
+        // behaviour is covered in `gate_tests` and `cli::tests`.
+        max_minutes: 0,
+        approve: None,
         dry_run: false,
         json: false,
         quiet: true,
@@ -2674,6 +2680,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &crate::estimate::Meter::new(),
         },
         100,
         1,
@@ -2758,6 +2765,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &crate::estimate::Meter::new(),
         },
         100,
         1,
@@ -2833,6 +2841,7 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &crate::estimate::Meter::new(),
         },
         100,
         1,

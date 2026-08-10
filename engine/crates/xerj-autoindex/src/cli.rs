@@ -1,8 +1,13 @@
 //! Hand-rolled arg parser (house style of xerj-server — no clap).
 
+use crate::gate::{Approval, DEFAULT_MAX_MINUTES};
 use crate::progress::ProgressMode;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Largest `--max-minutes` accepted: one week. Past that the flag is a typo,
+/// and `--max-minutes 0` already exists to mean "never ask".
+pub const MAX_MAX_MINUTES: u64 = 7 * 24 * 60;
 
 /// Largest `--bulk-mb` accepted. Past this a single bulk body stops being a
 /// unit of work and starts being a memory incident on the server.
@@ -38,6 +43,12 @@ pub struct IndexCfg {
     /// Disable edge detection entirely (no `.xerj-memory-*-edges` writes).
     pub no_graph: bool,
     pub dry_run: bool,
+    /// Stop and ask before indexing when phase A's measured estimate exceeds
+    /// this many minutes. `0` disables the gate outright.
+    pub max_minutes: u64,
+    /// An answer to a previous decision request. `None` means "nobody has
+    /// answered yet", which is what arms the gate.
+    pub approve: Option<Approval>,
     pub json: bool,
     pub quiet: bool,
     /// Progress surface. Orthogonal to `json`: `--json` shapes *stdout* (the
@@ -84,7 +95,13 @@ a --no-graph state directory written before the generation format must be rebuil
 --state-dir and --prefix; graph-enabled journals keep the existing crash-resume behaviour";
 
 pub fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+/// The help text as a value, so tests can assert that a documented flag is
+/// still documented instead of trusting a `println!`.
+pub fn help_text() -> String {
+    format!(
         "xerj autoindex — point it at any folder and make the contents AI-searchable, zero config\n\
          \n\
          USAGE:\n\
@@ -121,6 +138,14 @@ pub fn print_help() {
                                   .xerj-memory-<NAME>-edges (default: folder name slug)\n\
              --no-graph           skip relationship detection (wikilinks, local links,\n\
                                   section order, directory chains) — no edges are written\n\
+             --max-minutes <N>    stop and ask before indexing if phase A's MEASURED estimate\n\
+                                  is longer than this (default 10; 0 disables the gate;\n\
+                                  max 10080). See ESTIMATE + DECISION GATE below.\n\
+             --approve <ID>       answer a decision request: proceed | fast | cancel.\n\
+                                  `fast` also applies --no-semantic --no-graph. `narrower`\n\
+                                  is NOT accepted here — it means re-running against a\n\
+                                  subdirectory, which this flag cannot do.\n\
+             --yes, -y            alias for --approve proceed\n\
              --dry-run            walk+sniff+infer, print the plan, index nothing\n\
              --json               machine-readable RESULT on stdout (map: raw catalog docs).\n\
                                   Orthogonal to --progress, which owns stderr.\n\
@@ -199,6 +224,32 @@ pub fn print_help() {
              bar obeys the same rule: `[????…]` when there is no denominator,\n\
              and a full bar only at a real 100%.\n\
          \n\
+         ESTIMATE + DECISION GATE:\n\
+             Phase A already reads and parses every file to sniff and sample it, so it\n\
+             measures throughput per format family ON THIS MACHINE. autoindex turns that\n\
+             into a RANGE (never one confident number) for the indexing phase and prints\n\
+             the basis with it. Families phase A never read end to end are named and left\n\
+             OUT of the arithmetic instead of being priced at some other family's rate;\n\
+             if nothing could be measured, it says so and does not gate.\n\
+             The range covers CLIENT-SIDE EXTRACTION only — server indexing, embedding\n\
+             and network time are not in it, which is why the gate compares the upper end.\n\
+             If that upper end is longer than --max-minutes and no --approve/--yes was\n\
+             given, nothing is indexed: a JSON decision request goes to stdout and the\n\
+             process exits 4 (a code of its own — 1 is the catch-all for real failures).\n\
+             Answer by re-running the same command with --approve proceed|fast|cancel.\n\
+             A person at a terminal is prompted instead; a piped or agent-driven run is\n\
+             never blocked on stdin.\n\
+         \n\
+         WORK ORDER:\n\
+             Phase B drains source and documents first, then configuration, then\n\
+             structured data, then logs and line files, and vendored/generated/minified\n\
+             paths last — so stopping early, or searching while it runs, still gives you\n\
+             the files you cared about. Inside a band the biggest file starts first (with\n\
+             several workers it then runs alongside the rest instead of becoming the\n\
+             tail); a single-worker run goes smallest-first instead. One exception: a file\n\
+             so large that it outlasts everything ranked above it starts first whatever\n\
+             band it is in. The full breakdown is printed with the plan.\n\
+         \n\
          RESUME POLICY:\n\
              {resume_policy_help}.\n\
              On a graph-enabled or pre-generation journal the durable plan supports no-op\n\
@@ -217,12 +268,15 @@ pub fn print_help() {
              Validate before switching readers; explicitly clean the shared\n\
              autoindex-catalog and old target only after validation.\n\
          \n\
-         EXIT CODES: 0 complete; 3 completed-with-junk (junk recorded, never fatal);\n\
+         EXIT CODES: 0 complete (also: gate answered with --approve cancel);\n\
+                     3 completed-with-junk (junk recorded, never fatal);\n\
+                     4 NEEDS A DECISION — the estimate exceeded --max-minutes and\n\
+                       nothing was indexed; a JSON decision request is on stdout;\n\
                      2 usage; 1 endpoint/journal failure, a refused corpus removal, or a\n\
                      refused unsafe state transition\n",
         fresh_help = FRESH_HELP,
         resume_policy_help = RESUME_POLICY_HELP
-    );
+    )
 }
 
 pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
@@ -252,6 +306,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut brain: Option<String> = None;
     let mut no_graph = false;
     let mut dry_run = false;
+    let mut max_minutes = DEFAULT_MAX_MINUTES;
+    let mut max_minutes_explicit = false;
+    let mut approve: Option<Approval> = None;
+    let mut approve_explicit = false;
     let mut json = false;
     let mut quiet = false;
     let mut progress: Option<ProgressMode> = None;
@@ -355,6 +413,53 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 brain = Some(name);
             }
             "--no-graph" => no_graph = true,
+            "--max-minutes" => {
+                max_minutes_explicit = true;
+                max_minutes = it
+                    .next()
+                    .ok_or("--max-minutes needs a number of minutes (0 disables the gate)")?
+                    .parse()
+                    .map_err(|_| {
+                        format!("--max-minutes needs an integer from 0 to {MAX_MAX_MINUTES}")
+                    })?;
+                if max_minutes > MAX_MAX_MINUTES {
+                    return Err(format!(
+                        "--max-minutes must be from 0 to {MAX_MAX_MINUTES} (0 disables the gate)"
+                    ));
+                }
+            }
+            "--approve" => {
+                let raw = it.next().ok_or(
+                    "--approve needs one of: proceed, fast, cancel (narrower means re-running \
+                     against a subdirectory)",
+                )?;
+                let parsed = Approval::parse(&raw)?;
+                // Two different answers in one invocation is not something to
+                // resolve in either side's favour.
+                if let Some(previous) = approve {
+                    if previous != parsed {
+                        return Err(format!(
+                            "--approve {} and --approve {} contradict each other; pass one",
+                            previous.as_str(),
+                            parsed.as_str()
+                        ));
+                    }
+                }
+                approve = Some(parsed);
+                approve_explicit = true;
+            }
+            "--yes" | "-y" => {
+                if let Some(previous) = approve {
+                    if previous != Approval::Proceed {
+                        return Err(format!(
+                            "--yes means --approve proceed and contradicts --approve {}; pass one",
+                            previous.as_str()
+                        ));
+                    }
+                }
+                approve = Some(Approval::Proceed);
+                approve_explicit = true;
+            }
             "--dry-run" => dry_run = true,
             "--json" => json = true,
             "--md" => json = false,
@@ -424,7 +529,29 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         );
     }
 
+    // `--approve fast` is not a hint: it is the answer "index everything, but
+    // without the two expensive features", and the run has to actually apply
+    // them. Accepting the word and indexing semantically anyway is precisely
+    // the accepted-and-silently-ignored class from #204.
+    if approve == Some(Approval::Fast) {
+        no_semantic = true;
+        no_graph = true;
+    }
+    if approve == Some(Approval::Cancel) && dry_run {
+        return Err(
+            "--approve cancel and --dry-run contradict each other: a dry run already indexes \
+             nothing. Drop one of the two"
+                .into(),
+        );
+    }
+
     match (sub.as_deref(), folder) {
+        (Some("map"), _) | (Some("status"), _) if max_minutes_explicit || approve_explicit => {
+            Err(format!(
+                "--max-minutes/--approve/--yes apply only to indexing, not `autoindex {}`",
+                sub.as_deref().unwrap_or_default()
+            ))
+        }
         (Some("map"), _) | (Some("status"), _) if progress_explicit => Err(format!(
             "--progress/--progress-interval apply only to indexing, not `autoindex {}`",
             sub.as_deref().unwrap_or_default()
@@ -472,6 +599,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 brain,
                 no_graph,
                 dry_run,
+                max_minutes,
+                approve,
                 json,
                 quiet,
                 progress,
@@ -484,7 +613,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Cmd, Duration, ProgressMode};
+    use super::{parse, Approval, Cmd, Duration, ProgressMode, DEFAULT_MAX_MINUTES};
 
     fn index(args: &[&str]) -> super::IndexCfg {
         match parse(args.iter().map(|s| s.to_string()).collect()).unwrap() {
@@ -688,6 +817,130 @@ mod tests {
         }
         // --quiet keeps its historical no-op acceptance on map/status.
         assert!(parse(["map", "--quiet"].into_iter().map(str::to_string).collect()).is_ok());
+    }
+
+    /// The owner's threshold, verbatim: "if estimated more than 10min work
+    /// needs to ask AI back what to do".
+    #[test]
+    fn the_gate_defaults_to_ten_minutes_and_to_unanswered() {
+        let cfg = index(&["data"]);
+        assert_eq!(DEFAULT_MAX_MINUTES, 10);
+        assert_eq!(cfg.max_minutes, 10);
+        assert_eq!(cfg.approve, None, "an unanswered run is what arms the gate");
+        assert_eq!(index(&["data", "--max-minutes", "45"]).max_minutes, 45);
+        // 0 is the documented "never ask" value, not a rejected one.
+        assert_eq!(index(&["data", "--max-minutes", "0"]).max_minutes, 0);
+    }
+
+    #[test]
+    fn an_unusable_max_minutes_is_refused_not_clamped() {
+        for args in [
+            vec!["data", "--max-minutes"],
+            vec!["data", "--max-minutes", "soon"],
+            vec!["data", "--max-minutes", "-1"],
+            vec!["data", "--max-minutes", "10081"],
+        ] {
+            let rendered = args.join(" ");
+            let err = parse(args.into_iter().map(str::to_string).collect())
+                .expect_err(&format!("`{rendered}` must be refused"));
+            assert!(err.contains("--max-minutes"), "{err}");
+        }
+        assert_eq!(
+            index(&["data", "--max-minutes", "10080"]).max_minutes,
+            10080
+        );
+    }
+
+    /// `--approve fast` is an instruction, not a label: the run must really
+    /// drop semantic fields and edges. Accepting it and indexing everything
+    /// anyway is the #204 defect class.
+    #[test]
+    fn approve_fast_actually_applies_the_flags_it_names() {
+        let cfg = index(&["data", "--approve", "fast"]);
+        assert_eq!(cfg.approve, Some(Approval::Fast));
+        assert!(cfg.no_semantic, "--approve fast must set --no-semantic");
+        assert!(cfg.no_graph, "--approve fast must set --no-graph");
+        // The other two answers change nothing about what gets indexed.
+        let proceed = index(&["data", "--approve", "proceed"]);
+        assert_eq!(proceed.approve, Some(Approval::Proceed));
+        assert!(!proceed.no_semantic && !proceed.no_graph);
+        assert_eq!(
+            index(&["data", "--approve", "cancel"]).approve,
+            Some(Approval::Cancel)
+        );
+    }
+
+    #[test]
+    fn yes_is_an_alias_for_approve_proceed() {
+        for flag in ["--yes", "-y"] {
+            assert_eq!(index(&["data", flag]).approve, Some(Approval::Proceed));
+        }
+        // Agreeing with yourself twice is fine; disagreeing is not.
+        assert_eq!(
+            index(&["data", "--yes", "--approve", "proceed"]).approve,
+            Some(Approval::Proceed)
+        );
+        assert!(err(&["data", "--approve", "cancel", "--yes"]).contains("--yes"));
+        for contradiction in [
+            vec!["data", "--yes", "--approve", "cancel"],
+            vec!["data", "--approve", "fast", "--approve", "cancel"],
+        ] {
+            assert!(err(&contradiction).contains("contradict each other"));
+        }
+    }
+
+    /// `narrower` is a real option in the decision request and an impossible
+    /// one for this flag: it means running against a different folder.
+    #[test]
+    fn approve_refuses_the_answer_it_cannot_carry_out() {
+        let refused = err(&["data", "--approve", "narrower"]);
+        assert!(refused.contains("subdirectory"), "{refused}");
+        assert!(err(&["data", "--approve", "maybe"]).contains("proceed, fast, cancel"));
+        assert!(err(&["data", "--approve"]).contains("--approve"));
+    }
+
+    #[test]
+    fn cancel_and_dry_run_are_refused_rather_than_silently_merged() {
+        let err = err(&["data", "--approve", "cancel", "--dry-run"]);
+        assert!(err.contains("already indexes nothing"), "{err}");
+        // A dry run may still be told what threshold to report against.
+        assert_eq!(
+            index(&["data", "--dry-run", "--max-minutes", "3"]).max_minutes,
+            3
+        );
+    }
+
+    #[test]
+    fn gate_flags_are_rejected_for_non_index_subcommands() {
+        for args in [
+            vec!["map", "--max-minutes", "5"],
+            vec!["status", "--approve", "proceed"],
+            vec!["--yes", "map"],
+        ] {
+            let err = parse(args.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(err.contains("apply only to indexing"), "{err}");
+        }
+    }
+
+    /// A flag the engine honours but never mentions is only half-shipped, and
+    /// the exit code is the one thing an agent cannot discover by trying.
+    #[test]
+    fn the_help_documents_the_gate_its_exit_code_and_the_work_order() {
+        let help = super::help_text();
+        for expected in [
+            "--max-minutes",
+            "--approve <ID>",
+            "--yes, -y",
+            "0 disables the gate",
+            "ESTIMATE + DECISION GATE:",
+            "exits 4",
+            "4 NEEDS A DECISION",
+            "WORK ORDER:",
+            "vendored/generated/minified",
+            "CLIENT-SIDE EXTRACTION only",
+        ] {
+            assert!(help.contains(expected), "help is missing {expected:?}");
+        }
     }
 
     #[test]

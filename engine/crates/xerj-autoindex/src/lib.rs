@@ -11,12 +11,15 @@ pub mod correlate;
 pub mod dataset;
 pub mod detect;
 pub mod esclient;
+pub mod estimate;
 pub mod extract;
+pub mod gate;
 mod generation_catalog;
 #[cfg(test)]
 mod generation_catalog_http_tests;
 pub mod ids;
 pub mod infer;
+pub mod order;
 pub mod pool;
 pub mod progress;
 mod reconcile_plan;
@@ -171,6 +174,7 @@ fn project_reconcile_plan(
     cfg: &IndexCfg,
     state_dir: &Path,
     pr: &Progress,
+    meter: &estimate::Meter,
 ) -> Result<Plan> {
     let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
     let ctx = PhaseAContext {
@@ -178,6 +182,7 @@ fn project_reconcile_plan(
         budget: &budget,
         capacity_warning: None,
         progress: pr,
+        meter,
     };
     pr.phase(
         "scan",
@@ -663,6 +668,10 @@ struct PhaseAContext<'a> {
     budget: &'a std::sync::Arc<extract::pdf::ExtractionSpoolBudget>,
     capacity_warning: Option<&'a str>,
     progress: &'a Progress,
+    /// Throughput evidence for the pre-index estimate. Phase A already parses
+    /// every file; timing that parse is the only way to price the run on the
+    /// machine it will actually run on rather than on ours.
+    meter: &'a estimate::Meter,
 }
 
 fn scan_file(
@@ -750,15 +759,23 @@ fn scan_file(
             (entry.1 as usize) < sample
         }
     };
+    // Timed span: the extraction itself, nothing around it. The PDF spool's
+    // post-parse `content::verify` re-read is deliberately outside it — phase
+    // B never repeats that read, so charging it here would price a cost the
+    // estimate is trying to predict away.
+    let extraction_started = Instant::now();
+    let extraction_elapsed;
     let extraction = if sn.family == Family::Pdf {
-        match extract::pdf::extract_and_spool(
+        let parsed = extract::pdf::extract_and_spool(
             path,
             state_dir,
             size,
             digest,
             pdf_spool_budget,
             &mut sink,
-        ) {
+        );
+        extraction_elapsed = extraction_started.elapsed();
+        match parsed {
             Ok((stats, spool, fallback)) => {
                 // The inventory digest was computed before Phase A. Only hand
                 // bytes to Phase B when the source still matches that exact
@@ -794,7 +811,9 @@ fn scan_file(
             Err(error) => Err(error),
         }
     } else {
-        extract::extract(path, &sn, limit, &mut sink)
+        let parsed = extract::extract(path, &sn, limit, &mut sink);
+        extraction_elapsed = extraction_started.elapsed();
+        parsed
     };
     match extraction {
         Ok(stats) => {
@@ -815,6 +834,21 @@ fn scan_file(
             }
         }
     }
+    // Throughput evidence, but only where the read was provably complete: the
+    // sampler stops at whichever of the byte cap or the record cap comes
+    // first, and timing a partial read against the full file size would invent
+    // a rate this machine never demonstrated. `exact_scan_bytes` owns that
+    // judgement; a junked file is never timed at all, because phase B will
+    // not process it.
+    if out.junk.is_none() {
+        let sampled = groups.values().map(|(_, records, _)| *records).max();
+        if let Some(bytes) = sampled.and_then(|records| {
+            estimate::exact_scan_bytes(sn.family, sn.gzip, size, records, sample)
+        }) {
+            ctx.meter.record(sn.family, bytes, extraction_elapsed);
+        }
+    }
+
     out.sketches = groups
         .into_iter()
         .map(|(group, (fields, records, key_fields))| GroupSketch {
@@ -841,11 +875,13 @@ mod clustering_key_tests {
         // reuse: a zero budget keeps these cases on the plain parse path.
         let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
         let progress = Progress::silent();
+        let meter = estimate::Meter::new();
         let ctx = PhaseAContext {
             state_dir: dir,
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &meter,
         };
         scan_file(&path, size, "d0", &ctx, 500, 2)
     }
@@ -948,6 +984,12 @@ mod phase_a_grouping_tests {
             no_semantic: false,
             brain: None,
             no_graph: true,
+            // The gate is switched off in these fixtures on purpose: they assert
+            // indexing, resume and edge behaviour, and a timing-derived stop would
+            // make them depend on how loaded the runner was. The gate's own
+            // behaviour is covered in `gate_tests` and `cli::tests`.
+            max_minutes: 0,
+            approve: None,
             dry_run: true,
             json: false,
             quiet: true,
@@ -967,11 +1009,13 @@ mod phase_a_grouping_tests {
         // file on the plain parse path so no artifact is ever retained.
         let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
         let progress = Progress::silent();
+        let meter = estimate::Meter::new();
         let ctx = PhaseAContext {
             state_dir: root,
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &meter,
         };
         build_phase_a(
             root,
@@ -1414,6 +1458,31 @@ fn build_mapping(specs: &[infer::FieldSpec]) -> Value {
 }
 
 // ─── the main run ────────────────────────────────────────────────────────
+
+/// Files phase B still has work for: planned, with a real content key, and
+/// either never finished or finished against different bytes.
+///
+/// This predicate is evaluated twice per run — once to price the work for the
+/// pre-index estimate, once to build the real queue — against two different
+/// snapshots of `journal.done`. The two agree by construction: between the two
+/// calls the only thing that removes a key from `done` is `file_replace_start`,
+/// which is driven from `content_changed`, and for a key in `content_changed`
+/// this predicate ignores `done` altogether. Keeping it in one function is what
+/// makes "the estimate priced what the run then did" true rather than hoped.
+fn pending_for_phase_b(
+    keys: &[String],
+    plan: &Plan,
+    done: &std::collections::HashSet<String>,
+    content_changed: &std::collections::HashSet<String>,
+) -> Vec<usize> {
+    (0..keys.len())
+        .filter(|&i| {
+            !keys[i].is_empty()
+                && plan.files.contains_key(&keys[i])
+                && !(done.contains(&keys[i]) && !content_changed.contains(&keys[i]))
+        })
+        .collect()
+}
 
 fn select_resume_plan_keys(
     files: &[walk::FileEntry],
@@ -2119,6 +2188,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             .unwrap_or_else(|| progress::default_interval(surface)),
     );
     let ticker = pr.spawn_ticker();
+    // One throughput meter for the whole run: both phase-A routes (the legacy
+    // scan and the generated route's `project_reconcile_plan`) feed it, so the
+    // estimate is built from whatever this invocation actually parsed.
+    let scan_meter = estimate::Meter::new();
     // What this run decided to take from the machine, before it takes it.
     pr.note(&format!(
         "autoindex: {} scan threads, {} index workers, {} pdf workers, --bulk-mb {} [{}]",
@@ -2296,7 +2369,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 .committed_manifest
                 .as_ref()
                 .context("branch guard proved a committed manifest")?;
-            let plan = project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr)?;
+            let plan =
+                project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr, &scan_meter)?;
             let unchanged = serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
             // stdout is the RESULT, stderr is PROGRESS: the projection above is
@@ -2338,7 +2412,24 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             .as_ref()
             .context("generated journal lost its committed manifest")?
             .clone();
-        let plan = project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr)?;
+        let plan =
+            project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr, &scan_meter)?;
+        // Say out loud that the decision gate is not on this route. It is an
+        // incremental reconcile of an already-committed generation, so the work
+        // is the *changed* set and is published from a sealed snapshot rather
+        // than through the phase-B queue the estimate prices. Accepting
+        // `--max-minutes` here and quietly not applying it would be the
+        // accepted-and-ignored class from #204 — so the run states the
+        // exemption instead of leaving the caller to discover it.
+        if cfg.max_minutes > 0 && cfg.approve.is_none() {
+            pr.note(&format!(
+                "gate: --max-minutes {} does not apply to an incremental reconcile of committed \
+                 generation {} — only files that changed are processed, and they are published \
+                 from a sealed snapshot rather than through the queue the estimate prices. Use \
+                 --dry-run to see the projected plan before committing to it",
+                cfg.max_minutes, base.generation
+            ));
+        }
         if serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)? {
             if let Some(expected) = &base.execution {
                 let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
@@ -2675,6 +2766,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         budget: &pdf_spool_budget,
         capacity_warning: pdf_spool_capacity_warning.as_deref(),
         progress: &pr,
+        meter: &scan_meter,
     };
     let mut plan: Plan = if let Some(p) = journal.plan.clone().filter(|_| !genesis_recovery) {
         p
@@ -2756,6 +2848,196 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         })
         .map(|junk| junk.file_key.clone())
         .collect();
+
+    // ── estimate → work order → decision gate ────────────────────────────
+    //
+    // Everything below happens BEFORE the first remote mutation: no index has
+    // been created, no mapping upgraded, no plan persisted, no document
+    // written. That placement is the whole point — a run that stops here has
+    // cost the user a read of their folder and nothing else.
+    let pending = pending_for_phase_b(&keys, &plan, &journal.done_keys(), &content_changed);
+    let scan_rates = scan_meter.rates();
+    let planned_for_estimate: Vec<estimate::PlannedFile> = pending
+        .iter()
+        .map(|&i| estimate::PlannedFile {
+            family: plan.files[&keys[i]].family.clone(),
+            bytes: files[i].size,
+        })
+        .collect();
+    let run_estimate = estimate::Estimate::compute(&planned_for_estimate, &scan_rates, cfg.workers);
+    let work_items: Vec<order::Item> = pending
+        .iter()
+        .map(|&i| order::Item {
+            index: i,
+            band: order::band_from_family_str(&files[i].rel, &plan.files[&keys[i]].family),
+            bytes: files[i].size,
+        })
+        .collect();
+    let bands = order::summarize(&work_items);
+    let rel_bytes: Vec<(String, u64)> = pending
+        .iter()
+        .map(|&i| (files[i].rel.clone(), files[i].size))
+        .collect();
+    let rel_family_bytes: Vec<(String, String, u64)> = pending
+        .iter()
+        .map(|&i| {
+            (
+                files[i].rel.clone(),
+                plan.files[&keys[i]].family.clone(),
+                files[i].size,
+            )
+        })
+        .collect();
+    let heaviest = gate::heaviest_directories(&rel_bytes, 5);
+
+    pr.note(&format!("estimate: {}", run_estimate.headline()));
+    pr.note(&format!("estimate: basis — {}", run_estimate.basis));
+    for family in &run_estimate.families {
+        pr.note(&format!(
+            "  estimate: {:<10} {:>5} files {:>9} at {}/s measured over {} file(s) / {} → {}",
+            family.family,
+            family.planned_files,
+            estimate::human_bytes(family.planned_bytes),
+            estimate::human_bytes(family.bytes_per_sec as u64),
+            family.measured_files,
+            estimate::human_bytes(family.measured_bytes),
+            estimate::human_secs(family.seconds_of_work),
+        ));
+    }
+    for family in &run_estimate.unmeasured_families {
+        pr.note(&format!(
+            "  estimate: {:<10} {:>5} files {:>9} NOT priced — {}",
+            family.family,
+            family.planned_files,
+            estimate::human_bytes(family.planned_bytes),
+            family.reason,
+        ));
+    }
+    for exclude in &run_estimate.excludes {
+        pr.note(&format!("  estimate excludes: {exclude}"));
+    }
+    pr.note(&format!(
+        "work order: {} — {} inside each band at {} worker(s); a file that outlasts everything \
+         above it starts first regardless of band",
+        bands
+            .iter()
+            .map(|band| format!(
+                "{} ({} files, {})",
+                band.band,
+                band.files,
+                estimate::human_bytes(band.bytes)
+            ))
+            .collect::<Vec<_>>()
+            .join(" → "),
+        if cfg.workers == 1 {
+            "smallest first"
+        } else {
+            "biggest first"
+        },
+        cfg.workers,
+    ));
+    for band in &bands {
+        pr.note(&format!("  {:<16} {}", band.band, band.why));
+    }
+
+    if gate::over_threshold(&run_estimate, cfg.max_minutes) {
+        let semantic_datasets: Vec<String> = plan
+            .datasets
+            .iter()
+            .filter(|dataset| dataset.semantic_field.is_some())
+            .map(|dataset| dataset.slug.clone())
+            .collect();
+        let request = gate::DecisionRequest {
+            root: root_str.clone(),
+            estimate: &run_estimate,
+            max_minutes: cfg.max_minutes,
+            bands: bands.clone(),
+            heaviest: heaviest.clone(),
+            without_generated: gate::without_generated_directories(
+                &run_estimate,
+                &scan_rates,
+                &heaviest,
+                &rel_family_bytes,
+            ),
+            semantic_datasets,
+            total_datasets: plan.datasets.len(),
+            graph_files: if cfg.no_graph {
+                0
+            } else {
+                pending.len() as u64
+            },
+        };
+        match cfg.approve {
+            Some(answer) => pr.note(&format!(
+                "gate: {} — answered with --approve {}",
+                request.reason(),
+                answer.as_str()
+            )),
+            None if cfg.dry_run => pr.note(&format!(
+                "gate: a real run would STOP here and exit {} — {}",
+                gate::EXIT_NEEDS_DECISION,
+                request.reason()
+            )),
+            None => {
+                for line in request.prose() {
+                    pr.note(&line);
+                }
+                // Ask only where an answer can arrive. A pipe, a CI job or an
+                // agent has no one at the keyboard, and blocking on stdin
+                // there is an invisible deadlock — the failure this gate was
+                // added to prevent, not to introduce.
+                let answer = if gate::can_prompt() {
+                    let stdin = std::io::stdin();
+                    gate::read_answer(&mut stdin.lock(), |line| pr.note(line))
+                } else {
+                    None
+                };
+                match answer {
+                    Some(gate::Approval::Proceed) => pr.note("gate: proceeding"),
+                    Some(gate::Approval::Fast) => {
+                        // Not honourable mid-run: --no-semantic decides the
+                        // mappings this plan was inferred with. Saying so beats
+                        // silently indexing semantically anyway (#204).
+                        pr.note(
+                            "gate: 'fast' changes the inferred mappings, so it cannot be applied \
+                             to a plan that is already frozen. Nothing was indexed — re-run the \
+                             same command with --approve fast",
+                        );
+                        println!("{}", request.to_json());
+                        pr.finish(false, gate::EXIT_NEEDS_DECISION, "needs-decision", &[]);
+                        return Ok((gate::EXIT_NEEDS_DECISION, None));
+                    }
+                    Some(gate::Approval::Cancel) => {
+                        pr.note("gate: cancelled — nothing was indexed");
+                        pr.finish(true, 0, "cancelled", &[]);
+                        return Ok((0, None));
+                    }
+                    None => {
+                        println!("{}", request.to_json());
+                        pr.finish(false, gate::EXIT_NEEDS_DECISION, "needs-decision", &[]);
+                        return Ok((gate::EXIT_NEEDS_DECISION, None));
+                    }
+                }
+            }
+        }
+    } else if cfg.max_minutes > 0 && run_estimate.gate_seconds().is_some() {
+        // Say what the silence means. "Under the threshold" is a statement
+        // about the floor, not a promise about the run, and an agent relaying
+        // it to a person needs the difference.
+        pr.note(&format!(
+            "gate: not triggered — the measured extraction floor {} is under --max-minutes {}. \
+             That is NOT a promise the run finishes in {} minutes: server, network and embedding \
+             time are not measured before indexing starts",
+            run_estimate.range_text(),
+            cfg.max_minutes,
+            cfg.max_minutes
+        ));
+    }
+    if cfg.approve == Some(gate::Approval::Cancel) {
+        pr.note("gate: --approve cancel — nothing was indexed");
+        pr.finish(true, 0, "cancelled", &[]);
+        return Ok((0, None));
+    }
 
     if cfg.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -2902,14 +3184,14 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         .map(|j| j.file_key.as_str())
         .collect();
     let mut new_unplanned: Vec<JunkFile> = Vec::new();
-    let mut todo: Vec<usize> = Vec::new();
+    // The same predicate the estimate above priced — see `pending_for_phase_b`
+    // for why the two snapshots of `journal.done` cannot disagree.
+    let mut todo: Vec<usize> = pending_for_phase_b(&keys, &plan, &done0, &content_changed);
     for i in 0..files.len() {
         if keys[i].is_empty() || done0.contains(&keys[i]) && !content_changed.contains(&keys[i]) {
             continue;
         }
-        if plan.files.contains_key(&keys[i]) {
-            todo.push(i);
-        } else if !planned_junk.contains(keys[i].as_str()) {
+        if !plan.files.contains_key(&keys[i]) && !planned_junk.contains(keys[i].as_str()) {
             // file appeared after the plan was frozen — recorded, not fatal
             new_unplanned.push(JunkFile {
                 file_key: keys[i].clone(),
@@ -3134,9 +3416,28 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         })
     };
 
-    // ascending by size — workers pop() from the tail, so the BIGGEST files
-    // start first and can't serialize the end of the run.
-    todo.sort_by_key(|&i| files[i].size);
+    // Value first, then biggest-first inside each band — `crate::order` owns
+    // the rule and the reasoning, and the bands were already printed with the
+    // estimate above so the order is explained rather than asserted. The queue
+    // is drained with `pop()`, so this is the start order reversed.
+    //
+    // This replaces a plain ascending sort by size. That rule was right about
+    // scheduling (a huge file must not be left to serialise the tail) and
+    // silent about value: a user who stopped early got whatever was largest,
+    // which on a source tree is `node_modules`. `order` keeps the scheduling
+    // property inside each band and adds a critical-path exception so a file
+    // that genuinely dominates the run still starts first.
+    todo = {
+        let items: Vec<order::Item> = todo
+            .iter()
+            .map(|&i| order::Item {
+                index: i,
+                band: order::band_from_family_str(&files[i].rel, &plan.files[&keys[i]].family),
+                bytes: files[i].size,
+            })
+            .collect();
+        order::start_order_as_pop_queue(&items, cfg.workers)
+    };
     let n_todo = todo.len();
     // Percent and ETA are bytes-based, never file-count-based. The queue is
     // biggest-first, so a files-done percent races to ~100% and then sits
