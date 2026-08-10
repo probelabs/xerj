@@ -1142,7 +1142,9 @@ pub async fn create_index(
             // silent on a missing/untranslatable policy — real ILM is
             // equally lenient here: it discovers the policy by name lazily
             // and simply doesn't start managing until one exists.
-            if let Some(policy_name) = ilm_policy_name_from_settings(&body) {
+            if let LifecycleDirective::Attach(policy_name) =
+                ilm_lifecycle_directive_from_settings(&body)
+            {
                 let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
             }
 
@@ -22114,28 +22116,60 @@ pub async fn put_settings(
     // Same lazy, best-effort `index.lifecycle.name` attach as create_index —
     // `PUT {index}/_settings {"index.lifecycle.name": "policy"}` is the
     // other real ILM entry point (attaching to an index that already
-    // exists, not just at creation).
-    if let Some(policy_name) = ilm_policy_name_from_settings(&body) {
-        for idx in &targets {
-            let _ = crate::ism_api::attach_policy(&state, idx, &policy_name).await;
+    // exists, not just at creation) — and, symmetrically, this is also
+    // where a real client detaches: `{"index.lifecycle.name": null}`.
+    match ilm_lifecycle_directive_from_settings(&body) {
+        LifecycleDirective::Attach(policy_name) => {
+            for idx in &targets {
+                let _ = crate::ism_api::attach_policy(&state, idx, &policy_name).await;
+            }
         }
+        LifecycleDirective::Detach => {
+            for idx in &targets {
+                crate::ism_api::detach_ilm_policy(&state, idx);
+            }
+        }
+        LifecycleDirective::Absent => {}
     }
 
     Json(json!({ "acknowledged": true })).into_response()
 }
 
-/// Extract `index.lifecycle.name` from an index-settings body, accepting
-/// both the nested (`{"index":{"lifecycle":{"name":"..."}}}`,
+/// What a settings body says about `index.lifecycle.name`. A bare
+/// `Option<String>` cannot tell "the key was not mentioned" apart from
+/// "the key was explicitly set to `null`" — and those mean opposite things:
+/// the first is "leave lifecycle management alone", the second is "stop
+/// managing this index" (real ES's documented detach idiom). Collapsing
+/// them into one `None` is exactly the bug found in #262 (closed as
+/// superseded by this engine, but its finding stood): a client's
+/// `PUT {index}/_settings {"index.lifecycle.name": null}` got back
+/// `{"acknowledged": true}` while the index stayed attached and was later
+/// deleted by its policy anyway — confirmed live against this engine before
+/// this fix, `GET` on the "detached" index returned 404 after the next
+/// lifecycle tick.
+enum LifecycleDirective {
+    Absent,
+    Detach,
+    Attach(String),
+}
+
+/// Extract the `index.lifecycle.name` directive from an index-settings body,
+/// accepting both the nested (`{"index":{"lifecycle":{"name":"..."}}}`,
 /// `{"settings":{...}}`-wrapped at create time) and flat dotted-key
 /// (`{"index.lifecycle.name":"..."}`) forms ES accepts for every index
-/// setting.
-fn ilm_policy_name_from_settings(body: &Value) -> Option<String> {
+/// setting. A non-string, non-null value (malformed input) is treated as
+/// absent rather than erroring — matches the pre-existing leniency this
+/// function already had for every other shape it didn't recognize.
+fn ilm_lifecycle_directive_from_settings(body: &Value) -> LifecycleDirective {
     let settings = body.get("settings").unwrap_or(body);
-    settings
+    let raw = settings
         .pointer("/index/lifecycle/name")
-        .or_else(|| settings.get("index.lifecycle.name"))
-        .and_then(Value::as_str)
-        .map(String::from)
+        .or_else(|| settings.get("index.lifecycle.name"));
+    match raw {
+        Some(Value::String(s)) => LifecycleDirective::Attach(s.clone()),
+        Some(Value::Null) => LifecycleDirective::Detach,
+        _ => LifecycleDirective::Absent,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -24221,6 +24255,25 @@ pub async fn ilm_explain(
         }
     }
     Json(json!({ "indices": Value::Object(indices) })).into_response()
+}
+
+/// `POST {index}/_ilm/remove` — real ES's dedicated detach verb, sharing
+/// the same removal path the `index.lifecycle.name: null` settings
+/// directive uses (`ism_api::detach_ilm_policy`). Validates the index
+/// exists first (404 otherwise) rather than silently acknowledging a call
+/// against a name that was never real — the same accept-and-ignore shape
+/// #262 found and fixed on this exact endpoint in its own (closed,
+/// superseded) implementation.
+pub async fn ilm_remove(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+) -> impl IntoResponse {
+    if state.engine.get_index(&index).is_err() {
+        let e = xerj_common::XerjError::index_not_found(&index);
+        return ApiError::new(e).into_response();
+    }
+    crate::ism_api::detach_ilm_policy(&state, &index);
+    Json(json!({ "has_failures": false, "failed_indexes": [] })).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

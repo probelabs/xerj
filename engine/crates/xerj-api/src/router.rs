@@ -483,6 +483,7 @@ pub fn build_es_compat_router(state: AppState) -> Router {
                 .delete(es_compat::delete_ilm_policy),
         )
         .route("/:index/_ilm/explain", get(es_compat::ilm_explain))
+        .route("/:index/_ilm/remove", post(es_compat::ilm_remove))
         // ── ISM (OpenSearch Index State Management) ─────────────────────────
         // Same execution engine as ILM above — see `xerj_engine::lifecycle`.
         .route(
