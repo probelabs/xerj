@@ -23,6 +23,33 @@ use xerj_fts::bm25::Bm25Scorer;
 pub struct MemtableHit {
     pub doc_id: String,
     pub score: f32,
+    /// WAL `seq_no` of the buffered document (`u64::MAX` when it can't be
+    /// resolved).  #191 — the memtable's bounded FTS materialisation has to
+    /// truncate under the SAME total order the final page sort uses
+    /// (`score DESC, seq_no ASC, _id ASC`); score alone leaves the survivors
+    /// of a tie decided by shard-walk order, which is not arrival order.
+    pub seq_no: u64,
+}
+
+/// Order `hits` by the page key XERJ's final sort uses: `score DESC`, then
+/// `seq_no ASC` (arrival order — the `_doc` analogue), then `_id ASC`
+/// (`index.rs:16222-16228`).
+///
+/// #191 — any bounded materialisation must truncate under the SAME total order
+/// the page is finally sorted by, otherwise the documents that survive a tie
+/// are decided by whatever order the walk happened to visit them in.  Lucene
+/// makes the same comparator total for the same reason
+/// (`HitQueue.lessThan` breaks an equal score by the smaller doc id,
+/// `lucene/core/src/java/org/apache/lucene/search/HitQueue.java:76-82`);
+/// approach only, no code taken.
+fn sort_hits_by_page_key(hits: &mut [MemtableHit]) {
+    hits.sort_unstable_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.seq_no.cmp(&b.seq_no))
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
 }
 
 #[cfg(test)]
@@ -829,17 +856,49 @@ impl ShardedFtsMemtable {
     /// on every request — ~1 s per query at a 300 k-doc memtable under
     /// sustained bulk load (the `mem_admit` phase of the read-under-write
     /// breakdown).
+    /// #191 — reduce per-shard bounded candidates to the globally best `limit`
+    /// under the order the final page sort uses.
+    ///
+    /// Every hit these paths produce carries the SAME score (`1.0` for the
+    /// id-only and doc-values collectors; a top-level `constant_score` rewrites
+    /// them all to the wrapper's boost), so the page order reduces to
+    /// `(seq_no ASC, _id ASC)` — the tail of `(score DESC, seq_no ASC, _id ASC)`
+    /// at `index.rs:16222-16228`.
+    ///
+    /// Returns the surviving cap-th `seq_no` as the next shard's cutoff, so the
+    /// walk can stop cloning ids that can no longer reach the page.
+    fn narrow_to_page<T>(cands: &mut Vec<(u64, String, T)>, limit: usize) -> u64 {
+        if cands.len() <= limit {
+            return u64::MAX;
+        }
+        cands.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        cands.truncate(limit);
+        cands.last().map_or(u64::MAX, |c| c.0)
+    }
+
     pub fn doc_ids_bounded(&self, limit: usize) -> (Vec<String>, u64) {
-        let mut out: Vec<String> = Vec::with_capacity(limit.min(4096));
+        // #191 — this used to fill greedily from shard 0 (`limit - out.len()`
+        // of room for each later shard), so an index whose memtable held more
+        // than `limit` documents returned "shard 0's first `limit` ids", not
+        // "the `limit` earliest-arriving ids".  Shard assignment is by doc-id
+        // hash (and by BATCH for bulk), so that set is neither arrival order
+        // nor stable, and `size:5` stopped being a prefix of `size:1000` on an
+        // all-tied corpus.  Bound each shard independently and keep the global
+        // best `limit` by `(seq_no, _id)` instead.
+        let mut cands: Vec<(u64, String, ())> = Vec::with_capacity(limit.min(4096));
         let mut total: u64 = 0;
+        let mut cutoff = u64::MAX;
         for s in &self.shards {
             let g = s.read();
             total += g.doc_count() as u64;
-            if out.len() < limit {
-                out.extend(g.doc_ids_up_to(limit - out.len()));
-            }
+            cands.extend(
+                g.ranked_ids_up_to(limit, cutoff)
+                    .into_iter()
+                    .map(|(q, id)| (q, id, ())),
+            );
+            cutoff = Self::narrow_to_page(&mut cands, limit);
         }
-        (out, total)
+        (cands.into_iter().map(|(_, id, ())| id).collect(), total)
     }
 
     /// Return every (doc_id, source) pair.  Aggregates across all
@@ -859,6 +918,22 @@ impl ShardedFtsMemtable {
         let mut out = Vec::new();
         for s in &self.shards {
             out.extend(s.read().all_docs_with_sources_arc());
+        }
+        out
+    }
+
+    /// `(seq_no, doc_id, source_arc)` for every buffered document.
+    ///
+    /// #191 — the brute per-doc scan's bounded collector has to decide whether
+    /// a document it reaches AFTER filling the cap still belongs on the page.
+    /// Shards are concatenated in index order, which is not arrival order, so
+    /// that decision needs the document's arrival `seq_no`.  Carrying it in the
+    /// snapshot costs 8 bytes per entry and saves a `VersionMap` hash lookup
+    /// per match on the hottest memtable read path.
+    pub fn all_docs_with_seq_arc(&self) -> Vec<(u64, String, Arc<Value>)> {
+        let mut out = Vec::new();
+        for s in &self.shards {
+            out.extend(s.read().all_docs_with_seq_arc());
         }
         out
     }
@@ -1294,11 +1369,12 @@ impl ShardedFtsMemtable {
                 field_boosts,
             ));
         }
-        all.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // #191 — the cross-shard merge sorts by the FULL page key, not by score
+        // alone.  Score alone leaves ties in shard-concatenation order, so
+        // `truncate(limit)` kept "the tied documents that happen to live in the
+        // lowest-numbered shards" rather than the earliest-arriving ones, and a
+        // `size:5` page stopped being a prefix of a `size:1000` one.
+        sort_hits_by_page_key(&mut all);
         // A doc_id lives in exactly ONE shard, so `all` has no duplicates:
         // its pre-truncation length IS the exact global match count when
         // `shard_limit == usize::MAX` (a lower bound otherwise).
@@ -1482,19 +1558,28 @@ impl ShardedFtsMemtable {
         if preds.is_empty() {
             return None;
         }
-        let mut out: Vec<(String, usize)> = Vec::new();
+        // #191 — bound each shard independently and keep the global best
+        // `limit` by `(seq_no, _id)`; `limit - out.len()` starved every shard
+        // after the first, so the page was "shard 0's first `limit` matches".
+        let mut cands: Vec<(u64, String, usize)> = Vec::new();
         let mut total: u64 = 0;
         for s in &self.shards {
             let g = s.read();
             if g.doc_count() == 0 {
                 continue;
             }
-            let room = limit.saturating_sub(out.len());
-            let (mut hits, t) = g.doc_values_bool_hits(preds, room)?;
-            out.append(&mut hits);
+            let (hits, t) = g.doc_values_bool_hits(preds, limit)?;
+            cands.extend(
+                hits.into_iter()
+                    .map(|(id, pos)| (g.seq_no_at(pos), id, pos)),
+            );
             total += t;
+            Self::narrow_to_page(&mut cands, limit);
         }
-        Some((out, total))
+        Some((
+            cands.into_iter().map(|(_, id, pos)| (id, pos)).collect(),
+            total,
+        ))
     }
 
     /// Columnar per-value counts for one field across all shards, for the
@@ -1597,23 +1682,30 @@ impl ShardedFtsMemtable {
         value: &str,
         limit: usize,
     ) -> Option<(Vec<(String, usize)>, u64)> {
-        let mut out: Vec<(String, usize)> = Vec::new();
+        let mut cands: Vec<(u64, String, usize)> = Vec::new();
         let mut total: u64 = 0;
         let mut any_hit = false;
         for s in &self.shards {
             let g = s.read();
-            // Step 1: bound the id clone to the remaining global window;
-            // the total is still exact per shard.  Mirrors
-            // `doc_values_bool_query`.
-            let room = limit.saturating_sub(out.len());
-            if let Some((mut hits, t)) = g.doc_values_term_query(field, value, room) {
+            // Step 1: bound the id clone per shard; the total is still exact
+            // per shard.  Mirrors `doc_values_bool_query`.  #191 — the bound
+            // used to be the REMAINING global window, which handed the whole
+            // page to shard 0.
+            if let Some((hits, t)) = g.doc_values_term_query(field, value, limit) {
                 any_hit = true;
-                out.append(&mut hits);
+                cands.extend(
+                    hits.into_iter()
+                        .map(|(id, pos)| (g.seq_no_at(pos), id, pos)),
+                );
                 total += t;
+                Self::narrow_to_page(&mut cands, limit);
             }
         }
         if any_hit {
-            Some((out, total))
+            Some((
+                cands.into_iter().map(|(_, id, pos)| (id, pos)).collect(),
+                total,
+            ))
         } else {
             None
         }
@@ -1625,20 +1717,28 @@ impl ShardedFtsMemtable {
         values: &[String],
         limit: usize,
     ) -> Option<(Vec<(String, usize)>, u64)> {
-        let mut out: Vec<(String, usize)> = Vec::new();
+        // #191 — per-shard bound + global `(seq_no, _id)` narrowing, as in
+        // `doc_values_term_query`.
+        let mut cands: Vec<(u64, String, usize)> = Vec::new();
         let mut total: u64 = 0;
         let mut any_hit = false;
         for s in &self.shards {
             let g = s.read();
-            let room = limit.saturating_sub(out.len());
-            if let Some((mut hits, t)) = g.doc_values_terms_query(field, values, room) {
+            if let Some((hits, t)) = g.doc_values_terms_query(field, values, limit) {
                 any_hit = true;
-                out.append(&mut hits);
+                cands.extend(
+                    hits.into_iter()
+                        .map(|(id, pos)| (g.seq_no_at(pos), id, pos)),
+                );
                 total += t;
+                Self::narrow_to_page(&mut cands, limit);
             }
         }
         if any_hit {
-            Some((out, total))
+            Some((
+                cands.into_iter().map(|(_, id, pos)| (id, pos)).collect(),
+                total,
+            ))
         } else {
             None
         }
@@ -1709,20 +1809,28 @@ impl ShardedFtsMemtable {
         lt: Option<f64>,
         limit: usize,
     ) -> Option<(Vec<(String, usize)>, u64)> {
-        let mut out: Vec<(String, usize)> = Vec::new();
+        // #191 — per-shard bound + global `(seq_no, _id)` narrowing, as in
+        // `doc_values_term_query`.
+        let mut cands: Vec<(u64, String, usize)> = Vec::new();
         let mut total: u64 = 0;
         let mut any_hit = false;
         for s in &self.shards {
             let g = s.read();
-            let room = limit.saturating_sub(out.len());
-            if let Some((mut hits, t)) = g.doc_values_range_query(field, gte, gt, lte, lt, room) {
+            if let Some((hits, t)) = g.doc_values_range_query(field, gte, gt, lte, lt, limit) {
                 any_hit = true;
-                out.append(&mut hits);
+                cands.extend(
+                    hits.into_iter()
+                        .map(|(id, pos)| (g.seq_no_at(pos), id, pos)),
+                );
                 total += t;
+                Self::narrow_to_page(&mut cands, limit);
             }
         }
         if any_hit {
-            Some((out, total))
+            Some((
+                cands.into_iter().map(|(_, id, pos)| (id, pos)).collect(),
+                total,
+            ))
         } else {
             None
         }
@@ -2623,18 +2731,27 @@ impl FtsMemtable {
 
         let mut hits: Vec<MemtableHit> = scores
             .into_iter()
-            .map(|(doc_id, score)| MemtableHit {
-                doc_id: doc_id.to_string(),
-                score,
+            .map(|(doc_id, score)| {
+                // #191 — carry the arrival order with the hit.  `scores` is a
+                // HashMap, so without it the pre-truncation order of an
+                // all-tied hit set is the hash iteration order: the surviving
+                // documents changed from run to run.
+                let seq_no = self
+                    .doc_id_index
+                    .get(&doc_id)
+                    .map_or(u64::MAX, |&pos| self.seq_no_at(pos));
+                MemtableHit {
+                    doc_id: doc_id.to_string(),
+                    score,
+                    seq_no,
+                }
             })
             .collect();
 
-        // Sort by score descending.
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Sort by the FULL page key (score DESC, seq_no ASC, `_id` ASC) — the
+        // comparator `index.rs:16222-16228` applies to the final page — so a
+        // truncation at `limit` keeps exactly the documents that page would.
+        sort_hits_by_page_key(&mut hits);
         hits.truncate(limit);
         hits
     }
@@ -2662,6 +2779,37 @@ impl FtsMemtable {
     /// `ShardedFtsMemtable::doc_ids_bounded`.
     pub fn doc_ids_up_to(&self, n: usize) -> Vec<String> {
         self.docs.iter().take(n).map(|e| e.doc_id.clone()).collect()
+    }
+
+    /// The WAL `seq_no` of the document at shard-local position `pos`
+    /// (`u64::MAX` when the position is out of range).
+    ///
+    /// #191 — the bounded memtable paths must rank candidates ACROSS shards
+    /// by the same key the final page sort uses, and `seq_no` is that key's
+    /// tie-break.  Positions are only comparable within a shard; `seq_no` is
+    /// global.
+    pub fn seq_no_at(&self, pos: usize) -> u64 {
+        self.docs.get(pos).map_or(u64::MAX, |e| e.seq_no)
+    }
+
+    /// `(seq_no, doc_id)` for the first `n` buffered documents, stopping early
+    /// once an entry's `seq_no` exceeds `cutoff`.
+    ///
+    /// #191 — `docs` is append-ordered and `remove` preserves that order, so a
+    /// shard's entries ascend by `seq_no`: once one entry is past the caller's
+    /// running cap-th key, so is every entry after it, and neither needs its
+    /// `doc_id` cloned.  That early break is what keeps the per-shard bound
+    /// (which replaced a greedy "fill from shard 0" walk) from multiplying the
+    /// id clones by the shard count.
+    pub fn ranked_ids_up_to(&self, n: usize, cutoff: u64) -> Vec<(u64, String)> {
+        let mut out = Vec::new();
+        for e in self.docs.iter().take(n) {
+            if e.seq_no > cutoff {
+                break;
+            }
+            out.push((e.seq_no, e.doc_id.clone()));
+        }
+        out
     }
 
     /// Resolve a MemEntry's source Value — if `source` is Null but
@@ -2706,6 +2854,14 @@ impl FtsMemtable {
         self.docs
             .iter()
             .map(|e| (e.doc_id.clone(), Self::resolve_source_arc(e)))
+            .collect()
+    }
+
+    /// `seq_no`-carrying twin of [`Self::all_docs_with_sources_arc`] (#191).
+    pub fn all_docs_with_seq_arc(&self) -> Vec<(u64, String, Arc<Value>)> {
+        self.docs
+            .iter()
+            .map(|e| (e.seq_no, e.doc_id.clone(), Self::resolve_source_arc(e)))
             .collect()
     }
 
