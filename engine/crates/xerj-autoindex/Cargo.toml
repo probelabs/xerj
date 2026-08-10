@@ -16,6 +16,11 @@ serde_json.workspace = true
 chrono.workspace = true
 regex = "1"
 walkdir = "2"
+# gitignore/.xerjignore matching (#276). ripgrep's matcher, used for its
+# semantics only — traversal stays on walkdir so the existing symlink,
+# hidden-file and unreadable-entry behaviour is unchanged.
+# Licence: Unlicense OR MIT — compatible with XERJ's Apache-2.0.
+ignore = "0.4"
 encoding_rs = "0.8"
 xxhash-rust.workspace = true
 memchr.workspace = true
