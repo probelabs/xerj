@@ -738,3 +738,83 @@ async fn a_backing_index_that_cannot_be_deleted_aborts_the_delete() {
         "the retry did not record the removal: {state}"
     );
 }
+
+/// A DELETE that fails part-way still destroys every backing index it can —
+/// and the release note says so, so pin it.
+///
+/// The loop deliberately does not stop at the first error: the caller asked
+/// for the whole stream to go, so a generation that *can* be destroyed is
+/// destroyed and only the ones that could not are left. The 500 therefore
+/// means "did not finish", never "nothing happened", and this test exists so
+/// that sentence cannot quietly stop being true — a `break` added to that
+/// loop would leave `-000002` and `-000003` on disk and fail here.
+///
+/// Unix-only, and skipped when the process can write through a `chmod 555`
+/// (i.e. running as root), where the failure cannot be injected this way.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partly_failed_delete_still_removes_what_it_could() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_over(dir.path());
+    let (st, body) = put_json(&app, "/_data_stream/audit", json!({})).await;
+    assert_eq!(st, StatusCode::OK, "PUT _data_stream: {body}");
+    for _ in 0..2 {
+        let (st, body) = post(&app, "/audit/_rollover", json!({})).await;
+        assert_eq!(st, StatusCode::OK, "rollover: {body}");
+    }
+
+    let first = dir.path().join(".ds-audit-000001");
+    let second = dir.path().join(".ds-audit-000002");
+    let third = dir.path().join(".ds-audit-000003");
+    for p in [&first, &second, &third] {
+        assert!(p.is_dir(), "fixture is wrong: {} missing", p.display());
+    }
+
+    // Only the FIRST generation is un-unlinkable. It is also the first one
+    // the loop reaches, so a loop that stopped on error would leave the other
+    // two behind.
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+    if std::fs::File::create(first.join("root-probe")).is_ok() {
+        let _ = std::fs::remove_file(first.join("root-probe"));
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        eprintln!("skipped: permissions do not deny this process (running as root?)");
+        return;
+    }
+
+    let (st, body) = delete(&app, "/_data_stream/audit").await;
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    assert_eq!(
+        st,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a delete that could not destroy every backing index must report it: {body}"
+    );
+
+    assert!(
+        first.exists(),
+        "the generation that could not be deleted must still be there"
+    );
+    assert!(
+        !second.exists() && !third.exists(),
+        "the delete stopped at the first failure — the generations it could \
+         have destroyed are still on disk, which contradicts the release note"
+    );
+
+    // The stream is still addressable and still recorded, so the retry has
+    // something to finish.
+    let (st, body) = get(&app, "/_data_stream/audit").await;
+    assert_eq!(st, StatusCode::OK, "stream must stay addressable: {body}");
+    let state: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("cluster_state.json")).expect("read"),
+    )
+    .expect("parse");
+    assert!(
+        !state["data_streams"]["audit"].is_null(),
+        "the removal must not have been recorded while a backing index remains: {state}"
+    );
+
+    let (st, body) = delete(&app, "/_data_stream/audit").await;
+    assert_eq!(st, StatusCode::OK, "retry after the cause is fixed: {body}");
+    assert!(!first.exists(), "the retry left the backing index on disk");
+}

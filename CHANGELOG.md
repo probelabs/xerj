@@ -496,17 +496,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the removal is recorded only once every backing index is gone, and a
     backing index that cannot be deleted now aborts the DELETE with a 500
     (it was previously swallowed and answered `acknowledged`) so the operator
-    can retry.
+    can retry. Read that 500 as "did not finish", not as "nothing happened":
+    a multi-generation stream still loses every backing index that *could* be
+    destroyed, the stream itself stays addressable, and the retry after the
+    cause is fixed completes the delete.
 
   **Known gaps, deliberately not closed here.** `.ds-*` indices that no data
   stream claims — left by a data dir written before this change, or by a
   DELETE interrupted by an older build — are **not** cleaned up or adopted
   automatically; boot now names them in a warning and the recovery is
   `DELETE /<backing-index>` per index, because an orphan may hold the only copy
-  of real data. And `aliases.json` still has the read-error shape that was
+  of real data. And `aliases.json` still has both swallow shapes that were
   fixed here for `cluster_state.json`: an unreadable aliases file is swallowed
-  at boot and overwritten by the next alias write. That is pre-existing
-  behaviour, not introduced here, and is tracked separately.
+  at boot and overwritten by the next alias write, and a *failed* alias write
+  is only logged, so an alias can survive on disk after the stream it named was
+  deleted with a 200. Both are pre-existing behaviour, not introduced here or
+  made worse here, and are tracked separately.
 
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**
   ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the

@@ -2944,12 +2944,19 @@ impl Engine {
         //   fixes for an interrupted rollover, so it is not the ordering to
         //   ship.
         //
-        // A backing index that cannot be destroyed therefore aborts the
-        // delete: the stream is put back and the caller gets the error, so
-        // the operator can retry rather than be told `acknowledged` about
-        // data that is still on disk. A retry is safe — an already-deleted
-        // backing index is simply absent from `self.indices` on the next
-        // pass.
+        // A backing index that cannot be destroyed therefore fails the
+        // delete: the stream is put back, the removal is never recorded, and
+        // the caller gets the error rather than being told `acknowledged`
+        // about data that is still on disk.
+        //
+        // Note what "fails" does *not* mean. The loop does not stop at the
+        // first error — every backing index that can be destroyed is
+        // destroyed, and only the ones that could not are still there. The
+        // 500 says the delete did not finish, not that nothing happened; the
+        // caller asked for the whole stream to go, so making the progress we
+        // can is the useful half. A retry is safe and completes the job — an
+        // already-deleted backing index is simply absent from `self.indices`
+        // on the next pass.
         let mut delete_err: Option<EngineError> = None;
         for backing in &ds.backing_indices {
             let Some((_, idx)) = self.indices.remove(backing) else {
