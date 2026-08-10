@@ -1119,11 +1119,20 @@ fn deleted_path_bytes_remain_while_its_documents_remain_live() {
     assert_eq!(endpoint.state.lock().unwrap().docs.len(), 4);
 
     fs::remove_file(&removed).unwrap();
-    // Current autoindex semantics do not reconcile a missing canonical path:
-    // its indexed documents and FileDone remain live. Dataset bytes must
-    // describe that durable live index rather than silently pretend deletion.
+    // Autoindex still does not reconcile a missing canonical path: its indexed
+    // documents and FileDone stay live, so dataset bytes must keep describing
+    // that durable live index rather than silently pretend deletion (#249).
+    // What changed is the exit: the rerun that used to return 0 while leaving
+    // those documents stranded now refuses before any remote mutation. Run
+    // twice — a refusal is a stop, not a state change, so the second attempt
+    // must see exactly what the first one saw.
     for _ in 0..2 {
-        assert_eq!(run_index(config.clone()).unwrap(), 0);
+        assert_unsupported_delta_without_remote_mutation(
+            &endpoint,
+            config.clone(),
+            &[],
+            &["removed.csv"],
+        );
         assert_eq!(endpoint.state.lock().unwrap().docs.len(), 4);
         assert_eq!(
             dataset_catalog_docs(&endpoint)[0]["bytes"],

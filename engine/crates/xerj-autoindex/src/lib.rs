@@ -2074,25 +2074,28 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             });
         }
     }
-    if !new_unplanned.is_empty() && !cfg.quiet {
+    if !new_unplanned.is_empty() {
         // The frozen plan cannot absorb files discovered after it was written.
         // Say so on stderr rather than leaving it to the catalog: a rerun that
         // quietly ignores new files is the bug this gate exists to surface.
-        eprintln!(
+        // Routed through the progress surface, which owns stderr (#241): a raw
+        // eprintln! here would break `--progress json`'s single parseable
+        // stream, and `--quiet` already selects `--progress none`.
+        pr.note(&format!(
             "autoindex: {} file(s) appeared after the resume plan was frozen and were NOT \
              indexed:",
             new_unplanned.len()
-        );
+        ));
         for jf in new_unplanned.iter().take(REFUSAL_LIST_CAP) {
-            eprintln!("  not in plan, skipped: {}", jf.rel);
+            pr.note(&format!("  not in plan, skipped: {}", jf.rel));
         }
         let remaining = new_unplanned.len().saturating_sub(REFUSAL_LIST_CAP);
         if remaining > 0 {
-            eprintln!("  … and {remaining} more");
+            pr.note(&format!("  … and {remaining} more"));
         }
-        eprintln!(
+        pr.note(
             "autoindex: re-run with --fresh to rebuild the plan in place and index them (ids \
-             stay idempotent)"
+             stay idempotent)",
         );
     }
     if resumed_with_plan {
