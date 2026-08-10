@@ -157,6 +157,7 @@
     <li><strong>binary</strong> — 1-bit per dimension. Not implemented: the server <strong>refuses to start</strong> on <code class="inline">default_quantization = "binary"</code> rather than silently storing full precision while claiming a 32× saving.</li>
   </ul>
   <p>A 4-bit quantizer exists in the vector crate but no config or mapping value reaches it, so <code class="inline">scalar4</code> is not a mode you can select in this build.</p>
+  <p><strong>Known gap — a mapping's <code class="inline">quantization</code> value is not validated</strong> (<a href="https://github.com/xerj-org/xerj/issues/275">#275</a>). Startup refuses an unimplemented <code class="inline">[vector] default_quantization</code>, but the per-field mapping key does not: <code class="inline">"quantization": "scalar4"</code> — or <code class="inline">"binary"</code>, or a typo such as <code class="inline">"sq8"</code> — is accepted with a <code class="inline">200</code>, echoed back verbatim by <code class="inline">GET /_mapping</code>, and then ignored, so the field is stored at full-precision f32 while the mapping you read back says otherwise. Measured on rc.14. Until it is a <code class="inline">400</code>, <code class="inline">"scalar8"</code> (or <code class="inline">"int8"</code>, or <code class="inline">index_options.type: int8_hnsw</code>/<code class="inline">int8_flat</code>) is the only value that changes anything, and reading the mapping back is not a way to confirm it took.</p>
 
   <h2 id="knn-query">KNN query</h2>
 <pre class="code">{

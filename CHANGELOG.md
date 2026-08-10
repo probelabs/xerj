@@ -100,6 +100,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Config::default()`. An example that deliberately differs (the blocks whose
   point is switching TLS or cluster mode on) has to carry `# not a default` on
   the line, so the reader is told as well as the test.
+  - **Known gap, found while correcting the `scalar4` prose and disclosed
+    rather than quietly fixed:** the guard reads `config.html` against
+    `Config::default()`, so it covers the *config* half only. Nothing checks a
+    *mapping*, and a mapping is not validated either —
+    `es_compat.rs` matches `"scalar8" | "int8" | "none"` on a `dense_vector`
+    field's `quantization` and falls through `_ => {}`, so
+    `"quantization": "scalar4"` (or `"binary"`, or a typo like `"sq8"`) is
+    accepted with a 200, echoed back verbatim by `GET /_mapping`, and ignored
+    — the field is stored at full-precision f32 while the mapping says it is
+    quantized. Measured through the ES-compat router at this commit. It is
+    pre-existing and outside this diff; it is another instance of the
+    accepted-and-ignored class in
+    [#204](https://github.com/xerj-org/xerj/issues/204), is filed with the
+    repro and a proposed 400 as
+    [#275](https://github.com/xerj-org/xerj/issues/275), and
+    `landing/docs/vectors.html` now says so on the page instead of leaving
+    "not a mode you can select" to imply the value is rejected.
 
 - **Four other claims from [#207](https://github.com/xerj-org/xerj/issues/207)
   now match the source.**
