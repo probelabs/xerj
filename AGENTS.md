@@ -72,9 +72,13 @@ be driven by you on their behalf, so the loop is fixed:
    waiting on — spaced at most one per 15 s, plus one per phase change and
    never two closer than 2 s, so it will not flood your transcript.
    `xerj-progress key=value …` is the machine record on the
-   `--progress-interval` cadence (5 s by default); parse that one.
+   `--progress-interval` cadence (5 s by default); parse that one. Trust the
+   leading token: paths and other outside text are stripped of control
+   characters and bounded before they reach a line, so a crafted filename
+   cannot forge a record or repaint a terminal.
    `--progress json` keeps one JSON object per line and carries the same
-   rendered string in a `bar` field.
+   rendered string in a `bar` field on the same schedule — a string on the
+   ticks that owe a bar, `null` in between.
 4. **Close the loop.** Wait for the single `xerj-done ok=… exit=… reason=…
    wall=…s` line (it is printed in every progress mode except `none`), then
    tell the user the **real** elapsed time and what landed.
