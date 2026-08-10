@@ -18889,11 +18889,12 @@ async fn msearch_impl(
             .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
         {
             Ok(r) => r,
+            // Rendered through the same `ApiError` path the single-request
+            // `_search` uses, so a sub-response carries ES's full envelope
+            // (`root_cause`, `type`, `reason`) and not a bare `reason`. See
+            // the `search_error` arm below for why that matters.
             Err(e) => {
-                responses.push(json!({
-                    "error": { "reason": e.to_string() },
-                    "status": 400
-                }));
+                responses.push(ApiError::new(e).into_value());
                 continue;
             }
         };
@@ -18929,14 +18930,14 @@ async fn msearch_impl(
         let mut total_count: u64 = 0;
         let mut total_relation = "eq";
         let mut merged_aggs: Option<Value> = None;
-        let mut search_error: Option<String> = None;
+        let mut search_error: Option<xerj_common::XerjError> = None;
         let mut script_failure: Option<String> = None;
 
         for idx_name in &index_names {
             let idx = match state.engine.get_index(idx_name) {
                 Ok(i) => i,
                 Err(e) => {
-                    search_error = Some(e.to_string());
+                    search_error = Some(xerj_common::XerjError::from(e));
                     break;
                 }
             };
@@ -18964,7 +18965,7 @@ async fn msearch_impl(
                     }
                 }
                 Err(e) => {
-                    search_error = Some(e.to_string());
+                    search_error = Some(xerj_common::XerjError::from(e));
                     break;
                 }
             }
@@ -18975,11 +18976,16 @@ async fn msearch_impl(
             continue;
         }
 
+        // The sub-response carries the SAME body the single-request `_search`
+        // would have produced for this error, status and all: `ApiError`
+        // already maps every `XerjError` to its ES exception type, status and
+        // `root_cause` (see `api/error.rs`). It used to be flattened to a bare
+        // `{"reason": …}` under a hardcoded 500, which turned a plain user
+        // mapping declaration — a query naming an `"index": false` field, a
+        // 400 `search_phase_execution_exception` everywhere else — into a
+        // server error with no `type` for a client to switch on.
         if let Some(err) = search_error {
-            responses.push(json!({
-                "error": { "reason": err },
-                "status": 500
-            }));
+            responses.push(ApiError::new(err).into_value());
             continue;
         }
 
@@ -27945,13 +27951,22 @@ pub async fn explain_doc(
     // Reporting the fault alongside the verdict satisfies both: the caller
     // still gets the answer, and never gets it without being told a limit
     // tripped.
-    let mut script_failure: Option<String> = None;
-    let matched = match idx.search(&ids_req).await {
-        Ok(result) => {
-            script_failure = result.script_failure.clone();
-            !result.hits.is_empty()
-        }
-        Err(_) => false,
+    let (matched, script_failure) = match idx.search(&ids_req).await {
+        Ok(result) => (!result.hits.is_empty(), result.script_failure),
+        // The engine REFUSED to run the query — e.g. it names a field the
+        // mapping declared `"index": false` with no doc values, which ES
+        // rejects with `Cannot search on field [f] since it is not indexed
+        // nor has doc values.` Publishing `matched: false` here would be a
+        // confident negative for a question that was never asked, which is
+        // the accepted-and-ignored failure of #204 wearing a diagnostic hat.
+        // Every other error path in this handler already returns `ApiError`;
+        // so does this one, giving `_explain` the same 400 envelope
+        // `_search` and `_count` return for the identical query.
+        //
+        // Deliberately NOT the same as `script_failure` above: there the
+        // engine DID produce a hit list and only scoring was degraded, so the
+        // verdict is real and the fault is reported alongside it.
+        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
     let score = if matched { 1.0_f64 } else { 0.0_f64 };

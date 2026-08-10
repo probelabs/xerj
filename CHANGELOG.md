@@ -25,9 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is unsearchable, and a query naming one is now rejected with ES's own
   sentence, `Cannot search on field [f] since it is not indexed nor has doc
   values.`, as a 400 `search_phase_execution_exception` /
-  `query_shard_exception`. `_search`, `_count`, `_msearch` and `_explain` all
-  inherit the check. `exists` is unaffected and still returns zero hits rather
-  than an error, which is also what ES does.
+  `query_shard_exception`. The check lives in one place — `search_inner` — and
+  `_search`, `_count`, `_msearch` and `_explain` were each measured carrying it
+  all the way to the wire: `_explain` answers the 400 instead of a confident
+  `"matched": false` for a query it never ran, and `_msearch` renders it as a
+  per-response 400 envelope with `type` and `root_cause` instead of a bare 500.
+  `exists` is unaffected and still returns zero hits rather than an error, which
+  is also what ES does.
+
+  The multi-field query types follow ES's own split rather than a blanket rule.
+  An explicitly *named* field is rejected like any other named field —
+  `multi_match` / `simple_query_string` with `"fields": ["note"]`, `query_string`
+  with `"default_field": "note"` — while a *wildcard* spec such as
+  `"fields": ["*"]` is never an error and goes on being answered exactly as
+  before, because ES expands a pattern over the searchable fields and silently
+  drops the rest (`QueryParserHelper.resolveMappingField`). Before this,
+  the same user intent got two different answers: the `simple_query_string` form
+  was rejected (the parser lowers it to a `match`) while the `multi_match` form
+  returned the document through the unsearchable field.
 
   The field is dropped from the full-text index at flush and merge only where
   the stored-doc fallback is *equivalent* — a non-indexed `text` field. An
@@ -37,9 +52,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change: for those types the footprint the option implies is knowingly forgone
   rather than bought with wrong answers.
 
-  Known gap, unchanged by this release: the field-less `query_string` arm of the
-  stored-document scan is schema-free and walks every `_source` key, so a token
-  living only in an unsearchable field can still match there.
+  Known gaps, measured and left open rather than claimed shut. **Aggregations
+  and sort do not inherit the check**: only the `query` clause is walked, so
+  `{"size":0,"aggs":{"a":{"terms":{"field":"note"}}}}` still answers 200 with a
+  bucket built from `_source`, and `{"sort":[{"note":"asc"}]}` still answers 200.
+  ES rejects those too, but for an unrelated reason and with an unrelated
+  sentence — `Fielddata is disabled on [f] in [i]…`, which it raises for *any*
+  `text` field whether or not `index: false` was declared — so reusing this
+  error there would misreport a wider divergence as this one. **The field-less
+  arms of the stored-document scan are schema-free**, walking every `_source`
+  key, so a token living only in an unsearchable field can still match when
+  **no** field is named: `query_string {"query":"…"}` and `more_like_this` with
+  no `fields` both still return the document. (Their *named* forms are
+  rejected — `more_like_this` with `fields` lowers to a `bool.should` of
+  `match` at parse time and inherits the check.) Both gaps are pinned by
+  assertions in
+  `index_false_is_honoured::documented_gaps_are_still_open_and_still_documented`,
+  so closing one fails the test that says it is open.
 
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**
   ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the

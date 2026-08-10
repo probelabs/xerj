@@ -26925,25 +26925,63 @@ fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig
 /// unchanged: such a field keeps its whole-value postings, because they are
 /// what answers it *exactly* — see `memtable::fts_excluded_fields`.
 ///
-/// Deliberately NOT covered: the multi-field query types (`multi_match`,
-/// `query_string`, `simple_query_string`, `more_like_this`). ES throws when
-/// any *named* field is unsearchable, but XERJ expands wildcard field specs
-/// against the schema, so rejecting here would turn `fields: ["*"]` into a
-/// hard error for the whole index.
+/// The multi-field query types (`multi_match`, `simple_query_string`,
+/// `query_string`) follow ES's own split, not a blanket rule: an
+/// explicitly *named* field is kept whatever its type and left to fail in the
+/// per-field builder, while a *wildcard* spec silently drops the fields that
+/// are not searchable (`acceptAllTypes = isSimpleMatchPattern(spec) == false`
+/// in `server/src/main/java/org/elasticsearch/index/search/QueryParserHelper.java:115-150`,
+/// read for semantics only — ES is AGPL/SSPL/Elastic-2.0 and no code from it
+/// is reproduced here). So `fields: ["note"]` is rejected exactly like
+/// `match` on `note`, and `fields: ["*"]` keeps working over the searchable
+/// fields. Without this, the same user intent got two different answers:
+/// `simple_query_string {"fields":["note"]}` and `query_string
+/// {"default_field":"note"}` already 400ed because the parser lowers a
+/// single-field form to `Match`, while `multi_match {"fields":["note"]}` —
+/// and either of those with two fields — returned the document *through* the
+/// unsearchable field.
 ///
-/// The FTS route for those queries no longer projects a clause onto an
-/// unsearchable field (`text_fields`/`exact_fields` in `search_inner` apply
-/// ES's `isSearchable()` rule), but the stored-doc scan's field-less
-/// `query_string` arm is schema-free: it walks every non-`_` key of
-/// `_source`, so a token living only in an unsearchable field still matches
-/// there. Measured, not assumed. That arm's divergence from the FTS
+/// `more_like_this` needs no arm here: with an explicit `fields` list the
+/// parser lowers it to a `bool.should` of `match` clauses, which the leaf arms
+/// already reject (measured: `fields: ["note"]` and `["note","body"]` both
+/// 400). Without one it stays a `MoreLikeThis` node, which is the field-less
+/// gap below.
+///
+/// One gap remains open here, stated rather than papered over. The FTS route
+/// for these queries no longer projects a clause onto an unsearchable field
+/// (`text_fields`/`exact_fields` in `search_inner` apply ES's `isSearchable()`
+/// rule), but the stored-doc scan's FIELD-LESS arms are schema-free: they walk
+/// every non-`_` key of `_source`, so a token living only in an unsearchable
+/// field still matches when no field is named at all — `query_string
+/// {"query": "…"}` and a `more_like_this` with no `fields` both still return
+/// the document. Measured, not assumed. That divergence from the FTS
 /// projection predates this change and is called out in its own comment in
 /// `doc_matches_query`; making it schema-aware means threading a schema
 /// through ~79 call sites and is left as its own change.
+///
+/// Also not covered, and not claimed: aggregation and sort field targets. Only
+/// `request.query` reaches this function; `request.aggs` is opaque JSON at this
+/// layer, and both `{"aggs":{"a":{"terms":{"field":"note"}}}}` and
+/// `{"sort":[{"note":"asc"}]}` still answer 200 (measured). ES rejects those
+/// too, but for an unrelated reason with an unrelated sentence
+/// (`Fielddata is disabled on [f] in [i]…`,
+/// `server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java:1534-1546`)
+/// which it raises whether or not `index: false` was declared — a wider
+/// divergence than this change, and one this error message would misreport.
 fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
-    let check = |field: &String| -> Option<String> {
+    let check = |field: &str| -> Option<String> {
         let fc = declared_field(schema, field)?;
-        (!fc.options.indexed && !fc.options.doc_values).then(|| field.clone())
+        (!fc.options.indexed && !fc.options.doc_values).then(|| field.to_string())
+    };
+    // One entry of a `fields: [...]` list. `"title^3"` carries a boost;
+    // `"*"` / `"body.*"` is a pattern, which ES expands over searchable
+    // fields only and therefore must never be an error.
+    let check_spec = |spec: &String| -> Option<String> {
+        let (name, _boost) = parse_field_boost(spec);
+        if name.contains('*') {
+            return None;
+        }
+        check(name)
     };
     match q {
         // ── Leaves that name exactly one field ────────────────────────────
@@ -26963,6 +27001,19 @@ fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
         | QueryNode::GeoBoundingBox { field, .. }
         | QueryNode::GeoPolygon { field, .. }
         | QueryNode::GeoShape { field, .. } => check(field),
+
+        // ── Multi-field types: named fields fail, patterns expand ─────────
+        // ES's split as a rule, not as code (see this function's doc
+        // comment). `simple_query_string` with 2+ fields lowers to
+        // `MultiMatch` in the parser, so this covers that too, as well as
+        // `combined_fields`, which is rewritten to `multi_match:
+        // cross_fields`.
+        QueryNode::MultiMatch { fields, .. } => fields.iter().find_map(check_spec),
+        QueryNode::SimpleQueryString { fields, .. } => fields.iter().find_map(check_spec),
+        QueryNode::QueryString {
+            default_field: Some(f),
+            ..
+        } => check_spec(f),
 
         // `exists` is NOT an error in ES: an unsearchable field is simply
         // absent from `_field_names`, so the clause matches nothing. The
@@ -27013,10 +27064,11 @@ fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
                 .or_else(|| unsearchable_query_field(big, schema))
         }
 
-        // Everything else names no single mapped field to validate:
-        // MatchAll/MatchNone/Ids/Script, the multi-field types documented
-        // above, `percolate` (the field holds stored queries, not data), and
-        // `more_like_this`.
+        // Everything else names no mapped data field to validate:
+        // MatchAll/MatchNone/Ids/Script, a field-less `query_string`, a
+        // field-less `more_like_this` (with `fields` the parser lowers it to
+        // `bool.should` of `match`, which the leaf arms above catch), and
+        // `percolate` (the field holds stored queries, not data).
         _ => None,
     }
 }

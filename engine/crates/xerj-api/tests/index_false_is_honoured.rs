@@ -318,3 +318,327 @@ async fn an_alias_to_an_unsearchable_field_is_rejected_too() {
         "the error names the resolved target, as ES does: {reason:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The other read surfaces that route through `search_inner`
+//
+// The check lives in one place, but "one place" is only worth claiming if the
+// endpoints on top of it actually let the rejection through. Two of them did
+// not, and both failures were the same silent-answer shape #204 is about:
+// `_explain` swallowed the engine's refusal and published `matched: false`,
+// and `_msearch` flattened it into a bare 500 with no `type` to switch on.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn ndjson_req(app: &axum::Router, path: &str, body: &str) -> (StatusCode, Value) {
+    send(
+        app,
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(body.to_string()))
+            .expect("request"),
+    )
+    .await
+}
+
+/// `_count` runs the same query with no hits to return, so a swallowed
+/// rejection would show up as `count: 0` — a confident wrong number.
+#[tokio::test]
+async fn count_inherits_the_rejection() {
+    let (app, _dir) = app_with_mapping().await;
+
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_count",
+        json!({ "query": { "match": { "note": "pelicans" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body.pointer("/error/root_cause/0/type")
+            .and_then(Value::as_str),
+        Some("query_shard_exception"),
+        "{body}"
+    );
+}
+
+/// `_explain` must not answer `matched: false` for a query the engine refused
+/// to run. That is a *confident negative* — indistinguishable, to the caller,
+/// from "we ran it and your document does not match" — and it is what this
+/// endpoint returned until the `Err(_) => false` arm in `explain_doc` was
+/// replaced by the same `ApiError` every other arm of that handler uses.
+#[tokio::test]
+async fn explain_reports_the_rejection_instead_of_a_confident_no_match() {
+    let (app, _dir) = app_with_mapping().await;
+
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_explain/1",
+        json!({ "query": { "match": { "note": "pelicans" } } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "_explain must inherit the rejection, got {status}: {body}"
+    );
+    assert_eq!(
+        body.pointer("/matched"),
+        None,
+        "no verdict is published: {body}"
+    );
+    assert_eq!(
+        body.pointer("/error/type").and_then(Value::as_str),
+        Some("search_phase_execution_exception"),
+        "{body}"
+    );
+    let reason = body
+        .pointer("/error/root_cause/0/reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason
+            .contains("Cannot search on field [note] since it is not indexed nor has doc values."),
+        "got {reason:?}: {body}"
+    );
+
+    // An answerable query on the same document still gets its verdict — the
+    // change must not turn `_explain` into a refusal machine.
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_explain/1",
+        json!({ "query": { "match": { "body": "pelicans" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.pointer("/matched"), Some(&json!(true)), "{body}");
+}
+
+/// `_msearch` answers 200 overall and puts per-request outcomes in
+/// `responses[]`, so the rejection has to arrive there in ES's shape: status
+/// 400, a `type`, and a `root_cause`. It used to arrive as
+/// `{"error":{"reason":"…"},"status":500}` — a server error for a mapping the
+/// user declared, with nothing structured for a client to branch on.
+#[tokio::test]
+async fn msearch_renders_the_rejection_as_a_per_response_400_envelope() {
+    let (app, _dir) = app_with_mapping().await;
+
+    let body_ndjson = concat!(
+        "{\"index\":\"t\"}\n",
+        "{\"query\":{\"match\":{\"note\":\"pelicans\"}}}\n",
+        "{\"index\":\"t\"}\n",
+        "{\"query\":{\"match\":{\"body\":\"pelicans\"}}}\n"
+    );
+    let (status, body) = ndjson_req(&app, "/_msearch", body_ndjson).await;
+    assert_eq!(status, StatusCode::OK, "_msearch envelope is 200: {body}");
+
+    assert_eq!(
+        body.pointer("/responses/0/status").and_then(Value::as_u64),
+        Some(400),
+        "the failing sub-request must be a 400, not a 500: {body}"
+    );
+    assert_eq!(
+        body.pointer("/responses/0/error/type")
+            .and_then(Value::as_str),
+        Some("search_phase_execution_exception"),
+        "{body}"
+    );
+    assert_eq!(
+        body.pointer("/responses/0/error/root_cause/0/type")
+            .and_then(Value::as_str),
+        Some("query_shard_exception"),
+        "{body}"
+    );
+    let reason = body
+        .pointer("/responses/0/error/root_cause/0/reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason
+            .contains("Cannot search on field [note] since it is not indexed nor has doc values."),
+        "got {reason:?}: {body}"
+    );
+
+    // The sibling sub-request is unaffected: one bad query in a batch must not
+    // cost the others their answers.
+    assert_eq!(
+        body.pointer("/responses/1/hits/total/value")
+            .and_then(Value::as_u64),
+        Some(1),
+        "{body}"
+    );
+}
+
+/// ES's split for the multi-field types: an explicitly NAMED field is kept
+/// whatever its type and fails in the per-field builder, while a WILDCARD spec
+/// silently drops the fields that are not searchable
+/// (`QueryParserHelper.resolveMappingField`, semantics only). Before this,
+/// `multi_match {"fields":["note"]}` returned the document through the
+/// unsearchable field while `simple_query_string {"fields":["note"]}` — the
+/// same intent, lowered to `Match` by the parser — was rejected.
+#[tokio::test]
+async fn multi_field_queries_reject_a_named_unsearchable_field_but_not_a_pattern() {
+    let (app, _dir) = app_with_mapping().await;
+
+    for query in [
+        json!({ "multi_match": { "query": "pelicans", "fields": ["note"] } }),
+        json!({ "multi_match": { "query": "pelicans", "fields": ["note", "body"] } }),
+        // A boost suffix is part of the spec, not part of the field name.
+        json!({ "multi_match": { "query": "pelicans", "fields": ["note^3"] } }),
+        json!({ "simple_query_string": { "query": "pelicans", "fields": ["note"] } }),
+        json!({ "simple_query_string": { "query": "pelicans", "fields": ["note", "body"] } }),
+        json!({ "query_string": { "query": "pelicans", "default_field": "note" } }),
+    ] {
+        let (status, body) = search(&app, query.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "query {query} names an unsearchable field, got {status}: {body}"
+        );
+        let reason = body
+            .pointer("/error/root_cause/0/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            reason.contains("Cannot search on field [note]"),
+            "got {reason:?} for {query}: {body}"
+        );
+    }
+
+    // …while a pattern is never an error, even though `note` matches it: ES
+    // drops the unsearchable fields out of a wildcard expansion instead of
+    // failing the request, and turning `fields: ["*"]` into a hard error for
+    // the whole index is exactly what this arm exists to avoid.
+    for query in [
+        json!({ "multi_match": { "query": "pelicans", "fields": ["*"] } }),
+        json!({ "multi_match": { "query": "pelicans", "fields": ["note*"] } }),
+        json!({ "multi_match": { "query": "pelicans", "fields": ["*", "body"] } }),
+        json!({ "simple_query_string": { "query": "pelicans", "fields": ["*"] } }),
+        json!({ "query_string": { "query": "pelicans", "default_field": "*" } }),
+    ] {
+        let (status, body) = search(&app, query.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a wildcard spec must not be an error: {query} → {status}: {body}"
+        );
+    }
+
+    // Where a concrete searchable field is named alongside the pattern, the
+    // document still comes back — the arm drops clauses, it does not disarm
+    // the query. (A *bare* `["*"]` answers 0 hits in XERJ today; that is a
+    // pre-existing gap in wildcard field expansion, unrelated to this change
+    // — an index with no `index: false` field at all answers it the same way
+    // — so it is not asserted as a hit here.)
+    for query in [
+        json!({ "multi_match": { "query": "pelicans", "fields": ["*", "body"] } }),
+        json!({ "query_string": { "query": "pelicans", "default_field": "*" } }),
+    ] {
+        let (status, body) = search(&app, query.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body.pointer("/hits/total/value").and_then(Value::as_u64),
+            Some(1),
+            "the searchable `body` field still answers {query}: {body}"
+        );
+    }
+}
+
+/// The gaps this change does NOT close, pinned so the code and the claim
+/// cannot drift apart. These assertions describe present behaviour that is
+/// wrong-by-ES and is documented as open in the CHANGELOG — a failure here
+/// means a gap was closed and the disclosure needs deleting, not that the
+/// build is broken.
+#[tokio::test]
+async fn documented_gaps_are_still_open_and_still_documented() {
+    let (app, _dir) = app_with_mapping().await;
+
+    // GAP 1 — aggregations do not inherit the check. `request.aggs` is opaque
+    // JSON below the API layer and only the `query` clause is walked. (ES
+    // rejects this too, but for an unrelated reason and with an unrelated
+    // sentence: `Fielddata is disabled on [note] in [t]…`, which it raises for
+    // ANY text field, `index: false` or not.)
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_search",
+        json!({ "size": 0, "aggs": { "a": { "terms": { "field": "note" } } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GAP 1 changed: {body}");
+    assert!(
+        body.pointer("/aggregations/a/buckets/0/key").is_some(),
+        "GAP 1 changed — aggregations now inherit the check, update the CHANGELOG: {body}"
+    );
+
+    // …and sorting on the same field is likewise not checked.
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_search",
+        json!({ "sort": [ { "note": "asc" } ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GAP 1 (sort half) changed: {body}");
+
+    // GAP 2 — the FIELD-LESS arms of the stored-document scan are schema-free
+    // and walk every `_source` key, so a token living only in an unsearchable
+    // field still matches when NO field is named.
+    for query in [
+        json!({ "query_string": { "query": "pelicans" } }),
+        json!({ "more_like_this": { "like": ["pelicans"], "min_term_freq": 1, "max_query_terms": 5 } }),
+    ] {
+        let (status, body) = search(&app, query.clone()).await;
+        assert_eq!(status, StatusCode::OK, "GAP 2 changed for {query}: {body}");
+    }
+}
+
+/// `more_like_this` needs no arm of its own: with an explicit `fields` list the
+/// parser lowers it to a `bool.should` of `match` clauses, so it inherits the
+/// leaf check. Asserted because the CHANGELOG says so — the claim and the code
+/// have to be checkable against each other.
+#[tokio::test]
+async fn a_named_more_like_this_field_inherits_the_check() {
+    let (app, _dir) = app_with_mapping().await;
+
+    for fields in [json!(["note"]), json!(["note", "body"])] {
+        let query = json!({
+            "more_like_this": {
+                "fields": fields, "like": ["pelicans"],
+                "min_term_freq": 1, "max_query_terms": 5
+            }
+        });
+        let (status, body) = search(&app, query.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query} → {body}");
+        let reason = body
+            .pointer("/error/root_cause/0/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            reason.contains("Cannot search on field [note]"),
+            "got {reason:?}: {body}"
+        );
+    }
+
+    // The searchable control field still answers it.
+    let (status, body) = search(
+        &app,
+        json!({
+            "more_like_this": {
+                "fields": ["body"], "like": ["pelicans"],
+                "min_term_freq": 1, "max_query_terms": 5
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(Value::as_u64),
+        Some(1),
+        "{body}"
+    );
+}
