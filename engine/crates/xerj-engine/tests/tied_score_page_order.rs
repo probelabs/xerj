@@ -214,21 +214,35 @@ async fn tie_straddling_a_page_boundary_resolves_the_same_way_at_every_size() {
 /// The same property with an UNFLUSHED tail — the shape a live index is in
 /// between flushes, and the one a paginating client hits most often.
 ///
-/// The corpus is deliberately larger than the collector's 256-hit floor
-/// (`materialisation_limit = (from + size + 100).max(256)`; the `from + size`
-/// narrowing applies only to an EMPTY memtable, so a mixed fixture always
-/// pays the floor plus 100 hits of slack).  A smaller mixed fixture proves
-/// nothing at all: the whole corpus fits under the cap, the bounded collector
-/// never truncates, and every page agrees trivially.
+/// Sizing this fixture takes two conditions at once, and an earlier revision
+/// of this test met neither.  With `materialisation_limit = (from + size +
+/// 100).max(256)` and the flushed documents arriving FIRST (so they own the
+/// low `seq_no`s and the head of every page):
 ///
-/// Honest scope: unlike the two tests above, this one PASSED on the pre-fix
-/// engine in the runs we measured — the 100-hit slack means truncation only
-/// ever reached documents past the prefixes asserted here, so the pre-fix
-/// walk got away with dropping whichever segment it reached last.  It earns
-/// its place as a REGRESSION guard, not a reproducer: the fix changes both
-/// the segment walk order and the per-segment headroom, and the memtable
-/// (which seeds the collector past its cap before the first segment is even
-/// opened) is where a mistake in either would surface first.
+///   1. the UNFLUSHED batch must be larger than the cap, or the memtable hands
+///      up every buffered hit and its bound is never exercised; and
+///   2. some asserted page position must actually LAND on a memtable
+///      document — i.e. `size` must exceed the flushed count — while (1) still
+///      holds, which bounds `flushed < size < unflushed - 100`.
+///
+/// 40 flushed + 300 unflushed satisfies both across `size` 41…199.  The
+/// original 320 flushed + 40 unflushed satisfied neither: 40 buffered hits
+/// never reached a 256-hit cap, so the memtable collector could not truncate,
+/// and every page position asserted (`size` ≤ 359, against 320 flushed
+/// documents) was answered from segments.  That test passed before the fix and
+/// after it, and would have kept passing however broken the memtable path
+/// became.  Measured on this fixture at the pre-repair commit, `size` 60, 100
+/// and 150 each returned a non-prefix page for all three shapes below.
+///
+/// `constant_score` is deliberately NOT one of the shapes here, and that is a
+/// known gap rather than an oversight: on a MIXED corpus its bounded page
+/// contains only memtable documents (`size:1` returns `mem0000` where the full
+/// page starts `seg0000`) because the segment walk is skipped once the
+/// collector is already full.  That reproduces identically before and after
+/// this change — it is a separate, pre-existing defect in the segment-side
+/// early-out, not the memtable bound under test here — and it is why this PR
+/// says `Refs #191` rather than `Fixes #191`.  The memtable-only test below
+/// does cover `constant_score`, which is the path this change fixes.
 #[tokio::test]
 async fn tied_scores_page_the_same_way_with_an_unflushed_memtable() {
     let dir = TempDir::new().unwrap();
@@ -237,8 +251,8 @@ async fn tied_scores_page_the_same_way_with_an_unflushed_memtable() {
     let idx = engine.get_index("mixed").unwrap();
 
     let mut inserted = Vec::new();
-    for batch in 0..4 {
-        for i in 0..80 {
+    for batch in 0..2 {
+        for i in 0..20u32 {
             let id = format!("seg{batch}{i:03}");
             idx.index_document(
                 Some(id.clone()),
@@ -250,8 +264,10 @@ async fn tied_scores_page_the_same_way_with_an_unflushed_memtable() {
         }
         idx.flush().await.unwrap();
     }
-    // Deliberately NOT flushed — these stay in the memtable.
-    for i in 0..40 {
+    // Deliberately NOT flushed — these stay in the memtable, and there are
+    // more of them than any cap the sizes below imply, so the memtable-side
+    // bound is the thing under test.
+    for i in 0..300 {
         let id = format!("mem{i:03}");
         idx.index_document(
             Some(id.clone()),
@@ -261,7 +277,7 @@ async fn tied_scores_page_the_same_way_with_an_unflushed_memtable() {
         .unwrap();
         inserted.push(id);
     }
-    let total = inserted.len() as u64; // 360 > the 256 floor
+    let total = inserted.len() as u64; // 340: 40 flushed + 300 unflushed
 
     for (label, q) in [
         ("match", json!({"match": {"body": "listpack"}})),
@@ -276,13 +292,119 @@ async fn tied_scores_page_the_same_way_with_an_unflushed_memtable() {
             "{label}: an all-tied page must come back in arrival order, \
              segment documents before memtable ones"
         );
-        // Sizes on both sides of the 256 floor.
-        for size in [1usize, 5, 50, 255, 256, 257, 300, 359] {
+        // Every one of these implies a cap below 300, so the memtable is
+        // always truncating; the ones past 40 are the ones whose page actually
+        // contains buffered documents.
+        for size in [1usize, 5, 41, 60, 100, 150, 199] {
             let p = idx.search(&req(0, size, &q)).await.unwrap();
             assert_eq!(
                 page_ids(&p.hits),
                 full_ids[..size],
                 "{label}: size:{size} page disagrees with the full materialisation"
+            );
+        }
+    }
+}
+
+/// #191's most natural reproduction, and the one the PR originally shipped
+/// without: index N identical documents and page them BEFORE the flush.
+///
+/// Nothing here has been written to a segment, so every collector decision is
+/// made on the memtable side.  That side bounds its materialisation twice over
+/// — the sharded memtable caps each shard's contribution, and `admit_hit!`
+/// caps the merged result — and neither bound used to rank candidates by the
+/// page key.  A `ShardedFtsMemtable` holds 16 independent shards, a document
+/// lands in one by id hash (a whole bulk batch by its FIRST id's hash), and
+/// the query path walks them in INDEX order while filling a global budget.
+/// So the page was "the tied documents that happen to live in the
+/// lowest-numbered shards", which is neither arrival order nor stable.
+///
+/// Measured pre-fix, release, 600 byte-identical documents (every score bit
+/// pattern `1065353216`, an exact tie), for `match`, `term`, `match_all` AND
+/// `constant_score` alike:
+///
+/// ```text
+/// size:5    → ["m0000", "m0001", "m0004", "m0005", "m0008"]
+/// size:1000 → ["m0000", "m0001", "m0002", "m0003", "m0004"], …
+/// ```
+///
+/// Each shape reaches a different memtable collector, which is why all four
+/// are asserted: `match` takes the scored FTS merge, `term` the columnar
+/// doc-values walk, `match_all` the bounded id list, and `constant_score` the
+/// brute per-document scan.
+#[tokio::test]
+async fn tied_scores_page_the_same_way_with_no_flush_at_all() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine.create_index("memonly", Schema::empty()).unwrap();
+    let idx = engine.get_index("memonly").unwrap();
+
+    // Comfortably past the 256-hit floor.  `size:300` implies a 400-hit cap
+    // and so still truncates; `size:599` implies 699 and does not, which is
+    // why the full page below is a complete materialisation to compare
+    // against.
+    let mut inserted = Vec::new();
+    for i in 0..600 {
+        let id = format!("m{i:04}");
+        idx.index_document(
+            Some(id.clone()),
+            json!({"body": "listpack encoding", "kind": "same"}),
+        )
+        .await
+        .unwrap();
+        inserted.push(id);
+    }
+
+    for (label, q) in [
+        ("match", json!({"match": {"body": "listpack"}})),
+        ("term", json!({"term": {"kind": "same"}})),
+        ("match_all", json!({"match_all": {}})),
+        (
+            "constant_score",
+            json!({"constant_score": {"filter": {"match_all": {}}}}),
+        ),
+    ] {
+        let full = idx.search(&req(0, 1000, &q)).await.unwrap();
+        let full_ids = page_ids(&full.hits);
+        assert_eq!(full.total.value, 600, "{label}: every doc matches");
+
+        // The tie really is exact — otherwise the test proves nothing.
+        let scores: Vec<f32> = full.hits.iter().map(|h| h.score).collect();
+        assert!(
+            scores.windows(2).all(|w| w[0].to_bits() == w[1].to_bits()),
+            "{label}: fixture must produce an EXACT tie, got {:?}",
+            &scores[..5]
+        );
+        assert_eq!(
+            full_ids, inserted,
+            "{label}: an all-tied memtable page must come back in arrival order"
+        );
+
+        // Sizes on both sides of the 256 floor.  Measured pre-fix, `size` 5,
+        // 50 and 300 each returned a page drawn from the low-numbered shards
+        // for all four shapes; `size:1` happened to survive, because the
+        // globally-first document also lived in a shard the truncated walk
+        // reached.
+        for size in [1usize, 2, 5, 50, 255, 256, 257, 300, 599] {
+            let p = idx.search(&req(0, size, &q)).await.unwrap();
+            assert_eq!(
+                page_ids(&p.hits),
+                full_ids[..size],
+                "{label}: size:{size} page disagrees with the full materialisation"
+            );
+            assert_eq!(
+                p.total.value, 600,
+                "{label}: size:{size} total must stay exact"
+            );
+        }
+
+        // Paging one hit at a time reproduces the same order.
+        for from in [0usize, 1, 254, 255, 256, 300] {
+            let p = idx.search(&req(from, 1, &q)).await.unwrap();
+            assert_eq!(
+                page_ids(&p.hits),
+                full_ids[from..from + 1],
+                "{label}: from:{from} size:1 disagrees with the full materialisation"
             );
         }
     }

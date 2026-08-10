@@ -11836,6 +11836,39 @@ impl Index {
         worst
     }
 
+    /// Reduce `hits` to the best `cap` under the SAME comparator the final page
+    /// sort uses (`score DESC, seq_no ASC, _id ASC` — `index.rs:16222-16228`),
+    /// and return the surviving cap-th `(score, seq_no, _id)` page key.
+    ///
+    /// #191 — every bounded collector in `search` trims through here, so
+    /// admission and final ordering can never drift apart: a `size:5` page is
+    /// the first five of a `size:1000` one whatever order the walk visited the
+    /// documents in.
+    #[allow(clippy::type_complexity)]
+    fn trim_page_to_cap(
+        &self,
+        hits: Vec<Hit>,
+        cap: usize,
+    ) -> (Vec<Hit>, Option<(f32, u64, String)>) {
+        let mut decorated: Vec<(u64, Hit)> = hits
+            .into_iter()
+            .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
+            .collect();
+        decorated.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        decorated.truncate(cap);
+        let worst = decorated
+            .last()
+            .map(|(seq, h)| (h.score, *seq, h.id.clone()));
+        let kept = decorated.into_iter().map(|(_, h)| h).collect();
+        (kept, worst)
+    }
+
     /// Look up the latest `seq_no` for a document by id via the version
     /// map. Returns `None` when the doc is unknown or tombstoned.
     ///
@@ -13501,6 +13534,26 @@ impl Index {
         // memtable and a segment (possible during a flush race).  We prefer
         // the first appearance (which is usually the memtable, i.e. the
         // newest version).
+        //
+        // #191 — the `materialisation_limit` bound here is a plain FIFO cut,
+        // and it is only CORRECT because every arm that feeds it upholds one
+        // of two invariants:
+        //
+        //   * `AllDocIds` / `DocValuesHits` — the memtable already narrowed
+        //     its candidates to the globally best `limit` by `(seq_no, _id)`
+        //     (`ShardedFtsMemtable::narrow_to_page`), so the FIFO never
+        //     truncates at all; and
+        //   * `FtsHits` — the memtable returns its hits already sorted by the
+        //     full page key (`sort_hits_by_page_key`), so the first `limit`
+        //     ARE the page.  This matters on the ghost-window path, which asks
+        //     the memtable for every hit rather than a bounded prefix.
+        //
+        // The brute-scan arm upholds neither (it walks shards in index order),
+        // so it does NOT route post-cap admissions through here — see the
+        // `DocsForScan` arm.  Before #191 the FIFO was applied to unordered
+        // input and the surviving tied documents were decided by shard-walk
+        // order: `size:5` and `size:1000` disagreed on a 600-document
+        // all-tied memtable.
         macro_rules! admit_hit {
             ($hit:expr) => {{
                 total_count += 1;
@@ -13616,7 +13669,11 @@ impl Index {
             /// The `u64` is the UNCOLLECTED matching-doc remainder (bounded
             /// fused-bool path); it still counts toward `hits.total`.
             DocValuesHits(Vec<(String, usize)>, u64),
-            DocsForScan(Vec<(String, Arc<Value>)>), // doc_id + shared source for term-level scan
+            /// `(seq_no, doc_id, shared source)` for a term-level brute scan.
+            /// #191 — `seq_no` rides along so the bounded collector can rank a
+            /// document it reaches after filling the cap against the page it
+            /// already holds; shard-concatenation order is not arrival order.
+            DocsForScan(Vec<(u64, String, Arc<Value>)>),
         }
 
         // Search the memtable (unflushed docs only). Flushed docs are searched
@@ -13796,7 +13853,7 @@ impl Index {
                         // the heap is full (NOT the id-only snapshot,
                         // whose per-doc deep clone cost ~1 s/query at a
                         // 1 M-doc memtable).
-                        None => MemSnapshot::DocsForScan(mem.all_docs_with_sources_arc()),
+                        None => MemSnapshot::DocsForScan(mem.all_docs_with_seq_arc()),
                     }
                 } else {
                     let (ids, total) = mem.doc_ids_bounded(materialisation_limit);
@@ -13880,7 +13937,7 @@ impl Index {
                     } else {
                         // Brute per-doc scan — same authority the size>0
                         // path falls back to; `doc_matches_query` semantics.
-                        MemSnapshot::DocsForScan(mem.all_docs_with_sources_arc())
+                        MemSnapshot::DocsForScan(mem.all_docs_with_seq_arc())
                     }
                 } else if let Some((hits, total)) = (|| {
                     // Fused columnar term/range/bool: ONE position walk
@@ -13934,7 +13991,7 @@ impl Index {
                     // query (plus a second per-doc clone for `_id`
                     // injection below) was the single hottest search-side
                     // cost in the read-under-write thread dumps.
-                    let docs: Vec<(String, Arc<Value>)> = mem.all_docs_with_sources_arc();
+                    let docs: Vec<(u64, String, Arc<Value>)> = mem.all_docs_with_seq_arc();
                     MemSnapshot::DocsForScan(docs)
                 }
             } else {
@@ -14100,7 +14157,15 @@ impl Index {
                 let query_may_read_id: bool = serde_json::to_string(query)
                     .map(|s| s.contains("_id") || s.contains("Ids") || s.contains("ids"))
                     .unwrap_or(true);
-                for (doc_id, source) in docs {
+                // #191 — the cap-th page key the bounded collector currently
+                // holds, recomputed only when it can have changed (the moment
+                // the collector first fills, and after every trim).  A stale
+                // value is always a WEAKER threshold than the truth — it admits
+                // more than strictly necessary, never less — which is the safe
+                // direction, the same argument the segment walk's `page_worst`
+                // relies on.
+                let mut scan_worst: Option<(f32, u64, String)> = None;
+                for (seq_no, doc_id, source) in docs {
                     let matched = if let QueryNode::Ids { values } = query {
                         values.iter().any(|v| v == doc_id.as_str())
                     } else if !query_may_read_id || source.get("_id").is_some() {
@@ -14121,13 +14186,31 @@ impl Index {
                         // Materialise (score + owned source) ONLY when the
                         // hit can actually enter the bounded collector /
                         // top-N heap; everything else is a bare count.
-                        // Identical outcome to unconditionally building the
-                        // Hit: `admit_hit!` drops post-cap hits anyway.
+                        //
+                        // #191 — "can enter" is no longer "the collector still
+                        // has room".  This walk visits shards in index order
+                        // and each shard in arrival order, so it is NOT a
+                        // globally arrival-ordered walk: a document reached
+                        // after the cap is full can still hold a smaller
+                        // `seq_no` than the page's worst hit and therefore win
+                        // the tie-break against it.  Admit exactly those as
+                        // well — one `u64` compare against `scan_worst`, no
+                        // extra source clone for the ones that lose — and let
+                        // the trim below put the collector back at the cap by
+                        // the final comparator.  Documents that lose on
+                        // `seq_no` but would have won on SCORE are still
+                        // dropped here; that is pre-existing (they were dropped
+                        // outright before) and is recorded under Residual risk.
+                        let competitive = all_hits.len() < materialisation_limit || {
+                            if scan_worst.is_none() {
+                                scan_worst = self.worst_page_key(&all_hits);
+                            }
+                            scan_worst.as_ref().is_some_and(|w| seq_no < w.1)
+                        };
                         if count_only {
                             total_count += 1;
                         } else if sort_topk.is_some()
-                            || (all_hits.len() < materialisation_limit
-                                && !seen_ids.contains(&doc_id))
+                            || (competitive && !seen_ids.contains(&doc_id))
                         {
                             // Field-sorted: pre-clone primary-key rejection.
                             // Once the heap is full, a doc whose PRIMARY
@@ -14147,7 +14230,7 @@ impl Index {
                                 }
                             }
                             let score = score_doc(&source, &doc_id);
-                            admit_hit!(Hit {
+                            let hit = Hit {
                                 id: doc_id,
                                 score,
                                 source: (*source).clone(),
@@ -14156,13 +14239,48 @@ impl Index {
                                 highlight: None,
                                 matched_queries: Vec::new(),
                                 passage: None,
-                            });
+                            };
+                            if sort_topk.is_some() {
+                                admit_hit!(hit);
+                            } else {
+                                // `admit_hit!`'s FIFO bound would throw the
+                                // post-cap admissions above straight back
+                                // away, so this arm collects them itself and
+                                // trims by the page comparator once the
+                                // overflow reaches 2×cap — the same eager-trim
+                                // shape the segment walk uses.
+                                total_count += 1;
+                                if !seen_ids.contains(&hit.id) {
+                                    seen_ids.insert(hit.id.clone());
+                                    all_hits.push(hit);
+                                    if all_hits.len() > materialisation_limit.saturating_mul(2) {
+                                        let (kept, worst) = self.trim_page_to_cap(
+                                            std::mem::take(&mut all_hits),
+                                            materialisation_limit,
+                                        );
+                                        all_hits = kept;
+                                        scan_worst = worst;
+                                    }
+                                }
+                            }
                         } else {
                             total_count += 1;
                         }
                     }
                 }
             }
+        }
+
+        // #191 — normalise the memtable contribution back to exactly the cap
+        // before the segment walk starts, so every downstream stage sees the
+        // documented shape (`all_hits` holds the best `materialisation_limit`
+        // by the final comparator).  Only the brute-scan arm can overshoot —
+        // it admits post-cap documents that outrank the page it holds — and
+        // only up to 2×cap before its own eager trim fires.
+        if sort_topk.is_none() && all_hits.len() > materialisation_limit {
+            let (kept, _worst) =
+                self.trim_page_to_cap(std::mem::take(&mut all_hits), materialisation_limit);
+            all_hits = kept;
         }
 
         // --- Segment search ---
@@ -15177,31 +15295,8 @@ impl Index {
                                             Vec<Hit>,
                                             Option<(f32, u64, String)>,
                                         ) {
-                                                let mut decorated: Vec<(u64, Hit)> = hits
-                                                    .into_iter()
-                                                    .map(|h| {
-                                                        (
-                                                            self.lookup_seq_no(&h.id)
-                                                                .unwrap_or(u64::MAX),
-                                                            h,
-                                                        )
-                                                    })
-                                                    .collect();
-                                                decorated.sort_by(|a, b| {
-                                                    b.1.score
-                                                        .partial_cmp(&a.1.score)
-                                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                                        .then_with(|| a.0.cmp(&b.0))
-                                                        .then_with(|| a.1.id.cmp(&b.1.id))
-                                                });
-                                                decorated.truncate(materialisation_limit);
-                                                let worst = decorated
-                                                    .last()
-                                                    .map(|(seq, h)| (h.score, *seq, h.id.clone()));
-                                                let kept =
-                                                    decorated.into_iter().map(|(_, h)| h).collect();
-                                                (kept, worst)
-                                            };
+                                            self.trim_page_to_cap(hits, materialisation_limit)
+                                        };
                                         for sh in &seg_hits {
                                             // `seg_hits` descends by score, so once
                                             // a hit's score is STRICTLY below the
