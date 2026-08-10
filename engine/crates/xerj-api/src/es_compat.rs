@@ -1142,7 +1142,7 @@ pub async fn create_index(
             // silent on a missing/untranslatable policy — real ILM is
             // equally lenient here: it discovers the policy by name lazily
             // and simply doesn't start managing until one exists.
-            if let Some(policy_name) = ilm_policy_name_from_settings(&body) {
+            if let Some(Some(policy_name)) = ilm_lifecycle_directive_from_settings(&body) {
                 let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
             }
 
@@ -22116,31 +22116,72 @@ pub async fn put_settings(
         sync_display_blocks(&state, name).await;
     }
 
-    // Same lazy, best-effort `index.lifecycle.name` attach as create_index —
-    // `PUT {index}/_settings {"index.lifecycle.name": "policy"}` is the
-    // other real ILM entry point (attaching to an index that already
-    // exists, not just at creation).
-    if let Some(policy_name) = ilm_policy_name_from_settings(&body) {
-        for idx in &targets {
-            let _ = crate::ism_api::attach_policy(&state, idx, &policy_name).await;
+    // `PUT {index}/_settings` is the other real ILM entry point — for
+    // attaching (`"index.lifecycle.name": "policy"`) AND for detaching
+    // (`"index.lifecycle.name": null`, issue #282). The detach goes through
+    // `Engine::detach_lifecycle`, which tombstones and persists it: the
+    // `acknowledged: true` this handler returns must still be true after a
+    // restart, and must stop the delete phase immediately.
+    match ilm_lifecycle_directive_from_settings(&body) {
+        Some(Some(policy_name)) => {
+            for idx in &targets {
+                let _ = crate::ism_api::attach_policy(&state, idx, &policy_name).await;
+            }
         }
+        Some(None) => {
+            for idx in &targets {
+                // Never tombstone a name that is not an index: a persisted
+                // tombstone for a ghost is unbounded state writable from
+                // the public port (#262 hit exactly this in review).
+                if state.engine.get_index(idx).is_ok() {
+                    state.engine.detach_lifecycle(idx);
+                }
+            }
+        }
+        None => {}
     }
 
     Json(json!({ "acknowledged": true })).into_response()
 }
 
-/// Extract `index.lifecycle.name` from an index-settings body, accepting
-/// both the nested (`{"index":{"lifecycle":{"name":"..."}}}`,
-/// `{"settings":{...}}`-wrapped at create time) and flat dotted-key
-/// (`{"index.lifecycle.name":"..."}`) forms ES accepts for every index
-/// setting.
-fn ilm_policy_name_from_settings(body: &Value) -> Option<String> {
+/// What a settings body asks lifecycle management to do about the index's
+/// attachment, reading both the nested (`{"index":{"lifecycle":{"name":
+/// "..."}}}`, `{"settings":{...}}`-wrapped at create time) and flat
+/// dotted-key (`{"index.lifecycle.name":"..."}`) forms ES accepts for every
+/// index setting.
+///
+/// Three-valued on purpose (issue #282, ported from #262's
+/// `lifecycle_directive_from_settings`), because `Option<String>` cannot
+/// tell "the caller said nothing about `index.lifecycle.name`" apart from
+/// "the caller said `null`", and those mean opposite things:
+///
+///  * `None` — the body does not mention `index.lifecycle.name`. Leave the
+///    attachment exactly as it is.
+///  * `Some(None)` — explicit `null` (or an empty string): **detach**, ES's
+///    documented way to stop managing an index. Before #282 this arm did
+///    not exist: the null fell through `Value::as_str` and the index stayed
+///    attached to a policy whose delete phase later fired — the data-loss
+///    defect found in #262's review.
+///  * `Some(Some(policy))` — attach to `policy`.
+fn ilm_lifecycle_directive_from_settings(body: &Value) -> Option<Option<String>> {
     let settings = body.get("settings").unwrap_or(body);
-    settings
+    let v = settings
         .pointer("/index/lifecycle/name")
-        .or_else(|| settings.get("index.lifecycle.name"))
-        .and_then(Value::as_str)
-        .map(String::from)
+        .or_else(|| settings.get("index.lifecycle.name"))?;
+    match v {
+        Value::Null => Some(None),
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Some(None)
+            } else {
+                Some(Some(t.to_string()))
+            }
+        }
+        // Any other JSON type is not a policy name. Treat it as "said
+        // nothing" rather than guessing a detach out of a malformed body.
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -24072,41 +24113,37 @@ pub async fn put_ilm_policy(
     Path(name): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Translate into the shared internal model (`xerj_engine::lifecycle`)
+    // FIRST, and refuse the PUT outright if any part of the policy is not
+    // executable (issue #282, ported from #262's `validate_policy`
+    // allowlist). This used to accept the policy with an advisory
+    // `"xerj_lifecycle_execution": "unsupported"` note in the response —
+    // but nothing reads a response note twice: the policy sat stored and
+    // GET-able, looking configured, while executing less than it said (or
+    // nothing at all). Accepted-and-ignored is this repo's dominant bug
+    // class (#204); a 400 naming the action is the honest answer.
+    let policy = match xerj_engine::lifecycle::translate_ilm_policy(&body) {
+        Ok(policy) => policy,
+        Err(reason) => {
+            return ApiError::new(xerj_common::XerjError::invalid_query(format!(
+                "ILM policy '{name}' was refused, not stored: {reason}"
+            )))
+            .into_response();
+        }
+    };
+
     // Persist the raw policy verbatim in the ILM store; `get_ilm_policy`
     // reads it back out of this same DashMap, so PUT then GET round-trips
-    // faithfully regardless of whether translation below succeeds — and the
-    // store is written to `<data_dir>/cluster_state.json`, so it round-trips
-    // after a restart too (issue #203). This write goes first because it is
-    // the one that can fail loudly: if the document cannot be persisted the
-    // request is a 500 and nothing has happened yet, rather than an
-    // `acknowledged` that a reboot silently undoes.
+    // faithfully — and the store is written to
+    // `<data_dir>/cluster_state.json`, so it round-trips after a restart
+    // too (issue #203). If the document cannot be persisted the request is
+    // a 500 and nothing has happened, rather than an `acknowledged` that a
+    // reboot silently undoes.
     if let Err(e) = state.engine.put_ilm_policy(name.clone(), body.clone()) {
         return ApiError::new(xerj_common::XerjError::from(e)).into_response();
     }
-
-    // Translate into the shared internal model (`xerj_engine::lifecycle`)
-    // so the SAME background job that drives native ISM policies also
-    // drives this one — see that module's doc comment for why. Real ILM
-    // is lenient about phase actions it can't reproduce internally too
-    // (e.g. `searchable_snapshot` is best-effort); mirroring that, a
-    // translation failure here doesn't fail the PUT — the policy is
-    // still stored and GET-able, it just won't actually execute (no entry
-    // lands in `ism_policies`) until it's fixed. Surfaced back in the
-    // response so this isn't silent.
-    match xerj_engine::lifecycle::translate_ilm_policy(&body) {
-        Ok(policy) => {
-            state.engine.put_ism_policy(name, policy);
-            Json(json!({ "acknowledged": true })).into_response()
-        }
-        Err(reason) => Json(json!({
-            "acknowledged": true,
-            "xerj_lifecycle_execution": {
-                "status": "unsupported",
-                "reason": reason,
-            }
-        }))
-        .into_response(),
-    }
+    state.engine.put_ism_policy(name, policy);
+    Json(json!({ "acknowledged": true })).into_response()
 }
 
 // GET _ilm/policy (no name segment) — the form Kibana's own ILM UI calls to
@@ -24261,6 +24298,88 @@ pub async fn ilm_explain(
         }
     }
     Json(json!({ "indices": Value::Object(indices) })).into_response()
+}
+
+/// Resolve an index spec for the ILM endpoints that refuse ghosts: every
+/// *named* (non-wildcard) part must be an existing index or alias, and the
+/// result is filtered to indices that actually exist. A wildcard matching
+/// nothing is a legal empty answer (ES's `allow_no_indices=true` default);
+/// a literal that names nothing is a 404 `index_not_found_exception`.
+///
+/// Exists because `resolve_index_selector`'s documented fallback returns a
+/// literal name whether or not it exists — the right default for lenient
+/// read endpoints, and exactly wrong for a detach that writes a persisted
+/// tombstone per target (#262 shipped that bug first and fixed it as
+/// `resolve_existing_index_targets`; same name, same rule here).
+async fn resolve_existing_index_targets(
+    state: &AppState,
+    spec: &str,
+) -> Result<Vec<String>, xerj_common::XerjError> {
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part == "_all" || part.contains('*') {
+            continue;
+        }
+        if state.engine.get_index(part).is_err() && !state.engine.aliases.contains_key(part) {
+            return Err(xerj_common::XerjError::index_not_found(part));
+        }
+    }
+    Ok(resolve_index_selector(state, spec)
+        .await
+        .into_iter()
+        .filter(|t| state.engine.get_index(t).is_ok())
+        .collect())
+}
+
+/// `POST /{index}/_ilm/remove` — stop managing these indices (issue #282).
+///
+/// ES's own verb for detaching; until #282 the only detach route was `PUT
+/// /{index}/_settings {"index.lifecycle.name": null}` — which was itself
+/// silently ignored. Both now go through [`xerj_engine::Engine::detach_lifecycle`],
+/// so a detach is recorded (tombstoned + persisted) once, whichever surface
+/// the operator used.
+pub async fn remove_ilm_policy_from_index(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+) -> impl IntoResponse {
+    let targets = match resolve_existing_index_targets(&state, &index).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    for name in &targets {
+        state.engine.detach_lifecycle(name);
+    }
+    Json(json!({ "has_failures": false, "failed_indexes": [] })).into_response()
+}
+
+/// `GET /_ilm/status` — `RUNNING`/`STOPPED` plus XERJ's honest counters
+/// (issue #282). An operator halting retention needs to see that the halt
+/// took; a status endpoint that cannot disagree with the executor is the
+/// receipt (`operation_mode` reads the same flag `lifecycle::tick` checks).
+pub async fn get_ilm_status(State(state): State<AppState>) -> impl IntoResponse {
+    let running = state.engine.lifecycle_execution_running();
+    Json(json!({
+        "operation_mode": if running { "RUNNING" } else { "STOPPED" },
+        "xerj": {
+            "managed_indices": state.engine.managed_indices.len(),
+            "detached_indices": state.engine.lifecycle_detached.len(),
+            "policies": state.engine.ism_policies.len(),
+        }
+    }))
+    .into_response()
+}
+
+/// `POST /_ilm/start` and `POST /_ilm/stop` — the operator's kill switch
+/// (issue #282): halt lifecycle execution without stopping the node. The
+/// flag is in-memory (a restart resumes execution — erring on the side of
+/// retention running); the detach tombstone is the durable per-index stop.
+pub async fn start_ilm(State(state): State<AppState>) -> impl IntoResponse {
+    state.engine.set_lifecycle_execution_running(true);
+    Json(json!({ "acknowledged": true, "operation_mode": "RUNNING" })).into_response()
+}
+
+pub async fn stop_ilm(State(state): State<AppState>) -> impl IntoResponse {
+    state.engine.set_lifecycle_execution_running(false);
+    Json(json!({ "acknowledged": true, "operation_mode": "STOPPED" })).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
