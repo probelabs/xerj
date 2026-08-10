@@ -59,7 +59,20 @@ pub fn walk_reporting(
         let entry = match next {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("walk: skipping unreadable entry: {e}");
+                // This message renders the offending PATH, and it goes to the
+                // same stderr an agent parses for `xerj-progress` /
+                // `xerj-done` records. An unreadable directory whose name
+                // carries a newline would otherwise start a line here — the
+                // #278 forgery, through a surface the progress module does not
+                // own. Sanitised for the same reason and by the same rule.
+                //
+                // Routing this through `Progress` as well (so `--quiet` is
+                // silent and `--progress json` stays one object per line) needs
+                // a handle the walker does not have; that is a separate change.
+                eprintln!(
+                    "walk: skipping unreadable entry: {}",
+                    crate::progress::sanitize(&e.to_string(), crate::progress::SAFE_PATH_MAX)
+                );
                 continue;
             }
         };

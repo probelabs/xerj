@@ -221,7 +221,12 @@ pub fn print_help() {
              `xerj-progress` is the MACHINE line and keeps\n\
              the --progress-interval cadence; parse that one. --progress json\n\
              stays one object per line and carries the same rendered string in\n\
-             a `bar` field.\n\
+             a `bar` field on the same schedule: a string on the ticks that owe\n\
+             a bar, null in between.\n\
+             Every record is identified by its leading token, and that is\n\
+             enforced: paths and other outside text are stripped of control\n\
+             characters and bounded before they reach any line, so a crafted\n\
+             filename cannot forge a record or repaint your terminal.\n\
              `pct`/`eta_s` are the literal word `unknown` (JSON null) whenever they\n\
              cannot be computed honestly, never a filler number — and the drawn\n\
              bar obeys the same rule: `[????…]` when there is no denominator,\n\
