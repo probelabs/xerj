@@ -66,9 +66,15 @@ fn registry() -> &'static [LangDef] {
                 tree_sitter_javascript::LANGUAGE.into(),
                 JS_Q,
             ),
+            // `.mts`/`.cts` are TypeScript's ESM/CJS extensions — the exact
+            // counterparts of the `.mjs`/`.cjs` that javascript already claims
+            // below. Omitting them did not merely skip the AST pass: an
+            // unclaimed extension is not code to the sniffer at all, so those
+            // files fell through to the prose extractor and were chunked into
+            // several body-only records with no `language`, `defs` or `symbols`.
             def(
                 "typescript",
-                &["ts"],
+                &["ts", "mts", "cts"],
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 TS_Q,
             ),
@@ -583,6 +589,26 @@ mod tests {
         let s = syms("typescript", "export const Button = () => 1;\n");
         assert!(has(&s, "Button", "function"), "got {s:?}");
         assert!(has(&s, "Button", "const"), "got {s:?}");
+    }
+
+    /// `.mts`/`.cts` are TypeScript's ESM/CJS file extensions, the exact
+    /// counterparts of `.mjs`/`.cjs` which javascript already claims. Without
+    /// them a Node-ESM TypeScript file is not code to the sniffer at all: it
+    /// falls through to the prose extractor, so it yields no `language`, no
+    /// `defs`, no `symbols`, and gets chunked into several records instead of
+    /// one.
+    #[test]
+    fn typescript_module_extensions() {
+        assert!(is_code_ext("mts"), "mts must be recognised as code");
+        assert!(is_code_ext("cts"), "cts must be recognised as code");
+        for ext in ["mts", "cts"] {
+            let d = registry().iter().find(|d| d.exts.contains(&ext));
+            assert_eq!(
+                d.map(|d| d.name),
+                Some("typescript"),
+                "{ext} must route to the typescript grammar"
+            );
+        }
     }
     #[test]
     fn rust() {
