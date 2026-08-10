@@ -2324,7 +2324,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     )
                 }
             ));
-            pr.finish(
+            // `ignored_files_in_pruned_dirs` is budget-capped, so the flag
+            // saying whether it is a total or a floor travels with it (#279).
+            pr.finish_with_flags(
                 true,
                 0,
                 "dry-run",
@@ -2337,6 +2339,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                         ignore_report.files_inside_pruned_dirs,
                     ),
                 ],
+                &[(
+                    "ignored_files_in_pruned_dirs_exact",
+                    ignore_report.files_inside_pruned_dirs_is_exact(),
+                )],
             );
             return Ok((0, None));
         }
@@ -2776,7 +2782,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     if cfg.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         pr.note("(dry run — nothing indexed)");
-        pr.finish(
+        // As above: the count is capped, so the completeness flag ships with it.
+        pr.finish_with_flags(
             true,
             0,
             "dry-run",
@@ -2789,6 +2796,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     ignore_report.files_inside_pruned_dirs,
                 ),
             ],
+            &[(
+                "ignored_files_in_pruned_dirs_exact",
+                ignore_report.files_inside_pruned_dirs_is_exact(),
+            )],
         );
         return Ok((0, None));
     }

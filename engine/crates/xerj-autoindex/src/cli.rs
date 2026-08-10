@@ -155,12 +155,18 @@ pub fn print_help() {
                .gitignore   including nested ones and negation; the closest file wins.\n\
                .git/info/exclude  per-checkout excludes, including nested checkouts.\n\
                built-in     {defaults}\n\
+             Both git-owned kinds stop at a repository boundary, exactly as git does:\n\
+             a .gitignore above a nested checkout does not judge files inside it, so\n\
+             vendored and submoduled trees keep their own rules. .xerjignore and the\n\
+             built-in list are XERJ's, not git's, and apply throughout the folder.\n\
              Your global gitignore (core.excludesFile) is NOT read: a machine-wide\n\
              preference should not silently decide what is in your index.\n\
              A directory the rules reject is never descended, so nothing inside it is\n\
              stat-ed, hashed or sent. Every run prints what was dropped and by which\n\
-             rule; --dry-run additionally counts the files inside each pruned directory\n\
-             (bounded — past the budget the count is reported as `at least N`).\n\
+             rule; --dry-run additionally counts the non-hidden files inside each\n\
+             pruned directory (bounded — past the budget the count is reported as\n\
+             `at least N`, and xerj-done carries\n\
+             ignored_files_in_pruned_dirs_exact=false to say so).\n\
              The folder you name is never rejected: if it is itself ignored, it is\n\
              indexed anyway and the run says which rule it would have matched.\n\
          \n\
@@ -453,7 +459,11 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     // `--no-ignore` already removes the built-in defaults, so there is nothing
     // left for `--no-default-ignores` to do — say so instead of taking a flag
     // that changes nothing.
-    if no_ignore && no_default_ignores {
+    // Only meaningful for a run that walks a folder. On `map`/`status` neither
+    // flag does anything at all, and the arm below says so — a message about
+    // one flag subsuming the other would imply the pair is otherwise honoured.
+    let sub_walks_a_folder = !matches!(sub.as_deref(), Some("map") | Some("status"));
+    if no_ignore && no_default_ignores && sub_walks_a_folder {
         return Err(
             "--no-ignore already turns off the built-in default rules that --no-default-ignores \
              targets. Drop one of the two"
@@ -468,11 +478,37 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         );
     }
 
+    // `map` reads the catalog off the server and `status` reads the local
+    // journal; neither walks a filesystem, so an ignore flag on either cannot
+    // change one byte of the output. Measured before this check existed:
+    // `xerj autoindex map --no-ignore` was byte-identical to `xerj autoindex
+    // map`. Accepting it was the #204 accept-and-ignore class (#279).
+    let ignore_flags_used: Vec<&str> = [
+        ("--no-ignore", no_ignore),
+        ("--no-default-ignores", no_default_ignores),
+    ]
+    .into_iter()
+    .filter_map(|(name, used)| used.then_some(name))
+    .collect();
+
     match (sub.as_deref(), folder) {
         (Some("map"), _) | (Some("status"), _) if progress_explicit => Err(format!(
             "--progress/--progress-interval apply only to indexing, not `autoindex {}`",
             sub.as_deref().unwrap_or_default()
         )),
+        (Some("map"), _) | (Some("status"), _) if !ignore_flags_used.is_empty() => {
+            let sub = sub.as_deref().unwrap_or_default();
+            let (verb, them) = if ignore_flags_used.len() == 1 {
+                ("applies", "it")
+            } else {
+                ("apply", "them")
+            };
+            Err(format!(
+                "{} {verb} only to indexing, not `autoindex {sub}`: that subcommand never walks \
+                 a folder, so there is nothing for an ignore rule to skip. Drop {them}",
+                ignore_flags_used.join(" and "),
+            ))
+        }
         (Some("map"), _) if bulk_timeout_explicit => {
             Err("--bulk-timeout-secs applies only to indexing, not `autoindex map`".into())
         }
@@ -780,5 +816,51 @@ mod tests {
     fn no_default_ignores_under_no_ignore_is_refused() {
         let err = err(&["data", "--no-ignore", "--no-default-ignores"]);
         assert!(err.contains("--no-ignore already turns off"), "{err}");
+    }
+
+    /// #279, same class. `map` reads the catalog off the server and `status`
+    /// reads the local journal; neither walks a folder, so an ignore flag on
+    /// either changes nothing. Both were accepted, and `xerj autoindex map
+    /// --no-ignore` was measured byte-identical to `xerj autoindex map`.
+    #[test]
+    fn ignore_flags_are_rejected_for_non_index_subcommands_in_any_position() {
+        for args in [
+            vec!["map", "--no-ignore"],
+            vec!["--no-ignore", "map"],
+            vec!["map", "--no-default-ignores"],
+            vec!["--no-default-ignores", "map"],
+            vec!["status", "--no-ignore"],
+            vec!["--no-ignore", "status"],
+            vec!["status", "--no-default-ignores"],
+            vec!["--no-default-ignores", "status"],
+        ] {
+            let err = parse(args.iter().map(|a| a.to_string()).collect()).unwrap_err();
+            assert!(
+                err.contains("applies only to indexing") && err.contains("never walks a folder"),
+                "{args:?} -> {err}"
+            );
+        }
+    }
+
+    /// Both flags on `map` must be refused for the reason that is actually
+    /// true there — neither applies at all — not for the indexing-only reason
+    /// that one subsumes the other, which would imply the pair is honoured.
+    #[test]
+    fn both_ignore_flags_on_map_are_refused_as_inapplicable_not_as_redundant() {
+        let err = err(&["map", "--no-ignore", "--no-default-ignores"]);
+        assert!(err.contains("never walks a folder"), "{err}");
+        assert!(!err.contains("already turns off"), "{err}");
+        assert!(
+            err.contains("--no-ignore") && err.contains("--no-default-ignores"),
+            "both flags must be named: {err}"
+        );
+    }
+
+    /// …and the index path is untouched: the flags still work where they mean
+    /// something.
+    #[test]
+    fn ignore_flags_still_apply_to_an_index_run() {
+        assert!(!index(&["data", "--no-ignore"]).ignore.enabled);
+        assert!(!index(&["data", "--no-default-ignores"]).ignore.defaults);
     }
 }

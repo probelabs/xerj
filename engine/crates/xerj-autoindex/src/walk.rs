@@ -83,7 +83,7 @@ pub fn walk_reporting(
                 .to_str()
                 .is_some_and(|n| n.starts_with('.'))
         {
-            stack.record_hidden(entry.path(), is_dir);
+            stack.record_hidden(is_dir);
             if is_dir {
                 it.skip_current_dir();
             }
@@ -237,6 +237,144 @@ mod hidden_skip_tests {
             "{rels:?}"
         );
         assert_eq!(off.dirs_pruned, 0, "{off:?}");
+    }
+
+    /// Create a real checkout at `path`. Returns false when the `git` binary
+    /// is unavailable, in which case the caller still gets the on-disk shape
+    /// that matters (`.git/HEAD`) but skips the parity cross-check.
+    #[cfg(test)]
+    fn git_init(path: &std::path::Path) -> bool {
+        fs::create_dir_all(path).unwrap();
+        let ok = std::process::Command::new("git")
+            // A developer's global gitignore or an enclosing repo's config
+            // must not decide what this test sees.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            fs::create_dir_all(path.join(".git")).unwrap();
+            fs::write(path.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+        ok
+    }
+
+    /// Files a repository considers its own and does not ignore, as git itself
+    /// reports them. Dotfiles are dropped because XERJ's separate, non-optional
+    /// hidden-file rule removes them before any ignore rule is consulted.
+    #[cfg(test)]
+    fn git_untracked_visible_files(repo: &std::path::Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(repo)
+            .output()
+            .expect("git status");
+        let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix("?? "))
+            .map(|p| p.trim_matches('"').to_string())
+            .filter(|p| !p.split('/').any(|c| c.starts_with('.')))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// #279 (follow-up to #276). An outer repository's `.gitignore` must not
+    /// judge files inside a nested checkout.
+    ///
+    /// This is git's authority model, not a nicety: the repository that owns a
+    /// file decides whether it is ignored. `git status` in the outer repo does
+    /// not descend into a nested checkout at all, and `git status` inside the
+    /// nested one never consults the outer's `.gitignore`. The first cut of
+    /// this feature walked every layer with no boundary stop, so a root `*.md`
+    /// hid the README of every vendored dependency below it.
+    ///
+    /// The fixture is a real nested checkout — the boundary is a `.git` on
+    /// disk, so a matcher-level unit test could not have caught this.
+    #[test]
+    fn an_outer_repository_does_not_judge_a_nested_checkout() {
+        use super::walk_reporting;
+        use crate::ignore_rules::IgnoreOptions;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("outer");
+        let have_git = git_init(&root);
+        fs::write(root.join(".gitignore"), "*.md\n").unwrap();
+        fs::write(root.join("OUTER.md"), "outer, and outer's to ignore").unwrap();
+        fs::write(root.join("keep.txt"), "x").unwrap();
+
+        let inner = root.join("vendored");
+        git_init(&inner);
+        fs::write(inner.join(".gitignore"), "local-junk.txt\n").unwrap();
+        fs::write(inner.join("README.md"), "the vendored project's own README").unwrap();
+        fs::write(inner.join("local-junk.txt"), "inner's own rule drops this").unwrap();
+        fs::create_dir_all(inner.join("src")).unwrap();
+        fs::write(inner.join("src").join("guide.md"), "also the inner repo's").unwrap();
+
+        let (files, _) = walk_reporting(&root, false, IgnoreOptions::default()).unwrap();
+        let mut rels: Vec<String> = files.into_iter().map(|e| e.rel).collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec![
+                "keep.txt".to_string(),
+                "vendored/README.md".to_string(),
+                "vendored/src/guide.md".to_string(),
+            ],
+            "the outer *.md must stop at the nested checkout, and the inner \
+             repo's own rule must still apply inside it: {rels:?}"
+        );
+
+        // Parity with the tool whose semantics we claim to reproduce: the set
+        // XERJ keeps under `vendored/` is the set the nested repository itself
+        // reports as its own, unignored, visible files.
+        if have_git {
+            let from_git = git_untracked_visible_files(&inner);
+            assert_eq!(
+                from_git,
+                vec!["README.md".to_string(), "src/guide.md".to_string()],
+                "fixture drifted from git's own answer"
+            );
+            let from_xerj: Vec<String> = rels
+                .iter()
+                .filter_map(|r| r.strip_prefix("vendored/").map(str::to_string))
+                .collect();
+            assert_eq!(from_xerj, from_git, "XERJ and git must agree");
+        }
+    }
+
+    /// The other half of the boundary: `.xerjignore` is XERJ's own file, not
+    /// git's, and its stated job is to govern the folder you pointed at. It
+    /// deliberately keeps its authority across a nested checkout, so one file
+    /// at the root can say "not this, anywhere below here".
+    #[test]
+    fn a_root_xerjignore_still_reaches_into_a_nested_checkout() {
+        use super::walk_reporting;
+        use crate::ignore_rules::IgnoreOptions;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("outer");
+        git_init(&root);
+        fs::write(root.join(".xerjignore"), "*.md\n").unwrap();
+        fs::write(root.join("keep.txt"), "x").unwrap();
+
+        let inner = root.join("vendored");
+        git_init(&inner);
+        fs::write(inner.join("README.md"), "x").unwrap();
+        fs::write(inner.join("code.rs"), "x").unwrap();
+
+        let (files, _) = walk_reporting(&root, false, IgnoreOptions::default()).unwrap();
+        let mut rels: Vec<String> = files.into_iter().map(|e| e.rel).collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec!["keep.txt".to_string(), "vendored/code.rs".to_string()],
+            "{rels:?}"
+        );
     }
 
     #[test]
