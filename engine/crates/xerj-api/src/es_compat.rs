@@ -617,8 +617,30 @@ async fn cluster_health_inner(
 // GET /_cat/indices
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_indices(State(state): State<AppState>) -> impl IntoResponse {
-    cat_indices_inner(state, None).await
+/// Shared query params for the `_cat/*` handlers that previously ignored
+/// `format` entirely. Real ES/OS `_cat/*?format=json` returns a JSON array
+/// of objects (one per row, keyed by the same column names the `v`-header
+/// text form would print) instead of the aligned plain-text table — every
+/// modern client (`opensearch-js`'s `cat.*()` methods, and specifically
+/// OpenSearch Dashboards' Index Management backend) requests that form and
+/// silently breaks when it gets text back instead: the JSON parse either
+/// throws outright or returns something that isn't an array, and the
+/// frontend's `.map()` over it throws `Cannot read properties of undefined
+/// (reading 'map')`. `v` is accepted for parity but doesn't change output
+/// here — these handlers never printed a header row to begin with.
+#[derive(Debug, Deserialize, Default)]
+pub struct CatFormatParams {
+    #[serde(default)]
+    pub v: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+pub async fn cat_indices(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
+    cat_indices_inner(state, None, params).await
 }
 
 /// `GET /_cat/indices/{pattern}` — the per-index / pattern-scoped variant.
@@ -630,11 +652,16 @@ pub async fn cat_indices(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn cat_indices_pattern(
     State(state): State<AppState>,
     Path(pattern): Path<String>,
+    Query(params): Query<CatFormatParams>,
 ) -> impl IntoResponse {
-    cat_indices_inner(state, Some(pattern)).await
+    cat_indices_inner(state, Some(pattern), params).await
 }
 
-async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::response::Response {
+async fn cat_indices_inner(
+    state: AppState,
+    pattern: Option<String>,
+    params: CatFormatParams,
+) -> axum::response::Response {
     let indices = state.engine.list_indices().await;
     // Indices whose directory exists but refused to open. They are listed as
     // `red` rather than omitted: an index the operator can see is an index the
@@ -679,7 +706,7 @@ async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::re
         }
     };
 
-    let mut lines = Vec::new();
+    let mut rows = Vec::new();
     for info in &selected {
         // Real on-disk size: recursive byte sum of the index's data_dir.
         // Single-shard (pri=1, rep=0), so store.size == pri.store.size, and
@@ -690,24 +717,22 @@ async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::re
             .get_index(&info.name)
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
-        let hsize = human_bytes(size);
-        lines.push(format!(
-            "green open {} {} 1 0 {} 0 {} {} {}",
-            info.name,
-            // Emit the stable REAL settings uuid (the same value
-            // GET /{index}/_settings returns), not a fresh random one per call.
+        // Emit the stable REAL settings uuid (the same value
+        // GET /{index}/_settings returns), not a fresh random one per call.
+        rows.push((
+            info.name.clone(),
             stable_index_uuid(&info.name),
             info.doc_count,
-            hsize,
-            hsize,
-            hsize,
+            human_bytes(size),
         ));
     }
 
     // Failed indices, after the healthy ones. `red` is the status column and
     // the shard is unassigned, so `pri` is 1 and every stat column is 0 —
     // nothing about the contents can be read, and guessing a doc count here
-    // would be a claim we cannot back.
+    // would be a claim we cannot back. Selected via the same pattern rules
+    // as the healthy set above (issue #206: a failed index is still an
+    // index the operator can see and delete, not silently omitted).
     let selected_failed: Vec<&xerj_engine::engine::FailedIndex> = match pattern.as_deref() {
         None => failed.iter().collect(),
         Some(pat) => failed
@@ -722,14 +747,55 @@ async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::re
             })
             .collect(),
     };
-    for f in selected_failed {
-        lines.push(format!(
-            "red open {} {} 1 0 0 0 0b 0b 0b",
-            f.name,
-            stable_index_uuid(&f.name),
-        ));
+    let failed_rows: Vec<(String, String)> = selected_failed
+        .iter()
+        .map(|f| (f.name.clone(), stable_index_uuid(&f.name)))
+        .collect();
+
+    if params.format.as_deref() == Some("json") {
+        let mut arr: Vec<Value> = rows
+            .iter()
+            .map(|(name, uuid, doc_count, hsize)| {
+                json!({
+                    "health": "green",
+                    "status": "open",
+                    "index": name,
+                    "uuid": uuid,
+                    "pri": "1",
+                    "rep": "0",
+                    "docs.count": doc_count.to_string(),
+                    "docs.deleted": "0",
+                    "store.size": hsize,
+                    "pri.store.size": hsize,
+                })
+            })
+            .collect();
+        arr.extend(failed_rows.iter().map(|(name, uuid)| {
+            json!({
+                "health": "red",
+                "status": "open",
+                "index": name,
+                "uuid": uuid,
+                "pri": "1",
+                "rep": "0",
+                "docs.count": "0",
+                "docs.deleted": "0",
+                "store.size": "0b",
+                "pri.store.size": "0b",
+            })
+        }));
+        return Json(arr).into_response();
     }
 
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|(name, uuid, doc_count, hsize)| {
+            format!("green open {name} {uuid} 1 0 {doc_count} 0 {hsize} {hsize} {hsize}")
+        })
+        .collect();
+    for (name, uuid) in &failed_rows {
+        lines.push(format!("red open {name} {uuid} 1 0 0 0 0b 0b 0b"));
+    }
     // ES returns an empty body (not a bare newline) when nothing matches.
     let body = if lines.is_empty() {
         String::new()
@@ -793,6 +859,82 @@ fn stable_index_uuid(name: &str) -> String {
     name.hash(&mut lo);
     let low = lo.finish();
     Uuid::from_u128(((high as u128) << 64) | (low as u128)).to_string()
+}
+
+#[cfg(test)]
+mod cat_format_json_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Real OpenSearch Dashboards' Index Management "Indexes" page (and any
+    /// other `opensearch-js`/`@elastic/elasticsearch`-based client) requests
+    /// `_cat/indices?format=json` and expects a JSON array — `_cat/indices`
+    /// previously ignored `format` entirely and always returned the
+    /// plain-text table, which OSD's backend can't parse into an array,
+    /// producing `Cannot read properties of undefined (reading 'map')`
+    /// client-side. Root-caused by diffing against a real OpenSearch node.
+    #[tokio::test]
+    async fn cat_indices_format_json_returns_a_real_json_array() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/cat-json-test-idx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let (status, body) = get(&app, "/_cat/indices?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.as_array().expect("json array, not text/plain body");
+        let row = arr
+            .iter()
+            .find(|r| r["index"] == "cat-json-test-idx")
+            .expect("row present");
+        assert_eq!(row["health"], "green");
+        assert_eq!(row["status"], "open");
+        assert_eq!(row["docs.count"], "0");
+
+        // Text form (no `format` param) must be untouched.
+        let text = app
+            .oneshot(Request::get("/_cat/indices").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            text.headers().get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -16105,7 +16247,10 @@ async fn cat_ann_inner(
 /// and `/health/ready` all knew, and `_cat/health` said everything was fine
 /// (issue #206). It now reports the same status `_cluster/health` computes,
 /// from the same inputs.
-pub async fn cat_health(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_health(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     let health = state.engine.health().await;
     // epoch  timestamp  cluster  status  node.total  node.data  shards  pri  relo  init  unassign  pending_tasks  max_task_wait_time  active_shards_percent
     let epoch = std::time::SystemTime::now()
@@ -16127,6 +16272,27 @@ pub async fn cat_health(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         (shards as f64) / (total as f64) * 100.0
     };
+
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "epoch": epoch.to_string(),
+            "timestamp": ts,
+            "cluster": "xerj",
+            "status": status,
+            "node.total": "1",
+            "node.data": "1",
+            "shards": shards.to_string(),
+            "pri": shards.to_string(),
+            "relo": "0",
+            "init": "0",
+            "unassign": unassigned.to_string(),
+            "pending_tasks": "0",
+            "max_task_wait_time": "-",
+            "active_shards_percent": format!("{pct:.1}%"),
+        })])
+        .into_response();
+    }
+
     let body = format!(
         "{epoch} {ts} xerj {status} 1 1 {shards} {shards} 0 0 {unassigned} 0 - {pct:.1}%\n"
     );
@@ -16145,7 +16311,10 @@ pub async fn cat_health(State(state): State<AppState>) -> impl IntoResponse {
 // GET /_cat/nodes
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_nodes(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_nodes(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // ip  heap.percent  ram.percent  cpu  load_1m  load_5m  load_15m  node.role  master  name
     let (mem_total, mem_avail) = read_meminfo().unwrap_or((0, 0));
     // ram.percent = (1 - MemAvailable/MemTotal) * 100
@@ -16165,6 +16334,23 @@ pub async fn cat_nodes(State(state): State<AppState>) -> impl IntoResponse {
     let cpu = sample_cpu_percent().await;
     let (l1, l5, l15) = read_loadavg();
     let name = state.engine.node_id.as_str();
+
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "ip": "127.0.0.1",
+            "heap.percent": heap_percent.to_string(),
+            "ram.percent": ram_percent.to_string(),
+            "cpu": cpu.to_string(),
+            "load_1m": format!("{l1:.2}"),
+            "load_5m": format!("{l5:.2}"),
+            "load_15m": format!("{l15:.2}"),
+            "node.role": "cdfhilmrstw",
+            "master": "*",
+            "name": name,
+        })])
+        .into_response();
+    }
+
     let body = format!(
         "127.0.0.1 {heap_percent} {ram_percent} {cpu} {l1:.2} {l5:.2} {l15:.2} cdfhilmrstw * {name}\n"
     );
@@ -21416,15 +21602,40 @@ mod scripted_update_publication_tests {
 // GET /_cat/aliases
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_aliases(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_aliases(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // alias  index  filter  routing.index  routing.search  is_write_index
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, String)> = Vec::new();
     for entry in state.engine.aliases.iter() {
         let alias = entry.key();
         for idx_name in entry.value().iter() {
-            lines.push(format!("{} {} - - - -", alias, idx_name));
+            rows.push((alias.clone(), idx_name.clone()));
         }
     }
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(alias, index)| {
+                json!({
+                    "alias": alias,
+                    "index": index,
+                    "filter": "-",
+                    "routing.index": "-",
+                    "routing.search": "-",
+                    "is_write_index": "-",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(alias, index)| format!("{alias} {index} - - - -"))
+        .collect();
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -21448,6 +21659,7 @@ pub async fn cat_aliases(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn cat_count(
     State(state): State<AppState>,
     Path(index): Path<String>,
+    Query(params): Query<CatFormatParams>,
 ) -> impl IntoResponse {
     // Sum doc counts across every index the spec matches (comma/wildcard/
     // `_all`) — previously a wildcard/comma spec just missed the single
@@ -21470,6 +21682,15 @@ pub async fn cat_count(
         .as_secs();
     let ts = Utc::now().format("%H:%M:%S").to_string();
 
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "epoch": epoch.to_string(),
+            "timestamp": ts,
+            "count": count.to_string(),
+        })])
+        .into_response();
+    }
+
     // epoch  timestamp  count
     let body = format!("{epoch} {ts} {count}\n");
     (
@@ -21487,10 +21708,13 @@ pub async fn cat_count(
 // GET /_cat/shards
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_shards(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_shards(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // index  shard  prirep  state  docs  store  ip           node
     let indices = state.engine.list_indices().await;
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, u64, u64)> = Vec::new();
     for info in &indices {
         // Real on-disk size: recursive byte sum of the index's data_dir.
         let store_bytes = state
@@ -21498,16 +21722,57 @@ pub async fn cat_shards(State(state): State<AppState>) -> impl IntoResponse {
             .get_index(&info.name)
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
-        lines.push(format!(
-            "{} 0 p STARTED {} {}b 127.0.0.1 xerj-node-1",
-            info.name, info.doc_count, store_bytes,
-        ));
+        rows.push((info.name.clone(), info.doc_count, store_bytes));
     }
     // `_cat/shards` is the call an operator makes straight after seeing a red
     // cluster, so an index whose primary could not be opened has to be in it.
     // ES prints UNASSIGNED rows with no node and empty stats.
-    for f in state.engine.list_failed_indices() {
-        lines.push(format!("{} 0 p UNASSIGNED 0 0b - -", f.name));
+    let failed_names: Vec<String> = state
+        .engine
+        .list_failed_indices()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+
+    if params.format.as_deref() == Some("json") {
+        let mut arr: Vec<Value> = rows
+            .iter()
+            .map(|(name, docs, store_bytes)| {
+                json!({
+                    "index": name,
+                    "shard": "0",
+                    "prirep": "p",
+                    "state": "STARTED",
+                    "docs": docs.to_string(),
+                    "store": format!("{store_bytes}b"),
+                    "ip": "127.0.0.1",
+                    "node": "xerj-node-1",
+                })
+            })
+            .collect();
+        arr.extend(failed_names.iter().map(|name| {
+            json!({
+                "index": name,
+                "shard": "0",
+                "prirep": "p",
+                "state": "UNASSIGNED",
+                "docs": "0",
+                "store": "0b",
+                "ip": "-",
+                "node": "-",
+            })
+        }));
+        return Json(arr).into_response();
+    }
+
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|(name, docs, store_bytes)| {
+            format!("{name} 0 p STARTED {docs} {store_bytes}b 127.0.0.1 xerj-node-1")
+        })
+        .collect();
+    for name in &failed_names {
+        lines.push(format!("{name} 0 p UNASSIGNED 0 0b - -"));
     }
     let body = if lines.is_empty() {
         String::new()
@@ -23382,34 +23647,45 @@ pub async fn put_data_stream(
     }
 }
 
+/// `GET /_data_stream/{pattern}` — a comma-separated list of concrete names
+/// and/or glob patterns, same selector rules as `_cat/indices/{pattern}`: a
+/// WILDCARD matching nothing is an empty 200, a CONCRETE name matching
+/// nothing 404s. Previously only recognized the exact literals `*`/`_all`
+/// as wildcards — anything else, including the double-asterisk `**`
+/// OpenSearch Dashboards' own Data Streams page requests, fell through to
+/// the concrete-name branch and 404'd with `index_not_found_exception`
+/// even though it's a legitimate wildcard matching zero streams.
 pub async fn get_data_stream(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if name == "*" || name == "_all" {
-        let streams: Vec<Value> = state
-            .engine
-            .data_streams
-            .iter()
-            .map(|entry| {
-                let ds = entry.value();
-                data_stream_to_json(ds)
-            })
-            .collect();
-        return Json(json!({ "data_streams": streams })).into_response();
+    let parts: Vec<&str> = name
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let is_wildcard = |p: &str| p == "_all" || p.contains('*');
+
+    for &p in &parts {
+        if !is_wildcard(p) && !state.engine.data_streams.contains_key(p) {
+            let e = xerj_common::XerjError::index_not_found(format!("data_stream [{p}] missing"));
+            return ApiError::new(e).into_response();
+        }
     }
 
-    match state.engine.data_streams.get(&name) {
-        Some(ds) => {
-            let body = data_stream_to_json(ds.value());
-            Json(json!({ "data_streams": [body] })).into_response()
-        }
-        None => {
-            let e =
-                xerj_common::XerjError::index_not_found(format!("data_stream [{name}] missing"));
-            ApiError::new(e).into_response()
-        }
-    }
+    let streams: Vec<Value> = state
+        .engine
+        .data_streams
+        .iter()
+        .filter(|entry| {
+            let ds_name = entry.key();
+            parts
+                .iter()
+                .any(|&p| is_wildcard(p) || p == ds_name || glob_match_simple(p, ds_name))
+        })
+        .map(|entry| data_stream_to_json(entry.value()))
+        .collect();
+    Json(json!({ "data_streams": streams })).into_response()
 }
 
 fn data_stream_to_json(ds: &xerj_engine::engine::DataStream) -> Value {
@@ -23421,6 +23697,92 @@ fn data_stream_to_json(ds: &xerj_engine::engine::DataStream) -> Value {
         "status": "GREEN",
         "template": "",
     })
+}
+
+#[cfg(test)]
+mod data_stream_wildcard_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    /// OpenSearch Dashboards' Data Streams page calls `GET _data_stream/**`
+    /// to list everything. Only the exact literals `*`/`_all` were ever
+    /// recognized as wildcards, so `**` fell into the concrete-name branch
+    /// and 404'd with `index_not_found_exception: data_stream [**] missing`
+    /// — even with zero data streams, where real ES/OS returns an empty
+    /// array with 200. Confirmed against a real OpenSearch node.
+    #[tokio::test]
+    async fn double_asterisk_wildcard_with_no_streams_is_empty_200_not_404() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::get("/_data_stream/**")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["data_streams"], json!([]));
+    }
+
+    /// A concrete, non-wildcard name that doesn't exist must still 404 —
+    /// this fix is scoped to wildcard recognition, not to loosening that.
+    #[tokio::test]
+    async fn concrete_missing_name_still_404s() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::get("/_data_stream/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// OSD's Index Management pages call `/api/dataconnections` on every
+    /// load, which proxies straight through to this route; it was entirely
+    /// unregistered (404), which OSD's own backend turned into an opaque
+    /// 500 and a stray "Not Found" toast even on pages unrelated to Query
+    /// Workbench. xerj has no external-data-connection subsystem, so an
+    /// honest empty list (not a 404) is the correct answer.
+    #[tokio::test]
+    async fn query_workbench_datasources_is_an_honest_empty_list_not_404() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::get("/_plugins/_query/_datasources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, json!([]));
+    }
 }
 
 pub async fn delete_data_stream(
@@ -23569,6 +23931,28 @@ pub async fn delete_component_template(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /_plugins/_query/_datasources
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Real OpenSearch's Query Workbench / async-query plugin lists configured
+/// EXTERNAL data connections (S3, Prometheus, Security Lake, ...) here.
+/// xerj has no such pluggable-connector subsystem, so the honest answer —
+/// same principle as `cat_plugins`/`cat_pending_tasks` returning empty
+/// rather than fabricating entries — is zero connections, not a 404.
+///
+/// Found missing while diffing OpenSearch Dashboards' Index Management
+/// pages against a real OpenSearch node: this route was entirely
+/// unregistered (404), which OSD's own `/api/dataconnections` backend
+/// proxy turns into an opaque 500 ("Issue in fetching data sources:
+/// StatusCodeError: Not Found" in its own logs) — every Index Management
+/// page calls it on load regardless of which tab is open, so the missing
+/// route surfaced as a stray "Not Found" toast even on pages that have
+/// nothing to do with Query Workbench.
+pub async fn query_workbench_datasources() -> impl IntoResponse {
+    Json(Vec::<Value>::new())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /_cluster/state
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -23694,7 +24078,10 @@ pub async fn cluster_state(State(state): State<AppState>) -> impl IntoResponse {
 // GET /_cat/allocation
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_allocation(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_allocation(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // shards  disk.indices  disk.used  disk.avail  disk.total  disk.percent  host         ip           node
     let health = state.engine.health().await;
 
@@ -23719,6 +24106,22 @@ pub async fn cat_allocation(State(state): State<AppState>) -> impl IntoResponse 
         .unwrap_or(0);
 
     let shards = health.index_count;
+
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "shards": shards.to_string(),
+            "disk.indices": format!("{indices_bytes}b"),
+            "disk.used": format!("{disk_used_bytes}b"),
+            "disk.avail": format!("{disk_avail}b"),
+            "disk.total": format!("{disk_total}b"),
+            "disk.percent": disk_percent.to_string(),
+            "host": "127.0.0.1",
+            "ip": "127.0.0.1",
+            "node": "xerj-node-1",
+        })])
+        .into_response();
+    }
+
     let body = format!(
         "{shards} {indices_bytes}b {disk_used_bytes}b {disk_avail}b {disk_total}b {disk_percent} 127.0.0.1 127.0.0.1 xerj-node-1\n"
     );
@@ -24542,7 +24945,10 @@ pub async fn cluster_allocation_explain(
 // GET /_cat/master
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_recovery(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_recovery(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // ES _cat/recovery default column order:
     // index shard time type stage source_host source_node target_host
     // target_node repository snapshot files files_recovered files_percent
@@ -24553,20 +24959,62 @@ pub async fn cat_recovery(State(state): State<AppState>) -> impl IntoResponse {
     // existing_store recovery (stage=done, 100.0%). Files = segment count,
     // bytes = real on-disk data_dir size, translog ops = doc count.
     let indices = state.engine.list_indices().await;
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, u64, u64, u64)> = Vec::new();
     for info in &indices {
         let bytes = state
             .engine
             .get_index(&info.name)
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
-        let files = info.segment_count;
-        let docs = info.doc_count;
-        lines.push(format!(
-            "{} 0 0ms existing_store done n/a n/a 127.0.0.1 xerj-node-1 n/a n/a {files} {files} 100.0% {files} {bytes} {bytes} 100.0% {bytes} {docs} {docs} 100.0%",
-            info.name,
+        rows.push((
+            info.name.clone(),
+            info.segment_count as u64,
+            bytes,
+            info.doc_count,
         ));
     }
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(name, files, bytes, docs)| {
+                json!({
+                    "index": name,
+                    "shard": "0",
+                    "time": "0ms",
+                    "type": "existing_store",
+                    "stage": "done",
+                    "source_host": "n/a",
+                    "source_node": "n/a",
+                    "target_host": "127.0.0.1",
+                    "target_node": "xerj-node-1",
+                    "repository": "n/a",
+                    "snapshot": "n/a",
+                    "files": files.to_string(),
+                    "files_recovered": files.to_string(),
+                    "files_percent": "100.0%",
+                    "files_total": files.to_string(),
+                    "bytes": bytes.to_string(),
+                    "bytes_recovered": bytes.to_string(),
+                    "bytes_percent": "100.0%",
+                    "bytes_total": bytes.to_string(),
+                    "translog_ops": docs.to_string(),
+                    "translog_ops_recovered": docs.to_string(),
+                    "translog_ops_percent": "100.0%",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(name, files, bytes, docs)| {
+            format!(
+                "{name} 0 0ms existing_store done n/a n/a 127.0.0.1 xerj-node-1 n/a n/a {files} {files} 100.0% {files} {bytes} {bytes} 100.0% {bytes} {docs} {docs} 100.0%",
+            )
+        })
+        .collect();
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -24586,10 +25034,11 @@ pub async fn cat_recovery(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn cat_segments(
     State(state): State<AppState>,
     Path(index): Path<String>,
+    Query(params): Query<CatFormatParams>,
 ) -> impl IntoResponse {
     // index  shard  prirep  ip           segment  generation  docs.count  docs.deleted  size  size.memory  committed  searchable  version  compound
     let node = state.engine.node_id.as_str();
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, u64, u64)> = Vec::new();
     let indices_to_list: Vec<String> = if index == "_all" || index == "*" {
         state
             .engine
@@ -24611,15 +25060,44 @@ pub async fn cat_segments(
             // and persisted). We do NOT fabricate a Lucene version string —
             // xerj has no Lucene segments — so we report the xerj build version.
             let _ = node; // segments output has no node column in ES; kept for parity
-            lines.push(format!(
-                "{} 0 p 127.0.0.1 _0 0 {} 0 {}b 0 true true {} true",
-                idx_name,
-                stats.doc_count,
-                size,
-                env!("CARGO_PKG_VERSION"),
-            ));
+            rows.push((idx_name.clone(), stats.doc_count, size));
         }
     }
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(idx_name, doc_count, size)| {
+                json!({
+                    "index": idx_name,
+                    "shard": "0",
+                    "prirep": "p",
+                    "ip": "127.0.0.1",
+                    "segment": "_0",
+                    "generation": "0",
+                    "docs.count": doc_count.to_string(),
+                    "docs.deleted": "0",
+                    "size": format!("{size}b"),
+                    "size.memory": "0",
+                    "committed": "true",
+                    "searchable": "true",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "compound": "true",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(idx_name, doc_count, size)| {
+            format!(
+                "{idx_name} 0 p 127.0.0.1 _0 0 {doc_count} 0 {size}b 0 true true {} true",
+                env!("CARGO_PKG_VERSION"),
+            )
+        })
+        .collect();
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -24636,7 +25114,10 @@ pub async fn cat_segments(
         .into_response()
 }
 
-pub async fn cat_thread_pool(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_thread_pool(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // ES default columns: node_name name active queue rejected
     //
     // xerj does NOT use ES-style fixed, bounded thread pools — it schedules all
@@ -24658,6 +25139,23 @@ pub async fn cat_thread_pool(State(state): State<AppState>) -> impl IntoResponse
         "warmer",
         "generic",
     ];
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = pools
+            .iter()
+            .map(|p| {
+                json!({
+                    "node_name": node,
+                    "name": p,
+                    "active": "0",
+                    "queue": "0",
+                    "rejected": "0",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let body = pools
         .iter()
         .map(|p| format!("{node} {p} 0 0 0"))
@@ -24675,10 +25173,31 @@ pub async fn cat_thread_pool(State(state): State<AppState>) -> impl IntoResponse
         .into_response()
 }
 
-pub async fn cat_fielddata(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_fielddata(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // id  host         ip           node          field  size
     let node = state.engine.node_id.as_str();
     let indices = state.engine.list_indices().await;
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = indices
+            .iter()
+            .map(|info| {
+                json!({
+                    "id": node,
+                    "host": "127.0.0.1",
+                    "ip": "127.0.0.1",
+                    "node": node,
+                    "field": info.name,
+                    "size": "0b",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = Vec::new();
     for info in &indices {
         // Honest 0b fielddata usage per index: xerj has no fielddata cache.
@@ -24703,12 +25222,20 @@ pub async fn cat_fielddata(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn cat_pending_tasks(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_pending_tasks(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // insertOrder  timeInQueue  priority  source
     // Single-node: there is no cluster-state task queue (master service), so
     // the pending-task set is always empty. Derive it from that fact rather
     // than hardcoding — touch node_id so this is genuinely state-derived.
     let _node = state.engine.node_id.as_str();
+
+    if params.format.as_deref() == Some("json") {
+        return Json(Vec::<Value>::new()).into_response();
+    }
+
     let lines: Vec<String> = Vec::new();
     let body = if lines.is_empty() {
         String::new()
@@ -24726,12 +25253,20 @@ pub async fn cat_pending_tasks(State(state): State<AppState>) -> impl IntoRespon
         .into_response()
 }
 
-pub async fn cat_plugins(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_plugins(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // name  component  version  description
     // xerj has no plugin system — everything is built-in — so the honest,
     // state-derived answer is an empty body. (node_id touched so this is not
     // a bare constant.)
     let _node = state.engine.node_id.as_str();
+
+    if params.format.as_deref() == Some("json") {
+        return Json(Vec::<Value>::new()).into_response();
+    }
+
     let lines: Vec<String> = Vec::new();
     let body = if lines.is_empty() {
         String::new()
@@ -24749,13 +25284,33 @@ pub async fn cat_plugins(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn cat_nodeattrs(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_nodeattrs(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // node  host         ip           attr  value
     // Emit only attributes xerj can honestly report. There are no custom
     // user-configured node attributes and no ML subsystem, so we surface a
     // single real attribute: xpack.installed = false (xerj ships no X-Pack).
     let node = state.engine.node_id.as_str();
     let attrs: Vec<(&str, &str)> = vec![("xpack.installed", "false")];
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = attrs
+            .iter()
+            .map(|(attr, value)| {
+                json!({
+                    "node": node,
+                    "host": "127.0.0.1",
+                    "ip": "127.0.0.1",
+                    "attr": attr,
+                    "value": value,
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = Vec::new();
     for (attr, value) in &attrs {
         lines.push(format!("{node} 127.0.0.1 127.0.0.1 {attr} {value}"));
@@ -24776,9 +25331,23 @@ pub async fn cat_nodeattrs(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn cat_master(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_master(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // id                     host      ip        node
     let id = state.engine.node_id.as_str();
+
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "id": id,
+            "host": "127.0.0.1",
+            "ip": "127.0.0.1",
+            "node": id,
+        })])
+        .into_response();
+    }
+
     let body = format!("{id} 127.0.0.1 127.0.0.1 {id}\n");
     (
         StatusCode::OK,
@@ -31897,7 +32466,29 @@ pub async fn get_ml_records(
 
 /// GET /_cat/ml/anomaly_detectors — one line per real detector.
 /// Columns: id state source_index function bucket_span
-pub async fn cat_ml_anomaly_detectors(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_ml_anomaly_detectors(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
+    if params.format.as_deref() == Some("json") {
+        let mut arr: Vec<Value> = state
+            .ml_detectors
+            .iter()
+            .map(|e| {
+                let d = e.value();
+                json!({
+                    "id": d.detector_id,
+                    "state": "opened",
+                    "source_index": d.source_index,
+                    "function": d.function,
+                    "bucket_span": d.bucket_span,
+                })
+            })
+            .collect();
+        arr.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = state
         .ml_detectors
         .iter()
@@ -31928,7 +32519,27 @@ pub async fn cat_ml_anomaly_detectors(State(state): State<AppState>) -> impl Int
 
 /// GET /_cat/ml/datafeeds — one line per real datafeed.
 /// Columns: id state job_id
-pub async fn cat_ml_datafeeds(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_ml_datafeeds(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
+    if params.format.as_deref() == Some("json") {
+        let mut arr: Vec<Value> = state
+            .ml_datafeeds
+            .iter()
+            .map(|e| {
+                let f = e.value();
+                json!({
+                    "id": f.datafeed_id,
+                    "state": f.state,
+                    "job_id": f.job_id,
+                })
+            })
+            .collect();
+        arr.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = state
         .ml_datafeeds
         .iter()
@@ -31954,7 +32565,10 @@ pub async fn cat_ml_datafeeds(State(state): State<AppState>) -> impl IntoRespons
         .into_response()
 }
 
-pub async fn cat_ml_trained_models() -> impl IntoResponse {
+pub async fn cat_ml_trained_models(Query(params): Query<CatFormatParams>) -> impl IntoResponse {
+    if params.format.as_deref() == Some("json") {
+        return Json(Vec::<Value>::new()).into_response();
+    }
     (
         StatusCode::OK,
         [(
@@ -31963,6 +32577,7 @@ pub async fn cat_ml_trained_models() -> impl IntoResponse {
         )],
         "",
     )
+        .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33155,9 +33770,31 @@ pub async fn simulate_index_template_body(
 // GET /_cat/repositories
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_tasks(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_tasks(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // action  task_id  type  running_time  ip  node — backed by the real
     // in-flight TaskRegistry (consistent with GET /_tasks).
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = state
+            .tasks
+            .list()
+            .iter()
+            .map(|t| {
+                json!({
+                    "action": t.action,
+                    "task_id": format!("{}:{}", t.node, t.id),
+                    "type": "transport",
+                    "running_time": format!("{}ms", t.running_nanos() / 1_000_000),
+                    "ip": "127.0.0.1",
+                    "node": t.node.as_str(),
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = Vec::new();
     for t in state.tasks.list() {
         lines.push(format!(
@@ -33185,16 +33822,32 @@ pub async fn cat_tasks(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn cat_repositories(State(state): State<AppState>) -> impl IntoResponse {
-    let mut lines = Vec::new();
+pub async fn cat_repositories(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
+    let mut rows: Vec<(String, String)> = Vec::new();
     for entry in state.engine.snapshot_repos.iter() {
         let repo_type = entry
             .value()
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("fs");
-        lines.push(format!("{} {}", entry.key(), repo_type));
+        rows.push((entry.key().clone(), repo_type.to_string()));
     }
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(id, repo_type)| json!({ "id": id, "type": repo_type }))
+            .collect();
+        return Json(arr).into_response();
+    }
+
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(id, repo_type)| format!("{id} {repo_type}"))
+        .collect();
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -33208,6 +33861,7 @@ pub async fn cat_repositories(State(state): State<AppState>) -> impl IntoRespons
         )],
         body,
     )
+        .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
