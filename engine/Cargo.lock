@@ -6378,7 +6378,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-ai"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -6399,7 +6399,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-api"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6429,7 +6429,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-autoindex"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6471,7 +6471,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-cluster"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6496,7 +6496,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-common"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -6515,7 +6515,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-compress"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "byteorder",
  "bytes",
@@ -6528,7 +6528,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-console-api"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6564,7 +6564,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-engine"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6603,7 +6603,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-fts"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "bitpacking",
@@ -6629,7 +6629,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-logs"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -6647,7 +6647,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-mcp"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -6657,7 +6657,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-query"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6672,7 +6672,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-server"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "axum",
@@ -6718,7 +6718,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-storage"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6748,7 +6748,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-vector"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -6766,7 +6766,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-wasm"
-version = "1.0.0-rc.13"
+version = "1.0.0-rc.14"
 dependencies = [
  "anyhow",
  "bytes",
