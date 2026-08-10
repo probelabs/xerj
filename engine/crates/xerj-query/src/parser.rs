@@ -1173,10 +1173,28 @@ fn parse_query_string(params: &Value) -> Result<QueryNode> {
             MAX_QUERY_STRING_LEN
         )));
     }
-    let default_field = obj
+    let mut default_field = obj
         .get("default_field")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // `fields` was accepted and ignored: the key never reached this parser, so
+    // `query_string {"query":"x","fields":["title"]}` searched every field —
+    // and, once `index: false` became a real rejection, disagreed with
+    // `{"default_field":"title"}`, which is the same request written the other
+    // way. It is now read and used, the way `simple_query_string` already used
+    // its own `fields` list: an unqualified clause is searched over exactly
+    // these fields (a `^boost` suffix is honoured), while a `field:value`
+    // clause inside the string keeps naming its own field, as in ES.
+    let fields: Vec<String> = obj
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let default_operator = parse_bool_operator(obj.get("default_operator")).ok();
     let boost = obj.get("boost").and_then(|v| v.as_f64()).map(|b| b as f32);
 
@@ -1185,9 +1203,14 @@ fn parse_query_string(params: &Value) -> Result<QueryNode> {
     // QueryString node if lowering isn't possible (the FTS path still
     // tokenizes it) — but malformed range syntax is a hard parse error,
     // never a silent term-match fallback.
-    if let Some(lowered) =
-        try_lower_query_string(&query, default_field.as_deref(), default_operator)?
-    {
+    if let Some(lowered) = try_lower_query_string(
+        &query,
+        QsFields {
+            default_field: default_field.as_deref(),
+            fields: &fields,
+        },
+        default_operator,
+    )? {
         return Ok(match boost {
             Some(b) if b != 1.0 => QueryNode::Boosted {
                 boost: b,
@@ -1195,6 +1218,16 @@ fn parse_query_string(params: &Value) -> Result<QueryNode> {
             },
             _ => lowered,
         });
+    }
+
+    // Lowering declined (a string this tokenizer cannot handle, e.g. an
+    // unterminated quote): the opaque node hands the whole string to the FTS
+    // path. A one-element `fields` list means exactly what `default_field`
+    // means, so it is carried across rather than dropped. A multi-element list
+    // has no representation on this node — that residue is stated as a known
+    // gap in the CHANGELOG rather than papered over.
+    if default_field.is_none() && fields.len() == 1 {
+        default_field = Some(qs_split_boost(&fields[0]).0);
     }
 
     Ok(QueryNode::QueryString {
@@ -1205,11 +1238,89 @@ fn parse_query_string(params: &Value) -> Result<QueryNode> {
     })
 }
 
+/// Split a `fields` entry into its field name and optional `^boost`.
+///
+/// `"title^3"` → `("title", Some(3.0))`, `"title"` → `("title", None)`. A
+/// malformed suffix (`"title^x"`) keeps the whole spec as the name, which is
+/// what ES's field-spec parser does with an unparseable boost.
+fn qs_split_boost(spec: &str) -> (String, Option<f32>) {
+    match spec.rsplit_once('^') {
+        Some((name, b)) if !name.is_empty() => match b.parse::<f32>() {
+            Ok(b) if b.is_finite() => (name.to_string(), Some(b)),
+            _ => (spec.to_string(), None),
+        },
+        _ => (spec.to_string(), None),
+    }
+}
+
+/// Where a clause that named no field of its own is searched.
+///
+/// `query_string` has two ways to say this and ES treats them as the same
+/// thing: `default_field` (one field) and `fields` (a list, `^boost` allowed).
+/// An empty `fields` with no `default_field` keeps the historical `"*"`
+/// placeholder, which downstream means the field-less scan.
+#[derive(Clone, Copy)]
+struct QsFields<'a> {
+    default_field: Option<&'a str>,
+    fields: &'a [String],
+}
+
+impl QsFields<'_> {
+    /// The (field, boost) targets for an unqualified clause.
+    fn targets(&self) -> Vec<(String, Option<f32>)> {
+        if self.fields.is_empty() {
+            return vec![(self.default_field.unwrap_or("*").to_string(), None)];
+        }
+        self.fields.iter().map(|s| qs_split_boost(s)).collect()
+    }
+
+    /// Whether an unqualified *range* has a concrete field to land on. A
+    /// range needs one real field name; `"*"` is not one.
+    fn has_concrete_target(&self) -> bool {
+        if self.fields.is_empty() {
+            return matches!(self.default_field, Some(df) if !df.is_empty() && df != "*");
+        }
+        self.fields
+            .iter()
+            .any(|s| !s.is_empty() && !qs_split_boost(s).0.contains('*'))
+    }
+}
+
+/// The (field, boost) targets one query-string clause resolves to.
+///
+/// `explicit` is the `field:` prefix the clause carried, if any: ES keeps an
+/// explicitly named field whatever `fields` / `default_field` say, and only an
+/// unqualified clause fans out over them.
+fn qs_targets(explicit: &str, ctx: QsFields<'_>) -> Vec<(String, Option<f32>)> {
+    if explicit.is_empty() {
+        ctx.targets()
+    } else {
+        vec![(explicit.to_string(), None)]
+    }
+}
+
+/// Combine the per-field copies of one unqualified clause.
+///
+/// One target stays a bare leaf (the shape every existing query_string test
+/// pins); several become a `dis_max`, which is how ES combines a
+/// `query_string` over multiple fields — best field wins, no tie-breaker.
+fn qs_combine(mut nodes: Vec<QueryNode>) -> Option<QueryNode> {
+    match nodes.len() {
+        0 => None,
+        1 => nodes.pop(),
+        _ => Some(QueryNode::DisMax {
+            queries: nodes,
+            tie_breaker: 0.0,
+        }),
+    }
+}
+
 /// Lower a Lucene-style query string into a QueryNode::Bool tree.
 ///
 /// Supports:
 ///  - `field:value` → Match on that field
-///  - `value` → Match on default_field (if provided) else MultiMatch on all
+///  - `value` → Match on `default_field` / each entry of `fields` (a `dis_max`
+///    when there is more than one), else the `"*"` field-less placeholder
 ///  - `A OR B` → Bool.should
 ///  - `A AND B` → Bool.must
 ///  - `+A` must, `-A` must_not
@@ -1224,7 +1335,7 @@ fn parse_query_string(params: &Value) -> Result<QueryNode> {
 /// ranges must never silently degrade to a term match.
 fn try_lower_query_string(
     q: &str,
-    default_field: Option<&str>,
+    ctx: QsFields<'_>,
     default_op: Option<BoolOperator>,
 ) -> Result<Option<QueryNode>> {
     let Some(tokens) = tokenize_query_string(q)? else {
@@ -1234,14 +1345,13 @@ fn try_lower_query_string(
         return Ok(None);
     }
     // Range clauses must target a concrete field: resolve unqualified
-    // ranges against default_field up-front so `>10` with no usable
-    // default errors instead of degrading to a term match.
+    // ranges against default_field / fields up-front so `>10` with no usable
+    // target errors instead of degrading to a term match.
     let mut has_range = false;
     for t in &tokens {
         if let QsTok::Range { field, .. } = t {
             has_range = true;
-            if field.is_empty() && !matches!(default_field, Some(df) if !df.is_empty() && df != "*")
-            {
+            if field.is_empty() && !ctx.has_concrete_target() {
                 return Err(qerr(
                     "query_string range requires an explicit field (e.g. `price:>10`) or a non-wildcard default_field",
                 ));
@@ -1249,7 +1359,7 @@ fn try_lower_query_string(
         }
     }
     let mut pos = 0;
-    let parsed = parse_qs_or(&tokens, &mut pos, default_field, default_op);
+    let parsed = parse_qs_or(&tokens, &mut pos, ctx, default_op);
     match parsed {
         Some(node) if pos == tokens.len() => Ok(Some(node)),
         _ if has_range => Err(qerr(format!(
@@ -1584,14 +1694,14 @@ fn tokenize_query_string(q: &str) -> Result<Option<Vec<QsTok>>> {
 fn parse_qs_or(
     toks: &[QsTok],
     pos: &mut usize,
-    default_field: Option<&str>,
+    ctx: QsFields<'_>,
     default_op: Option<BoolOperator>,
 ) -> Option<QueryNode> {
-    let mut left = parse_qs_and(toks, pos, default_field, default_op)?;
+    let mut left = parse_qs_and(toks, pos, ctx, default_op)?;
     // `A OR B` — explicit OR operator.
     while *pos < toks.len() && matches!(toks[*pos], QsTok::Or) {
         *pos += 1;
-        let right = parse_qs_and(toks, pos, default_field, default_op)?;
+        let right = parse_qs_and(toks, pos, ctx, default_op)?;
         left = QueryNode::Bool {
             must: vec![],
             must_not: vec![],
@@ -1607,7 +1717,7 @@ fn parse_qs_or(
     let implicit_or = matches!(default_op, None | Some(BoolOperator::Or));
     if implicit_or {
         while *pos < toks.len() && !matches!(toks[*pos], QsTok::RParen | QsTok::Or | QsTok::And) {
-            let right = parse_qs_and(toks, pos, default_field, default_op)?;
+            let right = parse_qs_and(toks, pos, ctx, default_op)?;
             left = QueryNode::Bool {
                 must: vec![],
                 must_not: vec![],
@@ -1623,7 +1733,7 @@ fn parse_qs_or(
 fn parse_qs_and(
     toks: &[QsTok],
     pos: &mut usize,
-    default_field: Option<&str>,
+    ctx: QsFields<'_>,
     default_op: Option<BoolOperator>,
 ) -> Option<QueryNode> {
     let mut clauses: Vec<QueryNode> = Vec::new();
@@ -1644,7 +1754,7 @@ fn parse_qs_and(
                 _ => break,
             }
         }
-        let node = parse_qs_unary(toks, pos, default_field)?;
+        let node = parse_qs_unary(toks, pos, ctx)?;
         if force_not {
             not_clauses.push(node);
         } else {
@@ -1694,11 +1804,7 @@ fn parse_qs_and(
     Some(node)
 }
 
-fn parse_qs_unary(
-    toks: &[QsTok],
-    pos: &mut usize,
-    default_field: Option<&str>,
-) -> Option<QueryNode> {
+fn parse_qs_unary(toks: &[QsTok], pos: &mut usize, ctx: QsFields<'_>) -> Option<QueryNode> {
     if *pos >= toks.len() {
         return None;
     }
@@ -1716,7 +1822,7 @@ fn parse_qs_unary(
             // opaque `QueryNode::QueryString` path (iterative tokenizer, no
             // recursion). The guard decrements on drop when this arm returns.
             let _depth_guard = DepthGuard::enter().ok()?;
-            let n = parse_qs_or(toks, pos, default_field, None)?;
+            let n = parse_qs_or(toks, pos, ctx, None)?;
             if *pos >= toks.len() || !matches!(toks[*pos], QsTok::RParen) {
                 return None;
             }
@@ -1725,11 +1831,10 @@ fn parse_qs_unary(
         }
         QsTok::Term(field, value) => {
             *pos += 1;
-            let f = if field.is_empty() {
-                default_field.unwrap_or("*").to_string()
-            } else {
-                field
-            };
+            // A clause that named its own field keeps it; one that did not is
+            // searched over every target `default_field` / `fields` supplies,
+            // combined by `qs_combine`.
+            let targets = qs_targets(&field, ctx);
             // A bare term containing `*` or `?` is a Lucene wildcard —
             // emit a Wildcard query so `q=shor*` / `q=te?t` match text
             // tokens with the expected substitution semantics.
@@ -1750,36 +1855,47 @@ fn parse_qs_unary(
                 // `model:claude-* AND status:ok` → 1.0 + BM25(status:ok).
                 // `constant_score: true` also admits the keyword shape to
                 // the columnar Filtered plan (seq-ascending → ES tie order).
-                return Some(QueryNode::Wildcard {
-                    field: f,
-                    value: value.to_lowercase(),
-                    boost: None,
-                    constant_score: true,
-                });
+                let lowered = value.to_lowercase();
+                return qs_combine(
+                    targets
+                        .into_iter()
+                        .map(|(f, boost)| QueryNode::Wildcard {
+                            field: f,
+                            value: lowered.clone(),
+                            boost,
+                            constant_score: true,
+                        })
+                        .collect(),
+                );
             }
-            Some(QueryNode::Match {
-                field: f,
-                query: value,
-                operator: BoolOperator::Or,
-                analyzer: None,
-                boost: None,
-                minimum_should_match: None,
-            })
+            qs_combine(
+                targets
+                    .into_iter()
+                    .map(|(f, boost)| QueryNode::Match {
+                        field: f,
+                        query: value.clone(),
+                        operator: BoolOperator::Or,
+                        analyzer: None,
+                        boost,
+                        minimum_should_match: None,
+                    })
+                    .collect(),
+            )
         }
         QsTok::Phrase(field, value) => {
             *pos += 1;
-            let f = if field.is_empty() {
-                default_field.unwrap_or("*").to_string()
-            } else {
-                field
-            };
-            Some(QueryNode::MatchPhrase {
-                field: f,
-                query: value,
-                slop: 0,
-                analyzer: None,
-                boost: None,
-            })
+            qs_combine(
+                qs_targets(&field, ctx)
+                    .into_iter()
+                    .map(|(f, boost)| QueryNode::MatchPhrase {
+                        field: f,
+                        query: value.clone(),
+                        slop: 0,
+                        analyzer: None,
+                        boost,
+                    })
+                    .collect(),
+            )
         }
         QsTok::Range {
             field,
@@ -1789,21 +1905,27 @@ fn parse_qs_unary(
             lte,
         } => {
             *pos += 1;
-            // Unqualified ranges with no usable default_field were already
-            // rejected in try_lower_query_string.
-            let f = if field.is_empty() {
-                default_field.unwrap_or("*").to_string()
-            } else {
-                field
-            };
-            Some(QueryNode::Range {
-                field: f,
-                gte,
-                gt,
-                lte,
-                lt,
-                boost: None,
-            })
+            // Unqualified ranges with no usable target were already rejected
+            // in try_lower_query_string. A pattern entry in `fields` has no
+            // meaning for a range, so those targets are dropped here rather
+            // than turned into a `Range` on the literal field name `"*"`.
+            let targets: Vec<(String, Option<f32>)> = qs_targets(&field, ctx)
+                .into_iter()
+                .filter(|(f, _)| !field.is_empty() || !f.contains('*'))
+                .collect();
+            qs_combine(
+                targets
+                    .into_iter()
+                    .map(|(f, boost)| QueryNode::Range {
+                        field: f,
+                        gte: gte.clone(),
+                        gt: gt.clone(),
+                        lte: lte.clone(),
+                        lt: lt.clone(),
+                        boost,
+                    })
+                    .collect(),
+            )
         }
         _ => None,
     }
@@ -4729,6 +4851,70 @@ mod tests {
         let (field, _, _, _, lte) = expect_range(qs("n:<=5"));
         assert_eq!(field, "n");
         assert_eq!(lte, Some(json!(5)));
+    }
+
+    /// `query_string`'s `fields` was accepted and ignored — the key never
+    /// reached this parser, so the query ran over every field regardless. It
+    /// now selects the targets for an unqualified clause, the same way
+    /// `simple_query_string`'s `fields` already did.
+    #[test]
+    fn test_query_string_fields_select_the_unqualified_targets() {
+        // One field is exactly `default_field`.
+        match q(json!({"query_string": {"query": "hello", "fields": ["title"]}})) {
+            QueryNode::Match { field, query, .. } => {
+                assert_eq!(field, "title");
+                assert_eq!(query, "hello");
+            }
+            other => panic!("expected Match on title, got {other:?}"),
+        }
+
+        // Several become a dis_max over one leaf per field, and `^boost` on a
+        // spec lands on that leaf.
+        match q(json!({"query_string": {"query": "hello", "fields": ["title^3", "body"]}})) {
+            QueryNode::DisMax { queries, .. } => {
+                assert_eq!(queries.len(), 2);
+                match &queries[0] {
+                    QueryNode::Match { field, boost, .. } => {
+                        assert_eq!(field, "title");
+                        assert_eq!(*boost, Some(3.0));
+                    }
+                    other => panic!("expected boosted Match on title, got {other:?}"),
+                }
+                match &queries[1] {
+                    QueryNode::Match { field, boost, .. } => {
+                        assert_eq!(field, "body");
+                        assert_eq!(*boost, None);
+                    }
+                    other => panic!("expected Match on body, got {other:?}"),
+                }
+            }
+            other => panic!("expected DisMax, got {other:?}"),
+        }
+
+        // A clause that names its own field keeps it: `fields` only supplies
+        // the target for clauses that named none, as in ES.
+        match q(json!({"query_string": {"query": "body:hello", "fields": ["title"]}})) {
+            QueryNode::Match { field, .. } => assert_eq!(field, "body"),
+            other => panic!("expected Match on body, got {other:?}"),
+        }
+
+        // With no `fields` and no `default_field` nothing changes: the
+        // field-less `"*"` placeholder is still what an unqualified clause
+        // resolves to.
+        match qs("hello") {
+            QueryNode::Match { field, .. } => assert_eq!(field, "*"),
+            other => panic!("expected Match on *, got {other:?}"),
+        }
+
+        // An unqualified range now resolves against `fields` too, instead of
+        // erroring for want of a `default_field`.
+        match q(json!({"query_string": {"query": ">10", "fields": ["n"]}})) {
+            QueryNode::Range { field, gt, .. } => {
+                assert_eq!(field, "n");
+                assert_eq!(gt, Some(json!(10)));
+            }
+            other => panic!("expected Range on n, got {other:?}"),
+        }
     }
 
     #[test]

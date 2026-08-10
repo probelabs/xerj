@@ -585,16 +585,120 @@ async fn documented_gaps_are_still_open_and_still_documented() {
     .await;
     assert_eq!(status, StatusCode::OK, "GAP 1 (sort half) changed: {body}");
 
+    // A token that exists ONLY in the unsearchable field. The gaps below are
+    // about matching *through* `note`, so probing them with a word that also
+    // lives in `body` would pass whether or not the gap were open.
+    let (status, body) = json_req(
+        &app,
+        "PUT",
+        "/t/_doc/2?refresh=true",
+        json!({ "note": "zzquagga sighting", "body": "nothing to see here" }),
+    )
+    .await;
+    assert!(status.is_success(), "index doc 2 failed: {status} {body}");
+
     // GAP 2 — the FIELD-LESS arms of the stored-document scan are schema-free
     // and walk every `_source` key, so a token living only in an unsearchable
     // field still matches when NO field is named.
     for query in [
-        json!({ "query_string": { "query": "pelicans" } }),
-        json!({ "more_like_this": { "like": ["pelicans"], "min_term_freq": 1, "max_query_terms": 5 } }),
+        json!({ "query_string": { "query": "zzquagga" } }),
+        json!({ "more_like_this": { "like": ["zzquagga"], "min_term_freq": 1, "max_query_terms": 5 } }),
     ] {
         let (status, body) = search(&app, query.clone()).await;
         assert_eq!(status, StatusCode::OK, "GAP 2 changed for {query}: {body}");
     }
+    let (_, body) = search(&app, json!({ "query_string": { "query": "zzquagga" } })).await;
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(Value::as_u64),
+        Some(1),
+        "GAP 2 changed — the field-less scan no longer reaches `note`, \
+         update the CHANGELOG: {body}"
+    );
+
+    // GAP 3 — GAP 2 reached through a WILDCARD `fields` spec. A pattern is
+    // never an error (that half is ES's rule and is deliberate), but in
+    // `query_string` / `simple_query_string` a pattern lowers to the same
+    // field-less `"*"` placeholder as GAP 2, so it is answered by the
+    // schema-free scan and still matches through `note`. Identical on `main`:
+    // this change neither introduced nor closed it, and the CHANGELOG says so
+    // instead of claiming a pattern is "answered over the searchable fields".
+    for query in [
+        json!({ "simple_query_string": { "query": "zzquagga", "fields": ["*"] } }),
+        json!({ "query_string": { "query": "zzquagga", "fields": ["*"] } }),
+    ] {
+        let (status, body) = search(&app, query.clone()).await;
+        assert_eq!(status, StatusCode::OK, "GAP 3 changed for {query}: {body}");
+        assert_eq!(
+            body.pointer("/hits/total/value").and_then(Value::as_u64),
+            Some(1),
+            "GAP 3 changed for {query} — the wildcard form no longer reaches \
+             the field-less scan, update the CHANGELOG: {body}"
+        );
+    }
+
+    // `multi_match` with a pattern is the counter-example that keeps the
+    // sentence honest: it stays a `MultiMatch` node and is answered by the FTS
+    // projection, which DOES apply ES's `isSearchable()` rule — so it finds
+    // nothing in `note`. The gap is the field-less scan, not "patterns".
+    let (status, body) = search(
+        &app,
+        json!({ "multi_match": { "query": "zzquagga", "fields": ["*", "body"] } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(Value::as_u64),
+        Some(0),
+        "multi_match's pattern expansion must not reach an unsearchable field: {body}"
+    );
+
+    // GAP 4 — the opaque `query_string` fallback. A query string the parser
+    // declines to lower (here: an unterminated quote) keeps the whole string
+    // for the FTS path, and that node has nowhere to put a multi-element
+    // `fields` list, so the list is not applied and not checked. A ONE-element
+    // list is carried across as `default_field` and therefore is checked —
+    // asserted below, because that half is the part that works.
+    let (status, body) = search(
+        &app,
+        json!({ "query_string": { "query": "\"zzquagga", "fields": ["note", "body"] } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GAP 4 changed — the opaque query_string fallback now honours a \
+         multi-field `fields` list, update the CHANGELOG: {body}"
+    );
+    let (status, body) = search(
+        &app,
+        json!({ "query_string": { "query": "\"zzquagga", "fields": ["note"] } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a one-element `fields` must still reach the check on the opaque \
+         fallback: {body}"
+    );
+
+    // GAP 5 — `_validate/query` never opens the index, so it answers on the
+    // parse alone and says a query `_search` refuses is valid. Pre-existing
+    // and identical on `main`, but it now disagrees with `_search` on the same
+    // body, so it is stated rather than left for a user to trip over.
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_validate/query",
+        json!({ "query": { "match": { "note": "pelicans" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GAP 5 changed: {body}");
+    assert_eq!(
+        body.get("valid").and_then(Value::as_bool),
+        Some(true),
+        "GAP 5 changed — `_validate/query` now consults the mapping, \
+         update the CHANGELOG: {body}"
+    );
 }
 
 /// `more_like_this` needs no arm of its own: with an explicit `fields` list the
@@ -639,6 +743,352 @@ async fn a_named_more_like_this_field_inherits_the_check() {
     assert_eq!(
         body.pointer("/hits/total/value").and_then(Value::as_u64),
         Some(1),
+        "{body}"
+    );
+}
+
+/// A second, ordinary index so the multi-index selectors have something real
+/// to sum. `t2` maps `body` only — it has no unsearchable field at all, which
+/// is the point: the rejection must come from `t`'s mapping and must not be
+/// hidden by a sibling index answering normally.
+async fn add_plain_sibling(app: &axum::Router) {
+    let (status, body) = json_req(
+        app,
+        "PUT",
+        "/t2",
+        json!({ "mappings": { "properties": { "body": { "type": "text" } } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create t2 failed: {body}");
+
+    let (status, body) = json_req(
+        app,
+        "PUT",
+        "/t2/_doc/1?refresh=true",
+        json!({ "body": "another memo about pelicans" }),
+    )
+    .await;
+    assert!(status.is_success(), "index into t2 failed: {status} {body}");
+}
+
+/// A second index that shares `t`'s unsearchable mapping, so a multi-index
+/// selector can be built in which *every* participating index refuses.
+async fn add_unsearchable_sibling(app: &axum::Router) {
+    let (status, body) = json_req(
+        app,
+        "PUT",
+        "/t3",
+        json!({
+            "mappings": { "properties": {
+                "note": { "type": "text", "index": false },
+                "body": { "type": "text" }
+            } }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create t3 failed: {body}");
+
+    let (status, body) = json_req(
+        app,
+        "PUT",
+        "/t3/_doc/1?refresh=true",
+        json!({ "note": "third memo about pelicans", "body": "third memo about pelicans" }),
+    )
+    .await;
+    assert!(status.is_success(), "index into t3 failed: {status} {body}");
+}
+
+/// The multi-index `_count` selectors must report the refusal, never absorb it.
+///
+/// `count_docs` has two arms, and only the single-index arm propagated. The
+/// wildcard / comma-list / `_all` arm ran the search under `if let Ok(..)`
+/// with no else, so a refused index contributed nothing to the total and the
+/// response still published `"successful": 2, "failed": 0` —
+/// `{"count":0,"_shards":{"total":2,"successful":2,"failed":0}}`, a confident
+/// wrong number. `POST /_count` routes through `_all`, so the cluster-wide
+/// count endpoint took that arm, as does the `logs-*` shape almost every real
+/// caller writes.
+///
+/// The status follows ES's broadcast rule rather than "always 400": the
+/// failure status is returned only when NO index answered
+/// (`RestStatus.java:548-566`, semantics only), and otherwise the partial
+/// count comes back as a 200 with the failure visible in `_shards.failures`.
+#[tokio::test]
+async fn every_count_selector_reports_the_rejection() {
+    let (app, _dir) = app_with_mapping().await;
+    add_plain_sibling(&app).await;
+
+    // Control first: the same selectors answer the *searchable* field, and
+    // answer it with both indices counted. Without this the assertions below
+    // would also be satisfied by a route that simply never runs.
+    for path in ["/t*/_count", "/t,t2/_count", "/_all/_count", "/_count"] {
+        let (status, body) = json_req(
+            &app,
+            "POST",
+            path,
+            json!({ "query": { "match": { "body": "pelicans" } } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path} control: {body}");
+        assert_eq!(
+            body.get("count").and_then(Value::as_u64),
+            Some(2),
+            "{path} control must count both indices: {body}"
+        );
+        assert_eq!(
+            body.pointer("/_shards/failed").and_then(Value::as_u64),
+            Some(0),
+            "{path} control: {body}"
+        );
+    }
+
+    // `t` refuses, `t2` answers: a 200 whose `_shards` says one index failed,
+    // with the shard-level exception attached. The count is partial and says
+    // so — the bug was that it was partial and claimed to be complete.
+    for path in ["/t*/_count", "/t,t2/_count", "/_all/_count", "/_count"] {
+        let (status, body) = json_req(
+            &app,
+            "POST",
+            path,
+            json!({ "query": { "match": { "note": "pelicans" } } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(
+            body.pointer("/_shards/failed").and_then(Value::as_u64),
+            Some(1),
+            "{path} must not report a clean run: {body}"
+        );
+        assert_eq!(
+            body.pointer("/_shards/successful").and_then(Value::as_u64),
+            Some(1),
+            "{path}: {body}"
+        );
+        assert_eq!(
+            body.pointer("/_shards/failures/0/index")
+                .and_then(Value::as_str),
+            Some("t"),
+            "{path}: {body}"
+        );
+        assert_eq!(
+            body.pointer("/_shards/failures/0/reason/type")
+                .and_then(Value::as_str),
+            Some("query_shard_exception"),
+            "{path}: {body}"
+        );
+    }
+
+    // …and when every selected index refuses, the count IS the error: the same
+    // 400 envelope the single-index form returns, with no count published.
+    add_unsearchable_sibling(&app).await;
+    for path in ["/t,t3/_count", "/t3/_count"] {
+        let (status, body) = json_req(
+            &app,
+            "POST",
+            path,
+            json!({ "query": { "match": { "note": "pelicans" } } }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{path} must refuse, not answer 0: {body}"
+        );
+        assert_eq!(
+            body.pointer("/error/root_cause/0/type")
+                .and_then(Value::as_str),
+            Some("query_shard_exception"),
+            "{path}: {body}"
+        );
+        assert!(
+            body.get("count").is_none(),
+            "{path} published a count for a query no index ran: {body}"
+        );
+    }
+}
+
+/// `_msearch/template` renders the rejection instead of an empty success.
+///
+/// Its per-index loop was `if let Ok(idx)` / `if let Ok(result)` with no else,
+/// so a refused query produced `{"_shards":{"successful":1,"failed":0},
+/// "hits":{"total":{"value":0},"hits":[]}}` — a sub-response positively
+/// asserting the shard ran and found nothing. It now carries the same
+/// per-response envelope `_msearch` does.
+#[tokio::test]
+async fn msearch_template_reports_the_rejection_instead_of_zero_hits() {
+    let (app, _dir) = app_with_mapping().await;
+
+    let body_ndjson = concat!(
+        "{\"index\":\"t\"}\n",
+        "{\"source\":\"{\\\"query\\\":{\\\"match\\\":{\\\"note\\\":\\\"pelicans\\\"}}}\",\"params\":{}}\n",
+        "{\"index\":\"t\"}\n",
+        "{\"source\":\"{\\\"query\\\":{\\\"match\\\":{\\\"body\\\":\\\"pelicans\\\"}}}\",\"params\":{}}\n"
+    );
+    let (status, body) = ndjson_req(&app, "/_msearch/template", body_ndjson).await;
+    assert_eq!(status, StatusCode::OK, "envelope is 200: {body}");
+
+    assert_eq!(
+        body.pointer("/responses/0/status").and_then(Value::as_u64),
+        Some(400),
+        "refused sub-request must be a 400, not an empty 200: {body}"
+    );
+    assert_eq!(
+        body.pointer("/responses/0/error/root_cause/0/type")
+            .and_then(Value::as_str),
+        Some("query_shard_exception"),
+        "{body}"
+    );
+    assert!(
+        body.pointer("/responses/0/hits").is_none(),
+        "a refused sub-request must not also publish a hit list: {body}"
+    );
+
+    // The sibling template in the same batch keeps its answer.
+    assert_eq!(
+        body.pointer("/responses/1/hits/total/value")
+            .and_then(Value::as_u64),
+        Some(1),
+        "{body}"
+    );
+}
+
+/// `_rank_eval` records a refused request in `failures` instead of dropping it.
+///
+/// The three `Err(_) => continue` arms took the request out of `details` *and*
+/// out of `failures` while still publishing `metric_score` — so a relevance
+/// gate read a clean score over a batch that had silently shrunk. `failures`
+/// is the channel ES provides, and the neighbouring `script_failure` arm was
+/// already using it.
+#[tokio::test]
+async fn rank_eval_records_a_refused_request_in_failures() {
+    let (app, _dir) = app_with_mapping().await;
+
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_rank_eval",
+        json!({
+            "requests": [
+                {
+                    "id": "good",
+                    "request": { "query": { "match": { "body": "pelicans" } } },
+                    "ratings": [ { "_index": "t", "_id": "1", "rating": 1 } ]
+                },
+                {
+                    "id": "bad",
+                    "request": { "query": { "match": { "note": "pelicans" } } },
+                    "ratings": [ { "_index": "t", "_id": "1", "rating": 1 } ]
+                }
+            ],
+            "metric": { "precision": { "k": 10 } }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert!(
+        body.pointer("/details/good").is_some(),
+        "the answerable request keeps its details: {body}"
+    );
+    assert!(
+        body.pointer("/details/bad").is_none(),
+        "a refused request must not appear in details: {body}"
+    );
+    assert!(
+        body.pointer("/failures/bad").is_some(),
+        "a refused request must appear in failures, not vanish: {body}"
+    );
+    assert_eq!(
+        body.pointer("/failures/bad/root_cause/0/type")
+            .and_then(Value::as_str),
+        Some("query_shard_exception"),
+        "{body}"
+    );
+}
+
+/// `query_string`'s `fields` array is read, and a named unsearchable field in
+/// it is rejected exactly like `default_field`.
+///
+/// `parse_query_string` never looked at `fields`, so the key was accepted and
+/// ignored: the query ran over every field. Once `index: false` became a real
+/// rejection that also made two spellings of one request disagree —
+/// `{"default_field":"note"}` answered 400 while `{"fields":["note"]}`
+/// answered 200 with a hit *through* the unsearchable field.
+#[tokio::test]
+async fn query_string_fields_are_read_and_a_named_unsearchable_field_is_rejected() {
+    let (app, _dir) = app_with_mapping().await;
+
+    for fields in [json!(["note"]), json!(["note", "body"]), json!(["note^3"])] {
+        let query = json!({ "query_string": { "query": "pelicans", "fields": fields } });
+        let (status, body) = search(&app, query.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query} → {body}");
+        let reason = body
+            .pointer("/error/root_cause/0/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            reason.contains("Cannot search on field [note]"),
+            "got {reason:?}: {body}"
+        );
+    }
+
+    // The searchable field still answers, so the rejection above is the
+    // mapping talking and not `fields` having broken the query type.
+    let (status, body) = search(
+        &app,
+        json!({ "query_string": { "query": "pelicans", "fields": ["body"] } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(Value::as_u64),
+        Some(1),
+        "{body}"
+    );
+
+    // And a pattern spec is never an error, as for the other multi-field types.
+    let (status, body) = search(
+        &app,
+        json!({ "query_string": { "query": "pelicans", "fields": ["*"] } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// `_delete_by_query` refuses rather than reporting a clean zero-deletion run.
+///
+/// A write endpoint that answers `{"deleted": 0, "failures": []}` for a query
+/// it never ran is the worst shape of this bug: the caller reads it as "there
+/// was nothing to delete". Listed in the CHANGELOG, so asserted here.
+#[tokio::test]
+async fn delete_by_query_refuses_and_leaves_the_document() {
+    let (app, _dir) = app_with_mapping().await;
+
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_delete_by_query",
+        json!({ "query": { "match": { "note": "pelicans" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body.pointer("/error/root_cause/0/type")
+            .and_then(Value::as_str),
+        Some("query_shard_exception"),
+        "{body}"
+    );
+    assert!(
+        body.get("deleted").is_none(),
+        "a refused delete must not publish a deletion count: {body}"
+    );
+
+    // …and the document is still there.
+    let (status, body) = get(&app, "/t/_doc/1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/_source/note").and_then(Value::as_str),
+        Some("confidential memo about pelicans"),
         "{body}"
     );
 }

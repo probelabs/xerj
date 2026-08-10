@@ -15401,6 +15401,19 @@ pub async fn refresh_index(
 // GET /{index}/_count
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One entry of `_count`'s `_shards.failures`, in ES's shape. `rendered` is the
+/// `ApiError` body for the failure; the per-index entry carries the
+/// *shard-level* exception (`query_shard_exception`) rather than the
+/// `search_phase_execution_exception` wrapper the top-level error uses.
+fn count_shard_failure(index: &str, rendered: &Value) -> Value {
+    let reason = rendered
+        .pointer("/error/root_cause/0")
+        .or_else(|| rendered.pointer("/error"))
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "exception", "reason": "search failed" }));
+    json!({ "shard": 0, "index": index, "reason": reason })
+}
+
 pub async fn count_docs_global(
     State(state): State<AppState>,
     Query(params): Query<CountParams>,
@@ -15449,7 +15462,28 @@ pub async fn count_docs(
             .and_then(|b| b.get("query"))
             .map(|q| !q.is_null())
             .unwrap_or(false);
+        // A refused query is not a zero. This loop used to run the search under
+        // `if let Ok(..)` with no else, so an index whose mapping refuses the
+        // query — a `match` on an `"index": false` field, say — contributed
+        // nothing to `total` and the response still published
+        // `"successful": <all>, "failed": 0`: a confident wrong count on the
+        // shapes most callers actually write (`logs-*`, a comma list, and
+        // `POST /_count`, which routes here through `_all`).
+        //
+        // The failure is now reported per index, and the HTTP status follows
+        // ES's own rule for a broadcast action: the failure status is returned
+        // only when NO shard succeeded, and otherwise the response is a 200
+        // carrying the partial count with the failures visible in `_shards`
+        // (`server/src/main/java/org/elasticsearch/rest/RestStatus.java:548-566`
+        // — read for semantics only; ES is AGPL-3.0/SSPL-1.0/Elastic-2.0 and
+        // no code from it is reproduced here). So a single-index `_count`, and
+        // a `logs-*` whose indices all share the offending mapping, both 400
+        // exactly as `_search` does, while a mixed selector answers what it
+        // could count and says out loud what it could not.
         let mut total: u64 = 0;
+        let mut successful: u64 = 0;
+        let mut shard_failures: Vec<Value> = Vec::new();
+        let mut first_error: Option<Value> = None;
         for ix_name in &wanted {
             let Ok(idx) = state.engine.get_index(ix_name) else {
                 continue;
@@ -15466,8 +15500,17 @@ pub async fn count_docs(
                 // object and rejects it).
                 resolve_terms_lookups(&mut query_val, &state).await;
                 let search_body = json!({ "query": query_val, "size": 0, "from": 0 });
-                if let Ok(req) = xerj_query::parse_request(&search_body) {
-                    if let Ok(result) = idx.search(&req).await {
+                // A body that does not parse is not per-index: it is the same
+                // 400 the single-index arm returns, for the same reason.
+                let req = match xerj_query::parse_request(&search_body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let ze = xerj_common::XerjError::invalid_query(e.to_string());
+                        return ApiError::new(ze).into_response();
+                    }
+                };
+                match idx.search(&req).await {
+                    Ok(result) => {
                         // A script resource limit in the filter (terms_set's
                         // `minimum_should_match` script, say) makes matching
                         // fail-closed, so the count under-reports with nothing
@@ -15476,16 +15519,45 @@ pub async fn count_docs(
                             return script_limit_response(reason);
                         }
                         total += result.total.value;
+                        successful += 1;
+                    }
+                    Err(e) => {
+                        let rendered = ApiError::new(xerj_common::XerjError::from(e)).into_value();
+                        shard_failures.push(count_shard_failure(ix_name, &rendered));
+                        if first_error.is_none() {
+                            first_error = Some(rendered);
+                        }
                     }
                 }
             } else {
                 total += idx.stats().await.doc_count;
+                successful += 1;
             }
         }
+        // Nothing answered and something refused: the count IS the error, and
+        // it is returned with the same body and status the single-index form
+        // would have produced.
+        if successful == 0 && !shard_failures.is_empty() {
+            if let Some(rendered) = first_error {
+                let code = rendered
+                    .get("status")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| StatusCode::from_u16(c as u16).ok())
+                    .unwrap_or(StatusCode::BAD_REQUEST);
+                return (code, Json(rendered)).into_response();
+            }
+        }
+        // `total` is what was actually attempted, so the three numbers add up:
+        // a name in a comma list that resolves to no index is skipped here (as
+        // it always was) rather than counted as a shard that succeeded.
+        let failed = shard_failures.len() as u64;
         let mut body_out = json!({
             "count": total,
-            "_shards": { "total": wanted.len() as u64, "successful": wanted.len() as u64, "skipped": 0, "failed": 0 }
+            "_shards": { "total": successful + failed, "successful": successful, "skipped": 0, "failed": failed }
         });
+        if !shard_failures.is_empty() {
+            body_out["_shards"]["failures"] = Value::Array(shard_failures);
+        }
         if let Some(ref fp) = params.filter_path {
             if !fp.is_empty() {
                 let paths: Vec<&str> = fp.split(',').map(str::trim).collect();
@@ -25368,10 +25440,27 @@ async fn msearch_template_impl(
         let mut merged_hits: Vec<Value> = Vec::new();
         let mut total_count: u64 = 0;
         let mut script_failure: Option<String> = None;
+        let mut search_error: Option<xerj_common::XerjError> = None;
 
+        // Both arms below used to be `if let Ok(..)` with no else, so a
+        // missing index or a query the engine refused produced
+        // `{"_shards":{"successful":1,"failed":0},"hits":{"total":0}}` — a
+        // sub-response positively asserting the shard succeeded and found
+        // nothing. `_msearch` carries the same errors as a per-response
+        // envelope (`ApiError::into_value`, which keeps the exact body and
+        // status the single-request `_search` would have returned); the
+        // template form now does the same, and the sibling sub-requests in the
+        // batch are unaffected either way.
         for idx_name in &index_names {
-            if let Ok(idx) = state.engine.get_index(idx_name) {
-                if let Ok(result) = idx.search(&search_req).await {
+            let idx = match state.engine.get_index(idx_name) {
+                Ok(i) => i,
+                Err(e) => {
+                    search_error = Some(xerj_common::XerjError::from(e));
+                    break;
+                }
+            };
+            match idx.search(&search_req).await {
+                Ok(result) => {
                     if let Some(reason) = result.script_failure {
                         script_failure = Some(reason);
                         break;
@@ -25391,6 +25480,10 @@ async fn msearch_template_impl(
                         }));
                     }
                 }
+                Err(e) => {
+                    search_error = Some(xerj_common::XerjError::from(e));
+                    break;
+                }
             }
         }
 
@@ -25398,6 +25491,11 @@ async fn msearch_template_impl(
             // Degraded scores — report this sub-request as failed instead of
             // publishing them as if the script had run.
             responses.push(script_limit_error_value(&reason));
+            continue;
+        }
+
+        if let Some(err) = search_error {
+            responses.push(ApiError::new(err).into_value());
             continue;
         }
 
@@ -30134,6 +30232,25 @@ pub async fn rank_eval(
 
     let mut failures = serde_json::Map::new();
 
+    // A request `_rank_eval` cannot run is recorded in `failures`, never
+    // dropped. The three arms below used to be `Err(_) => continue`, so a
+    // refused request vanished from `details` AND from `failures` while
+    // `metric_score` was still published — the batch silently shrank and the
+    // mean was taken over the survivors, on the one endpoint whose entire
+    // purpose is measuring relevance quality. `failures` is the channel ES
+    // provides for exactly this (the `script_failure` arm further down already
+    // used it); a faulted request contributes nothing to `metric_score`, and a
+    // caller can now see that it did not.
+    let record_failure =
+        |failures: &mut serde_json::Map<String, Value>, id: &str, err: xerj_common::XerjError| {
+            let detail = ApiError::new(err)
+                .into_value()
+                .get("error")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "exception", "reason": "request failed" }));
+            failures.insert(id.to_string(), detail);
+        };
+
     for req_spec in &body.requests {
         let query_val = req_spec
             .request
@@ -30149,17 +30266,30 @@ pub async fn rank_eval(
         let search_req =
             match xerj_query::parse_request(&json!({"query": query_val, "size": size.max(k)})) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    record_failure(
+                        &mut failures,
+                        &req_spec.id,
+                        xerj_common::XerjError::invalid_query(e.to_string()),
+                    );
+                    continue;
+                }
             };
 
         let idx = match state.engine.get_index(&index) {
             Ok(i) => i,
-            Err(_) => continue,
+            Err(e) => {
+                record_failure(&mut failures, &req_spec.id, xerj_common::XerjError::from(e));
+                continue;
+            }
         };
 
         let result = match idx.search(&search_req).await {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                record_failure(&mut failures, &req_spec.id, xerj_common::XerjError::from(e));
+                continue;
+            }
         };
         // A Painless resource limit tripped while scoring or matching this
         // request. `_rank_eval` exists to *measure relevance quality*, so a
