@@ -437,7 +437,18 @@ pub struct EsBulkItemResult {
     pub id: String,
     #[serde(rename = "_version")]
     pub version: u64,
-    pub result: String,
+    /// `"created"` / `"updated"` / `"deleted"` / `"noop"`, and ABSENT on an
+    /// item that failed.
+    ///
+    /// Issue #204: this was a bare `String` filled from
+    /// `item.result.unwrap_or_else(|| "deleted".to_string())`, so every failed
+    /// bulk item — a rejected pipeline, a mapping error, a version conflict —
+    /// was reported as `"result": "deleted"` alongside its own `status: 400`.
+    /// A client reading `result` was told the document had been deleted when
+    /// nothing had been written or removed. Elasticsearch omits the field on a
+    /// failed item; so do we.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
     #[serde(rename = "_shards")]
     pub shards: EsShards,
     #[serde(rename = "_seq_no")]

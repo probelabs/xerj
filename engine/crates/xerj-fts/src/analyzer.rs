@@ -1333,7 +1333,10 @@ impl AnalyzerRegistry {
     /// 6. `normalizer` — accepted by ES for `keyword` fields, never built here;
     /// 7. an analyzer whose `filter` is not an array or whose `tokenizer` is
     ///    not a string: `apply_settings` drops the value shape-first and falls
-    ///    back to "no filters" / `standard`.
+    ///    back to "no filters" / `standard`;
+    /// 8. a `synonym` filter whose `synonyms` is not an array of strings —
+    ///    dropped the same shape-first way, leaving a filter that expands
+    ///    nothing.
     ///
     /// # What is NOT checked
     ///
@@ -1373,6 +1376,34 @@ impl AnalyzerRegistry {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if SUPPORTED_FILTER_TYPES.contains(&filter_type) {
+                    // A supported TYPE can still be given a wrong-shaped
+                    // option, and `apply_settings` drops those shape-first:
+                    // `synonyms` is read with `and_then(as_array)` and its
+                    // entries with `filter_map(as_str)`, so
+                    // `"synonyms": "fast,quick"` builds a synonym filter with
+                    // ZERO rules — registered, referenced, expanding nothing,
+                    // and reported nowhere. Same silent-loss class as the
+                    // analyzer-level `filter`/`tokenizer` shapes below.
+                    if filter_type == "synonym" {
+                        match filter_def.get("synonyms") {
+                            None => {}
+                            Some(serde_json::Value::Array(arr)) => {
+                                for v in arr {
+                                    if !v.is_string() {
+                                        problems.push(format!(
+                                            "token filter [{filter_name}]: `synonyms` entries \
+                                             must be rule strings, got {v} — it would be dropped"
+                                        ));
+                                    }
+                                }
+                            }
+                            Some(other) => problems.push(format!(
+                                "token filter [{filter_name}]: `synonyms` must be an array of \
+                                 rule strings, got {other} — it would be ignored and the filter \
+                                 would expand nothing"
+                            )),
+                        }
+                    }
                     continue;
                 }
                 // The `type` is one `apply_settings` cannot BUILD — but that is

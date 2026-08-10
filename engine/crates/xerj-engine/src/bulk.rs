@@ -265,6 +265,16 @@ pub struct BulkOpts {
     /// shape (see search body filter). Applied to every update action
     /// that doesn't provide its own `_source` in the action meta.
     pub default_source_req: Option<Value>,
+    /// URL-level `?pipeline=` — the ingest pipeline for every `index` /
+    /// `create` action that does not name one in its own action metadata.
+    /// `_none` disables the target index's `index.default_pipeline`.
+    ///
+    /// Issue #204: this used to be dropped on the floor, so
+    /// `POST /_bulk?pipeline=redact` answered `201` per item and stored the
+    /// UNREDACTED document, while the single-document form of the same write
+    /// ran the pipeline. Same for `index.default_pipeline`, which `_bulk` never
+    /// consulted at all.
+    pub default_pipeline: Option<String>,
 }
 
 pub async fn process_bulk_with_opts(
@@ -936,10 +946,49 @@ pub async fn process_bulk_with_opts(
         }
     }
 
+    // ── Effective ingest pipeline per item ──────────────────────────────────
+    //
+    // Elasticsearch resolves the pipeline for a bulk `index`/`create` action in
+    // this order, and so does xerj now:
+    //
+    //   1. the action's own `"pipeline"` metadata key
+    //   2. the request's `?pipeline=` query parameter
+    //   3. the target index's `index.default_pipeline` setting
+    //
+    // and `_none` at either of the first two levels disables the setting.
+    //
+    // Issue #204: only step 1 existed here. `POST /_bulk?pipeline=redact` and
+    // an index carrying `index.default_pipeline` both answered `201` per item
+    // and stored the document UNTRANSFORMED — no error, no log line — while
+    // `PUT /{index}/_doc/{id}?pipeline=redact` ran the pipeline and refused
+    // when it could not. One instruction, two answers, and the silent one was
+    // the high-volume path.
+    //
+    // Resolving here, before the existence check below and before the
+    // turbo-path partition (which diverts any action carrying a pipeline),
+    // means the rest of this function needs no further change: an unknown or
+    // unrunnable name fails the item exactly as an explicit one always did.
+    for action in parsed.iter_mut() {
+        if !matches!(action.action_type.as_str(), "index" | "create") {
+            // `update` and `delete` never carry a source body through a
+            // pipeline, in ES or here.
+            continue;
+        }
+        let explicit = action
+            .pipeline
+            .as_deref()
+            .or(opts.default_pipeline.as_deref());
+        action.pipeline = match explicit {
+            Some("_none") => None,
+            Some(p) => Some(p.to_string()),
+            None => engine.default_pipeline_for(&action.target_index),
+        };
+    }
+
     // ── Per-item validation: pipeline existence ─────────────────────────────
     //
-    // A per-item `pipeline: "..."` metadata reference must resolve to a
-    // registered ingest pipeline; otherwise ES fails the item with
+    // The effective pipeline resolved above must name a registered ingest
+    // pipeline; otherwise ES fails the item with
     // `illegal_argument_exception: pipeline with id [...] does not exist`.
     parsed.retain(|action| {
         if let Some(pid) = action.pipeline.as_deref() {
@@ -1644,8 +1693,24 @@ pub async fn process_bulk_with_opts(
                         }
                         doc_body = Some(transformed);
                     }
-                    // Empty result set — index the original body unchanged.
-                    Ok(_) => {}
+                    // No output for this document. `process_through_pipeline`
+                    // zips one action per input, so this is an internal
+                    // invariant break — but it must not fall through to
+                    // indexing the ORIGINAL body, which is the silent
+                    // pass-through issue #204 is about. Fail the item.
+                    Ok(_) => {
+                        items[item_idx] = Some(BulkItemResult {
+                            action: action_type.to_string(),
+                            index: target_index.clone(),
+                            id: error_id.clone(),
+                            status: 400,
+                            result: None,
+                            error: Some(format!("pipeline with id [{pid}] returned no document")),
+                            get_source: None,
+                        });
+                        errors = true;
+                        continue;
+                    }
                     Err(e) => {
                         // A genuinely absent pipeline keeps ES's exact wording
                         // (the conformance suite asserts it). A pipeline that

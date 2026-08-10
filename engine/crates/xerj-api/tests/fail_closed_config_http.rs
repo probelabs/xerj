@@ -394,3 +394,337 @@ async fn clone_copies_every_document_not_the_first_ten_thousand() {
         "clone must copy every document: {count}"
     );
 }
+
+// ── Every ingest path, not just the single-document one ──────────────────────
+//
+// The first cut of this branch made `PUT /_ingest/pipeline` mean "compiled ⇒
+// xerj honours this" and wired the refusal into the three single-document
+// handlers only. Measured against that build, `_bulk?pipeline=`, an index
+// carrying `index.default_pipeline`, `_reindex` `dest.pipeline` and
+// `_update_by_query?pipeline=` all answered 200/201 and stored the document
+// UNTRANSFORMED — including for a pipeline that was perfectly runnable.
+
+fn ndjson(path: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+/// `{"set": {"field": "env", "value": "prod"}}` — compiles and runs.
+async fn define_runnable_pipeline(app: &axum::Router, id: &str) {
+    let (status, body) = send(
+        app,
+        put(
+            &format!("/_ingest/pipeline/{id}"),
+            json!({ "processors": [{ "set": { "field": "env", "value": "prod" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// An ES `grok` `patterns` array — accepted by `PUT`, recorded unrunnable.
+async fn define_unrunnable_pipeline(app: &axum::Router, id: &str) {
+    let (status, body) = send(
+        app,
+        put(
+            &format!("/_ingest/pipeline/{id}"),
+            json!({ "processors": [{ "grok": {
+                "field": "message",
+                "patterns": ["%{IP:client} %{WORD:method}"]
+            } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["acknowledged"], true, "{body}");
+}
+
+#[tokio::test]
+async fn bulk_runs_the_url_level_pipeline() {
+    let (app, _dir) = app();
+    define_runnable_pipeline(&app, "setp").await;
+
+    let (status, body) = send(
+        &app,
+        ndjson(
+            "/_bulk?pipeline=setp&refresh=true",
+            "{\"index\":{\"_index\":\"b\",\"_id\":\"1\"}}\n{\"a\":1}\n",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], false, "{body}");
+
+    let (_, doc) = send(&app, get("/b/_doc/1")).await;
+    // Pre-fix: `{"a": 1}` — the parameter was read by nothing.
+    assert_eq!(doc["_source"]["env"], "prod", "{doc}");
+}
+
+#[tokio::test]
+async fn bulk_refuses_an_unrunnable_url_level_pipeline() {
+    let (app, _dir) = app();
+    define_unrunnable_pipeline(&app, "unrun").await;
+
+    let (status, body) = send(
+        &app,
+        ndjson(
+            "/_bulk?pipeline=unrun",
+            "{\"index\":{\"_index\":\"b\",\"_id\":\"1\"}}\n{\"message\":\"10.0.0.1 GET\"}\n",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], true, "{body}");
+    assert_eq!(body["items"][0]["index"]["status"], 400, "{body}");
+    // A failed item carries no `result`. Pre-fix it said `"deleted"`, which is
+    // a statement about the document that was not true.
+    assert!(
+        body["items"][0]["index"].get("result").is_none(),
+        "a failed item must not claim a result: {body}"
+    );
+
+    let (status, _) = send(&app, get("/b/_doc/1")).await;
+    assert_ne!(status, StatusCode::OK, "nothing may have been written");
+}
+
+#[tokio::test]
+async fn bulk_honours_index_default_pipeline() {
+    let (app, _dir) = app();
+    define_runnable_pipeline(&app, "setp").await;
+    let (status, body) = send(
+        &app,
+        put(
+            "/dp",
+            json!({ "settings": { "index": { "default_pipeline": "setp" } } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = send(
+        &app,
+        ndjson(
+            "/_bulk?refresh=true",
+            "{\"index\":{\"_index\":\"dp\",\"_id\":\"1\"}}\n{\"a\":1}\n",
+        ),
+    )
+    .await;
+    assert_eq!(body["errors"], false, "{body}");
+    let (_, doc) = send(&app, get("/dp/_doc/1")).await;
+    // Pre-fix: `_bulk` never consulted the setting, so this was `{"a": 1}`
+    // while `PUT /dp/_doc/1` on the same index ran the pipeline.
+    assert_eq!(doc["_source"]["env"], "prod", "{doc}");
+
+    // `_none` still disables it, as in Elasticsearch.
+    let (_, body) = send(
+        &app,
+        ndjson(
+            "/_bulk?pipeline=_none&refresh=true",
+            "{\"index\":{\"_index\":\"dp\",\"_id\":\"2\"}}\n{\"a\":2}\n",
+        ),
+    )
+    .await;
+    assert_eq!(body["errors"], false, "{body}");
+    let (_, doc) = send(&app, get("/dp/_doc/2")).await;
+    assert!(doc["_source"].get("env").is_none(), "{doc}");
+}
+
+#[tokio::test]
+async fn reindex_runs_and_validates_dest_pipeline() {
+    let (app, _dir) = app();
+    define_runnable_pipeline(&app, "setp").await;
+    define_unrunnable_pipeline(&app, "unrun").await;
+    let (status, _) = send(&app, put("/rsrc/_doc/1?refresh=true", json!({ "a": 1 }))).await;
+    assert!(status.is_success());
+
+    // Unrunnable: refused before anything is copied.
+    let (status, body) = send(
+        &app,
+        post(
+            "/_reindex",
+            json!({ "source": { "index": "rsrc" },
+                    "dest": { "index": "rbad", "pipeline": "unrun" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = send(&app, get("/rbad/_count")).await;
+    assert_ne!(status, StatusCode::OK, "no destination may have been made");
+
+    // Runnable: every copied document really went through it. Pre-fix
+    // `dest.pipeline` was not even a field on the request struct, so serde
+    // dropped it and the corpus was copied verbatim under `"created": 1`.
+    let (status, body) = send(
+        &app,
+        post(
+            "/_reindex",
+            json!({ "source": { "index": "rsrc" },
+                    "dest": { "index": "rdst", "pipeline": "setp" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 1, "{body}");
+    let (_, doc) = send(&app, get("/rdst/_doc/1")).await;
+    assert_eq!(doc["_source"]["env"], "prod", "{doc}");
+}
+
+#[tokio::test]
+async fn update_by_query_runs_and_validates_its_pipeline() {
+    let (app, _dir) = app();
+    define_runnable_pipeline(&app, "setp").await;
+    define_unrunnable_pipeline(&app, "unrun").await;
+    let (status, _) = send(&app, put("/ubq/_doc/1?refresh=true", json!({ "a": 1 }))).await;
+    assert!(status.is_success());
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/ubq/_update_by_query?pipeline=unrun",
+            json!({ "query": { "match_all": {} } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (_, doc) = send(&app, get("/ubq/_doc/1")).await;
+    assert_eq!(doc["_version"], 1, "nothing may have been rewritten: {doc}");
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/ubq/_update_by_query?pipeline=setp&refresh=true",
+            json!({ "query": { "match_all": {} } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["updated"], 1, "{body}");
+    let (_, doc) = send(&app, get("/ubq/_doc/1")).await;
+    // Pre-fix: `"updated": 1` and the document byte-identical to what it was.
+    assert_eq!(doc["_source"]["env"], "prod", "{doc}");
+}
+
+#[tokio::test]
+async fn a_pipeline_level_on_failure_block_is_accepted_and_then_refuses_the_write() {
+    let (app, _dir) = app();
+    // The same key one level up from the processor-level `on_failure` the
+    // first cut refused. Measured against that build: `PUT` answered 200, `GET`
+    // echoed the block back, and the write succeeded with the recovery chain
+    // silently absent.
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/plof",
+            json!({
+                "processors": [{ "set": { "field": "env", "value": "prod" } }],
+                "on_failure": [{ "set": { "field": "err", "value": "yes" } }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["acknowledged"], true, "{body}");
+
+    let (status, body) = send(&app, put("/plof/_doc/1?pipeline=plof", json!({ "a": 1 }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("on_failure")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn set_copy_from_is_a_capability_gap_not_a_caller_error() {
+    let (app, _dir) = app();
+    // `copy_from` is valid Elasticsearch 7.x+. Refusing the DEFINITION with
+    // `mapper_parsing_exception: missing value` told the caller their correct
+    // pipeline was malformed; the gap is xerj's, so it takes the same
+    // accept-then-refuse-the-write route as every other unsupported option.
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/cf",
+            json!({ "processors": [{ "set": { "field": "b", "copy_from": "a" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["acknowledged"], true, "{body}");
+
+    let (status, body) = send(&app, put("/cf/_doc/1?pipeline=cf", json!({ "a": 1 }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("copy_from")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn all_stats_reports_the_schema_persist_failure_counter_too() {
+    let (app, _dir) = app();
+    let (status, _) = send(&app, put("/s1/_doc/1?refresh=true", json!({ "a": 1 }))).await;
+    assert!(status.is_success());
+
+    let (status, body) = send(&app, get("/_all/_stats")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Pre-fix `_all.primaries` carried no `mappings` key at all, while
+    // `Index::schema_persist_failures`'s doc-comment named this endpoint.
+    assert_eq!(
+        body["_all"]["primaries"]["mappings"]["schema_persist_failures"], 0,
+        "{body}"
+    );
+    assert_eq!(
+        body["indices"]["s1"]["primaries"]["mappings"]["schema_persist_failures"], 0,
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_synonym_filter_given_a_bare_string_is_refused_not_silently_emptied() {
+    let (app, _dir) = app();
+    // `apply_settings` reads `synonyms` with `and_then(as_array)`, so a bare
+    // string built a synonym filter with ZERO rules — registered, referenced by
+    // the analyzer, expanding nothing, reported nowhere.
+    let (status, body) = send(
+        &app,
+        put(
+            "/syn_bad",
+            json!({ "settings": { "analysis": {
+                "filter": { "s": { "type": "synonym", "synonyms": "fast,quick" } },
+                "analyzer": { "a": { "type": "custom", "tokenizer": "standard",
+                                     "filter": ["s"] } }
+            } } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("synonyms")),
+        "{body}"
+    );
+
+    // The array form is still accepted.
+    let (status, body) = send(
+        &app,
+        put(
+            "/syn_ok",
+            json!({ "settings": { "analysis": {
+                "filter": { "s": { "type": "synonym", "synonyms": ["fast,quick"] } },
+                "analyzer": { "a": { "type": "custom", "tokenizer": "standard",
+                                     "filter": ["s"] } }
+            } } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

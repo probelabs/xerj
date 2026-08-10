@@ -1668,6 +1668,32 @@ impl Engine {
 
     // ── Transform pipeline methods ────────────────────────────────────────────
 
+    /// The `index.default_pipeline` setting for `index`, if it has one.
+    ///
+    /// One implementation for every write path. It used to live only in the
+    /// `_doc` handlers, which is why `_bulk` ignored the setting entirely and
+    /// stored documents untransformed under a `201` while the single-document
+    /// form of the same write refused (issue #204).
+    ///
+    /// Handles the three shapes settings arrive in — nested
+    /// `{index: {default_pipeline: ..}}`, dotted `{"index.default_pipeline": ..}`
+    /// and flat `{default_pipeline: ..}` — mirroring the `number_of_shards`
+    /// lookup pattern used elsewhere.
+    ///
+    /// `index` is matched literally: an alias has no settings of its own, so a
+    /// write addressed to an alias does not pick up its backing index's default
+    /// pipeline. That is a known gap, identical on every write path.
+    pub fn default_pipeline_for(&self, index: &str) -> Option<String> {
+        self.index_settings.get(index).and_then(|v| {
+            v.get("index")
+                .and_then(|ix| ix.get("default_pipeline"))
+                .or_else(|| v.get("index.default_pipeline"))
+                .or_else(|| v.get("default_pipeline"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    }
+
     /// Compile and register a typed transform pipeline from a JSON config.
     ///
     /// `config_json` must be a valid [`PipelineConfig`](xerj_wasm::pipeline::PipelineConfig)

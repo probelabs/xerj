@@ -17776,9 +17776,11 @@ impl Index {
     /// `schema.json`. Non-zero means the on-disk mapping is behind the
     /// in-memory one and a restart will lose dynamically-mapped fields.
     ///
-    /// Read by `GET /{index}/_stats` and `GET /_all/_stats`, which report it as
-    /// `primaries.mappings.schema_persist_failures` — a health check can see it
-    /// without reading logs.
+    /// Read by `GET /{index}/_stats`, which reports it as
+    /// `primaries.mappings.schema_persist_failures`, and by `GET /_all/_stats`,
+    /// which reports the sum over every index at
+    /// `_all.primaries.mappings.schema_persist_failures` — so a health check
+    /// can see it without reading logs.
     pub fn schema_persist_failures(&self) -> u64 {
         self.schema_persist_failures.load(Ordering::Relaxed)
     }

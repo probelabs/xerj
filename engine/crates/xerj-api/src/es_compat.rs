@@ -2201,10 +2201,9 @@ pub struct IndexDocAutoParams {
 /// - `Some(name)`    → that pipeline (an explicit `?pipeline=` always wins).
 /// - `None`          → the index's `index.default_pipeline` setting, if any.
 ///
-/// The default is read from `engine.index_settings`, handling the nested
-/// `{index: {default_pipeline: ..}}`, dotted `{"index.default_pipeline": ..}`,
-/// and flat `{default_pipeline: ..}` shapes — mirroring the `number_of_shards`
-/// lookup pattern used elsewhere in this module.
+/// The default is read by [`xerj_engine::Engine::default_pipeline_for`], which
+/// `_bulk` also uses — one lookup, so the two forms of the same write cannot
+/// disagree about which pipeline applies.
 fn resolve_effective_pipeline(
     state: &AppState,
     index: &str,
@@ -2213,14 +2212,7 @@ fn resolve_effective_pipeline(
     match explicit {
         Some("_none") => None,
         Some(p) => Some(p.to_string()),
-        None => state.engine.index_settings.get(index).and_then(|v| {
-            v.get("index")
-                .and_then(|ix| ix.get("default_pipeline"))
-                .or_else(|| v.get("index.default_pipeline"))
-                .or_else(|| v.get("default_pipeline"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
-        }),
+        None => state.engine.default_pipeline_for(index),
     }
 }
 
@@ -2295,10 +2287,9 @@ pub async fn index_doc_auto(
                 }
                 transformed
             }
-            Ok(_) => {
-                // Pipeline returned empty results — pass through original
-                serde_json::from_slice(&body).unwrap_or(Value::Null)
-            }
+            // No output for this document: refused, not passed through
+            // unchanged — see `pipeline_empty_result_error`.
+            Ok(_) => return pipeline_empty_result_error(pipeline).into_response(),
             // Issue #204, the purest form of the class on a user-DATA path:
             // this used to warn and then index the ORIGINAL document. A
             // pipeline whose job was to redact PII, drop a field or route the
@@ -2426,9 +2417,9 @@ pub async fn index_doc(
                 }
                 transformed
             }
-            // Pipeline produced no output for this document — index the
-            // original body, which is what it asked for.
-            Ok(_) => doc,
+            // No output for this document: refused, not passed through
+            // unchanged — see `pipeline_empty_result_error`.
+            Ok(_) => return pipeline_empty_result_error(pipeline).into_response(),
             // Issue #204: this arm was folded into `_ => doc`, so a pipeline
             // that could not run left the document indexed UNTRANSFORMED under
             // a success response. Refuse instead.
@@ -2553,9 +2544,9 @@ pub async fn create_doc(
                 }
                 transformed
             }
-            // Pipeline produced no output for this document — index the
-            // original body, which is what it asked for.
-            Ok(_) => doc,
+            // No output for this document: refused, not passed through
+            // unchanged — see `pipeline_empty_result_error`.
+            Ok(_) => return pipeline_empty_result_error(pipeline).into_response(),
             // Issue #204: this arm was folded into `_ => doc`, so a pipeline
             // that could not run left the document indexed UNTRANSFORMED under
             // a success response. Refuse instead.
@@ -13054,6 +13045,10 @@ fn bulk_opts_from_query(
             _ => None,
         }),
         default_source_req,
+        // `?pipeline=` — the request-level default for every `index`/`create`
+        // action that names no pipeline of its own. Read but discarded before
+        // (issue #204): the bulk item was written untransformed under a `201`.
+        default_pipeline: qp.get("pipeline").cloned(),
     }
 }
 
@@ -13182,7 +13177,14 @@ async fn process_bulk_body(
             index: item.index,
             id: item.id,
             version,
-            result: item.result.unwrap_or_else(|| "deleted".to_string()),
+            // A successful action with no explicit result is a `delete`
+            // (the only one that does not set one). A FAILED action has no
+            // result at all — see `EsBulkItemResult::result`.
+            result: if item.error.is_some() {
+                None
+            } else {
+                Some(item.result.clone().unwrap_or_else(|| "deleted".to_string()))
+            },
             shards: crate::responses::EsShards::single_success(),
             seq_no,
             primary_term: 1,
@@ -16506,6 +16508,13 @@ pub async fn index_stats(
         // Aggregate across multiple indices.
         let mut all_doc_count = 0u64;
         let mut all_store_bytes = 0u64;
+        // Aggregated so `GET /_all/_stats` carries the same
+        // `primaries.mappings.schema_persist_failures` the per-index form does.
+        // Without it `Index::schema_persist_failures`'s doc-comment named an
+        // endpoint that did not report the counter, and a fleet-wide health
+        // check reading only `_all` saw nothing (issue #204: the claim has to
+        // match what the endpoint really answers).
+        let mut all_schema_persist_failures = 0u64;
         let mut all_indices = serde_json::Map::new();
         for name in &targets {
             let stats = match state.engine.index_stats(name).await {
@@ -16545,6 +16554,7 @@ pub async fn index_stats(
                 .get_index(name)
                 .map(|idx| idx.schema_persist_failures())
                 .unwrap_or(0);
+            all_schema_persist_failures += schema_persist_failures;
             let primaries = json!({
                 "docs": { "count": doc_count, "deleted": 0 },
                 "store": { "size_in_bytes": store_size_bytes },
@@ -16614,6 +16624,7 @@ pub async fn index_stats(
         let all_primaries = json!({
             "docs": { "count": all_doc_count, "deleted": 0 },
             "store": { "size_in_bytes": all_store_bytes },
+            "mappings": { "schema_persist_failures": all_schema_persist_failures },
             "dense_vector": {
                 "value_count": all_dv_value_count,
                 "off_heap": {
@@ -18309,6 +18320,14 @@ fn reindex_default_size() -> usize {
 #[derive(Debug, Deserialize)]
 pub struct ReindexDest {
     pub index: String,
+    /// `dest.pipeline` — the ingest pipeline every copied document is run
+    /// through before it is written to the destination.
+    ///
+    /// Issue #204: this field did not exist, so serde dropped it and a
+    /// `_reindex` asking for redaction on the way in answered
+    /// `{"created": N}` having copied every document VERBATIM.
+    #[serde(default)]
+    pub pipeline: Option<String>,
 }
 
 pub async fn reindex(
@@ -18356,6 +18375,41 @@ pub async fn reindex(
     let source_name = &body.source.index;
     let dest_name = &body.dest.index;
 
+    // `dest.pipeline` is checked BEFORE a single document is copied. A name
+    // that does not resolve, or one this build cannot run, fails the whole
+    // request with nothing written — rather than copying the corpus
+    // untransformed and reporting success (issue #204). `_none` means "no
+    // pipeline", matching the write paths.
+    let dest_pipeline: Option<String> = match body.dest.pipeline.as_deref() {
+        None | Some("_none") => None,
+        Some(p) => {
+            let reason = if !state.engine.pipelines.contains_key(p) {
+                Some(format!("pipeline with id [{p}] does not exist"))
+            } else {
+                state
+                    .engine
+                    .unrunnable_pipelines
+                    .get(p)
+                    .map(|r| format!("pipeline with id [{p}] cannot be run: {}", r.value()))
+            };
+            if let Some(reason) = reason {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+                            "type": "illegal_argument_exception",
+                            "reason": reason,
+                        },
+                        "status": 400,
+                    })),
+                )
+                    .into_response();
+            }
+            Some(p.to_string())
+        }
+    };
+
     // Get or create destination index.
     let dest_idx = match state.engine.get_or_create_index(dest_name) {
         Ok(i) => i,
@@ -18374,7 +18428,19 @@ pub async fn reindex(
     // reliably, so un-flushed recent writes would be skipped or duplicated
     // across pages. Reindex is a snapshot-style bulk op, so a single flush up
     // front is an acceptable cost and makes the whole source keyset-pageable.
-    let _ = source_idx.flush().await;
+    //
+    // Propagated, not swallowed, for the same reason as `clone_index_to`: the
+    // flush is a precondition of the paging being complete, so a failed flush
+    // must not be followed by a reindex that reports `"total": N` over a source
+    // it could not read consistently (issue #204).
+    if let Err(e) = source_idx.flush().await {
+        return ApiError::new(xerj_common::XerjError::internal(format!(
+            "reindex from [{source_name}] into [{dest_name}] was not attempted: flushing \
+             the source failed ({e}); the copy needs a flushed source to page over it \
+             without skipping or duplicating documents"
+        )))
+        .into_response();
+    }
 
     let query_val = body
         .source
@@ -18391,6 +18457,7 @@ pub async fn reindex(
     let mut total_fetched = 0usize;
     let mut created = 0usize;
     let mut updated = 0usize;
+    let mut noops = 0usize;
     let mut failures: Vec<Value> = Vec::new();
     let mut batches = 0usize;
     // Keyset cursor: `[last_id]` of the previous page (the sole sort key is
@@ -18441,6 +18508,49 @@ pub async fn reindex(
 
         for hit in results.hits {
             if !hit.source.is_null() {
+                // `dest.pipeline`, if the request named one. Already known to
+                // exist and to be runnable (checked before any copy started),
+                // so anything that goes wrong here is a per-document failure
+                // and is reported as one — never a pass-through of the
+                // untransformed source.
+                let doc_source = match dest_pipeline.as_deref() {
+                    None => hit.source,
+                    Some(p) => match state.engine.process_through_pipeline(p, vec![hit.source]) {
+                        Ok(mut results) if !results.is_empty() => {
+                            let (action, transformed) = results.remove(0);
+                            if matches!(action, xerj_wasm::pipeline::ProcessAction::Drop) {
+                                // ES: a pipeline that drops the document does
+                                // not write it, and the run reports a noop.
+                                noops += 1;
+                                continue;
+                            }
+                            transformed
+                        }
+                        Ok(_) => {
+                            failures.push(json!({
+                                "id": hit.id,
+                                "cause": {
+                                    "type": "reindex_error",
+                                    "reason": format!(
+                                        "pipeline [{p}] returned no document for [{}]",
+                                        hit.id
+                                    ),
+                                },
+                            }));
+                            continue;
+                        }
+                        Err(e) => {
+                            failures.push(json!({
+                                "id": hit.id,
+                                "cause": {
+                                    "type": "reindex_error",
+                                    "reason": format!("pipeline [{p}] failed: {e}"),
+                                },
+                            }));
+                            continue;
+                        }
+                    },
+                };
                 // Check if doc already exists in dest to track created vs updated.
                 let exists = dest_idx
                     .get_document(&hit.id)
@@ -18449,7 +18559,7 @@ pub async fn reindex(
                     .flatten()
                     .is_some();
                 match dest_idx
-                    .index_document(Some(hit.id.clone()), hit.source)
+                    .index_document(Some(hit.id.clone()), doc_source)
                     .await
                 {
                     Ok(_) => {
@@ -18490,7 +18600,7 @@ pub async fn reindex(
         "batches": batches,
         "failures": failures,
         "throttled_millis": 0,
-        "noops": 0,
+        "noops": noops,
         "version_conflicts": 0,
         "retries": { "bulk": 0, "search": 0 },
     }))
@@ -21245,6 +21355,42 @@ pub async fn update_by_query(
     // update happens in place (no duplicate-`_id` docs are appended).
     let script = body.script.as_ref().map(extract_update_script);
 
+    // `?pipeline=` — every matched document is run through it before being
+    // written back. Issue #204: the parameter used to be read by nothing, so
+    // `_update_by_query?pipeline=redact` reported `"updated": N` having
+    // rewritten every document EXACTLY as it was. Resolved and validated
+    // before any document is touched: an unknown or unrunnable name fails the
+    // whole request rather than half of it.
+    let pipeline = match params.get("pipeline").map(String::as_str) {
+        None | Some("_none") => None,
+        Some(p) => {
+            let reason = if !state.engine.pipelines.contains_key(p) {
+                Some(format!("pipeline with id [{p}] does not exist"))
+            } else {
+                state
+                    .engine
+                    .unrunnable_pipelines
+                    .get(p)
+                    .map(|r| format!("pipeline with id [{p}] cannot be run: {}", r.value()))
+            };
+            if let Some(reason) = reason {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+                            "type": "illegal_argument_exception",
+                            "reason": reason,
+                        },
+                        "status": 400,
+                    })),
+                )
+                    .into_response();
+            }
+            Some((state.engine.clone(), p.to_string()))
+        }
+    };
+
     // ES defaults `wait_for_completion` to true (synchronous); only an
     // explicit `false` switches to the async `{"task": "node:id"}` form.
     let wait_for_completion = params
@@ -21260,14 +21406,14 @@ pub async fn update_by_query(
         // Same reasoning as the `_delete_by_query` spawn above: the task owns
         // one already-authorized `Index` handle and can reach no other index.
         tokio::spawn(async move {
-            let response = run_update_by_query(&idx, &search_req, script).await;
+            let response = run_update_by_query(&idx, &search_req, script, pipeline).await;
             tasks.complete(&spawned_key, response);
             drop(handle);
         });
         return Json(json!({ "task": task_key })).into_response();
     }
 
-    let response = run_update_by_query(&idx, &search_req, script).await;
+    let response = run_update_by_query(&idx, &search_req, script, pipeline).await;
     drop(handle);
     by_query_response(response)
 }
@@ -21280,10 +21426,46 @@ pub async fn update_by_query(
 /// `wait_for_completion=false` form.
 const SCRIPTED_UPDATE_BUDGET_MS: u64 = 30_000;
 
+/// Run `doc` through `pipeline`, or say why it could not be run.
+///
+/// Issue #204: every caller must get a document that really went through the
+/// pipeline, or an error. There is deliberately no "return the input unchanged"
+/// branch — that is precisely how an unrun redaction became a `200`.
+///
+/// A `drop` action is an error here rather than a deletion:
+/// `_update_by_query` updates documents in place and has no delete path, so
+/// honouring `drop` is not something this endpoint can do. Saying so per
+/// document beats writing the document as if the processor had not asked.
+fn apply_pipeline_or_fail(
+    engine: &xerj_engine::Engine,
+    pipeline: &str,
+    doc_id: &str,
+    doc: Value,
+) -> std::result::Result<Value, String> {
+    match engine.process_through_pipeline(pipeline, vec![doc]) {
+        Ok(mut results) if !results.is_empty() => {
+            let (action, transformed) = results.remove(0);
+            if matches!(action, xerj_wasm::pipeline::ProcessAction::Drop) {
+                return Err(format!(
+                    "pipeline [{pipeline}] dropped document [{doc_id}]; _update_by_query \
+                     updates in place and cannot delete it, so the document was left \
+                     unchanged"
+                ));
+            }
+            Ok(transformed)
+        }
+        Ok(_) => Err(format!(
+            "pipeline [{pipeline}] returned no document for [{doc_id}]"
+        )),
+        Err(e) => Err(format!("pipeline [{pipeline}] failed: {e}")),
+    }
+}
+
 async fn run_update_by_query(
     idx: &xerj_engine::Index,
     search_req: &xerj_query::SearchRequest,
     script: Option<(String, Value)>,
+    pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
 ) -> Value {
     let started = Instant::now();
 
@@ -21343,6 +21525,13 @@ async fn run_update_by_query(
                     let result = idx
                         .transform_document_serialized(&hit.id, None, |mut current| {
                             apply_painless_update(&mut current, src, params)?;
+                            // ES runs `?pipeline=` on the result of the script,
+                            // and so do we — inside the same serialized
+                            // transform, so the pipeline sees exactly the
+                            // document that is about to be written.
+                            if let Some((engine, name)) = pipeline.as_ref() {
+                                current = apply_pipeline_or_fail(engine, name, &hit.id, current)?;
+                            }
                             Ok::<_, String>(current)
                         })
                         .await;
@@ -21359,8 +21548,24 @@ async fn run_update_by_query(
                         })),
                     }
                 } else {
-                    // No script: preserve the historical re-index-in-place behavior.
-                    match idx.index_document(Some(hit.id.clone()), hit.source).await {
+                    // No script: preserve the historical re-index-in-place
+                    // behavior, with `?pipeline=` applied when one was named.
+                    let doc = match pipeline.as_ref() {
+                        None => hit.source,
+                        Some((engine, name)) => {
+                            match apply_pipeline_or_fail(engine, name, &hit.id, hit.source) {
+                                Ok(d) => d,
+                                Err(reason) => {
+                                    failures.push(json!({
+                                        "id": hit.id,
+                                        "cause": { "reason": reason },
+                                    }));
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    match idx.index_document(Some(hit.id.clone()), doc).await {
                         Ok(_) => updated += 1,
                         Err(e) => {
                             failures.push(json!({
@@ -21483,6 +21688,7 @@ mod scripted_update_publication_tests {
                     &idx,
                     &xerj_query::SearchRequest::default(),
                     Some(("ctx._source.n += 1".into(), json!({}))),
+                    None,
                 )
                 .await
             }));
@@ -21761,6 +21967,21 @@ fn pipeline_execution_error(pipeline: &str, e: &xerj_wasm::WasmError) -> ApiErro
     )))
 }
 
+/// A pipeline that returned no document for the one it was given.
+///
+/// `process_through_pipeline` zips one action per input document, so this is an
+/// internal invariant break rather than a configuration a caller can write.
+/// It still must not fall through to indexing the ORIGINAL document: "the
+/// pipeline produced nothing, so store what the caller sent" is the same
+/// silent-pass-through this whole change exists to remove, and it would land on
+/// exactly the redaction case where it costs the most.
+fn pipeline_empty_result_error(pipeline: &str) -> ApiError {
+    tracing::error!(pipeline = %pipeline, "refusing write: ingest pipeline returned no document");
+    ApiError::new(xerj_common::XerjError::config(format!(
+        "document not indexed: ingest pipeline [{pipeline}] returned no document"
+    )))
+}
+
 pub async fn put_ingest_pipeline(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -21884,6 +22105,27 @@ pub async fn put_ingest_pipeline(
     } else {
         body.clone()
     };
+    // Elasticsearch pipeline-level (top-level body) keys that decide what
+    // happens when a processor fails. The compiled pipeline has no equivalent:
+    // `PipelineConfig` carries a single `on_error` policy and no recovery
+    // chain, so a top-level `on_failure` was read by nothing.
+    //
+    // This is the SAME defect the repair fixed one level down
+    // (`UNHONOURED_PROCESSOR_KEYS` in `xerj-wasm/src/pipeline.rs`): refusing a
+    // processor-level `on_failure` while silently dropping the identical key at
+    // pipeline level would have left the endpoint inconsistent with itself.
+    // `description`, `version`, `_meta` and `deprecated` are NOT here — they
+    // are identification metadata that changes no document, the same line drawn
+    // for processor-level `tag`/`description`.
+    const UNHONOURED_PIPELINE_KEYS: &[(&str, &str)] = &[(
+        "on_failure",
+        "the pipeline-level recovery processors are not run; the compiled pipeline's \
+         `on_error` policy applies instead",
+    )];
+    let unhonoured_top_level = UNHONOURED_PIPELINE_KEYS
+        .iter()
+        .find(|(key, _)| body.get(*key).is_some())
+        .copied();
     // Three outcomes, and the difference between them is the whole point of
     // issue #204:
     //
@@ -21902,6 +22144,21 @@ pub async fn put_ingest_pipeline(
     //                         where a document would otherwise be silently
     //                         mis-ingested.
     match state.engine.create_pipeline(&id, xerj_config) {
+        Ok(()) if unhonoured_top_level.is_some() => {
+            // Every stage compiled, but a top-level key we cannot act on came
+            // with it. `register_unrunnable_pipeline` drops the compiled form
+            // `create_pipeline` just installed, so nothing runs half-honoured.
+            let (option, reason) = unhonoured_top_level.expect("guarded by the match arm");
+            state.engine.register_unrunnable_pipeline(
+                &id,
+                body,
+                format!(
+                    "pipeline-level [{option}] is not supported by this xerj build \
+                     ({reason}); no document can be ingested through pipeline [{id}]"
+                ),
+            );
+            Json(json!({ "acknowledged": true })).into_response()
+        }
         Ok(()) => {
             // `create_pipeline` stores the *translated* config; put the ES
             // body back so GET and _simulate see what was actually submitted.
@@ -25151,7 +25408,19 @@ async fn clone_index_to(state: &AppState, source: &str, target: &str) -> Result<
     // `max_result_window`. The source is flushed first because the in-memory
     // memtable's sort path does not order by `_id` reliably, so un-flushed
     // writes would be skipped or duplicated across pages.
-    let _ = src_idx.flush().await;
+    //
+    // That makes the flush a CORRECTNESS precondition of the paging below, not
+    // a best-effort hint — so it is propagated rather than swallowed. A
+    // `let _ =` here would have produced exactly the defect this function was
+    // rewritten to remove: a silently partial (or duplicated) copy answering
+    // `{"acknowledged": true, "shards_acknowledged": true}`.
+    src_idx.flush().await.map_err(|e| {
+        ApiError::new(xerj_common::XerjError::internal(format!(
+            "clone of [{source}] into [{target}] was not attempted: flushing the source \
+             failed ({e}); the copy needs a flushed source to page over it without \
+             skipping or duplicating documents"
+        )))
+    })?;
 
     const CLONE_PAGE_SIZE: usize = 1_000;
     let mut search_after: Option<Value> = None;
@@ -34102,6 +34371,7 @@ mod reindex_keyset_tests {
             },
             dest: ReindexDest {
                 index: "dst".into(),
+                pipeline: None,
             },
         };
         let resp = reindex(State(state.clone()), Json(body))

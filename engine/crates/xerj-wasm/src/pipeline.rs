@@ -436,6 +436,22 @@ fn build_plugin(
 
         "set" => {
             let field = str_field(config, "field")?;
+            // Elasticsearch's `set` takes EITHER `value` or `copy_from` (7.x+),
+            // where `copy_from` names another field to read the value out of
+            // the document at ingest time. `SetPlugin` only holds a literal
+            // value, so `copy_from` cannot be honoured — but it is a valid ES
+            // processor, which makes the gap xerj's, not the caller's. Reported
+            // as an unsupported OPTION (accept the definition, refuse the
+            // write) rather than falling through to `missing 'value'`, which
+            // told the caller their correct ES pipeline was malformed.
+            if config.get("copy_from").is_some() {
+                return Err(StageBuildError::UnsupportedOption {
+                    option: "copy_from".to_string(),
+                    reason: "xerj's set stage assigns a literal `value`; copying the value \
+                             from another field at ingest time is not implemented"
+                        .to_string(),
+                });
+            }
             let value = config
                 .get("value")
                 .cloned()
