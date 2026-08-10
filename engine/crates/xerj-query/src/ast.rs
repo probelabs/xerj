@@ -558,6 +558,13 @@ pub enum QueryNode {
         query: String,
         #[serde(default = "default_max_expansions")]
         max_expansions: u32,
+        /// Allowed intervening positions across the whole phrase, trailing
+        /// prefix term included.  ES accepts and honours `slop` here
+        /// (`MatchPhrasePrefixQueryBuilder` parses it and passes it to
+        /// `MatchQueryParser.setPhraseSlop`), so dropping it would be
+        /// accept-and-ignore (#204 class).
+        #[serde(default)]
+        slop: u32,
     },
 
     /// Simple query string — splits on `+`/`|`/`-` operators, converted to a Bool query.

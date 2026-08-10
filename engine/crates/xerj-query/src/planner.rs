@@ -506,14 +506,16 @@ fn plan_node(query: QueryNode, schema: &Schema) -> ExecutionPlan {
         QueryNode::Intervals { field, .. } => ExecutionPlan::ExistsScan { field },
 
         // MatchPhrasePrefix: treat as a phrase search on the given field.
-        QueryNode::MatchPhrasePrefix { field, query, .. } => {
+        QueryNode::MatchPhrasePrefix {
+            field, query, slop, ..
+        } => {
             let tokens: Vec<String> = query.split_whitespace().map(str::to_string).collect();
             ExecutionPlan::FtsSearch {
                 field,
                 tokens,
                 require_all: true,
                 phrase: true,
-                slop: 0,
+                slop,
                 cost: 10.0,
             }
         }

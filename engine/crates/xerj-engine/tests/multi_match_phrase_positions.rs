@@ -311,45 +311,191 @@ async fn memtable_phrase_hit_scores_nonzero() {
     }
 }
 
-/// `slop` on a `phrase_prefix` cannot be honoured by either evaluator —
-/// the segment clause (`xerj_fts::search::PhrasePrefixQuery`) carries no
-/// slop, and the stored-doc walk requires an adjacent head phrase. ES does
-/// honour it, so accepting the parameter and answering an exact phrase
-/// would silently answer a different query (#204's defect class). It must
-/// be refused, loudly.
-#[test]
-fn slop_on_phrase_prefix_is_refused_not_ignored() {
-    let err = parse_request(&json!({
-        "query": {"multi_match": {"query": "merge poli", "fields": ["body"],
-                                  "type": "phrase_prefix", "slop": 2}}
-    }))
-    .expect_err("slop on phrase_prefix must be refused, not silently dropped");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("slop") && msg.contains("phrase_prefix"),
-        "error must name both the parameter and the type, got: {msg}"
-    );
+/// `slop` on a `phrase_prefix` is HONOURED, at both entry points and in
+/// both states. ES honours it (`TextFieldMapper.createPhrasePrefixQuery`
+/// builds a `MultiPhrasePrefixQuery` and calls `setSlop`), so refusing it
+/// would break clients, and dropping it — which `parse_match_phrase_prefix`
+/// did — is the accept-and-ignore defect class of #204: the `multi_match`
+/// and `match_phrase_prefix` spellings of the same query must not disagree.
+///
+/// Doc 1's `body` analyses to [the, log, merge, policy, …]: the phrase
+/// `log poli*` needs one intervening position, so slop 0 misses and slop 1
+/// hits.
+#[tokio::test]
+async fn phrase_prefix_slop_is_honoured_at_both_entry_points() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let idx = seed(&engine, "mmpp_prefix_slop").await;
 
-    // slop 0 is the default and stays accepted.
-    parse_request(&json!({
-        "query": {"multi_match": {"query": "merge poli", "fields": ["body"],
-                                  "type": "phrase_prefix", "slop": 0}}
-    }))
-    .expect("slop 0 on phrase_prefix is the default and must parse");
+    assert_both_states(
+        &idx,
+        &[
+            (
+                json!({"multi_match": {"query": "log poli", "fields": ["body"],
+                                       "type": "phrase_prefix"}}),
+                &[],
+                "phrase_prefix slop 0 (default): one intervening token → no match",
+            ),
+            (
+                json!({"multi_match": {"query": "log poli", "fields": ["body"],
+                                       "type": "phrase_prefix", "slop": 1}}),
+                &["1"],
+                "phrase_prefix slop 1: one intervening token → match",
+            ),
+            (
+                json!({"match_phrase_prefix": {"body": {"query": "log poli", "slop": 1}}}),
+                &["1"],
+                "oracle match_phrase_prefix slop 1 answers the same query",
+            ),
+            (
+                json!({"match_phrase_prefix": {"body": {"query": "log poli"}}}),
+                &[],
+                "oracle match_phrase_prefix slop 0",
+            ),
+        ],
+    )
+    .await;
 }
 
-/// A negative `slop` is a client error in ES; accepting it silently would
-/// be another accept-and-ignore. Assert the parser rejects it.
+/// A negative `slop` is a client error in ES from EVERY builder, so every
+/// entry point must answer alike — a 400 from one spelling and a silently
+/// coerced 0 from the other is the same accept-and-ignore defect wearing a
+/// different hat.
 #[test]
-fn negative_slop_is_rejected() {
-    let err = parse_request(&json!({
-        "query": {"multi_match": {"query": "merge policy", "fields": ["body"],
-                                  "type": "phrase", "slop": -1}}
-    }))
-    .expect_err("negative slop must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("slop"),
-        "error should name the offending parameter, got: {msg}"
-    );
+fn negative_slop_is_rejected_at_every_entry_point() {
+    for bad in [
+        json!({"multi_match": {"query": "merge policy", "fields": ["body"],
+                               "type": "phrase", "slop": -1}}),
+        json!({"match_phrase": {"body": {"query": "merge policy", "slop": -1}}}),
+        json!({"match_phrase_prefix": {"body": {"query": "merge poli", "slop": -1}}}),
+    ] {
+        let err = parse_request(&json!({"query": bad}))
+            .expect_err("negative slop must be rejected, not coerced to 0");
+        assert!(
+            err.to_string().contains("slop"),
+            "error should name the offending parameter, got: {err}"
+        );
+    }
+}
+
+/// The stored-scan/memtable evaluator and the positional segment clause
+/// must tokenize with the SAME analyzer, or they answer different queries
+/// and the hit set changes at `_flush` — the regression class #218/#222
+/// removed and that #230 names as the standing invariant.
+///
+/// An earlier revision of this fix tokenized the memtable side by splitting
+/// on `!char::is_alphanumeric()` while the segment clause was built from the
+/// `standard` analyzer (UAX#29 `unicode_words()`). The two disagree on
+/// intra-word `.`, `'` and `_`: `3.14`, `don't` and `foo_bar` are ONE
+/// analyzed term each and two-or-three split ones. Each case below returned
+/// a hit pre-flush and none post-flush at that revision; the analyzed answer
+/// (no hit — the terms never line up) is also the one ES gives.
+#[tokio::test]
+async fn phrase_tokenizer_matches_the_segment_analyzer() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine.create_index("mmpp_tok", Schema::empty()).unwrap();
+    let idx = engine.get_index("mmpp_tok").unwrap();
+    for (id, body) in [
+        ("n1", "release 3.14 notes here"),
+        ("d1", "we don't stop now"),
+        ("u1", "the foo_bar baz"),
+    ] {
+        idx.index_document(Some(id.into()), json!({ "body": body }))
+            .await
+            .unwrap();
+    }
+
+    assert_both_states(
+        &idx,
+        &[
+            (
+                json!({"multi_match": {"query": "release 3", "fields": ["body"],
+                                       "type": "phrase"}}),
+                &[],
+                "`3.14` is ONE analyzed term, so `release 3` is not a phrase in it",
+            ),
+            (
+                json!({"match_phrase": {"body": "release 3"}}),
+                &[],
+                "oracle match_phrase agrees",
+            ),
+            (
+                json!({"multi_match": {"query": "don t", "fields": ["body"],
+                                       "type": "phrase"}}),
+                &[],
+                "`don't` is ONE analyzed term, so `don t` is not a phrase in it",
+            ),
+            (
+                json!({"multi_match": {"query": "foo bar", "fields": ["body"],
+                                       "type": "phrase"}}),
+                &[],
+                "`foo_bar` is ONE analyzed term, so `foo bar` is not a phrase in it",
+            ),
+            // The whole analyzed term still matches, in both states.
+            (
+                json!({"multi_match": {"query": "release 3.14", "fields": ["body"],
+                                       "type": "phrase"}}),
+                &["n1"],
+                "the analyzed term itself matches",
+            ),
+            (
+                json!({"multi_match": {"query": "we don't", "fields": ["body"],
+                                       "type": "phrase"}}),
+                &["d1"],
+                "the analyzed term itself matches (apostrophe)",
+            ),
+        ],
+    )
+    .await;
+}
+
+/// `max_expansions` is why `phrase_prefix` keeps the declined/stored-scan
+/// routing on `multi_match`: the segment clause bounds the trailing prefix
+/// to `max_expansions` terms from the field's term dictionary, and the
+/// stored-doc walk — which has no term dictionary — cannot. Projecting it
+/// made the hit set shrink at `_flush`.
+///
+/// This asserts the INVARIANT (same answer either side of the flush), not
+/// ES parity: XERJ does not bind `max_expansions` on `multi_match`, so both
+/// states return the unbounded answer. Stated plainly rather than papered
+/// over — flush invariance is the property #230 asks for.
+///
+/// HONEST LIMIT of this test: it also passes against the revision that DID
+/// project `phrase_prefix` (checked out and run — 7 passed, 3 failed, and
+/// this was not one of the three), so it is an invariant assertion, not a
+/// regression catcher. This in-process fixture does not reliably route the
+/// query through the bounded segment clause the way a mapped index on a
+/// live server does, which is where the review measured the shrink
+/// (pre {p1,p2,p3,p4,s1} / post {p1,p2,p3,p4}). The discriminating guard
+/// for the routing decision is the unit test
+/// `index::fts_projection_tests::multi_match_phrase_projects_positional_dis_max`,
+/// which asserts `query_node_to_fts` returns `None` for `phrase_prefix`.
+#[tokio::test]
+async fn phrase_prefix_max_expansions_does_not_change_the_hit_set_at_flush() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine.create_index("mmpp_maxexp", Schema::empty()).unwrap();
+    let idx = engine.get_index("mmpp_maxexp").unwrap();
+    // `pol*` expands to two dictionary terms — `polar` sorts first, so a
+    // max_expansions of 1 would keep only it on a bounded segment clause.
+    for (id, body) in [
+        ("p1", "a tiered merge policy compacts segments"),
+        ("p2", "the merge polar route"),
+    ] {
+        idx.index_document(Some(id.into()), json!({ "body": body }))
+            .await
+            .unwrap();
+    }
+
+    assert_both_states(
+        &idx,
+        &[(
+            json!({"multi_match": {"query": "merge pol", "fields": ["body"],
+                                   "type": "phrase_prefix", "max_expansions": 1}}),
+            &["p1", "p2"],
+            "multi_match phrase_prefix hit set is the same before and after _flush",
+        )],
+    )
+    .await;
 }
