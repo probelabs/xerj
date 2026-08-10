@@ -2068,6 +2068,11 @@ async fn async_main() -> Result<()> {
     //      a 429 circuit_breaking_exception before the kernel OOM-kills us.
     state.engine.spawn_resource_sampler();
 
+    // 12c. ISM/ILM lifecycle-management background job: drives every
+    //      managed index's state machine (actions, then transitions) on
+    //      `lifecycle.tick_interval_secs` (default 5 minutes).
+    state.engine.spawn_lifecycle_manager();
+
     let _ingest_memory_trace = ingest_memory_trace::spawn(&state.engine);
     // 13. Start servers concurrently
     let rest_tls = tls_config.clone();
