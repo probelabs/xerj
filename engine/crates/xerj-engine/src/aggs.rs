@@ -5751,7 +5751,17 @@ pub(crate) fn parse_time_zone_offset(tz: &str) -> Option<chrono::FixedOffset> {
                 rest[..idx].parse::<i32>().ok()?,
                 rest[idx + 1..].parse::<i32>().ok()?,
             )
-        } else if rest.len() == 4 {
+        } else if rest.len() == 4 && rest.bytes().all(|b| b.is_ascii_digit()) {
+            // The digit check makes the byte offset 2 a true char boundary
+            // by construction, rather than assuming `rest` is ASCII and
+            // slicing blind — `rest.len()` counts bytes, so a two-character
+            // zone like "+中a" is also 4 bytes long, and slicing at byte 2
+            // would land inside the multi-byte '中' and panic (the release
+            // profile's `panic = "abort"` turns that into a process crash,
+            // reachable from an unauthenticated `_search` body). Every input
+            // that used to reach `parse::<i32>()` and succeed is still
+            // all-ASCII-digits, so this rejects nothing that previously
+            // parsed into a valid offset.
             (
                 rest[..2].parse::<i32>().ok()?,
                 rest[2..].parse::<i32>().ok()?,
@@ -5765,6 +5775,51 @@ pub(crate) fn parse_time_zone_offset(tz: &str) -> Option<chrono::FixedOffset> {
         return chrono::FixedOffset::east_opt(total);
     }
     None
+}
+
+#[cfg(test)]
+mod parse_time_zone_offset_char_boundary_tests {
+    //! Regression coverage for #272: `rest.len() == 4` counts BYTES, not
+    //! characters, so a two-character zone like "+中a" is also 4 bytes and
+    //! `rest[..2]` used to slice inside the multi-byte '中' — a byte-index
+    //! panic that the release profile's `panic = "abort"` turns into a
+    //! process crash, reachable from an unauthenticated `_search` body via
+    //! `date_histogram.time_zone`.
+    use super::*;
+
+    #[test]
+    fn multi_byte_offset_does_not_panic_and_is_rejected() {
+        assert_eq!(parse_time_zone_offset("+中a"), None);
+        assert_eq!(parse_time_zone_offset("-中a"), None);
+    }
+
+    #[test]
+    fn run_aggs_with_a_multi_byte_time_zone_does_not_abort() {
+        // The exact reproduction from #272, through the public entry point
+        // an unauthenticated `_search` body reaches.
+        let aggs_def = json!({
+            "h": {
+                "date_histogram": {
+                    "field": "ts",
+                    "fixed_interval": "1d",
+                    "time_zone": "+中a",
+                }
+            }
+        });
+        let docs = [json!({"ts": "2025-01-24T07:31:52.102Z"})];
+        // Must return, not panic — the assertion is that this line is
+        // reached at all.
+        let _ = run_aggs(&aggs_def, &docs);
+    }
+
+    #[test]
+    fn valid_four_digit_offsets_still_parse_the_same_as_before() {
+        // The digit guard must not reject anything that used to succeed.
+        let plus = parse_time_zone_offset("+0530").expect("valid offset must still parse");
+        assert_eq!(plus.local_minus_utc(), 5 * 3600 + 30 * 60);
+        let minus = parse_time_zone_offset("-0800").expect("valid offset must still parse");
+        assert_eq!(minus.local_minus_utc(), -8 * 3600);
+    }
 }
 
 /// Given an IANA zone name and an instant, return the offset at that instant,
