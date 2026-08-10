@@ -617,8 +617,30 @@ async fn cluster_health_inner(
 // GET /_cat/indices
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_indices(State(state): State<AppState>) -> impl IntoResponse {
-    cat_indices_inner(state, None).await
+/// Shared query params for the `_cat/*` handlers that previously ignored
+/// `format` entirely. Real ES/OS `_cat/*?format=json` returns a JSON array
+/// of objects (one per row, keyed by the same column names the `v`-header
+/// text form would print) instead of the aligned plain-text table — every
+/// modern client (`opensearch-js`'s `cat.*()` methods, and specifically
+/// OpenSearch Dashboards' Index Management backend) requests that form and
+/// silently breaks when it gets text back instead: the JSON parse either
+/// throws outright or returns something that isn't an array, and the
+/// frontend's `.map()` over it throws `Cannot read properties of undefined
+/// (reading 'map')`. `v` is accepted for parity but doesn't change output
+/// here — these handlers never printed a header row to begin with.
+#[derive(Debug, Deserialize, Default)]
+pub struct CatFormatParams {
+    #[serde(default)]
+    pub v: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+pub async fn cat_indices(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
+    cat_indices_inner(state, None, params).await
 }
 
 /// `GET /_cat/indices/{pattern}` — the per-index / pattern-scoped variant.
@@ -630,11 +652,16 @@ pub async fn cat_indices(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn cat_indices_pattern(
     State(state): State<AppState>,
     Path(pattern): Path<String>,
+    Query(params): Query<CatFormatParams>,
 ) -> impl IntoResponse {
-    cat_indices_inner(state, Some(pattern)).await
+    cat_indices_inner(state, Some(pattern), params).await
 }
 
-async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::response::Response {
+async fn cat_indices_inner(
+    state: AppState,
+    pattern: Option<String>,
+    params: CatFormatParams,
+) -> axum::response::Response {
     let indices = state.engine.list_indices().await;
     // Indices whose directory exists but refused to open. They are listed as
     // `red` rather than omitted: an index the operator can see is an index the
@@ -679,7 +706,7 @@ async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::re
         }
     };
 
-    let mut lines = Vec::new();
+    let mut rows = Vec::new();
     for info in &selected {
         // Real on-disk size: recursive byte sum of the index's data_dir.
         // Single-shard (pri=1, rep=0), so store.size == pri.store.size, and
@@ -690,24 +717,22 @@ async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::re
             .get_index(&info.name)
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
-        let hsize = human_bytes(size);
-        lines.push(format!(
-            "green open {} {} 1 0 {} 0 {} {} {}",
-            info.name,
-            // Emit the stable REAL settings uuid (the same value
-            // GET /{index}/_settings returns), not a fresh random one per call.
+        // Emit the stable REAL settings uuid (the same value
+        // GET /{index}/_settings returns), not a fresh random one per call.
+        rows.push((
+            info.name.clone(),
             stable_index_uuid(&info.name),
             info.doc_count,
-            hsize,
-            hsize,
-            hsize,
+            human_bytes(size),
         ));
     }
 
     // Failed indices, after the healthy ones. `red` is the status column and
     // the shard is unassigned, so `pri` is 1 and every stat column is 0 —
     // nothing about the contents can be read, and guessing a doc count here
-    // would be a claim we cannot back.
+    // would be a claim we cannot back. Selected via the same pattern rules
+    // as the healthy set above (issue #206: a failed index is still an
+    // index the operator can see and delete, not silently omitted).
     let selected_failed: Vec<&xerj_engine::engine::FailedIndex> = match pattern.as_deref() {
         None => failed.iter().collect(),
         Some(pat) => failed
@@ -722,14 +747,55 @@ async fn cat_indices_inner(state: AppState, pattern: Option<String>) -> axum::re
             })
             .collect(),
     };
-    for f in selected_failed {
-        lines.push(format!(
-            "red open {} {} 1 0 0 0 0b 0b 0b",
-            f.name,
-            stable_index_uuid(&f.name),
-        ));
+    let failed_rows: Vec<(String, String)> = selected_failed
+        .iter()
+        .map(|f| (f.name.clone(), stable_index_uuid(&f.name)))
+        .collect();
+
+    if params.format.as_deref() == Some("json") {
+        let mut arr: Vec<Value> = rows
+            .iter()
+            .map(|(name, uuid, doc_count, hsize)| {
+                json!({
+                    "health": "green",
+                    "status": "open",
+                    "index": name,
+                    "uuid": uuid,
+                    "pri": "1",
+                    "rep": "0",
+                    "docs.count": doc_count.to_string(),
+                    "docs.deleted": "0",
+                    "store.size": hsize,
+                    "pri.store.size": hsize,
+                })
+            })
+            .collect();
+        arr.extend(failed_rows.iter().map(|(name, uuid)| {
+            json!({
+                "health": "red",
+                "status": "open",
+                "index": name,
+                "uuid": uuid,
+                "pri": "1",
+                "rep": "0",
+                "docs.count": "0",
+                "docs.deleted": "0",
+                "store.size": "0b",
+                "pri.store.size": "0b",
+            })
+        }));
+        return Json(arr).into_response();
     }
 
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|(name, uuid, doc_count, hsize)| {
+            format!("green open {name} {uuid} 1 0 {doc_count} 0 {hsize} {hsize} {hsize}")
+        })
+        .collect();
+    for (name, uuid) in &failed_rows {
+        lines.push(format!("red open {name} {uuid} 1 0 0 0 0b 0b 0b"));
+    }
     // ES returns an empty body (not a bare newline) when nothing matches.
     let body = if lines.is_empty() {
         String::new()
@@ -793,6 +859,82 @@ fn stable_index_uuid(name: &str) -> String {
     name.hash(&mut lo);
     let low = lo.finish();
     Uuid::from_u128(((high as u128) << 64) | (low as u128)).to_string()
+}
+
+#[cfg(test)]
+mod cat_format_json_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Real OpenSearch Dashboards' Index Management "Indexes" page (and any
+    /// other `opensearch-js`/`@elastic/elasticsearch`-based client) requests
+    /// `_cat/indices?format=json` and expects a JSON array — `_cat/indices`
+    /// previously ignored `format` entirely and always returned the
+    /// plain-text table, which OSD's backend can't parse into an array,
+    /// producing `Cannot read properties of undefined (reading 'map')`
+    /// client-side. Root-caused by diffing against a real OpenSearch node.
+    #[tokio::test]
+    async fn cat_indices_format_json_returns_a_real_json_array() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/cat-json-test-idx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let (status, body) = get(&app, "/_cat/indices?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.as_array().expect("json array, not text/plain body");
+        let row = arr
+            .iter()
+            .find(|r| r["index"] == "cat-json-test-idx")
+            .expect("row present");
+        assert_eq!(row["health"], "green");
+        assert_eq!(row["status"], "open");
+        assert_eq!(row["docs.count"], "0");
+
+        // Text form (no `format` param) must be untouched.
+        let text = app
+            .oneshot(Request::get("/_cat/indices").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            text.headers().get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -991,6 +1133,17 @@ pub async fn create_index(
                     .engine
                     .index_alias_metadata
                     .insert(index.clone(), Value::Object(resolved_aliases));
+            }
+
+            // ES-shape lifecycle attach: `index.lifecycle.name` in create-time
+            // settings is how ILM associates an index with a policy (there is
+            // no dedicated "attach" endpoint on the ES surface, unlike ISM's
+            // explicit `POST _plugins/_ism/add/{index}`). Best-effort and
+            // silent on a missing/untranslatable policy — real ILM is
+            // equally lenient here: it discovers the policy by name lazily
+            // and simply doesn't start managing until one exists.
+            if let Some(policy_name) = ilm_policy_name_from_settings(&body) {
+                let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
             }
 
             let resp = EsIndexResponse::ok(&index);
@@ -13809,6 +13962,23 @@ fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
             .and_then(Value::as_bool)
             .unwrap_or(doc_values_default);
 
+        // `index` — the sibling of `doc_values` above, and the last open
+        // instance of the accepted-and-ignored class in #204. `"index": false`
+        // was parsed nowhere, echoed back verbatim by `GET _mapping`, and had
+        // no effect at all: the field kept its inverted index and every query
+        // against it kept matching.
+        //
+        // Carrying the declared intent here is what makes the two halves of
+        // the fix possible — `fts_excluded_fields` (xerj-engine) drops the
+        // field from the inverted index at flush/merge, and
+        // `unsearchable_query_field` (xerj-engine) rejects queries that ES
+        // rejects. Default `true` mirrors ES: every field is indexed unless
+        // the mapping says otherwise.
+        fc.options.indexed = field_def
+            .get("index")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
         // Handle copy_to: store the target field in a special null_value marker.
         if let Some(copy_target) = field_def.get("copy_to").and_then(Value::as_str) {
             fc.options.null_value = Some(Value::String(format!("__copy_to__:{}", copy_target)));
@@ -15618,6 +15788,19 @@ pub async fn refresh_index(
 // GET /{index}/_count
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One entry of `_count`'s `_shards.failures`, in ES's shape. `rendered` is the
+/// `ApiError` body for the failure; the per-index entry carries the
+/// *shard-level* exception (`query_shard_exception`) rather than the
+/// `search_phase_execution_exception` wrapper the top-level error uses.
+fn count_shard_failure(index: &str, rendered: &Value) -> Value {
+    let reason = rendered
+        .pointer("/error/root_cause/0")
+        .or_else(|| rendered.pointer("/error"))
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "exception", "reason": "search failed" }));
+    json!({ "shard": 0, "index": index, "reason": reason })
+}
+
 pub async fn count_docs_global(
     State(state): State<AppState>,
     Query(params): Query<CountParams>,
@@ -15666,7 +15849,28 @@ pub async fn count_docs(
             .and_then(|b| b.get("query"))
             .map(|q| !q.is_null())
             .unwrap_or(false);
+        // A refused query is not a zero. This loop used to run the search under
+        // `if let Ok(..)` with no else, so an index whose mapping refuses the
+        // query — a `match` on an `"index": false` field, say — contributed
+        // nothing to `total` and the response still published
+        // `"successful": <all>, "failed": 0`: a confident wrong count on the
+        // shapes most callers actually write (`logs-*`, a comma list, and
+        // `POST /_count`, which routes here through `_all`).
+        //
+        // The failure is now reported per index, and the HTTP status follows
+        // ES's own rule for a broadcast action: the failure status is returned
+        // only when NO shard succeeded, and otherwise the response is a 200
+        // carrying the partial count with the failures visible in `_shards`
+        // (`server/src/main/java/org/elasticsearch/rest/RestStatus.java:548-566`
+        // — read for semantics only; ES is AGPL-3.0/SSPL-1.0/Elastic-2.0 and
+        // no code from it is reproduced here). So a single-index `_count`, and
+        // a `logs-*` whose indices all share the offending mapping, both 400
+        // exactly as `_search` does, while a mixed selector answers what it
+        // could count and says out loud what it could not.
         let mut total: u64 = 0;
+        let mut successful: u64 = 0;
+        let mut shard_failures: Vec<Value> = Vec::new();
+        let mut first_error: Option<Value> = None;
         for ix_name in &wanted {
             let Ok(idx) = state.engine.get_index(ix_name) else {
                 continue;
@@ -15683,8 +15887,17 @@ pub async fn count_docs(
                 // object and rejects it).
                 resolve_terms_lookups(&mut query_val, &state).await;
                 let search_body = json!({ "query": query_val, "size": 0, "from": 0 });
-                if let Ok(req) = xerj_query::parse_request(&search_body) {
-                    if let Ok(result) = idx.search(&req).await {
+                // A body that does not parse is not per-index: it is the same
+                // 400 the single-index arm returns, for the same reason.
+                let req = match xerj_query::parse_request(&search_body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let ze = xerj_common::XerjError::invalid_query(e.to_string());
+                        return ApiError::new(ze).into_response();
+                    }
+                };
+                match idx.search(&req).await {
+                    Ok(result) => {
                         // A script resource limit in the filter (terms_set's
                         // `minimum_should_match` script, say) makes matching
                         // fail-closed, so the count under-reports with nothing
@@ -15693,16 +15906,45 @@ pub async fn count_docs(
                             return script_limit_response(reason);
                         }
                         total += result.total.value;
+                        successful += 1;
+                    }
+                    Err(e) => {
+                        let rendered = ApiError::new(xerj_common::XerjError::from(e)).into_value();
+                        shard_failures.push(count_shard_failure(ix_name, &rendered));
+                        if first_error.is_none() {
+                            first_error = Some(rendered);
+                        }
                     }
                 }
             } else {
                 total += idx.stats().await.doc_count;
+                successful += 1;
             }
         }
+        // Nothing answered and something refused: the count IS the error, and
+        // it is returned with the same body and status the single-index form
+        // would have produced.
+        if successful == 0 && !shard_failures.is_empty() {
+            if let Some(rendered) = first_error {
+                let code = rendered
+                    .get("status")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| StatusCode::from_u16(c as u16).ok())
+                    .unwrap_or(StatusCode::BAD_REQUEST);
+                return (code, Json(rendered)).into_response();
+            }
+        }
+        // `total` is what was actually attempted, so the three numbers add up:
+        // a name in a comma list that resolves to no index is skipped here (as
+        // it always was) rather than counted as a shard that succeeded.
+        let failed = shard_failures.len() as u64;
         let mut body_out = json!({
             "count": total,
-            "_shards": { "total": wanted.len() as u64, "successful": wanted.len() as u64, "skipped": 0, "failed": 0 }
+            "_shards": { "total": successful + failed, "successful": successful, "skipped": 0, "failed": failed }
         });
+        if !shard_failures.is_empty() {
+            body_out["_shards"]["failures"] = Value::Array(shard_failures);
+        }
         if let Some(ref fp) = params.filter_path {
             if !fp.is_empty() {
                 let paths: Vec<&str> = fp.split(',').map(str::trim).collect();
@@ -16105,7 +16347,10 @@ async fn cat_ann_inner(
 /// and `/health/ready` all knew, and `_cat/health` said everything was fine
 /// (issue #206). It now reports the same status `_cluster/health` computes,
 /// from the same inputs.
-pub async fn cat_health(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_health(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     let health = state.engine.health().await;
     // epoch  timestamp  cluster  status  node.total  node.data  shards  pri  relo  init  unassign  pending_tasks  max_task_wait_time  active_shards_percent
     let epoch = std::time::SystemTime::now()
@@ -16127,6 +16372,27 @@ pub async fn cat_health(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         (shards as f64) / (total as f64) * 100.0
     };
+
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "epoch": epoch.to_string(),
+            "timestamp": ts,
+            "cluster": "xerj",
+            "status": status,
+            "node.total": "1",
+            "node.data": "1",
+            "shards": shards.to_string(),
+            "pri": shards.to_string(),
+            "relo": "0",
+            "init": "0",
+            "unassign": unassigned.to_string(),
+            "pending_tasks": "0",
+            "max_task_wait_time": "-",
+            "active_shards_percent": format!("{pct:.1}%"),
+        })])
+        .into_response();
+    }
+
     let body = format!(
         "{epoch} {ts} xerj {status} 1 1 {shards} {shards} 0 0 {unassigned} 0 - {pct:.1}%\n"
     );
@@ -16145,7 +16411,10 @@ pub async fn cat_health(State(state): State<AppState>) -> impl IntoResponse {
 // GET /_cat/nodes
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_nodes(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_nodes(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // ip  heap.percent  ram.percent  cpu  load_1m  load_5m  load_15m  node.role  master  name
     let (mem_total, mem_avail) = read_meminfo().unwrap_or((0, 0));
     // ram.percent = (1 - MemAvailable/MemTotal) * 100
@@ -16165,6 +16434,23 @@ pub async fn cat_nodes(State(state): State<AppState>) -> impl IntoResponse {
     let cpu = sample_cpu_percent().await;
     let (l1, l5, l15) = read_loadavg();
     let name = state.engine.node_id.as_str();
+
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "ip": "127.0.0.1",
+            "heap.percent": heap_percent.to_string(),
+            "ram.percent": ram_percent.to_string(),
+            "cpu": cpu.to_string(),
+            "load_1m": format!("{l1:.2}"),
+            "load_5m": format!("{l5:.2}"),
+            "load_15m": format!("{l15:.2}"),
+            "node.role": "cdfhilmrstw",
+            "master": "*",
+            "name": name,
+        })])
+        .into_response();
+    }
+
     let body = format!(
         "127.0.0.1 {heap_percent} {ram_percent} {cpu} {l1:.2} {l5:.2} {l15:.2} cdfhilmrstw * {name}\n"
     );
@@ -17479,7 +17765,50 @@ pub async fn next_scroll(
             return ApiError::new(e).into_response();
         }
     };
+    let scroll_keep_alive = body.scroll.as_deref().or(params.scroll.as_deref());
+    scroll_page_response(
+        &state,
+        scroll_id,
+        scroll_keep_alive,
+        params.rest_total_hits_as_int.as_deref() == Some("true"),
+    )
+    .await
+}
 
+/// `GET|POST /_search/scroll/{scroll_id}` — the legacy path-parameter form
+/// of scroll continuation. A real, documented ES/OpenSearch REST API
+/// variant alongside the body/query-param form above (`next_scroll`), not
+/// a client mistake: found missing while investigating why OpenSearch
+/// Dashboards 3.7.0 crashes fatally partway through its saved-objects
+/// migration (`.kibana_1` → `.kibana_2`) against xerj. Traced via request
+/// tracing (`logging.access_log = true`) to the exact call: the migration
+/// opens a scroll (`POST /.kibana_1/_search?scroll=15m`, 200), bulk-indexes
+/// the first page into the new index (200), then continues the scroll via
+/// `GET /_search/scroll/{scroll_id}` — which had no matching route at all,
+/// so axum's default fallback returned a bare 404 with an empty body. OSD's
+/// migration code treats that as fatal and aborts the whole process rather
+/// than retrying, so ANY client using this form — not just OSD 3.7.0's
+/// migrator — would have hit the same wall.
+pub async fn next_scroll_path(
+    State(state): State<AppState>,
+    Path(scroll_id): Path<String>,
+    Query(params): Query<ScrollQueryParamsFull>,
+) -> impl IntoResponse {
+    scroll_page_response(
+        &state,
+        scroll_id,
+        params.scroll.as_deref(),
+        params.rest_total_hits_as_int.as_deref() == Some("true"),
+    )
+    .await
+}
+
+async fn scroll_page_response(
+    state: &AppState,
+    scroll_id: String,
+    scroll_keep_alive: Option<&str>,
+    rest_total_hits_as_int: bool,
+) -> Response {
     // An id xerj never issued (its scroll ids are v4 UUIDs) cannot name a
     // context: ES answers 400 `Cannot parse scroll id`, not a 404 (item 4e).
     if Uuid::parse_str(&scroll_id).is_err() {
@@ -17501,12 +17830,7 @@ pub async fn next_scroll(
             // (body wins over query param, like scroll_id) sets a new
             // keep-alive (capped); absent → the previous keep-alive window
             // restarts from now, matching ES.
-            if let Some(ka_secs) = body
-                .scroll
-                .as_deref()
-                .or(params.scroll.as_deref())
-                .and_then(parse_keep_alive_to_secs)
-            {
+            if let Some(ka_secs) = scroll_keep_alive.and_then(parse_keep_alive_to_secs) {
                 let capped = ka_secs.min(state.config.search_context.scroll_max_keep_alive_secs);
                 ctx.keep_alive = std::time::Duration::from_secs(capped);
             }
@@ -17607,7 +17931,7 @@ pub async fn next_scroll(
             });
 
             // rest_total_hits_as_int=true → flatten hits.total to a bare integer.
-            if params.rest_total_hits_as_int.as_deref() == Some("true") {
+            if rest_total_hits_as_int {
                 resp["hits"]["total"] = json!(total);
             }
             Json(resp).into_response()
@@ -17692,6 +18016,63 @@ mod passage_scroll_tests {
             1
         );
         assert_eq!(body["hits"]["hits"][0]["fields"]["_passage"][0]["page"], 2);
+    }
+
+    /// Regression test for a real bug found live: OpenSearch Dashboards
+    /// 3.7.0's saved-objects migration (`.kibana_1` → `.kibana_2`) continues
+    /// its scroll via `GET /_search/scroll/{scroll_id}` (the legacy
+    /// path-parameter form — a real ES/OpenSearch REST variant, not a
+    /// client mistake), which had no matching route at all and 404'd with
+    /// an empty body. OSD's migration code treats that as fatal and crashes
+    /// the whole process rather than retrying.
+    #[tokio::test]
+    async fn scroll_continuation_via_legacy_path_param_form_works() {
+        let state = test_state();
+        let scroll_id = Uuid::new_v4().to_string();
+        let now = Instant::now();
+        state.engine.scrolls.insert(
+            scroll_id.clone(),
+            xerj_engine::engine::ScrollContext {
+                index: "reports".into(),
+                hits: vec![passage_hit("page-1", 0), passage_hit("page-2", 1)],
+                position: 1,
+                page_size: 1,
+                created: now,
+                keep_alive: Duration::from_secs(60),
+                expires_at: now + Duration::from_secs(60),
+            },
+        );
+        let app = crate::router::build_es_compat_router(state);
+
+        // GET form, exactly as OSD 3.7.0's migrator calls it.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/_search/scroll/{scroll_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["hits"]["hits"][0]["_id"], "page-2");
+        assert_eq!(body["_scroll_id"], scroll_id);
+
+        // An id xerj never issued still gets ES's 400 "cannot parse", not a
+        // bare 404, matching the body-form endpoint's existing behavior.
+        let response = app
+            .oneshot(
+                Request::get("/_search/scroll/not-a-real-scroll-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -18190,6 +18571,16 @@ pub async fn clear_scroll(
         state.engine.scrolls.clear();
     }
 
+    Json(json!({ "succeeded": true, "num_freed": num_freed })).into_response()
+}
+
+/// `DELETE /_search/scroll/{scroll_id}` — the same legacy path-parameter
+/// form as `next_scroll_path`, for clearing rather than continuing.
+pub async fn clear_scroll_path(
+    State(state): State<AppState>,
+    Path(scroll_id): Path<String>,
+) -> impl IntoResponse {
+    let num_freed = usize::from(state.engine.scrolls.remove(&scroll_id).is_some());
     Json(json!({ "succeeded": true, "num_freed": num_freed })).into_response()
 }
 
@@ -19128,11 +19519,12 @@ async fn msearch_impl(
             .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
         {
             Ok(r) => r,
+            // Rendered through the same `ApiError` path the single-request
+            // `_search` uses, so a sub-response carries ES's full envelope
+            // (`root_cause`, `type`, `reason`) and not a bare `reason`. See
+            // the `search_error` arm below for why that matters.
             Err(e) => {
-                responses.push(json!({
-                    "error": { "reason": e.to_string() },
-                    "status": 400
-                }));
+                responses.push(ApiError::new(e).into_value());
                 continue;
             }
         };
@@ -19168,14 +19560,14 @@ async fn msearch_impl(
         let mut total_count: u64 = 0;
         let mut total_relation = "eq";
         let mut merged_aggs: Option<Value> = None;
-        let mut search_error: Option<String> = None;
+        let mut search_error: Option<xerj_common::XerjError> = None;
         let mut script_failure: Option<String> = None;
 
         for idx_name in &index_names {
             let idx = match state.engine.get_index(idx_name) {
                 Ok(i) => i,
                 Err(e) => {
-                    search_error = Some(e.to_string());
+                    search_error = Some(xerj_common::XerjError::from(e));
                     break;
                 }
             };
@@ -19203,7 +19595,7 @@ async fn msearch_impl(
                     }
                 }
                 Err(e) => {
-                    search_error = Some(e.to_string());
+                    search_error = Some(xerj_common::XerjError::from(e));
                     break;
                 }
             }
@@ -19214,11 +19606,16 @@ async fn msearch_impl(
             continue;
         }
 
+        // The sub-response carries the SAME body the single-request `_search`
+        // would have produced for this error, status and all: `ApiError`
+        // already maps every `XerjError` to its ES exception type, status and
+        // `root_cause` (see `api/error.rs`). It used to be flattened to a bare
+        // `{"reason": …}` under a hardcoded 500, which turned a plain user
+        // mapping declaration — a query naming an `"index": false` field, a
+        // 400 `search_phase_execution_exception` everywhere else — into a
+        // server error with no `type` for a client to switch on.
         if let Some(err) = search_error {
-            responses.push(json!({
-                "error": { "reason": err },
-                "status": 500
-            }));
+            responses.push(ApiError::new(err).into_value());
             continue;
         }
 
@@ -21416,15 +21813,40 @@ mod scripted_update_publication_tests {
 // GET /_cat/aliases
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_aliases(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_aliases(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // alias  index  filter  routing.index  routing.search  is_write_index
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, String)> = Vec::new();
     for entry in state.engine.aliases.iter() {
         let alias = entry.key();
         for idx_name in entry.value().iter() {
-            lines.push(format!("{} {} - - - -", alias, idx_name));
+            rows.push((alias.clone(), idx_name.clone()));
         }
     }
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(alias, index)| {
+                json!({
+                    "alias": alias,
+                    "index": index,
+                    "filter": "-",
+                    "routing.index": "-",
+                    "routing.search": "-",
+                    "is_write_index": "-",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(alias, index)| format!("{alias} {index} - - - -"))
+        .collect();
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -21448,6 +21870,7 @@ pub async fn cat_aliases(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn cat_count(
     State(state): State<AppState>,
     Path(index): Path<String>,
+    Query(params): Query<CatFormatParams>,
 ) -> impl IntoResponse {
     // Sum doc counts across every index the spec matches (comma/wildcard/
     // `_all`) — previously a wildcard/comma spec just missed the single
@@ -21470,6 +21893,15 @@ pub async fn cat_count(
         .as_secs();
     let ts = Utc::now().format("%H:%M:%S").to_string();
 
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "epoch": epoch.to_string(),
+            "timestamp": ts,
+            "count": count.to_string(),
+        })])
+        .into_response();
+    }
+
     // epoch  timestamp  count
     let body = format!("{epoch} {ts} {count}\n");
     (
@@ -21487,10 +21919,13 @@ pub async fn cat_count(
 // GET /_cat/shards
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_shards(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_shards(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // index  shard  prirep  state  docs  store  ip           node
     let indices = state.engine.list_indices().await;
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, u64, u64)> = Vec::new();
     for info in &indices {
         // Real on-disk size: recursive byte sum of the index's data_dir.
         let store_bytes = state
@@ -21498,16 +21933,57 @@ pub async fn cat_shards(State(state): State<AppState>) -> impl IntoResponse {
             .get_index(&info.name)
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
-        lines.push(format!(
-            "{} 0 p STARTED {} {}b 127.0.0.1 xerj-node-1",
-            info.name, info.doc_count, store_bytes,
-        ));
+        rows.push((info.name.clone(), info.doc_count, store_bytes));
     }
     // `_cat/shards` is the call an operator makes straight after seeing a red
     // cluster, so an index whose primary could not be opened has to be in it.
     // ES prints UNASSIGNED rows with no node and empty stats.
-    for f in state.engine.list_failed_indices() {
-        lines.push(format!("{} 0 p UNASSIGNED 0 0b - -", f.name));
+    let failed_names: Vec<String> = state
+        .engine
+        .list_failed_indices()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+
+    if params.format.as_deref() == Some("json") {
+        let mut arr: Vec<Value> = rows
+            .iter()
+            .map(|(name, docs, store_bytes)| {
+                json!({
+                    "index": name,
+                    "shard": "0",
+                    "prirep": "p",
+                    "state": "STARTED",
+                    "docs": docs.to_string(),
+                    "store": format!("{store_bytes}b"),
+                    "ip": "127.0.0.1",
+                    "node": "xerj-node-1",
+                })
+            })
+            .collect();
+        arr.extend(failed_names.iter().map(|name| {
+            json!({
+                "index": name,
+                "shard": "0",
+                "prirep": "p",
+                "state": "UNASSIGNED",
+                "docs": "0",
+                "store": "0b",
+                "ip": "-",
+                "node": "-",
+            })
+        }));
+        return Json(arr).into_response();
+    }
+
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|(name, docs, store_bytes)| {
+            format!("{name} 0 p STARTED {docs} {store_bytes}b 127.0.0.1 xerj-node-1")
+        })
+        .collect();
+    for name in &failed_names {
+        lines.push(format!("{name} 0 p UNASSIGNED 0 0b - -"));
     }
     let body = if lines.is_empty() {
         String::new()
@@ -21635,7 +22111,31 @@ pub async fn put_settings(
         sync_display_blocks(&state, name).await;
     }
 
+    // Same lazy, best-effort `index.lifecycle.name` attach as create_index —
+    // `PUT {index}/_settings {"index.lifecycle.name": "policy"}` is the
+    // other real ILM entry point (attaching to an index that already
+    // exists, not just at creation).
+    if let Some(policy_name) = ilm_policy_name_from_settings(&body) {
+        for idx in &targets {
+            let _ = crate::ism_api::attach_policy(&state, idx, &policy_name).await;
+        }
+    }
+
     Json(json!({ "acknowledged": true })).into_response()
+}
+
+/// Extract `index.lifecycle.name` from an index-settings body, accepting
+/// both the nested (`{"index":{"lifecycle":{"name":"..."}}}`,
+/// `{"settings":{...}}`-wrapped at create time) and flat dotted-key
+/// (`{"index.lifecycle.name":"..."}`) forms ES accepts for every index
+/// setting.
+fn ilm_policy_name_from_settings(body: &Value) -> Option<String> {
+    let settings = body.get("settings").unwrap_or(body);
+    settings
+        .pointer("/index/lifecycle/name")
+        .or_else(|| settings.get("index.lifecycle.name"))
+        .and_then(Value::as_str)
+        .map(String::from)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23382,34 +23882,45 @@ pub async fn put_data_stream(
     }
 }
 
+/// `GET /_data_stream/{pattern}` — a comma-separated list of concrete names
+/// and/or glob patterns, same selector rules as `_cat/indices/{pattern}`: a
+/// WILDCARD matching nothing is an empty 200, a CONCRETE name matching
+/// nothing 404s. Previously only recognized the exact literals `*`/`_all`
+/// as wildcards — anything else, including the double-asterisk `**`
+/// OpenSearch Dashboards' own Data Streams page requests, fell through to
+/// the concrete-name branch and 404'd with `index_not_found_exception`
+/// even though it's a legitimate wildcard matching zero streams.
 pub async fn get_data_stream(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if name == "*" || name == "_all" {
-        let streams: Vec<Value> = state
-            .engine
-            .data_streams
-            .iter()
-            .map(|entry| {
-                let ds = entry.value();
-                data_stream_to_json(ds)
-            })
-            .collect();
-        return Json(json!({ "data_streams": streams })).into_response();
+    let parts: Vec<&str> = name
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let is_wildcard = |p: &str| p == "_all" || p.contains('*');
+
+    for &p in &parts {
+        if !is_wildcard(p) && !state.engine.data_streams.contains_key(p) {
+            let e = xerj_common::XerjError::index_not_found(format!("data_stream [{p}] missing"));
+            return ApiError::new(e).into_response();
+        }
     }
 
-    match state.engine.data_streams.get(&name) {
-        Some(ds) => {
-            let body = data_stream_to_json(ds.value());
-            Json(json!({ "data_streams": [body] })).into_response()
-        }
-        None => {
-            let e =
-                xerj_common::XerjError::index_not_found(format!("data_stream [{name}] missing"));
-            ApiError::new(e).into_response()
-        }
-    }
+    let streams: Vec<Value> = state
+        .engine
+        .data_streams
+        .iter()
+        .filter(|entry| {
+            let ds_name = entry.key();
+            parts
+                .iter()
+                .any(|&p| is_wildcard(p) || p == ds_name || glob_match_simple(p, ds_name))
+        })
+        .map(|entry| data_stream_to_json(entry.value()))
+        .collect();
+    Json(json!({ "data_streams": streams })).into_response()
 }
 
 fn data_stream_to_json(ds: &xerj_engine::engine::DataStream) -> Value {
@@ -23421,6 +23932,92 @@ fn data_stream_to_json(ds: &xerj_engine::engine::DataStream) -> Value {
         "status": "GREEN",
         "template": "",
     })
+}
+
+#[cfg(test)]
+mod data_stream_wildcard_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    /// OpenSearch Dashboards' Data Streams page calls `GET _data_stream/**`
+    /// to list everything. Only the exact literals `*`/`_all` were ever
+    /// recognized as wildcards, so `**` fell into the concrete-name branch
+    /// and 404'd with `index_not_found_exception: data_stream [**] missing`
+    /// — even with zero data streams, where real ES/OS returns an empty
+    /// array with 200. Confirmed against a real OpenSearch node.
+    #[tokio::test]
+    async fn double_asterisk_wildcard_with_no_streams_is_empty_200_not_404() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::get("/_data_stream/**")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["data_streams"], json!([]));
+    }
+
+    /// A concrete, non-wildcard name that doesn't exist must still 404 —
+    /// this fix is scoped to wildcard recognition, not to loosening that.
+    #[tokio::test]
+    async fn concrete_missing_name_still_404s() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::get("/_data_stream/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// OSD's Index Management pages call `/api/dataconnections` on every
+    /// load, which proxies straight through to this route; it was entirely
+    /// unregistered (404), which OSD's own backend turned into an opaque
+    /// 500 and a stray "Not Found" toast even on pages unrelated to Query
+    /// Workbench. xerj has no external-data-connection subsystem, so an
+    /// honest empty list (not a 404) is the correct answer.
+    #[tokio::test]
+    async fn query_workbench_datasources_is_an_honest_empty_list_not_404() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::get("/_plugins/_query/_datasources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, json!([]));
+    }
 }
 
 pub async fn delete_data_stream(
@@ -23463,10 +24060,52 @@ pub async fn put_ilm_policy(
     Path(name): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // Persist the policy in the real ILM store; `get_ilm_policy` reads it back
-    // out of this same DashMap, so PUT then GET round-trips faithfully.
-    state.engine.ilm_policies.insert(name, body);
-    Json(json!({ "acknowledged": true })).into_response()
+    // Persist the raw policy verbatim in the ILM store; `get_ilm_policy`
+    // reads it back out of this same DashMap, so PUT then GET round-trips
+    // faithfully regardless of whether translation below succeeds.
+    state.engine.ilm_policies.insert(name.clone(), body.clone());
+
+    // Translate into the shared internal model (`xerj_engine::lifecycle`)
+    // so the SAME background job that drives native ISM policies also
+    // drives this one — see that module's doc comment for why. Real ILM
+    // is lenient about phase actions it can't reproduce internally too
+    // (e.g. `searchable_snapshot` is best-effort); mirroring that, a
+    // translation failure here doesn't fail the PUT — the policy is
+    // still stored and GET-able, it just won't actually execute (no entry
+    // lands in `ism_policies`) until it's fixed. Surfaced back in the
+    // response so this isn't silent.
+    match xerj_engine::lifecycle::translate_ilm_policy(&body) {
+        Ok(policy) => {
+            state.engine.put_ism_policy(name, policy);
+            Json(json!({ "acknowledged": true })).into_response()
+        }
+        Err(reason) => Json(json!({
+            "acknowledged": true,
+            "xerj_lifecycle_execution": {
+                "status": "unsupported",
+                "reason": reason,
+            }
+        }))
+        .into_response(),
+    }
+}
+
+// GET _ilm/policy (no name segment) — the form Kibana's own ILM UI calls to
+// populate the "Index Lifecycle Policies" list page. Real ES returns every
+// policy from this bare path; we had only ever wired up the `*`/`_all`
+// wildcard under `/_ilm/policy/:name`, so the bare path 404'd (no route
+// matched it at all) and the UI silently rendered its "no policies" empty
+// state even when policies existed — same bug class as the ISM list-form gap.
+pub async fn list_ilm_policies(State(state): State<AppState>) -> impl IntoResponse {
+    all_ilm_policies_response(&state)
+}
+
+fn all_ilm_policies_response(state: &AppState) -> Response {
+    let mut result = serde_json::Map::new();
+    for entry in state.engine.ilm_policies.iter() {
+        result.insert(entry.key().clone(), entry.value().clone());
+    }
+    Json(Value::Object(result)).into_response()
 }
 
 pub async fn get_ilm_policy(
@@ -23474,11 +24113,7 @@ pub async fn get_ilm_policy(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     if name == "*" || name == "_all" {
-        let mut result = serde_json::Map::new();
-        for entry in state.engine.ilm_policies.iter() {
-            result.insert(entry.key().clone(), entry.value().clone());
-        }
-        return Json(Value::Object(result)).into_response();
+        return all_ilm_policies_response(&state);
     }
     match state.engine.ilm_policies.get(&name) {
         Some(policy) => {
@@ -23497,11 +24132,95 @@ pub async fn delete_ilm_policy(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     if state.engine.ilm_policies.remove(&name).is_some() {
+        state.engine.remove_ism_policy(&name);
         Json(json!({ "acknowledged": true })).into_response()
     } else {
         let e = xerj_common::XerjError::index_not_found(format!("policy [{name}] not found"));
         ApiError::new(e).into_response()
     }
+}
+
+#[cfg(test)]
+mod ilm_policy_list_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[tokio::test]
+    async fn bare_get_ilm_policy_lists_every_policy() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/_ilm/policy/kibana-verify-policy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"policy": {"phases": {"hot": {"actions": {}}}}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        // Real ES's `GET _ilm/policy` (no name segment) lists every policy —
+        // this is the exact form Kibana's UI calls for its policy list page.
+        let list = app
+            .oneshot(Request::get("/_ilm/policy").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(list.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("kibana-verify-policy").is_some());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /{index}/_ilm/explain
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub async fn ilm_explain(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+) -> impl IntoResponse {
+    let mut indices = serde_json::Map::new();
+    match state.engine.managed_indices.get(&index) {
+        Some(managed) => {
+            indices.insert(
+                index.clone(),
+                json!({
+                    "index": index,
+                    "managed": true,
+                    "policy": managed.policy_id,
+                    "phase": managed.current_state,
+                    "phase_time_millis": managed.state_entered_at_ms,
+                    "action": managed.info_message,
+                    "step": managed.info_message,
+                    "step_info": { "message": managed.info_message },
+                    "failed_step": if managed.failed { Some(managed.info_message.clone()) } else { None },
+                }),
+            );
+        }
+        None => {
+            indices.insert(index.clone(), json!({ "index": index, "managed": false }));
+        }
+    }
+    Json(json!({ "indices": Value::Object(indices) })).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23566,6 +24285,28 @@ pub async fn delete_component_template(
             xerj_common::XerjError::index_not_found(format!("component template [{name}] missing"));
         ApiError::new(e).into_response()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /_plugins/_query/_datasources
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Real OpenSearch's Query Workbench / async-query plugin lists configured
+/// EXTERNAL data connections (S3, Prometheus, Security Lake, ...) here.
+/// xerj has no such pluggable-connector subsystem, so the honest answer —
+/// same principle as `cat_plugins`/`cat_pending_tasks` returning empty
+/// rather than fabricating entries — is zero connections, not a 404.
+///
+/// Found missing while diffing OpenSearch Dashboards' Index Management
+/// pages against a real OpenSearch node: this route was entirely
+/// unregistered (404), which OSD's own `/api/dataconnections` backend
+/// proxy turns into an opaque 500 ("Issue in fetching data sources:
+/// StatusCodeError: Not Found" in its own logs) — every Index Management
+/// page calls it on load regardless of which tab is open, so the missing
+/// route surfaced as a stray "Not Found" toast even on pages that have
+/// nothing to do with Query Workbench.
+pub async fn query_workbench_datasources() -> impl IntoResponse {
+    Json(Vec::<Value>::new())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23694,7 +24435,10 @@ pub async fn cluster_state(State(state): State<AppState>) -> impl IntoResponse {
 // GET /_cat/allocation
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_allocation(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_allocation(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // shards  disk.indices  disk.used  disk.avail  disk.total  disk.percent  host         ip           node
     let health = state.engine.health().await;
 
@@ -23719,6 +24463,22 @@ pub async fn cat_allocation(State(state): State<AppState>) -> impl IntoResponse 
         .unwrap_or(0);
 
     let shards = health.index_count;
+
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "shards": shards.to_string(),
+            "disk.indices": format!("{indices_bytes}b"),
+            "disk.used": format!("{disk_used_bytes}b"),
+            "disk.avail": format!("{disk_avail}b"),
+            "disk.total": format!("{disk_total}b"),
+            "disk.percent": disk_percent.to_string(),
+            "host": "127.0.0.1",
+            "ip": "127.0.0.1",
+            "node": "xerj-node-1",
+        })])
+        .into_response();
+    }
+
     let body = format!(
         "{shards} {indices_bytes}b {disk_used_bytes}b {disk_avail}b {disk_total}b {disk_percent} 127.0.0.1 127.0.0.1 xerj-node-1\n"
     );
@@ -24542,7 +25302,10 @@ pub async fn cluster_allocation_explain(
 // GET /_cat/master
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_recovery(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_recovery(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // ES _cat/recovery default column order:
     // index shard time type stage source_host source_node target_host
     // target_node repository snapshot files files_recovered files_percent
@@ -24553,20 +25316,62 @@ pub async fn cat_recovery(State(state): State<AppState>) -> impl IntoResponse {
     // existing_store recovery (stage=done, 100.0%). Files = segment count,
     // bytes = real on-disk data_dir size, translog ops = doc count.
     let indices = state.engine.list_indices().await;
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, u64, u64, u64)> = Vec::new();
     for info in &indices {
         let bytes = state
             .engine
             .get_index(&info.name)
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
-        let files = info.segment_count;
-        let docs = info.doc_count;
-        lines.push(format!(
-            "{} 0 0ms existing_store done n/a n/a 127.0.0.1 xerj-node-1 n/a n/a {files} {files} 100.0% {files} {bytes} {bytes} 100.0% {bytes} {docs} {docs} 100.0%",
-            info.name,
+        rows.push((
+            info.name.clone(),
+            info.segment_count as u64,
+            bytes,
+            info.doc_count,
         ));
     }
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(name, files, bytes, docs)| {
+                json!({
+                    "index": name,
+                    "shard": "0",
+                    "time": "0ms",
+                    "type": "existing_store",
+                    "stage": "done",
+                    "source_host": "n/a",
+                    "source_node": "n/a",
+                    "target_host": "127.0.0.1",
+                    "target_node": "xerj-node-1",
+                    "repository": "n/a",
+                    "snapshot": "n/a",
+                    "files": files.to_string(),
+                    "files_recovered": files.to_string(),
+                    "files_percent": "100.0%",
+                    "files_total": files.to_string(),
+                    "bytes": bytes.to_string(),
+                    "bytes_recovered": bytes.to_string(),
+                    "bytes_percent": "100.0%",
+                    "bytes_total": bytes.to_string(),
+                    "translog_ops": docs.to_string(),
+                    "translog_ops_recovered": docs.to_string(),
+                    "translog_ops_percent": "100.0%",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(name, files, bytes, docs)| {
+            format!(
+                "{name} 0 0ms existing_store done n/a n/a 127.0.0.1 xerj-node-1 n/a n/a {files} {files} 100.0% {files} {bytes} {bytes} 100.0% {bytes} {docs} {docs} 100.0%",
+            )
+        })
+        .collect();
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -24586,10 +25391,11 @@ pub async fn cat_recovery(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn cat_segments(
     State(state): State<AppState>,
     Path(index): Path<String>,
+    Query(params): Query<CatFormatParams>,
 ) -> impl IntoResponse {
     // index  shard  prirep  ip           segment  generation  docs.count  docs.deleted  size  size.memory  committed  searchable  version  compound
     let node = state.engine.node_id.as_str();
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, u64, u64)> = Vec::new();
     let indices_to_list: Vec<String> = if index == "_all" || index == "*" {
         state
             .engine
@@ -24611,15 +25417,44 @@ pub async fn cat_segments(
             // and persisted). We do NOT fabricate a Lucene version string —
             // xerj has no Lucene segments — so we report the xerj build version.
             let _ = node; // segments output has no node column in ES; kept for parity
-            lines.push(format!(
-                "{} 0 p 127.0.0.1 _0 0 {} 0 {}b 0 true true {} true",
-                idx_name,
-                stats.doc_count,
-                size,
-                env!("CARGO_PKG_VERSION"),
-            ));
+            rows.push((idx_name.clone(), stats.doc_count, size));
         }
     }
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(idx_name, doc_count, size)| {
+                json!({
+                    "index": idx_name,
+                    "shard": "0",
+                    "prirep": "p",
+                    "ip": "127.0.0.1",
+                    "segment": "_0",
+                    "generation": "0",
+                    "docs.count": doc_count.to_string(),
+                    "docs.deleted": "0",
+                    "size": format!("{size}b"),
+                    "size.memory": "0",
+                    "committed": "true",
+                    "searchable": "true",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "compound": "true",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(idx_name, doc_count, size)| {
+            format!(
+                "{idx_name} 0 p 127.0.0.1 _0 0 {doc_count} 0 {size}b 0 true true {} true",
+                env!("CARGO_PKG_VERSION"),
+            )
+        })
+        .collect();
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -24636,7 +25471,10 @@ pub async fn cat_segments(
         .into_response()
 }
 
-pub async fn cat_thread_pool(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_thread_pool(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // ES default columns: node_name name active queue rejected
     //
     // xerj does NOT use ES-style fixed, bounded thread pools — it schedules all
@@ -24658,6 +25496,23 @@ pub async fn cat_thread_pool(State(state): State<AppState>) -> impl IntoResponse
         "warmer",
         "generic",
     ];
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = pools
+            .iter()
+            .map(|p| {
+                json!({
+                    "node_name": node,
+                    "name": p,
+                    "active": "0",
+                    "queue": "0",
+                    "rejected": "0",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let body = pools
         .iter()
         .map(|p| format!("{node} {p} 0 0 0"))
@@ -24675,10 +25530,31 @@ pub async fn cat_thread_pool(State(state): State<AppState>) -> impl IntoResponse
         .into_response()
 }
 
-pub async fn cat_fielddata(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_fielddata(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // id  host         ip           node          field  size
     let node = state.engine.node_id.as_str();
     let indices = state.engine.list_indices().await;
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = indices
+            .iter()
+            .map(|info| {
+                json!({
+                    "id": node,
+                    "host": "127.0.0.1",
+                    "ip": "127.0.0.1",
+                    "node": node,
+                    "field": info.name,
+                    "size": "0b",
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = Vec::new();
     for info in &indices {
         // Honest 0b fielddata usage per index: xerj has no fielddata cache.
@@ -24703,12 +25579,20 @@ pub async fn cat_fielddata(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn cat_pending_tasks(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_pending_tasks(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // insertOrder  timeInQueue  priority  source
     // Single-node: there is no cluster-state task queue (master service), so
     // the pending-task set is always empty. Derive it from that fact rather
     // than hardcoding — touch node_id so this is genuinely state-derived.
     let _node = state.engine.node_id.as_str();
+
+    if params.format.as_deref() == Some("json") {
+        return Json(Vec::<Value>::new()).into_response();
+    }
+
     let lines: Vec<String> = Vec::new();
     let body = if lines.is_empty() {
         String::new()
@@ -24726,12 +25610,20 @@ pub async fn cat_pending_tasks(State(state): State<AppState>) -> impl IntoRespon
         .into_response()
 }
 
-pub async fn cat_plugins(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_plugins(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // name  component  version  description
     // xerj has no plugin system — everything is built-in — so the honest,
     // state-derived answer is an empty body. (node_id touched so this is not
     // a bare constant.)
     let _node = state.engine.node_id.as_str();
+
+    if params.format.as_deref() == Some("json") {
+        return Json(Vec::<Value>::new()).into_response();
+    }
+
     let lines: Vec<String> = Vec::new();
     let body = if lines.is_empty() {
         String::new()
@@ -24749,13 +25641,33 @@ pub async fn cat_plugins(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn cat_nodeattrs(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_nodeattrs(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // node  host         ip           attr  value
     // Emit only attributes xerj can honestly report. There are no custom
     // user-configured node attributes and no ML subsystem, so we surface a
     // single real attribute: xpack.installed = false (xerj ships no X-Pack).
     let node = state.engine.node_id.as_str();
     let attrs: Vec<(&str, &str)> = vec![("xpack.installed", "false")];
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = attrs
+            .iter()
+            .map(|(attr, value)| {
+                json!({
+                    "node": node,
+                    "host": "127.0.0.1",
+                    "ip": "127.0.0.1",
+                    "attr": attr,
+                    "value": value,
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = Vec::new();
     for (attr, value) in &attrs {
         lines.push(format!("{node} 127.0.0.1 127.0.0.1 {attr} {value}"));
@@ -24776,9 +25688,23 @@ pub async fn cat_nodeattrs(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn cat_master(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_master(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // id                     host      ip        node
     let id = state.engine.node_id.as_str();
+
+    if params.format.as_deref() == Some("json") {
+        return Json(vec![json!({
+            "id": id,
+            "host": "127.0.0.1",
+            "ip": "127.0.0.1",
+            "node": id,
+        })])
+        .into_response();
+    }
+
     let body = format!("{id} 127.0.0.1 127.0.0.1 {id}\n");
     (
         StatusCode::OK,
@@ -25662,10 +26588,27 @@ async fn msearch_template_impl(
         let mut merged_hits: Vec<Value> = Vec::new();
         let mut total_count: u64 = 0;
         let mut script_failure: Option<String> = None;
+        let mut search_error: Option<xerj_common::XerjError> = None;
 
+        // Both arms below used to be `if let Ok(..)` with no else, so a
+        // missing index or a query the engine refused produced
+        // `{"_shards":{"successful":1,"failed":0},"hits":{"total":0}}` — a
+        // sub-response positively asserting the shard succeeded and found
+        // nothing. `_msearch` carries the same errors as a per-response
+        // envelope (`ApiError::into_value`, which keeps the exact body and
+        // status the single-request `_search` would have returned); the
+        // template form now does the same, and the sibling sub-requests in the
+        // batch are unaffected either way.
         for idx_name in &index_names {
-            if let Ok(idx) = state.engine.get_index(idx_name) {
-                if let Ok(result) = idx.search(&search_req).await {
+            let idx = match state.engine.get_index(idx_name) {
+                Ok(i) => i,
+                Err(e) => {
+                    search_error = Some(xerj_common::XerjError::from(e));
+                    break;
+                }
+            };
+            match idx.search(&search_req).await {
+                Ok(result) => {
                     if let Some(reason) = result.script_failure {
                         script_failure = Some(reason);
                         break;
@@ -25685,6 +26628,10 @@ async fn msearch_template_impl(
                         }));
                     }
                 }
+                Err(e) => {
+                    search_error = Some(xerj_common::XerjError::from(e));
+                    break;
+                }
             }
         }
 
@@ -25692,6 +26639,11 @@ async fn msearch_template_impl(
             // Degraded scores — report this sub-request as failed instead of
             // publishing them as if the script had run.
             responses.push(script_limit_error_value(&reason));
+            continue;
+        }
+
+        if let Some(err) = search_error {
+            responses.push(ApiError::new(err).into_value());
             continue;
         }
 
@@ -28448,13 +29400,22 @@ pub async fn explain_doc(
     // Reporting the fault alongside the verdict satisfies both: the caller
     // still gets the answer, and never gets it without being told a limit
     // tripped.
-    let mut script_failure: Option<String> = None;
-    let matched = match idx.search(&ids_req).await {
-        Ok(result) => {
-            script_failure = result.script_failure.clone();
-            !result.hits.is_empty()
-        }
-        Err(_) => false,
+    let (matched, script_failure) = match idx.search(&ids_req).await {
+        Ok(result) => (!result.hits.is_empty(), result.script_failure),
+        // The engine REFUSED to run the query — e.g. it names a field the
+        // mapping declared `"index": false` with no doc values, which ES
+        // rejects with `Cannot search on field [f] since it is not indexed
+        // nor has doc values.` Publishing `matched: false` here would be a
+        // confident negative for a question that was never asked, which is
+        // the accepted-and-ignored failure of #204 wearing a diagnostic hat.
+        // Every other error path in this handler already returns `ApiError`;
+        // so does this one, giving `_explain` the same 400 envelope
+        // `_search` and `_count` return for the identical query.
+        //
+        // Deliberately NOT the same as `script_failure` above: there the
+        // engine DID produce a hit list and only scoring was degraded, so the
+        // verdict is real and the fault is reported alongside it.
+        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
     let score = if matched { 1.0_f64 } else { 0.0_f64 };
@@ -30622,6 +31583,25 @@ pub async fn rank_eval(
 
     let mut failures = serde_json::Map::new();
 
+    // A request `_rank_eval` cannot run is recorded in `failures`, never
+    // dropped. The three arms below used to be `Err(_) => continue`, so a
+    // refused request vanished from `details` AND from `failures` while
+    // `metric_score` was still published — the batch silently shrank and the
+    // mean was taken over the survivors, on the one endpoint whose entire
+    // purpose is measuring relevance quality. `failures` is the channel ES
+    // provides for exactly this (the `script_failure` arm further down already
+    // used it); a faulted request contributes nothing to `metric_score`, and a
+    // caller can now see that it did not.
+    let record_failure =
+        |failures: &mut serde_json::Map<String, Value>, id: &str, err: xerj_common::XerjError| {
+            let detail = ApiError::new(err)
+                .into_value()
+                .get("error")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "exception", "reason": "request failed" }));
+            failures.insert(id.to_string(), detail);
+        };
+
     for req_spec in &body.requests {
         let query_val = req_spec
             .request
@@ -30637,17 +31617,30 @@ pub async fn rank_eval(
         let search_req =
             match xerj_query::parse_request(&json!({"query": query_val, "size": size.max(k)})) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    record_failure(
+                        &mut failures,
+                        &req_spec.id,
+                        xerj_common::XerjError::invalid_query(e.to_string()),
+                    );
+                    continue;
+                }
             };
 
         let idx = match state.engine.get_index(&index) {
             Ok(i) => i,
-            Err(_) => continue,
+            Err(e) => {
+                record_failure(&mut failures, &req_spec.id, xerj_common::XerjError::from(e));
+                continue;
+            }
         };
 
         let result = match idx.search(&search_req).await {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                record_failure(&mut failures, &req_spec.id, xerj_common::XerjError::from(e));
+                continue;
+            }
         };
         // A Painless resource limit tripped while scoring or matching this
         // request. `_rank_eval` exists to *measure relevance quality*, so a
@@ -31897,7 +32890,29 @@ pub async fn get_ml_records(
 
 /// GET /_cat/ml/anomaly_detectors — one line per real detector.
 /// Columns: id state source_index function bucket_span
-pub async fn cat_ml_anomaly_detectors(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_ml_anomaly_detectors(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
+    if params.format.as_deref() == Some("json") {
+        let mut arr: Vec<Value> = state
+            .ml_detectors
+            .iter()
+            .map(|e| {
+                let d = e.value();
+                json!({
+                    "id": d.detector_id,
+                    "state": "opened",
+                    "source_index": d.source_index,
+                    "function": d.function,
+                    "bucket_span": d.bucket_span,
+                })
+            })
+            .collect();
+        arr.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = state
         .ml_detectors
         .iter()
@@ -31928,7 +32943,27 @@ pub async fn cat_ml_anomaly_detectors(State(state): State<AppState>) -> impl Int
 
 /// GET /_cat/ml/datafeeds — one line per real datafeed.
 /// Columns: id state job_id
-pub async fn cat_ml_datafeeds(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_ml_datafeeds(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
+    if params.format.as_deref() == Some("json") {
+        let mut arr: Vec<Value> = state
+            .ml_datafeeds
+            .iter()
+            .map(|e| {
+                let f = e.value();
+                json!({
+                    "id": f.datafeed_id,
+                    "state": f.state,
+                    "job_id": f.job_id,
+                })
+            })
+            .collect();
+        arr.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = state
         .ml_datafeeds
         .iter()
@@ -31954,7 +32989,10 @@ pub async fn cat_ml_datafeeds(State(state): State<AppState>) -> impl IntoRespons
         .into_response()
 }
 
-pub async fn cat_ml_trained_models() -> impl IntoResponse {
+pub async fn cat_ml_trained_models(Query(params): Query<CatFormatParams>) -> impl IntoResponse {
+    if params.format.as_deref() == Some("json") {
+        return Json(Vec::<Value>::new()).into_response();
+    }
     (
         StatusCode::OK,
         [(
@@ -31963,6 +33001,7 @@ pub async fn cat_ml_trained_models() -> impl IntoResponse {
         )],
         "",
     )
+        .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33155,9 +34194,31 @@ pub async fn simulate_index_template_body(
 // GET /_cat/repositories
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn cat_tasks(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_tasks(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
     // action  task_id  type  running_time  ip  node — backed by the real
     // in-flight TaskRegistry (consistent with GET /_tasks).
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = state
+            .tasks
+            .list()
+            .iter()
+            .map(|t| {
+                json!({
+                    "action": t.action,
+                    "task_id": format!("{}:{}", t.node, t.id),
+                    "type": "transport",
+                    "running_time": format!("{}ms", t.running_nanos() / 1_000_000),
+                    "ip": "127.0.0.1",
+                    "node": t.node.as_str(),
+                })
+            })
+            .collect();
+        return Json(arr).into_response();
+    }
+
     let mut lines: Vec<String> = Vec::new();
     for t in state.tasks.list() {
         lines.push(format!(
@@ -33185,16 +34246,32 @@ pub async fn cat_tasks(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn cat_repositories(State(state): State<AppState>) -> impl IntoResponse {
-    let mut lines = Vec::new();
+pub async fn cat_repositories(
+    State(state): State<AppState>,
+    Query(params): Query<CatFormatParams>,
+) -> impl IntoResponse {
+    let mut rows: Vec<(String, String)> = Vec::new();
     for entry in state.engine.snapshot_repos.iter() {
         let repo_type = entry
             .value()
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("fs");
-        lines.push(format!("{} {}", entry.key(), repo_type));
+        rows.push((entry.key().clone(), repo_type.to_string()));
     }
+
+    if params.format.as_deref() == Some("json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(id, repo_type)| json!({ "id": id, "type": repo_type }))
+            .collect();
+        return Json(arr).into_response();
+    }
+
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(id, repo_type)| format!("{id} {repo_type}"))
+        .collect();
     let body = if lines.is_empty() {
         String::new()
     } else {
@@ -33208,6 +34285,7 @@ pub async fn cat_repositories(State(state): State<AppState>) -> impl IntoRespons
         )],
         body,
     )
+        .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

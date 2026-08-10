@@ -28,7 +28,8 @@ use uuid::Uuid;
 use xerj_common::config::CorsConfig;
 
 use crate::{
-    auth::auth_middleware, authz, es_compat, graph_api, memory_api, native, state::AppState,
+    auth::auth_middleware, authz, es_compat, graph_api, ism_api, memory_api, native,
+    state::AppState,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +388,18 @@ pub fn build_es_compat_router(state: AppState) -> Router {
             "/_search/scroll",
             post(es_compat::next_scroll).delete(es_compat::clear_scroll),
         )
+        // Legacy path-parameter form of scroll continuation — a real,
+        // documented ES/OpenSearch REST variant, not a client mistake.
+        // Found missing while investigating why OpenSearch Dashboards
+        // 3.7.0's saved-objects migration crashes: it continues its scroll
+        // this way, hits a bare 404 (no route matched at all), and treats
+        // that as fatal.
+        .route(
+            "/_search/scroll/:scroll_id",
+            get(es_compat::next_scroll_path)
+                .post(es_compat::next_scroll_path)
+                .delete(es_compat::clear_scroll_path),
+        )
         // ── Reindex ────────────────────────────────────────────────────────
         .route("/_reindex", post(es_compat::reindex))
         // ── Field Capabilities ─────────────────────────────────────────────
@@ -462,18 +475,52 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         )
         .route("/:name/_rollover", post(es_compat::rollover_data_stream))
         // ── ILM ────────────────────────────────────────────────────────────
+        .route("/_ilm/policy", get(es_compat::list_ilm_policies))
         .route(
             "/_ilm/policy/:name",
             put(es_compat::put_ilm_policy)
                 .get(es_compat::get_ilm_policy)
                 .delete(es_compat::delete_ilm_policy),
         )
+        .route("/:index/_ilm/explain", get(es_compat::ilm_explain))
+        // ── ISM (OpenSearch Index State Management) ─────────────────────────
+        // Same execution engine as ILM above — see `xerj_engine::lifecycle`.
+        .route(
+            "/_plugins/_ism/policies/:policy_id",
+            put(ism_api::put_ism_policy)
+                .get(ism_api::get_ism_policy)
+                .delete(ism_api::delete_ism_policy),
+        )
+        .route("/_plugins/_ism/policies", get(ism_api::list_ism_policies))
+        .route("/_plugins/_ism/add/:index", post(ism_api::add_ism_policy))
+        .route(
+            "/_plugins/_ism/remove/:index",
+            post(ism_api::remove_ism_policy),
+        )
+        .route(
+            "/_plugins/_ism/change_policy/:index",
+            post(ism_api::change_ism_policy),
+        )
+        .route(
+            "/_plugins/_ism/retry/:index",
+            post(ism_api::retry_ism_index),
+        )
+        .route(
+            "/_plugins/_ism/explain/:index",
+            get(ism_api::explain_ism_index),
+        )
+        .route("/_plugins/_ism/explain", get(ism_api::list_managed_indices))
         // ── Component templates ────────────────────────────────────────────
         .route(
             "/_component_template/:name",
             put(es_compat::put_component_template)
                 .get(es_compat::get_component_template)
                 .delete(es_compat::delete_component_template),
+        )
+        // ── Query Workbench data connections (honest empty list) ────────────
+        .route(
+            "/_plugins/_query/_datasources",
+            get(es_compat::query_workbench_datasources),
         )
         // ── Cluster state ──────────────────────────────────────────────────
         .route("/_cluster/state", get(es_compat::cluster_state))

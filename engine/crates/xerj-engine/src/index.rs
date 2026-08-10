@@ -6914,7 +6914,7 @@ impl Index {
             let analyzer = mem
                 .default_analyzer()
                 .expect("standard analyzer always present");
-            let excluded_fts_fields = crate::memtable::semantic_derived_vector_fields(schema);
+            let excluded_fts_fields = crate::memtable::fts_excluded_fields(schema);
             let p_t = std::time::Instant::now();
             let analyzed: Vec<Vec<(String, Vec<xerj_fts::analyzer::Token>)>> = crate::ingest_pool()
                 .install(|| {
@@ -7385,9 +7385,7 @@ impl Index {
         let registry = Arc::clone(&self.registry);
         let data_dir = self.data_dir.clone();
         let field_configs = self.flush_signal.field_configs(&self.schema);
-        let excluded_fts_fields = self
-            .flush_signal
-            .semantic_derived_vector_fields(&self.schema);
+        let excluded_fts_fields = self.flush_signal.fts_excluded_fields(&self.schema);
         let dv_skip = self.flush_signal.doc_values_skip_set(&self.schema);
         let dataset_version = Arc::clone(&self.dataset_version);
         let query_cache = Arc::clone(&self.query_cache);
@@ -7638,7 +7636,7 @@ impl Index {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
-                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
         };
@@ -7774,7 +7772,7 @@ impl Index {
             let (excluded_fts_fields, dv_skip) = {
                 let schema = self.schema.read().await;
                 (
-                    crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                    crate::memtable::fts_excluded_fields(&schema.schema),
                     doc_values_skip_set(&schema.schema),
                 )
             };
@@ -8014,7 +8012,7 @@ impl Index {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
-                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                crate::memtable::fts_excluded_fields(&schema.schema),
             )
         };
         // Kept for the legacy "if !text_fields.is_empty()" branch — empty
@@ -11798,6 +11796,83 @@ impl Index {
         self.query_cache_misses.load(Ordering::Relaxed)
     }
 
+    /// The last-ranking `(score, seq_no, _id)` page key held by `hits`, under
+    /// the exact comparator the final page sort uses (score DESC, `seq_no` ASC,
+    /// `_id` ASC).
+    ///
+    /// #191 — the bounded collector's admission bound has to be this WHOLE key,
+    /// not just the score.  Documents that tie on score are separated by
+    /// `seq_no`, and the collection walk visits segments in snapshot order and
+    /// documents in stored-layout order — neither is `seq_no`-ascending — so a
+    /// score-only bound silently rejected tied documents that outrank the kept
+    /// set, and a `size:5` page stopped agreeing with a `size:1000` one.
+    ///
+    /// The score minimum is found first with a lookup-free scan; the `seq_no`
+    /// (a `VersionMap` hash lookup) is resolved only for the hits that actually
+    /// tie that minimum, so the usual tie-free case costs one lookup.
+    fn worst_page_key(&self, hits: &[Hit]) -> Option<(f32, u64, String)> {
+        let min_score = hits
+            .iter()
+            .map(|h| h.score)
+            .fold(None, |acc: Option<f32>, s| {
+                Some(match acc {
+                    Some(a) if a <= s => a,
+                    _ => s,
+                })
+            })?;
+        let mut worst: Option<(f32, u64, String)> = None;
+        for h in hits.iter().filter(|h| h.score == min_score) {
+            let key = (
+                h.score,
+                self.lookup_seq_no(&h.id).unwrap_or(u64::MAX),
+                h.id.clone(),
+            );
+            let worse = match worst.as_ref() {
+                None => true,
+                // Ranks LATER than the incumbent = worse: same score, then
+                // larger seq_no, then larger `_id`.
+                Some(w) => (key.1, &key.2) > (w.1, &w.2),
+            };
+            if worse {
+                worst = Some(key);
+            }
+        }
+        worst
+    }
+
+    /// Reduce `hits` to the best `cap` under the SAME comparator the final page
+    /// sort uses (`score DESC, seq_no ASC, _id ASC` — `index.rs:16222-16228`),
+    /// and return the surviving cap-th `(score, seq_no, _id)` page key.
+    ///
+    /// #191 — every bounded collector in `search` trims through here, so
+    /// admission and final ordering can never drift apart: a `size:5` page is
+    /// the first five of a `size:1000` one whatever order the walk visited the
+    /// documents in.
+    #[allow(clippy::type_complexity)]
+    fn trim_page_to_cap(
+        &self,
+        hits: Vec<Hit>,
+        cap: usize,
+    ) -> (Vec<Hit>, Option<(f32, u64, String)>) {
+        let mut decorated: Vec<(u64, Hit)> = hits
+            .into_iter()
+            .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
+            .collect();
+        decorated.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        decorated.truncate(cap);
+        let worst = decorated
+            .last()
+            .map(|(seq, h)| (h.score, *seq, h.id.clone()));
+        let kept = decorated.into_iter().map(|(_, h)| h).collect();
+        (kept, worst)
+    }
+
     /// Look up the latest `seq_no` for a document by id via the version
     /// map. Returns `None` when the doc is unknown or tombstoned.
     ///
@@ -12905,9 +12980,25 @@ impl Index {
         let from = request.from;
 
         // Resolve field aliases in the query: rewrite any alias field names to their targets.
+        //
+        // The unsearchable-field check rides on the same schema guard, and runs
+        // AFTER alias resolution so an alias inherits its target's mapping —
+        // which is what ES validates. See `unsearchable_query_field`: a field
+        // declared `"index": false` with no doc values has neither postings nor
+        // a column to scan, and ES fails the query rather than answering it
+        // from `_source` (#204 — accepted means honoured).
         let resolved_query = {
             let schema = self.schema.read().await;
-            rewrite_query_aliases(&request.query, &schema.schema)
+            let resolved = rewrite_query_aliases(&request.query, &schema.schema);
+            if let Some(field) = unsearchable_query_field(&resolved, &schema.schema) {
+                return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                    format!(
+                        "failed to create query: Cannot search on field [{field}] \
+                         since it is not indexed nor has doc values."
+                    ),
+                )));
+            }
+            resolved
         };
         let query = &resolved_query;
 
@@ -13269,6 +13360,27 @@ impl Index {
             let mut num: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut bf: std::collections::HashSet<String> = std::collections::HashSet::new();
             for f in &schema_guard.schema.fields {
+                // These sets are the field-less expansion: what a bare
+                // `query_string` / `simple_query_string` / `multi_match` on
+                // `*` projects a clause onto. ES expands `*` over SEARCHABLE
+                // fields only (`MappedFieldType.isSearchable()` = has terms OR
+                // has doc values), so a field declared `"index": false` with no
+                // doc values must not appear here — otherwise the projected
+                // clause falls through the per-segment `fts_has_field` gate
+                // onto the stored-doc scan and matches the field's `_source`
+                // text, which is the accepted-and-ignored bug wearing a
+                // different hat (#204). A named query on the same field is
+                // rejected outright by `unsearchable_query_field`; this is the
+                // implicit-expansion half of the same rule.
+                //
+                // `index: false` WITH doc values stays in: ES calls it
+                // searchable and answers it from the column (8.1 doc-values
+                // search). We answer it exactly too — see
+                // `memtable::fts_excluded_fields` for why such a field keeps
+                // its postings rather than falling back to the scan.
+                if !f.options.indexed && !f.options.doc_values {
+                    continue;
+                }
                 if matches!(f.field_type, FieldType::Text) {
                     tf.push(f.name.clone());
                 } else {
@@ -13463,6 +13575,26 @@ impl Index {
         // memtable and a segment (possible during a flush race).  We prefer
         // the first appearance (which is usually the memtable, i.e. the
         // newest version).
+        //
+        // #191 — the `materialisation_limit` bound here is a plain FIFO cut,
+        // and it is only CORRECT because every arm that feeds it upholds one
+        // of two invariants:
+        //
+        //   * `AllDocIds` / `DocValuesHits` — the memtable already narrowed
+        //     its candidates to the globally best `limit` by `(seq_no, _id)`
+        //     (`ShardedFtsMemtable::narrow_to_page`), so the FIFO never
+        //     truncates at all; and
+        //   * `FtsHits` — the memtable returns its hits already sorted by the
+        //     full page key (`sort_hits_by_page_key`), so the first `limit`
+        //     ARE the page.  This matters on the ghost-window path, which asks
+        //     the memtable for every hit rather than a bounded prefix.
+        //
+        // The brute-scan arm upholds neither (it walks shards in index order),
+        // so it does NOT route post-cap admissions through here — see the
+        // `DocsForScan` arm.  Before #191 the FIFO was applied to unordered
+        // input and the surviving tied documents were decided by shard-walk
+        // order: `size:5` and `size:1000` disagreed on a 600-document
+        // all-tied memtable.
         macro_rules! admit_hit {
             ($hit:expr) => {{
                 total_count += 1;
@@ -13578,7 +13710,11 @@ impl Index {
             /// The `u64` is the UNCOLLECTED matching-doc remainder (bounded
             /// fused-bool path); it still counts toward `hits.total`.
             DocValuesHits(Vec<(String, usize)>, u64),
-            DocsForScan(Vec<(String, Arc<Value>)>), // doc_id + shared source for term-level scan
+            /// `(seq_no, doc_id, shared source)` for a term-level brute scan.
+            /// #191 — `seq_no` rides along so the bounded collector can rank a
+            /// document it reaches after filling the cap against the page it
+            /// already holds; shard-concatenation order is not arrival order.
+            DocsForScan(Vec<(u64, String, Arc<Value>)>),
         }
 
         // Search the memtable (unflushed docs only). Flushed docs are searched
@@ -13758,7 +13894,7 @@ impl Index {
                         // the heap is full (NOT the id-only snapshot,
                         // whose per-doc deep clone cost ~1 s/query at a
                         // 1 M-doc memtable).
-                        None => MemSnapshot::DocsForScan(mem.all_docs_with_sources_arc()),
+                        None => MemSnapshot::DocsForScan(mem.all_docs_with_seq_arc()),
                     }
                 } else {
                     let (ids, total) = mem.doc_ids_bounded(materialisation_limit);
@@ -13842,7 +13978,7 @@ impl Index {
                     } else {
                         // Brute per-doc scan — same authority the size>0
                         // path falls back to; `doc_matches_query` semantics.
-                        MemSnapshot::DocsForScan(mem.all_docs_with_sources_arc())
+                        MemSnapshot::DocsForScan(mem.all_docs_with_seq_arc())
                     }
                 } else if let Some((hits, total)) = (|| {
                     // Fused columnar term/range/bool: ONE position walk
@@ -13896,7 +14032,7 @@ impl Index {
                     // query (plus a second per-doc clone for `_id`
                     // injection below) was the single hottest search-side
                     // cost in the read-under-write thread dumps.
-                    let docs: Vec<(String, Arc<Value>)> = mem.all_docs_with_sources_arc();
+                    let docs: Vec<(u64, String, Arc<Value>)> = mem.all_docs_with_seq_arc();
                     MemSnapshot::DocsForScan(docs)
                 }
             } else {
@@ -14062,7 +14198,15 @@ impl Index {
                 let query_may_read_id: bool = serde_json::to_string(query)
                     .map(|s| s.contains("_id") || s.contains("Ids") || s.contains("ids"))
                     .unwrap_or(true);
-                for (doc_id, source) in docs {
+                // #191 — the cap-th page key the bounded collector currently
+                // holds, recomputed only when it can have changed (the moment
+                // the collector first fills, and after every trim).  A stale
+                // value is always a WEAKER threshold than the truth — it admits
+                // more than strictly necessary, never less — which is the safe
+                // direction, the same argument the segment walk's `page_worst`
+                // relies on.
+                let mut scan_worst: Option<(f32, u64, String)> = None;
+                for (seq_no, doc_id, source) in docs {
                     let matched = if let QueryNode::Ids { values } = query {
                         values.iter().any(|v| v == doc_id.as_str())
                     } else if !query_may_read_id || source.get("_id").is_some() {
@@ -14083,13 +14227,31 @@ impl Index {
                         // Materialise (score + owned source) ONLY when the
                         // hit can actually enter the bounded collector /
                         // top-N heap; everything else is a bare count.
-                        // Identical outcome to unconditionally building the
-                        // Hit: `admit_hit!` drops post-cap hits anyway.
+                        //
+                        // #191 — "can enter" is no longer "the collector still
+                        // has room".  This walk visits shards in index order
+                        // and each shard in arrival order, so it is NOT a
+                        // globally arrival-ordered walk: a document reached
+                        // after the cap is full can still hold a smaller
+                        // `seq_no` than the page's worst hit and therefore win
+                        // the tie-break against it.  Admit exactly those as
+                        // well — one `u64` compare against `scan_worst`, no
+                        // extra source clone for the ones that lose — and let
+                        // the trim below put the collector back at the cap by
+                        // the final comparator.  Documents that lose on
+                        // `seq_no` but would have won on SCORE are still
+                        // dropped here; that is pre-existing (they were dropped
+                        // outright before) and is recorded under Residual risk.
+                        let competitive = all_hits.len() < materialisation_limit || {
+                            if scan_worst.is_none() {
+                                scan_worst = self.worst_page_key(&all_hits);
+                            }
+                            scan_worst.as_ref().is_some_and(|w| seq_no < w.1)
+                        };
                         if count_only {
                             total_count += 1;
                         } else if sort_topk.is_some()
-                            || (all_hits.len() < materialisation_limit
-                                && !seen_ids.contains(&doc_id))
+                            || (competitive && !seen_ids.contains(&doc_id))
                         {
                             // Field-sorted: pre-clone primary-key rejection.
                             // Once the heap is full, a doc whose PRIMARY
@@ -14109,7 +14271,7 @@ impl Index {
                                 }
                             }
                             let score = score_doc(&source, &doc_id);
-                            admit_hit!(Hit {
+                            let hit = Hit {
                                 id: doc_id,
                                 score,
                                 source: (*source).clone(),
@@ -14118,13 +14280,48 @@ impl Index {
                                 highlight: None,
                                 matched_queries: Vec::new(),
                                 passage: None,
-                            });
+                            };
+                            if sort_topk.is_some() {
+                                admit_hit!(hit);
+                            } else {
+                                // `admit_hit!`'s FIFO bound would throw the
+                                // post-cap admissions above straight back
+                                // away, so this arm collects them itself and
+                                // trims by the page comparator once the
+                                // overflow reaches 2×cap — the same eager-trim
+                                // shape the segment walk uses.
+                                total_count += 1;
+                                if !seen_ids.contains(&hit.id) {
+                                    seen_ids.insert(hit.id.clone());
+                                    all_hits.push(hit);
+                                    if all_hits.len() > materialisation_limit.saturating_mul(2) {
+                                        let (kept, worst) = self.trim_page_to_cap(
+                                            std::mem::take(&mut all_hits),
+                                            materialisation_limit,
+                                        );
+                                        all_hits = kept;
+                                        scan_worst = worst;
+                                    }
+                                }
+                            }
                         } else {
                             total_count += 1;
                         }
                     }
                 }
             }
+        }
+
+        // #191 — normalise the memtable contribution back to exactly the cap
+        // before the segment walk starts, so every downstream stage sees the
+        // documented shape (`all_hits` holds the best `materialisation_limit`
+        // by the final comparator).  Only the brute-scan arm can overshoot —
+        // it admits post-cap documents that outrank the page it holds — and
+        // only up to 2×cap before its own eager trim fires.
+        if sort_topk.is_none() && all_hits.len() > materialisation_limit {
+            let (kept, _worst) =
+                self.trim_page_to_cap(std::mem::take(&mut all_hits), materialisation_limit);
+            all_hits = kept;
         }
 
         // --- Segment search ---
@@ -14538,7 +14735,37 @@ impl Index {
                 false
             };
 
-            for meta in &snap.segments {
+            // #191 — worst `(score, seq_no, _id)` key currently kept by the
+            // stored-scan collector, maintained across segments so the skip
+            // below is O(1).  See `worst_page_key`.
+            let mut scan_page_worst: Option<(f32, u64, String)> = None;
+            // #191 — walk the segments in ARRIVAL order.  `IndexSnapshot`
+            // documents its list as "oldest first", but nothing enforces it:
+            // `with_new_segment` appends in flush-COMPLETION order (a flush
+            // drains each memtable shard into its own segment, so the shards
+            // race) and `replace_segments` appends a merge's output — the
+            // oldest data in the index — at the very end.  Documents inside a
+            // segment ARE `seq_no`-ordered (`drain_for_flush` and the merge
+            // both sort by `seq_no`), so ordering the segments by `min_seq_no`
+            // is what makes the whole walk approximate the page's own
+            // `(score DESC, seq_no ASC)` order — Lucene's "leaves in index
+            // order, docs ascending within a leaf" invariant, which is exactly
+            // what lets a bounded collector stop early
+            // (`TopScoreDocCollector.java:122-124`).  Correctness no longer
+            // depends on this — the bounds below are order-independent — but
+            // without it a reversed list would defeat every early-out.
+            // `id` breaks the remaining tie so the walk is deterministic.
+            let ordered_segments: Vec<&xerj_storage::segment::SegmentMeta> = {
+                let mut v: Vec<&xerj_storage::segment::SegmentMeta> =
+                    snap.segments.iter().collect();
+                v.sort_by(|a, b| {
+                    a.min_seq_no
+                        .cmp(&b.min_seq_no)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                v
+            };
+            for meta in ordered_segments {
                 dbg_segs += 1;
                 // F1: once the exact total is authoritative AND the bounded
                 // collector is full, remaining segments can neither add a
@@ -14548,8 +14775,32 @@ impl Index {
                 // O(N) cost just moves from JSON-parsing to `decode_stored`
                 // over every segment.  This is what turns the whole query into
                 // O(from+size) rather than O(segments·docs_per_segment).
+                //
+                // #191 — this used to be an unconditional `break`, which made
+                // the page "the first `cap` matches in SEGMENT-LIST order".
+                // That list is flush/merge COMPLETION order, not `seq_no`
+                // order: a flush drains each memtable shard into its own
+                // segment, and a merge appends its output at the end.  The
+                // final page sort ties by `seq_no` ASC (ES `_doc`), so with
+                // tied scores a `size:5` page and a `size:1000` page named
+                // different documents.  A segment is now skipped only when it
+                // provably cannot displace a kept hit: every document in it
+                // arrived strictly after the worst kept hit
+                // (`min_seq_no > worst.seq_no`), so on a tie it loses.
+                // Segments that CAN compete are scanned, and the cross-segment
+                // merge at the bottom of the loop re-selects the best `cap` by
+                // the same comparator the final page sort uses.
                 if count_authoritative && all_hits.len() >= materialisation_limit {
-                    break;
+                    if scan_page_worst.is_none() {
+                        scan_page_worst = self.worst_page_key(&all_hits);
+                    }
+                    match scan_page_worst.as_ref() {
+                        Some(w) if meta.min_seq_no > w.1 => continue,
+                        // No key resolvable (empty collector) — keep the
+                        // historical behaviour and stop.
+                        None => break,
+                        Some(_) => {}
+                    }
                 }
                 // Cooperative deadline: stop fanning into further segments
                 // once the request timeout has elapsed — partial results
@@ -14561,6 +14812,23 @@ impl Index {
 
                 let seg_id = meta.id.clone();
                 let fts_dir = segments_dir.clone();
+
+                // #191 — on the count-authoritative stored-scan path each
+                // segment gets its OWN `materialisation_limit` of headroom:
+                // `scan_stored_section_into` stops at
+                // `all_hits.len() >= limit`, so a collector already filled by
+                // an earlier segment would let a genuinely competitive segment
+                // contribute nothing.  Positions inside a segment ARE `seq_no`
+                // order (`drain_for_flush` and the merge both sort by
+                // `seq_no`), so this segment's first `cap` matches are its own
+                // `cap` best; the merge below then re-selects the global best
+                // `cap`.  Peak is 2×cap, trimmed at the bottom of the loop.
+                let scan_limit = if count_authoritative && !count_only && sort_topk.is_none() {
+                    all_hits.len().saturating_add(materialisation_limit)
+                } else {
+                    materialisation_limit
+                };
+                let hits_before_segment = all_hits.len();
 
                 let field_refs: Vec<&str> = fts_open_fields.iter().map(|s| s.as_str()).collect();
                 // `QueryString` is steered by its own flag rather than added
@@ -14901,19 +15169,32 @@ impl Index {
                                 // O(matches) score-sort *inside* `search_bounded`
                                 // is a separate cost governed by `fts_cap`, not by
                                 // this admission walk, and is out of scope here.)
-                                let mut page_worst: Option<f32> = if sort_topk.is_none()
+                                //
+                                // #191 — `page_worst` is the FULL page key
+                                // `(score, seq_no, _id)` of the worst kept hit,
+                                // not just its score.  A score-only bound is
+                                // only sound when the walk visits documents in
+                                // tie-break order, which is what Lucene relies
+                                // on ("Since docs are returned in-order (i.e.,
+                                // increasing doc Id), a document with equal
+                                // score to pqTop.score cannot compete since
+                                // HitQueue favors documents with lower doc Ids"
+                                // — lucene/core/src/java/org/apache/lucene/
+                                // search/TopScoreDocCollector.java:122-124, over
+                                // the `(score, doc)` comparator in
+                                // HitQueue.java:76-82).  XERJ ties by `seq_no`
+                                // (arrival order = ES `_doc`) but walks segments
+                                // in snapshot order and documents in STORED
+                                // LAYOUT order — neither is seq-ascending — so
+                                // an equal-scoring hit met later in the walk can
+                                // still own a smaller `seq_no` and must be
+                                // allowed to compete.
+                                let mut page_worst: Option<(f32, u64, String)> = if sort_topk
+                                    .is_none()
                                     && !count_only
                                     && all_hits.len() >= materialisation_limit
                                 {
-                                    all_hits.iter().map(|h| h.score).fold(
-                                        None,
-                                        |acc: Option<f32>, s| {
-                                            Some(match acc {
-                                                Some(a) if a <= s => a,
-                                                _ => s,
-                                            })
-                                        },
-                                    )
+                                    self.worst_page_key(&all_hits)
                                 } else {
                                     None
                                 };
@@ -14934,12 +15215,31 @@ impl Index {
                                 // segments and drop global sort candidates.  The
                                 // bounded `SortTopK` heap — not this cap — bounds the
                                 // sorted path's memory.
+                                //
+                                // #191 — a segment whose best score BEATS the
+                                // worst kept hit can always contribute.  A
+                                // segment whose best score merely TIES it can
+                                // still contribute, but only through the
+                                // `seq_no` tie-break, and only if it holds a
+                                // document that arrived no later than the worst
+                                // kept hit.  `min_seq_no` decides that in O(1)
+                                // from the segment meta — the same
+                                // later-segment argument `scored_columnar`'s
+                                // `later_min_seq` break already makes — so an
+                                // all-tied corpus does not degrade into opening
+                                // every segment.  A segment written before
+                                // `min_seq_no` was recorded reads back 0, which
+                                // simply makes the gate admit it: correct, just
+                                // not shortcut.
                                 let seg_can_enter = sort_topk.is_some()
                                     || all_hits.len() < materialisation_limit
-                                    || seg_hits
-                                        .first()
-                                        .zip(page_worst)
-                                        .is_some_and(|(sh, worst)| sh.score > worst);
+                                    || seg_hits.first().zip(page_worst.as_ref()).is_some_and(
+                                        |(sh, worst)| {
+                                            sh.score > worst.0
+                                                || (sh.score == worst.0
+                                                    && meta.min_seq_no <= worst.1)
+                                        },
+                                    );
                                 if !fts_sorted_handled
                                     && !count_only
                                     && !seg_hits.is_empty()
@@ -15025,36 +15325,19 @@ impl Index {
                                         // `materialisation_limit` hits seen so far
                                         // by the SAME comparator the final page sort
                                         // uses (score DESC, seq_no ASC, `_id` ASC),
-                                        // and return the surviving worst score (the
-                                        // new cap-th score, = the min of the kept
-                                        // set).  Shared by the in-walk 2×cap eager
-                                        // trim and the end-of-run trim so admission
-                                        // and final ordering always agree.
-                                        let trim_to_cap =
-                                            |hits: Vec<Hit>| -> (Vec<Hit>, Option<f32>) {
-                                                let mut decorated: Vec<(u64, Hit)> = hits
-                                                    .into_iter()
-                                                    .map(|h| {
-                                                        (
-                                                            self.lookup_seq_no(&h.id)
-                                                                .unwrap_or(u64::MAX),
-                                                            h,
-                                                        )
-                                                    })
-                                                    .collect();
-                                                decorated.sort_by(|a, b| {
-                                                    b.1.score
-                                                        .partial_cmp(&a.1.score)
-                                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                                        .then_with(|| a.0.cmp(&b.0))
-                                                        .then_with(|| a.1.id.cmp(&b.1.id))
-                                                });
-                                                decorated.truncate(materialisation_limit);
-                                                let worst = decorated.last().map(|(_, h)| h.score);
-                                                let kept =
-                                                    decorated.into_iter().map(|(_, h)| h).collect();
-                                                (kept, worst)
-                                            };
+                                        // and return the surviving worst PAGE KEY
+                                        // (the new cap-th `(score, seq_no, _id)`,
+                                        // = the last of the kept set under that
+                                        // comparator).  Shared by the in-walk 2×cap
+                                        // eager trim and the end-of-run trim so
+                                        // admission and final ordering always agree.
+                                        #[allow(clippy::type_complexity)]
+                                        let trim_to_cap = |hits: Vec<Hit>| -> (
+                                            Vec<Hit>,
+                                            Option<(f32, u64, String)>,
+                                        ) {
+                                            self.trim_page_to_cap(hits, materialisation_limit)
+                                        };
                                         for sh in &seg_hits {
                                             // `seg_hits` descends by score, so once
                                             // a hit's score is STRICTLY below the
@@ -15083,7 +15366,9 @@ impl Index {
                                             // the sort key, not the highest-scoring
                                             // prefix.
                                             if sort_topk.is_none()
-                                                && page_worst.is_some_and(|worst| sh.score < worst)
+                                                && page_worst
+                                                    .as_ref()
+                                                    .is_some_and(|worst| sh.score < worst.0)
                                             {
                                                 break;
                                             }
@@ -15151,12 +15436,17 @@ impl Index {
                                                 // it exceeds 2×cap, trim back to the
                                                 // best cap by the final comparator
                                                 // and refresh `page_worst` to the new
-                                                // cap-th score.  Between cap and 2×cap
-                                                // no recompute is needed: every hit
-                                                // pushed since the last (re)establish
-                                                // scored `>= page_worst` (it did not
-                                                // break), so the running min — and
-                                                // hence `page_worst` — is unchanged.
+                                                // cap-th key.  Between cap and 2×cap
+                                                // no recompute is needed: `page_worst`
+                                                // is established the instant the
+                                                // collector holds exactly `cap` hits,
+                                                // so it IS the cap-th key at that
+                                                // moment, and every later push can only
+                                                // improve the true cap-th key.  A stale
+                                                // `page_worst` is therefore a WEAKER
+                                                // threshold than the truth — it admits
+                                                // more than strictly necessary, never
+                                                // less, which is the safe direction.
                                                 if all_hits.len() >= materialisation_limit {
                                                     if all_hits.len()
                                                         > materialisation_limit.saturating_mul(2)
@@ -15167,15 +15457,7 @@ impl Index {
                                                         all_hits = kept;
                                                         page_worst = worst;
                                                     } else if page_worst.is_none() {
-                                                        page_worst = all_hits
-                                                            .iter()
-                                                            .map(|h| h.score)
-                                                            .fold(None, |acc: Option<f32>, s| {
-                                                                Some(match acc {
-                                                                    Some(a) if a <= s => a,
-                                                                    _ => s,
-                                                                })
-                                                            });
+                                                        page_worst = self.worst_page_key(&all_hits);
                                                     }
                                                 }
                                             }
@@ -15532,7 +15814,7 @@ impl Index {
                             query,
                             is_match_all,
                             count_only,
-                            materialisation_limit,
+                            scan_limit,
                             count_authoritative,
                             &mut total_count,
                             &mut all_hits,
@@ -15584,7 +15866,7 @@ impl Index {
                                     query,
                                     is_match_all,
                                     count_only,
-                                    materialisation_limit,
+                                    scan_limit,
                                     count_authoritative,
                                     &mut total_count,
                                     &mut all_hits,
@@ -15598,7 +15880,7 @@ impl Index {
                                     query,
                                     is_match_all,
                                     count_only,
-                                    materialisation_limit,
+                                    scan_limit,
                                     count_authoritative,
                                     &mut total_count,
                                     &mut all_hits,
@@ -15681,7 +15963,7 @@ impl Index {
                                     query,
                                     is_match_all,
                                     count_only,
-                                    materialisation_limit,
+                                    scan_limit,
                                     count_authoritative,
                                     &mut total_count,
                                     &mut all_hits,
@@ -15741,6 +16023,42 @@ impl Index {
                             }
                         }
                     }
+                }
+
+                // #191 — cross-segment merge for the stored-scan path.  This
+                // segment was allowed its own `materialisation_limit` of
+                // headroom (see `scan_limit`), so reduce back to the global
+                // best `cap` by the SAME comparator the final page sort uses
+                // (score DESC, `seq_no` ASC, `_id` ASC) and refresh the skip
+                // bound.  Without it the collector kept whichever segment
+                // reached the cap first — segment-list order — rather than the
+                // documents the page sort would pick, so a bounded page and a
+                // full page named different documents whenever scores tied.
+                // Trimmed hits stay in `seen_ids`: the cap-th key only ever
+                // improves, so a document that lost the trim can never become
+                // competitive again.
+                if count_authoritative
+                    && !count_only
+                    && sort_topk.is_none()
+                    && all_hits.len() != hits_before_segment
+                    && all_hits.len() >= materialisation_limit
+                {
+                    let mut decorated: Vec<(u64, Hit)> = std::mem::take(&mut all_hits)
+                        .into_iter()
+                        .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
+                        .collect();
+                    decorated.sort_by(|a, b| {
+                        b.1.score
+                            .partial_cmp(&a.1.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                            .then_with(|| a.1.id.cmp(&b.1.id))
+                    });
+                    decorated.truncate(materialisation_limit);
+                    scan_page_worst = decorated
+                        .last()
+                        .map(|(seq, h)| (h.score, *seq, h.id.clone()));
+                    all_hits = decorated.into_iter().map(|(_, h)| h).collect();
                 }
             }
         }
@@ -16773,7 +17091,7 @@ impl Index {
             let schema = self.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
-                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
         };
@@ -17982,7 +18300,7 @@ fn read_doc_values_sidecar(
 fn build_fts_field_configs(schema: &Schema) -> HashMap<String, xerj_fts::index::FieldIndexConfig> {
     use xerj_fts::index::FieldIndexConfig;
     let mut out = HashMap::new();
-    let excluded = crate::memtable::semantic_derived_vector_fields(schema);
+    let excluded = crate::memtable::fts_excluded_fields(schema);
     for f in &schema.fields {
         if excluded.contains(&f.name) {
             continue;
@@ -23527,7 +23845,7 @@ impl SyncFlushCoord {
         })
     }
 
-    fn semantic_derived_vector_fields(
+    fn fts_excluded_fields(
         &self,
         schema: &Arc<RwLock<ManagedSchema>>,
     ) -> std::collections::HashSet<String> {
@@ -23536,7 +23854,7 @@ impl SyncFlushCoord {
         };
         rt.block_on(async {
             let guard = schema.read().await;
-            crate::memtable::semantic_derived_vector_fields(&guard.schema)
+            crate::memtable::fts_excluded_fields(&guard.schema)
         })
     }
 }
@@ -26948,6 +27266,217 @@ fn lookup_vector_quantization(schema: &Schema, field: &str) -> Option<String> {
     find(&schema.fields, &parts).and_then(|fc| fc.options.quantization.clone())
 }
 
+/// Resolve a (possibly dotted) field path to its declared [`FieldConfig`].
+///
+/// Same walk as `lookup_vector_quantization`: a dotted path descends through
+/// `FieldConfig::fields` (object sub-paths and multi-fields). Returns `None`
+/// for anything the schema does not declare — dynamic fields have no declared
+/// mapping options to honour.
+fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig> {
+    fn find<'a>(fields: &'a [FieldConfig], path: &[&str]) -> Option<&'a FieldConfig> {
+        let head = *path.first()?;
+        let tail = &path[1..];
+        for fc in fields {
+            if fc.name == head {
+                if tail.is_empty() {
+                    return Some(fc);
+                }
+                return find(&fc.fields, tail);
+            }
+        }
+        None
+    }
+    find(&schema.fields, &field.split('.').collect::<Vec<_>>())
+}
+
+/// The first field in `q` that the mapping has made completely unsearchable.
+///
+/// A field is unsearchable when its mapping declares BOTH `"index": false`
+/// (no postings) and no doc values (nothing to scan instead) — for example
+/// `{"type": "text", "index": false}`, since `text` has no doc values by
+/// default. ES rejects every query naming such a field with
+/// `IllegalArgumentException: Cannot search on field [f] since it is not
+/// indexed nor has doc values.`, which its shard query builder wraps as a
+/// `query_shard_exception` inside a 400 `search_phase_execution_exception`.
+/// XERJ's `XerjError::InvalidQuery` + the `failed to create query:` prefix
+/// reproduce exactly that envelope (see `xerj-api/src/error.rs`).
+///
+/// `index: false` WITH doc values is *not* unsearchable: ES 8.1 added "doc
+/// values search" and answers term/terms/range/prefix/wildcard/regexp/fuzzy
+/// from the doc-values column instead (the whole of
+/// `search/390_doc_values_search.yml`). Those queries keep working here too,
+/// unchanged: such a field keeps its whole-value postings, because they are
+/// what answers it *exactly* — see `memtable::fts_excluded_fields`.
+///
+/// The multi-field query types (`multi_match`, `simple_query_string`,
+/// `query_string`) follow ES's own split, not a blanket rule: an
+/// explicitly *named* field is kept whatever its type and left to fail in the
+/// per-field builder, while a *wildcard* spec silently drops the fields that
+/// are not searchable (`acceptAllTypes = isSimpleMatchPattern(spec) == false`
+/// in `server/src/main/java/org/elasticsearch/index/search/QueryParserHelper.java:115-150`,
+/// read for semantics only — ES is AGPL/SSPL/Elastic-2.0 and no code from it
+/// is reproduced here). So a named `fields: ["note"]` is rejected exactly like
+/// `match` on `note`, and a pattern spec is never an error. Without this, the
+/// same user intent got two different answers: `simple_query_string
+/// {"fields":["note"]}` and `query_string {"default_field":"note"}` already
+/// 400ed because the parser lowers a single-field form to `Match`, while
+/// `multi_match {"fields":["note"]}` — and either of those with two fields —
+/// returned the document *through* the unsearchable field.
+///
+/// `query_string`'s `fields` array reaches these arms only because the parser
+/// now reads it (`parser::parse_query_string`); until then the key was
+/// accepted and ignored, so `{"fields":["note"]}` searched everything and
+/// disagreed with `{"default_field":"note"}`. An unqualified clause is now
+/// lowered onto those fields (a `dis_max` when there is more than one), which
+/// is what brings it here. One residue is left, and is not claimed shut: a
+/// query string this parser declines to lower (an unterminated quote, say)
+/// falls back to the opaque `QueryString` node, where a one-element `fields`
+/// is carried across as `default_field` and a longer list is not represented
+/// at all.
+///
+/// `more_like_this` needs no arm here: with an explicit `fields` list the
+/// parser lowers it to a `bool.should` of `match` clauses, which the leaf arms
+/// already reject (measured: `fields: ["note"]` and `["note","body"]` both
+/// 400). Without one it stays a `MoreLikeThis` node, which is the field-less
+/// gap below.
+///
+/// One gap remains open here, stated rather than papered over. The FTS route
+/// no longer projects a clause onto an unsearchable field
+/// (`text_fields`/`exact_fields` in `search_inner` apply ES's `isSearchable()`
+/// rule — measured: `multi_match {"fields":["*","body"]}` finds nothing in an
+/// unsearchable `note`), but the stored-doc scan's FIELD-LESS arms are
+/// schema-free: they walk every non-`_` key of `_source`, so a token living
+/// only in an unsearchable field still matches when no field is named at all.
+/// `query_string {"query": "…"}` and a `more_like_this` with no `fields` both
+/// still return the document — and so does a *wildcard* spec in
+/// `query_string` / `simple_query_string`, because `fields: ["*"]` lowers to
+/// that same field-less `"*"` placeholder rather than to an expansion over the
+/// searchable fields. Measured, not assumed. That divergence from the FTS
+/// projection predates this change and is called out in its own comment in
+/// `doc_matches_query`; making it schema-aware means threading a schema
+/// through ~79 call sites and is left as its own change.
+///
+/// Also not covered, and not claimed: aggregation and sort field targets. Only
+/// `request.query` reaches this function; `request.aggs` is opaque JSON at this
+/// layer, and both `{"aggs":{"a":{"terms":{"field":"note"}}}}` and
+/// `{"sort":[{"note":"asc"}]}` still answer 200 (measured). ES rejects those
+/// too, but for an unrelated reason with an unrelated sentence
+/// (`Fielddata is disabled on [f] in [i]…`,
+/// `server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java:1534-1546`)
+/// which it raises whether or not `index: false` was declared — a wider
+/// divergence than this change, and one this error message would misreport.
+///
+/// And one surface never reaches this function at all: `_validate/query`
+/// (`xerj-api/src/es_compat.rs::validate_query`) answers from the parse alone
+/// and never opens the index, so it still reports `{"valid": true}` for a body
+/// `_search` refuses. That is its behaviour on `main` too — this change did
+/// not alter it — but it now disagrees with `_search`, so it is written down
+/// here and in the CHANGELOG instead of being left to surprise someone.
+fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
+    let check = |field: &str| -> Option<String> {
+        let fc = declared_field(schema, field)?;
+        (!fc.options.indexed && !fc.options.doc_values).then(|| field.to_string())
+    };
+    // One entry of a `fields: [...]` list. `"title^3"` carries a boost;
+    // `"*"` / `"body.*"` is a pattern, which ES expands over searchable
+    // fields only and therefore must never be an error.
+    let check_spec = |spec: &String| -> Option<String> {
+        let (name, _boost) = parse_field_boost(spec);
+        if name.contains('*') {
+            return None;
+        }
+        check(name)
+    };
+    match q {
+        // ── Leaves that name exactly one field ────────────────────────────
+        QueryNode::Term { field, .. }
+        | QueryNode::Terms { field, .. }
+        | QueryNode::Range { field, .. }
+        | QueryNode::Prefix { field, .. }
+        | QueryNode::Wildcard { field, .. }
+        | QueryNode::Match { field, .. }
+        | QueryNode::MatchPhrase { field, .. }
+        | QueryNode::MatchPhrasePrefix { field, .. }
+        | QueryNode::Fuzzy { field, .. }
+        | QueryNode::Regexp { field, .. }
+        | QueryNode::Intervals { field, .. }
+        | QueryNode::SpanTerm { field, .. }
+        | QueryNode::GeoDistance { field, .. }
+        | QueryNode::GeoBoundingBox { field, .. }
+        | QueryNode::GeoPolygon { field, .. }
+        | QueryNode::GeoShape { field, .. } => check(field),
+
+        // ── Multi-field types: named fields fail, patterns expand ─────────
+        // ES's split as a rule, not as code (see this function's doc
+        // comment). `simple_query_string` with 2+ fields lowers to
+        // `MultiMatch` in the parser, so this covers that too, as well as
+        // `combined_fields`, which is rewritten to `multi_match:
+        // cross_fields`.
+        QueryNode::MultiMatch { fields, .. } => fields.iter().find_map(check_spec),
+        QueryNode::SimpleQueryString { fields, .. } => fields.iter().find_map(check_spec),
+        QueryNode::QueryString {
+            default_field: Some(f),
+            ..
+        } => check_spec(f),
+
+        // `exists` is NOT an error in ES: an unsearchable field is simply
+        // absent from `_field_names`, so the clause matches nothing. The
+        // API layer already rewrites it to `match_none`
+        // (`es_compat::rewrite_unqueryable_exists`).
+        QueryNode::Exists { .. } => None,
+
+        // ── Composites: recurse ───────────────────────────────────────────
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .find_map(|c| unsearchable_query_field(c, schema)),
+        QueryNode::Constant { query, .. }
+        | QueryNode::Boosted { query, .. }
+        | QueryNode::Named { query, .. }
+        | QueryNode::Nested { query, .. }
+        | QueryNode::FunctionScore { query, .. } => unsearchable_query_field(query, schema),
+        QueryNode::Pinned { organic, .. } => unsearchable_query_field(organic, schema),
+        QueryNode::Boosting {
+            positive, negative, ..
+        } => unsearchable_query_field(positive, schema)
+            .or_else(|| unsearchable_query_field(negative, schema)),
+        QueryNode::DisMax { queries, .. } => queries
+            .iter()
+            .find_map(|c| unsearchable_query_field(c, schema)),
+        QueryNode::Hybrid { queries, .. } => queries
+            .iter()
+            .find_map(|wq| unsearchable_query_field(&wq.query, schema)),
+        QueryNode::Knn { filter, .. } | QueryNode::SemanticSearch { filter, .. } => filter
+            .as_ref()
+            .and_then(|f| unsearchable_query_field(f, schema)),
+        QueryNode::SpanNear { clauses, .. } | QueryNode::SpanOr { clauses } => clauses
+            .iter()
+            .find_map(|c| unsearchable_query_field(c, schema)),
+        QueryNode::SpanNot { include, exclude } => unsearchable_query_field(include, schema)
+            .or_else(|| unsearchable_query_field(exclude, schema)),
+        QueryNode::SpanFirst { match_query, .. } => unsearchable_query_field(match_query, schema),
+        QueryNode::SpanContaining { little, big } | QueryNode::SpanWithin { little, big } => {
+            unsearchable_query_field(little, schema)
+                .or_else(|| unsearchable_query_field(big, schema))
+        }
+
+        // Everything else names no mapped data field to validate:
+        // MatchAll/MatchNone/Ids/Script, a field-less `query_string`, a
+        // field-less `more_like_this` (with `fields` the parser lowers it to
+        // `bool.should` of `match`, which the leaf arms above catch), and
+        // `percolate` (the field holds stored queries, not data).
+        _ => None,
+    }
+}
+
 /// Rewrite a query by resolving any field aliases to their canonical field names.
 ///
 /// Traverses the query tree, replacing alias field names with their target paths.
@@ -27150,10 +27679,12 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             field,
             query,
             max_expansions,
+            slop,
         } => QueryNode::MatchPhrasePrefix {
             field: strip(field),
             query: query.clone(),
             max_expansions: *max_expansions,
+            slop: *slop,
         },
         QueryNode::Fuzzy {
             field,
@@ -27175,6 +27706,8 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             operator,
             analyzer,
             boost,
+            slop,
+            max_expansions,
         } => QueryNode::MultiMatch {
             fields: fields.iter().map(|f| strip(f)).collect(),
             query: query.clone(),
@@ -27182,6 +27715,8 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             operator: *operator,
             analyzer: analyzer.clone(),
             boost: *boost,
+            slop: *slop,
+            max_expansions: *max_expansions,
         },
         QueryNode::GeoDistance {
             field,
@@ -28222,6 +28757,205 @@ fn geo_coord(v: &Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+/// The analyzed token stream the stored-doc evaluator treats as "positions".
+///
+/// It runs the **standard analyzer** — the same pipeline the indexing path
+/// and `query_node_to_fts` use — so the stored-scan/memtable evaluator and
+/// the positional segment clause answer the same query. The analyzer drops
+/// punctuation and lowercases, so `merge, policy` yields `[merge, policy]`
+/// — two ADJACENT positions, which is why a positional phrase matches it
+/// and raw-substring containment does not (issue #230).
+///
+/// It must not be hand-rolled. An earlier revision of this fix split on
+/// `!char::is_alphanumeric()`, which is NOT the standard tokenizer:
+/// UAX#29 (`unicode_words()`) keeps intra-word `.`, `'` and `_` inside one
+/// word, so `3.14`, `don't` and `foo_bar` are ONE term each on the segment
+/// side but two or three under the split. Measured at that revision, with an
+/// explicit `_flush` between the two probes of one index:
+///
+/// | query (`multi_match`, `type: phrase`) | doc | pre-flush | post-flush |
+/// |---|---|---|---|
+/// | `"release 3"` | `release 3.14 notes here` | hit | miss |
+/// | `"don t"`     | `we don't stop now`       | hit | miss |
+/// | `"foo bar"`   | `the foo_bar baz`         | hit | miss |
+///
+/// — a flush-variant hit set, the regression class #218/#222 removed and
+/// that issue #230 names as the standing invariant; and the pre-flush answer
+/// was also the wrong one (ES's standard analyzer keeps `don't` whole).
+///
+/// Callers pass field text that upstream has already lowercased; the
+/// pipeline's lowercase filter is idempotent, so that is harmless.
+fn phrase_tokens(text: &str) -> Vec<String> {
+    static STANDARD: std::sync::OnceLock<std::sync::Arc<xerj_fts::analyzer::AnalyzerPipeline>> =
+        std::sync::OnceLock::new();
+    STANDARD
+        .get_or_init(|| AnalyzerRegistry::default().standard())
+        .analyze_to_terms(text)
+}
+
+/// True when `query_tokens` occur in `field_tokens` in order with at most
+/// `slop` intervening positions in total — the stored-scan twin of
+/// `xerj_fts::search`'s `phrase_positions_match`, which evaluates the same
+/// predicate over the segment's real term positions.
+///
+/// `slop == 0` is exact adjacency (a window compare); `slop > 0` anchors on
+/// EVERY occurrence of the first term and walks each later term to its
+/// earliest position after the previous match, summing the gaps — the same
+/// greedy walk `phrase_positions_match` runs over segment positions.
+///
+/// Anchoring on every occurrence is load-bearing: the previous stored-scan
+/// walk anchored only on the FIRST occurrence of the leading term, so
+/// `[a, x, x, x, a, b]` rejected the slop-1 phrase `a b` that both ES and
+/// the segment path accept (anchor at the second `a`).
+fn phrase_positions_in_tokens(field_tokens: &[String], query_tokens: &[String], slop: u32) -> bool {
+    phrase_walk(field_tokens, query_tokens, slop, false)
+}
+
+/// The one positional walk behind both `phrase_positions_in_tokens` and
+/// `phrase_prefix_positions_in_tokens`. `last_is_prefix` makes the FINAL
+/// query token match by `starts_with` instead of equality, which is exactly
+/// what the segment side computes: `execute_phrase_prefix` expands the
+/// trailing prefix against the term dictionary and unions one sloppy phrase
+/// query per expansion, and "some expansion term sits here" is the same
+/// predicate as "this token starts with the prefix".
+///
+/// Keeping one walk (rather than two look-alike ones) is deliberate: the
+/// two evaluators must not be able to drift apart the way the slop-0-only
+/// prefix walk had already drifted from the sloppy phrase walk.
+///
+/// KNOWN DIVERGENCE FROM ES, not closed by #230: this walk is **in-order
+/// only**.  Lucene's sloppy phrase admits a transposition at a distance
+/// cost — its own javadoc: «for query "a b"~2, a document "x a b a y" can
+/// be matched twice: once for "a b" (distance=0), and once for "b a"
+/// (distance=2)» (`lucene/core/.../search/SloppyPhraseMatcher.java`, class
+/// javadoc; Apache-2.0) — so ES answers `match_phrase {"query": "policy
+/// merge", "slop": 2}` on a document reading `merge policy`, and XERJ
+/// answers it with zero hits.  That is the pre-existing semantics of
+/// `xerj_fts::search::phrase_positions_match`, which the segment side has
+/// always used and which this walk deliberately mirrors: matching ES here
+/// means changing BOTH evaluators together, and mirroring the existing one
+/// is what keeps the hit set flush-invariant today.  Measured, not assumed
+/// (5-doc index, `"policy merge"` slop 2 and slop 3 → `[]` in both states).
+fn phrase_walk(
+    field_tokens: &[String],
+    query_tokens: &[String],
+    slop: u32,
+    last_is_prefix: bool,
+) -> bool {
+    if query_tokens.is_empty() {
+        return true;
+    }
+    if query_tokens.len() > field_tokens.len() {
+        return false;
+    }
+    let n = query_tokens.len();
+    let matches_at = |idx: usize, qi: usize| -> bool {
+        let ft = &field_tokens[idx];
+        if last_is_prefix && qi == n - 1 {
+            ft.starts_with(query_tokens[qi].as_str())
+        } else {
+            ft == &query_tokens[qi]
+        }
+    };
+    // Exact-adjacency fast path for the whole-term case (the common one).
+    if slop == 0 && !last_is_prefix {
+        return field_tokens.windows(n).any(|w| w == query_tokens);
+    }
+    for start in 0..field_tokens.len() {
+        if !matches_at(start, 0) {
+            continue;
+        }
+        let mut current = start;
+        let mut total_gaps: u32 = 0;
+        let mut ok = true;
+        for qi in 1..n {
+            // Earliest match after `current` minimises the running gap sum,
+            // so the greedy walk is optimal for an in-order phrase — the
+            // same walk `xerj_fts::search::phrase_positions_match` runs over
+            // segment positions.
+            match (current + 1..field_tokens.len()).find(|&i| matches_at(i, qi)) {
+                Some(next) => {
+                    total_gaps += (next - current - 1) as u32;
+                    if total_gaps > slop {
+                        ok = false;
+                        break;
+                    }
+                    current = next;
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the leading `query_tokens[..n-1]` form an in-order phrase whose
+/// next position starts with `query_tokens[n-1]`, with at most `slop`
+/// intervening positions in total — ES `match_phrase_prefix` semantics over
+/// the token stream. A single token degrades to "any token starts with it".
+///
+/// This is TERM-level, not substring-level: `merge poli` matches the token
+/// stream `[merge, policy]` (so it matches raw text `merge, policy` too),
+/// while `merge polic` does NOT satisfy the exact-phrase variant, because
+/// `polic` is not the term `policy`.
+///
+/// `slop` spans the whole phrase, trailing prefix term included — the same
+/// thing ES's `MultiPhrasePrefixQuery.setSlop` does and the same thing
+/// `execute_phrase_prefix` now does by carrying `PhrasePrefixQuery.slop`
+/// into each expansion's phrase query.
+fn phrase_prefix_positions_in_tokens(
+    field_tokens: &[String],
+    query_tokens: &[String],
+    slop: u32,
+) -> bool {
+    phrase_walk(field_tokens, query_tokens, slop, true)
+}
+
+/// Per-field phrase predicate for the phrase-shaped `multi_match` types,
+/// shared by the membership (`doc_matches_query`) and scoring
+/// (`score_query_against_doc`) arms so an admitted doc can never score 0.
+///
+/// `phrase_prefix` treats the trailing token as a prefix; `phrase` requires
+/// whole terms. Both honour `slop`, as ES does for both types.
+///
+/// `query_tokens` MUST come from `phrase_tokens` (the standard analyzer),
+/// not from a hand-rolled split: `3.14` is one analyzed term and two split
+/// ones, so a split query and an analyzed segment clause ask different
+/// questions and the hit set changes at `_flush`.
+///
+/// `field_text_lc` is the field's text as the rest of the `multi_match` arms
+/// see it — an array-valued field arrives already joined with a space.
+/// That means a phrase CAN span two array elements, which ES prevents with a
+/// `position_increment_gap`. XERJ has no such gap anywhere: the indexing
+/// path flattens an array to one space-joined string before the FTS layer
+/// ever sees it (`extract_field_text`), so the segment's positions have no
+/// gap either. Evaluating per element here would therefore FIX the memtable
+/// and leave the segment as it is — reintroducing the flush-variant hit set
+/// this fix exists to remove. The gap belongs in the indexing path; it is
+/// deliberately not attempted here.
+fn multi_match_phrase_hit(
+    field_text_lc: &str,
+    query_tokens: &[String],
+    is_prefix: bool,
+    slop: u32,
+) -> bool {
+    if query_tokens.is_empty() {
+        return true;
+    }
+    let field_tokens = phrase_tokens(field_text_lc);
+    if is_prefix {
+        phrase_prefix_positions_in_tokens(&field_tokens, query_tokens, slop)
+    } else {
+        phrase_positions_in_tokens(&field_tokens, query_tokens, slop)
+    }
+}
+
 /// Evaluate a query against a single stored document source value.
 ///
 /// Returns true if the document matches the query.
@@ -28745,7 +29479,7 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
         // operator and match_type. `operator: and` + `cross_fields` (used
         // by `combined_fields`) requires every query token to appear in
         // at least one of the listed fields. The default (operator: or)
-        // admits the hit when any query substring hits any field.
+        // admits the hit when any query token equals a token of one field.
         //
         // Field specs may carry a boost factor (`"title^3"`); strip it for matching.
         QueryNode::MultiMatch {
@@ -28753,6 +29487,7 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
             query,
             match_type,
             operator,
+            slop,
             ..
         } => {
             let q_lower = query.to_lowercase();
@@ -28767,7 +29502,20 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                 xerj_query::ast::MultiMatchType::Phrase
                     | xerj_query::ast::MultiMatchType::PhrasePrefix
             );
+            let is_phrase_prefix =
+                matches!(match_type, xerj_query::ast::MultiMatchType::PhrasePrefix);
             let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
+            // The phrase arms need ANALYZER tokens, not the alphanumeric
+            // split above: `query_node_to_fts` builds the segment clause
+            // from `analyzer.analyze(query)`, and `3.14` is one analyzed
+            // term but two split ones. Only the phrase arms switch — the
+            // cross_fields / AND / OR arms below intentionally keep the
+            // split, which is what they have always matched with.
+            let phrase_q_tokens: Vec<String> = if is_phrase {
+                phrase_tokens(query)
+            } else {
+                Vec::new()
+            };
             let field_texts: Vec<String> = fields
                 .iter()
                 .filter_map(|field_spec| {
@@ -28793,7 +29541,36 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                     }
                 })
                 .collect();
-            if is_cross && is_and && !tokens.is_empty() {
+            if is_phrase && !phrase_q_tokens.is_empty() {
+                // phrase / phrase_prefix: POSITIONAL, per field (issue
+                // #230). ES lowers these types to a dis_max over per-field
+                // `match_phrase`/`match_phrase_prefix`, so the predicate is
+                // the same positional walk `MatchPhrase` uses — the query
+                // terms must occur in order in ONE field's analyzed token
+                // stream, within `slop` intervening positions (0 = exact
+                // adjacency), the trailing term treated as a prefix for
+                // `phrase_prefix`.
+                //
+                // Pre-fix this branch was `ft.contains(&q_lower)` — raw
+                // lowercase substring containment, which both UNDER-matched
+                // (`"merge policy"` missed the doc `merge, policy`, whose
+                // analyzed terms are adjacent) and OVER-matched (`"merge
+                // polic"` matched `merge policy`, where no such term
+                // exists). The hit set stays flush-invariant because the
+                // segment either evaluates the SAME positions via
+                // `FtsQuery::Phrase` (type `phrase`, same standard-analyzer
+                // token stream on both sides) or declines the projection
+                // and runs this very predicate (type `phrase_prefix`).
+                //
+                // Tested FIRST, ahead of the operator branches: `operator`
+                // is meaningless for a phrase in ES (its phrase parser never
+                // consults it), and pre-fix `{"type":"phrase","operator":
+                // "and"}` fell into the token-AND branch below and silently
+                // stopped being a phrase at all.
+                field_texts
+                    .iter()
+                    .any(|ft| multi_match_phrase_hit(ft, &phrase_q_tokens, is_phrase_prefix, *slop))
+            } else if is_cross && is_and && !tokens.is_empty() {
                 // cross_fields + operator AND: every token must appear in
                 // at least one listed field (combined perspective).
                 let combined = field_texts.join(" ");
@@ -28826,13 +29603,10 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                         .collect();
                     tokens.iter().all(|t| ft_tokens.contains(t.as_str()))
                 })
-            } else if is_phrase || tokens.is_empty() {
-                // phrase / phrase_prefix: the whole query must appear
-                // contiguously — substring approximation of phrase
-                // matching, shared with the segment path (whose FTS
-                // projection declines these types, so BOTH states evaluate
-                // this predicate and the hit set is flush-invariant). Also
-                // the fallback when the query has no alphanumeric tokens.
+            } else if tokens.is_empty() {
+                // No alphanumeric tokens at all (e.g. a punctuation-only
+                // query): the analyzer yields nothing, so fall back to raw
+                // containment rather than admitting every document.
                 field_texts.iter().any(|ft| ft.contains(&q_lower))
             } else {
                 // best_fields / most_fields with the default operator (OR,
@@ -28881,58 +29655,22 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
             // `match_phrase`/`match_phrase_prefix`): that fix stops the
             // crash on `{query: true}`, but without this one the
             // (now-valid) query still silently matched 0 documents.
+            //
+            // The positional walk itself lives in
+            // `phrase_positions_in_tokens` so the `multi_match` phrase arm
+            // evaluates the SAME predicate (issue #230) instead of its own
+            // substring approximation.
             fn matches_scalar(v: &Value, query_tokens: &[String], slop: u32) -> Option<bool> {
                 let s = match v {
                     Value::String(s) => s.clone(),
                     Value::Bool(_) | Value::Number(_) => v.to_string(),
                     _ => return None,
                 };
-                let field_tokens: Vec<String> = s
-                    .to_lowercase()
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if query_tokens.is_empty() {
-                    return Some(true);
-                }
-                if query_tokens.len() > field_tokens.len() {
-                    return Some(false);
-                }
-                // slop=0: exact contiguous phrase match in order.
-                if slop == 0 {
-                    let found = field_tokens
-                        .windows(query_tokens.len())
-                        .any(|w| w == query_tokens);
-                    return Some(found);
-                }
-                // slop>0: ES enforces in-order positions with at most
-                // `slop` intervening tokens between adjacent query tokens.
-                // Find each query token AFTER the previous one and sum the
-                // gaps.
-                let mut last_pos: Option<usize> = None;
-                let mut total_gaps: i64 = 0;
-                let mut ordered_ok = true;
-                for qt in query_tokens {
-                    let search_start = last_pos.map(|p| p + 1).unwrap_or(0);
-                    match field_tokens[search_start..]
-                        .iter()
-                        .position(|ft| ft == qt)
-                        .map(|off| search_start + off)
-                    {
-                        Some(pos) => {
-                            if let Some(prev) = last_pos {
-                                total_gaps += (pos as i64 - prev as i64 - 1).max(0);
-                            }
-                            last_pos = Some(pos);
-                        }
-                        None => {
-                            ordered_ok = false;
-                            break;
-                        }
-                    }
-                }
-                Some(ordered_ok && total_gaps <= slop as i64)
+                Some(phrase_positions_in_tokens(
+                    &phrase_tokens(&s),
+                    query_tokens,
+                    slop,
+                ))
             }
             get_field_value(source, field)
                 .and_then(|v| match &v {
@@ -29048,41 +29786,30 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                 .unwrap_or(false)
         }
 
-        QueryNode::MatchPhrasePrefix { field, query, .. } => {
-            fn matches_str(s: &str, query: &str) -> Option<bool> {
-                let tokens: Vec<&str> = query.split_whitespace().collect();
-                if tokens.is_empty() {
+        QueryNode::MatchPhrasePrefix {
+            field, query, slop, ..
+        } => {
+            // POSITIONAL, not substring (issue #230). Pre-fix this arm found
+            // the head phrase as a raw substring (`s_lower.find(head)`) and
+            // required the prefix to follow it in the raw text — so
+            // punctuation INSIDE the phrase (`merge, policy`) defeated it,
+            // while the segment path (`FtsQuery::PhrasePrefix`) matched over
+            // the analyzed positions. The two states disagreed at `_flush`.
+            // Both now walk the same analyzed token stream.
+            fn matches_str(s: &str, query: &str, slop: u32) -> Option<bool> {
+                let query_tokens = phrase_tokens(query);
+                if query_tokens.is_empty() {
                     return Some(true);
                 }
-                let s_lower = s.to_lowercase();
-                let (prefix, exact_tokens) = match tokens.split_last() {
-                    Some(pair) => pair,
-                    None => return Some(true),
-                };
-                // All tokens except the last must appear as an ordered substring.
-                // Last token is a prefix match.
-                let phrase_without_last = exact_tokens.join(" ").to_lowercase();
-                let last_lower = prefix.to_lowercase();
-                if exact_tokens.is_empty() {
-                    // Only one token — prefix match on the whole query.
-                    Some(
-                        s_lower
-                            .split_whitespace()
-                            .any(|w| w.starts_with(last_lower.as_str())),
-                    )
-                } else {
-                    // Multi-token: check phrase prefix.
-                    if let Some(pos) = s_lower.find(&phrase_without_last) {
-                        let after = &s_lower[pos + phrase_without_last.len()..].trim_start();
-                        Some(after.starts_with(last_lower.as_str()))
-                    } else {
-                        Some(false)
-                    }
-                }
+                Some(phrase_prefix_positions_in_tokens(
+                    &phrase_tokens(s),
+                    &query_tokens,
+                    slop,
+                ))
             }
             get_field_value(source, field)
                 .and_then(|v| match &v {
-                    Value::String(s) => matches_str(s, query),
+                    Value::String(s) => matches_str(s, query, *slop),
                     // Multi-valued field: ES matches if ANY element
                     // satisfies the phrase-prefix — pre-fix this arm only
                     // handled a scalar string, so a `match_phrase_prefix`
@@ -29092,7 +29819,7 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                     Value::Array(arr) => {
                         if arr.iter().any(|e| {
                             e.as_str()
-                                .and_then(|s| matches_str(s, query))
+                                .and_then(|s| matches_str(s, query, *slop))
                                 .unwrap_or(false)
                         }) {
                             Some(true)
@@ -30517,6 +31244,7 @@ fn score_query_against_doc(q: &QueryNode, source: &Value) -> f32 {
             boost,
             match_type,
             operator,
+            slop,
             ..
         } => {
             let q_lower = query.to_lowercase();
@@ -30527,20 +31255,40 @@ fn score_query_against_doc(q: &QueryNode, source: &Value) -> f32 {
                 xerj_query::ast::MultiMatchType::Phrase
                     | xerj_query::ast::MultiMatchType::PhrasePrefix
             );
+            let is_phrase_prefix =
+                matches!(match_type, xerj_query::ast::MultiMatchType::PhrasePrefix);
             let is_and = matches!(operator, Some(xerj_query::ast::BoolOperator::And));
             // Per-field hit test mirroring `doc_matches_query` (issue #218):
-            // token-level OR by default / AND on request; phrase types keep
-            // whole-query substring containment. Pre-fix this arm tested
-            // `contains(whole query)`, so a memtable doc admitted by the
-            // membership check could still score 0.0 and be dropped by
-            // scored paths / rescore.
+            // token-level OR by default / AND on request; phrase types run
+            // the same POSITIONAL predicate the membership arm uses (issue
+            // #230 — this copy used to test whole-query substring
+            // containment). Pre-fix this arm tested `contains(whole query)`,
+            // so a memtable doc admitted by the membership check could still
+            // score 0.0 and be dropped by scored paths / rescore.
             let q_tokens: Vec<String> = q_lower
                 .split(|c: char| !c.is_alphanumeric())
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
                 .collect();
+            // Phrase arms tokenize with the ANALYZER, matching both
+            // `doc_matches_query` and the segment clause built by
+            // `query_node_to_fts` — see `phrase_tokens`. The non-phrase arms
+            // keep `q_tokens` (the alphanumeric split) unchanged.
+            let phrase_q_tokens: Vec<String> = if is_phrase {
+                phrase_tokens(query)
+            } else {
+                Vec::new()
+            };
             let field_hit = |text_lc: &str| -> bool {
-                if is_phrase || q_tokens.is_empty() {
+                if is_phrase && !phrase_q_tokens.is_empty() {
+                    return multi_match_phrase_hit(
+                        text_lc,
+                        &phrase_q_tokens,
+                        is_phrase_prefix,
+                        *slop,
+                    );
+                }
+                if q_tokens.is_empty() {
                     return text_lc.contains(&q_lower);
                 }
                 let ft_tokens: std::collections::HashSet<&str> = text_lc
@@ -32908,26 +33656,31 @@ fn query_node_to_fts(
             match_type,
             operator,
             boost,
-            ..
+            slop,
+            // Unused HERE on purpose: `phrase_prefix` declines the
+            // projection (see below), so nothing in this function expands a
+            // prefix and nothing needs the bound.
+            max_expansions: _,
+            analyzer,
         } => {
-            // The memtable evaluator (`doc_matches_query`) gives phrase /
-            // phrase_prefix multi_match whole-query-containment semantics,
-            // which is not expressible as this per-field token bool —
-            // projecting them as an OR over tokens made the segment path
-            // OVER-match (the reverse of issue #218's memtable under-match:
-            // a reversed phrase started matching at _flush).
-            // Decline the projection instead; the stored-doc scan then
-            // evaluates the same `doc_matches_query` predicate the memtable
-            // uses, keeping the matched set flush-invariant.
-            // (cross_fields + `operator: and` is declined too — see the
+            // phrase is POSITIONAL (issue #230): it lowers to one positional
+            // clause per field, combined by dis_max — the
+            // shape ES builds (`MultiMatchQueryParser.buildFieldQueries` +
+            // `combineGrouped` → `DisjunctionMaxQuery`, tie_breaker 0.0 for
+            // both phrase types; AGPL, read for semantics only, no code
+            // copied).  This used to `return None`, which forced an O(N)
+            // stored-doc scan per segment AND left the (substring) memtable
+            // predicate as the definition of "phrase".
+            // (cross_fields + `operator: and` is still declined — see the
             // `is_and` guard below, which needs the analyzed token count.)
-            if matches!(
+            let is_phrase_type = matches!(
                 match_type,
                 xerj_query::ast::MultiMatchType::Phrase
                     | xerj_query::ast::MultiMatchType::PhrasePrefix
-            ) {
-                return None;
-            }
+            );
+            let is_phrase_prefix =
+                matches!(match_type, xerj_query::ast::MultiMatchType::PhrasePrefix);
+            let query_analyzer_name = analyzer.as_deref();
             let registry = AnalyzerRegistry::default();
             let analyzer = registry.get_analyzer("standard")?;
             let tokens = analyzer.analyze(query);
@@ -32966,6 +33719,86 @@ fn query_node_to_fts(
             // MultiMatch), which finds no such fields in any document.
             if field_specs.is_empty() {
                 return None;
+            }
+            // ── phrase: one positional clause per field ──
+            if is_phrase_type {
+                // `phrase_prefix` deliberately keeps the DECLINED /
+                // stored-scan routing it has on `main`. The segment clause
+                // (`FtsQuery::PhrasePrefix`) bounds the trailing prefix to
+                // `max_expansions` terms taken from the field's term
+                // dictionary; the stored-doc walk has no term dictionary and
+                // uses an unbounded `starts_with`. Projecting it therefore
+                // makes the hit set change at `_flush` — measured on one
+                // index: `{type: phrase_prefix, query: "merge pol",
+                // max_expansions: 1}` returned 5 docs in the memtable and 4
+                // after `_flush`. That is the #218 regression class, and
+                // #230 names flush invariance as the standing invariant, so
+                // the invariant wins over the projection. Consequence,
+                // stated plainly: `max_expansions` does not bind on
+                // `multi_match` (it never did on `main` either — the
+                // parameter was dropped in the parser), and phrase_prefix
+                // keeps the O(N) stored scan. `phrase` — where the measured
+                // 5.7× win is — still projects.
+                if is_phrase_prefix {
+                    return None;
+                }
+                let terms: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
+                // Every listed field must be an ANALYZED TEXT field with a
+                // positions side-car, and the query must analyze to at least
+                // one term, or the projection is declined WHOLE and the
+                // stored-doc scan — which now evaluates the same positional
+                // predicate — answers instead. Three reasons to bail:
+                //   * a keyword/exact field indexes ONE case-preserved
+                //     whole-value term, which the schema-blind stored-scan
+                //     evaluator (it tokenizes every field) cannot model — a
+                //     Term projection there would change the hit set at
+                //     `_flush`, the exact regression class of #218;
+                //   * a dotted multi-field path (`title.raw`) or a non-text
+                //     mapped type has no positions to intersect;
+                //   * a non-standard query `analyzer` produces terms this
+                //     projection does not reproduce (the `match_phrase` arm
+                //     declines on the same condition).
+                // Dropping just the offending field instead would shrink the
+                // disjunction and under-match.
+                if terms.is_empty()
+                    || !matches!(query_analyzer_name, None | Some("standard"))
+                    || field_specs.iter().any(|(f, _)| {
+                        exact_fields.contains(f.as_str()) || !text_fields.iter().any(|t| t == f)
+                    })
+                {
+                    return None;
+                }
+                let outer = boost.unwrap_or(1.0);
+                let mut per_field: Vec<FtsQuery> = Vec::with_capacity(field_specs.len());
+                for (field, fb) in &field_specs {
+                    per_field.push(if terms.len() == 1 {
+                        // A one-term phrase is just a term query — and scores
+                        // identically to `match_phrase` on that field.
+                        FtsQuery::Term(FtsTerm::boosted(field.as_str(), &terms[0], *fb))
+                    } else {
+                        FtsQuery::Phrase(xerj_fts::search::PhraseQuery {
+                            field: field.clone(),
+                            terms: terms.clone(),
+                            slop: *slop,
+                            boost: *fb,
+                        })
+                    });
+                }
+                if per_field.is_empty() {
+                    return None;
+                }
+                // ES combines the per-field phrase clauses with dis_max
+                // (tie_breaker 0.0 for phrase and phrase_prefix alike).
+                let combined = if per_field.len() == 1 {
+                    per_field.pop().unwrap()
+                } else {
+                    FtsQuery::DisMax(Box::new(FtsDisMax::new(per_field)))
+                };
+                return Some(if (outer - 1.0).abs() > f32::EPSILON {
+                    FtsQuery::Bool(Box::new(FtsBool::new().should(combined).boost(outer)))
+                } else {
+                    combined
+                });
             }
             // `operator: and` binds PER FIELD for the field-centric types
             // (ES best_fields/most_fields build one match query per field
@@ -33304,6 +34137,7 @@ fn query_node_to_fts(
             field,
             query,
             max_expansions,
+            slop,
         } => {
             // match_phrase_prefix on a KEYWORD field: single whole-value token
             // whose last (only) term is a prefix → a prefix query over the
@@ -33338,6 +34172,10 @@ fn query_node_to_fts(
                         field: field.clone(),
                         terms: tokens.iter().map(|t| t.text.clone()).collect(),
                         max_expansions: *max_expansions as usize,
+                        // `slop` used to be dropped on the floor here, so a
+                        // sloppy `match_phrase_prefix` silently answered as
+                        // slop 0 (#204 class).
+                        slop: *slop,
                         boost: 1.0,
                     },
                 ));
@@ -35648,6 +36486,8 @@ mod fts_projection_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let fq = query_node_to_fts(&q, &[], &kw(&["model", "top_doc"])).expect("projects");
         match fq {
@@ -35676,6 +36516,8 @@ mod fts_projection_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let fq = query_node_to_fts(&q, &["title".to_string()], &kw(&["model"])).expect("projects");
         match fq {
@@ -35726,6 +36568,8 @@ mod fts_projection_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         }
     }
 
@@ -35837,6 +36681,8 @@ mod fts_projection_tests {
             operator: Some(xerj_query::ast::BoolOperator::And),
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let fq = query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]))
             .expect("projects");
@@ -35870,9 +36716,111 @@ mod fts_projection_tests {
             operator: Some(xerj_query::ast::BoolOperator::And),
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         assert!(
             query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]),).is_none()
+        );
+    }
+
+    /// #230 — `multi_match` phrase types project to POSITIONAL per-field
+    /// clauses combined by dis_max (the shape ES builds), instead of
+    /// declining the projection and forcing an O(N) stored-doc scan per
+    /// segment. `slop` rides along into the phrase clause.
+    #[test]
+    fn multi_match_phrase_projects_positional_dis_max() {
+        let mut q = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "title^3".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::Phrase,
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 2,
+            max_expansions: 50,
+        };
+        let text = vec!["body".to_string(), "title".to_string()];
+        match query_node_to_fts(&q, &text, &kw(&[])).expect("phrase projects") {
+            FtsQuery::DisMax(d) => {
+                assert_eq!(d.queries.len(), 2, "one phrase clause per field");
+                for clause in &d.queries {
+                    match clause {
+                        FtsQuery::Phrase(p) => {
+                            assert_eq!(p.terms, vec!["merge".to_string(), "policy".to_string()]);
+                            assert_eq!(p.slop, 2, "slop must reach the positional clause");
+                            if p.field == "title" {
+                                assert_eq!(p.boost, 3.0, "^3 field boost preserved");
+                            }
+                        }
+                        other => panic!("expected positional phrase clause, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected dis_max of phrase clauses, got {other:?}"),
+        }
+
+        // phrase_prefix DECLINES the projection on purpose (#230 review): a
+        // positional prefix clause bounds the trailing prefix to
+        // `max_expansions` terms from the segment's term dictionary, while
+        // the stored-doc walk that answers for the memtable has no term
+        // dictionary and expands unbounded — so projecting it makes the hit
+        // set shrink at `_flush`, the #218 regression class. Declining keeps
+        // one evaluator for both states.
+        q = QueryNode::MultiMatch {
+            fields: vec!["body".into()],
+            query: "merge poli".into(),
+            match_type: xerj_query::ast::MultiMatchType::PhrasePrefix,
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 7,
+        };
+        assert!(
+            query_node_to_fts(&q, &text, &kw(&[])).is_none(),
+            "multi_match phrase_prefix must decline the projection so the \
+             memtable and the segment stay on one predicate"
+        );
+    }
+
+    /// #230 parity guard — a KEYWORD field in a phrase `multi_match` declines
+    /// the projection. The keyword FST holds one case-preserved whole-value
+    /// term, which the schema-blind stored-scan evaluator (it tokenizes every
+    /// field) cannot model; projecting it would make the hit set change at
+    /// `_flush`, the regression class of #218. Same for a dotted multi-field
+    /// path, which has no positions side-car at all.
+    #[test]
+    fn multi_match_phrase_declines_non_positional_fields() {
+        let text = vec!["body".to_string()];
+        let keyword_field = QueryNode::MultiMatch {
+            fields: vec!["body".into(), "tags".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::Phrase,
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+        };
+        assert!(
+            query_node_to_fts(&keyword_field, &text, &kw(&["tags"])).is_none(),
+            "keyword field must keep the stored-scan path"
+        );
+
+        let dotted = QueryNode::MultiMatch {
+            fields: vec!["body.raw".into()],
+            query: "merge policy".into(),
+            match_type: xerj_query::ast::MultiMatchType::Phrase,
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+        };
+        assert!(
+            query_node_to_fts(&dotted, &text, &kw(&[])).is_none(),
+            "dotted multi-field path must keep the stored-scan path"
         );
     }
 
@@ -35997,6 +36945,7 @@ mod fts_projection_tests {
             field: "body".into(),
             query: "status ok log".into(),
             max_expansions: 50,
+            slop: 0,
         };
         match query_node_to_fts(&q, &tf, &kw(&[])).expect("text mpp projects") {
             FtsQuery::PhrasePrefix(p) => {
@@ -36015,6 +36964,7 @@ mod fts_projection_tests {
             field: "top_doc".into(),
             query: "runbook/on".into(),
             max_expansions: 50,
+            slop: 0,
         };
         let fq = query_node_to_fts(&q, &[], &kw(&["top_doc"])).expect("keyword prefix projects");
         match fq {
@@ -36723,6 +37673,8 @@ mod lexical_passage_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let hit = Hit {
             id: "doc-1".into(),
@@ -36777,6 +37729,8 @@ mod lexical_passage_tests {
             operator: None,
             analyzer: None,
             boost: None,
+            slop: 0,
+            max_expansions: 50,
         };
         let hit = Hit {
             id: "doc-1".into(),
@@ -38258,7 +39212,7 @@ mod flush_memory_integration_tests {
             let schema = idx.schema.read().await;
             (
                 build_fts_field_configs(&schema.schema),
-                crate::memtable::semantic_derived_vector_fields(&schema.schema),
+                crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
         };

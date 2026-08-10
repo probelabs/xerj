@@ -510,6 +510,7 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         pdf_timeout_secs: 120,
         bulk_mb: BULK_MB,
         bulk_timeout_secs: 300,
+        snapshot_max_bytes: 64u64 << 30,
         prefix: "ax".into(),
         state_dir: None,
         fresh: cfg.fresh,
