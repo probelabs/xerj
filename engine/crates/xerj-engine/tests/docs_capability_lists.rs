@@ -31,6 +31,48 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Read a directory, or fail the test naming it.
+///
+/// The walkers below used `let Ok(entries) = read_dir(dir) else { return }` and
+/// `entries.flatten()`, so an unreadable directory removed its whole subtree
+/// from the scan and the test still reported success. The `> 20` floors on the
+/// collected file counts do not catch it: `landing/docs/playbooks/` going
+/// unreadable drops those pages while sixty others keep the total above the
+/// floor. A guard that silently checks less than it was asked to is the
+/// accepted-and-ignored pattern (#204) this file exists to prevent, so both
+/// the directory and each entry inside it are now hard failures.
+fn read_dir_or_panic(dir: &Path) -> Vec<std::fs::DirEntry> {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot list {}: {e} — this walk feeds the published-surface checks; a directory that cannot be read must fail the test, not shrink its scope", dir.display()));
+    entries
+        .map(|e| {
+            e.unwrap_or_else(|err| {
+                panic!(
+                    "cannot read an entry of {}: {err} — see above; entries are not skipped",
+                    dir.display()
+                )
+            })
+        })
+        .collect()
+}
+
+/// Read a published surface, or fail the test naming it.
+///
+/// `read_to_string(..).unwrap_or_default()` turned an unreadable or non-UTF-8
+/// page into an empty string, which passes every check below by finding
+/// nothing — a confidently wrong "no phantom query type here". Every one of
+/// these paths came from a directory walk moments earlier, so a read failure
+/// is a real fault and belongs in the failure output.
+fn read_surface_or_panic(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read published surface {}: {e} — an unreadable page must fail \
+             this test; treating it as empty would silently pass every check",
+            path.display()
+        )
+    })
+}
+
 /// Documentation files that publish the **query**-type lists.
 ///
 /// Paths are repo-relative. A file listed here that has lost its markers is a
@@ -262,10 +304,7 @@ fn an_html_card_that_is_not_a_type_name_is_refused() {
 #[test]
 fn every_source_pointer_in_the_docs_site_resolves() {
     fn html_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
+        for e in read_dir_or_panic(dir) {
             let p = e.path();
             if p.is_dir() {
                 html_files(&p, out);
@@ -286,7 +325,7 @@ fn every_source_pointer_in_the_docs_site_resolves() {
 
     let mut broken = Vec::new();
     for page in &pages {
-        let text = std::fs::read_to_string(page).unwrap_or_default();
+        let text = read_surface_or_panic(page);
         for (idx, _) in text.match_indices("engine/crates/") {
             let tail: String = text[idx..]
                 .chars()
@@ -413,10 +452,7 @@ fn a_backticked_qualifier_inside_a_region_is_refused() {
 /// text files, and the two repository documents an evaluator reads first.
 fn doc_surfaces() -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
+        for e in read_dir_or_panic(dir) {
             let p = e.path();
             if p.is_dir() {
                 walk(&p, out);
@@ -533,7 +569,7 @@ fn no_published_surface_names_a_phantom_query_type() {
     let mut hits = Vec::new();
 
     for file in doc_surfaces() {
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let text = read_surface_or_panic(&file);
         for phantom in PHANTOM_QUERY_TYPES {
             for (at, _) in text.match_indices(phantom) {
                 if at_token_start(&text, at) && token_ends_at(&text, at + phantom.len()) {
@@ -569,7 +605,7 @@ fn every_query_clause_in_a_published_sample_is_a_real_query_type() {
     let mut checked = 0usize;
 
     for file in doc_surfaces() {
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let text = read_surface_or_panic(&file);
         for (at, _) in text.match_indices("\"query\"") {
             // `"query"` `:` `{` `"<name>"` — anything else (a string value, as
             // in `match` / `query_string` / `semantic`, or an array) is not a
