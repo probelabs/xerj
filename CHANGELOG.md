@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A crafted filename can no longer forge records on the agent progress
+  stream** (the first rc.15 known issue below). Every externally-controlled
+  string — in-flight paths, the paths and error text interpolated into human
+  notes, the terminal line's reason — is stripped of control characters, bidi
+  overrides and zero-width characters and bounded in length before it reaches
+  any progress surface. Measured on a corpus holding crafted names: a run that
+  previously emitted a forged `xerj-done ok=true exit=0 reason=completed`
+  2.2 s ahead of its real terminal line now emits one terminal line and no
+  control characters at all. The same sanitisation covers the walker's
+  "skipping unreadable entry" warning, which renders a path to the same stderr.
+- **`--progress json` paces the bar like `--progress plain`.** The `bar` field
+  bypassed the spacing slot entirely: measured at `--progress-interval 1`, 178
+  of 178 ticks carried a bar against 18 bars on the plain surface. It is now a
+  string on exactly the ticks that owe a bar and `null` in between — 26 of 320
+  ticks on the same corpus, against 16 on plain.
+- **The bar spacing floor is the 15 s the documentation states.** A half-tick
+  tolerance made the enforced floor `interval/2` shorter — 12.5 s at the
+  shipped defaults. Measured at `--progress-interval 10`: 11 of 11 same-phase
+  gaps under 15 s (min 10.0 s) before, none after (min 19.3 s).
+
 ## [1.0.0-rc.15] - 2026-08-10
 
 ### Known issues in this release
