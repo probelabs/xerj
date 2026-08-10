@@ -25934,27 +25934,141 @@ pub async fn xpack_usage(State(state): State<AppState>) -> impl IntoResponse {
 // GET /_security/_authenticate — return current user info
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn security_authenticate(State(_state): State<AppState>) -> impl IntoResponse {
-    // Single-node owner identity. xerj has no multi-user store; the caller is
-    // always the built-in superuser.
-    Json(json!({
-        "username": "xerj",
-        "roles": ["superuser"],
+/// Describe the credential that made *this* request (issue #201).
+///
+/// This used to answer `{"username":"xerj","roles":["superuser"]}` no matter
+/// who asked. That was already untrue when it was written and became flatly
+/// misleading once minted keys carried real grants (issue #79): a key confined
+/// to `logs-*` was told it was the superuser, an operator auditing the cluster
+/// was told every key was, and a client had no way to discover its own
+/// permissions — the one question this endpoint exists to answer. Enforcement
+/// was never affected (`rbac`/`authz` are fail-closed and consult the same
+/// [`crate::auth::Principal`] this handler now reads), so it was introspection
+/// drift, not an authorization hole. Drift in the direction of "you are more
+/// privileged than you are" is still exactly the wrong direction.
+///
+/// Shape follows ES's `Authentication#toXContentFragment`
+/// (`x-pack/plugin/core/.../authc/Authentication.java:773-860`, APPROACH ONLY
+/// — AGPL/Elastic, read for semantics): an API-key authentication reports the
+/// `_es_api_key` realm, `authentication_type: "api_key"`, and an `api_key:
+/// {id, name}` block, while a realm login reports `authentication_type:
+/// "realm"`. `username` stays the single owner identity in both cases
+/// ([`API_KEY_OWNER_USERNAME`]) — xerj has one owner, and a minted key belongs
+/// to it; what differs between callers is the *roles*, which is precisely what
+/// was being misreported.
+///
+/// # One deliberate divergence, in the safe direction
+///
+/// ES reports `roles: []` for an API-key call — its API-key user is built with
+/// `Strings.EMPTY_ARRAY` (`ApiKeyService.java:1641`) and a client is expected
+/// to read `GET /_security/api_key` for the descriptors. xerj reports the
+/// descriptor names the key was actually minted with. That is a divergence, so
+/// it is written down rather than left to be discovered: `[]` is not *wrong*,
+/// but it answers "which named cluster roles do you hold" when the question a
+/// caller has is "what am I allowed to do", and xerj has no named-role store
+/// to point at instead. The divergence is additive and never over-states — a
+/// caller that only checks for `"superuser"` behaves identically, and no key
+/// is described as holding more than it holds.
+///
+/// Deliberately *not* fixed here: `POST /_security/user/_has_privileges` still
+/// answers `true` to everything (see its own handler). Reporting honest roles
+/// beside a lying privilege oracle is an improvement, not a completion.
+pub async fn security_authenticate(
+    State(state): State<AppState>,
+    principal: crate::auth::Principal,
+) -> impl IntoResponse {
+    use crate::auth::Principal;
+
+    let (roles, key): (Vec<String>, Option<(String, String)>) = match &principal {
+        // The configured admin key, or open mode (`--insecure` / no key set).
+        // This one really is the superuser, and saying so is the truth.
+        Principal::Superuser => (vec!["superuser".to_string()], None),
+        // The `role_descriptors` keys the caller supplied at mint time, in the
+        // order they first appear and deduplicated: one descriptor with three
+        // `indices` entries becomes three internal `Role`s named `r[0]`,
+        // `r[1]`, `r[2]` (`rbac::roles_from_role_descriptors`), and reporting
+        // that encoding back would describe roles the caller never named.
+        Principal::Scoped { key_id, roles } => (
+            dedup_in_order(roles.iter().map(|r| r.descriptor_name())),
+            Some((key_id.clone(), key_name(&state, key_id))),
+        ),
+        // A key minted without usable `role_descriptors`. Reporting `[]` would
+        // be as wrong as reporting `["superuser"]`, in the other direction: it
+        // holds no grant on the reserved `.xerj-memory-*` namespace but keeps
+        // its historical reach over ordinary indices. `"unscoped"` is the name
+        // of that capability, defined by `Principal::Unscoped`.
+        Principal::Unscoped { key_id } => (
+            vec!["unscoped".to_string()],
+            Some((key_id.clone(), key_name(&state, key_id))),
+        ),
+        // Unreachable behind `auth_middleware`, which answers 401 first — but
+        // if this handler is ever mounted without it, "no credential" must not
+        // be described as a user.
+        Principal::Denied => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": {
+                        "root_cause": [{
+                            "type": "security_exception",
+                            "reason": "missing or invalid API key in Authorization header"
+                        }],
+                        "type": "security_exception",
+                        "reason": "missing or invalid API key in Authorization header"
+                    },
+                    "status": 401
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    let (realm_name, realm_type, auth_type) = match key {
+        Some(_) => (API_KEY_REALM, API_KEY_REALM, "api_key"),
+        None => (API_KEY_OWNER_REALM, API_KEY_OWNER_REALM, "realm"),
+    };
+
+    let mut body = json!({
+        "username": API_KEY_OWNER_USERNAME,
+        "roles": roles,
         "full_name": "Xerj Administrator",
         "email": null,
         "metadata": {},
         "enabled": true,
-        "authentication_realm": {
-            "name": "native",
-            "type": "native"
-        },
-        "lookup_realm": {
-            "name": "native",
-            "type": "native"
-        },
-        "authentication_type": "realm"
-    }))
-    .into_response()
+        "authentication_realm": { "name": realm_name, "type": realm_type },
+        "lookup_realm": { "name": realm_name, "type": realm_type },
+        "authentication_type": auth_type
+    });
+    if let Some((id, name)) = key {
+        body["api_key"] = json!({ "id": id, "name": name });
+    }
+    Json(body).into_response()
+}
+
+/// Name of a minted key, for the `api_key` block above. A key that vanished
+/// between authentication and this lookup (revoked mid-request) reports an
+/// empty name rather than failing the call — the id is the identifying part.
+fn key_name(state: &AppState, key_id: &str) -> String {
+    state
+        .engine
+        .api_keys
+        .get(key_id)
+        .map(|r| r.name.clone())
+        .unwrap_or_default()
+}
+
+/// Collect into a `Vec<String>`, keeping first-appearance order and dropping
+/// repeats. Role lists here are single digits long, so the linear `contains`
+/// is cheaper than a set and keeps the output deterministic — a response that
+/// reordered its own roles between calls would be a nuisance to diff.
+fn dedup_in_order<'a>(items: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        if !out.iter().any(|seen| seen == item) {
+            out.push(item.to_string());
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -25970,12 +26084,20 @@ pub async fn security_authenticate(State(_state): State<AppState>) -> impl IntoR
 // harder failure to diagnose than the 404 itself since nothing about
 // privileges appears in the error shown to the user.
 //
-// Same single-owner identity model as `security_authenticate` — xerj has no
-// per-user privilege enforcement, every authenticated caller is the one
-// built-in superuser — so answering "yes" to every privilege asked about
-// isn't a lie, it's what's actually true: nothing is denied. Echoes back
-// every cluster/index/application privilege named in the request body as
-// granted, keyed exactly the way ES's response is shaped.
+// It echoes back every cluster/index/application privilege named in the
+// request body as granted, keyed exactly the way ES's response is shaped.
+//
+// ⚠️ That is a STUB, not an answer. The comment here used to justify it as
+// "what's actually true: nothing is denied", which was accurate when xerj had
+// one built-in superuser and stopped being accurate when minted keys gained
+// real grants (issue #79): a key confined to `logs-*` is told it may write
+// `payments`, and then the write is refused by `authz`. #201 fixed the same
+// class of drift in `security_authenticate` above; this handler is left alone
+// on purpose, because answering honestly means denying privileges to callers
+// that Kibana's bootstrap currently expects to be granted, and that is a
+// behaviour change with its own blast radius rather than a comment fix. Do
+// not treat this endpoint as an authorization oracle — `Principal::
+// allows_index` is the only one.
 pub async fn security_has_privileges(
     State(_state): State<AppState>,
     body: Option<Json<Value>>,
@@ -26225,21 +26347,21 @@ pub async fn security_create_api_key(
 
     // Persist the key so the auth middleware can re-authenticate an inbound
     // `Authorization: ApiKey <encoded>` header. `encoded` decodes to
-    // `id:api_key`, so the stored secret is the `api_key` value. Persisted
+    // `id:api_key`, so the credential the record must recognise is the
+    // `api_key` value — `ApiKeyRecord::new` hashes it (issue #201) and the
+    // plaintext leaves this function only in the response below. Persisted
     // across restarts via `persist_api_key` (item 6: `<data_dir>/api_keys.json`).
     let now_ms = Utc::now().timestamp_millis().max(0) as u64;
     let expiration_ms = parse_api_key_expiration_ms(expiration.as_str(), now_ms);
     state.engine.persist_api_key(
         key_id.clone(),
-        xerj_engine::engine::ApiKeyRecord {
-            name: name.clone(),
-            secret: api_key.clone(),
-            creation_ms: now_ms,
+        xerj_engine::engine::ApiKeyRecord::new(
+            name.clone(),
+            &api_key,
+            now_ms,
             expiration_ms,
-            invalidated: false,
-            invalidation_ms: None,
             roles,
-        },
+        ),
     );
     state.engine.audit.append(
         "security.api_key.create",
@@ -26248,6 +26370,10 @@ pub async fn security_create_api_key(
         "ok",
         &format!("id={key_id} name={name}"),
     );
+    // Minting privilege is exactly the kind of event that must not be lost to
+    // a power cut, and it is rare enough to afford the barrier — unlike the
+    // per-search append, which deliberately does not sync (see `audit`).
+    state.engine.audit.sync_to_disk();
 
     Json(json!({
         "id": key_id,
@@ -26291,6 +26417,13 @@ pub async fn security_create_api_key(
 const API_KEY_OWNER_USERNAME: &str = "xerj";
 const API_KEY_OWNER_REALM: &str = "native";
 
+/// Realm name/type ES reports for a request authenticated by an API key
+/// (`AuthenticationField.API_KEY_REALM_NAME`/`_TYPE`, both `_es_api_key`).
+/// Used by [`security_authenticate`] so a client can tell an API-key call
+/// apart from a realm login instead of being told every caller is the
+/// built-in `native`-realm superuser.
+const API_KEY_REALM: &str = "_es_api_key";
+
 /// 400 in ES's `action_request_validation_exception` shape — what ES's REST
 /// layer answers when `InvalidateApiKeyRequest#validate` rejects a request.
 /// `errors` are joined as `Validation Failed: 1: a;2: b;`, matching
@@ -26325,6 +26458,16 @@ fn api_key_validation_error(errors: &[String]) -> Response {
 /// so what comes back is that normalized form, not the caller's original
 /// descriptor JSON. An unscoped key reports `{}` — the same "no usable grant"
 /// signal the parse produced.
+///
+/// Descriptors are keyed by the name the caller supplied, and a descriptor
+/// that had several `indices` entries is reassembled into one object with
+/// several entries. This used to key by `Role::name`, which is the internal
+/// `"{descriptor}[{i}]"` fan-out: a key minted with one `reader` descriptor
+/// over two index sets was listed back as two descriptors, `reader[0]` and
+/// `reader[1]`, neither of which the caller ever wrote and neither of which
+/// could be fed back into `POST /_security/api_key` to reproduce the key. It
+/// is the same introspection drift issue #201 fixes in
+/// `security_authenticate`, and the two must agree on what a role is called.
 fn api_key_role_descriptors_json(roles: &[xerj_engine::rbac::Role]) -> Value {
     use xerj_engine::rbac::Privilege;
     let mut out = serde_json::Map::new();
@@ -26345,12 +26488,12 @@ fn api_key_role_descriptors_json(roles: &[xerj_engine::rbac::Role]) -> Value {
         // HashSet order is nondeterministic; sort so the wire shape is stable.
         privileges.sort_unstable();
         privileges.dedup();
-        out.insert(
-            role.name.clone(),
-            json!({
-                "indices": [{ "names": role.indices, "privileges": privileges }]
-            }),
-        );
+        let descriptor = out
+            .entry(role.descriptor_name().to_string())
+            .or_insert_with(|| json!({ "indices": [] }));
+        if let Some(entries) = descriptor.get_mut("indices").and_then(Value::as_array_mut) {
+            entries.push(json!({ "names": role.indices, "privileges": privileges }));
+        }
     }
     Value::Object(out)
 }
@@ -26623,6 +26766,8 @@ pub async fn security_invalidate_api_key(
             previously.join(",")
         ),
     );
+    // Revocation, like minting, is a privilege change worth an fsync.
+    state.engine.audit.sync_to_disk();
     // ES answers 200 whatever matched; ids that matched nothing appear in
     // neither list. `error_details` exists only when per-key errors occurred,
     // which this single-node store cannot produce — so `error_count` is 0 and

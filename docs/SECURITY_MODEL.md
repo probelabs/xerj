@@ -201,8 +201,9 @@ Accepted credential forms (`authenticate`, `auth.rs:214`):
   key's `id:secret` (`basic_principal`, `auth.rs:257`). Kibana's basic-realm
   login sends this shape.
 
-All secret comparisons are constant-time after a length check
-(`constant_time_eq`, `auth.rs:364`), on both the admin-key and minted-key paths.
+All secret comparisons are constant-time after a length check: the admin key
+against the configured value (`constant_time_eq`, `auth.rs`), a minted key
+against its stored hash (`secret_hash::verify_secret`).
 
 Two paths are exempt from authentication: `/health/live` and `/health/ready`
 (`AUTH_EXEMPT_PATHS`, `auth.rs:41`), so a hardened deployment's probes do not
@@ -262,6 +263,49 @@ Not honoured, and each one fails closed by granting nothing
 
 A key also carries expiry and invalidation, both checked on every request before
 the secret comparison (`auth.rs:338-349`).
+
+### Key secrets at rest
+
+Minted secrets are stored as a **salted SHA-256 hash**, never in the clear
+(`secret_hash.rs`, issue #201). `<data_dir>/api_keys.json` holds
+`$ssha256$<salt>$<digest>` per key; authentication re-hashes the presented
+secret under that record's salt and compares digests in constant time
+(`ApiKeyRecord::verify_secret`). A store written before this lands is migrated
+on boot — hashed, and the file rewritten without the plaintext — before the
+server accepts a request.
+
+The hash is deliberately *fast*, not a password hash. The secret is two v4
+UUIDs of CSPRNG output (244 bits), never chosen or reused by a human, so an
+offline guessing attack is not the threat; a per-request Argon2/scrypt would
+buy nothing against it and would hand an attacker a CPU-exhaustion DoS. This is
+the same choice Elasticsearch makes for API keys (its default
+`xpack.security.authc.api_key.hashing.algorithm` is `SSHA256`).
+
+What this does **not** protect against: an attacker who can read the process's
+memory, or who intercepts the one response that carries the plaintext. The file
+stays 0600, because a hash plus a key id is still an offline target and still
+enumerates which credentials exist.
+
+### Introspecting your own credential
+
+`GET /_security/_authenticate` reports the principal that made the call
+(`security_authenticate`, issue #201): `authentication_type: "api_key"` in the
+`_es_api_key` realm, with an `api_key: {id, name}` block and the
+`role_descriptors` names the key was minted with, for a minted key;
+`authentication_type: "realm"` with `roles: ["superuser"]` for the admin key or
+open mode. A key minted without usable `role_descriptors` reports
+`roles: ["unscoped"]` — it holds no grant in the reserved namespace but keeps
+its historical reach over ordinary indices, so neither `["superuser"]` nor `[]`
+would be true. Before #201 this endpoint answered `superuser` for every caller.
+
+One deliberate divergence from ES: ES reports `roles: []` for an API-key call
+and expects the client to read `GET /_security/api_key` for the descriptors.
+xerj reports the names instead, because it has no named-role store to point at.
+The divergence is additive and never over-states a key's reach.
+
+`POST /_security/user/_has_privileges` is **not** fixed: it still answers `true`
+to every privilege named in the request, which is wrong for a scoped key. Treat
+it as a stub, not as an authorization oracle.
 
 ### Privileges that exist but are not decided
 
@@ -555,8 +599,16 @@ it is on a schedule this document can promise.
 - **The audit endpoints are not privilege-gated.** `/_audit/_search` and
   `/_audit/_verify` (`router.rs:124-125`) are cluster-classified reads, so any
   authenticated principal that reaches the router passes; `AuditRead` is not
-  consulted. The startup banner also states plainly that auditing today is
-  request tracing, not a tamper-evident log (`main.rs:317`).
+  consulted.
+- **The audit log covers very little.** It is a hash-chained, restart-surviving
+  log (`audit.rs`, issue #201) of the last 4096 entries in
+  `<data_dir>/audit.jsonl` — but the only callers are `_search` and the three
+  `_security/api_key` operations. Indexing and deletion are **not** audited, so
+  a missing entry is not evidence that a write did not happen. The file is not
+  `fsync`ed per entry (a search would pay the barrier); it survives a process
+  restart, not a power cut. Anyone who can write the file can rewrite the whole
+  chain, seed line included — tamper-*evidence* requires pinning a known-good
+  head externally.
 - **`names: ["*"]` reaches the reserved namespace.** This is intended and pinned
   by a test, but it means one careless grant hands over every brain
   (`rbac.rs:72-98`).

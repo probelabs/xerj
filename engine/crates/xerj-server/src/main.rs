@@ -336,7 +336,15 @@ fn print_banner(cfg: &Config, startup_ms: u128) {
             " │ ✓  Auth:   single API-key (no RBAC; per-doc / per-field controls roadmap v0.9)"
         );
     }
-    println!(" │ ⚠  Audit:  request tracing only — tamper-evident WORM audit log v0.9");
+    // Issue #201 made the hash chain durable, so "request tracing only" is no
+    // longer the honest line — but the coverage is still narrow (searches and
+    // the `_security/api_key` operations, not every write) and the endpoints
+    // are still not privilege-gated. Say exactly that.
+    println!(
+        " │ ⚠  Audit:  hash-chained log of searches + API-key ops, kept in \
+         <data_dir>/audit.jsonl"
+    );
+    println!(" │           (last 4096 entries; /_audit/* is not privilege-gated)");
     println!(" │ ⚠  Encryption-at-rest: not engine-level — use OS FDE or S3 SSE for now");
     println!(" └────────────────────────────────────────────────────────────────");
     println!();
