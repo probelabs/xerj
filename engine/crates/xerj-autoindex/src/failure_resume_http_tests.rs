@@ -2345,6 +2345,36 @@ fn a_run_reports_progress_through_every_phase_and_closes_the_stream() {
         "every progress line carries a percent and an ETA field (possibly `unknown`):\n{stream}"
     );
 
+    // ...and the same run hands the agent something it can show a person.
+    // Asserted on the REAL pipeline rather than on a hand-built snapshot.
+    //
+    // This corpus indexes in ~0.3 s, so it is also the end-to-end proof of the
+    // burst floor: every one of its phase changes falls inside `BAR_MIN_GAP`,
+    // and a run that short must therefore relay ONE display line, not one per
+    // phase. The machine lines above already proved every phase is on the
+    // stream — the relay is deliberately quieter than the record.
+    let bars: Vec<&str> = stream
+        .lines()
+        .filter(|line| line.starts_with("xerj-bar "))
+        .collect();
+    assert_eq!(
+        bars.len(),
+        1,
+        "a sub-2s run relays exactly one bar, whatever its phase count:\n{stream}"
+    );
+    assert!(
+        bars[0].starts_with("xerj-bar [") && bars[0].contains(']'),
+        "the display line carries a drawn bar:\n{stream}"
+    );
+    // The display line is derived, never a second source of truth: it may not
+    // claim completion while the machine line still reports work outstanding.
+    assert!(
+        !bars.iter().any(|line| line.contains("[####")
+            && line.contains("----]")
+            && line.contains("100.0%")),
+        "a partly-drawn bar cannot be labelled 100%:\n{stream}"
+    );
+
     let done = stream
         .lines()
         .find(|line| line.starts_with("xerj-done "))

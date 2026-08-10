@@ -19,6 +19,38 @@
 //!   quality gate below is satisfied; otherwise the field is literally
 //!   `unknown` (`null` in JSON) rather than a comforting number.
 //!
+//! # The two lines of the stream surface
+//!
+//! An AI coding agent is the main consumer of the non-terminal surface, and it
+//! has two jobs at once: parse the run, and tell a human what is happening. A
+//! key=value record serves the first and reads as noise in a chat transcript;
+//! a drawn bar serves the second and is miserable to parse. Both were tried in
+//! one line — `xerj-progress bar=[####----] phase=… pct=…` — and the result
+//! satisfies neither: an agent relaying it verbatim pastes twelve internal
+//! fields at its user, and one that strips them is back to rendering its own
+//! bar from `pct`, which is exactly the work this module exists to do once.
+//!
+//! So a tick on [`Surface::Plain`] writes **two lines, in one write**:
+//!
+//! ```text
+//! xerj-bar [######################--] 93.4% | index | 8082/8083 items | 6.6MB/s | eta 7s | waiting on …/tests/util/europarl.lines.txt.gz(9.2MB)
+//! xerj-progress phase=index basis=bytes pct=93.4 items=8082/8083 bytes=136376668/146072142 rate=6965552.1 eta_s=7.2 eta_quality=good … waiting_on=lucene/…/europarl.lines.txt.gz(9.2MB)
+//! ```
+//!
+//! (a real pair, from a 28.8 s / 8,083-file / 253 MB run)
+//!
+//! `xerj-bar` is the relayable view: self-contained, safe to surface verbatim,
+//! and never carrying a number the machine line does not also carry.
+//! `xerj-progress` is unchanged — every reader written against it keeps
+//! working, which is why the bar is a new line rather than a new shape for the
+//! old one. The stream stays parseable because every record is identified by
+//! its leading token; a reader consumes `xerj-progress` / `xerj-done` and
+//! skips what it does not know. `--progress json` keeps its promise of one
+//! object per line by carrying the same rendered string in a `bar` field
+//! instead of beside it.
+//!
+//! The two lines are paced independently — see [`AGENT_BAR_INTERVAL`].
+//!
 //! ETA is derived from **bytes**, not from file count. File count is a badly
 //! skewed proxy for work — in the corpus that produced #241 the largest single
 //! file held 40.4% of all bytes, so a files-done ETA collapses to ~0 while
@@ -60,11 +92,37 @@ const ETA_MAX_STEP: f64 = 0.20;
 const STRAGGLER_MAX: usize = 3;
 /// Fallback terminal width when `COLUMNS` is unset.
 const DEFAULT_COLUMNS: usize = 100;
+/// Cells in the drawn bar on the stream surface.
+const BAR_CELLS: usize = 24;
+/// Cells in the drawn bar on a terminal, where the bar shares a single line
+/// with every other field and the line is truncated to the window.
+const TTY_BAR_CELLS: usize = 12;
+/// Longest straggler description carried on the display line before its middle
+/// is elided. A path is the only unbounded field on that line.
+const DISPLAY_STRAGGLER_MAX: usize = 44;
 
 /// Live-redraw cadence on a terminal.
 pub const TTY_INTERVAL: Duration = Duration::from_secs(1);
 /// Line cadence for pipes, agents and CI.
 pub const STREAM_INTERVAL: Duration = Duration::from_secs(5);
+/// Minimum spacing between two `xerj-bar` display lines.
+///
+/// The two lines of the stream surface are paced independently on purpose.
+/// `xerj-progress` is a machine record and keeps [`STREAM_INTERVAL`], because
+/// that interval is the documented upper bound on silence — lengthening it
+/// would weaken a contract callers rely on. `xerj-bar` is a line an agent
+/// relays *verbatim to a person*, and a person does not want to be told the
+/// same thing every five seconds: at the 5 s default a 30-minute index would
+/// put 360 bars in the transcript, and at this spacing it puts 120. Fifteen
+/// seconds is short enough that a human being read to never wonders whether
+/// the job died, and long enough that the relay is not the loudest thing in
+/// the conversation. It is a judgement about reading, not a measured optimum.
+pub const AGENT_BAR_INTERVAL: Duration = Duration::from_secs(15);
+/// Floor under the burst a phase change can produce: no two display lines
+/// closer together than this. A phase transition is allowed to jump the
+/// spacing above — that is the news worth interrupting for — but a run whose
+/// phases are all short must not turn the relay into a wall of `0.0%` lines.
+pub const BAR_MIN_GAP: Duration = Duration::from_secs(2);
 
 /// `--progress` as the user wrote it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +318,13 @@ struct State {
     in_flight: Vec<(u64, String, u64)>,
     next_seq: u64,
     tty_width: usize,
+    /// When the last `xerj-bar` display line was written; `None` before the
+    /// first one.
+    last_bar_at: Option<Instant>,
+    /// A phase change is waiting to be shown. Cleared only when a bar actually
+    /// goes out, so a transition the burst floor swallowed is still drawn on
+    /// the next tick rather than lost.
+    bar_owed: bool,
 }
 
 struct Snapshot {
@@ -316,6 +381,8 @@ impl Progress {
                 in_flight: Vec::new(),
                 next_seq: 0,
                 tty_width: 0,
+                last_bar_at: None,
+                bar_owed: false,
             }),
             stopped: Mutex::new(false),
             wake: Condvar::new(),
@@ -383,6 +450,9 @@ impl Progress {
             state.rate = None;
             state.shown_eta = None;
             state.in_flight.clear();
+            // A phase change is the news a relayed bar exists to carry, so it
+            // jumps the display spacing — subject only to the burst floor.
+            state.bar_owed = true;
         }
         self.items_done.store(0, Ordering::Relaxed);
         self.bytes_done.store(0, Ordering::Relaxed);
@@ -635,6 +705,47 @@ impl Progress {
         (self.interval * 3).max(Duration::from_secs(15))
     }
 
+    /// Spacing between display bars: at least [`AGENT_BAR_INTERVAL`], and
+    /// never tighter than the tick that produces them — an interval wider than
+    /// the spacing simply draws on every tick.
+    fn bar_interval(&self) -> Duration {
+        self.interval.max(AGENT_BAR_INTERVAL)
+    }
+
+    /// Claim the next display-bar slot, if this tick owns it.
+    ///
+    /// Three rules, in order: the first line of a run always draws; a phase
+    /// change draws as soon as [`BAR_MIN_GAP`] allows; otherwise the spacing
+    /// is [`bar_interval`](Self::bar_interval).
+    ///
+    /// The floor exists because a phase change is *not* rate-limited by the
+    /// tick. A measured 11.8 s run of this tool crossed nine phases and drew
+    /// eight bars, five of them inside the first second — bounded in total but
+    /// a burst in a transcript. A pending transition is not dropped when the
+    /// floor swallows it; it stays owed and draws on the next tick, so the
+    /// human still learns the phase changed.
+    fn bar_slot(&self) -> bool {
+        let now = Instant::now();
+        let target = self.bar_interval();
+        let mut state = self.state.lock().unwrap();
+        let due = match state.last_bar_at {
+            None => true,
+            Some(previous) => {
+                let elapsed = now.duration_since(previous);
+                if state.bar_owed {
+                    elapsed >= BAR_MIN_GAP
+                } else {
+                    bar_due(elapsed, self.interval, target)
+                }
+            }
+        };
+        if due {
+            state.last_bar_at = Some(now);
+            state.bar_owed = false;
+        }
+        due
+    }
+
     fn emit(&self) {
         if !self.enabled() {
             return;
@@ -645,9 +756,21 @@ impl Progress {
             Surface::Json => self
                 .sink
                 .write(format!("{}\n", render_json(&snapshot)).as_bytes()),
-            Surface::Plain => self
-                .sink
-                .write(format!("{}\n", render_plain(&snapshot)).as_bytes()),
+            Surface::Plain => {
+                // Both lines of a tick go out in ONE write. They are two views
+                // of a single snapshot, and a pipe splits a write only above
+                // PIPE_BUF (4 KiB on Linux) — well beyond either line — so a
+                // reader never sees a bar torn from the record it describes.
+                let mut out = String::new();
+                if self.bar_slot() {
+                    out.push_str("xerj-bar ");
+                    out.push_str(&render_bar_line(&snapshot, BAR_CELLS));
+                    out.push('\n');
+                }
+                out.push_str(&render_plain(&snapshot));
+                out.push('\n');
+                self.sink.write(out.as_bytes());
+            }
             Surface::Tty => {
                 let body = render_tty(&snapshot);
                 let width = columns();
@@ -811,8 +934,126 @@ fn fmt_secs(seconds: f64) -> String {
     }
 }
 
+/// Is this tick the one that owes a display bar?
+///
+/// Half a tick of tolerance, because ticks land on a timer with jitter: at a
+/// 5 s tick and a 15 s target the third tick can measure 14.998 s, and a bare
+/// `>=` would push every bar to the fourth tick and turn a 15 s spacing into
+/// 20 s. Pure so the spacing rule can be tested without sleeping.
+fn bar_due(elapsed: Duration, tick: Duration, target: Duration) -> bool {
+    elapsed + tick / 2 >= target
+}
+
+/// The drawn bar itself.
+///
+/// **Filled cells are floored, never rounded**, and a completely filled bar is
+/// reserved for a percent that has actually reached 100. Rounding 99.6% up to
+/// a full bar would draw "done" over work that is still running, which is the
+/// same class of comforting lie as an invented ETA. With no denominator the
+/// track is drawn as `?` rather than as an empty bar: an empty bar reads as
+/// 0%, and 0% is a claim this code cannot support.
+///
+/// ASCII `#`/`-` rather than `█`/`░`. `indicatif` defaults to the block pair
+/// (`indicatif-0.17.11/src/style.rs:92`, MIT — read for the technique, not
+/// copied) and offers ASCII sets such as `#>-` / `=>-` for terminals that
+/// cannot render blocks (`:821`, `:933`). This surface is the one that goes to
+/// pipes, CI logs, Windows consoles and an agent's transcript, so the portable
+/// set is the right default here; the flooring rule follows indicatif's own
+/// "rounding down" of filled clusters (`:185`).
+fn bar(percent: Option<f64>, cells: usize) -> String {
+    match percent {
+        None => format!("[{}]", "?".repeat(cells)),
+        Some(percent) => {
+            let clamped = percent.clamp(0.0, 100.0);
+            let mut filled = ((clamped / 100.0) * cells as f64).floor() as usize;
+            if filled >= cells && clamped < 100.0 {
+                filled = cells.saturating_sub(1);
+            }
+            let filled = filled.min(cells);
+            format!("[{}{}]", "#".repeat(filled), "-".repeat(cells - filled))
+        }
+    }
+}
+
+/// `eta 2m10s`, `eta ~2m10s (rough)`, `eta unknown`, `eta unknown (stalled)`.
+/// The word never disappears: a missing ETA field would read as a rendering
+/// fault, while `unknown` is the honest answer and is what the machine line
+/// says too.
+fn display_eta(eta: Eta) -> String {
+    match eta {
+        Eta::Good(seconds) => format!("eta {}", fmt_secs(seconds)),
+        Eta::Rough(seconds) => format!("eta ~{} (rough)", fmt_secs(seconds)),
+        Eta::Unknown => "eta unknown".to_string(),
+        Eta::Stalled => "eta unknown (stalled)".to_string(),
+    }
+}
+
+/// Keep the tail of an over-long straggler description — the end of a path
+/// carries the file name, which is what identifies it.
+///
+/// The cut snaps forward to the next path separator when there is one, so a
+/// real 27 s run's `…ene/tests/util/europarl.lines.txt.gz(9.2MB)` reads as
+/// `…/tests/util/europarl.lines.txt.gz(9.2MB)` instead of inventing a
+/// directory called `ene`.
+fn elide_start(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - max.saturating_sub(1)).collect();
+    let snapped = match tail.find(['/', '\\']) {
+        Some(cut) => &tail[cut..],
+        None => tail.as_str(),
+    };
+    format!("…{snapped}")
+}
+
+/// The line an agent can relay verbatim: a drawn bar and the four things a
+/// person waiting on a job actually asks — how far, how fast, how long left,
+/// and what it is on right now.
+fn render_bar_line(snapshot: &Snapshot, cells: usize) -> String {
+    let mut line = bar(snapshot.percent, cells);
+    match snapshot.percent {
+        Some(percent) => line.push_str(&format!(" {percent:.1}%")),
+        None => line.push_str(" pct unknown"),
+    }
+    line.push_str(&format!(" | {}", snapshot.phase));
+    if snapshot.items_total > 0 {
+        line.push_str(&format!(
+            " | {}/{} items",
+            snapshot.items_done, snapshot.items_total
+        ));
+    } else if snapshot.items_done > 0 {
+        line.push_str(&format!(" | {} items", snapshot.items_done));
+    }
+    if let Some(rate) = snapshot.rate {
+        match snapshot.basis {
+            Basis::Bytes => line.push_str(&format!(" | {}/s", fmt_bytes(rate as u64))),
+            Basis::Items => line.push_str(&format!(" | {rate:.1} items/s")),
+            Basis::None => {}
+        }
+    }
+    line.push_str(&format!(" | {}", display_eta(snapshot.eta)));
+    if snapshot.waiting_on.len() == 1 {
+        line.push_str(&format!(
+            " | waiting on {}",
+            elide_start(&straggler(&snapshot.waiting_on[0]), DISPLAY_STRAGGLER_MAX)
+        ));
+    } else if snapshot.waiting_on.len() > 1 {
+        line.push_str(&format!(
+            " | waiting on {} items",
+            snapshot.waiting_on.len()
+        ));
+    }
+    line
+}
+
 fn render_tty(snapshot: &Snapshot) -> String {
-    let mut line = format!("{} ", snapshot.phase);
+    let mut line = format!(
+        "{} {} ",
+        snapshot.phase,
+        bar(snapshot.percent, TTY_BAR_CELLS)
+    );
     match snapshot.percent {
         Some(percent) => line.push_str(&format!("{percent:5.1}% ")),
         None => line.push_str("  ..%  "),
@@ -912,6 +1153,10 @@ fn render_json(snapshot: &Snapshot) -> String {
         .collect();
     serde_json::json!({
         "event": "progress",
+        // The same relayable string the `xerj-bar` line carries, as a FIELD —
+        // `--progress json` promises one JSON object per line, so the display
+        // view rides inside the object instead of beside it.
+        "bar": render_bar_line(snapshot, BAR_CELLS),
         "phase": snapshot.phase,
         "basis": snapshot.basis.as_str(),
         "pct": snapshot.percent.map(round1),
@@ -1014,6 +1259,174 @@ mod tests {
         assert!(text.contains("items=0/135"), "{text}");
     }
 
+    /// The agent-facing half of the stream: one line a harness can show a
+    /// person verbatim, immediately followed by the machine record it renders,
+    /// both from one snapshot and one write.
+    #[test]
+    fn a_tick_pairs_a_relayable_bar_with_an_unchanged_machine_line() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        progress.phase("index", 1922, 37_004_502);
+        let text = captured(&buffer);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].starts_with("xerj-bar ["), "{text}");
+        // The parse target is untouched — a reader that matched this prefix
+        // before this change matches exactly the same fields after it.
+        assert!(
+            lines[1].starts_with("xerj-progress phase=index basis=bytes pct="),
+            "{text}"
+        );
+        assert!(lines[0].contains("| index |"), "{text}");
+        assert!(lines[0].contains("eta unknown"), "{text}");
+    }
+
+    /// A drawn bar is a claim about how much is done, so it obeys the same
+    /// rule as the percent it accompanies: floored, and never full until the
+    /// work actually is.
+    #[test]
+    fn the_bar_is_floored_and_a_full_bar_means_complete() {
+        assert_eq!(bar(Some(0.0), 10), "[----------]");
+        assert_eq!(bar(Some(41.2), 10), "[####------]");
+        // 9.99 of 10 cells: floors to 9, and the guard keeps the last cell
+        // empty rather than drawing a finished job.
+        assert_eq!(bar(Some(99.9), 10), "[#########-]");
+        assert_eq!(bar(Some(100.0), 10), "[##########]");
+        // Out-of-range input cannot produce a bar of the wrong width.
+        assert_eq!(bar(Some(140.0), 10).chars().count(), 12);
+        assert_eq!(bar(Some(-3.0), 10), "[----------]");
+    }
+
+    /// With no denominator there is nothing to draw, and an empty bar would
+    /// read as 0% — a number this code has not earned.
+    #[test]
+    fn an_unknown_percent_draws_question_marks_not_an_empty_bar() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        progress.phase("walk", 0, 0);
+        let display = captured(&buffer)
+            .lines()
+            .next()
+            .expect("a bar line")
+            .to_string();
+        assert!(display.contains("[????"), "{display}");
+        assert!(display.contains("pct unknown"), "{display}");
+        assert!(!display.contains('#'), "{display}");
+        assert!(!display.contains('%'), "{display}");
+    }
+
+    /// Two cadences, on purpose: the machine line keeps the interval that
+    /// bounds silence, the relayed line is spaced so it does not flood a
+    /// transcript. Driven by moving the clock rather than by sleeping.
+    #[test]
+    fn display_bars_are_spaced_while_the_machine_line_keeps_its_interval() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(5));
+        progress.phase("index", 100, 1000);
+        for _ in 0..3 {
+            progress.tick();
+        }
+        let text = captured(&buffer);
+        let bars = text.lines().filter(|l| l.starts_with("xerj-bar ")).count();
+        let records = text
+            .lines()
+            .filter(|l| l.starts_with("xerj-progress "))
+            .count();
+        assert_eq!(records, 4, "every tick records: {text}");
+        assert_eq!(bars, 1, "only the phase transition owed a bar: {text}");
+
+        // Age the last bar past the spacing and the next tick draws again.
+        progress.state.lock().unwrap().last_bar_at = Some(Instant::now() - Duration::from_secs(20));
+        progress.tick();
+        let text = captured(&buffer);
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("xerj-bar ")).count(),
+            2,
+            "{text}"
+        );
+
+        // The spacing rule itself, at the shipped defaults: the third 5 s tick
+        // owes the bar, the first two do not, and jitter cannot push it to the
+        // fourth.
+        let tick = STREAM_INTERVAL;
+        assert!(!bar_due(Duration::from_secs(5), tick, AGENT_BAR_INTERVAL));
+        assert!(!bar_due(Duration::from_secs(10), tick, AGENT_BAR_INTERVAL));
+        assert!(bar_due(
+            Duration::from_millis(14_998),
+            tick,
+            AGENT_BAR_INTERVAL
+        ));
+        // An interval wider than the spacing draws on every tick instead of
+        // skipping one and going silent for two minutes.
+        let slow = Duration::from_secs(60);
+        assert!(bar_due(
+            Duration::from_secs(60),
+            slow,
+            slow.max(AGENT_BAR_INTERVAL)
+        ));
+    }
+
+    /// A phase change jumps the spacing — but a run whose phases are all short
+    /// must not turn the relay into a wall of `0.0%` lines. Measured on a real
+    /// 11.8 s run: nine phases, five of them inside the first second.
+    #[test]
+    fn a_burst_of_short_phases_cannot_flood_the_relay() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(5));
+        for phase in ["walk", "hash", "scan", "prepare", "graph", "index"] {
+            progress.phase(phase, 10, 100);
+        }
+        let text = captured(&buffer);
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("xerj-progress "))
+                .count(),
+            6,
+            "every transition is still on the machine line: {text}"
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("xerj-bar ")).count(),
+            1,
+            "six phases inside the 2s floor draw one line, not six: {text}"
+        );
+
+        // The swallowed transition is owed, not dropped: once the floor has
+        // passed, the next tick shows the phase the run is actually in.
+        progress.state.lock().unwrap().last_bar_at = Some(Instant::now() - BAR_MIN_GAP);
+        progress.tick();
+        let display = captured(&buffer)
+            .lines()
+            .rfind(|l| l.starts_with("xerj-bar "))
+            .expect("a bar line")
+            .to_string();
+        assert!(display.contains("| index |"), "{display}");
+    }
+
+    /// What the run is waiting on is the most useful thing on the line and the
+    /// only unbounded field on it.
+    #[test]
+    fn the_relayed_line_names_the_file_and_keeps_a_long_path_bounded() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        progress.phase("index", 3, 30_000_000);
+        let _guard = progress.file(
+            "vendor/github.com/example/very/deeply/nested/module/benches/hdfs.json",
+            23_488_102,
+        );
+        progress.state.lock().unwrap().last_bar_at = None;
+        progress.tick();
+        let display = captured(&buffer)
+            .lines()
+            .rfind(|line| line.starts_with("xerj-bar "))
+            .expect("a bar line")
+            .to_string();
+        assert!(display.contains("waiting on …/"), "{display}");
+        assert!(display.contains("hdfs.json(22.4MB)"), "{display}");
+        // Snapped to a component boundary, so the elision never invents a
+        // directory name out of the middle of one.
+        assert_eq!(
+            elide_start("a/bbbbbbbbbb/cccccccccc/dddddddddd/ee.txt(1.0KB)", 30),
+            "…/dddddddddd/ee.txt(1.0KB)"
+        );
+        // A last component longer than the budget still yields its tail.
+        assert_eq!(elide_start("aaaaaaaaaaaaaaaa.txt", 10), "…aaaaa.txt");
+    }
+
     #[test]
     fn percent_is_bytes_based_when_bytes_are_known() {
         let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
@@ -1094,6 +1507,42 @@ mod tests {
         assert_eq!(last["exit"], 3);
         assert_eq!(last["reason"], "completed-with-junk");
         assert_eq!(last["files"], 1922);
+    }
+
+    /// `--progress json` promises one object per line, so the relayable view
+    /// has to arrive as a field. A JSON consumer must not have to re-derive a
+    /// bar to show its user the same thing a plain consumer sees.
+    #[test]
+    fn json_carries_the_bar_as_a_field_and_stays_one_object_per_line() {
+        let (progress, buffer) = Progress::capture(Surface::Json, Duration::from_secs(3600));
+        progress.phase("index", 4, 1000);
+        for _ in 0..3 {
+            progress.item_done(330);
+        }
+        progress.tick();
+        let text = captured(&buffer);
+        for line in text.lines() {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("{line}: {e}"));
+        }
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        let rendered = last["bar"].as_str().expect("a bar field");
+        assert!(rendered.starts_with("[##"), "{rendered}");
+        assert!(rendered.contains("99.0%"), "{rendered}");
+        assert!(rendered.contains("| index | 3/4 items"), "{rendered}");
+    }
+
+    /// The human at a terminal asked for this too — same helper, narrower bar,
+    /// still inside the width the line is truncated to.
+    #[test]
+    fn the_terminal_line_draws_the_same_bar() {
+        let (progress, buffer) = Progress::capture(Surface::Tty, Duration::from_secs(3600));
+        progress.phase("index", 1000, 1_000_000);
+        progress.item_done(500_000);
+        progress.tick();
+        let text = captured(&buffer);
+        assert!(text.contains("index [######------]"), "{text:?}");
+        assert!(text.contains(" 50.0%"), "{text:?}");
     }
 
     /// Exit 3 is success. The stream must say so in words, because an agent
