@@ -1115,8 +1115,10 @@ fn zero_live_documents_after_journaled_records_fails_the_run() {
 /// the REAL progress surface a production run uses:
 ///   1. phase B reports as it goes, with a percent and an ETA field;
 ///   2. the previously-silent finalize block reports at all;
-///   3. every run ends with a terminal line that states the outcome in words,
-///      because exit 3 is a success an agent otherwise reads as failure.
+///   3. every run on a surface that prints at all ends with a terminal line
+///      stating the outcome in words, because exit 3 is a success an agent
+///      otherwise reads as failure. (`--progress none` prints nothing —
+///      asserted by `quiet_runs_emit_no_progress_stream_at_all` below.)
 #[test]
 fn a_run_reports_progress_through_every_phase_and_closes_the_stream() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();

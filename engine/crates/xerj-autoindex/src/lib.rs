@@ -2622,9 +2622,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     } else {
         0
     };
-    // Terminal line, in every mode. Exit 3 means "completed, some files were
-    // unparseable" — success — and an agent reading a bare `3` off a silent
-    // stream reads failure (#241 §9). Say it in words.
+    // Terminal line, in every progress mode but `none` (which `--quiet`
+    // selects, and which prints nothing by definition). Exit 3 means
+    // "completed, some files were unparseable" — success — and an agent reading
+    // a bare `3` off a silent stream reads failure (#241 §9). Say it in words.
     pr.finish(
         true,
         code,

@@ -9,7 +9,11 @@
 //!   worker-driven heartbeat cannot bound silence — a timer can.
 //! * **Liveness is time-based, never item-based.** `--progress-interval`
 //!   seconds is the guaranteed upper bound on silence between the first phase
-//!   and the terminal line.
+//!   and the terminal line. It is an upper bound on silence *only* — never a
+//!   floor on the run: stopping the ticker must be observed at once, not at the
+//!   next tick, or a run that exits early pays the whole interval to shut down.
+//!   `--progress none` (`--quiet`) opts out of the surface entirely and so out
+//!   of both the liveness bound and the terminal line.
 //! * **Nothing is displayed that cannot be computed honestly.** A percent is
 //!   emitted only when a real denominator exists, and an ETA only after the
 //!   quality gate below is satisfied; otherwise the field is literally
@@ -452,14 +456,22 @@ impl Progress {
         self.emit();
     }
 
-    /// The terminal line, in every mode. An exit code alone is ambiguous —
-    /// autoindex exits 3 on success-with-junk — so the reason is spelled out.
+    /// The terminal line, in every mode that has a surface at all. An exit code
+    /// alone is ambiguous — autoindex exits 3 on success-with-junk — so the
+    /// reason is spelled out.
     ///
     /// Every run that *reaches an exit* emits exactly one of these: on success
     /// from the call sites below, and on any error path from [`Ticker::drop`].
-    /// A run killed by a signal, or aborted by a panic (the release profile is
-    /// `panic = "abort"`, so unwinding never reaches `Drop`), cannot print one
-    /// — which is itself the signal that the process died abnormally.
+    ///
+    /// Two documented exceptions, both of which a caller must plan for:
+    /// - [`Surface::Silent`] (`--progress none`, which `--quiet` selects)
+    ///   returns early below and emits nothing — no progress and no terminal
+    ///   line. A quiet run is watched with `autoindex status` or its exit code,
+    ///   never by waiting on this stream. (A fatal `error:` line is printed by
+    ///   the caller and is unaffected.)
+    /// - A run killed by a signal, or aborted by a panic (the release profile
+    ///   is `panic = "abort"`, so unwinding never reaches `Drop`), cannot print
+    ///   one — which is itself the signal that the process died abnormally.
     pub fn finish(&self, ok: bool, exit: i32, reason: &str, extra: &[(&str, u64)]) {
         if self.reported.swap(true, Ordering::SeqCst) || !self.enabled() {
             return;
@@ -662,17 +674,38 @@ impl Progress {
         let interval = self.interval;
         let handle = std::thread::Builder::new()
             .name("autoindex-progress".into())
-            .spawn(move || loop {
-                let stopped = progress.stopped.lock().unwrap();
-                let (stopped, _timeout) = progress
-                    .wake
-                    .wait_timeout(stopped, interval)
-                    .expect("progress ticker mutex poisoned");
-                if *stopped {
-                    break;
+            .spawn(move || {
+                // Hold the guard across the loop and test the flag BEFORE
+                // waiting. A condvar notification reaches only threads already
+                // parked in `wait`, so a `stop()` that lands while this thread
+                // is anywhere else — above all before its very first wait — is
+                // delivered to nobody and is gone. Re-checking the predicate
+                // under the lock is what makes it impossible to miss: the flag
+                // is set under the same mutex, so either we see it here or we
+                // are already parked and the notify wakes us.
+                //
+                // Getting this wrong is not a latency detail. `Ticker::drop`
+                // joins this thread, so a lost stop turns every early exit —
+                // `es.ping()` refused, `no-files`, a small `--dry-run` — into a
+                // full `--progress-interval` of silence AFTER the terminal line
+                // has printed, and `--progress-interval 3600` makes that an
+                // hour.
+                let mut stopped = progress.stopped.lock().unwrap();
+                while !*stopped {
+                    let (guard, _timeout) = progress
+                        .wake
+                        .wait_timeout(stopped, interval)
+                        .expect("progress ticker mutex poisoned");
+                    stopped = guard;
+                    if *stopped {
+                        break;
+                    }
+                    // Never emit while holding `stopped`: `stop()` would block
+                    // behind a write to a slow pipe.
+                    drop(stopped);
+                    progress.emit();
+                    stopped = progress.stopped.lock().unwrap();
                 }
-                drop(stopped);
-                progress.emit();
             })
             .ok();
         Ticker {
@@ -1203,6 +1236,104 @@ mod tests {
         assert!(
             (80.0..=120.0).contains(&eta),
             "a displayed ETA may move at most 20% per tick, got {eta}"
+        );
+    }
+
+    /// Run `f` on its own thread and return how long it took, or `None` if it
+    /// had not finished within `limit`. The thread is deliberately **not**
+    /// joined on the timeout path: the failure under test is a thread that is
+    /// parked for an entire `--progress-interval`, so joining it would make a
+    /// failing test hang for that interval instead of reporting in seconds.
+    fn time_boxed(limit: Duration, f: impl FnOnce() + Send + 'static) -> Option<Duration> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            f();
+            let _ = tx.send(start.elapsed());
+        });
+        rx.recv_timeout(limit).ok()
+    }
+
+    /// Window 1 — `stop()` before the ticker's first wait.
+    ///
+    /// A condvar notification reaches only threads already parked in `wait`.
+    /// The original loop locked `stopped` and went straight into
+    /// `wait_timeout` without testing the flag, so a `stop()` that landed
+    /// before the thread parked was delivered to nobody, and `Ticker::drop`'s
+    /// `join()` blocked for a full `--progress-interval`. Every early exit hits
+    /// this: `es.ping()` refused (lib.rs), the `no-files` return, a small
+    /// `--dry-run`.
+    ///
+    /// The interval here is an hour against a five-second box, so the assertion
+    /// cannot pass by being lucky with the scheduler and no machine is slow
+    /// enough to make a correct implementation fail it. Fifty attempts because
+    /// the defect is a race: pre-fix, the standalone reproduction of this loop
+    /// hung 11/12 at a 5 s interval and 4/5 at 30 s, not 12/12.
+    #[test]
+    fn a_stop_before_the_first_wait_is_not_lost() {
+        for attempt in 0..50 {
+            let blocked = time_boxed(Duration::from_secs(5), || {
+                let (progress, _buffer) =
+                    Progress::capture(Surface::Plain, Duration::from_secs(3600));
+                let ticker = progress.spawn_ticker();
+                drop(ticker);
+            });
+            assert!(
+                blocked.is_some(),
+                "attempt {attempt}: drop(ticker) had not returned after 5s at a \
+                 3600s interval — the stop() racing the ticker's first wait was \
+                 lost, and a real run would sit silent for the whole interval"
+            );
+        }
+    }
+
+    /// Window 2 — `stop()` while the ticker is inside `emit()`.
+    ///
+    /// Held deterministically open rather than raced for: the capture sink
+    /// takes the buffer mutex on every write, so holding that mutex parks the
+    /// ticker thread inside `emit()`, provably outside `wait_timeout`. The
+    /// wakeup is delivered by `notify_all` directly (the interval is an hour,
+    /// so the timeout can never rescue a broken loop), and `stop()` is made to
+    /// land while the thread is parked in the sink. A loop that re-enters
+    /// `wait_timeout` without re-testing the flag hangs for the hour.
+    #[test]
+    fn a_stop_that_lands_while_the_ticker_is_emitting_is_not_lost() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        let ticker = progress.spawn_ticker();
+
+        // Own the sink the ticker writes to, then wake it. Notified repeatedly
+        // for 300 ms rather than once, because a notify sent before the thread
+        // parks is lost by definition — that is this module's whole subject,
+        // and a single early notify would leave the thread parked, where
+        // `stop()` wakes it normally and the test proves nothing. After this
+        // loop the thread is provably blocked in `emit()`: it took at least one
+        // notify while parked, and it cannot return to `wait_timeout` until the
+        // sink is released. The notifies stop here, so nothing rescues a loop
+        // that re-parks after emitting.
+        let held = buffer.lock().unwrap();
+        for _ in 0..60 {
+            progress.wake.notify_all();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Drop on another thread: stop() takes `stopped` (which the ticker is
+        // not holding while it emits) and lands now; join() then blocks.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            drop(ticker);
+            let _ = tx.send(start.elapsed());
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Let emit() complete. A loop that re-tests the flag exits here; one
+        // that goes straight back into wait_timeout sleeps for the hour.
+        drop(held);
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "drop(ticker) had not returned after 5s at a 3600s interval — a \
+             stop() that landed while the ticker was emitting was lost"
         );
     }
 }

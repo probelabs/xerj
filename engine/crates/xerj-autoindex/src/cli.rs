@@ -146,11 +146,16 @@ pub fn print_help() {
          PROGRESS STREAM:\n\
              stdout is the RESULT, stderr is PROGRESS — pipe them separately.\n\
              Every run that reaches an exit — success OR error — ends with one\n\
-             terminal line, in every mode, so an outcome never has to be guessed\n\
-             from silence:\n\
+             terminal line, in every progress mode EXCEPT `none` (which --quiet\n\
+             selects), so an outcome never has to be guessed from silence:\n\
                xerj-done ok=true exit=3 reason=completed-with-junk wall=57.6s …\n\
-             (A run killed by a signal cannot print one; a missing terminal line\n\
-             after the process is gone means it died, not that it finished.)\n\
+             --quiet/--progress none prints no progress and NO terminal line\n\
+             (only a fatal `error:` line, if any) — poll `autoindex status\n\
+             --state-dir <dir>` or read the exit code instead of waiting for\n\
+             output that never comes.\n\
+             (A run killed by a signal cannot print one either; a missing\n\
+             terminal line after the process is gone means it died, not that it\n\
+             finished.)\n\
              --progress plain emits `xerj-progress phase=… pct=… eta_s=…` lines;\n\
              `pct`/`eta_s` are the literal word `unknown` (JSON null) whenever they\n\
              cannot be computed honestly, never a filler number.\n\
