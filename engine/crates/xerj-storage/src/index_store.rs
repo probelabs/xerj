@@ -24,7 +24,7 @@
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
@@ -37,13 +37,30 @@ use crate::{Result, SeqNo, StorageError};
 
 // ── Data-directory format marker (RC4 W3 #10) ─────────────────────────────────
 
-/// On-disk format version of the *data directory* as a whole — distinct from
-/// the per-segment `.seg` `FORMAT_VERSION` in `segment.rs`. Bumped only on an
-/// incompatible change to the data-dir layout / manifest. A binary refuses to
-/// open a data dir whose recorded marker version is greater than this, because
-/// opening data written in a format it does not understand risks silent
-/// corruption or loss.
-const DATA_DIR_FORMAT_VERSION: u32 = 1;
+/// Highest on-disk data-directory format this binary can read.
+///
+/// Version 2 reserves digest-derived FTS field filename components. A v2
+/// binary can read v1 raw side-cars, but a v1 binary must refuse a directory
+/// after the first v2 side-car can be created.
+const DATA_DIR_FORMAT_VERSION: u32 = 2;
+
+/// Baseline written for fresh and pre-marker directories.
+///
+/// Merely opening a directory with a newer binary must not make rollback
+/// impossible. The marker advances to v2 only at the durable preflight for a
+/// writer that will create an encoded FTS field filename.
+const DATA_DIR_BASE_FORMAT_VERSION: u32 = 1;
+
+/// First layout version that permits digest-derived FTS field components.
+const DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION: u32 = 2;
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataDirFormatWriteFailpoint {
+    BeforeTempWrite = 1,
+    BeforeRename = 2,
+    BeforeParentFsync = 3,
+}
 
 /// Name of the format-marker file written at the data-dir root.
 const DATA_DIR_META_FILE: &str = "xerj_meta.json";
@@ -437,6 +454,22 @@ pub struct IndexStore {
     /// Root directory for this index's data files.
     pub data_dir: PathBuf,
     config: IndexStoreConfig,
+    /// Serializes monotonic data-directory marker advancement. The durable
+    /// writer itself is atomic, but without this latch concurrent future
+    /// version transitions could let a lower version overwrite a higher one.
+    data_dir_format_lock: Mutex<()>,
+    /// Process-local proof that the v2 marker has crossed the platform's
+    /// durable-publication boundary: parent-directory fsync on Unix, or
+    /// same-directory Win32 write-through replacement on Windows. Merely
+    /// observing v2 is insufficient: Unix may expose a rename before its
+    /// parent fsync, and an older Windows build may have used the non-durable
+    /// directory-sync shim. The format lock serializes the false -> true
+    /// transition so concurrent flush/merge retries cannot bypass confirmation.
+    fts_v2_marker_durability_confirmed: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    data_dir_format_write_failpoint: std::sync::atomic::AtomicU8,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fts_v2_marker_durability_confirmations: AtomicU64,
     /// Actual memtable shard count, derived at open time from
     /// `IndexStoreConfig.num_wal_shards.max(1).next_power_of_two()`.
     num_shards: usize,
@@ -641,6 +674,12 @@ impl IndexStore {
         let store = Arc::new(Self {
             data_dir: data_dir.clone(),
             config,
+            data_dir_format_lock: Mutex::new(()),
+            fts_v2_marker_durability_confirmed: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            data_dir_format_write_failpoint: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fts_v2_marker_durability_confirmations: AtomicU64::new(0),
             num_shards,
             snapshot: ArcSwap::from_pointee(snapshot),
             wal_shards,
@@ -1173,7 +1212,7 @@ impl IndexStore {
                 return false;
             }
             let rest = &name[prefix.len()..];
-            if matches!(rest, "seg" | "sidx" | "ids" | "dv") {
+            if matches!(rest, "seg" | "sidx" | "ids" | "dv" | "fts-layout-v2") {
                 if !roles.insert(rest) {
                     return false;
                 }
@@ -1317,7 +1356,8 @@ impl IndexStore {
 
     /// Unlink every on-disk file belonging to the given segment ids — the
     /// primary `.seg` plus all side-cars (`.sidx`, `.ids`, `.dv`,
-    /// `.<field>.post` / `.fst` / `.meta` / `.norms`).
+    /// `.<field>.post` / `.fst` / `.meta` / `.norms`) and the optional
+    /// `.fts-layout-v2` discriminator.
     ///
     /// Disk-space fix (2026-07): called by the engine merge task right
     /// after `apply_merge` commits, so merged-away input segments are
@@ -3027,6 +3067,12 @@ impl IndexStore {
     ///   (a newer xerj wrote this dir; we may not understand its layout).
     /// - Marker present but UNPARSEABLE → REFUSE (corrupt marker).
     fn check_data_dir_version(data_dir: &Path) -> Result<()> {
+        Self::check_data_dir_version_with_max(data_dir, DATA_DIR_FORMAT_VERSION)
+    }
+
+    /// Version-parameterized form used by the compatibility regression to
+    /// exercise exactly what a v1 binary does when it sees a v2 marker.
+    fn check_data_dir_version_with_max(data_dir: &Path, max_supported: u32) -> Result<()> {
         let path = Self::data_dir_meta_path(data_dir);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -3041,14 +3087,14 @@ impl IndexStore {
                 path.display()
             ))
         })?;
-        if meta.format_version > DATA_DIR_FORMAT_VERSION {
+        if meta.format_version > max_supported {
             return Err(StorageError::IncompatibleDataDir(format!(
                 "data dir {} was written by a newer xerj (data-dir format \
                  version {}); this binary supports up to {}. Refusing to open \
                  — upgrade xerj to a build that understands format {}.",
                 data_dir.display(),
                 meta.format_version,
-                DATA_DIR_FORMAT_VERSION,
+                max_supported,
                 meta.format_version
             )));
         }
@@ -3067,7 +3113,7 @@ impl IndexStore {
             return Ok(());
         }
         let meta = DataDirMeta {
-            format_version: DATA_DIR_FORMAT_VERSION,
+            format_version: DATA_DIR_BASE_FORMAT_VERSION,
             xerj_version: env!("CARGO_PKG_VERSION").to_string(),
         };
         let bytes = serde_json::to_vec(&meta)?;
@@ -3075,6 +3121,158 @@ impl IndexStore {
         // must not silently re-appear as "no marker" and skip the version gate.
         xerj_common::fsio::write_file_durable(&path, &bytes)?;
         Ok(())
+    }
+
+    /// Durably fence a writer before it creates digest-derived FTS side-cars.
+    ///
+    /// The marker reaches disk before the first v2 filename. A v1 process
+    /// therefore either sees a v1-only directory or refuses the complete v2
+    /// directory; it can never open v2 filenames as if they were v1. The
+    /// transition is intentionally monotonic: if later segment publication
+    /// fails, retaining v2 is the safe crash/retry outcome.
+    ///
+    /// Product-level cross-process exclusion is provided by Engine's
+    /// `<server-data-dir>/node.lock`. The mutex here covers concurrent flush
+    /// and merge callers inside that one supported writer process; opening
+    /// multiple raw `IndexStore`s on the same directory remains unsupported.
+    pub fn ensure_fts_encoded_field_component_format(&self) -> Result<()> {
+        let _format_guard = self.data_dir_format_lock.lock().unwrap();
+        if self
+            .fts_v2_marker_durability_confirmed
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let path = Self::data_dir_meta_path(&self.data_dir);
+        let mut document = match std::fs::read(&path) {
+            Ok(bytes) => Some(serde_json::from_slice::<serde_json::Value>(&bytes).map_err(
+                |error| {
+                    StorageError::IncompatibleDataDir(format!(
+                        "data-dir format marker {} is present but unparseable ({error}). Refusing to write encoded FTS side-cars.",
+                        path.display()
+                    ))
+                },
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        if let Some(value) = document.as_ref() {
+            let meta: DataDirMeta = serde_json::from_value(value.clone()).map_err(|error| {
+                StorageError::IncompatibleDataDir(format!(
+                    "data-dir format marker {} has an incompatible shape ({error}). Refusing to write encoded FTS side-cars.",
+                    path.display()
+                ))
+            })?;
+            if meta.format_version > DATA_DIR_FORMAT_VERSION {
+                return Err(StorageError::IncompatibleDataDir(format!(
+                    "data dir {} records unsupported format version {}; this binary supports up to {}",
+                    self.data_dir.display(),
+                    meta.format_version,
+                    DATA_DIR_FORMAT_VERSION
+                )));
+            }
+            if meta.format_version >= DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION {
+                // Do not trust visibility as proof of durability. A previous
+                // attempt may have renamed v2 into place and then failed its
+                // durability confirmation. Re-establish that proof now, while
+                // still holding the transition lock, before permitting any
+                // encoded FTS filename to be created.
+                #[cfg(not(windows))]
+                if let Some(parent) = path.parent() {
+                    xerj_common::fsio::fsync_dir(parent)?;
+                }
+                // Windows has no parent-directory fsync contract. Rewrite the
+                // exact visible marker through the Win32 write-through replace
+                // path instead. Besides confirming current writes, this safely
+                // upgrades a marker left visible by an older build whose
+                // Windows directory-sync shim was a no-op.
+                #[cfg(windows)]
+                xerj_common::fsio::write_file_durable(&path, &std::fs::read(&path)?)?;
+                self.note_fts_v2_marker_durability_confirmed();
+                return Ok(());
+            }
+        }
+
+        let document = document.get_or_insert_with(|| serde_json::json!({}));
+        let object = document.as_object_mut().ok_or_else(|| {
+            StorageError::IncompatibleDataDir(format!(
+                "data-dir format marker {} must be a JSON object",
+                path.display()
+            ))
+        })?;
+        object.insert(
+            "format_version".to_string(),
+            serde_json::Value::from(DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION),
+        );
+        object.insert(
+            "xerj_version".to_string(),
+            serde_json::Value::from(env!("CARGO_PKG_VERSION")),
+        );
+        let bytes = serde_json::to_vec(document)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let failpoint = self
+                .data_dir_format_write_failpoint
+                .swap(0, Ordering::AcqRel);
+            xerj_common::fsio::write_file_durable_with_hook(&path, &bytes, |stage| {
+                use xerj_common::fsio::DurableWriteStage;
+                let injected_stage = match failpoint {
+                    x if x == DataDirFormatWriteFailpoint::BeforeTempWrite as u8 => {
+                        Some(DurableWriteStage::BeforeTempWrite)
+                    }
+                    x if x == DataDirFormatWriteFailpoint::BeforeRename as u8 => {
+                        Some(DurableWriteStage::BeforeRename)
+                    }
+                    x if x == DataDirFormatWriteFailpoint::BeforeParentFsync as u8 => {
+                        Some(DurableWriteStage::BeforeParentFsync)
+                    }
+                    _ => None,
+                };
+                if injected_stage == Some(stage) {
+                    Err(std::io::Error::other(
+                        "injected data-directory marker persistence failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        xerj_common::fsio::write_file_durable(&path, &bytes)?;
+        self.note_fts_v2_marker_durability_confirmed();
+        Ok(())
+    }
+
+    fn note_fts_v2_marker_durability_confirmed(&self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.fts_v2_marker_durability_confirmations
+            .fetch_add(1, Ordering::AcqRel);
+        self.fts_v2_marker_durability_confirmed
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_data_dir_format_write_failpoint_for_test(
+        &self,
+        failpoint: DataDirFormatWriteFailpoint,
+    ) {
+        self.data_dir_format_write_failpoint
+            .store(failpoint as u8, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fts_v2_marker_durability_confirmations_for_test(&self) -> u64 {
+        self.fts_v2_marker_durability_confirmations
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn clear_fts_v2_marker_durability_confirmation_for_test(&self) {
+        self.fts_v2_marker_durability_confirmed
+            .store(false, Ordering::Release);
+        self.fts_v2_marker_durability_confirmations
+            .store(0, Ordering::Release);
     }
 
     // ── Segment version map rebuild ───────────────────────────────────────────
@@ -4134,6 +4332,48 @@ mod tests {
         assert!(!store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
         store.cleanup_orphaned_segment_files().unwrap();
         assert!(!complete.exists(), "orphan cleanup must remove `.complete`");
+    }
+
+    #[test]
+    fn fts_layout_discriminator_is_manifested_and_removed_with_its_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        // `delete_segment_files` intentionally recognizes only the engine's
+        // canonical UUID-shaped segment prefix. Use a real-shaped id so this
+        // assertion exercises production cleanup rather than a no-op fixture.
+        let segment_id = "12345678-1234-1234-1234-123456789abc";
+        let segments = dir.path().join("segments");
+        for (role, bytes) in [
+            ("seg", b"segment".as_slice()),
+            ("sidx", b"sidx".as_slice()),
+            ("ids", b"ids".as_slice()),
+            ("fts-layout-v2", b"XERJ_FTS_FILENAME_LAYOUT_V2\n".as_slice()),
+        ] {
+            std::fs::write(segments.join(format!("{segment_id}.{role}")), bytes).unwrap();
+        }
+        let meta = SegmentMeta {
+            id: segment_id.to_owned(),
+            doc_count: 1,
+            size_bytes: 7,
+            min_seq_no: 1,
+            max_seq_no: 1,
+            created_at_ms: 0,
+            has_tombstones: false,
+            seg_path: format!("{segment_id}.seg"),
+            sidx_path: format!("{segment_id}.sidx"),
+        };
+        store.write_flush_completion_manifest(&meta).unwrap();
+        assert!(store.validate_flush_completion_manifest(segment_id, 1, 1, 1));
+
+        let (removed, _) = store.delete_segment_files(&[segment_id.to_owned()]);
+        assert_eq!(removed, 5, "segment family includes the discriminator");
+        assert!(std::fs::read_dir(&segments)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{segment_id}."))));
     }
 
     #[test]
@@ -5540,7 +5780,152 @@ mod tests {
 
         assert!(marker.exists(), "open() must stamp {DATA_DIR_META_FILE}");
         let meta: DataDirMeta = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
-        assert_eq!(meta.format_version, DATA_DIR_FORMAT_VERSION);
+        assert_eq!(meta.format_version, DATA_DIR_BASE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn ordinary_reopen_does_not_advance_the_baseline_format_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_test_store(dir.path()));
+        drop(open_test_store(dir.path()));
+
+        let marker = dir.path().join(DATA_DIR_META_FILE);
+        let meta: DataDirMeta = serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+        assert_eq!(meta.format_version, DATA_DIR_BASE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn encoded_fts_preflight_advances_marker_and_v1_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let marker = dir.path().join(DATA_DIR_META_FILE);
+        let mut before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        before["future_provenance"] = serde_json::json!({"keep": true});
+        std::fs::write(&marker, serde_json::to_vec(&before).unwrap()).unwrap();
+
+        store.ensure_fts_encoded_field_component_format().unwrap();
+        // The transition is idempotent and may be called by concurrent flush
+        // or merge preflights without changing its result.
+        store.ensure_fts_encoded_field_component_format().unwrap();
+
+        let marker_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        let meta: DataDirMeta = serde_json::from_value(marker_value.clone()).unwrap();
+        assert_eq!(
+            meta.format_version,
+            DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION
+        );
+        assert_eq!(marker_value["future_provenance"]["keep"], true);
+        assert!(IndexStore::check_data_dir_version_with_max(
+            dir.path(),
+            DATA_DIR_BASE_FORMAT_VERSION
+        )
+        .is_err());
+        assert!(IndexStore::check_data_dir_version(dir.path()).is_ok());
+
+        drop(store);
+        drop(open_test_store(dir.path()));
+    }
+
+    #[test]
+    fn failed_encoded_fts_marker_persistence_is_conservative_at_every_boundary() {
+        for (failpoint, expected_version) in [
+            (DataDirFormatWriteFailpoint::BeforeTempWrite, 1),
+            (DataDirFormatWriteFailpoint::BeforeRename, 1),
+            (DataDirFormatWriteFailpoint::BeforeParentFsync, 2),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_test_store(dir.path());
+            store.set_data_dir_format_write_failpoint_for_test(failpoint);
+
+            assert!(store.ensure_fts_encoded_field_component_format().is_err());
+            assert_eq!(store.fts_v2_marker_durability_confirmations_for_test(), 0);
+            let marker = dir.path().join(DATA_DIR_META_FILE);
+            let meta: DataDirMeta =
+                serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+            assert_eq!(meta.format_version, expected_version, "{failpoint:?}");
+            assert!(IndexStore::check_data_dir_version(dir.path()).is_ok());
+            if expected_version == 2 {
+                assert!(IndexStore::check_data_dir_version_with_max(dir.path(), 1).is_err());
+            }
+
+            // In the post-rename case the v2 bytes are already visible, but
+            // retry must not treat visibility as durability. It crosses one
+            // platform-appropriate durable replacement confirmation before
+            // the store records success.
+            store.ensure_fts_encoded_field_component_format().unwrap();
+            assert_eq!(store.fts_v2_marker_durability_confirmations_for_test(), 1);
+            store.ensure_fts_encoded_field_component_format().unwrap();
+            assert_eq!(store.fts_v2_marker_durability_confirmations_for_test(), 1);
+        }
+    }
+
+    #[test]
+    fn concurrent_encoded_fts_preflights_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.ensure_fts_encoded_field_component_format()
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let marker = dir.path().join(DATA_DIR_META_FILE);
+        let meta: DataDirMeta = serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+        assert_eq!(
+            meta.format_version,
+            DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION
+        );
+        assert_eq!(store.fts_v2_marker_durability_confirmations_for_test(), 1);
+    }
+
+    #[test]
+    fn concurrent_retries_confirm_visible_unconfirmed_v2_marker_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store.set_data_dir_format_write_failpoint_for_test(
+            DataDirFormatWriteFailpoint::BeforeParentFsync,
+        );
+        assert!(store.ensure_fts_encoded_field_component_format().is_err());
+        assert_eq!(store.fts_v2_marker_durability_confirmations_for_test(), 0);
+
+        let marker = dir.path().join(DATA_DIR_META_FILE);
+        let meta: DataDirMeta = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(
+            meta.format_version, DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION,
+            "the injected post-rename failure must leave v2 visible but unconfirmed"
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.ensure_fts_encoded_field_component_format()
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        assert_eq!(
+            store.fts_v2_marker_durability_confirmations_for_test(),
+            1,
+            "the format mutex must serialize visible-marker durability confirmation"
+        );
     }
 
     /// THE UPGRADE PATH: an rc3-vintage data dir has NO format marker (rc3

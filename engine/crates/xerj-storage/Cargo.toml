@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 description = "Storage engine for xerj: WAL, segment format, mmap reads, pluggable backends"
 
+[features]
+default = []
+test-hooks = []
+
 [dependencies]
 xerj-common = { path = "../xerj-common" }
 

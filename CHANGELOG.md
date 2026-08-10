@@ -56,6 +56,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance made the enforced floor `interval/2` shorter — 12.5 s at the
   shipped defaults. Measured at `--progress-interval 10`: 11 of 11 same-phase
   gaps under 15 s (min 10.0 s) before, none after (min 19.3 s).
+- **Text field names containing path separators can be flushed and reopened.**
+  FTS side-car filenames previously interpolated the raw field name, so a name
+  such as `styles_blocks_core/site-title` became a child path and prevented the
+  segment from being published. Unsafe or overlong field names now use one
+  deterministic bounded filename component. Existing portable names retain
+  their byte-identical paths. Each segment has an immutable filename-layout
+  discriminator: absence means the historical raw layout; an explicit marker
+  means the encoded layout. Readers never infer the layout from side-car file
+  existence, preventing partial files and raw names that resemble digests from
+  aliasing another field. Before the discriminator or first encoded side-car
+  is written, the index durably advances its data-directory marker to format 2;
+  older binaries refuse that index instead of silently missing the new layout.
+  A retry after a post-rename marker failure must re-establish durable marker
+  publication before writing the discriminator or encoded FTS paths. Unix
+  confirms the parent-directory fsync; Windows uses a same-directory Win32
+  write-through replacement rather than claiming its directory-sync no-op is
+  durable. Safe-only indices remain format 1.
 
 ## [1.0.0-rc.15] - 2026-08-10
 

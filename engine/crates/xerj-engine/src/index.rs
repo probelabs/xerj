@@ -829,10 +829,25 @@ mod flush_publication_recovery_tests {
 
     static FLUSH_FAULT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    fn data_dir_format_version(index: &Index) -> u64 {
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(index.data_dir.join("xerj_meta.json")).unwrap())
+                .unwrap();
+        marker["format_version"].as_u64().unwrap()
+    }
+
     fn text_schema() -> Schema {
         let mut schema = Schema::empty();
         schema
             .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    fn slash_field_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("bad/field", FieldType::Text))
             .unwrap();
         schema
     }
@@ -1142,6 +1157,203 @@ mod flush_publication_recovery_tests {
         let idx = restarted.get_index("bm25-failed-publication").unwrap();
         idx.abort_background_tasks();
         assert_eq!(idx.search(&request).await.unwrap().hits[0].id, "survivor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slash_field_flush_publishes_and_restarts_searchable() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("slash-field-publish", slash_field_schema())
+            .unwrap();
+        let idx = engine.get_index("slash-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 1);
+        idx.index_document(Some("survivor".into()), json!({"bad/field": "slashneedle"}))
+            .await
+            .unwrap();
+
+        idx.flush().await.unwrap();
+        assert_eq!(data_dir_format_version(&idx), 2);
+        assert_eq!(idx.memtable.doc_count(), 0);
+        assert_eq!(idx.store.snapshot().segments.len(), 1);
+        assert!(idx.data_dir.join("snapshot.json").is_file());
+        let segment_entries: Vec<_> = std::fs::read_dir(idx.data_dir.join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert!(segment_entries
+            .iter()
+            .all(|entry| entry.file_type().unwrap().is_file()));
+        assert!(segment_entries.iter().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".fts-layout-v2")));
+
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"bad/field": "slashneedle"}},
+            "size": 10,
+            "track_total_hits": true
+        }))
+        .unwrap();
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "survivor");
+        drop(idx);
+        drop(engine);
+
+        let restarted = crate::Engine::new(config).unwrap();
+        let idx = restarted.get_index("slash-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 2);
+        assert_eq!(idx.store.snapshot().segments.len(), 1);
+        assert_eq!(idx.memtable.doc_count(), 0);
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "survivor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn portable_field_flush_keeps_baseline_data_dir_format() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("portable-field-publish", text_schema())
+            .unwrap();
+        let idx = engine.get_index("portable-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 1);
+        idx.index_document(Some("safe".into()), json!({"body": "portable"}))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        assert_eq!(data_dir_format_version(&idx), 1);
+        drop(idx);
+        drop(engine);
+
+        let restarted = crate::Engine::new(config).unwrap();
+        let idx = restarted.get_index("portable-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn marker_preflight_failure_writes_no_encoded_sidecars_and_retry_recovers() {
+        use xerj_storage::index_store::DataDirFormatWriteFailpoint;
+
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        for (position, failpoint, expected_version) in [
+            (
+                "temp write",
+                DataDirFormatWriteFailpoint::BeforeTempWrite,
+                1,
+            ),
+            ("rename", DataDirFormatWriteFailpoint::BeforeRename, 1),
+            (
+                "parent fsync",
+                DataDirFormatWriteFailpoint::BeforeParentFsync,
+                2,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(config).unwrap();
+            let index_name = format!("slash-field-marker-{}", position.replace(' ', "-"));
+            engine
+                .create_index(&index_name, slash_field_schema())
+                .unwrap();
+            let idx = engine.get_index(&index_name).unwrap();
+            idx.abort_background_tasks();
+            idx.index_document(Some("survivor".into()), json!({"bad/field": "slashneedle"}))
+                .await
+                .unwrap();
+            idx.store
+                .set_data_dir_format_write_failpoint_for_test(failpoint);
+
+            let error = idx.flush().await.unwrap_err().to_string();
+            assert!(
+                error.contains("marker persistence failure"),
+                "unexpected {position} error: {error}"
+            );
+            assert_eq!(
+                data_dir_format_version(&idx),
+                expected_version,
+                "{position}"
+            );
+            let entries: Vec<String> = std::fs::read_dir(idx.data_dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                entries
+                    .iter()
+                    .all(|name| !name.contains("__xerj_fts_field_sha256_")),
+                "{position} failure wrote an encoded side-car: {entries:?}"
+            );
+            assert!(
+                entries.iter().all(|name| !name.ends_with(".fts-layout-v2")),
+                "{position} failure published a layout discriminator: {entries:?}"
+            );
+            assert_eq!(
+                idx.store.fts_v2_marker_durability_confirmations_for_test(),
+                0,
+                "{position} must not claim marker durability after failure"
+            );
+            assert_eq!(idx.memtable.doc_count(), 1);
+
+            // Split the retry at its preflight boundary: confirmation must
+            // cross one platform-appropriate durable-publication boundary
+            // (Unix parent fsync or Windows write-through replacement) while
+            // no discriminator, encoded temporary path, or encoded final path
+            // exists yet.
+            idx.store
+                .ensure_fts_encoded_field_component_format()
+                .unwrap();
+            assert_eq!(
+                idx.store.fts_v2_marker_durability_confirmations_for_test(),
+                1,
+                "{position} retry must establish durability exactly once"
+            );
+            let after_confirmation: Vec<String> = std::fs::read_dir(idx.data_dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(after_confirmation.iter().all(|name| {
+                !name.contains("__xerj_fts_field_sha256_") && !name.ends_with(".fts-layout-v2")
+            }));
+
+            idx.flush().await.unwrap();
+            assert_eq!(
+                idx.store.fts_v2_marker_durability_confirmations_for_test(),
+                1,
+                "{position} publication must reuse the confirmed preflight"
+            );
+            assert_eq!(data_dir_format_version(&idx), 2);
+            assert_eq!(idx.memtable.doc_count(), 0);
+            assert!(std::fs::read_dir(idx.data_dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("__xerj_fts_field_sha256_")));
+            assert!(std::fs::read_dir(idx.data_dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".fts-layout-v2")));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1828,6 +2040,131 @@ mod merge_publication_transaction_tests {
         config.merge.min_merge_count = 2;
         config.merge.max_merge_count = 2;
         config
+    }
+
+    fn dot_field_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new(".", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    fn marker_version(index: &Index) -> u64 {
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(index.data_dir.join("xerj_meta.json")).unwrap())
+                .unwrap();
+        marker["format_version"].as_u64().unwrap()
+    }
+
+    async fn v1_raw_dot_field_merge_fixture(
+        dir: &TempDir,
+        index_name: &str,
+    ) -> (Engine, Arc<Index>, String, PathBuf) {
+        use sha2::{Digest, Sha256};
+
+        let engine = Engine::new(config(dir)).unwrap();
+        engine.create_index(index_name, dot_field_schema()).unwrap();
+        let index = engine.get_index(index_name).unwrap();
+        index.abort_background_tasks();
+        for (id, value) in [("one", "alpha"), ("two", "beta")] {
+            index
+                .index_document(Some(id.into()), serde_json::json!({".": value}))
+                .await
+                .unwrap();
+            index.flush().await.unwrap();
+        }
+        assert_eq!(index.store.snapshot().segments.len(), 2);
+        assert_eq!(marker_version(&index), 2);
+
+        // Rewrite the two input families into the exact v1 raw layout and
+        // restore a v1 marker. This models segments published by the old
+        // writer without needing an old binary inside this unit test.
+        let component = format!("__xerj_fts_field_sha256_{:x}", Sha256::digest(b"."));
+        let segments_dir = index.data_dir.join("segments");
+        for meta in index.store.snapshot().segments.iter() {
+            for extension in ["fst", "post", "meta", "norms"] {
+                let current = segments_dir.join(format!("{}.{}.{}", meta.id, component, extension));
+                let legacy = segments_dir.join(format!("{}...{}", meta.id, extension));
+                std::fs::rename(current, legacy).unwrap();
+            }
+            std::fs::remove_file(segments_dir.join(format!("{}.fts-layout-v2", meta.id))).unwrap();
+        }
+        std::fs::write(
+            index.data_dir.join("xerj_meta.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "format_version": 1,
+                "xerj_version": "v1-test-fixture"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        index
+            .store
+            .clear_fts_v2_marker_durability_confirmation_for_test();
+        assert_eq!(marker_version(&index), 1);
+        (engine, index, component, segments_dir)
+    }
+
+    #[tokio::test]
+    async fn merging_v1_raw_unsafe_fields_advances_marker_before_encoded_output() {
+        let dir = TempDir::new().unwrap();
+        let (_engine, index, component, segments_dir) =
+            v1_raw_dot_field_merge_fixture(&dir, "v1-raw-fts-merge").await;
+
+        assert_eq!(index.run_merge_once().await.unwrap(), 1);
+        assert_eq!(marker_version(&index), 2);
+        let snapshot = index.store.snapshot();
+        assert_eq!(snapshot.segments.len(), 1);
+        let output = &snapshot.segments[0];
+        assert!(segments_dir
+            .join(format!("{}.fts-layout-v2", output.id))
+            .is_file());
+        for extension in ["fst", "post", "meta", "norms"] {
+            assert!(segments_dir
+                .join(format!("{}.{}.{}", output.id, component, extension))
+                .is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_marker_failure_publishes_only_v1_compatible_no_fts_output() {
+        use xerj_storage::index_store::DataDirFormatWriteFailpoint;
+
+        let dir = TempDir::new().unwrap();
+        let (_engine, index, component, segments_dir) =
+            v1_raw_dot_field_merge_fixture(&dir, "v1-raw-fts-merge-failure").await;
+        index.store.set_data_dir_format_write_failpoint_for_test(
+            DataDirFormatWriteFailpoint::BeforeRename,
+        );
+
+        // Merge has historically allowed a correct stored-scan output when
+        // optional FTS side-car construction fails. Preserve that policy:
+        // marker failure skips finish(), so no v2 filename exists and the v1
+        // marker remains truthful.
+        assert_eq!(index.run_merge_once().await.unwrap(), 1);
+        assert_eq!(marker_version(&index), 1);
+        let snapshot = index.store.snapshot();
+        assert_eq!(snapshot.segments.len(), 1);
+        let output = &snapshot.segments[0];
+        assert!(["fst", "post", "meta", "norms"].iter().all(|extension| {
+            !segments_dir
+                .join(format!("{}.{}.{}", output.id, component, extension))
+                .exists()
+        }));
+        assert!(!segments_dir
+            .join(format!("{}.fts-layout-v2", output.id))
+            .exists());
+
+        let request = xerj_query::parse_request(&serde_json::json!({
+            "query": {"match": {".": "alpha"}},
+            "size": 10,
+            "track_total_hits": true
+        }))
+        .unwrap();
+        let result = index.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "one");
     }
 
     async fn fixture(dir: &TempDir) -> (Engine, Arc<Index>) {
@@ -8538,6 +8875,24 @@ impl Index {
                             // the whole batch already runs inside merge_pool.
                             crate::merge_pool().install(|| {
                                 fts_writer.add_documents_parallel(&fts_input);
+                                if fts_writer.uses_encoded_field_filename_components() {
+                                    if let Err(e) = store_for_task
+                                        .ensure_fts_encoded_field_component_format()
+                                    {
+                                        tracing::warn!(
+                                            "merge: encoded FTS filename format preflight failed: {e}"
+                                        );
+                                        return;
+                                    }
+                                    if let Err(e) =
+                                        fts_writer.publish_encoded_filename_layout()
+                                    {
+                                        tracing::warn!(
+                                            "merge: FTS filename-layout publication failed: {e}"
+                                        );
+                                        return;
+                                    }
+                                }
                                 if let Err(e) = fts_writer.finish() {
                                     tracing::warn!("merge: FTS build failed: {e}");
                                 }
@@ -23573,6 +23928,16 @@ async fn do_flush_shard(
                 fts_writer.add_documents_parallel(&drained_fts_for_build);
                 fts_add_us = t_add.elapsed().as_micros();
                 let t_fin = std::time::Instant::now();
+                if fts_writer.uses_encoded_field_filename_components() {
+                    store_for_warm.ensure_fts_encoded_field_component_format()?;
+                    fts_writer
+                        .publish_encoded_filename_layout()
+                        .map_err(|error| {
+                            xerj_storage::StorageError::Io(std::io::Error::other(format!(
+                                "FTS filename-layout publication failed: {error}"
+                            )))
+                        })?;
+                }
                 fts_writer.finish().map_err(|error| {
                     xerj_storage::StorageError::Io(std::io::Error::other(format!(
                         "FTS side-car build failed: {error}"
