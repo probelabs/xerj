@@ -67,16 +67,19 @@
 - `cargo-audit` runs on every push and pull request (`.github/workflows/ci.yml`,
   job `security-audit`). A RUSTSEC **vulnerability** advisory against anything in
   `engine/Cargo.lock` fails the build; informational advisories (unmaintained,
-  unsound, yanked) are printed in the job log and do not
+  unsound, yanked) are printed in the job log and do not fail it, because they
+  land in transitive crates we cannot upgrade unilaterally and a gate that is
+  red for reasons nobody can act on gets ignored, then switched off.
 - `cargo-fuzz` harnesses live in `engine/fuzz/` and run on every push and pull
   request (job `fuzz`, script `.github/scripts/fuzz-smoke.sh`). They cover the
   parsers an unauthenticated request can reach: the Elasticsearch query DSL, the
   Lucene `query_string` / `simple_query_string` grammar, date math and date-format
-  patterns, index-name date math (`<logs-{now/d}>`), SQL, and Painless scripts.
-  Each target replays a checked-in seed corpus and then fuzzes for a bounded
-  budget. **That list is the coverage** —
-  it is not every parser in the engine, and this line should be edited, not
-  broadened, when targets are added or removed
+  patterns, index-name date math (`<logs-{now/d}>`), SQL, `xerj_engine::painless`
+  scripts, and the two separate script tokenisers in the aggregation engine
+  (`scripted_metric`, `bucket_script` / `bucket_selector`). Each target replays a
+  checked-in seed corpus and then fuzzes for a bounded budget. **That list is the
+  coverage** — it is not every parser in the engine, and this line should be
+  edited, not broadened, when targets are added or removed.
 
 ## Sources
 - Elastic Security Advisory ESA-2021-31

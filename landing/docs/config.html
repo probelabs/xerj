@@ -162,9 +162,9 @@ flush_size_mb       = 256        # flush memtable at 256 MiB
 flush_interval_secs = 30</pre>
 
   <h2 id="merge-section">[merge]</h2>
-  <p>Segment compaction. <code class="inline">size_tiered</code> is the right default: it merges same-size segments, which is cheap and write-optimal. Switch to <code class="inline">log_structured</code> if your reads are doing a lot of full-range scans.</p>
+  <p>Segment compaction. <code class="inline">size_tiered</code> is the only implemented policy: it merges same-size segments, which is cheap and write-optimal. <code class="inline">log_structured</code> is a name in the enum with no merge policy behind it, so the server <strong>refuses to start</strong> on it rather than silently running size-tiered merging for an operator who picked a levelled policy for its read amplification. If full-range scans are what hurts, that is a real gap in this build — setting the key will not change it.</p>
 <pre class="code">[merge]
-strategy           = "size_tiered"
+strategy           = "size_tiered" # the only one implemented — log_structured is refused at startup
 min_segments       = 10          # accepted, not wired
 max_segment_mb     = 8192        # 8 GiB cap
 io_rate_mb_per_sec = 100         # accepted, not wired — merges are not throttled

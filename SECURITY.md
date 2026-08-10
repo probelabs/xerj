@@ -86,9 +86,11 @@ worth reporting.
   harnesses in [`engine/fuzz/`](engine/fuzz/), covering the parsers an
   unauthenticated request reaches: the Elasticsearch query DSL, the Lucene
   `query_string` grammar, date math and date-format patterns, index-name date
-  math, SQL, and Painless scripts. Each target replays a checked-in seed corpus
-  and then fuzzes for a bounded budget. That list is the coverage — it is not
-  every parser in the engine.
+  math, SQL, `xerj_engine::painless` scripts, and the two separate script
+  tokenisers inside the aggregation engine (`scripted_metric`, and
+  `bucket_script` / `bucket_selector`). Each target replays a checked-in seed
+  corpus and then fuzzes for a bounded budget. That list is the coverage — it is
+  not every parser in the engine.
 
 Neither is a substitute for a report. Fuzzing finds crashes and hangs, not logic
 flaws, and an advisory database only knows about vulnerabilities somebody has

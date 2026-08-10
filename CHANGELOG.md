@@ -19,11 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that was not there.
   - New CI job `security-audit` runs `cargo audit` on every push and pull
     request; a RUSTSEC vulnerability advisory fails the build.
-  - New CI job `fuzz` builds and runs six libFuzzer harnesses
+  - New CI job `fuzz` builds and runs seven libFuzzer harnesses
     (`engine/fuzz/`) over checked-in seeds: the Elasticsearch query DSL, the
     Lucene `query_string` grammar, date math and date-format patterns,
-    index-name date math, SQL, and Painless scripts. `.github/scripts/fuzz-smoke.sh` is the same entry
-    point locally and in CI.
+    index-name date math, SQL, Painless scripts, and the aggregation engine's
+    two separate script tokenisers. `.github/scripts/fuzz-smoke.sh` is the same
+    entry point locally and in CI.
   - `xerj-engine/tests/security_tooling_claims.rs` fails if a documented tool
     stops running, if a fuzz target ships without a seed corpus, or if the
     "all input parsing paths" overclaim reappears in any prose file.
@@ -140,10 +141,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code (`parser.rs:931`), the release profile sets `panic = "abort"`, and the
   result is an unauthenticated remote denial of service on a released binary.
   Fixed with the fallible `try_*` constructors. Grepping for the same pattern
-  found two more copies in the index-name date-math resolvers
-  (`xerj-engine/src/index.rs`, `xerj-api/src/es_compat.rs`), reachable from a
-  request URI as `<logs-{now+9999999999999d}>`; both are fixed too, and their
-  `n * 30` / `n * 365` multiplications are now checked.
+  found **three** more copies in the index-name date-math resolvers —
+  `xerj-engine/src/index.rs`, and *both* branches of
+  `xerj-api/src/es_compat.rs`: the `now` form (`<logs-{now+9999999999999d}>`)
+  and the anchored form (`<logs-{2026-01-01||+9999999999999d}>`), which are
+  handled by two different functions sixty lines apart. All three are fixed,
+  their `n * 30` / `n * 365` multiplications are `checked_mul`, the unit is read
+  as one character rather than one byte, and the addition goes through
+  `checked_add_signed`. `es_compat`'s resolver is the one that runs on the wire
+  — the index path parameter of every create/index call and the `_search` index
+  list — so `crates/xerj-api/tests/index_name_date_math_is_total.rs` now drives
+  it at the crate boundary; the same-file fix that missed the anchored branch
+  passed because nothing exercised the public entry point.
+
+- **A `_search` aggregation script containing one non-ASCII character aborted
+  the process.** `painless::tokenize` was not the only Painless-subset scanner
+  in the tree: `aggs.rs` holds two more with the identical byte-walk /
+  `&str`-slice shape — `lex_script` (`scripted_metric`) and `tokenize_script`
+  (`bucket_script` / `bucket_selector`) — and both took `&src[i..i + 2]` to test
+  for a two-character operator at a byte index that can sit inside a multi-byte
+  character, because every arm above it is ASCII-only.
+  `{"m":{"scripted_metric":{"map_script":"中"}}}` was `end byte index 2 is not a
+  char boundary`. Both also skipped whitespace with `is_whitespace()` on
+  `bytes[i] as char`, which is true for Latin-1 NEL and NBSP — bytes that in
+  valid UTF-8 are only ever *continuation* bytes. The two-character probe now
+  requires both bytes to be ASCII (every such operator is ASCII, so nothing is
+  lost) and whitespace is `is_ascii_whitespace`. A new `agg_script` fuzz target
+  covers all three entry points, which is how the next one gets found instead of
+  reported.
 
 - **An XML entity nobody declared no longer discards the text around it.**
   Fallout from the `quick-xml` upgrade above, which is a breaking change to how

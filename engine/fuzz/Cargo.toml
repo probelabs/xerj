@@ -14,6 +14,10 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 xerj-query = { path = "../crates/xerj-query" }
 xerj-engine = { path = "../crates/xerj-engine" }
+# The index-name date-math resolver that actually runs on the wire lives here,
+# not in xerj-engine — see the note at the top of
+# fuzz_targets/index_name_date_math.rs.
+xerj-api = { path = "../crates/xerj-api" }
 
 # Keep the harnesses out of the engine workspace: they only build under a
 # nightly toolchain with sanitizers, so a `cargo build --workspace` on stable
@@ -61,6 +65,13 @@ bench = false
 [[bin]]
 name = "index_name_date_math"
 path = "fuzz_targets/index_name_date_math.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agg_script"
+path = "fuzz_targets/agg_script.rs"
 test = false
 doc = false
 bench = false

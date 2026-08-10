@@ -46,7 +46,15 @@ input libFuzzer minimised the `TimeDelta::hours out of bounds` panic down to.
 | `date_math` | `xerj_query::dates` | `"gte": "now-1d/d"` and `"format": "…"` are caller-supplied; both compile through hand-written tokenisers |
 | `sql` | `xerj_engine::sql::parse_sql` | `/_sql` takes a statement from the wire; ES's CVE-2024-43709 was an OOM from a crafted SQL query |
 | `painless` | `xerj_engine::painless::{check_script_limits, eval_painless}` | attacker-supplied *code* inside a query body, plus the depth/op/deadline budgets that are supposed to bound it |
-| `index_name_date_math` | `xerj_engine::index::resolve_date_math` | `<logs-{now/d}>` arrives in a request URI — a second date-math implementation with its own brace scanner |
+| `index_name_date_math` | `xerj_api::es_compat::resolve_date_math_index`, then `xerj_engine::index::resolve_date_math` | `<logs-{now/d}>` arrives in a request URI — a second date-math implementation with its own brace scanner |
+| `agg_script` | `xerj_engine::aggs::run_aggs` with a fuzzed script in `scripted_metric`, `bucket_script`, `bucket_selector` | two *more* Painless-subset tokenisers, distinct from `xerj_engine::painless` and reached only through an aggregation body |
+
+The `es_compat` entry point above is named first for a reason. The first version
+of `index_name_date_math` fuzzed `xerj_engine::index::resolve_date_math` alone —
+which has no production callers — so it passed while the resolver that runs on
+the wire still aborted on `<logs-{2026-01-01||+9999999999999d}>`. **Fuzz the
+function the request reaches**, and check that it is that function: `grep` for
+callers before you write the harness.
 
 This list is the coverage. It is not every parser in the engine, and the
 security docs must name these rather than claim the parser surface generally —
