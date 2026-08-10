@@ -336,11 +336,13 @@ async fn a_failed_index_can_still_be_deleted() {
 /// all writers of that path. Two concurrent settings writes (`PUT /_settings`
 /// racing another `PUT /_settings`, or an `index.blocks` update) therefore both
 /// opened it `O_TRUNC` and interleaved their bytes before either renamed, so
-/// the *complete* file that landed was a mix of two bodies. Pre-fix, this test
-/// reports 294 of 800 writes failing with ENOENT (the loser renaming a file the
-/// winner had already moved) and — with those errors swallowed, which is what
-/// the callers do — 16 of 200 rounds leaving an unparseable file. After the
-/// fix: no failed writes, no torn file, no debris.
+/// the *complete* file that landed was a mix of two bodies. Run against the old
+/// shared name (four runs, two boxes) this loop reports 86–294 of 800 writes
+/// failing with ENOENT — the loser renaming a file the winner had already moved
+/// — and, with those errors swallowed as the callers do, 1–16 of 200 rounds
+/// leaving an unparseable file. The counts are race-dependent; both being
+/// non-zero is not. After the fix: no failed writes, no torn file, no debris,
+/// which is what the assertions below pin.
 ///
 /// Before #202 that torn file was "only" silently swapped for an empty mapping.
 /// Now it refuses the open, so a lost race would brick the index — which is why

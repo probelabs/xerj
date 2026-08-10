@@ -1,31 +1,27 @@
-//! Issue #202, from the outside — the recovery story for a failed index has to
-//! exist on the surface operators actually use.
+//! Issue #202, from the outside — a torn `schema.json` has to reach the
+//! recovery surfaces, not just the engine.
 //!
 //! Refusing to open an index whose metadata is unparseable is only useful if
 //! the ES-compat API (`:9200`, the port every ES client, Kibana and monitoring
 //! dashboard talks to) then tells the truth about it and offers a way out. The
 //! engine-level tests in `xerj-engine/tests/corrupt_index_metadata.rs` call
 //! `engine.delete_index` / `engine.health()` directly and therefore cannot see
-//! the HTTP layer at all. Measured over `build_es_compat_router` with one torn
-//! `schema.json`, that layer was wrong in three ways:
+//! the HTTP layer at all.
 //!
-//! 1. `DELETE /{index}` answered `404 index_not_found_exception` and left the
-//!    directory on disk — the handler resolves names from
-//!    `engine.list_indices()`, which iterates `indices` only, so a failed index
-//!    never reaches `engine.delete_index`. Combined with the create gate the
-//!    name was unopenable, uncreatable *and* undeletable on `:9200`.
-//! 2. `DELETE /_all` answered `200 {"acknowledged": true}` while the corrupt
-//!    index survived — the wildcard branch expands over the same list.
-//! 3. `GET /_cluster/health` answered `status: "green"` while
-//!    `engine.health()` answered `"red"`, because it too is built from
-//!    `list_indices()`.
+//! **The HTTP behaviour asserted here is not this change's work.** Issue #206
+//! built it — failed indices in `_cat/indices` and `_cluster/state`, a red
+//! `_cluster/health` that names them, `DELETE` reaching a failed index through
+//! literal, `_all` and wildcard forms, `GET /_cluster/indices/failed`, the
+//! retry endpoint, and a readiness probe scoped to "this node has nothing to
+//! serve" rather than "cluster is red". What #202 adds is a *new way in*: an
+//! unparseable sidecar is now one of the conditions that puts an index in that
+//! failed set. This file pins the join between the two, so a change to either
+//! side that stops a corrupt-metadata index from being visible, deletable and
+//! survivable on `:9200` fails here rather than in production.
 //!
-//! And one consequence that had to be decided rather than inherited: readiness
-//! was `engine.health() == "red"`, which after #202 means "any index failed",
-//! so a single unparseable sidecar would have taken the whole node out of
-//! kubelet rotation permanently while its other indices kept serving. Readiness
-//! is a traffic gate, not an alarm channel, so it is now scoped to "this node
-//! has nothing to serve". Both halves of that are pinned below.
+//! Every case below quarantines an index by truncating its `schema.json` —
+//! the #202 trigger — and then asserts the #206 contract over
+//! `build_es_compat_router`.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -107,11 +103,12 @@ async fn delete(app: &axum::Router, path: &str) -> (StatusCode, Value) {
     .await
 }
 
-// ── must-fix 1: DELETE /{index} is the documented escape hatch ────────────────
+// ── DELETE /{index} is the documented escape hatch ───────────────────────────
 
-/// The PR body's recovery story ("restore the file, restore from snapshot, or
-/// DELETE the index") has to hold on the ES-compat port. Pre-fix this answered
-/// 404 and left the directory on disk.
+/// The recovery story for a corrupt sidecar ("restore the file and retry,
+/// restore from a snapshot, or DELETE the index") has to hold on the ES-compat
+/// port for an index quarantined by #202, not only for the #206 triggers the
+/// delete path was built against.
 #[tokio::test]
 async fn delete_removes_a_failed_index_over_the_es_api() {
     let dir = tempfile::tempdir().unwrap();
@@ -172,11 +169,11 @@ async fn health_recovers_after_the_failed_index_is_deleted() {
     assert!(dir.path().join("healthy").exists());
 }
 
-// ── must-fix 2: DELETE /_all must not acknowledge a no-op ─────────────────────
+// ── DELETE /_all must not acknowledge a no-op ────────────────────────────────
 
-/// `DELETE /_all` expanded only over `list_indices()`, so it answered
-/// `200 {"acknowledged": true}` with the corrupt index still on disk — the
-/// accepted-and-ignored class tracked in #204.
+/// A wildcard expansion that skipped the failed index would answer
+/// `200 {"acknowledged": true}` with the corrupt directory still on disk — the
+/// accepted-and-ignored class tracked in #204. Pinned for a #202 failure.
 #[tokio::test]
 async fn delete_all_actually_removes_a_failed_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -216,11 +213,12 @@ async fn delete_wildcard_resolves_a_failed_index() {
     );
 }
 
-// ── must-fix 3: GET /_cluster/health is the surface monitoring polls ──────────
+// ── GET /_cluster/health is the surface monitoring polls ─────────────────────
 
-/// The PR's headline claim is "the operator sees red". `engine.health()` said
-/// red; `GET /_cluster/health` — what every ES client and dashboard actually
-/// polls — said green, because it is built from `list_indices()`.
+/// #202's user-visible promise is "the operator sees red". `engine.health()`
+/// answering red is not enough: the claim only holds if `GET /_cluster/health`
+/// — what every ES client and dashboard actually polls — reports it too, for an
+/// index that failed on a torn sidecar.
 #[tokio::test]
 async fn cluster_health_reports_red_for_a_failed_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -297,15 +295,17 @@ async fn per_index_health_is_scoped_to_the_selector() {
     );
 }
 
-// ── must-fix 4: readiness is a traffic gate, not an alarm channel ────────────
+// ── readiness is a traffic gate, not an alarm channel ───────────────────────
 
 /// `native::readiness` is mounted on BOTH routers (`router.rs:113` and
-/// `router.rs:225`) and used to be `health() == "red"`. After #202 red means
-/// "any index failed", which is permanent — so one unparseable sidecar out of
-/// N indices would have removed the pod from kubelet rotation for good while
-/// the other N-1 answered perfectly, and would have bricked `xerj brain`, which
-/// gates on this probe. A node that is still serving must stay in rotation; the
-/// alarm belongs on `_cluster/health`, asserted here alongside it.
+/// `router.rs:225`) and was rescoped by #206 away from `health() == "red"`.
+/// #202 is what makes that rescope load-bearing: red now also means "an index
+/// has an unparseable sidecar", which is permanent, so under the old predicate
+/// one torn `schema.json` out of N indices would have removed the pod from
+/// kubelet rotation for good while the other N-1 answered perfectly — and would
+/// have bricked `xerj brain`, which gates on this probe. A node that is still
+/// serving must stay in rotation; the alarm belongs on `_cluster/health`,
+/// asserted here alongside it.
 #[tokio::test]
 async fn a_partially_failed_node_stays_in_rotation_and_keeps_serving() {
     let dir = tempfile::tempdir().unwrap();
@@ -376,9 +376,10 @@ async fn an_empty_node_is_ready() {
 
 // ── the create gate, over HTTP ───────────────────────────────────────────────
 
-/// `PUT /{index}` and `_bulk` auto-create used to run `Index::create` over the
-/// corrupt directory. They are now refused — and the refusal must name the file
-/// and the way out rather than being an opaque 500.
+/// `PUT /{index}` and `_bulk` auto-create used to run `Index::create` over a
+/// corrupt directory, overwriting `schema.json` with an empty mapping and
+/// destroying the evidence. They are refused — and the refusal must name the
+/// file and the way out rather than being an opaque 500.
 #[tokio::test]
 async fn create_over_a_failed_index_is_refused_over_http() {
     let dir = tempfile::tempdir().unwrap();

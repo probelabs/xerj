@@ -25473,12 +25473,13 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// every writer of that file, so two concurrent `write_file_atomic` calls on one
 /// sidecar both opened it `O_TRUNC` and interleaved their bytes before either
 /// renamed. Measured on this tree with the old shared name, 4 threads writing
-/// two different-length settings bodies for 200 rounds: 294 of the 800 writes
-/// failed outright with ENOENT (the loser renaming a file the winner had
-/// already moved), and with those errors swallowed — which is what the callers
-/// did — 16 of the 200 rounds left a `settings.json` that does not parse. That
-/// is exactly the file `Index::open` now refuses (#202), so the writer must not
-/// be able to manufacture it.
+/// two different-length settings bodies for 200 rounds, four runs: 86–294 of
+/// the 800 writes failed outright with ENOENT (the loser renaming a file the
+/// winner had already moved), and with those errors swallowed — which is what
+/// the callers did — 1–16 of the 200 rounds left a `settings.json` that does
+/// not parse. The counts move with machine load; both being non-zero on every
+/// run does not. That torn file is exactly what `Index::open` now refuses
+/// (#202), so the writer must not be able to manufacture it.
 ///
 /// Prior art: tantivy stages atomic writes in a *unique* temp file created in
 /// the destination's own directory and then persists it over the target
