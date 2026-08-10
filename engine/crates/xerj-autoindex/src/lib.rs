@@ -1282,6 +1282,27 @@ impl UnsupportedInventoryDelta {
             .map(String::as_str)
             .chain(plan.junk_files.iter().map(|junk| junk.file_key.as_str()))
             .collect();
+        // Path identity, not just content identity. An in-place EDIT gives the
+        // same file a new content key, so a key-only comparison reads the
+        // superseded key as vanished and the new one as added — the SAME path
+        // listed as both removed and added. That is a replacement, and the file
+        // is still there to be republished, so it must never be refused.
+        // Ordinary resume already reaches this conclusion by mapping each file
+        // onto its planned key (`select_resume_plan_keys`); doing it here makes
+        // `--fresh`, which has no plan to map through, agree — without making
+        // the gate more fatal than the open it precedes.
+        let current_rels: std::collections::HashSet<&str> =
+            files.iter().map(|file| file.rel.as_str()).collect();
+        let current_path_ids: std::collections::HashSet<&str> = files
+            .iter()
+            .map(|file| file.rel_id.as_str())
+            .filter(|id| !id.is_empty())
+            .collect();
+        let path_survives = |assignment: &FileAssignment| {
+            current_rels.contains(assignment.rel.as_str())
+                || (!assignment.path_id.is_empty()
+                    && current_path_ids.contains(assignment.path_id.as_str()))
+        };
 
         let mut added_content_groups: Vec<InventoryDeltaEntry> = files
             .iter()
@@ -1295,7 +1316,9 @@ impl UnsupportedInventoryDelta {
         let mut vanished_content_groups: Vec<InventoryDeltaEntry> = plan
             .files
             .iter()
-            .filter(|(key, _)| !current_keys.contains(key.as_str()))
+            .filter(|(key, assignment)| {
+                !current_keys.contains(key.as_str()) && !path_survives(assignment)
+            })
             .map(|(key, assignment)| InventoryDeltaEntry {
                 file_key: key.clone(),
                 path: assignment.rel.clone(),
