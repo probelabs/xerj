@@ -28,6 +28,7 @@ mod sync_executor;
 pub mod walk;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, Write};
@@ -222,6 +223,33 @@ fn generated_exit_code(summary: &Value) -> i32 {
     }
 }
 
+/// Terminal progress line for a run that ends on the generated `--no-graph`
+/// path.
+///
+/// Every exit closes the stream itself (#241). `Ticker::drop` reports
+/// `ok=false` for a run that never called `finish`, so a generated run that
+/// merely returned would print an aborted line straight after a successful
+/// commit — the one place the two landed changes could contradict each other.
+/// Exit 3 is success ("completed, some input was unusable"), so it is spelled
+/// out in words rather than left as a bare number.
+fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
+    let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+    pr.finish(
+        true,
+        code,
+        if code == 3 {
+            "completed-with-junk"
+        } else {
+            "completed"
+        },
+        &[
+            ("files", count("files_indexed")),
+            ("records", count("records_total")),
+            ("generation", count("generation")),
+        ],
+    );
+}
+
 fn begin_non_graph_generation(
     es: &Es,
     journal: &mut state::Journal,
@@ -391,10 +419,24 @@ struct CliErrorRoute {
 
 fn route_cli_error(error: &anyhow::Error, json_output: bool) -> CliErrorRoute {
     if json_output {
+        // Two distinct refusals reach the JSON route, and both must keep it.
+        // `UnsafeFreshGenerationError` guards durable *generation* state on the
+        // `--no-graph` path; `UnsupportedInventoryDeltaError` (#254) guards the
+        // legacy graph-enabled path against a rerun that would strand live
+        // documents. Neither supersedes the other — they protect different
+        // destinations — so routing only one would silently drop the other's
+        // machine-readable rendering back to a prose stderr line.
         if let Some(unsafe_fresh) = error.downcast_ref::<UnsafeFreshGenerationError>() {
             return CliErrorRoute {
                 exit_code: 1,
                 stdout: Some(unsafe_fresh.to_json().to_string()),
+                stderr: None,
+            };
+        }
+        if let Some(delta) = error.downcast_ref::<UnsupportedInventoryDeltaError>() {
+            return CliErrorRoute {
+                exit_code: 1,
+                stdout: Some(delta.to_json().to_string()),
                 stderr: None,
             };
         }
@@ -1538,6 +1580,284 @@ impl std::fmt::Display for UnsafeFreshGenerationError {
 
 impl std::error::Error for UnsafeFreshGenerationError {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct InventoryDeltaEntry {
+    file_key: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct UnsupportedInventoryDelta {
+    added_content_groups: Vec<InventoryDeltaEntry>,
+    vanished_content_groups: Vec<InventoryDeltaEntry>,
+}
+
+/// Everything the refusal needs to name the destination it is protecting.
+/// Collected at the gate so the message can list the exact indices and state
+/// directory an operator has to act on, instead of describing them abstractly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefusalTargets {
+    state_dir: String,
+    data_indices: Vec<String>,
+    edges_index: Option<String>,
+}
+
+impl RefusalTargets {
+    fn describe(cfg: &IndexCfg, state_dir: &Path, plan: &Plan) -> Self {
+        let mut data_indices: Vec<String> = plan.datasets.iter().map(|d| d.index.clone()).collect();
+        data_indices.sort();
+        data_indices.dedup();
+        let edges_index = (!cfg.no_graph).then(|| {
+            let brain = cfg
+                .brain
+                .clone()
+                .unwrap_or_else(|| derive_brain_name(&cfg.root));
+            detect::edges_index_name(&brain)
+        });
+        Self {
+            state_dir: state_dir.display().to_string(),
+            data_indices,
+            edges_index,
+        }
+    }
+
+    fn indices_phrase(&self) -> String {
+        if self.data_indices.is_empty() {
+            "the indices this plan publishes".to_string()
+        } else {
+            self.data_indices.join(", ")
+        }
+    }
+
+    fn edges_note(&self) -> String {
+        match &self.edges_index {
+            Some(edges) => format!(
+                " Graph edges taught by the removed file(s) stay live in {edges} until that \
+                 index is deleted too."
+            ),
+            None => String::new(),
+        }
+    }
+}
+
+/// The #195 zero-live verification failure, as a type rather than a string.
+///
+/// The journal claims records were made visible; the destination answers with
+/// none. That is always a failure, but not always the *same* failure: for a
+/// composing caller like `xerj brain` a resume journal that outlived a wiped
+/// data directory has a specific, executable recovery (`--fresh` in place),
+/// while a write-blocked or unreachable server does not. Only a typed error
+/// lets the caller tell them apart — `anyhow::bail!` forces it to either
+/// string-match the prose or reprint it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZeroLiveVerificationError {
+    /// Records the resume journal says were published.
+    pub journal_records: u64,
+    /// Completed files those records came from.
+    pub files_done_journaled: usize,
+    /// Dataset indices that answered with zero live documents.
+    pub dataset_indices: usize,
+}
+
+impl std::fmt::Display for ZeroLiveVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "autoindex verification failed: the resume journal records {} \
+             record(s) from {} completed file(s), but 0 documents are \
+             live across the {} dataset index(es). The indices exist and look healthy but \
+             hold nothing — a server-side write rejection (e.g. a disk flood-stage or \
+             index write block), deleted indices, or an unreadable server can all cause \
+             this. Fix the server-side condition, then rerun with --fresh to re-index \
+             from scratch",
+            self.journal_records, self.files_done_journaled, self.dataset_indices
+        )
+    }
+}
+
+impl std::error::Error for ZeroLiveVerificationError {}
+
+#[derive(Debug)]
+struct UnsupportedInventoryDeltaError {
+    delta: UnsupportedInventoryDelta,
+    targets: RefusalTargets,
+}
+
+impl UnsupportedInventoryDeltaError {
+    fn to_json(&self) -> Value {
+        json!({
+            "schema": "xerj.autoindex.unsupported_sync_delta.v1",
+            "status": "error",
+            "error": "unsupported_content_group_removal",
+            "message": "this attempt made no remote mutations. Files that were indexed under this resume plan no longer exist in the folder, and their documents are still live in the destination; removing files from an indexed folder is not reconciled yet",
+            "vanished_content_groups": self.delta.vanished_content_groups,
+            // Context, not the reason for the refusal: a rerun over a frozen
+            // plan does not index files added after the plan was frozen.
+            "added_content_groups": self.delta.added_content_groups,
+            "recovery": {
+                "restore_removed_files": "put the listed file(s) back and rerun; every other file keeps its resume state",
+                "rebuild_in_place": format!(
+                    "delete the indices this plan publishes ({}) and the state directory {}, then rerun. This re-extracts and re-embeds the whole corpus.{}",
+                    self.targets.indices_phrase(),
+                    self.targets.state_dir,
+                    self.targets.edges_note().trim_start_matches(' ')
+                ),
+                "rebuild_isolated": "index with a new --state-dir, new --prefix, and (when graph detection is enabled) new --brain; alternatively add --no-graph. Validate the isolated target before switching readers, then clean the old one",
+                "fresh_warning": "--fresh re-extracts the current folder in place and does pick up added and changed files, but it never deletes documents already published for removed files, so it is refused here"
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for UnsupportedInventoryDeltaError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Capped like the duplicate and unplanned-file listings above; see
+        // REFUSAL_LIST_CAP. The machine-readable `--json` rendering keeps the
+        // full lists, so nothing is lost — only the prose is bounded.
+        let render = |entries: &[InventoryDeltaEntry]| {
+            let mut rendered = entries
+                .iter()
+                .take(REFUSAL_LIST_CAP)
+                .map(|entry| format!("{} ({})", entry.path, entry.file_key))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remaining = entries.len().saturating_sub(REFUSAL_LIST_CAP);
+            if remaining > 0 {
+                rendered.push_str(&format!(", … and {remaining} more"));
+            }
+            rendered
+        };
+        write!(
+            formatter,
+            "{} file(s) indexed under this resume plan no longer exist in the folder, and their \
+             documents are still live in the destination. Removing files from an indexed folder \
+             is not reconciled yet, so this attempt made no remote mutations — no documents, \
+             aliases, graph edges or catalog entries were written. Removed content groups [{}].",
+            self.delta.vanished_content_groups.len(),
+            render(&self.delta.vanished_content_groups)
+        )?;
+        if !self.delta.added_content_groups.is_empty() {
+            write!(
+                formatter,
+                " Also present but not in the frozen resume plan, so not indexed by this run \
+                 either [{}].",
+                render(&self.delta.added_content_groups)
+            )?;
+        }
+        write!(
+            formatter,
+            " Recovery, cheapest first: (1) restore the removed file(s) and rerun — every other \
+             file keeps its resume state; (2) rebuild in place by deleting the indices this plan \
+             publishes ({}) and the state directory {}, then rerunning — this re-extracts and \
+             re-embeds the whole corpus.{} (3) rebuild isolated with a new --state-dir, a new \
+             --prefix and, when graph detection is enabled, a new --brain (or --no-graph), \
+             validate it, switch readers, then clean the old target. `--fresh` picks up added \
+             and changed files in place but never deletes documents for removed files, so it is \
+             refused here too",
+            self.targets.indices_phrase(),
+            self.targets.state_dir,
+            self.targets.edges_note()
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedInventoryDeltaError {}
+
+impl UnsupportedInventoryDelta {
+    fn between(files: &[walk::FileEntry], keys: &[String], plan: &Plan) -> Self {
+        let current_keys: std::collections::HashSet<&str> = keys
+            .iter()
+            .filter(|key| !key.is_empty())
+            .map(String::as_str)
+            .collect();
+        let durable_keys: std::collections::HashSet<&str> = plan
+            .files
+            .keys()
+            .map(String::as_str)
+            .chain(plan.junk_files.iter().map(|junk| junk.file_key.as_str()))
+            .collect();
+        // Path identity, not just content identity. An in-place EDIT gives the
+        // same file a new content key, so a key-only comparison reads the
+        // superseded key as vanished and the new one as added — the SAME path
+        // listed as both removed and added. That is a replacement, and the file
+        // is still there to be republished, so it must never be refused.
+        // Ordinary resume already reaches this conclusion by mapping each file
+        // onto its planned key (`select_resume_plan_keys`); doing it here makes
+        // `--fresh`, which has no plan to map through, agree — without making
+        // the gate more fatal than the open it precedes.
+        let current_rels: std::collections::HashSet<&str> =
+            files.iter().map(|file| file.rel.as_str()).collect();
+        let current_path_ids: std::collections::HashSet<&str> = files
+            .iter()
+            .map(|file| file.rel_id.as_str())
+            .filter(|id| !id.is_empty())
+            .collect();
+        let path_survives = |assignment: &FileAssignment| {
+            current_rels.contains(assignment.rel.as_str())
+                || (!assignment.path_id.is_empty()
+                    && current_path_ids.contains(assignment.path_id.as_str()))
+        };
+
+        let mut added_content_groups: Vec<InventoryDeltaEntry> = files
+            .iter()
+            .zip(keys)
+            .filter(|(_, key)| !key.is_empty() && !durable_keys.contains(key.as_str()))
+            .map(|(file, key)| InventoryDeltaEntry {
+                file_key: key.clone(),
+                path: file.rel.clone(),
+            })
+            .collect();
+        let mut vanished_content_groups: Vec<InventoryDeltaEntry> = plan
+            .files
+            .iter()
+            .filter(|(key, assignment)| {
+                !current_keys.contains(key.as_str()) && !path_survives(assignment)
+            })
+            .map(|(key, assignment)| InventoryDeltaEntry {
+                file_key: key.clone(),
+                path: assignment.rel.clone(),
+            })
+            .collect();
+        // Deliberately NOT extended with `plan.junk_files`. A junk/skipped file
+        // published no documents, no aliases and no graph edges — its entire
+        // live footprint is one `file:{key}` catalog row, and the stale
+        // junk-catalog sweep below (#238) deletes that row before dropping the
+        // plan entry. Removing it therefore strands nothing, so refusing the
+        // rerun would block a case the pipeline now handles completely. Junk
+        // keys stay in `durable_keys` above: an unchanged skipped file is still
+        // not an addition.
+
+        let stable_order = |left: &InventoryDeltaEntry, right: &InventoryDeltaEntry| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.file_key.cmp(&right.file_key))
+        };
+        added_content_groups.sort_by(stable_order);
+        vanished_content_groups.sort_by(stable_order);
+        Self {
+            added_content_groups,
+            vanished_content_groups,
+        }
+    }
+
+    /// A rerun is refused only when a content group the plan published has
+    /// vanished from the folder: those documents stay live and searchable with
+    /// no source file behind them, and nothing in this pipeline removes them.
+    /// Additions are not refused — they are skipped by the frozen plan exactly
+    /// as before and `--fresh` rebuilds the plan in place to include them.
+    fn refuses(&self) -> bool {
+        !self.vanished_content_groups.is_empty()
+    }
+
+    fn into_error(self, targets: RefusalTargets) -> anyhow::Error {
+        UnsupportedInventoryDeltaError {
+            delta: self,
+            targets,
+        }
+        .into()
+    }
+}
+
 fn alias_keys_to_reindex(
     previous: &[state::DuplicateFile],
     current: &[state::DuplicateFile],
@@ -1838,7 +2158,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // Acquire state authority before discovery as well as hashing. A waiter
     // must never classify a path snapshot taken while another owner was
     // publishing or replacing the durable plan.
-    let preflight = state::Journal::preflight(&state_dir, &root_str, &cfg.url, &cfg.prefix)?;
+    let preflight =
+        state::Journal::preflight(&state_dir, &root_str, &cfg.url, &cfg.prefix, cfg.fresh)?;
     let genesis_recovery = preflight
         .committed_manifest
         .as_ref()
@@ -1872,6 +2193,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
         .into());
     }
+    if let Some(reason) = preflight.unreadable_plan.as_deref() {
+        // Only reachable under --fresh; without it the preflight would have
+        // returned this as an error. It goes through the progress surface, not
+        // a raw eprintln!, so `--progress none` (which `--quiet` selects) stays
+        // silent and `--progress json` stays one parseable stream (#241).
+        pr.note(&format!(
+            "autoindex: --fresh: the durable resume plan in {} could not be read ({reason}); \
+             rebuilding it from the current folder. Documents published for files that are no \
+             longer present cannot be identified from an unreadable plan and are not deleted.",
+            state_dir.join("journal.ndjson").display()
+        ));
+    }
     // `--dry-run` has to be decided *before* the generated branches, not after
     // them. Both of those branches publish and commit, and both return before
     // control ever reaches the legacy `cfg.dry_run` check further down — so on
@@ -1884,11 +2217,16 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     if cfg.dry_run {
         if let Some(pending) = &preflight.pending_sync {
             println!("{}", serde_json::to_string_pretty(&pending.desired.plan)?);
-            eprintln!(
+            // stdout is the RESULT, stderr is PROGRESS — so this explanation
+            // goes through the progress surface, never a bare `eprintln!`
+            // that `--progress none` could not silence and `--progress json`
+            // could not parse (#241).
+            pr.note(&format!(
                 "(dry run — nothing indexed; corpus generation {} is already sealed and pending \
                  replay from its own durable snapshot. Re-run without --dry-run to finish it.)",
                 pending.desired.generation
-            );
+            ));
+            pr.finish(true, 0, "dry-run", &[]);
             return Ok((0, None));
         }
     }
@@ -1921,7 +2259,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         // `--progress json` stays one parseable stream (#241).
         pr.note("autoindex: resumed and committed pending corpus generation from durable source");
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
-        return Ok((generated_exit_code(&summary), Some(summary)));
+        let code = generated_exit_code(&summary);
+        finish_generated_progress(&pr, code, &summary);
+        return Ok((code, Some(summary)));
     }
     // Totals are unknown until the walk returns, so this phase honestly
     // reports `pct=unknown` and proves liveness with the clock alone.
@@ -2036,7 +2376,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 }
             }
             let summary = finish_generated_run(&es, &mut journal, &cfg)?;
-            return Ok((generated_exit_code(&summary), Some(summary)));
+            let code = generated_exit_code(&summary);
+            finish_generated_progress(&pr, code, &summary);
+            return Ok((code, Some(summary)));
         }
         begin_non_graph_generation(
             &es,
@@ -2050,7 +2392,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         let mut backend = sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20);
         sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
-        return Ok((generated_exit_code(&summary), Some(summary)));
+        let code = generated_exit_code(&summary);
+        finish_generated_progress(&pr, code, &summary);
+        return Ok((code, Some(summary)));
     }
     if cfg.no_graph && preflight.plan.is_some() && !genesis_recovery {
         let replacement_state = state_dir.with_extension("generation-v1");
@@ -2101,6 +2445,32 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
              authentication",
             rebuild_argv
         );
+    }
+    if let Some(prior_plan) = preflight.plan.as_ref() {
+        let comparison_keys = if cfg.fresh {
+            inventory.keys.clone()
+        } else {
+            // Ordinary resume preserves planned-key identity for supported
+            // same-path replacement and legacy plans.
+            select_resume_plan_keys(
+                &inventory.files,
+                &inventory.keys,
+                prior_plan,
+                &state_dir.join("journal.ndjson"),
+            )?
+            .into_iter()
+            .zip(inventory.keys.iter())
+            .map(|(planned, current)| planned.unwrap_or_else(|| current.clone()))
+            .collect()
+        };
+        // `--fresh` is checked here too: discarding the plan does not delete
+        // the documents already published for a file that is now gone, so a
+        // removal is unsafe in place whether or not the plan is kept.
+        let delta =
+            UnsupportedInventoryDelta::between(&inventory.files, &comparison_keys, prior_plan);
+        if delta.refuses() {
+            return Err(delta.into_error(RefusalTargets::describe(&cfg, &state_dir, prior_plan)));
+        }
     }
     let mut journal = state::Journal::open_after_preflight(
         preflight,
@@ -2340,6 +2710,22 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         plan
     };
 
+    // Second gate, after key selection has settled: fail before index
+    // creation/mapping, replacement intent, graph invalidation,
+    // delete-by-query, bulk publication, refresh, or catalog writes when a
+    // canonical content group the plan published is gone from the folder.
+    // Continuing would leave those documents searchable with no source file.
+    // Additions, same-path replacement and crash repair remain supported.
+    //
+    // It runs before the #238 junk sweep below on purpose: a refused rerun
+    // must compute nothing and mutate nothing.
+    if resumed_with_plan {
+        let delta = UnsupportedInventoryDelta::between(&files, &keys, &plan);
+        if delta.refuses() {
+            return Err(delta.into_error(RefusalTargets::describe(&cfg, &state_dir, &plan)));
+        }
+    }
+
     // ── stale junk-catalog sweep (#238) ──────────────────────────────────
     //
     // A junk/skipped file is never indexed and never enters the graph corpus
@@ -2391,7 +2777,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         let mut backend = sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20);
         sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
-        return Ok((generated_exit_code(&summary), Some(summary)));
+        let code = generated_exit_code(&summary);
+        finish_generated_progress(&pr, code, &summary);
+        return Ok((code, Some(summary)));
     }
 
     if plan
@@ -2528,9 +2916,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 rel: files[i].rel.clone(),
                 format: "unknown".into(),
                 status: "skipped".into(),
-                reason: "not in the frozen resume plan; no destination change was made. For an \
-                         exact rebuild use a new --state-dir, a new --prefix, and, when graph \
-                         detection is enabled, a new --brain (or use --no-graph)"
+                reason: "not in the frozen resume plan, so nothing was published for it. Re-run \
+                         with --fresh to rebuild the plan in place and include it (ids stay \
+                         idempotent), or index it under a new --state-dir and --prefix"
                     .into(),
                 bytes: files[i].size,
             });
@@ -4280,6 +4668,215 @@ mod unsafe_fresh_generation_tests {
             pending_value["blocking_state"]["kind"],
             "pending_generation"
         );
+
+        let unrelated = anyhow::anyhow!("endpoint unavailable");
+        let route = route_cli_error(&unrelated, true);
+        assert_eq!(route.exit_code, 1);
+        assert!(route.stdout.is_none());
+        assert_eq!(route.stderr.as_deref(), Some("error: endpoint unavailable"));
+    }
+}
+
+#[cfg(test)]
+mod inventory_delta_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn file(path: &str) -> walk::FileEntry {
+        walk::FileEntry {
+            path: PathBuf::from(path),
+            rel: path.to_owned(),
+            rel_id: format!("id:{path}"),
+            is_symlink: false,
+            size: 1,
+        }
+    }
+
+    fn assignment(path: &str) -> FileAssignment {
+        FileAssignment {
+            rel: path.to_owned(),
+            path_id: format!("id:{path}"),
+            family: "csv".into(),
+            gzip: false,
+            content_digest: Some(format!("digest:{path}")),
+            assignments: vec![(None, "rows".into())],
+            as_document: false,
+            is_symlink: Some(false),
+        }
+    }
+
+    fn targets() -> RefusalTargets {
+        RefusalTargets {
+            state_dir: "/state".into(),
+            data_indices: vec!["ax-rows".into()],
+            edges_index: Some(".xerj-memory-corpus-edges".into()),
+        }
+    }
+
+    #[test]
+    fn only_a_removed_content_group_refuses_a_rerun() {
+        let mut plan = Plan::default();
+        plan.files.insert("keep".into(), assignment("keep.csv"));
+        assert!(
+            !UnsupportedInventoryDelta::between(&[file("keep.csv")], &["keep".into()], &plan)
+                .refuses()
+        );
+        // An added file is skipped by the frozen plan, not a refusal: the
+        // documented rerun-then---fresh workflow has to keep working.
+        let added = UnsupportedInventoryDelta::between(
+            &[file("keep.csv"), file("new.csv")],
+            &["keep".into(), "new".into()],
+            &plan,
+        );
+        assert_eq!(added.added_content_groups.len(), 1);
+        assert!(!added.refuses(), "an addition alone must not fail the run");
+        // A removal leaves live documents with no source file behind them.
+        assert!(UnsupportedInventoryDelta::between(&[], &[], &plan).refuses());
+    }
+
+    #[test]
+    fn classifier_sorts_added_and_vanished_groups() {
+        let mut plan = Plan::default();
+        plan.files.insert("keep".into(), assignment("keep.csv"));
+        plan.junk_files.push(JunkFile {
+            file_key: "junk".into(),
+            rel: "broken.pdf".into(),
+            format: "pdf".into(),
+            status: "junk".into(),
+            reason: "fixture".into(),
+            bytes: 1,
+        });
+        assert!(
+            !UnsupportedInventoryDelta::between(
+                &[file("keep.csv"), file("broken.pdf")],
+                &["keep".into(), "junk".into()],
+                &plan,
+            )
+            .refuses(),
+            "unchanged durable junk is neither added nor vanished"
+        );
+
+        plan.files.insert("old-z".into(), assignment("z-old.csv"));
+        plan.files.insert("old-a".into(), assignment("a-old.csv"));
+        let delta = UnsupportedInventoryDelta::between(
+            &[
+                file("keep.csv"),
+                file("broken.pdf"),
+                file("z-new.csv"),
+                file("m-new.csv"),
+            ],
+            &["keep".into(), "junk".into(), "new-z".into(), "new-m".into()],
+            &plan,
+        );
+        assert_eq!(
+            delta
+                .added_content_groups
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["m-new.csv", "z-new.csv"]
+        );
+        assert_eq!(
+            delta
+                .vanished_content_groups
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a-old.csv", "z-old.csv"]
+        );
+    }
+
+    #[test]
+    fn refusal_names_the_removed_files_and_every_recovery_route() {
+        let mut plan = Plan::default();
+        plan.files.insert("gone".into(), assignment("gone.csv"));
+        let error = UnsupportedInventoryDelta::between(&[], &[], &plan).into_error(targets());
+        let message = format!("{error:#}");
+        assert!(message.contains("gone.csv"), "{message}");
+        assert!(
+            message.contains("no longer exist in the folder"),
+            "{message}"
+        );
+        assert!(message.contains("made no remote mutations"), "{message}");
+        assert!(message.contains("restore the removed file(s)"), "{message}");
+        assert!(message.contains("ax-rows"), "{message}");
+        assert!(message.contains("/state"), "{message}");
+        assert!(message.contains(".xerj-memory-corpus-edges"), "{message}");
+        assert!(message.contains("new --state-dir"), "{message}");
+        assert!(message.contains("`--fresh`"), "{message}");
+    }
+
+    /// The prose refusal is bounded by REFUSAL_LIST_CAP, not by the corpus: an
+    /// unmounted bind mount under an indexed root vanishes every group at once,
+    /// and rendering 82k entries into one String is megabytes of stderr in the
+    /// one path whose job is to be read. `--json` still carries all of them.
+    #[test]
+    fn refusal_prose_caps_its_listings_while_json_keeps_every_entry() {
+        let mut plan = Plan::default();
+        let total = REFUSAL_LIST_CAP * 3;
+        for i in 0..total {
+            plan.files.insert(
+                format!("gone{i:03}"),
+                assignment(&format!("gone{i:03}.csv")),
+            );
+        }
+        let error = UnsupportedInventoryDelta::between(&[], &[], &plan).into_error(targets());
+        let message = format!("{error:#}");
+        assert!(message.contains("gone000.csv"), "{message}");
+        assert!(
+            message.contains(&format!(", … and {} more", total - REFUSAL_LIST_CAP)),
+            "{message}"
+        );
+        // The tail past the cap must not be rendered at all, not merely elided.
+        let last = format!("gone{:03}.csv", total - 1);
+        assert!(!message.contains(&last), "{message}");
+        assert_eq!(
+            message.matches(".csv (").count(),
+            REFUSAL_LIST_CAP,
+            "{message}"
+        );
+
+        let stdout = route_cli_error(&error, true)
+            .stdout
+            .expect("the typed refusal renders as JSON under --json");
+        let value: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            value["vanished_content_groups"].as_array().unwrap().len(),
+            total
+        );
+    }
+
+    #[test]
+    fn refusal_prose_below_the_cap_has_no_more_tail() {
+        let mut plan = Plan::default();
+        plan.files.insert("gone".into(), assignment("gone.csv"));
+        let error = UnsupportedInventoryDelta::between(&[], &[], &plan).into_error(targets());
+        let message = format!("{error:#}");
+        assert!(!message.contains("… and "), "{message}");
+    }
+
+    #[test]
+    fn cli_error_routing_separates_typed_json_from_unrelated_human_errors() {
+        let typed = UnsupportedInventoryDelta {
+            added_content_groups: Vec::new(),
+            vanished_content_groups: vec![InventoryDeltaEntry {
+                file_key: "key".into(),
+                path: "gone.csv".into(),
+            }],
+        }
+        .into_error(targets());
+        let route = route_cli_error(&typed, true);
+        assert_eq!(route.exit_code, 1);
+        assert!(route.stderr.is_none());
+        let stdout = route.stdout.unwrap();
+        let value: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["schema"], "xerj.autoindex.unsupported_sync_delta.v1");
+        assert_eq!(value["error"], "unsupported_content_group_removal");
+        assert_eq!(value["vanished_content_groups"][0]["path"], "gone.csv");
+        assert!(value["recovery"]["rebuild_in_place"]
+            .as_str()
+            .unwrap()
+            .contains("ax-rows"));
 
         let unrelated = anyhow::anyhow!("endpoint unavailable");
         let route = route_cli_error(&unrelated, true);

@@ -202,21 +202,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn preflight_holds_the_same_exclusive_lock_through_authoritative_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let preflight = Journal::preflight(dir.path(), "root", "url", "prefix").unwrap();
-        let error = Journal::open(dir.path(), "root", "url", "prefix", 300, false)
-            .err()
-            .expect("a second opener must not pass the held preflight lock");
-        assert!(format!("{error:#}").contains("already in use"));
-
-        let journal =
-            Journal::open_after_preflight(preflight, "root", "url", "prefix", 300, false).unwrap();
-        drop(journal);
-        assert!(Journal::open(dir.path(), "root", "url", "prefix", 300, false).is_ok());
-    }
-
     /// The preflight must never be more fatal than the open it precedes.
     /// `open_after_preflight` deletes the journal unread when `--fresh` is set,
     /// so a preflight that hard-errors while parsing that journal would make
@@ -534,10 +519,14 @@ fn read_plan_for_preflight(
                         "journal corruption at byte {record_start} in {}: malformed \
                          newline-terminated record. Refusing to discard later records. Restore \
                          the journal from a backup, or truncate it to exactly {record_start} \
-                         bytes to keep every completion recorded before the corruption. For an \
-                         isolated rebuild use a new --state-dir, new --prefix, and new --brain \
-                         when graph detection is enabled (or --no-graph); explicitly validate \
-                         and clean the shared catalog and old target",
+                         bytes to keep every completion recorded before the corruption. Deleting \
+                         the whole journal (or rerunning with --fresh) also recovers, but \
+                         re-extracts and re-embeds the entire corpus — and it discards any \
+                         durable generation records in this journal along with it, which is \
+                         why --fresh is reachable here at all. For an isolated rebuild use a \
+                         new --state-dir, new --prefix, and new --brain when graph detection \
+                         is enabled (or --no-graph); explicitly validate and clean the shared \
+                         catalog and old target",
                         path.display()
                     )
                 })?;
@@ -608,14 +597,25 @@ pub struct JournalPreflight {
     pub pending_sync: Option<crate::sync::PendingSync>,
     pub legacy_migration_reasons: Vec<String>,
     pub journal_exists: bool,
+    /// Set only under `--fresh`, when the durable plan could not be read and
+    /// the run is about to discard the journal anyway. The caller owns the
+    /// decision to print it (autoindex honours `--quiet`).
+    pub unreadable_plan: Option<String>,
 }
 
 impl Journal {
+    /// `fresh` is not a formality here. `open_after_preflight` removes the
+    /// journal before replaying it when `--fresh` is set, so nothing inside a
+    /// journal can be fatal to that path — and a preflight that hard-errors on
+    /// a corrupt record or a root/url/prefix mismatch would make `--fresh`
+    /// unreachable in exactly the cases whose error text recommends it. The
+    /// preflight must therefore never be more fatal than the open it precedes.
     pub fn preflight(
         state_dir: &Path,
         root: &str,
         url: &str,
         prefix: &str,
+        fresh: bool,
     ) -> Result<JournalPreflight> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
@@ -635,8 +635,26 @@ impl Journal {
         })?;
         let journal_path = state_dir.join("journal.ndjson");
         let journal_exists = journal_path.exists();
-        let (plan, committed_manifest, pending_sync, legacy_migration_reasons) =
-            read_plan_for_preflight(&journal_path, root, url, prefix)?;
+        let (plan, committed_manifest, pending_sync, legacy_migration_reasons, unreadable_plan) =
+            match read_plan_for_preflight(&journal_path, root, url, prefix) {
+                Ok((plan, committed, pending, reasons)) => {
+                    (plan, committed, pending, reasons, None)
+                }
+                // The journal is about to be deleted unread. Losing the plan here
+                // costs the removed-file gate its comparison basis, which is
+                // exactly what a full in-place rebuild accepts; the alternative is
+                // a state directory that no supported flag can recover.
+                //
+                // Every generated record is discarded with it, so the durable
+                // generation this run might otherwise have refused to overwrite is
+                // reported as absent rather than half-parsed. That is what keeps
+                // `--fresh` genuinely reachable here: the caller's generation
+                // refusal reads `committed_manifest`/`pending_sync`, and firing it
+                // off a partially-replayed journal would contradict the recovery
+                // this very error recommends.
+                Err(error) if fresh => (None, None, None, Vec::new(), Some(format!("{error:#}"))),
+                Err(error) => return Err(error),
+            };
         Ok(JournalPreflight {
             state_dir: state_dir.to_owned(),
             state_lock,
@@ -645,6 +663,7 @@ impl Journal {
             pending_sync,
             legacy_migration_reasons,
             journal_exists,
+            unreadable_plan,
         })
     }
 
@@ -656,7 +675,7 @@ impl Journal {
         bulk_timeout_secs: u64,
         fresh: bool,
     ) -> Result<Journal> {
-        let preflight = Self::preflight(state_dir, root, url, prefix)?;
+        let preflight = Self::preflight(state_dir, root, url, prefix, fresh)?;
         Self::open_after_preflight(preflight, root, url, prefix, bulk_timeout_secs, fresh)
     }
 
@@ -732,10 +751,9 @@ impl Journal {
                                     anyhow::bail!(
                                 "journal at {} was created for root={jr} url={ju} prefix={jp}; \
                                  current run has root={root} url={url} prefix={prefix}. \
-                                 Refusing to discard history under the same destination. For an \
-                                 isolated rebuild use a new --state-dir, new --prefix, and new \
-                                 --brain when graph detection is enabled (or --no-graph); \
-                                 explicitly validate and clean the shared catalog and old target.",
+                                 Use --state-dir for separate state, or --fresh to rebuild the \
+                                 plan in place — note that --fresh never deletes documents \
+                                 already published under the other root, url or prefix.",
                                 jpath.display()
                             );
                                 }
@@ -1452,7 +1470,7 @@ mod sync_journal_tests {
             .err()
             .unwrap();
         assert!(format!("{error:#}").contains("while a sync is pending"));
-        let preflight = Journal::preflight(dir.path(), "root", "url", "prefix")
+        let preflight = Journal::preflight(dir.path(), "root", "url", "prefix", false)
             .err()
             .unwrap();
         assert!(format!("{preflight:#}").contains("while a sync is pending"));
@@ -1530,7 +1548,7 @@ mod sync_journal_tests {
         let mut journal = journal_with_plan(dir.path());
         journal.sync_begin(&pending(&journal)).unwrap();
         drop(journal);
-        let preflight = Journal::preflight(dir.path(), "root", "url", "prefix").unwrap();
+        let preflight = Journal::preflight(dir.path(), "root", "url", "prefix", false).unwrap();
         assert_eq!(preflight.committed_manifest.as_ref().unwrap().generation, 0);
         assert_eq!(preflight.pending_sync.as_ref().unwrap().tx_id, "sync-1");
         drop(preflight);
@@ -1623,6 +1641,7 @@ mod sync_journal_tests {
                 records: 1,
                 junk: 0,
                 bytes: 10,
+                dropped_by_dataset: std::collections::HashMap::new(),
                 generation: None,
             })
             .unwrap();

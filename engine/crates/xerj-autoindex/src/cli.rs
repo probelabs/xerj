@@ -74,8 +74,10 @@ pub enum Cmd {
 }
 
 const FRESH_HELP: &str =
-    "ignore an existing resume journal and restart (ids stay idempotent); refused when the \
-state directory holds a durable corpus generation, and it never resets destination records";
+    "ignore an existing resume journal and restart, rebuild the plan in place\n\
+                                  (ids stay idempotent); it never resets destination records,\n\
+                                  and is refused on a durable corpus generation — see\n\
+                                  RESUME POLICY";
 const RESUME_POLICY_HELP: &str =
     "generated --no-graph journals reconcile add, change, delete, rename, and no-op runs; \
 a --no-graph state directory written before the generation format must be rebuilt into a new \
@@ -186,6 +188,14 @@ pub fn print_help() {
          \n\
          RESUME POLICY:\n\
              {resume_policy_help}.\n\
+             On a graph-enabled or pre-generation journal the durable plan supports no-op\n\
+             resume and same-path content replacement. Files added after that plan was frozen\n\
+             are reported as skipped and are not indexed; --fresh rebuilds the plan in place\n\
+             and picks them up. Removing an indexed file is refused there before any remote\n\
+             mutation: its documents are already live and nothing on that path deletes them.\n\
+             Restore the file and rerun, or rebuild — in place by deleting the published\n\
+             indices and the state directory, or isolated under a new --state-dir, --prefix\n\
+             and --brain (or --no-graph), validated before you switch readers.\n\
              --fresh is not cleanup and is not destination reconciliation: it never removes\n\
              stale records from the destination, and it is refused outright once a durable\n\
              corpus generation exists (re-run without it — the generated path reconciles the\n\
@@ -195,7 +205,8 @@ pub fn print_help() {
              autoindex-catalog and old target only after validation.\n\
          \n\
          EXIT CODES: 0 complete; 3 completed-with-junk (junk recorded, never fatal);\n\
-                     2 usage; 1 endpoint/journal failure or a refused unsafe state transition\n",
+                     2 usage; 1 endpoint/journal failure, a refused corpus removal, or a\n\
+                     refused unsafe state transition\n",
         fresh_help = FRESH_HELP,
         resume_policy_help = RESUME_POLICY_HELP
     );
@@ -543,6 +554,13 @@ mod tests {
         ] {
             assert!(help.contains(claim), "missing resume-policy claim: {claim}");
         }
+    }
+
+    #[test]
+    fn fresh_help_points_at_the_resume_policy_that_bounds_it() {
+        assert!(super::FRESH_HELP.contains("rebuild the plan in place"));
+        assert!(super::FRESH_HELP.contains("ids stay idempotent"));
+        assert!(super::FRESH_HELP.contains("RESUME POLICY"));
     }
 
     #[test]

@@ -389,7 +389,9 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         url: url.to_owned(),
         api_key: None,
         workers: 1,
+        scan_workers: 1,
         pdf_workers: 1,
+        resource_notes: Vec::new(),
         pdf_timeout_secs: 30,
         bulk_mb: 1,
         bulk_timeout_secs: 30,
@@ -406,6 +408,8 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         dry_run: false,
         json: false,
         quiet: true,
+        progress: crate::progress::ProgressMode::None,
+        progress_interval: None,
     }
 }
 
@@ -531,6 +535,7 @@ fn initial_generation_and_noop_are_end_to_end_idempotent() {
         &root.to_string_lossy(),
         &endpoint.url,
         "incremental-http",
+        false,
     )
     .unwrap();
     assert!(
@@ -1180,4 +1185,92 @@ fn a_junk_record_is_counted_into_the_generation_and_never_fatal() {
         .expect("the indexed file has a catalog document");
     assert_eq!(file_doc["junk"], 1);
     assert_eq!(file_doc["records"], 40);
+}
+
+/// Where this branch and #241 meet.
+///
+/// The generated `--no-graph` route returns from inside `run_index_report`,
+/// several hundred lines before the legacy `pr.finish` at the bottom of the
+/// function. `Ticker::drop` closes an unfinished stream with `ok=false`, so a
+/// generated run that merely returned would print an *aborted* terminal line
+/// immediately after committing a generation successfully — a silent
+/// contradiction between two changes that each looked right on its own.
+///
+/// This pins all three properties on the generated path: the phase-A scan is
+/// narrated (it is a per-file, minutes-long phase here exactly as on the legacy
+/// path), the stream closes with a truthful terminal line, and `--progress
+/// none` on the same path stays completely silent.
+#[test]
+fn a_generated_run_narrates_its_scan_and_closes_its_own_stream() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    for n in 0..4 {
+        fs::write(
+            corpus.path().join(format!("rows-{n}.csv")),
+            format!("id,value\n{n}0,alpha\n{n}1,beta\n"),
+        )
+        .unwrap();
+    }
+    let endpoint = HttpEndpoint::start();
+
+    // Generation 1: the initial commit, through the real progress surface.
+    let mut loud = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    loud.quiet = false;
+    loud.progress = crate::progress::ProgressMode::Plain;
+    loud.progress_interval = Some(std::time::Duration::from_secs(1));
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let code = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index(loud.clone()).unwrap()
+    };
+    assert_eq!(code, 0);
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let done = stream
+        .lines()
+        .find(|line| line.starts_with("xerj-done "))
+        .unwrap_or_else(|| panic!("a generated run must close its own stream:\n{stream}"));
+    assert!(
+        done.contains("ok=true") && done.contains("exit=0"),
+        "a committed generation is not an aborted run: {done}"
+    );
+    assert!(done.contains("reason=completed"), "{done}");
+
+    // Generation 2: the reconcile branch, which runs its own phase-A scan.
+    fs::write(corpus.path().join("rows-0.csv"), "id,value\n00,CHANGED\n").unwrap();
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let code = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index(loud).unwrap()
+    };
+    assert_eq!(code, 0);
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    assert!(
+        stream
+            .lines()
+            .any(|line| line.starts_with("xerj-progress ") && line.contains("phase=scan")),
+        "the reconcile projection re-scans every file and must say so:\n{stream}"
+    );
+    let done = stream
+        .lines()
+        .find(|line| line.starts_with("xerj-done "))
+        .unwrap_or_else(|| panic!("a reconciled generation must close its own stream:\n{stream}"));
+    assert!(done.contains("ok=true"), "{done}");
+
+    // The other half of the contract on the same path: silence means silence.
+    fs::write(corpus.path().join("rows-1.csv"), "id,value\n10,CHANGED\n").unwrap();
+    let quiet = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    assert_eq!(quiet.progress, crate::progress::ProgressMode::None);
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        assert_eq!(run_index(quiet).unwrap(), 0);
+    }
+    assert!(
+        buffer.lock().unwrap().is_empty(),
+        "--progress none asked for nothing: {}",
+        String::from_utf8_lossy(&buffer.lock().unwrap())
+    );
 }

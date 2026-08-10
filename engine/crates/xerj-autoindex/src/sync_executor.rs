@@ -1721,7 +1721,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn inventory(root: &Path) -> Inventory {
-        crate::content::resolve(walk::walk(root, false).unwrap()).unwrap()
+        crate::content::resolve_reporting(walk::walk(root, false).unwrap(), &|_| {}).unwrap()
     }
 
     fn plan_for(inventory: &Inventory) -> Plan {
@@ -2045,8 +2045,11 @@ mod tests {
     fn prepared_snapshot_budget_aborts_and_removes_staging() {
         let corpus = tempfile::tempdir().unwrap();
         std::fs::write(corpus.path().join("a.txt"), "budgeted source bytes").unwrap();
-        let inventory =
-            crate::content::resolve(crate::walk::walk(corpus.path(), false).unwrap()).unwrap();
+        let inventory = crate::content::resolve_reporting(
+            crate::walk::walk(corpus.path(), false).unwrap(),
+            &|_| {},
+        )
+        .unwrap();
         let plan = plan_for(&inventory);
         let state = tempfile::tempdir().unwrap();
         let error = create_prepared_snapshot(
@@ -2116,8 +2119,11 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let corpus = tempfile::tempdir().unwrap();
         std::fs::write(corpus.path().join("a.txt"), "protected bytes").unwrap();
-        let inventory =
-            crate::content::resolve(crate::walk::walk(corpus.path(), false).unwrap()).unwrap();
+        let inventory = crate::content::resolve_reporting(
+            crate::walk::walk(corpus.path(), false).unwrap(),
+            &|_| {},
+        )
+        .unwrap();
         let plan = plan_for(&inventory);
         let state = tempfile::tempdir().unwrap();
         let snapshot = create_snapshot(state.path(), "tx-protected", &inventory).unwrap();

@@ -468,6 +468,11 @@ mod tests {
                 records: 1,
             }],
             junk: None,
+            // Reconciliation re-samples from the source tree and publishes
+            // through the sealed snapshot, so it never carries a run-local
+            // PDF artifact (#248 is a phase A→B accelerator).
+            pdf_spool: None,
+            pdf_spool_fallbacks: Vec::new(),
         }
     }
 
