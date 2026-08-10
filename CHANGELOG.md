@@ -297,6 +297,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from its fragments before being emitted, so an entity-bearing field stays one
   value instead of becoming an array of pieces.
 
+- **`index` on the mapping is now honoured instead of silently ignored**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)). `"index": false` was
+  accepted by `PUT /{index}`, echoed back verbatim by `GET /{index}/_mapping`,
+  and then had no effect at all: the field kept a full inverted index and
+  `match`, `term`, `match_phrase`, `prefix` and `wildcard` against it all
+  returned the document, where Elasticsearch answers 400. It is the sibling of
+  the `doc_values` fix in rc.12 and follows its shape.
+
+  The line is drawn where ES draws it. Since 8.1, `"index": false` on a
+  keyword / numeric / date / boolean / ip field keeps the doc-values column and
+  stays queryable — `MappedFieldType.isSearchable()` is "has postings **or** has
+  doc values" — so those queries keep working here, unchanged. Only a field with
+  neither (a `text` field, or anything with an explicit `"doc_values": false`)
+  is unsearchable, and a query naming one is now rejected with ES's own
+  sentence, `Cannot search on field [f] since it is not indexed nor has doc
+  values.`, as a 400 `search_phase_execution_exception` /
+  `query_shard_exception`. The check lives in one place — `search_inner` — and
+  these surfaces were each measured reporting the rejection rather than
+  absorbing it, including the three that were swallowing it: `_search`,
+  `_count` on all four selectors (single index, `logs-*`, a comma list and the
+  cluster-wide `POST /_count`), `_msearch`, `_msearch/template`, `_explain`,
+  `_delete_by_query` and `_rank_eval`. `_explain` answers the 400 instead of a
+  confident `"matched": false` for a query it never ran; `_msearch` and
+  `_msearch/template` render it as a per-response 400 envelope with `type` and
+  `root_cause`, leaving the sibling sub-requests in the batch untouched; and
+  `_rank_eval` records the refused request under `failures` instead of dropping
+  it from `details` *and* `failures`. It still publishes a `metric_score`, and
+  that number is still the mean over the requests that actually ran — which is
+  ES's behaviour too — but the batch no longer shrinks silently underneath it:
+  a two-request batch in which one is refused now answers `details: {good}`,
+  `failures: {bad}`, `metric_score: 1.0` (measured), so a relevance gate reading
+  a clean score can see what did not contribute to it.
+
+  A multi-index `_count` follows ES's broadcast rule rather than failing
+  outright: the failure status is returned only when **no** index answered
+  (`RestStatus.status`, semantics only), so `/t/_count` and a `logs-*` whose
+  indices all carry the offending mapping both 400 exactly as `_search` does,
+  while a mixed selector returns 200 with the partial count and the refusal
+  visible as `_shards.failed: 1` plus a `_shards.failures` entry carrying the
+  `query_shard_exception`. What it will not do any more is what it did before:
+  report `count: 0` with `"successful": 2, "failed": 0`.
+
+  `exists` is unaffected and still returns zero hits rather than an error, which
+  is also what ES does.
+
+  The multi-field query types follow ES's own split rather than a blanket rule.
+  An explicitly *named* field is rejected like any other named field —
+  `multi_match` / `simple_query_string` / `query_string` with
+  `"fields": ["note"]`, and `query_string` with `"default_field": "note"` —
+  while a *wildcard* spec such as `"fields": ["*"]` is never an error, because
+  ES expands a pattern over the searchable fields and silently drops the rest
+  (`QueryParserHelper.resolveMappingField`). Before this, the same user intent
+  got two different answers: the `simple_query_string` form was rejected (the
+  parser lowers it to a `match`) while the `multi_match` form returned the
+  document through the unsearchable field.
+
+  Reaching the `query_string` half of that meant fixing a second
+  accepted-and-ignored key in the same family: **`query_string`'s `fields`
+  array was never read by the parser**, so `{"query":"x","fields":["title"]}`
+  searched every field, and — once `index: false` became a real rejection —
+  disagreed with `{"default_field":"title"}`, which is the same request written
+  the other way. `fields` now selects the targets for a clause that named no
+  field of its own (a `dis_max` over one leaf per field when there is more than
+  one, `^boost` honoured) — the same job `simple_query_string`'s `fields` list
+  was already doing. A clause that does name its own field keeps it, as in ES.
+
+  The field is dropped from the full-text index at flush and merge only where
+  the stored-doc fallback is *equivalent* — a non-indexed `text` field. An
+  exact-typed field that kept its doc values keeps its whole-value postings,
+  because the fallback scan splits on non-alphanumerics and would start matching
+  `192.168.0.1` against `192.168.0.2`. So no byte-saving claim is made for this
+  change: for those types the footprint the option implies is knowingly forgone
+  rather than bought with wrong answers.
+
+  Known gaps, measured and left open rather than claimed shut. **Aggregations
+  and sort do not inherit the check**: only the `query` clause is walked, so
+  `{"size":0,"aggs":{"a":{"terms":{"field":"note"}}}}` still answers 200 with a
+  bucket built from `_source`, and `{"sort":[{"note":"asc"}]}` still answers 200.
+  ES rejects those too, but for an unrelated reason and with an unrelated
+  sentence — `Fielddata is disabled on [f] in [i]…`, which it raises for *any*
+  `text` field whether or not `index: false` was declared — so reusing this
+  error there would misreport a wider divergence as this one. **The field-less
+  arms of the stored-document scan are schema-free**, walking every `_source`
+  key, so a token living only in an unsearchable field can still match when
+  **no** field is named: `query_string {"query":"…"}` and `more_like_this` with
+  no `fields` both still return the document. (Their *named* forms are
+  rejected — `more_like_this` with `fields` lowers to a `bool.should` of
+  `match` at parse time and inherits the check.) **A wildcard `fields` spec
+  reaches that same field-less arm**: `simple_query_string` / `query_string`
+  with `"fields": ["*"]` lowers to the `"*"` placeholder and is answered by the
+  schema-free scan, so it can still match through an unsearchable field. It is
+  never an *error*, which is ES's rule and deliberate — but it is not "answered
+  over the searchable fields" either, and that is a pre-existing property of
+  wildcard expansion, identical on `main`. (`multi_match` with a pattern is
+  different: it is answered by the FTS projection, which does apply
+  `isSearchable()`, and finds nothing in an unsearchable field.) **The opaque
+  `query_string` fallback still ignores a multi-field `fields` list**: a query
+  string the parser declines to lower keeps the whole string for the FTS path,
+  where a one-element `fields` is carried across as `default_field` and a
+  longer list has nowhere to go. And **`_validate/query` never opens the
+  index** — it answers from the parse alone, so it reports `{"valid": true}`
+  for a body `_search` refuses. That too is unchanged from `main`, but it now
+  disagrees with `_search`, so it is written down rather than left to be
+  discovered. Every one of these gaps is pinned by an assertion in
+  `index_false_is_honoured::documented_gaps_are_still_open_and_still_documented`,
+  so closing one fails the test that says it is open.
+
+### Added — incremental `--no-graph` corpus reconciliation
+
+- **`xerj autoindex --no-graph` now reconciles a changed folder instead of
+  re-deriving it.** A `--no-graph` run commits a durable *corpus generation*: a
+  manifest of content groups (stable group identity, content digest and byte
+  length, canonical path plus aliases, dataset assignment, validated output
+  counts) plus a sealed source snapshot of the prepared records. A later run
+  projects the current inventory onto the committed manifest and publishes only
+  the difference — additions, content changes, deletions, renames, junk
+  transitions and duplicate-alias moves all converge, and a no-op re-run issues
+  no data bulk and appends no new generation. A run interrupted mid-generation
+  replays from its own sealed snapshot, so the result never depends on whether
+  the source tree changed after the crash. Dataset and mapping identity is
+  frozen at generation 1: a file that would need a *new* dataset or a mapping
+  change is refused before any remote mutation rather than silently widening
+  the schema.
+
+  Scope, plainly: only `--no-graph`. Graph-enabled runs are unchanged, and each
+  changed generation still copies and prepares the full corpus (O(N) staging) —
+  the win is in what gets published and verified, not yet in what gets read.
+  `--snapshot-max-gb` (default 64) caps the logical staged payload; it is a
+  payload budget, not a disk-space or peak-memory guarantee.
+
+  Original work by Leonid Bugaev (@buger).
+
+- **Junk keeps the contract it always had on the generated path: recorded,
+  never fatal.** A file that cannot be read or recognised (`plan.junk_files`)
+  and a record that no dataset assignment accepts (`stats.junk`) both used to
+  abort a `--no-graph` run outright — the first with
+  `plan has no assignment for <file>`, the second with
+  `durable preparation of <file> produced N junk records`. A single zero-byte
+  file was enough to make a whole folder unindexable. Both are now counted
+  instead: the sealed prepared artifact carries its junk-record count, the
+  manifest group carries it into the generation, and the catalog's per-file
+  `junk` and run-level `junk_records_total` report it instead of a hardcoded
+  zero. Such a run exits **3** ("completed with junk"), the same signal the
+  legacy path publishes — the generated path previously returned a flat `0`
+  and lost it.
+
+- **`--dry-run` is honoured on an already-generated state directory.** It was
+  evaluated only after the pending-replay and reconcile branches had already
+  published and committed, so on any state directory past generation 1 the flag
+  was accepted, silently ignored, and the destination mutated. It is now decided
+  before either branch: it prints the plan a real run would act on — the
+  projected reconcile plan, or the sealed plan of a pending generation — and
+  returns without opening the journal for write, without snapshot GC, and
+  without a single bulk request.
+
+### Changed — `autoindex --fresh` is refused on a durable generation
+
+- **`--fresh` no longer silently destroys a committed corpus generation.**
+  `--fresh` deletes the resume journal, and the snapshot GC that follows every
+  journal open then sees an empty protected set and removes every sealed
+  snapshot — so on a generated state directory `--fresh` would discard the
+  committed manifest, the pending replay evidence, and the alias/path/
+  stale-record knowledge, while cleaning nothing at the destination. It is now
+  refused up front, naming the generation that blocks it, and pointing at the
+  plain re-run (which reconciles the change) or at an isolated rebuild with a
+  new `--state-dir` and `--prefix`.
+
+  **Unchanged for everyone else.** On a legacy (non-generated) journal —
+  including every graph-enabled corpus and anything `xerj brain` writes —
+  `--fresh` behaves exactly as before: it ignores the journal and restarts,
+  which is what `xerj brain`'s documented self-heal for a wiped data directory
+  depends on.
+
+### Migration — pre-generation `--no-graph` state directories must be rebuilt
+
+- **A `--no-graph` state directory written before this release cannot be
+  adopted as generation zero, and the first `--no-graph` run against it will
+  refuse with a followable rebuild command.** This is a deliberate, versioned
+  format boundary (`sync::GENERATION_FORMAT_VERSION = 1`), not a validation
+  failure: a pre-generation resume plan records no stable group identity, no
+  content byte length and no validated per-group output counts, so no amount of
+  evidence in it could reconstruct a manifest group. The refusal prints the
+  exact `xerj autoindex` argv for an isolated rebuild into a new `--state-dir`
+  and `--prefix`; the old target and the shared `autoindex-catalog` are left
+  alone and require explicit, validated cleanup once the new target is
+  verified. Nothing is migrated in place and no destination data is touched by
+  the refusal. Graph-enabled state directories are not affected.
+
 ## [1.0.0-rc.14] - 2026-08-10
 
 ### Changed
