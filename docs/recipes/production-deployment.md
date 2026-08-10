@@ -189,6 +189,71 @@ container. If you enable in-process TLS, change the probe to
 your container is marked unhealthy forever. Same for a Kubernetes probe: set
 `scheme: HTTPS` on the `httpGet`.
 
+### What readiness actually means
+
+`/health/ready` answers **"can this node serve?"**, not "is every index
+perfect". A node with 200 healthy indices and one that will not open stays
+`200` and keeps taking traffic, with the degradation named in the body:
+
+```text
+ready (degraded): 200 of 201 indices serving, 1 failed to open; see GET /_cluster/indices/failed
+```
+
+The body carries counts only — this path is exempt from authentication, so it
+must not enumerate index names to anything that can reach the port. The names
+and reasons live behind auth on `GET /_cluster/indices/failed`.
+
+It returns `503` only when there is genuinely nothing to serve — every index
+the node holds failed to open. This is deliberate: readiness used to hard-fail
+on any red status, so one bad index directory removed the whole pod from
+service permanently and took the 200 working indices down with it. The red
+status itself is untouched — `/v1/health`, `/v1/cluster/health`,
+`_cluster/health` and `_cat/health` all still report `red`, so alert on those,
+not on the probe.
+
+### Recovering an index that will not open
+
+An index directory that fails to open at boot is quarantined rather than
+silently dropped, and it is a state you can act on without stopping the
+server. All four moves work on a live node:
+
+```bash
+# 1. What failed, and why — the verbatim open error, not just a name
+curl -s localhost:9200/_cluster/indices/failed | jq .
+
+# 2. It is visible in the surfaces you already watch
+curl -s localhost:9200/_cat/indices          # → red open broken <uuid> 1 0 0 0 0b 0b 0b
+curl -s "localhost:9200/_cluster/health?level=indices" | jq '.indices.broken'
+
+# 3. Fix the cause the error names (e.g. restore snapshot.json from a
+#    backup or from an interrupted-write `.tmp.*` sibling), then retry
+curl -s -XPOST localhost:9200/_cluster/indices/failed/broken/_retry
+
+# 4. Or give up on it and remove it
+curl -s -XDELETE localhost:9200/broken
+```
+
+A retry that does not work returns `503` with the *current* reason, not the
+one recorded at boot. While an index is in this state, searches and writes to
+it return `503 no_shard_available_action_exception` naming the open error —
+**not** `404 index_not_found`, which would be a lie: the name is taken and the
+data is still on disk. Creating an index over that name is refused for the
+same reason.
+
+Existence is answered separately from data, the way ES answers it: `GET
+/broken`, `HEAD /broken` (the `indices.exists()` your client library calls),
+`GET /broken/_mapping` and `GET /broken/_settings` all return `200` and report
+the index as existing, because those read metadata and never touch a shard. So
+a client that probes before writing gets one consistent answer — the name is
+taken — instead of a `404` from `HEAD` followed by a `503` from the `PUT`.
+
+Watch for the failure on the health surfaces, not the existence probes:
+`_cat/health` and `_cluster/health` both report `red` with
+`unassigned_primary_shards: 1`, and the two conditions that gate on it are
+honoured — `wait_for_status=green` and `wait_for_active_shards=all` answer
+`408` with `"timed_out": true` rather than reporting success on a red node, so
+a startup gate written against real ES behaves the same here.
+
 ### gRPC posture
 
 The gRPC `XerjSearch` service (default `:8081`) always speaks **plaintext

@@ -56,6 +56,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed index can now be inspected, deleted and retried without stopping
+  the server** ([#206](https://github.com/xerj-org/xerj/issues/206)). An index
+  directory that refused to open at boot was recorded in a map that only
+  `Engine::health` ever read. Live-reproduced with a corrupt `snapshot.json`:
+  it was absent from `_cat/indices` and `_cluster/state`, `DELETE /{index}`
+  answered `404 index_not_found` and left the bytes on disk, and the only
+  recovery was to stop the server and edit the data directory by hand. A
+  failed index is now a real state: listed as `red` in `_cat/indices`, present
+  in `_cluster/state` as an `UNASSIGNED` primary with `ALLOCATION_FAILED` and
+  the verbatim open error, enumerated with its reason by
+  `GET /_cluster/indices/failed`, reopenable via
+  `POST /_cluster/indices/failed/{name}/_retry` once the cause is fixed, and
+  deletable through the ordinary `DELETE /{index}`. Searches, writes and
+  creates against it return `503 no_shard_available_action_exception` carrying
+  the reason instead of a `404` that claimed it did not exist, while the
+  metadata surfaces — `GET /{index}`, `HEAD /{index}` (the `indices.exists()`
+  every ES client calls), `_mapping`, `_settings`, `_cat/indices` — report it
+  as an index that exists, the way ES answers those from cluster metadata
+  rather than from a shard. Before this, `HEAD` said the name was free and the
+  following `PUT` said it was unavailable.
+
+  Two related defects in the same report are fixed with it. **Readiness no
+  longer hard-fails on a partly degraded node** — `/health/ready` returned
+  `503` for any red status, so one broken index pulled a pod holding 200
+  healthy ones out of service permanently; it now reports `200 ready
+  (degraded)` while the node can still serve something and `503` only when
+  every index it holds failed to open. And **`_cat/health` no longer prints a
+  hardcoded `green`** — the one health surface an existing ES dashboard points
+  at was the one that could not report a broken node; it and `_cluster/health`
+  now count an unopenable index as an unassigned primary, agreeing with
+  `/v1/health` and `/v1/cluster/health`.
+
+  Because `red` is now reachable on `_cluster/health` for the first time, the
+  two conditions that gate on it are consulted rather than assumed:
+  `wait_for_active_shards=all` and `wait_for_status=green|yellow` both answer
+  `408` with `timed_out: true` on a red node instead of `200 timed_out: false`.
+  `GET /_cluster/health?wait_for_status=green&timeout=30s` is the bootstrap gate
+  every docker healthcheck, CI wait loop and Kibana startup uses; a red node
+  used to sail straight through it. A green or yellow cluster is unaffected.
+
+- **A `DELETE /{index}` that could not remove the bytes no longer strands the
+  index.** The open-index path pulled the handle out of the engine before
+  `remove_dir_all`, so a removal that failed (read-only mount, `EACCES`) freed
+  the name while the directory survived: no handle, no failed-index entry,
+  nothing on `_cat/indices`, and the next `DELETE` answered `404` — the same
+  dead end as [#206](https://github.com/xerj-org/xerj/issues/206), reached from
+  the other side. The handle is now restored on failure, so the index stays in
+  service and addressable and the operator can retry the delete once the cause
+  is fixed.
+
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**
   ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the
   resume plan was frozen is skipped and reported in the catalog — but that

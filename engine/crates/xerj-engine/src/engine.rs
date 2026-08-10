@@ -98,6 +98,28 @@ pub struct IndexInfo {
     pub schema_version: u64,
 }
 
+/// An index directory that is present on disk but could not be opened.
+///
+/// Before issue #206 a failed open left only `name → reason` in a private map
+/// that nothing but [`Engine::health`] ever read: the index was invisible to
+/// `_cat/indices` and `_cluster/state`, `DELETE` answered 404, and the only
+/// recovery was to stop the server and edit the data directory by hand. A
+/// failed index is now a real, addressable state — it is listed, it carries
+/// the open error verbatim, it can be deleted, and it can be retried once the
+/// operator has fixed the cause.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedIndex {
+    /// Index name, i.e. the directory name under `data_dir`.
+    pub name: String,
+    /// The verbatim error from the last open attempt. Never summarised —
+    /// the storage layer's message already names the file and the fix.
+    pub reason: String,
+    /// Wall-clock ms of the first failure (boot, restore, or a failed retry).
+    pub failed_at_ms: i64,
+    /// How many explicit retries have been attempted since (0 at first boot).
+    pub retries: u32,
+}
+
 /// Overall engine health.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatus {
@@ -297,8 +319,11 @@ pub struct Engine {
     pub search_templates: Arc<DashMap<String, Value>>,
     /// async search id → stored result JSON
     pub async_searches: Arc<DashMap<String, Value>>,
-    /// Names of index directories that failed to open on startup (health = red).
-    pub failed_indices: Arc<DashMap<String, String>>,
+    /// Index directories that are present but could not be opened, keyed by
+    /// index name (health = red). See [`FailedIndex`] — these are inspectable
+    /// (`GET /_cluster/indices/failed`), deletable (`DELETE /{index}`) and
+    /// retryable (`POST /_cluster/indices/failed/{index}/_retry`).
+    pub failed_indices: Arc<DashMap<String, FailedIndex>>,
     /// transform id → transform definition JSON
     pub transforms: Arc<DashMap<String, Value>>,
     /// index_name → frozen state (true = frozen / read-only)
@@ -524,7 +549,15 @@ impl Engine {
                     }
                     Err(e) => {
                         warn!(name = name_str.as_str(), error = %e, "failed to open index");
-                        engine.failed_indices.insert(name_str, e.to_string());
+                        // The mapping blob lives beside the data, not inside
+                        // the store, so it is readable even when the store
+                        // refuses to open. Load it so the metadata surfaces
+                        // (`GET /{index}`, `GET /{index}/_mapping`) can still
+                        // tell the operator what was in the index they are
+                        // trying to recover. Propagation into the (absent)
+                        // handle no-ops.
+                        engine.load_persisted_es_mapping(&name_str);
+                        engine.record_failed_index(&name_str, e.to_string());
                     }
                 }
             }
@@ -835,6 +868,16 @@ impl Engine {
         if self.indices.contains_key(name) {
             return Err(EngineError::Common(
                 xerj_common::XerjError::index_already_exists(name),
+            ));
+        }
+
+        // The name is taken by an index that exists on disk but would not
+        // open. Creating over it would run the store open again and surface a
+        // storage error that says nothing about the operator's options, so
+        // refuse here with the recorded reason instead (issue #206).
+        if let Some(f) = self.failed_indices.get(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
             ));
         }
 
@@ -1184,6 +1227,11 @@ impl Engine {
     /// Also drops any aliases that pointed only at this index (matching ES
     /// semantics) and clears the `closed_indices` flag so the name is
     /// truly gone when another test recreates it.
+    ///
+    /// A **failed** index (present on disk, refused at open — see
+    /// [`FailedIndex`]) is deletable through this same door. It used to answer
+    /// 404 `index_not_found`, which left an operator with no lever but
+    /// stopping the server and removing the directory by hand (issue #206).
     pub async fn delete_index(&self, name: &str) -> Result<()> {
         // Per-index authorization backstop (issue #79) — "destroy the brain"
         // is the loudest door, so it is checked before the index is removed
@@ -1193,13 +1241,54 @@ impl Engine {
                 xerj_common::XerjError::index_not_found(name),
             ));
         }
-        let idx =
-            self.indices.remove(name).map(|(_, v)| v).ok_or_else(|| {
-                EngineError::Common(xerj_common::XerjError::index_not_found(name))
-            })?;
+        match self.indices.remove(name).map(|(_, v)| v) {
+            Some(idx) => {
+                // The handle is pulled out of the map first so no write can
+                // land in a directory that is being removed — but if the
+                // removal then fails (read-only mount, EACCES, EROFS), the
+                // name has been freed while the bytes are still there. That
+                // is exactly the stuck state issue #206 is about, arrived at
+                // from the other side: `Engine::indices` no longer holds it,
+                // `failed_indices` never did, so `_cat/indices` cannot show
+                // it, `DELETE` answers 404 and none of the three recovery
+                // levers this module adds can name it. Put the handle back so
+                // a delete that did not happen leaves the index addressable
+                // and the operator can retry it.
+                if let Err(e) = idx.delete_all_data().await {
+                    self.indices.insert(name.to_string(), idx);
+                    warn!(name, error = %e, "index delete failed; index left in service");
+                    return Err(e);
+                }
+            }
+            None => {
+                // Not open. If it is a known failed index, its bytes are still
+                // on disk and removing them is exactly what the operator asked
+                // for; anything else is a genuine 404.
+                if !self.failed_indices.contains_key(name) {
+                    return Err(EngineError::Common(
+                        xerj_common::XerjError::index_not_found(name),
+                    ));
+                }
+                // Drop the bookkeeping only after the bytes are gone. Removing
+                // it first would take a delete that failed (read-only mount,
+                // fs error) out of the failed list while its directory
+                // survives — the operator would believe the name was freed and
+                // the index would reappear on the next boot.
+                self.remove_index_dir(name)?;
+                self.failed_indices.remove(name);
+            }
+        }
 
-        idx.delete_all_data().await?;
+        self.forget_index_metadata(name);
+        info!(name, "index deleted");
+        Ok(())
+    }
 
+    /// Drop every piece of engine-side metadata that names `index` — aliases
+    /// that pointed only at it, the closed flag, settings, mappings, alias
+    /// metadata. Shared by the open-index and failed-index delete paths so the
+    /// two cannot drift.
+    fn forget_index_metadata(&self, name: &str) {
         // Remove this index from every alias that references it; drop the
         // alias entirely when its backing list becomes empty.
         let empty_aliases: Vec<String> = self
@@ -1223,9 +1312,109 @@ impl Engine {
         self.index_settings.remove(name);
         self.index_mappings.remove(name);
         self.index_alias_metadata.remove(name);
+    }
 
-        info!(name, "index deleted");
+    /// Remove `<data_dir>/<name>` from disk, refusing anything that does not
+    /// resolve inside `data_dir`.
+    ///
+    /// The open-index path deletes through `Index::delete_all_data`, which can
+    /// only ever point at a directory the engine itself built. The failed-index
+    /// path has no `Index` to ask, so the name is re-validated here and the
+    /// resolved path is proven to be under `data_dir` before anything is
+    /// removed — the same canonicalisation rule the snapshot-restore path
+    /// applies before it writes.
+    fn remove_index_dir(&self, name: &str) -> Result<()> {
+        // Reject traversal/absolute forms up front: only a legal index name
+        // can name a directory we own.
+        IndexName::new(name).map_err(EngineError::Common)?;
+        let dir = self.data_dir.join(name);
+        if !dir.exists() {
+            return Ok(());
+        }
+        let dir_canon = dir.canonicalize().map_err(EngineError::Io)?;
+        let root_canon = self.data_dir.canonicalize().map_err(EngineError::Io)?;
+        if !dir_canon.starts_with(&root_canon) {
+            return Err(EngineError::Common(xerj_common::XerjError::storage(
+                format!("refusing to delete index [{name}] outside data_dir (canonical)"),
+            )));
+        }
+        std::fs::remove_dir_all(&dir_canon).map_err(EngineError::Io)?;
         Ok(())
+    }
+
+    // ── Failed-index recovery (issue #206) ────────────────────────────────────
+
+    /// Record (or re-record) an index that could not be opened.
+    ///
+    /// Preserves `failed_at_ms` across repeated failures so "since when" stays
+    /// truthful, and counts retries so a flapping directory is visible as
+    /// such.
+    fn record_failed_index(&self, name: &str, reason: String) {
+        match self.failed_indices.get_mut(name) {
+            Some(mut existing) => {
+                existing.reason = reason;
+                existing.retries = existing.retries.saturating_add(1);
+            }
+            None => {
+                self.failed_indices.insert(
+                    name.to_string(),
+                    FailedIndex {
+                        name: name.to_string(),
+                        reason,
+                        failed_at_ms: now_millis(),
+                        retries: 0,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Every failed index the caller is allowed to see, sorted by name.
+    pub fn list_failed_indices(&self) -> Vec<FailedIndex> {
+        let mut out: Vec<FailedIndex> = self
+            .failed_indices
+            .iter()
+            .filter(|e| crate::index_guard::visible(e.key()))
+            .map(|e| e.value().clone())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Re-attempt the open of a failed index.
+    ///
+    /// On success the index becomes a normal, serving index (mapping and date
+    /// flags restored exactly as at boot) and leaves the failed set. On failure
+    /// the recorded reason is refreshed, the retry counter advances, and the
+    /// new error is returned — the operator gets the *current* reason, not the
+    /// one from boot.
+    pub fn retry_failed_index(&self, name: &str) -> Result<()> {
+        if !crate::index_guard::visible(name) || !self.failed_indices.contains_key(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_not_found(name),
+            ));
+        }
+        let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+        match Index::open(index_name, &self.config, &self.data_dir) {
+            Ok(idx) => {
+                self.load_persisted_es_mapping(name);
+                if let Some(m) = self.index_mappings.get(name) {
+                    Engine::apply_date_mapping_flags(&idx, m.value());
+                }
+                self.indices.insert(name.to_string(), idx);
+                self.failed_indices.remove(name);
+                info!(name, "failed index reopened");
+                Ok(())
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                self.record_failed_index(name, reason.clone());
+                warn!(name, error = %reason, "retry of failed index did not succeed");
+                Err(EngineError::Common(
+                    xerj_common::XerjError::index_unavailable(name, reason),
+                ))
+            }
+        }
     }
 
     /// Get a reference to an index by name, resolving aliases first.
@@ -1252,9 +1441,7 @@ impl Engine {
                     .indices
                     .get(real_name.as_str())
                     .map(|r| Arc::clone(r.value()))
-                    .ok_or_else(|| {
-                        EngineError::Common(xerj_common::XerjError::index_not_found(real_name))
-                    });
+                    .ok_or_else(|| EngineError::Common(self.missing_index_error(real_name)));
             }
         }
         if !crate::index_guard::visible(name) {
@@ -1265,7 +1452,21 @@ impl Engine {
         self.indices
             .get(name)
             .map(|r| Arc::clone(r.value()))
-            .ok_or_else(|| EngineError::Common(xerj_common::XerjError::index_not_found(name)))
+            .ok_or_else(|| EngineError::Common(self.missing_index_error(name)))
+    }
+
+    /// The error for a name that is not in `indices`.
+    ///
+    /// A name that failed to open is **not** "not found": the directory is
+    /// still there and the operator has a lever. Reporting a 404 for it is how
+    /// issue #206's stuck state stayed invisible, so a failed index answers
+    /// 503 `no_shard_available_action_exception` carrying the open error and
+    /// the three commands that act on it.
+    fn missing_index_error(&self, name: &str) -> xerj_common::XerjError {
+        match self.failed_indices.get(name) {
+            Some(f) => xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
+            None => xerj_common::XerjError::index_not_found(name),
+        }
     }
 
     /// Return an index by name, creating it if it doesn't exist (ES behaviour).
@@ -1284,6 +1485,15 @@ impl Engine {
         }
         if let Ok(idx) = self.get_index(name) {
             return Ok(idx);
+        }
+        // A failed index already occupies this name and its bytes are still on
+        // disk. Auto-creating over it would either destroy recoverable data or
+        // fail deep inside the store with an opaque message — refuse loudly
+        // with the open reason and the operator's options instead (issue #206).
+        if let Some(f) = self.failed_indices.get(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
+            ));
         }
         // Auto-create with empty schema.
         self.create_index(name, Schema::empty())?;
@@ -1981,7 +2191,7 @@ impl Engine {
                 }
                 Err(e) => {
                     warn!(index = idx_name, error = %e, "failed to reopen restored index");
-                    self.failed_indices.insert(idx_name.clone(), e.to_string());
+                    self.record_failed_index(idx_name, e.to_string());
                 }
             }
         }
