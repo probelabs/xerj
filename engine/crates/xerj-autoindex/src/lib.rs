@@ -150,6 +150,78 @@ pub(crate) fn ensure_generation_mappings(es: &Es, plan: &Plan) -> Result<()> {
         .context("install generation catalog mapping")
 }
 
+/// Project the current inventory onto a committed plan.
+///
+/// Pure by design and deliberately shared: `--dry-run` prints exactly the plan
+/// the real reconcile would act on, because it is produced by this same call
+/// rather than by a parallel implementation that could drift away from it.
+///
+/// The scan itself obeys the same two policies the legacy phase A does. It runs
+/// inside the run's own pool, because `--workers` has to bound the CPU-bound
+/// phase for the knob to mean anything (#240 §2), and it opens a per-file
+/// progress guard, because a file this route touches must not drop out of the
+/// progress denominator (#241). Run-local PDF artifact reuse is deliberately
+/// disabled here: the generated route publishes from its own sealed snapshot
+/// and never reaches the legacy phase B, so a retained artifact could never be
+/// replayed (#248).
+fn project_reconcile_plan(
+    inventory: &content::Inventory,
+    base_plan: &Plan,
+    cfg: &IndexCfg,
+    state_dir: &Path,
+    pr: &Progress,
+) -> Result<Plan> {
+    let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
+    let ctx = PhaseAContext {
+        state_dir,
+        budget: &budget,
+        capacity_warning: None,
+        progress: pr,
+    };
+    pr.phase(
+        "scan",
+        inventory.files.len() as u64,
+        inventory.files.iter().map(|file| file.size).sum(),
+    );
+    let scans: Vec<FileScan> = crate::pool::install(|| {
+        use rayon::prelude::*;
+        inventory
+            .files
+            .par_iter()
+            .zip(inventory.digests.par_iter())
+            .map(|(file, digest)| {
+                let _in_flight = pr.file(&file.rel, file.size);
+                scan_file(
+                    &file.path,
+                    file.size,
+                    digest,
+                    &ctx,
+                    cfg.sample,
+                    cfg.max_file_gb,
+                )
+            })
+            .collect()
+    });
+    reconcile_plan::reconcile_plan(inventory, base_plan, scans, cfg.sample)
+}
+
+/// Exit code for a run that committed (or confirmed) a corpus generation.
+///
+/// `3` is "completed with junk — recorded, never fatal", the same contract the
+/// legacy path publishes (`cli.rs` EXIT CODES, and CLAUDE.md's own indexing
+/// workflow treats 3 as success). The generated path returned a flat `0`, which
+/// silently downgraded that signal for `--no-graph`. Both inputs come from the
+/// committed generation's own run document, so a no-op re-run over a corpus
+/// that still contains junk reports 3 again instead of flapping to 0.
+fn generated_exit_code(summary: &Value) -> i32 {
+    let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+    if count("junk_records_total") > 0 || count("files_junk") > 0 {
+        3
+    } else {
+        0
+    }
+}
+
 fn begin_non_graph_generation(
     es: &Es,
     journal: &mut state::Journal,
@@ -273,6 +345,7 @@ fn begin_non_graph_generation(
             expected_records: 0,
             expected_passages: 0,
             expected_vectors: 0,
+            expected_junk_records: 0,
         });
     }
     let mut groups = sync::reconcile_groups(&base.groups, candidates)?;
@@ -1799,6 +1872,26 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
         .into());
     }
+    // `--dry-run` has to be decided *before* the generated branches, not after
+    // them. Both of those branches publish and commit, and both return before
+    // control ever reaches the legacy `cfg.dry_run` check further down — so on
+    // any already-generated state directory the flag was accepted, ignored, and
+    // the destination mutated anyway. A projection-only flag that writes is
+    // worse than one that errors, so this branch is placed where nothing has
+    // been opened for write yet: the journal is still only preflighted, and
+    // `gc_snapshots` (which deletes unprotected snapshot directories) has not
+    // run.
+    if cfg.dry_run {
+        if let Some(pending) = &preflight.pending_sync {
+            println!("{}", serde_json::to_string_pretty(&pending.desired.plan)?);
+            eprintln!(
+                "(dry run — nothing indexed; corpus generation {} is already sealed and pending \
+                 replay from its own durable snapshot. Re-run without --dry-run to finish it.)",
+                pending.desired.generation
+            );
+            return Ok((0, None));
+        }
+    }
     // A durable sync_begin owns the desired generation. Never rediscover and
     // replan from a mutable source tree while that transaction is pending.
     // Operation handlers are deliberately not enabled by this foundation
@@ -1828,7 +1921,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         // `--progress json` stays one parseable stream (#241).
         pr.note("autoindex: resumed and committed pending corpus generation from durable source");
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
-        return Ok((0, Some(summary)));
+        return Ok((generated_exit_code(&summary), Some(summary)));
     }
     // Totals are unknown until the walk returns, so this phase honestly
     // reports `pct=unknown` and proves liveness with the clock alone.
@@ -1858,6 +1951,39 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     pr.phase("hash", discovered_files.len() as u64, discovered_bytes);
     let mut inventory = content::resolve_reporting(discovered_files, &|bytes| pr.item_done(bytes))?;
     if cfg.no_graph && preflight.committed_manifest.is_some() && !genesis_recovery {
+        if cfg.dry_run {
+            let base = preflight
+                .committed_manifest
+                .as_ref()
+                .context("branch guard proved a committed manifest")?;
+            let plan = project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr)?;
+            let unchanged = serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+            // stdout is the RESULT, stderr is PROGRESS: the projection above is
+            // the result, this explanation is progress and goes out through the
+            // surface that `--progress none` silences (#241).
+            pr.note(&format!(
+                "(dry run — nothing indexed; {})",
+                if unchanged {
+                    format!(
+                        "committed generation {} already describes this folder",
+                        base.generation
+                    )
+                } else {
+                    format!(
+                        "this is the plan a real run would commit as generation {}",
+                        base.generation + 1
+                    )
+                }
+            ));
+            pr.finish(
+                true,
+                0,
+                "dry-run",
+                &[("files", inventory.files.len() as u64)],
+            );
+            return Ok((0, None));
+        }
         let mut journal = state::Journal::open_after_preflight(
             preflight,
             &root_str,
@@ -1872,46 +1998,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             .as_ref()
             .context("generated journal lost its committed manifest")?
             .clone();
-<<<<<<< HEAD
-        // Phase A's scan runs in the run's own pool and reports every file it
-        // touches, exactly as the legacy route does: `--workers` has to bound
-        // the CPU-bound phase for the knob to mean anything (#240 §2), and no
-        // file may drop out of the progress denominator (#241). Run-local PDF
-        // artifact reuse is disabled here on purpose — this route publishes
-        // from its own durable snapshot and never reaches the legacy phase B,
-        // so a retained artifact could never be replayed (#248).
-        let reconcile_budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
-        let reconcile_ctx = PhaseAContext {
-            state_dir: &state_dir,
-            budget: &reconcile_budget,
-            capacity_warning: None,
-            progress: &pr,
-        };
-        pr.phase(
-            "scan",
-            inventory.files.len() as u64,
-            inventory.files.iter().map(|file| file.size).sum(),
-        );
-        let scans: Vec<FileScan> = crate::pool::install(|| {
-            use rayon::prelude::*;
-            inventory
-                .files
-                .par_iter()
-                .zip(inventory.digests.par_iter())
-                .map(|(file, digest)| {
-                    let _in_flight = pr.file(&file.rel, file.size);
-                    scan_file(
-                        &file.path,
-                        file.size,
-                        digest,
-                        &reconcile_ctx,
-                        cfg.sample,
-                        cfg.max_file_gb,
-                    )
-                })
-                .collect()
-        });
-        let plan = reconcile_plan::reconcile_plan(&inventory, &base.plan, scans, cfg.sample)?;
+        let plan = project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr)?;
         if serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)? {
             if let Some(expected) = &base.execution {
                 let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
@@ -1949,7 +2036,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 }
             }
             let summary = finish_generated_run(&es, &mut journal, &cfg)?;
-            return Ok((0, Some(summary)));
+            return Ok((generated_exit_code(&summary), Some(summary)));
         }
         begin_non_graph_generation(
             &es,
@@ -1963,7 +2050,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         let mut backend = sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20);
         sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
-        return Ok((0, Some(summary)));
+        return Ok((generated_exit_code(&summary), Some(summary)));
     }
     if cfg.no_graph && preflight.plan.is_some() && !genesis_recovery {
         let replacement_state = state_dir.with_extension("generation-v1");
@@ -2304,7 +2391,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         let mut backend = sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20);
         sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
-        return Ok((0, Some(summary)));
+        return Ok((generated_exit_code(&summary), Some(summary)));
     }
 
     if plan

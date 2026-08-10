@@ -52,6 +52,11 @@ pub struct PreparedArtifact {
     pub records: u64,
     pub passages: u64,
     pub vectors: u64,
+    /// Records the extractor produced that no dataset assignment could accept.
+    /// Sealed here because nothing downstream can recover the number: junk is
+    /// never published, so no read-back count sees it.
+    #[serde(default)]
+    pub junk: u64,
     pub bytes: u64,
     pub digest: String,
 }
@@ -424,6 +429,20 @@ impl<'a> EsSyncBackend<'a> {
                 sum.checked_add(group.content_size)
                     .context("dataset source byte count overflow")
             })?;
+            // Junk is a property of the *file*, not of a dataset: a record that
+            // no assignment accepted belongs to no dataset by definition. A
+            // group that feeds several datasets therefore charges its junk to
+            // exactly one of them — the first of its sorted slugs — so the
+            // run-level `junk_records_total` (a sum over datasets) stays exact
+            // instead of multiplying by fan-out. The legacy path attributes it
+            // the same way, to `fa.assignments.first()` (lib.rs).
+            let junk_records = groups
+                .iter()
+                .filter(|group| group.dataset_slugs.first() == Some(&dataset.slug))
+                .try_fold(0u64, |sum, group| {
+                    sum.checked_add(group.expected_junk_records)
+                        .context("dataset junk-record count overflow")
+                })?;
             let time = |name: &str| {
                 response
                     .pointer(&format!("/aggregations/{name}/value_as_string"))
@@ -434,7 +453,7 @@ impl<'a> EsSyncBackend<'a> {
                 dataset.slug.clone(),
                 crate::generation_catalog::DatasetCatalogStats {
                     record_count,
-                    junk_records: 0,
+                    junk_records,
                     bytes,
                     formats,
                     time_min: time("time_min"),
@@ -1062,6 +1081,7 @@ pub fn groups_from_inventory(
                 expected_records: prior.map_or(0, |group| group.expected_records),
                 expected_passages: prior.map_or(0, |group| group.expected_passages),
                 expected_vectors: prior.map_or(0, |group| group.expected_vectors),
+                expected_junk_records: prior.map_or(0, |group| group.expected_junk_records),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1098,6 +1118,7 @@ pub fn bind_prepared_counts(
         group.expected_records = prepared.records;
         group.expected_passages = prepared.passages;
         group.expected_vectors = prepared.vectors;
+        group.expected_junk_records = prepared.junk;
     }
     Ok(())
 }
@@ -1235,20 +1256,26 @@ fn create_snapshot_inner(
         crate::content::verify(&destination, source.size, content_digest)?;
         #[cfg(test)]
         apply_post_seal_source_replacement(&source.path)?;
-        let prepared = plan
-            .map(|plan| {
-                prepare_artifact(
-                    &staging,
-                    ordinal,
-                    tx_id,
-                    source,
-                    content_id,
-                    &destination,
-                    plan,
-                    &mut budget,
-                )
-            })
-            .transpose()?;
+        // A junk/skipped file has no `plan.files` entry *by construction* — it
+        // lives in `plan.junk_files` and is never indexed — so demanding one
+        // here made `--no-graph` fail outright on any folder holding a single
+        // unreadable, empty or unrecognised file. Its bytes still belong in the
+        // sealed snapshot (a resume replays from the snapshot, not from the
+        // mutable tree, and the inventory it is verified against lists the
+        // file), but there is nothing to prepare for it: `prepared: None`.
+        let prepared = match plan {
+            Some(plan) if plan.files.contains_key(content_id.as_str()) => Some(prepare_artifact(
+                &staging,
+                ordinal,
+                tx_id,
+                source,
+                content_id,
+                &destination,
+                plan,
+                &mut budget,
+            )?),
+            _ => None,
+        };
         files.push(SnapshotFile {
             content_id: content_id.clone(),
             content_digest: content_digest.clone(),
@@ -1493,14 +1520,14 @@ fn prepare_artifact(
         }
         true
     };
+    // Junk records are recorded, never fatal — that is the documented contract
+    // (`cli.rs` EXIT CODES: "3 completed-with-junk (junk recorded, never
+    // fatal)") and what the legacy path has always done. Aborting the whole
+    // generation because one line of one log file did not parse would make a
+    // realistic corpus unindexable. The count is sealed into the artifact so
+    // the generation, and then the catalog, can report it.
     let stats = crate::extract::extract(snapshot_blob, &sniffed, None, &mut sink)
         .with_context(|| format!("extract {} into durable preparation", source.rel))?;
-    anyhow::ensure!(
-        stats.junk == 0,
-        "durable preparation of {} produced {} junk records",
-        source.rel,
-        stats.junk
-    );
     if let Some(error) = sink_error {
         return Err(error);
     }
@@ -1513,6 +1540,7 @@ fn prepare_artifact(
         records,
         passages,
         vectors,
+        junk: stats.junk,
         bytes,
         digest: stream_digest(&path, "axp1")?,
     })

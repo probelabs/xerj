@@ -1015,3 +1015,169 @@ fn upsert_clears_a_survivor_under_the_desired_content_identity() {
     assert_eq!(paths(&endpoint.data_docs()), ["a.csv"]);
     assert_eq!(journal_events(state_dir.path(), "sync_commit"), 3);
 }
+
+/// `--dry-run` used to be consulted only *after* the generated branches had
+/// already published and committed, so on any already-generated state
+/// directory the flag was accepted, ignored, and the destination mutated.
+#[test]
+fn dry_run_on_a_generated_state_directory_publishes_nothing() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let committed_docs = endpoint.data_docs();
+    let bulks = endpoint.data_bulk_requests();
+    let journal_before = fs::read(state_dir.path().join("journal.ndjson")).unwrap();
+
+    // A real change, so the dry run has something it would publish.
+    fs::write(
+        corpus.path().join("a.csv"),
+        "id,value\n1,CHANGED\n2,added\n",
+    )
+    .unwrap();
+    let mut dry = config.clone();
+    dry.dry_run = true;
+    let (code, summary) = run_index_report(dry.clone()).unwrap();
+    assert_eq!(code, 0);
+    assert!(
+        summary.is_none(),
+        "--dry-run must not report a committed run summary"
+    );
+    assert_eq!(
+        endpoint.data_bulk_requests(),
+        bulks,
+        "--dry-run issued a data bulk"
+    );
+    assert_eq!(
+        endpoint.data_docs(),
+        committed_docs,
+        "--dry-run mutated the destination"
+    );
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+    assert_eq!(
+        fs::read(state_dir.path().join("journal.ndjson")).unwrap(),
+        journal_before,
+        "--dry-run appended to the durable journal"
+    );
+
+    // An unchanged folder takes the no-op arm of the same branch: still inert.
+    fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n").unwrap();
+    assert_eq!(run_index(dry).unwrap(), 0);
+    assert_eq!(endpoint.data_bulk_requests(), bulks);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    // And the real run that follows still converges on the change.
+    fs::write(
+        corpus.path().join("a.csv"),
+        "id,value\n1,CHANGED\n2,added\n",
+    )
+    .unwrap();
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(endpoint.data_docs().len(), 2);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
+}
+
+/// A junk/skipped file has no `plan.files` entry by construction, so demanding
+/// a prepared artifact for every inventory entry failed the whole run on any
+/// folder containing one unreadable, empty or unrecognised file.
+#[test]
+fn a_junk_file_is_recorded_and_never_fatal() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n2,beta\n").unwrap();
+    fs::write(corpus.path().join("empty.csv"), "").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (code, summary) = run_index_report(config.clone()).unwrap();
+    let summary = summary.expect("a corpus with one junk file still commits a generation");
+    assert_eq!(
+        code, 3,
+        "a completed run that skipped a file exits 3, not 0 (cli.rs EXIT CODES)"
+    );
+    assert_eq!(summary["generation"], 1);
+    assert_eq!(summary["files_junk"], 1);
+    assert_eq!(summary["records_total"], 2);
+    assert_eq!(paths(&endpoint.data_docs()), ["a.csv"]);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+    let junk_docs: Vec<Value> = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .docs
+        .iter()
+        .filter(|((index, _), doc)| {
+            index == catalog::CATALOG_INDEX
+                && doc.get("doc_kind").and_then(Value::as_str) == Some("file")
+                && doc.get("path").and_then(Value::as_str) == Some("empty.csv")
+        })
+        .map(|(_, doc)| doc.clone())
+        .collect();
+    assert_eq!(
+        junk_docs.len(),
+        1,
+        "the skipped file must still get exactly one catalog entry"
+    );
+
+    // The generation reconciles normally afterwards, junk file and all.
+    fs::write(corpus.path().join("b.csv"), "id,value\n3,gamma\n").unwrap();
+    assert_eq!(run_index(config).unwrap(), 3);
+    assert_eq!(paths(&endpoint.data_docs()), ["a.csv", "b.csv"]);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
+}
+
+/// Junk *records* were fatal on the generated path
+/// (`durable preparation of X produced N junk records`) while the legacy path
+/// merely accumulated them — directly contradicting the documented contract
+/// "3 completed-with-junk (junk recorded, never fatal)".
+#[test]
+fn a_junk_record_is_counted_into_the_generation_and_never_fatal() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut log = String::from("!!! rotated by logrotate, not a log line\n");
+    for n in 1..=40 {
+        log.push_str(&format!(
+            "10.0.0.{n} - - [09/Aug/2026:10:00:{n:02} +0000] \"GET /p/{n} HTTP/1.1\" 200 {n}\n"
+        ));
+    }
+    fs::write(corpus.path().join("access.log"), log).unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (code, summary) = run_index_report(config).unwrap();
+    let summary = summary.expect("a corpus with one junk record still commits a generation");
+    assert_eq!(code, 3, "completed-with-junk exits 3");
+    assert_eq!(summary["generation"], 1);
+    assert_eq!(summary["files_junk"], 0);
+    assert_eq!(
+        summary["junk_records_total"], 1,
+        "the unparseable line must be counted, not hardcoded to zero"
+    );
+    assert_eq!(summary["records_total"], 40);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    // The same count reaches the per-file catalog document.
+    let file_doc = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .docs
+        .iter()
+        .find(|((index, _), doc)| {
+            index == catalog::CATALOG_INDEX
+                && doc.get("doc_kind").and_then(Value::as_str) == Some("file")
+                && doc.get("path").and_then(Value::as_str) == Some("access.log")
+        })
+        .map(|(_, doc)| doc.clone())
+        .expect("the indexed file has a catalog document");
+    assert_eq!(file_doc["junk"], 1);
+    assert_eq!(file_doc["records"], 40);
+}

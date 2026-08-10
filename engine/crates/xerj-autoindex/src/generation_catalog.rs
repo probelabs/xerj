@@ -111,7 +111,7 @@ pub fn project_generation(
             "indexed",
             None,
             group.expected_records,
-            0,
+            group.expected_junk_records,
             group.content_size,
             &metadata.generation_id,
         );
@@ -145,7 +145,16 @@ pub fn project_generation(
     }
 
     let mut total_records = 0u64;
-    let mut total_junk_records = 0u64;
+    // The run total comes from the manifest, not from summing the per-dataset
+    // statistics. A junk record belongs to no dataset — the dataset docs
+    // attribute it to one of the group's slugs so a multi-dataset file is not
+    // counted twice, and a group with no dataset slug at all would otherwise
+    // drop out of the total entirely. Summing the sealed per-group counts is
+    // the only arithmetic that is exact in both cases.
+    let total_junk_records = desired.groups.iter().try_fold(0u64, |sum, group| {
+        sum.checked_add(group.expected_junk_records)
+            .context("catalog total junk-record count overflow")
+    })?;
     for dataset in &desired.plan.datasets {
         let stats = dataset_stats.get(&dataset.slug).with_context(|| {
             format!(
@@ -156,9 +165,6 @@ pub fn project_generation(
         total_records = total_records
             .checked_add(stats.record_count)
             .context("catalog total record count overflow")?;
-        total_junk_records = total_junk_records
-            .checked_add(stats.junk_records)
-            .context("catalog total junk-record count overflow")?;
         let mut formats = stats.formats.clone();
         formats.sort();
         formats.dedup();
@@ -361,6 +367,7 @@ mod tests {
             expected_records: 2,
             expected_passages: 0,
             expected_vectors: 0,
+            expected_junk_records: 0,
         }
     }
 

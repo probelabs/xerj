@@ -114,6 +114,7 @@ fn group(key: &str, path: &str, aliases: &[&str]) -> ManifestGroup {
         expected_records: 2,
         expected_passages: 0,
         expected_vectors: 0,
+        expected_junk_records: 0,
     }
 }
 

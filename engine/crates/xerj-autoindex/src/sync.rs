@@ -47,6 +47,13 @@ pub struct ManifestGroup {
     pub expected_records: u64,
     pub expected_passages: u64,
     pub expected_vectors: u64,
+    /// Records this content produced that no dataset could accept. They are
+    /// *not* published, so no read-back count can recover them — the sealed
+    /// preparation is the only place the number exists, and the generation has
+    /// to carry it or the catalog's `junk_records_total` is a permanent zero.
+    /// Junk is recorded, never fatal (`cli.rs` EXIT CODES).
+    #[serde(default)]
+    pub expected_junk_records: u64,
 }
 
 impl ManifestGroup {
@@ -549,6 +556,7 @@ pub struct DesiredContentGroup {
     pub expected_records: u64,
     pub expected_passages: u64,
     pub expected_vectors: u64,
+    pub expected_junk_records: u64,
 }
 
 /// Content identity is collision-safe and byte-verified by the inventory
@@ -631,6 +639,7 @@ pub fn reconcile_groups(
             expected_records: candidate.expected_records,
             expected_passages: candidate.expected_passages,
             expected_vectors: candidate.expected_vectors,
+            expected_junk_records: candidate.expected_junk_records,
         });
     }
     result.sort_by(|left, right| left.group_id.cmp(&right.group_id));
@@ -1112,6 +1121,7 @@ mod tests {
             expected_records: 1,
             expected_passages: 1,
             expected_vectors: 1,
+            expected_junk_records: 0,
         }
     }
 
@@ -1125,6 +1135,7 @@ mod tests {
             expected_records: 1,
             expected_passages: 1,
             expected_vectors: 1,
+            expected_junk_records: 0,
         }
     }
 

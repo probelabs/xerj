@@ -1370,6 +1370,7 @@ mod sync_journal_tests {
                     expected_records: 1,
                     expected_passages: 1,
                     expected_vectors: 1,
+                    expected_junk_records: 0,
                 }],
             },
         )

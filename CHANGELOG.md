@@ -409,6 +409,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--snapshot-max-gb` (default 64) caps the logical staged payload; it is a
   payload budget, not a disk-space or peak-memory guarantee.
 
+- **Junk keeps the contract it always had on the generated path: recorded,
+  never fatal.** A file that cannot be read or recognised (`plan.junk_files`)
+  and a record that no dataset assignment accepts (`stats.junk`) both used to
+  abort a `--no-graph` run outright — the first with
+  `plan has no assignment for <file>`, the second with
+  `durable preparation of <file> produced N junk records`. A single zero-byte
+  file was enough to make a whole folder unindexable. Both are now counted
+  instead: the sealed prepared artifact carries its junk-record count, the
+  manifest group carries it into the generation, and the catalog's per-file
+  `junk` and run-level `junk_records_total` report it instead of a hardcoded
+  zero. Such a run exits **3** ("completed with junk"), the same signal the
+  legacy path publishes — the generated path previously returned a flat `0`
+  and lost it.
+
+- **`--dry-run` is honoured on an already-generated state directory.** It was
+  evaluated only after the pending-replay and reconcile branches had already
+  published and committed, so on any state directory past generation 1 the flag
+  was accepted, silently ignored, and the destination mutated. It is now decided
+  before either branch: it prints the plan a real run would act on — the
+  projected reconcile plan, or the sealed plan of a pending generation — and
+  returns without opening the journal for write, without snapshot GC, and
+  without a single bulk request.
+
 ### Changed — `autoindex --fresh` is refused on a durable generation
 
 - **`--fresh` no longer silently destroys a committed corpus generation.**
