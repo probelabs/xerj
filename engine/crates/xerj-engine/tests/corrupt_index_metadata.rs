@@ -112,6 +112,92 @@ async fn wrong_shape_schema_json_refuses_to_open() {
     );
 }
 
+/// Regression pin for the interaction this branch acquired when
+/// [#260](https://github.com/xerj-org/xerj/issues/260) landed on `main` while
+/// it was open.
+///
+/// #260 made `index: false` real: `unsearchable_query_field` rejects a query
+/// naming a field whose mapping declares neither postings nor doc values. It
+/// reads that from `schema.schema` — the `ManagedSchema` that `Index::open`
+/// loads out of **`schema.json`**, the very file #202 is about.
+///
+/// So the two changes are coupled, and the coupling only runs one way. Under
+/// the pre-#202 fallback a torn `schema.json` became `ManagedSchema::dynamic()`;
+/// `declared_field` then finds nothing for `note`, `check` returns `None`, and
+/// the #260 rejection **silently stops firing** — a field the operator
+/// deliberately declared unsearchable answers queries again, with no error
+/// anywhere saying the declaration was lost. Refusing the open is what keeps
+/// #260's guarantee true across a corrupt sidecar, so it is asserted here
+/// rather than left to be rediscovered.
+#[tokio::test]
+async fn a_torn_schema_cannot_resurrect_an_index_false_field() {
+    let dir = TempDir::new().unwrap();
+
+    // `note` is #260's shape exactly: text, not indexed, no doc values —
+    // nothing to answer a query from, so naming it is an error.
+    let mut schema = Schema::empty();
+    schema
+        .add_field(FieldConfig::new("code", FieldType::Keyword))
+        .unwrap();
+    let mut note = FieldConfig::new("note", FieldType::Text);
+    note.options.indexed = false;
+    note.options.doc_values = false;
+    schema.add_field(note).unwrap();
+
+    let config = config_for(&dir);
+    let index = Index::create(
+        IndexName::new("unsearchable").unwrap(),
+        schema,
+        &config,
+        dir.path(),
+    )
+    .unwrap();
+    index
+        .index_document(Some("d1".to_string()), json!({"code": "A-1", "note": "hi"}))
+        .await
+        .unwrap();
+    index.flush().await.unwrap();
+    drop(index);
+
+    let path = dir.path().join("unsearchable").join("schema.json");
+    let good = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &good[..good.len() / 2]).unwrap();
+
+    // The refusal is the assertion: an index that opened here would carry an
+    // empty mapping, and `note` would be searchable again.
+    let err = Index::open(IndexName::new("unsearchable").unwrap(), &config, dir.path())
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| {
+            panic!(
+                "opened an index whose schema.json is unparseable — `note` was declared \
+             index:false with no doc values, and a dynamic mapping makes it searchable again"
+            )
+        });
+    assert!(
+        err.contains("schema.json"),
+        "the error must name the file the operator has to restore, got: {err}"
+    );
+
+    // Restoring the file restores the declaration, so the refusal above was
+    // about the corruption and not about the mapping being unusable.
+    std::fs::write(&path, &good).unwrap();
+    let index = Index::open(IndexName::new("unsearchable").unwrap(), &config, dir.path())
+        .expect("an intact schema.json must still open");
+    let reopened = index.schema().await;
+    let note = reopened
+        .fields
+        .iter()
+        .find(|f| f.name == "note")
+        .expect("`note` must come back declared, not re-inferred");
+    assert!(
+        !note.options.indexed && !note.options.doc_values,
+        "`note` must reopen index:false with no doc values, got indexed={} doc_values={}",
+        note.options.indexed,
+        note.options.doc_values
+    );
+}
+
 /// The other half of the contract: absent is not unparseable. Indices created
 /// before create-time schema persistence have no `schema.json` at all and must
 /// keep opening.
