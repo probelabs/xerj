@@ -61,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance made the enforced floor `interval/2` shorter — 12.5 s at the
   shipped defaults. Measured at `--progress-interval 10`: 11 of 11 same-phase
   gaps under 15 s (min 10.0 s) before, none after (min 19.3 s).
+- **`/{index}/_refresh` reports segment-publication failures instead of
+  claiming every shard succeeded.** The endpoint previously discarded every
+  error returned by the synchronous engine flush and always answered HTTP 200
+  with `successful == total`. It now includes the index, status, and underlying
+  reason in `_shards.failures`, attempts every resolved index, and returns the
+  first failed shard's HTTP status as Elasticsearch 8.13.4 does for refresh.
 
 ## [1.0.0-rc.15] - 2026-08-10
 
