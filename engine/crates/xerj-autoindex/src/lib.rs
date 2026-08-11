@@ -4717,6 +4717,33 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 cfg.prefix
             );
         }
+        // A mixed corpus needs one more thing said out loud. Code volume
+        // swamps prose on shared vocabulary: in a blind run, a question about
+        // documentation ("exit code 3") matched WordPress PHP on `exit` and
+        // `code` and returned nothing but source, costing a wasted round trip.
+        // The agent worked out the fix itself afterwards — scope the query —
+        // which is exactly the sort of thing that should not have to be
+        // rediscovered.
+        let indexed_prose = plan
+            .files
+            .values()
+            .any(|fa| fa.family.starts_with("txt") || fa.family == "html");
+        if indexed_code && indexed_prose {
+            println!(
+                "      this corpus mixes code and prose — code volume can swamp prose on\n\
+                 \x20     shared words. Scope the side you want:\n\
+                 \x20       …,\"query\":{{\"bool\":{{\"must\":[{{\"match\":{{\"body\":\"<text>\"}}}}],\
+                 \"filter\":[{{\"term\":{{\"ax_format\":\"code\"}}}}]}}}}\n\
+                 \x20       (values for `ax_format` in this run: {})",
+                {
+                    let mut fams: Vec<&str> =
+                        plan.files.values().map(|fa| fa.family.as_str()).collect();
+                    fams.sort_unstable();
+                    fams.dedup();
+                    fams.join(", ")
+                }
+            );
+        }
     }
     // Exit 3 means "completed, some input was unusable". Backend rejections
     // are not consulted and must not be: a rejected item aborts the run with
