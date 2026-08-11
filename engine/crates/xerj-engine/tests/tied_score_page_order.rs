@@ -234,15 +234,18 @@ async fn tie_straddling_a_page_boundary_resolves_the_same_way_at_every_size() {
 /// became.  Measured on this fixture at the pre-repair commit, `size` 60, 100
 /// and 150 each returned a non-prefix page for all three shapes below.
 ///
-/// `constant_score` is deliberately NOT one of the shapes here, and that is a
-/// known gap rather than an oversight: on a MIXED corpus its bounded page
-/// contains only memtable documents (`size:1` returns `mem0000` where the full
-/// page starts `seg0000`) because the segment walk is skipped once the
-/// collector is already full.  That reproduces identically before and after
-/// this change — it is a separate, pre-existing defect in the segment-side
-/// early-out, not the memtable bound under test here — and it is why this PR
-/// says `Refs #191` rather than `Fixes #191`.  The memtable-only test below
-/// does cover `constant_score`, which is the path this change fixes.
+/// `constant_score` was originally NOT one of the shapes here: on a MIXED
+/// corpus its bounded page contained only memtable documents (`size:1`
+/// returned `mem000` where the full page starts `seg0000`) — the
+/// segment-side counterpart (#270) of the memtable bound this test was
+/// written for.  The wrapper defeated the `is_match_all` flag, no
+/// `try_shortcut_count` arm resolves a bare MatchAll, so the scan ran with
+/// `count_authoritative == false`: it tallied segment matches past the full
+/// collector but never materialised them, and the memtable (walked first)
+/// owned the whole page.  Asserted since `is_match_all_effective` peels
+/// `constant_score`/`boosted` chains for the count/bounds decisions, putting
+/// the wrapped query on the same bounded-scan + cross-segment re-merge path
+/// as bare `match_all`.
 #[tokio::test]
 async fn tied_scores_page_the_same_way_with_an_unflushed_memtable() {
     let dir = TempDir::new().unwrap();
@@ -283,6 +286,10 @@ async fn tied_scores_page_the_same_way_with_an_unflushed_memtable() {
         ("match", json!({"match": {"body": "listpack"}})),
         ("term", json!({"term": {"kind": "same"}})),
         ("match_all", json!({"match_all": {}})),
+        (
+            "constant_score",
+            json!({"constant_score": {"filter": {"match_all": {}}}}),
+        ),
     ] {
         let full = idx.search(&req(0, 1000, &q)).await.unwrap();
         let full_ids = page_ids(&full.hits);

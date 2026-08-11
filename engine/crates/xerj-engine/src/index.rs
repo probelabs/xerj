@@ -11873,6 +11873,38 @@ impl Index {
         (kept, worst)
     }
 
+    /// Sort `hits` into the ONE total order every score-ranked page uses:
+    /// `score DESC, seq_no ASC (arrival — ES `_doc`), _id ASC`.  Decorates
+    /// with the resolved `seq_no` once, sorts, undecorates — same shape as
+    /// the main page sort (a per-comparison `VersionMap` lookup was ~6% of a
+    /// `term` page in the P1 profile).
+    ///
+    /// #270 — five post-sort re-sorts (the bool-text IDF rescore, the TF-IDF
+    /// fallback, and the three `request.rescore` sorts) used to tie by `_id`
+    /// ALONE, so any of them firing on a tied hit set silently reordered the
+    /// page into `_id` ASC — for UUID-shaped ids exactly the "essentially
+    /// random" ordering the main sort's `seq_no` tie-break replaced.  The
+    /// peer engines keep ONE comparator through collection, merge and final
+    /// sort (Lucene `HitQueue.java:76-82`; tantivy
+    /// `collector/sort_key/sort_by_score.rs:105-109` heap entry vs `:187`
+    /// final sort, same key; quickwit `quickwit-search/src/collector.rs:
+    /// 1131-1156` ties by `GlobalDocAddress` in both comparators) — every
+    /// score re-sort routes through here so they cannot drift again.
+    fn sort_hits_page_order(&self, hits: &mut Vec<Hit>) {
+        let mut decorated: Vec<(u64, Hit)> = std::mem::take(hits)
+            .into_iter()
+            .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
+            .collect();
+        decorated.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        *hits = decorated.into_iter().map(|(_, h)| h).collect();
+    }
+
     /// Look up the latest `seq_no` for a document by id via the version
     /// map. Returns `None` when the doc is unknown or tombstoned.
     ///
@@ -14359,6 +14391,34 @@ impl Index {
         // Anything more complex (Bool, Range, Match) currently returns
         // `None` — `Range` will be shortcut-able once G3 (BKD) lands.
         let is_match_all = matches!(query, QueryNode::MatchAll);
+        // #270 — a top-level `constant_score`/`boosted` chain over
+        // `match_all` matches exactly the documents `match_all` matches, but
+        // the raw flag above left it with `count_authoritative == false` (no
+        // `try_shortcut_count` arm resolves a bare MatchAll — MatchAll totals
+        // are handled by the flag, which the wrapper defeated).  The scan
+        // then ran in exact-counting mode: it TALLIES past a full collector
+        // but never materialises into it, so with the memtable walked first
+        // the bounded page was all memtable documents (`size:1` →
+        // `mem0000` where the full page starts `seg0000`) even though the
+        // segment documents hold the lowest `seq_no`s and own the head of
+        // the page.  This flag widens ONLY the count/bounds decisions
+        // (`count_authoritative`, the final `live_doc_count()` total
+        // overwrite) so wrapped match_all takes the same bounded-scan +
+        // cross-segment re-merge path as bare match_all.  SCORING keeps the
+        // raw flag: wrapper hits still go through `score_doc`, and a
+        // top-level `Constant`'s scores are overwritten with the wrapper
+        // boost before the page sort regardless.
+        let is_match_all_effective = is_match_all || {
+            let mut q = query;
+            loop {
+                match q {
+                    QueryNode::Constant { query, .. } | QueryNode::Boosted { query, .. } => {
+                        q = query
+                    }
+                    other => break matches!(other, QueryNode::MatchAll),
+                }
+            }
+        };
 
         // For MatchAll we now skip the memtable iteration entirely at
         // `MemSnapshot` time (it was cloning 200 k doc_ids just to tick a
@@ -14718,7 +14778,7 @@ impl Index {
             // pre-F1 scan time — correctness over speed until the shortcut
             // itself is made delete-aware. (`deletes_present` hoisted above.)
             let count_authoritative: bool = !query_needs_fts
-                && (is_match_all || (shortcut_count.is_some() && !deletes_present));
+                && (is_match_all_effective || (shortcut_count.is_some() && !deletes_present));
 
             // Whether a Regexp query's field is keyword-typed — gates the
             // FST term-dictionary route of the regexp pre-filter (computed
@@ -16251,23 +16311,7 @@ impl Index {
                     hit.score = *score;
                 }
             }
-            // Precompute seq_no ONCE per hit, not once per comparison. The
-            // former `seq(&a.id)`/`seq(&b.id)` closure did a `VersionMap`
-            // dashmap string-hash get inside the comparator — O(n log n) gets
-            // per page sort (~6% of a `term` page in the P1 profile). Decorate
-            // with the resolved seq_no, then sort on the plain u64.
-            let mut decorated: Vec<(u64, Hit)> = std::mem::take(&mut final_hits)
-                .into_iter()
-                .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
-                .collect();
-            decorated.sort_by(|a, b| {
-                b.1.score
-                    .partial_cmp(&a.1.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-                    .then_with(|| a.1.id.cmp(&b.1.id))
-            });
-            final_hits = decorated.into_iter().map(|(_, h)| h).collect();
+            self.sort_hits_page_order(&mut final_hits);
         }
 
         // --- IDF-weighted rescore for Bool queries with multiple terms ---
@@ -16322,13 +16366,9 @@ impl Index {
                         hit.score = score;
                     }
                 }
-                // Re-sort by the new scores.
-                final_hits.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.id.cmp(&b.id))
-                });
+                // Re-sort by the new scores (#270 — full page-order key, so
+                // hits the rescore left tied keep arrival order).
+                self.sort_hits_page_order(&mut final_hits);
             }
         }
 
@@ -16387,13 +16427,10 @@ impl Index {
                     for (hit, score) in final_hits.iter_mut().zip(new_scores) {
                         hit.score = score;
                     }
-                    // Re-sort with new TF-IDF scores.
-                    final_hits.sort_by(|a, b| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.id.cmp(&b.id))
-                    });
+                    // Re-sort with new TF-IDF scores (#270 — full page-order
+                    // key; on ~640 identical docs every fallback score is
+                    // exactly 1.0, and an `_id` tie-break inverted the page).
+                    self.sort_hits_page_order(&mut final_hits);
                 }
             }
         }
@@ -16419,13 +16456,11 @@ impl Index {
         // For each rescore stage, re-score the top window_size hits using the secondary query.
         // Final score = original_score * query_weight + rescore_score * rescore_query_weight
         if !request.rescore.is_empty() {
-            // Sort by score before applying rescore so we work on the correct top-N.
-            final_hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            // Sort by score before applying rescore so we work on the correct
+            // top-N (#270 — full page-order key at every stage, so the
+            // window selection and any hits a stage leaves tied both follow
+            // arrival order rather than `_id`).
+            self.sort_hits_page_order(&mut final_hits);
 
             for rescore_stage in &request.rescore {
                 apply_rescore(&mut final_hits, rescore_stage);
@@ -16433,21 +16468,11 @@ impl Index {
                 // next stage's `window_size` applies to the top-N
                 // of the just-rescored order, not the pre-rescore
                 // BM25 order.
-                final_hits.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.id.cmp(&b.id))
-                });
+                self.sort_hits_page_order(&mut final_hits);
             }
 
             // Re-sort after rescoring.
-            final_hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            self.sort_hits_page_order(&mut final_hits);
         }
 
         // --- match_all total = authoritative live doc count ---
@@ -16456,7 +16481,10 @@ impl Index {
         // an UPDATE would inflate hits.total. For an unfiltered match_all the
         // true total is the live doc count (one entry per `_id`). min_score
         // below still adjusts from this corrected base if present.
-        if is_match_all {
+        // `_effective` (#270): a wrapped match_all now scans in bounded
+        // `count_authoritative` mode, so its tally is partial and needs this
+        // same overwrite.
+        if is_match_all_effective {
             total_count = self.live_doc_count();
         } else if !count_only
             && !query_needs_fts
