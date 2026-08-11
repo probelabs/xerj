@@ -6973,6 +6973,139 @@ fn fields_request_includes_passage(fields: &Value) -> bool {
 /// every response the caller already handled correctly is exactly the kind
 /// of noise this project's review guidance rules out. Returns `None`
 /// whenever the hint would not be actionable.
+/// Field names a query refers to, gathered from the ordinary ES leaf shapes.
+///
+/// Subfield suffixes are kept (`symbols.name.keyword`) but the parent is also
+/// recorded, so a query against a real field's subfield is not reported as
+/// unknown.
+fn referenced_query_fields(q: &Value, out: &mut Vec<String>) {
+    const FIELD_KEYED: &[&str] = &[
+        "match",
+        "match_phrase",
+        "match_phrase_prefix",
+        "term",
+        "terms",
+        "prefix",
+        "wildcard",
+        "regexp",
+        "fuzzy",
+        "range",
+    ];
+    match q {
+        Value::Object(o) => {
+            for (k, v) in o {
+                if FIELD_KEYED.contains(&k.as_str()) {
+                    if let Value::Object(inner) = v {
+                        for f in inner.keys() {
+                            out.push(f.clone());
+                        }
+                    }
+                } else if k == "exists" {
+                    if let Some(f) = v.get("field").and_then(Value::as_str) {
+                        out.push(f.to_string());
+                    }
+                } else if k == "multi_match" {
+                    if let Some(Value::Array(fs)) = v.get("fields") {
+                        for f in fs.iter().filter_map(Value::as_str) {
+                            // `body^3` — the boost is not part of the name.
+                            out.push(f.split('^').next().unwrap_or(f).to_string());
+                        }
+                    }
+                } else {
+                    referenced_query_fields(v, out);
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|v| referenced_query_fields(v, out)),
+        _ => {}
+    }
+}
+
+/// Hint for a query that names a field the index does not have.
+///
+/// Fires regardless of hit count: a bogus field inside a `multi_match` that
+/// also names a real one still returns results, so a zero-hit-only check would
+/// never see the worst case.
+///
+/// This is the most expensive silent failure a newcomer hits. In blind
+/// usability runs, two independent agents both guessed `content` (a reasonable
+/// name that does not exist here), got `0 hits` with no explanation, and then
+/// spent their largest payloads — 182 KB and 65 KB in one run — trial-and-
+/// erroring field names before thinking to fetch `_mapping`. The engine knows
+/// the schema; staying silent is a choice, and the wrong one.
+fn unknown_field_hint(index: &str, body: &EsSearchBody, schema: &xerj_common::types::Schema) -> Option<Value> {
+    let query = body.query.as_ref()?;
+    let mut referenced = Vec::new();
+    referenced_query_fields(query, &mut referenced);
+    if referenced.is_empty() {
+        return None;
+    }
+
+    let known = |name: &str| -> bool {
+        // Accept the field itself, a subfield of a real field, and the ES
+        // metadata fields a query may legitimately target.
+        schema.field(name).is_some()
+            || name.starts_with('_')
+            || name
+                .split_once('.')
+                .is_some_and(|(parent, _)| schema.field(parent).is_some())
+    };
+
+    let unknown: Vec<String> = referenced
+        .iter()
+        .filter(|f| !known(f))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+
+    // Text-ish fields are what a full-text query actually wants; listing every
+    // keyword and numeric column would bury the answer.
+    let searchable: Vec<String> = schema
+        .fields
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.field_type,
+                xerj_common::types::FieldType::Text | xerj_common::types::FieldType::Keyword
+            ) && !f.name.starts_with("ax_")
+        })
+        .map(|f| f.name.clone())
+        .collect();
+
+    let primary = searchable
+        .iter()
+        .find(|n| n.as_str() == "body")
+        .or_else(|| searchable.first())
+        .cloned()
+        .unwrap_or_else(|| "body".to_string());
+
+    Some(json!({
+        "hints": [{
+            "code": "unknown_field",
+            "reason": format!(
+                "no results, and this query names {} that {} not exist in `{index}`: {}. \
+                 Searchable text fields here are: {}.",
+                if unknown.len() == 1 { "a field" } else { "fields" },
+                if unknown.len() == 1 { "does" } else { "do" },
+                unknown.join(", "),
+                if searchable.is_empty() { "(none)".to_string() } else { searchable.join(", ") },
+            ),
+            "try": {
+                "request": format!("POST /{index}/_search"),
+                "body": {
+                    "query": {"match": {primary.clone(): "<your text>"}},
+                    "_source": ["ax_path", "title"],
+                    "fields": ["_passage"],
+                },
+            },
+        }],
+    }))
+}
+
 /// Hint attached to an oversized `GET /{index}/_doc/{id}` response.
 ///
 /// A document fetch cannot be narrowed the way a search can, so the recovery is
@@ -12597,7 +12730,31 @@ async fn search_impl(
     }
 
     // Computed before `hits` is moved into `response_body` below.
-    let response_hint = search_response_hint(&index, &body, &hits);
+    // Two independent diagnostics, merged into one `hints` array rather than
+    // one winning: a query can both name a nonexistent field AND return an
+    // oversized payload, and reporting only the first would hide the other.
+    //
+    // The unknown-field check runs whether or not there were hits. A bogus
+    // field inside a `multi_match` that also names a real one is the worst
+    // shape of all — it returns plenty of results, silently searching fewer
+    // fields than asked, so the caller has no signal at all.
+    let mut all_hints: Vec<Value> = Vec::new();
+    if let Some(first) = index_names.first() {
+        if let Ok(idx) = state.engine.get_index(first) {
+            let schema = idx.schema().await;
+            if let Some(h) = unknown_field_hint(&index, &body, &schema) {
+                if let Some(Value::Array(items)) = h.get("hints") {
+                    all_hints.extend(items.iter().cloned());
+                }
+            }
+        }
+    }
+    if let Some(h) = search_response_hint(&index, &body, &hits) {
+        if let Some(Value::Array(items)) = h.get("hints") {
+            all_hints.extend(items.iter().cloned());
+        }
+    }
+    let response_hint = (!all_hints.is_empty()).then(|| json!({ "hints": all_hints }));
 
     let mut response_body = if track_total_disabled {
         if want_int_total {

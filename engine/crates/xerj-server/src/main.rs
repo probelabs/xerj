@@ -107,6 +107,7 @@ struct CliArgs {
     config: Option<PathBuf>,
     data_dir: Option<String>,
     bind: Option<String>,
+    port: Option<String>,
     insecure: bool,
     embed_mode: Option<String>,
     onnx_model: Option<String>,
@@ -120,6 +121,7 @@ fn parse_args() -> CliArgs {
     let mut config = None;
     let mut data_dir = None;
     let mut bind = None;
+    let mut port: Option<String> = None;
     let mut insecure = false;
     let mut embed_mode = None;
     let mut onnx_model = None;
@@ -137,6 +139,9 @@ fn parse_args() -> CliArgs {
             }
             "--bind" | "-b" => {
                 bind = args.next();
+            }
+            "--port" => {
+                port = args.next();
             }
             "--insecure" | "-k" => {
                 insecure = true;
@@ -167,6 +172,7 @@ fn parse_args() -> CliArgs {
         config,
         data_dir,
         bind,
+        port,
         insecure,
         embed_mode,
         onnx_model,
@@ -235,6 +241,10 @@ fn print_help() {
                                       client library versions aren't a reliable stand-in for a\n\
                                       compatible server version, confirmed against a real OSD\n\
                                       container). Example: --compat-version 2.11.0\n\
+             --port      <PORT>     Port for the Elasticsearch-compatible API (default 9200).\n\
+                                      Also claims PORT+1 for the native REST API and PORT+2\n\
+                                      for gRPC, so a second instance needs only this one flag:\n\
+                                      xerj --insecure --port 9300 -d ./other-data\n\
              --help,     -h         Show this help\n\
              --version,  -V         Print version and exit\n\
          \n\
@@ -476,6 +486,33 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         }
         info!("server.bind_address = {addr} (from CLI/env)");
         cfg.server.bind_address = addr;
+    }
+
+    // Running a second instance used to require hand-writing a TOML file, and
+    // the three port keys are not mentioned in `--help`. In a blind usability
+    // run an agent tried `-b 127.0.0.1:9310`, got "not an IP address", and
+    // ended up running `strings` on the binary to find the config key names.
+    // One flag removes that entirely. The sibling ports are derived so a second
+    // instance does not collide on them either; set them individually in a
+    // config file when that matters.
+    if let Some(p) = args.port.clone() {
+        let base: u16 = p.parse().map_err(|_| {
+            anyhow::anyhow!("--port must be a number between 1 and 65533, got {p:?}")
+        })?;
+        if base == 0 || base > 65_533 {
+            anyhow::bail!(
+                "--port must be between 1 and 65533 (it also claims PORT+1 for the \
+                 native REST API and PORT+2 for gRPC), got {base}"
+            );
+        }
+        info!(
+            "server.es_compat_port = {base}, rest_port = {}, grpc_port = {} (from --port)",
+            base + 1,
+            base + 2
+        );
+        cfg.server.es_compat_port = base;
+        cfg.server.rest_port = base + 1;
+        cfg.server.grpc_port = base + 2;
     }
 
     // The #228 opt-out, also settable from the environment so a container can
@@ -1111,6 +1148,8 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
     // Load config but override to a minimal in-process shape.
     let fake_cli = CliArgs {
         config: cmd.config.clone(),
+        // No listener is bound for in-process indexing, so no port applies.
+        port: None,
         data_dir: cmd.data_dir.clone(),
         // In-process CLI indexing binds no listener at all, so the bind
         // address is irrelevant here — take whatever the config says.
