@@ -172,6 +172,8 @@ The painless-execute endpoint hardening that landed in v0.6.0 (input limits, no 
 - Graceful SIGTERM shutdown (fixed in v0.5.9)
 - 187 ES API endpoints exposed
 - Single static binary, single config file (TOML), 38 knobs vs ES 3 000+
+  [CORRECTION 2026-08-09 (#207): "38" was never measured. The counted figure is
+  103 settings, all optional — still ~29x fewer than ES.]
 
 **Missing:**
 - Distributed tracing (OTLP log ingest works; **xerj does not emit spans**)

@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"bool":{"should":[{"bool":{"must":[{"prefix":{"a":"b"}}]}}]}}]}}}

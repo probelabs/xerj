@@ -79,7 +79,7 @@ A team spent 14 hours manually relocating shards, only to discover the real issu
 Every one of these complaints traces to one or more of:
 1. JVM/GC → Rust eliminates entirely
 2. Cluster coordination → single-node M1 eliminates entirely
-3. Configuration sprawl → <50 settings with sensible defaults
+3. Configuration sprawl → 105 settings, all optional, with sensible defaults
 4. Shard management → no shards, automatic segment management
 5. Upgrade complexity → replace binary + restart
 

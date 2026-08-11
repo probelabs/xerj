@@ -1,0 +1,1 @@
+{"size":0,"aggs":{"by_day":{"date_histogram":{"field":"ts","calendar_interval":"1d"},"aggs":{"avg_price":{"avg":{"field":"price"}}}}}}

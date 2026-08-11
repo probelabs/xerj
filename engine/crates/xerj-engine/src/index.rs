@@ -11873,6 +11873,38 @@ impl Index {
         (kept, worst)
     }
 
+    /// Sort `hits` into the ONE total order every score-ranked page uses:
+    /// `score DESC, seq_no ASC (arrival — ES `_doc`), _id ASC`.  Decorates
+    /// with the resolved `seq_no` once, sorts, undecorates — same shape as
+    /// the main page sort (a per-comparison `VersionMap` lookup was ~6% of a
+    /// `term` page in the P1 profile).
+    ///
+    /// #270 — five post-sort re-sorts (the bool-text IDF rescore, the TF-IDF
+    /// fallback, and the three `request.rescore` sorts) used to tie by `_id`
+    /// ALONE, so any of them firing on a tied hit set silently reordered the
+    /// page into `_id` ASC — for UUID-shaped ids exactly the "essentially
+    /// random" ordering the main sort's `seq_no` tie-break replaced.  The
+    /// peer engines keep ONE comparator through collection, merge and final
+    /// sort (Lucene `HitQueue.java:76-82`; tantivy
+    /// `collector/sort_key/sort_by_score.rs:105-109` heap entry vs `:187`
+    /// final sort, same key; quickwit `quickwit-search/src/collector.rs:
+    /// 1131-1156` ties by `GlobalDocAddress` in both comparators) — every
+    /// score re-sort routes through here so they cannot drift again.
+    fn sort_hits_page_order(&self, hits: &mut Vec<Hit>) {
+        let mut decorated: Vec<(u64, Hit)> = std::mem::take(hits)
+            .into_iter()
+            .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
+            .collect();
+        decorated.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        *hits = decorated.into_iter().map(|(_, h)| h).collect();
+    }
+
     /// Look up the latest `seq_no` for a document by id via the version
     /// map. Returns `None` when the doc is unknown or tombstoned.
     ///
@@ -14359,6 +14391,34 @@ impl Index {
         // Anything more complex (Bool, Range, Match) currently returns
         // `None` — `Range` will be shortcut-able once G3 (BKD) lands.
         let is_match_all = matches!(query, QueryNode::MatchAll);
+        // #270 — a top-level `constant_score`/`boosted` chain over
+        // `match_all` matches exactly the documents `match_all` matches, but
+        // the raw flag above left it with `count_authoritative == false` (no
+        // `try_shortcut_count` arm resolves a bare MatchAll — MatchAll totals
+        // are handled by the flag, which the wrapper defeated).  The scan
+        // then ran in exact-counting mode: it TALLIES past a full collector
+        // but never materialises into it, so with the memtable walked first
+        // the bounded page was all memtable documents (`size:1` →
+        // `mem0000` where the full page starts `seg0000`) even though the
+        // segment documents hold the lowest `seq_no`s and own the head of
+        // the page.  This flag widens ONLY the count/bounds decisions
+        // (`count_authoritative`, the final `live_doc_count()` total
+        // overwrite) so wrapped match_all takes the same bounded-scan +
+        // cross-segment re-merge path as bare match_all.  SCORING keeps the
+        // raw flag: wrapper hits still go through `score_doc`, and a
+        // top-level `Constant`'s scores are overwritten with the wrapper
+        // boost before the page sort regardless.
+        let is_match_all_effective = is_match_all || {
+            let mut q = query;
+            loop {
+                match q {
+                    QueryNode::Constant { query, .. } | QueryNode::Boosted { query, .. } => {
+                        q = query
+                    }
+                    other => break matches!(other, QueryNode::MatchAll),
+                }
+            }
+        };
 
         // For MatchAll we now skip the memtable iteration entirely at
         // `MemSnapshot` time (it was cloning 200 k doc_ids just to tick a
@@ -14718,7 +14778,7 @@ impl Index {
             // pre-F1 scan time — correctness over speed until the shortcut
             // itself is made delete-aware. (`deletes_present` hoisted above.)
             let count_authoritative: bool = !query_needs_fts
-                && (is_match_all || (shortcut_count.is_some() && !deletes_present));
+                && (is_match_all_effective || (shortcut_count.is_some() && !deletes_present));
 
             // Whether a Regexp query's field is keyword-typed — gates the
             // FST term-dictionary route of the regexp pre-filter (computed
@@ -16251,23 +16311,7 @@ impl Index {
                     hit.score = *score;
                 }
             }
-            // Precompute seq_no ONCE per hit, not once per comparison. The
-            // former `seq(&a.id)`/`seq(&b.id)` closure did a `VersionMap`
-            // dashmap string-hash get inside the comparator — O(n log n) gets
-            // per page sort (~6% of a `term` page in the P1 profile). Decorate
-            // with the resolved seq_no, then sort on the plain u64.
-            let mut decorated: Vec<(u64, Hit)> = std::mem::take(&mut final_hits)
-                .into_iter()
-                .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
-                .collect();
-            decorated.sort_by(|a, b| {
-                b.1.score
-                    .partial_cmp(&a.1.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-                    .then_with(|| a.1.id.cmp(&b.1.id))
-            });
-            final_hits = decorated.into_iter().map(|(_, h)| h).collect();
+            self.sort_hits_page_order(&mut final_hits);
         }
 
         // --- IDF-weighted rescore for Bool queries with multiple terms ---
@@ -16322,13 +16366,9 @@ impl Index {
                         hit.score = score;
                     }
                 }
-                // Re-sort by the new scores.
-                final_hits.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.id.cmp(&b.id))
-                });
+                // Re-sort by the new scores (#270 — full page-order key, so
+                // hits the rescore left tied keep arrival order).
+                self.sort_hits_page_order(&mut final_hits);
             }
         }
 
@@ -16387,13 +16427,10 @@ impl Index {
                     for (hit, score) in final_hits.iter_mut().zip(new_scores) {
                         hit.score = score;
                     }
-                    // Re-sort with new TF-IDF scores.
-                    final_hits.sort_by(|a, b| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.id.cmp(&b.id))
-                    });
+                    // Re-sort with new TF-IDF scores (#270 — full page-order
+                    // key; on ~640 identical docs every fallback score is
+                    // exactly 1.0, and an `_id` tie-break inverted the page).
+                    self.sort_hits_page_order(&mut final_hits);
                 }
             }
         }
@@ -16419,13 +16456,11 @@ impl Index {
         // For each rescore stage, re-score the top window_size hits using the secondary query.
         // Final score = original_score * query_weight + rescore_score * rescore_query_weight
         if !request.rescore.is_empty() {
-            // Sort by score before applying rescore so we work on the correct top-N.
-            final_hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            // Sort by score before applying rescore so we work on the correct
+            // top-N (#270 — full page-order key at every stage, so the
+            // window selection and any hits a stage leaves tied both follow
+            // arrival order rather than `_id`).
+            self.sort_hits_page_order(&mut final_hits);
 
             for rescore_stage in &request.rescore {
                 apply_rescore(&mut final_hits, rescore_stage);
@@ -16433,21 +16468,11 @@ impl Index {
                 // next stage's `window_size` applies to the top-N
                 // of the just-rescored order, not the pre-rescore
                 // BM25 order.
-                final_hits.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.id.cmp(&b.id))
-                });
+                self.sort_hits_page_order(&mut final_hits);
             }
 
             // Re-sort after rescoring.
-            final_hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            self.sort_hits_page_order(&mut final_hits);
         }
 
         // --- match_all total = authoritative live doc count ---
@@ -16456,7 +16481,10 @@ impl Index {
         // an UPDATE would inflate hits.total. For an unfiltered match_all the
         // true total is the live doc count (one entry per `_id`). min_score
         // below still adjusts from this corrected base if present.
-        if is_match_all {
+        // `_effective` (#270): a wrapped match_all now scans in bounded
+        // `count_authoritative` mode, so its tally is partial and needs this
+        // same overwrite.
+        if is_match_all_effective {
             total_count = self.live_doc_count();
         } else if !count_only
             && !query_needs_fts
@@ -25939,15 +25967,28 @@ fn resolve_date_math_inner(expr: &str) -> String {
         None => return expr.to_string(),
     };
     let brace_end = match expr.rfind('}') {
-        Some(i) => i,
-        None => return expr.to_string(),
+        // The closing brace must come AFTER the opening one, or the slice
+        // below is `expr[4..0]` — a panic, not an empty string. `<}<}<>{>{}>`
+        // is enough, and `panic = "abort"` makes it the process rather than a
+        // 400 (#207, found by the `index_name_date_math` fuzz target). Braces
+        // in the wrong order are not date math, so the name passes through.
+        Some(i) if i > brace_start => i,
+        _ => return expr.to_string(),
     };
 
     let prefix = &expr[..brace_start];
     let date_part = &expr[brace_start + 1..brace_end];
 
     let (math_expr, fmt) = if let Some(inner_brace) = date_part.find('{') {
-        let inner_end = date_part.rfind('}').unwrap_or(date_part.len());
+        // The closing brace has to come AFTER the opening one. `<{}{}>` gives a
+        // `date_part` of `}{`, where `rfind('}')` is 0 and `inner_brace` is 1 —
+        // and `date_part[2..0]` is a panic, not an error. With
+        // `panic = "abort"` that is the process, from an index name in a
+        // request URI. Same class as the two date-math offsets below.
+        let inner_end = date_part
+            .rfind('}')
+            .filter(|end| *end > inner_brace)
+            .unwrap_or(date_part.len());
         (
             &date_part[..inner_brace],
             &date_part[inner_brace + 1..inner_end],
@@ -25960,6 +26001,73 @@ fn resolve_date_math_inner(expr: &str) -> String {
     let date = resolve_now_date(math_expr, now);
     let formatted = format_date_expr(date, fmt);
     format!("{}{}", prefix, formatted)
+}
+
+#[cfg(test)]
+mod index_name_date_math_tests {
+    use super::resolve_date_math;
+
+    /// Two regressions in one, both reachable from an index name in a request
+    /// URI, and both aborts rather than errors because the release profile sets
+    /// `panic = "abort"` (#207).
+    ///
+    /// * `<{}{}>` gives an inner `date_part` of `}{`, where the closing brace
+    ///   is found *before* the opening one — and `date_part[2..0]` is a panic,
+    ///   not an empty slice.
+    /// * `<logs-{now+9999999999999d}>` reached `chrono::Duration::days`, which
+    ///   panics on a count that does not fit a `TimeDelta`. Same defect the
+    ///   `date_math` fuzz target found in `xerj_query::dates::add_unit`.
+    ///
+    /// Before the fix each of these aborts the test process.
+    #[test]
+    fn a_malformed_or_unrepresentable_index_name_resolves_instead_of_aborting() {
+        for name in [
+            "<{}{}>",
+            "<}{>",
+            "<a{}{}z>",
+            "<{{}}>",
+            "<logs-{now+9999999999999d}>",
+            "<logs-{now-9999999999999d}>",
+            "<logs-{now+9223372036854775807y}>",
+            "<logs-{now+9223372036854775807M}>",
+            "<logs-{now+9223372036854775807w}>",
+            "<logs-{now+9223372036854775807h}>",
+            "<logs-{now/d",
+            "<>",
+            // The unit position holding a multi-byte character — the digit
+            // scan stops there and the old code sliced one byte out of it.
+            "<logs-{now+9\u{1be}999d}>",
+            "<logs-{now+1\u{4e2d}}>",
+            "<logs-{now-\u{e9}}>",
+            "<logs-{now+1d/\u{4e2d}}>",
+            "<logs-{now\u{1be}}>",
+            // Braces in the wrong order, outer pair and inner pair.
+            "<}<}<>{>{}>",
+            "}{",
+            "<a}b{c>",
+            "<a{b}c{d>",
+        ] {
+            // Any string is allowed to come back. None may take the process.
+            let _ = resolve_date_math(name);
+        }
+    }
+
+    /// The ordinary forms still resolve, so the guards above did not turn the
+    /// feature off to make the crash go away.
+    #[test]
+    fn ordinary_index_name_date_math_still_resolves() {
+        let today = chrono::Utc::now().format("%Y.%m.%d").to_string();
+        assert_eq!(resolve_date_math("<logs-{now/d}>"), format!("logs-{today}"));
+        assert_eq!(
+            resolve_date_math("<logs-{now/d{yyyy.MM.dd}}>"),
+            format!("logs-{today}")
+        );
+        assert_eq!(
+            resolve_date_math("plain-index"),
+            "plain-index",
+            "a name with no date math is returned unchanged"
+        );
+    }
 }
 
 fn resolve_now_date(
@@ -25981,20 +26089,35 @@ fn resolve_now_date(
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(rest.len());
         let n: i64 = rest[..end].parse().unwrap_or(0) * sign;
-        let (unit, rest) = if end < rest.len() {
-            (&rest[end..end + 1], &rest[end + 1..])
-        } else {
-            ("", &rest[end..])
+        // The unit is one CHARACTER, not one byte. `end` lands on the first
+        // non-digit, which may be multi-byte: `<logs-{now+9ƾ999d}>` made
+        // `rest[end..end + 1]` split U+01BE in half and panic. With
+        // `panic = "abort"` that is the process, from an index name in a
+        // request URI. Found by the `index_name_date_math` fuzz target (#207).
+        let (unit, rest) = match rest[end..].chars().next() {
+            Some(c) => rest[end..].split_at(c.len_utf8()),
+            None => ("", &rest[end..]),
         };
+        // `Duration::days` and friends PANIC when the count does not fit a
+        // `TimeDelta`, and `n * 30` overflows before that. `expr` is the
+        // date-math inside an index name (`<logs-{now+9999999999999d}>`), which
+        // arrives in a request URI — so the panicking constructors are an
+        // unauthenticated crash. Same defect the `date_math` fuzz target found
+        // in `xerj_query::dates::add_unit`; this is the second copy.
+        //
+        // An offset that cannot be represented degrades to "no offset", which
+        // is what this resolver already does for an unrecognised unit. It has
+        // no error channel to report into.
         let offset = match unit {
-            "d" => Duration::days(n),
-            "h" => Duration::hours(n),
-            "w" => Duration::weeks(n),
-            "M" => Duration::days(n * 30),
-            "y" => Duration::days(n * 365),
-            _ => Duration::zero(),
-        };
-        (base + offset, rest)
+            "d" => Duration::try_days(n),
+            "h" => Duration::try_hours(n),
+            "w" => Duration::try_weeks(n),
+            "M" => n.checked_mul(30).and_then(Duration::try_days),
+            "y" => n.checked_mul(365).and_then(Duration::try_days),
+            _ => Some(Duration::zero()),
+        }
+        .unwrap_or_else(Duration::zero);
+        (base.checked_add_signed(offset).unwrap_or(base), rest)
     } else {
         (base, rest)
     };
@@ -28088,6 +28211,12 @@ fn infer_field_type(val: &Value, date_detection: bool) -> FieldType {
 /// `KeywordFieldMapper("keyword").ignoreAbove(256)`).
 const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
 
+/// ES default `index.mapping.depth.limit` — how many `properties` levels a
+/// dynamically discovered document may nest before recursion stops. Applies
+/// only to the nested-object walk below; it does not change how deep an
+/// *explicit* `_mapping` PUT may nest (that path is unaffected by this cap).
+const DYNAMIC_MAPPING_DEPTH_LIMIT: usize = 20;
+
 /// Build the [`FieldConfig`] for a dynamically discovered field.
 ///
 /// Wraps [`infer_field_type`] and mirrors the ES default dynamic mapping for
@@ -28101,13 +28230,62 @@ const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
 /// this records that contract in the schema rather than leaving it implicit.
 /// Sub-fields of a leaf parent are NOT top-level `schema.fields` entries, so
 /// the search path's text/keyword field sets are unaffected.
+///
+/// A nested JSON object gets the same treatment one level deeper: its own
+/// keys are recursively dynamic-mapped into child `FieldConfig`s under
+/// `fields`, the same way `Text` gets its `keyword` sibling -- `FieldConfig`
+/// and the ES-compat mapping renderer already both understand this dual
+/// meaning of `fields` (real `properties` on `Object`/`Nested`, multi-fields
+/// on a leaf type, see the doc comment on `FieldConfig::fields`); only the
+/// *dynamic-discovery* path was never populating it for `Object`, so a
+/// subfield like `metadata.kind` was genuinely queryable (the query path
+/// resolves dotted paths against `_source` regardless of the mapping) but
+/// invisible to `GET _mapping`/`_field_caps` -- indistinguishable from not
+/// existing to any client that discovers fields that way instead of already
+/// knowing the field name in advance (Kibana/OSD's own field list included).
+/// Array-of-objects is intentionally out of scope here: `infer_field_type`
+/// already only inspects an array's first element for its *type*, so this
+/// recurses into that same first element for consistency rather than
+/// attempting to reconcile a heterogeneous shape across array entries --
+/// no behavior change for arrays beyond what recursing into their inferred
+/// Object element already implies.
 fn dynamic_field_config(key: &str, val: &Value, date_detection: bool) -> FieldConfig {
+    dynamic_field_config_at_depth(key, val, date_detection, 1)
+}
+
+fn dynamic_field_config_at_depth(
+    key: &str,
+    val: &Value,
+    date_detection: bool,
+    depth: usize,
+) -> FieldConfig {
     let ft = infer_field_type(val, date_detection);
     let mut fc = FieldConfig::new(key.to_string(), ft);
-    if matches!(fc.field_type, FieldType::Text) {
-        let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
-        kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
-        fc.fields.push(kw);
+    match fc.field_type {
+        FieldType::Text => {
+            let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
+            kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
+            fc.fields.push(kw);
+        }
+        FieldType::Object if depth < DYNAMIC_MAPPING_DEPTH_LIMIT => {
+            // `val` itself may be the Array whose first element inferred
+            // Object (see doc comment) -- unwrap to whichever object is the
+            // real source of the nested keys.
+            let obj = val
+                .as_object()
+                .or_else(|| val.as_array()?.iter().find(|v| !v.is_null())?.as_object());
+            if let Some(obj) = obj {
+                for (sub_key, sub_val) in obj {
+                    fc.fields.push(dynamic_field_config_at_depth(
+                        sub_key,
+                        sub_val,
+                        date_detection,
+                        depth + 1,
+                    ));
+                }
+            }
+        }
+        _ => {}
     }
     fc
 }
@@ -36340,13 +36518,14 @@ mod date_detection_tests {
         assert!(matches!(fc.field_type, FieldType::Text));
         assert_eq!(fc.fields.len(), 1);
 
-        // Non-string inferences carry NO multi-field.
+        // Non-string leaf inferences carry NO multi-field. Object is
+        // exercised separately below (dynamic_object_recurses_into_nested_properties)
+        // since it now gets real child sub-fields, not zero.
         for (val, want_sub) in [
             (serde_json::json!(42), 0usize),
             (serde_json::json!(2.5), 0),
             (serde_json::json!(true), 0),
             (serde_json::json!("2026-07-25T10:30:00Z"), 0), // date-detected
-            (serde_json::json!({"a": 1}), 0),
         ] {
             let fc = dynamic_field_config("f", &val, true);
             assert_eq!(fc.fields.len(), want_sub, "value {val} sub-field count");
@@ -36356,6 +36535,89 @@ mod date_detection_tests {
         let fc = dynamic_field_config("ts", &serde_json::json!("2026-07-25T10:30:00Z"), false);
         assert!(matches!(fc.field_type, FieldType::Text));
         assert_eq!(fc.fields.len(), 1);
+    }
+
+    /// A dynamically discovered nested object must recurse into its own
+    /// keys instead of staying an opaque `{"type": "object"}` -- otherwise
+    /// a subfield like `metadata.kind` is genuinely queryable (the query
+    /// path resolves dotted paths against `_source` regardless of the
+    /// mapping) but invisible to `GET _mapping`/`_field_caps`, indistinguishable
+    /// from not existing to any client that discovers fields that way. Found
+    /// via `/_memory`'s `metadata` field, which is exactly this shape.
+    #[test]
+    fn dynamic_object_recurses_into_nested_properties() {
+        let fc = dynamic_field_config(
+            "metadata",
+            &serde_json::json!({"kind": "preference", "topic": "language"}),
+            true,
+        );
+        assert!(matches!(fc.field_type, FieldType::Object));
+        assert_eq!(fc.fields.len(), 2, "both nested keys should be discovered");
+
+        let kind = fc.fields.iter().find(|f| f.name == "kind").expect("kind");
+        assert!(matches!(kind.field_type, FieldType::Text));
+        // Recursion composes with #209: a nested Text field gets its own
+        // .keyword multi-field too, same as a top-level one would.
+        assert_eq!(kind.fields.len(), 1);
+        assert_eq!(kind.fields[0].name, "keyword");
+        assert!(matches!(kind.fields[0].field_type, FieldType::Keyword));
+
+        // Multi-level nesting: object -> object -> leaf.
+        let fc = dynamic_field_config("a", &serde_json::json!({"b": {"c": 1}}), true);
+        let b = &fc.fields[0];
+        assert_eq!(b.name, "b");
+        assert!(matches!(b.field_type, FieldType::Object));
+        let c = &b.fields[0];
+        assert_eq!(c.name, "c");
+        assert!(matches!(c.field_type, FieldType::Long));
+
+        // Mixed-type nested keys are inferred independently, like top-level
+        // dynamic mapping already does.
+        let fc = dynamic_field_config(
+            "metadata",
+            &serde_json::json!({"count": 3, "active": true, "label": "x"}),
+            true,
+        );
+        let by_name = |n: &str| fc.fields.iter().find(|f| f.name == n).unwrap();
+        assert!(matches!(by_name("count").field_type, FieldType::Long));
+        assert!(matches!(by_name("active").field_type, FieldType::Boolean));
+        assert!(matches!(by_name("label").field_type, FieldType::Text));
+
+        // Depth limit: recursion stops at DYNAMIC_MAPPING_DEPTH_LIMIT rather
+        // than walking an adversarially deep document forever (ES has the
+        // same guard via index.mapping.depth.limit, default 20).
+        let mut deep = serde_json::json!(1);
+        for _ in 0..DYNAMIC_MAPPING_DEPTH_LIMIT + 5 {
+            deep = serde_json::json!({"n": deep});
+        }
+        let fc = dynamic_field_config("root", &deep, true);
+        let mut cur = &fc;
+        let mut levels = 0;
+        while let Some(next) = cur.fields.first() {
+            cur = next;
+            levels += 1;
+        }
+        assert!(
+            levels < DYNAMIC_MAPPING_DEPTH_LIMIT + 5,
+            "recursion must stop before reaching the artificially deep bottom, got {levels} levels"
+        );
+
+        // Array of objects: infer_field_type already only looks at the
+        // first non-null element to decide the *type* (Object); the
+        // dynamic-mapping walk mirrors that by recursing into the same
+        // element rather than reconciling every array entry's shape.
+        let fc = dynamic_field_config(
+            "tags",
+            &serde_json::json!([{"kind": "x"}, {"kind": "y", "extra": true}]),
+            true,
+        );
+        assert!(matches!(fc.field_type, FieldType::Object));
+        assert_eq!(
+            fc.fields.len(),
+            1,
+            "only the first element's keys are discovered"
+        );
+        assert_eq!(fc.fields[0].name, "kind");
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on

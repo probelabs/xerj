@@ -51,6 +51,18 @@ node_modules/
 # Rust build output
 target/
 
+# cargo-fuzz working state. The harnesses and their SEEDS are tracked
+# (engine/fuzz/fuzz_targets/, engine/fuzz/seeds/) — the seeds are the
+# regression suite and every one of them is named after what it covers. The
+# working corpus is not: `cargo fuzz run` writes every input it finds
+# interesting into it, and a few hundred opaque blobs per run is how a seed
+# corpus stops being reviewable. Promote a discovered input by copying it into
+# seeds/ under a descriptive name.
+engine/fuzz/corpus/
+engine/fuzz/artifacts/
+engine/fuzz/coverage/
+engine/fuzz/Cargo.lock
+
 # Upstream Elasticsearch reference clone — not part of this repo
 es-reference/
 

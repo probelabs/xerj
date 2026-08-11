@@ -429,11 +429,11 @@ async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
 /// This is the worse half of the corrupt case and it was missed on the first
 /// pass: the bytes are perfectly good, only the `read(2)` failed — a uid
 /// change on a container volume, a backup tool's chmod, `EIO`, `EMFILE` at
-/// boot. The maps come up empty, and `write_file_atomic` renames
-/// `cluster_state.tmp` over the target; `rename(2)` needs write permission on
-/// the *directory*, not on the file, so a `PUT` answering
+/// boot. The maps come up empty, and `write_file_atomic` renames its staged
+/// file over the target; `rename(2)` needs write permission on the *directory*,
+/// not on the file, so a `PUT` answering
 /// `{"acknowledged": true}` unlinked a fully recoverable document. Measured
-/// on this test before the fix, with `chmod 000` for the boot only:
+/// before the fix with a read-error target that the atomic writer could replace:
 ///
 /// ```text
 /// PUT /_index_template/fresh -> 200 {"acknowledged":true}
@@ -443,7 +443,7 @@ async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreadable_cluster_state_is_never_overwritten() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
 
     let dir = tempfile::tempdir().expect("tempdir");
     {
@@ -452,17 +452,46 @@ async fn an_unreadable_cluster_state_is_never_overwritten() {
     }
 
     let state_path = dir.path().join("cluster_state.json");
+    let saved_path = dir.path().join("cluster_state.saved.json");
     let original = std::fs::read_to_string(&state_path).expect("read state");
     assert!(original.contains("logs-*"), "fixture must be on disk");
 
-    // Unreadable for the boot only; restored immediately afterwards so the
-    // assertions below read the file the node was left holding, and so a
-    // failure cannot be blamed on the test's own permissions.
-    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o000))
-        .expect("chmod 000");
+    // Prove that this filesystem permits the destructive operation the latch
+    // prevents. A directory at the target would be a bad oracle because rename
+    // fails independently; a regular file can replace a symlink atomically.
+    let control_path = dir.path().join("replaceability-control");
+    let control_staged = dir.path().join("replaceability-staged");
+    symlink("replaceability-control", &control_path).expect("create control self-loop");
+    std::fs::write(&control_staged, b"replacement").expect("write control staging file");
+    std::fs::rename(&control_staged, &control_path)
+        .expect("a regular staged file must be able to replace the self-loop");
+    assert_eq!(
+        std::fs::read(&control_path).expect("read replacement control"),
+        b"replacement"
+    );
+    std::fs::remove_file(&control_path).expect("remove replacement control");
+
+    // A self-referential symlink makes read(2) fail with ELOOP even under root,
+    // while remaining replaceable by the atomic writer. Keep the valid bytes
+    // beside it so we can prove that the failed boot and refused writes did not
+    // alter the operator's configuration.
+    std::fs::rename(&state_path, &saved_path).expect("save valid cluster state");
+    symlink("cluster_state.json", &state_path).expect("create cluster-state self-loop");
+    let read_error = std::fs::read(&state_path).expect_err("self-loop must fail to read");
+    assert_ne!(
+        read_error.kind(),
+        std::io::ErrorKind::NotFound,
+        "the fixture must exercise the non-NotFound read-error branch"
+    );
+    assert!(
+        std::fs::symlink_metadata(&state_path)
+            .expect("inspect cluster-state self-loop")
+            .file_type()
+            .is_symlink(),
+        "the failing target must be a symlink, not a directory"
+    );
+
     let app = app_over(dir.path());
-    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o644))
-        .expect("chmod 644");
 
     let (st, _) = get(&app, "/_index_template/logs").await;
     assert_eq!(
@@ -494,13 +523,28 @@ async fn an_unreadable_cluster_state_is_never_overwritten() {
     );
 
     assert_eq!(
-        std::fs::read_to_string(&state_path).expect("read state"),
+        std::fs::read_link(&state_path).expect("read cluster-state self-loop"),
+        std::path::PathBuf::from("cluster_state.json"),
+        "the refused write must not replace the unreadable target"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&saved_path).expect("read saved state"),
         original,
-        "the intact document must still be on disk, byte for byte"
+        "the intact document must remain recoverable, byte for byte"
     );
     assert!(
-        !dir.path().join("cluster_state.tmp").exists(),
-        "a refused write must not even stage a temp file"
+        !dir.path().join("cluster_state.corrupt.json").exists(),
+        "a read error must not be mislabeled as parse corruption"
+    );
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("list data directory")
+            .all(|entry| !entry
+                .expect("read data-directory entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cluster_state.json.tmp.")),
+        "a refused write must not even stage a uniquely named temp file"
     );
 
     // And the refusal is not a one-off: the in-memory map must not be left
@@ -518,9 +562,11 @@ async fn an_unreadable_cluster_state_is_never_overwritten() {
         "deletes are writes too — they must be refused as well"
     );
 
-    // Recovery path: the file was readable all along, so a plain restart is
-    // the whole fix.
+    // Recovery path: remove the bad directory entry, put the saved bytes back,
+    // and restart. The latch belongs to the failed engine lifetime only.
     drop(app);
+    std::fs::remove_file(&state_path).expect("remove cluster-state self-loop");
+    std::fs::rename(&saved_path, &state_path).expect("restore valid cluster state");
     let app = app_over(dir.path());
     let (st, body) = get(&app, "/_index_template/logs").await;
     assert_eq!(

@@ -1,8 +1,11 @@
 # xerj Default Configuration
 # ============================================================
-# This file documents all 38 user-facing settings with their
-# production-ready defaults. Uncomment and edit any section
-# you want to override.
+# This file sets 54 of XERJ's 105 user-facing settings to their
+# production-ready defaults, and describes the rest in comments.
+# Every value here IS the default, so copying this file changes
+# nothing until you edit it (a test enforces that). The complete
+# set — every one of them optional — is documented in
+# crates/xerj-common/src/config.rs.
 #
 # To use: copy this file to xerj.toml and start the server:
 #   xerj --config /path/to/xerj.toml
@@ -77,7 +80,7 @@ allow_insecure_network_bind = false
 #   trusted_proxies = ["10.0.0.7", "10.1.0.0/16", "::1"]
 trusted_proxies = []
 
-# ── Authentication (2 settings) ───────────────────────────────────────────────
+# ── Authentication (3 settings) ───────────────────────────────────────────────
 
 [auth]
 
@@ -134,7 +137,7 @@ key_path = ""
 # opt-out. Ignored entirely when enabled = false.
 allow_insecure_grpc_h2c = false
 
-# ── Storage & WAL (5 settings) ────────────────────────────────────────────────
+# ── Storage & WAL (5 of 10 settings) ──────────────────────────────────────────
 
 [storage]
 
@@ -162,47 +165,66 @@ wal_batch_ms = 100
 # After a rollover, the old WAL file is retained until a flush checkpoint
 # advances past it. Larger values reduce rollover overhead at the cost of
 # longer recovery times after a crash.
-wal_max_size_mb = 512
+wal_max_size_mb = 1024
 
 # In-memory buffer size that triggers a segment flush to disk (MiB).
 # When the memtable for an index reaches this size, it is flushed to a
 # durable on-disk segment. Larger values improve write throughput but
 # increase recovery time and memory usage.
-flush_size_mb = 256
+flush_size_mb = 512
 
 # Maximum time between flushes, regardless of buffer size (seconds).
 # Ensures data is durable even during low-write periods.
 flush_interval_secs = 30
 
-# ── Segment Merging (5 settings) ──────────────────────────────────────────────
+# ── Segment Merging (8 settings) ──────────────────────────────────────────────
+#
+# Three of these are DORMANT: accepted and validated, but no code path in this
+# build reads them. Setting one away from its default logs a warning at startup.
+# They are marked below. The merge that runs reads max_segment_mb, tier_floor_mb,
+# min_merge_count and max_merge_count, and nothing else.
 
 [merge]
 
 # Merge strategy for combining small segments into larger ones.
 #
-#   "size_tiered"   — merges segments of similar size. Best for write-heavy
-#                     workloads with infrequent reads.
-#   "log_structured" — LSMT-style levelled merging. Better read performance
-#                      for mixed read/write workloads.
+#   "size_tiered" — merges segments of similar size. Best for write-heavy
+#                   workloads with infrequent reads.
+#
+# Only size_tiered is implemented. "log_structured" is refused at startup rather
+# than silently running size-tiered merging.
 strategy = "size_tiered"
 
+# DORMANT — nothing reads this. The merge trigger is per-tier and comes from
+# min_merge_count below.
 # Minimum number of segments that must exist before a merge is triggered.
-# Higher values delay merging (more write throughput, slower reads).
 # Must be >= 2. Default: 10.
 min_segments = 10
 
-# Maximum size of a merged segment (MiB). Segments larger than this are
-# never merged. 5120 MiB = 5 GiB.
-max_segment_mb = 5120
+# Maximum size of a merged segment (MiB). Segments at or above this size are
+# never merged again. 8192 MiB = 8 GiB.
+max_segment_mb = 8192
 
+# DORMANT — merge I/O is NOT throttled in this build. The rate limiter that
+# honours this value is wired only into an unused storage-crate merge executor,
+# so setting it buys nothing today.
 # I/O rate cap for merge operations (MiB/s).
-# Throttle merges to prevent them from saturating disk I/O on shared storage.
-# Set to 0 to disable throttling (not recommended in production).
 io_rate_mb_per_sec = 100
 
+# DORMANT — nothing reads this. Merge parallelism comes from the
+# XERJ_MERGE_PARALLELISM environment variable, which also defaults to 1.
 # Maximum number of concurrent merge operations.
-# Increase on systems with fast NVMe arrays. Lower on spinning disks.
 max_concurrent = 1
+
+# Tier boundary base for the size-tiered policy (MiB). Segments group into tiers
+# by floor(log2(size / tier_floor_mb)).
+tier_floor_mb = 4
+
+# Minimum segments in one tier before that tier is merged.
+min_merge_count = 4
+
+# Maximum segments merged per batch. Caps peak merge RAM.
+max_merge_count = 16
 
 # ── Compression (3 settings) ──────────────────────────────────────────────────
 
@@ -243,7 +265,7 @@ block_size_docs = 128
 # creation time via the mappings API.
 default_analyzer = "standard"
 
-# ── Vector Search / HNSW (6 settings) ────────────────────────────────────────
+# ── Vector Search / HNSW (6 settings) ─────────────────────────────────────────
 
 [vector]
 
@@ -282,7 +304,7 @@ hnsw_ef_search = 100
 # vectors while claiming a 32× saving. 4-bit ("scalar4") quantization and
 # automatic quantization downgrade are not implemented either and have no
 # settings here.
-default_quantization = "scalar8"
+default_quantization = "none"
 
 # Maximum supported vector dimensionality.
 # Vectors with more dimensions than this are rejected at ingest time.
@@ -307,7 +329,7 @@ retention_days = 90
 # Use "1d" for lower-volume application logs.
 time_partition = "1h"
 
-# ── External Embedding Service (4 settings) ────────────────────────────────────
+# ── External Embedding Service (4 of 19 settings) ─────────────────────────────
 #
 # NOTE: Token limits are model-specific, not xerj-specific.
 #
@@ -344,7 +366,7 @@ batch_size = 64
 # request fails with a timeout error.
 timeout_ms = 5000
 
-# ── Resource Limits (11 settings; omitted keys use documented defaults) ───────
+# ── Resource Limits (6 of 13 settings) ────────────────────────────────────────
 
 [limits]
 
@@ -410,7 +432,7 @@ turbo_parallel = true
 # (e.g. "running" will not match "run").
 turbo_fast_analyzer = false
 
-# ── Cluster (5 settings) ──────────────────────────────────────────────────────
+# ── Cluster (5 settings, all commented out below) ─────────────────────────────
 #
 # Multi-node cluster mode is OFF by default and is experimental. The whole
 # block is commented out; uncomment it only if you are evaluating clustering.

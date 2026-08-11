@@ -18,18 +18,34 @@
 //! behaviour of [`crate::walk`] is unchanged, and so we can report *which*
 //! rule discarded *what*, which `ignore`'s own walker does not expose.
 //!
-//! Two behaviours are copied deliberately from that reference implementation
-//! (`ignore-0.4.32/src/dir.rs`, read at `~/.cargo/registry/src/*/ignore-0.4.32`):
+//! Three behaviours are copied deliberately from that reference implementation
+//! (`ignore-0.4.32/src/dir.rs` — the version this crate's lockfile pins; read
+//! at `~/.cargo/registry/src/*/ignore-0.4.32`). All three live in
+//! `Ignore::matched_ignore`, `dir.rs:548-685`:
 //!
-//! * **Deepest ignore file wins, per kind.** `dir.rs:563-594` walks matchers
-//!   from the current directory outward and keeps the first decision each kind
-//!   produces (`if m_gi.is_none() { m_gi = … }`).
-//! * **Kinds are ranked, and the rank beats depth.** `dir.rs:678-684` combines
-//!   them `m_custom_ignore.or(m_ignore).or(m_gi).or(m_gi_exclude)`. So a
-//!   `.xerjignore` at the root outranks a `.gitignore` in a deep subdirectory.
-//!   That is what makes `.xerjignore` useful as the stated "exclude things git
-//!   tracks" (and re-include things git ignores) override rather than just a
-//!   second `.gitignore`.
+//! * **Deepest ignore file wins, per kind.** The loop at `dir.rs:563-594` walks
+//!   matchers from the current directory outward and keeps the first decision
+//!   each kind produces — `if m_custom_ignore.is_none() { m_custom_ignore = … }`
+//!   at `:565`, and the same shape for the other three kinds.
+//! * **The two git kinds stop at a repository boundary.** In that same loop the
+//!   git kinds are guarded by `saw_git` — declared `:562`, tested at `:579` and
+//!   `:586` (`if any_git && !saw_git && m_gi.is_none()`), and set at `:593`
+//!   (`saw_git = saw_git || ig.inner.has_git`). Once the walk outward has
+//!   passed a directory holding a `.git`, no `.gitignore` or `.git/info/exclude`
+//!   above it is consulted. That is git's own authority model: the repository
+//!   that *owns* a file decides whether it is ignored, so an outer repository's
+//!   `.gitignore` has no say over a vendored or submoduled checkout nested
+//!   inside it. See [`IgnoreStack::lookup`] for our copy of the guard.
+//! * **Kinds are ranked, and the rank beats depth.** `dir.rs:679-684` combines
+//!   them `m_custom_ignore.or(m_ignore).or(m_gi).or(m_gi_exclude).or(m_global)
+//!   .or(m_explicit)`. We reproduce the first four as `.xerjignore` >
+//!   `.gitignore` > `.git/info/exclude` > built-in defaults. The last two have
+//!   no analogue here: `m_global` is the global gitignore we deliberately do not
+//!   read (below), and `m_explicit` is ripgrep's `--ignore-file`, which XERJ
+//!   does not offer. So a `.xerjignore` at the root outranks a `.gitignore` in a
+//!   deep subdirectory — that is what makes `.xerjignore` useful as the stated
+//!   "exclude things git tracks" (and re-include things git ignores) override
+//!   rather than just a second `.gitignore`.
 //!
 //! Within one file the last matching pattern wins; that is `Gitignore::matched`
 //! and we do not reimplement it.
@@ -136,9 +152,14 @@ pub struct RuleCount {
     pub files: u64,
     /// Directories pruned by this rule (their contents were never walked).
     pub dirs: u64,
-    /// Files found inside those pruned directories. Only ever non-zero when
-    /// the deep count ran (`--dry-run`).
+    /// Non-hidden files found inside those pruned directories. Only ever
+    /// non-zero when the deep count ran (`--dry-run`).
     pub files_inside_pruned_dirs: u64,
+    /// How many of `dirs` had their contents counted. Always 0 for
+    /// [`HIDDEN_RULE`], whose directories are never counted at all, so the
+    /// reporting can stay silent about them instead of printing a `0 files
+    /// inside` that is false of the filesystem.
+    pub dirs_deep_counted: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +168,12 @@ pub struct IgnoreReport {
     pub by_rule: BTreeMap<String, RuleCount>,
     pub files_skipped: u64,
     pub dirs_pruned: u64,
+    /// Non-hidden files inside the pruned directories — see
+    /// [`IgnoreStack::count_inside`] for exactly what is and is not counted.
+    /// Directories pruned by [`HIDDEN_RULE`] contribute nothing: their
+    /// contents were excluded by the dotfile rule before any ignore rule was
+    /// consulted. Never read this without
+    /// [`IgnoreReport::files_inside_pruned_dirs_is_exact`].
     pub files_inside_pruned_dirs: u64,
     /// True unless the deep count hit [`DEEP_COUNT_BUDGET`]. When false,
     /// `files_inside_pruned_dirs` is a floor and every line that prints it
@@ -187,6 +214,18 @@ impl IgnoreReport {
         self.by_rule.is_empty() && self.root_exemption.is_none() && self.warnings.is_empty()
     }
 
+    /// Whether [`Self::files_inside_pruned_dirs`] is the whole count or a
+    /// floor.
+    ///
+    /// False in two cases, and a consumer must treat both the same way: the
+    /// deep count never ran (a real run does not pay for it, so the field is a
+    /// vacuous 0), or it ran and hit [`DEEP_COUNT_BUDGET`]. A bare `u64` on a
+    /// machine surface cannot say "at least", so every such surface must carry
+    /// this flag next to the number (#279).
+    pub fn files_inside_pruned_dirs_is_exact(&self) -> bool {
+        self.deep_count_ran && self.deep_count_complete
+    }
+
     /// Human-readable lines for the progress surface. Every number here was
     /// counted by this run; the ones that were deliberately not counted are
     /// named as such instead of being printed as zero.
@@ -208,9 +247,15 @@ impl IgnoreReport {
             self.dirs_pruned,
             if self.dirs_pruned == 1 { "y" } else { "ies" },
         );
-        if self.deep_count_ran && self.dirs_pruned > 0 {
+        let deep_counted_dirs: u64 = self.by_rule.values().map(|c| c.dirs_deep_counted).sum();
+        if self.deep_count_ran && deep_counted_dirs > 0 {
+            // "non-hidden" is the whole of the claim: dotfiles are excluded
+            // from the count, and directories the dotfile rule pruned are not
+            // counted at all. Anything stronger — "files that would otherwise
+            // have been indexed" — would be overclaiming, because ignore files
+            // nested inside a pruned tree are never read (#279).
             headline.push_str(&format!(
-                " ({}{} file{} inside them)",
+                " ({}{} non-hidden file{} inside them)",
                 if self.deep_count_complete {
                     ""
                 } else {
@@ -243,9 +288,12 @@ impl IgnoreReport {
                 parts.push(format!("{} file{}", count.files, plural(count.files)));
             }
             if count.dirs > 0 {
-                let inside = if self.deep_count_ran {
+                // Silent for the dotfile rule, whose directories are never
+                // counted: "0 files inside" would be a false statement about
+                // `.git/`, and "N files inside" was the inflated one.
+                let inside = if self.deep_count_ran && count.dirs_deep_counted > 0 {
                     format!(
-                        " ({}{} file{} inside)",
+                        " ({}{} non-hidden file{} inside)",
                         if self.deep_count_complete {
                             ""
                         } else {
@@ -289,6 +337,12 @@ struct Layer {
     xerj: Option<Gitignore>,
     git: Option<Gitignore>,
     exclude: Option<Gitignore>,
+    /// This directory holds a `.git`, so it is the root of a checkout and the
+    /// outward end of the git kinds' authority — see [`IgnoreStack::lookup`].
+    /// `.git` is a directory in a normal clone and a file (`gitdir: …`) in a
+    /// submodule or linked worktree; both are boundaries, so this is an
+    /// `exists()` test rather than `is_dir()`.
+    repo_root: bool,
 }
 
 /// A stack of ignore matchers, one entry per directory on the current
@@ -439,6 +493,10 @@ impl IgnoreStack {
                 // only I have". Loaded per directory so a nested checkout gets
                 // its own.
                 exclude: self.load(dir, dir.join(".git").join("info").join("exclude")),
+                // One extra stat per directory entered, next to the three this
+                // already pays, and it is the only way to know where one
+                // checkout ends and another begins.
+                repo_root: dir.join(".git").exists(),
             }
         } else {
             Layer::default()
@@ -478,7 +536,28 @@ impl IgnoreStack {
 
     /// ripgrep's precedence, reproduced: the deepest match *per kind*, then
     /// the kinds ranked `.xerjignore` > `.gitignore` > `.git/info/exclude` >
-    /// built-in defaults (`ignore-0.4.32/src/dir.rs:563-594` and `:678-684`).
+    /// built-in defaults (`ignore-0.4.32/src/dir.rs:563-594` and `:679-684`).
+    ///
+    /// # The repository boundary
+    ///
+    /// The two git-owned kinds — `.gitignore` and `.git/info/exclude` — stop
+    /// as soon as the outward walk has passed a directory holding a `.git`.
+    /// This is `saw_git` in the reference implementation (`dir.rs:562`, `:579`,
+    /// `:586`, `:593`) and it is git's own rule: the repository that owns a
+    /// file is the one that decides whether it is ignored. A vendored or
+    /// submoduled checkout inside a tree is a different repository, and the
+    /// outer `.gitignore` has no authority over its contents — `git status` in
+    /// the outer repo never even descends into it. Without the stop, a root
+    /// `*.md` would hide the README of every vendored dependency.
+    ///
+    /// Two kinds deliberately do **not** stop at the boundary, because neither
+    /// is git's to scope:
+    ///
+    /// * `.xerjignore` is XERJ's own file and its stated job is to govern the
+    ///   folder you pointed at. One at the root is how a user says "not this,
+    ///   anywhere below here" without editing anyone's `.gitignore`.
+    /// * the built-in defaults are anchored at the root and apply throughout —
+    ///   a `node_modules/` inside a vendored checkout is still build output.
     fn lookup(&self, path: &Path, is_dir: bool) -> Option<(bool, String)> {
         if !self.opts.enabled {
             return None;
@@ -486,15 +565,25 @@ impl IgnoreStack {
         let mut xerj = None;
         let mut git = None;
         let mut exclude = None;
+        // Cleared once the walk outward leaves the checkout that owns `path`.
+        let mut in_owning_repo = true;
         for layer in self.layers.iter().rev() {
             if xerj.is_none() {
                 xerj = self.decide_with(layer.xerj.as_ref(), path, is_dir);
             }
-            if git.is_none() {
-                git = self.decide_with(layer.git.as_ref(), path, is_dir);
-            }
-            if exclude.is_none() {
-                exclude = self.decide_with(layer.exclude.as_ref(), path, is_dir);
+            if in_owning_repo {
+                if git.is_none() {
+                    git = self.decide_with(layer.git.as_ref(), path, is_dir);
+                }
+                if exclude.is_none() {
+                    exclude = self.decide_with(layer.exclude.as_ref(), path, is_dir);
+                }
+                // This layer's own files still count — it is the repository
+                // root, not the far side of the boundary. Anything above it is
+                // a different repository.
+                if layer.repo_root {
+                    in_owning_repo = false;
+                }
             }
             if xerj.is_some() {
                 // Nothing ranked lower can change the answer.
@@ -558,9 +647,22 @@ impl IgnoreStack {
     /// The dotfile skip is decided by the walker, not here, but it is reported
     /// through the same accounting so `--dry-run` explains every missing file
     /// with one mechanism.
-    pub fn record_hidden(&mut self, path: &Path, is_dir: bool) {
+    ///
+    /// A hidden **directory** is recorded as pruned and nothing more: its
+    /// contents are never deep-counted. Nothing under `.git/` or `.venv/` was
+    /// ever a candidate for indexing — the dotfile rule had already excluded
+    /// all of it — so counting those files would inflate
+    /// [`IgnoreReport::files_inside_pruned_dirs`] with work that no run was
+    /// ever going to do. On this repository that inflation was 97,731 files
+    /// against a real exclusion of 273,441 (#279).
+    pub fn record_hidden(&mut self, is_dir: bool) {
         if is_dir {
-            self.record_dir(path, HIDDEN_RULE);
+            self.report.dirs_pruned += 1;
+            self.report
+                .by_rule
+                .entry(HIDDEN_RULE.to_string())
+                .or_default()
+                .dirs += 1;
         } else {
             self.record_file(HIDDEN_RULE);
         }
@@ -576,19 +678,15 @@ impl IgnoreStack {
     }
 
     fn record_dir(&mut self, path: &Path, label: &str) {
-        self.report.dirs_pruned += 1;
-        self.report
-            .by_rule
-            .entry(label.to_string())
-            .or_default()
-            .dirs += 1;
         let inside = self.count_inside(path);
+        let entry = self.report.by_rule.entry(label.to_string()).or_default();
+        entry.dirs += 1;
+        entry.files_inside_pruned_dirs += inside;
+        if self.opts.deep_count {
+            entry.dirs_deep_counted += 1;
+        }
+        self.report.dirs_pruned += 1;
         self.report.files_inside_pruned_dirs += inside;
-        self.report
-            .by_rule
-            .entry(label.to_string())
-            .or_default()
-            .files_inside_pruned_dirs += inside;
     }
 
     /// Only under `--dry-run`. Symlinks are never followed here whatever the
@@ -596,12 +694,25 @@ impl IgnoreStack {
     /// directory we have already decided not to index, and it must not be able
     /// to wander outside it or loop.
     ///
-    /// The dotfile rule is applied here too, so the number means "files that
-    /// would otherwise have been indexed" and not "inodes under this path".
-    /// Without it a pruned directory containing a nested checkout reports its
-    /// whole `.git`, which was never indexable in the first place — a number
-    /// that does not reconcile with the before/after file count is worse than
-    /// no number.
+    /// # Exactly what this counts
+    ///
+    /// Regular files under `dir`, excluding every dot-named file and the whole
+    /// subtree of every dot-named directory — the dotfile rule, applied here
+    /// too, because those paths were never indexable. That is the figure the
+    /// reporting prints and the phrase it prints it with ("N non-hidden files
+    /// inside them"). Two things it is deliberately *not*:
+    ///
+    /// * It is **not** a promise about what a `--no-ignore` run would have
+    ///   indexed. Ignore files nested *inside* the pruned tree are not
+    ///   consulted — the point of pruning is to never read that tree — so a
+    ///   `node_modules/.gitignore` excluding some of its own contents would
+    ///   make the real figure smaller than this one.
+    /// * It is **not** guaranteed complete. [`DEEP_COUNT_BUDGET`] caps the
+    ///   traversal; past it [`IgnoreReport::deep_count_complete`] goes false
+    ///   and every surface says "at least".
+    ///
+    /// Callers that publish the number to a machine must publish
+    /// [`IgnoreReport::files_inside_pruned_dirs_is_exact`] beside it.
     fn count_inside(&mut self, dir: &Path) -> u64 {
         if !self.opts.deep_count {
             return 0;
@@ -651,7 +762,7 @@ mod tests {
                     .to_str()
                     .is_some_and(|n| n.starts_with('.'))
             {
-                stack.record_hidden(entry.path(), is_dir);
+                stack.record_hidden(is_dir);
                 if is_dir {
                     it.skip_current_dir();
                 }
@@ -882,9 +993,140 @@ mod tests {
         assert_eq!(deep.files_inside_pruned_dirs, 7);
         assert!(deep.deep_count_complete);
         assert!(
-            deep.summary_lines().iter().any(|l| l.contains("7 files")),
+            deep.summary_lines()
+                .iter()
+                .any(|l| l.contains("7 non-hidden files")),
             "{:?}",
             deep.summary_lines()
+        );
+    }
+
+    /// #279. A count that never ran and a count that ran to completion are both
+    /// reported as a `u64`, and only the exactness flag separates them. A
+    /// consumer that reads the number without the flag reads 0 as "nothing
+    /// inside those directories", which is the opposite of the truth.
+    #[test]
+    fn an_unmeasured_count_is_never_claimed_to_be_exact() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "keep.txt", "x");
+        for i in 0..4 {
+            write(root, &format!("node_modules/pkg/f{i}.js"), "x");
+        }
+
+        let (_, cheap) = survivors(root, IgnoreOptions::default());
+        assert_eq!(cheap.files_inside_pruned_dirs, 0);
+        assert!(
+            !cheap.files_inside_pruned_dirs_is_exact(),
+            "a 0 that was never measured must not be published as a total"
+        );
+
+        let (_, deep) = survivors(root, IgnoreOptions::default().with_deep_count(true));
+        assert_eq!(deep.files_inside_pruned_dirs, 4);
+        assert!(deep.files_inside_pruned_dirs_is_exact());
+
+        // The floor case the budget produces, which no test can reach with a
+        // real 1M-entry tree: the flag, not the number, is what says so.
+        let capped = IgnoreReport {
+            deep_count_ran: true,
+            deep_count_complete: false,
+            ..IgnoreReport::default()
+        };
+        assert!(!capped.files_inside_pruned_dirs_is_exact());
+    }
+
+    /// #279. `record_hidden` used to route directories through `record_dir`,
+    /// which deep-counts. Every non-hidden file under `.git/`, `.venv/` and
+    /// friends was therefore counted as "inside a pruned directory" — on the
+    /// XERJ repository that was 97,731 phantom files on a real exclusion of
+    /// 273,441. Nothing under a dot-directory was ever a candidate for
+    /// indexing, so it must not appear in the exclusion accounting at all.
+    #[test]
+    fn a_dotfile_pruned_directory_contributes_nothing_to_the_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "keep.txt", "x");
+        // A hidden directory holding plenty of non-hidden files, exactly like
+        // `.git/objects/`.
+        for i in 0..9 {
+            write(root, &format!(".hidden/objects/o{i}.pack"), "x");
+        }
+        // …and a directory pruned by a real ignore rule.
+        for i in 0..3 {
+            write(root, &format!("node_modules/pkg/f{i}.js"), "x");
+        }
+
+        let (kept, deep) = survivors(root, IgnoreOptions::default().with_deep_count(true));
+        assert_eq!(kept, vec!["keep.txt"], "{kept:?}");
+        assert_eq!(
+            deep.files_inside_pruned_dirs, 3,
+            "only node_modules/ may contribute; the 9 files under .hidden/ were \
+             never indexable: {deep:?}"
+        );
+
+        let hidden = deep.by_rule[HIDDEN_RULE];
+        assert_eq!(hidden.dirs, 1, "the dot-directory is still reported pruned");
+        assert_eq!(hidden.files_inside_pruned_dirs, 0);
+        assert_eq!(
+            hidden.dirs_deep_counted, 0,
+            "its contents must never be walked for the count"
+        );
+
+        // …and the printed sentence must agree with the printed figure: no
+        // "N files inside" clause for the dotfile rule at all, because "0" is
+        // as false about `.hidden/` as "9" was misleading.
+        let lines = deep.summary_lines();
+        let hidden_line = lines
+            .iter()
+            .find(|l| l.contains(HIDDEN_RULE))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(
+            !hidden_line.contains("inside"),
+            "must not claim a count it did not take: {hidden_line}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("(3 non-hidden files inside them)")),
+            "{lines:?}"
+        );
+    }
+
+    /// #279. The claim the reporting makes about its own number, checked as
+    /// arithmetic: what a default run excludes over a `--no-ignore` run is
+    /// exactly the files the rules matched directly plus the files inside the
+    /// directories they pruned. The dotfile rule cancels out — it applies to
+    /// both arms — which is precisely why its directories must not be counted.
+    #[test]
+    fn the_exclusion_count_reconciles_with_a_no_ignore_walk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, ".gitignore", "*.log\nbuild/\n");
+        write(root, "keep.txt", "x");
+        write(root, "a.log", "x");
+        write(root, "src/b.log", "x");
+        for i in 0..5 {
+            write(root, &format!("build/out{i}.o"), "x");
+        }
+        for i in 0..4 {
+            write(root, &format!("node_modules/pkg/m{i}.js"), "x");
+        }
+        // Hidden noise on both sides of the comparison.
+        for i in 0..6 {
+            write(root, &format!(".git/objects/o{i}.pack"), "x");
+        }
+
+        let (kept, rep) = survivors(root, IgnoreOptions::default().with_deep_count(true));
+        let (all, _) = survivors(root, IgnoreOptions::off());
+        assert!(rep.files_inside_pruned_dirs_is_exact());
+
+        let hidden = rep.by_rule.get(HIDDEN_RULE).copied().unwrap_or_default();
+        let by_ignore_rules = (rep.files_skipped - hidden.files) + rep.files_inside_pruned_dirs;
+        assert_eq!(
+            all.len() - kept.len(),
+            by_ignore_rules as usize,
+            "reported exclusions must equal the measured difference; kept={kept:?} all={all:?} \
+             report={rep:?}"
         );
     }
 

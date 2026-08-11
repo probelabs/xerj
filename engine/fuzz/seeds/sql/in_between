@@ -1,0 +1,1 @@
+SELECT * FROM idx WHERE code IN (1,2,3) AND price BETWEEN 5 AND 10

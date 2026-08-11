@@ -1,0 +1,1 @@
+SELECT a, b FROM logs WHERE status = 200 AND level = 'error'

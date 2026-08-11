@@ -7,6 +7,354 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`cargo-audit` and `cargo-fuzz` now actually run in CI — they were only ever
+  documented** ([#207](https://github.com/xerj-org/xerj/issues/207)).
+  `user-feedback/09-security/cves-and-vulnerabilities.md` listed "`cargo-audit`
+  for dependency vulnerability scanning" and "fuzz testing (cargo-fuzz) on all
+  input parsing paths" as part of XERJ's answer to Elasticsearch's CVE history.
+  Neither existed: no audit job, no fuzz job, no fuzz target anywhere in the
+  tree. A reader comparing the two engines priced in a fuzzed parser surface
+  that was not there.
+  - New CI job `security-audit` runs `cargo audit` on every push and pull
+    request; a RUSTSEC vulnerability advisory fails the build.
+  - New CI job `fuzz` builds and runs seven libFuzzer harnesses
+    (`engine/fuzz/`) over checked-in seeds: the Elasticsearch query DSL, the
+    Lucene `query_string` grammar, date math and date-format patterns,
+    index-name date math, SQL, Painless scripts, and the aggregation engine's
+    two separate script tokenisers. `.github/scripts/fuzz-smoke.sh` is the same
+    entry point locally and in CI.
+  - `xerj-engine/tests/security_tooling_claims.rs` fails if a documented tool
+    stops running, if a fuzz target ships without a seed corpus, or if the
+    "all input parsing paths" overclaim reappears in any prose file.
+  - The claim itself is now specific about what is and is not covered.
+  - **Known gap, stated because the point of this entry is not to overclaim
+    again:** seven harnesses are seven parsers, not the engine's whole input
+    surface, and one parser outside them is already known to abort.
+    `aggs::parse_time_zone_offset` slices a `time_zone` string at byte 2 after
+    a *byte*-length check, so a `date_histogram` with `"time_zone": "+中a"` in
+    an unauthenticated `_search` body dies on a character boundary. It is
+    pre-existing, is not touched by this change, and is tracked in
+    [#272](https://github.com/xerj-org/xerj/issues/272) with a fix and a
+    proposed harness for the aggregation date parsers.
+
+- **Fixed two high-severity advisories in the document-ingest XML parser.**
+  Turning the audit gate on found `quick-xml` 0.36.2 in `xerj-autoindex`, which
+  parses `.docx`, `.xlsx` and `.xml` files supplied by whoever owns the folder
+  being indexed: RUSTSEC-2026-0195 (unbounded namespace-declaration allocation →
+  memory-exhaustion DoS, CVSS 7.5) and RUSTSEC-2026-0194 (quadratic run time on
+  duplicate attribute names, CVSS 7.5). Upgraded to 0.41, which also
+  de-duplicates the crate — 0.41 was already in the tree via `pdf_oxide`.
+  `crossbeam-epoch` moved 0.9.18 → 0.9.20 for RUSTSEC-2026-0204.
+
+### Fixed
+
+- **`PUT /{index}/_settings {"index.lifecycle.name": null}` actually detaches
+  the index, and the detach survives a restart** (#282, ported from #262). The
+  null previously fell through a string-only settings reader, so the operator
+  got `200 acknowledged` while the index stayed attached — to a policy whose
+  delete phase then destroyed it. A detach now removes the execution cursor,
+  writes a persisted tombstone (`ism_managed_indices.json` grew a
+  `managed`/`detached` envelope; the old bare-map file is still read), and
+  scrubs the stale `index.lifecycle.name` from the stored settings.
+- **The lifecycle delete action gained #262's safety rails.** It now refuses —
+  visibly, in `explain`, never silently — to delete a dot-prefixed internal
+  index (`.ds-*` backing indices exempt), a data stream's current write index,
+  or an index whose age cannot be established from its execution cursor.
+- **An ILM policy naming an action the engine cannot execute is refused at PUT
+  time with the action named** (400), instead of being stored with the action
+  silently dropped — the accepted-and-ignored class (#204). Executable ILM
+  actions are `rollover`, `delete`, `readonly`.
+- **`autoindex` no longer rejects a resumed generation after journal replay
+  when inferred floating-point schema statistics need exact decimal
+  round-tripping.** Unchanged reruns and junk-bearing corpus shrink now replay
+  correctly; existing affected journals resume without a rebuild, while the
+  manifest format and integrity checks remain unchanged.
+
+- **A `query_string` containing one non-ASCII character aborted the process.**
+  `{"query_string":{"query":"_\u0660"}}` — or the same text in `?q=` — took the
+  server down. The Lucene tokeniser walks bytes but slices `&q[start..i]` as a
+  `&str`, and it broke on `is_whitespace()`, which is true for Latin-1 NBSP
+  (0xA0). In valid UTF-8 that byte is only ever a *continuation* byte, so the
+  scan stopped between the two bytes of U+0660 and the slice panicked on a
+  character boundary. Every delimiter test in that scanner is now `is_ascii_*`,
+  which makes "the scan can only stop on a character boundary" true by
+  construction. Nothing is lost: the only non-ASCII bytes the old test accepted
+  were 0x85 and 0xA0, neither of which is a standalone character in UTF-8.
+
+- **An index name of `<{}{}>` aborted the process.** Index-name date math finds
+  the first `{` and the last `}` inside the braces; when the `}` comes first,
+  `date_part[2..0]` is a panic, not an empty slice. Reachable from any request
+  that names an index. The closing brace is now required to come after the
+  opening one.
+
+- **A Painless script containing one non-ASCII character aborted the process.**
+  The second thing the new fuzz harnesses found, inside a second. The tokeniser
+  walks *bytes* (`bytes[i] as char` reinterprets each byte as Latin-1) but
+  slices `&src[start..i]` as a `&str`. Every continuation byte of a multi-byte
+  character reads as an alphabetic Latin-1 char, so an identifier scan could
+  start or stop inside one and the slice panicked on a char boundary —
+  `end byte index 24 is not a char boundary; it is inside 'ʋ'`. Scripts arrive
+  in ordinary search and update bodies and the release profile sets
+  `panic = "abort"`, so this was not a 400, it was the whole server. The
+  identifier scan is now ASCII-only, which keeps both ends on a character
+  boundary by construction; a non-ASCII byte reaches the tokeniser's
+  `unexpected char` error instead. String literals still carry any Unicode.
+
+- **A search body could abort the whole process: `{"range":{"ts":{"gte":"now+33333333333333H"}}}`.**
+  The first thing the new `date_math` fuzz target found, 20 seconds into its
+  first run. `chrono`'s `Duration::hours` and its siblings **panic** when the
+  count does not fit a `TimeDelta`, and they run before the
+  `checked_add_signed` that was supposed to make
+  `xerj_query::dates::add_unit` total — so the careful checking around them
+  bought nothing. A range bound goes straight from the request body into this
+  code (`parser.rs:931`), the release profile sets `panic = "abort"`, and the
+  result is an unauthenticated remote denial of service on a released binary.
+  Fixed with the fallible `try_*` constructors. Grepping for the same pattern
+  found **three** more copies in the index-name date-math resolvers —
+  `xerj-engine/src/index.rs`, and *both* branches of
+  `xerj-api/src/es_compat.rs`: the `now` form (`<logs-{now+9999999999999d}>`)
+  and the anchored form (`<logs-{2026-01-01||+9999999999999d}>`), which are
+  handled by two different functions sixty lines apart. All three are fixed,
+  their `n * 30` / `n * 365` multiplications are `checked_mul`, the unit is read
+  as one character rather than one byte, and the addition goes through
+  `checked_add_signed`. `es_compat`'s resolver is the one that runs on the wire
+  — the index path parameter of every create/index call and the `_search` index
+  list — so `crates/xerj-api/tests/index_name_date_math_is_total.rs` now drives
+  it at the crate boundary; the same-file fix that missed the anchored branch
+  passed because nothing exercised the public entry point.
+
+- **A `_search` aggregation script containing one non-ASCII character aborted
+  the process.** `painless::tokenize` was not the only Painless-subset scanner
+  in the tree: `aggs.rs` holds two more with the identical byte-walk /
+  `&str`-slice shape — `lex_script` (`scripted_metric`) and `tokenize_script`
+  (`bucket_script` / `bucket_selector`) — and both took `&src[i..i + 2]` to test
+  for a two-character operator at a byte index that can sit inside a multi-byte
+  character, because every arm above it is ASCII-only.
+  `{"m":{"scripted_metric":{"map_script":"中"}}}` was `end byte index 2 is not a
+  char boundary`. Both also skipped whitespace with `is_whitespace()` on
+  `bytes[i] as char`, which is true for Latin-1 NEL and NBSP — bytes that in
+  valid UTF-8 are only ever *continuation* bytes. The two-character probe now
+  requires both bytes to be ASCII (every such operator is ASCII, so nothing is
+  lost) and whitespace is `is_ascii_whitespace`. A new `agg_script` fuzz target
+  covers all three entry points, which is how the next one gets found instead of
+  reported.
+
+- **An XML entity nobody declared no longer discards the text around it.**
+  Fallout from the `quick-xml` upgrade above, which is a breaking change to how
+  character data arrives: 0.38 stopped folding `&amp;` into the surrounding
+  `Event::Text` and began emitting each reference as its own
+  `Event::GeneralRef`. Entity handling is preserved across that change (a
+  reader that ignored the new event would have silently dropped every `&`, `<`,
+  `>` and `&#233;` while the words around them still arrived), and one case
+  gets better: 0.36's `BytesText::unescape()` failed the whole text node on an
+  entity no DTD declared for us, and `unwrap_or_default()` then discarded it —
+  now only the reference itself is dropped. Character data is also reassembled
+  from its fragments before being emitted, so an entity-bearing field stays one
+  value instead of becoming an array of pieces.
+
+### Added
+
+- **`GET /_ilm/status`, `POST /_ilm/start`, `POST /_ilm/stop`** (#282): the
+  operator can halt lifecycle execution without stopping the node; a stopped
+  engine's tick touches nothing. The flag is in-memory — a restart resumes
+  execution — while the per-index detach tombstone is the durable stop.
+- **`POST /{index}/_ilm/remove`** (#282): ES's own detach verb; goes through
+  the same tombstoned detach path as the settings-null route. A literal name
+  that is not an index answers 404 rather than writing a tombstone for a
+  ghost.
+
+- **A crafted filename can no longer forge records on the agent progress
+  stream** (the first rc.15 known issue below). Every externally-controlled
+  string — in-flight paths, the paths and error text interpolated into human
+  notes, the terminal line's reason — is stripped of control characters, bidi
+  overrides and zero-width characters and bounded in length before it reaches
+  any progress surface. Measured on a corpus holding crafted names: a run that
+  previously emitted a forged `xerj-done ok=true exit=0 reason=completed`
+  2.2 s ahead of its real terminal line now emits one terminal line and no
+  control characters at all. The same sanitisation covers the walker's
+  "skipping unreadable entry" warning, which renders a path to the same stderr.
+- **`--progress json` paces the bar like `--progress plain`.** The `bar` field
+  bypassed the spacing slot entirely: measured at `--progress-interval 1`, 178
+  of 178 ticks carried a bar against 18 bars on the plain surface. It is now a
+  string on exactly the ticks that owe a bar and `null` in between — 26 of 320
+  ticks on the same corpus, against 16 on plain.
+- **The bar spacing floor is the 15 s the documentation states.** A half-tick
+  tolerance made the enforced floor `interval/2` shorter — 12.5 s at the
+  shipped defaults. Measured at `--progress-interval 10`: 11 of 11 same-phase
+  gaps under 15 s (min 10.0 s) before, none after (min 19.3 s).
+- **`/{index}/_refresh` reports segment-publication failures instead of
+  claiming every shard succeeded.** The endpoint previously discarded every
+  error returned by the synchronous engine flush and always answered HTTP 200
+  with `successful == total`. It now includes the index, status, and underlying
+  reason in `_shards.failures`, attempts every resolved index, and returns the
+  first failed shard's HTTP status as Elasticsearch 8.13.4 does for refresh.
+
+### Changed
+
+- **`merge.strategy = "log_structured"` is now refused at startup instead of
+  silently running the size-tiered policy**
+  ([#207](https://github.com/xerj-org/xerj/issues/207)). Nothing in the tree
+  ever read `merge.strategy`; `run_merge_once` always builds a
+  `SizeTieredMergePolicy`. An operator who chose a levelled policy for its read
+  amplification got the other one, quietly. This follows the `storage.backend`
+  and `vector.default_quantization` guards already in `Config::validate`.
+
+- **The three dormant `[merge]` settings now say so, in the code, in the shipped
+  TOML, on the docs site, and in the log at startup**
+  ([#207](https://github.com/xerj-org/xerj/issues/207)). The issue reported
+  merge I/O rate limiting as "claimed but dormant" and it is: the `RateLimiter`
+  that honours `io_rate_mb_per_sec` is wired only into `xerj-storage`'s legacy
+  `MergeExecutor`, which the engine never constructs. `min_segments` and
+  `max_concurrent` are unread too — the real per-tier trigger is
+  `min_merge_count`, and merge parallelism comes from `XERJ_MERGE_PARALLELISM`.
+  `MergeConfig::dormant_overrides` names any of the three the operator has moved
+  off its default and `xerj-server` logs each at WARN, so the operator throttling
+  merges to protect query latency finds out instead of guessing. They stay
+  accepted rather than becoming hard errors because the wrong value costs
+  latency, not data, and `io_rate_mb_per_sec = 100` has shipped in
+  `xerj.default.toml` since v0.1. Wiring a real throttle into `run_merge_once`
+  is the fix that makes this list shorter.
+
+- **`engine/xerj.default.toml` disagreed with the defaults it claims to
+  document, in four places.** `max_segment_mb` said 5120 against a real 8192,
+  `wal_max_size_mb` 512 against 1024, `flush_size_mb` 256 against 512, and
+  `default_quantization` `"scalar8"` against `"none"` — so `cp xerj.default.toml
+  xerj.toml`, the documented first step, silently changed four engine behaviours
+  including turning on 8-bit vector quantization. The file is corrected and
+  `shipped_default_config_documents_the_real_defaults` now diffs every leaf key
+  against `Config::default()`, so it cannot drift again.
+
+- **The docs site had drifted the same way, and now has the same guard.**
+  `landing/docs/config.html` shipped `wal_max_size_mb = 512`,
+  `flush_size_mb = 256` and `default_quantization = "scalar8"` in its
+  copy-pasteable `[storage]` and `[vector]` blocks while its own DEFAULT
+  table — thirty lines up, on the same page — said 1024, 512 and `"none"`;
+  `landing/docs/storage.html` said the WAL rolls at 512 MiB;
+  `landing/docs/vectors.html` called `scalar8` "the default" and listed a
+  `scalar4` mode that no config or mapping value can reach; and
+  `engine/README.md` put `flush_size_mb` at 256 MiB. All four are corrected,
+  along with the docs search-index blob duplicated across 44 landing pages,
+  which offered `scalar4` as a selectable quantization mode.
+  A second guard, `the_docs_site_config_page_agrees_with_the_real_defaults`,
+  now diffs *both* halves of that page — every DEFAULT cell in the reference
+  table and every assignment in the example blocks — against
+  `Config::default()`. An example that deliberately differs (the blocks whose
+  point is switching TLS or cluster mode on) has to carry `# not a default` on
+  the line, so the reader is told as well as the test.
+  - **Known gap, found while correcting the `scalar4` prose and disclosed
+    rather than quietly fixed:** the guard reads `config.html` against
+    `Config::default()`, so it covers the *config* half only. Nothing checks a
+    *mapping*, and a mapping is not validated either —
+    `es_compat.rs` matches `"scalar8" | "int8" | "none"` on a `dense_vector`
+    field's `quantization` and falls through `_ => {}`, so
+    `"quantization": "scalar4"` (or `"binary"`, or a typo like `"sq8"`) is
+    accepted with a 200, echoed back verbatim by `GET /_mapping`, and ignored
+    — the field is stored at full-precision f32 while the mapping says it is
+    quantized. Measured through the ES-compat router at this commit. It is
+    pre-existing and outside this diff; it is another instance of the
+    accepted-and-ignored class in
+    [#204](https://github.com/xerj-org/xerj/issues/204), is filed with the
+    repro and a proposed 400 as
+    [#275](https://github.com/xerj-org/xerj/issues/275), and
+    `landing/docs/vectors.html` now says so on the page instead of leaving
+    "not a mode you can select" to imply the value is rejected.
+
+- **Four other claims from [#207](https://github.com/xerj-org/xerj/issues/207)
+  now match the source.**
+  - *Settings count.* `config.rs` said 38 in its header and 56 twenty lines
+    down while the count test asserted 60 — and the test asserted it by
+    re-adding a hardcoded sum (`5 + 2 + 3 + … - 1 == 38`), an identity that
+    could not fail whatever `Config` held. There was a second copy of the same
+    non-test in `config.rs` itself (`count_user_facing_settings`, `61 == 61`).
+    Both now serialise `Config::default()` and count leaf keys, section by
+    section. The measured figure is **105** (103 when this work was done; the
+    rc.14 `server.allow_insecure_network_bind` key made it 104 and #247's
+    `lifecycle.tick_interval_secs` makes it 105 — which is the point: it is
+    measured, so it moves with the code), and 38 / 50 /
+    56 / 60 / 61 / "<50"
+    are corrected in `config.rs`, `xerj-common/src/lib.rs`, `engine/README.md`,
+    `xerj.default.toml` and the feedback responses, along with the stale
+    per-sub-config annotations (limits 3 → 13, storage 5 → 10, embedding 4 → 19,
+    merge 5 → 8, cluster 4 → 5, tls 3 → 4, auth 2 → 3). This closes item 10 of
+    `user-feedback/ROADMAP-TO-GA.md`. 105 versus 3,000+ is still the winning
+    story, told truthfully.
+  - *Wire-compatibility test framing.* `journey_es_migration` was described as
+    proving "the same curl commands" work. It calls the Rust engine API
+    directly and never makes an HTTP request. The response-shape assertions are
+    real and stay; the comment now says what the test does and points at the
+    ES-compat YAML conformance suite, which is what actually covers the wire.
+  - *OpenAPI spec.* `landing/openapi.json` declared `version: 1.0` while
+    specifying 7 routes out of the 200-plus the router registers. It is now
+    titled and versioned as a partial spec, and says so.
+
+- **`autoindex` estimates the job on the user's own machine and hands the
+  decision back before it takes their laptop.** Phase A already reads and
+  parses every file to sniff and sample it, so it now *times* that work per
+  format family and turns it into a range with its basis printed next to it —
+  `code 500 files 749.3 MB at 11.7 MB/s measured over 500 file(s) → 64.2 s` —
+  rather than a constant calibrated on someone else's hardware. A family is
+  priced only from files phase A **provably** read end to end (whole-file
+  parsers always; streaming parsers only when the file was under the sampling
+  byte cap *and* stopped short of the record cap; never `sqlite`, never
+  gzip), and everything else is named under `unmeasured_families` with its
+  bytes instead of being priced at another family's rate. If nothing could be
+  measured there is no number at all and no gate. The two ends are the
+  classical list-scheduling bounds (Graham, 1969) over the phase-B worker
+  count that #240's resource policy chose.
+  The number is a **floor**, labelled as one on every surface: it covers
+  client-side extraction only, because measuring the server, the network or
+  embedding would mean writing to the index the estimate exists to ask
+  permission for. Measured on a 68 MB source tree the floor was 0.1 s against
+  a real 8.9 s run; on a 793 MB one, 64.2 s against ~350 s. The gate therefore
+  under-asks and never over-asks, and says so where a reader would otherwise
+  mistake silence for a promise.
+- **`--max-minutes` (default 10) stops the run and asks instead of deciding.**
+  Past the threshold with no answer, autoindex indexes nothing, writes a JSON
+  decision request to stdout and exits **4** — a code of its own, because exit
+  1 is already the catch-all for every real failure and an agent must be able
+  to tell "choose something" from "your endpoint is down". The payload carries
+  the estimate and its basis, file/byte counts, the per-band work order, the
+  heaviest directories with real byte counts (flagged when they match the
+  vendored/generated rule), and four options: `proceed`, `fast`, `narrower`,
+  `cancel`. Answer with `--approve <id>` (`--yes` = proceed), which skips the
+  gate; `--max-minutes 0` disables it. A person at a terminal gets the same
+  facts as prose plus a prompt; a piped or agent-driven run is **never**
+  blocked on stdin, and an unanswerable prompt is a cancel, never consent.
+  `--approve fast` really applies `--no-semantic --no-graph`, and `--approve
+  narrower` is refused with instructions rather than accepted and ignored
+  (#204). The `fast` option states no speed-up factor: it reports the datasets
+  and file count it changes and says plainly that this run did not measure the
+  factor.
+  The gate governs the phase-B route. An **incremental reconcile of an already
+  committed generation** (a `--no-graph` re-run over a folder that already has
+  one) processes only what changed and publishes from a sealed snapshot, so
+  `--max-minutes` does not apply there — and that route now *says so* on
+  stderr rather than accepting the flag and quietly not honouring it.
+
+### Changed
+
+- **`autoindex` indexes what matters first.** Phase B's queue was sorted by
+  size alone — right about scheduling, silent about value, so a user who
+  stopped early got whatever was largest, which on a source tree is
+  `node_modules`. Work is now ordered by value band (source and documents →
+  configuration → structured data → logs and line files → vendored, generated
+  and minified paths), with the old biggest-first rule kept *inside* each band
+  so a large file still runs alongside its band instead of becoming the tail;
+  a single-worker run goes smallest-first, where there is no tail to hide in.
+  One exception keeps the new order from costing wall clock: a file whose own
+  extraction outlasts everything ranked above it (`size × workers > the rest`)
+  starts first regardless of band. The bands, their file/byte counts and the
+  reason each sits where it does are printed with the plan and included in the
+  decision payload as `priority_order` — an unexplained order is
+  indistinguishable from an arbitrary one. Verified live on a 28 MB mixed
+  corpus at two workers: the first second of phase B was spent on
+  `src/mod_*.rs`, and the 1.7 MB `node_modules/**` files — the largest in the
+  corpus, and therefore *first* under the old rule — drained last.
+  Bytes-based progress and its percent are unaffected: reordering does not
+  change the denominator.
+
 ## [1.0.0-rc.15] - 2026-08-10
 
 ### Known issues in this release

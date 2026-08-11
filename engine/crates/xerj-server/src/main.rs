@@ -432,6 +432,15 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         cfg.server.data_dir = dir.clone();
     }
 
+    // Merge settings this build accepts but does not act on. An operator who
+    // throttles merges to protect query latency was getting no throttle and no
+    // signal (#207); the signal is the minimum. See
+    // `MergeConfig::dormant_overrides` for why these are a warning rather than
+    // the hard startup error `storage.backend` gets.
+    for (key, effect) in cfg.merge.dormant_overrides() {
+        warn!("{key} is set but has no effect in this build: {effect}");
+    }
+
     // Bind address override: `--bind` flag or `XERJ_BIND_ADDRESS` env (flag
     // wins). Both exist because the default is loopback (#228): without a way
     // to say "expose me" that is not a TOML file, a container image or a

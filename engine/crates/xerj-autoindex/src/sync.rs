@@ -6,9 +6,11 @@
 
 use crate::state::{DuplicateFile, Plan};
 use anyhow::{Context, Result};
+use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 pub const EXECUTION_IDENTITY_VERSION: u32 = 2;
 
@@ -995,6 +997,155 @@ pub fn apply_begin(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct UniqueValue;
+
+impl<'de> DeserializeSeed<'de> for UniqueValue {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for UniqueValue {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(self)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(A::Error::custom(format!(
+                    "duplicate JSON object key {key:?}"
+                )));
+            }
+            values.insert(key, object.next_value_seed(self)?);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
+pub(crate) fn decode_unique_durable_json(bytes: &[u8]) -> Result<Value> {
+    // Generic JSON maps accept duplicate keys with last-key semantics. A
+    // duplicate `kind` could otherwise make the ordinary routing decoder and
+    // an exact payload decoder disagree about which durable invariant applies;
+    // nested duplicates are equally ambiguous. Journal replay therefore
+    // rejects duplicates for every durable record before routing it.
+    let mut uniqueness = serde_json::Deserializer::from_slice(bytes);
+    let value = UniqueValue
+        .deserialize(&mut uniqueness)
+        .context("validate durable journal record structure")?;
+    uniqueness
+        .end()
+        .context("validate durable journal record trailing bytes")?;
+    Ok(value)
+}
+
+fn decode_durable_sync_begin_validated(bytes: &[u8]) -> Result<PendingSync> {
+    // simd-json 0.14.3 `src/serde.rs:56-62` deserializes directly from the
+    // supplied bytes. Restrict it to this persistence boundary: request and
+    // bulk JSON keep serde_json's default parser. The exact Value retains the
+    // original IEEE-754 bits when the ordinary parser lands on an adjacent
+    // value; conversion from Value into PendingSync performs no decimal parse.
+    let mut exact_bytes = bytes.to_vec();
+    let exact: Value = simd_json::serde::from_slice(&mut exact_bytes)
+        .context("decode durable sync_begin with exact floats")?;
+    anyhow::ensure!(
+        record_str(&exact, "kind")? == "sync_begin",
+        "exact durable decoder disagrees with sync_begin routing"
+    );
+    serde_json::from_value(exact).context("decode durable sync_begin payload")
+}
+
+#[cfg(test)]
+fn decode_durable_sync_begin(bytes: &[u8]) -> Result<PendingSync> {
+    decode_unique_durable_json(bytes)?;
+    decode_durable_sync_begin_validated(bytes)
+}
+
+pub(crate) fn replay_durable_record(
+    record: &Value,
+    bytes: &[u8],
+    committed: &mut Option<CommittedManifest>,
+    pending: &mut Option<PendingSync>,
+) -> Result<()> {
+    if record_str(record, "kind")? != "sync_begin" {
+        return replay_record(record, committed, pending);
+    }
+    // Journal callers validate uniqueness before routing every record. Keep
+    // the exact decoder single-pass here rather than parsing sync_begin a
+    // redundant fourth time.
+    let begin = decode_durable_sync_begin_validated(bytes)?;
+    apply_begin(
+        committed
+            .as_ref()
+            .context("sync_begin has no committed base manifest")?,
+        pending,
+        begin,
+    )
+}
+
 pub fn is_sync_record_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -1100,6 +1251,7 @@ fn record_str<'a>(record: &'a Value, field: &str) -> Result<&'a str> {
 mod tests {
     use super::*;
     use crate::state::{FileAssignment, PlanDataset};
+    use serde_json::json;
 
     fn path(id_hex: &str, symlink: bool) -> ManifestPath {
         ManifestPath {
@@ -1137,6 +1289,175 @@ mod tests {
             expected_vectors: 1,
             expected_junk_records: 0,
         }
+    }
+
+    #[test]
+    fn durable_sync_begin_decoder_preserves_inferred_float_bits() {
+        let original = 245.44444444444446_f64;
+        let replayed = decode_durable_sync_begin(include_bytes!(
+            "../tests/fixtures/issue_283_sync_begin.json"
+        ))
+        .unwrap()
+        .desired
+        .plan
+        .datasets[0]
+            .specs[0]
+            .avg_len;
+        assert_eq!(
+            replayed.to_bits(),
+            original.to_bits(),
+            "the durable decimal must recover the exact inferred f64"
+        );
+    }
+
+    #[test]
+    fn pre_fix_sync_begin_recovers_digest_and_still_rejects_changes() {
+        // Captured before `serde_json/float_roundtrip` was enabled. Its digest
+        // was computed from the original in-memory `avg_len` bits, while the
+        // JSON contains the shortest round-tripping decimal for those bits.
+        let pending = decode_durable_sync_begin(include_bytes!(
+            "../tests/fixtures/issue_283_sync_begin.json"
+        ))
+        .unwrap();
+        let base = CommittedManifest::genesis().unwrap();
+        assert_eq!(
+            base.manifest_digest,
+            "axm1-225526cc79184af5df2509f2e6908557"
+        );
+        assert_eq!(
+            pending.desired.plan.datasets[0].specs[0].avg_len.to_bits(),
+            245.44444444444446_f64.to_bits()
+        );
+        pending.validate_against(&base).unwrap();
+
+        let mut changed = pending;
+        changed.desired.plan.datasets[0].specs[0].avg_len += 1.0;
+        assert!(
+            changed.validate_against(&base).is_err(),
+            "a genuinely changed manifest must not inherit the persisted digest"
+        );
+    }
+
+    #[test]
+    fn pre_fix_sync_begin_reopens_from_durable_journal_without_digest_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = CommittedManifest::genesis().unwrap();
+        // NDJSON requires one physical line. Remove formatting whitespace
+        // mechanically; never parse through the ordinary float decoder while
+        // constructing the historical record under test.
+        let historical_begin = include_str!("../tests/fixtures/issue_283_sync_begin.json")
+            .lines()
+            .collect::<String>();
+        assert!(historical_begin.contains("\"avg_len\": 245.44444444444446"));
+        let records = [
+            serde_json::to_string(&json!({
+                "v": 1,
+                "kind": "run",
+                "root": "root",
+                "url": "url",
+                "prefix": "prefix",
+                "bulk_timeout_secs": 300,
+                "run_id": "run-issue-283-fixture",
+                "started": "2026-08-10T00:00:00Z"
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({"kind": "sync_bootstrap", "manifest": base})).unwrap(),
+            historical_begin,
+        ];
+        let mut journal_bytes = records.join("\n").into_bytes();
+        journal_bytes.push(b'\n');
+        std::fs::write(dir.path().join("journal.ndjson"), journal_bytes).unwrap();
+
+        // This is the durable resume boundary only: Journal::open reads the
+        // checked-in pre-fix sync_begin from disk, validates it against the
+        // committed generation, and appends the ordinary resume marker. It
+        // deliberately does not claim to replay network operations.
+        let reopened =
+            crate::state::Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
+        assert!(reopened.resumed);
+        assert_eq!(
+            reopened
+                .committed_manifest
+                .as_ref()
+                .unwrap()
+                .manifest_digest,
+            "axm1-225526cc79184af5df2509f2e6908557"
+        );
+        let pending = reopened.pending_sync.as_ref().unwrap();
+        assert_eq!(
+            pending.desired_manifest_digest,
+            "axm1-5e314eb29c9617433af240313b94e544"
+        );
+        assert_eq!(
+            manifest_digest(&pending.desired).unwrap(),
+            pending.desired_manifest_digest
+        );
+        assert_eq!(
+            pending.desired.plan.datasets[0].specs[0].avg_len.to_bits(),
+            245.44444444444446_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn durable_sync_begin_rejects_duplicate_keys_at_any_depth() {
+        let fixture = include_str!("../tests/fixtures/issue_283_sync_begin.json");
+        let duplicate = fixture.replacen(
+            "\"avg_len\": 245.44444444444446,",
+            "\"avg_len\": 1.0, \"avg_len\": 245.44444444444446,",
+            1,
+        );
+        let error = decode_durable_sync_begin(duplicate.as_bytes()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("duplicate JSON object key \"avg_len\""),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn durable_sync_begin_rejects_malformed_trailing_and_deep_input() {
+        let fixture = include_str!("../tests/fixtures/issue_283_sync_begin.json");
+        assert!(decode_durable_sync_begin(b"{\"kind\":\"sync_begin\"").is_err());
+
+        let trailing = format!("{fixture}\n{{}}");
+        let trailing_error = decode_durable_sync_begin(trailing.as_bytes()).unwrap_err();
+        assert!(
+            format!("{trailing_error:#}").contains("trailing"),
+            "{trailing_error:#}"
+        );
+
+        let mut deep = String::from("{\"kind\":\"sync_begin\",\"ignored\":");
+        deep.push_str(&"[".repeat(140));
+        deep.push_str("null");
+        deep.push_str(&"]".repeat(140));
+        deep.push('}');
+        assert!(decode_durable_sync_begin(deep.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn durable_sync_begin_requires_both_parsers_to_route_sync_begin() {
+        let routed = json!({"kind": "sync_begin"});
+        let raw = br#"{"kind":"sync_commit","tx_id":"tx","desired_manifest_digest":"digest"}"#;
+        let mut committed = Some(CommittedManifest::genesis().unwrap());
+        let error = replay_durable_record(&routed, raw, &mut committed, &mut None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("disagrees with sync_begin routing"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn alternate_decoder_is_not_used_for_other_durable_records() {
+        let genesis = CommittedManifest::genesis().unwrap();
+        let record = json!({"kind": "sync_bootstrap", "manifest": genesis});
+        let mut committed = None;
+        replay_durable_record(
+            &record,
+            b"not parsed for a non-sync_begin record",
+            &mut committed,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(committed.unwrap().generation, 0);
     }
 
     #[test]

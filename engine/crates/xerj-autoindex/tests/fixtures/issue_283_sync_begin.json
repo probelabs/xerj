@@ -1,0 +1,64 @@
+{
+  "kind": "sync_begin",
+  "tx_id": "tx",
+  "base_generation": 0,
+  "base_manifest_digest": "axm1-225526cc79184af5df2509f2e6908557",
+  "desired_manifest_digest": "axm1-5e314eb29c9617433af240313b94e544",
+  "operation_hash": "axo1-39347ff402b6c53d831154110e30ac6a",
+  "desired": {
+    "generation": 1,
+    "execution": {
+      "version": 2,
+      "root_identity": "unix:root",
+      "url": "url",
+      "prefix": "prefix",
+      "follow_symlinks": false,
+      "chunker_identity": "chunker-v1",
+      "embedding_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "embedding_backend": "lexical",
+      "embedding_dimension": 384,
+      "embedding_semantic_contract": "semantic_text-derived-vector.v1",
+      "embedding_resumable": true,
+      "graph_enabled": false,
+      "brain": "disabled",
+      "detector_identity": "disabled",
+      "schema_identity": "schema-v1",
+      "index_identity": "index-v1",
+      "source_policy": {
+        "policy": "abort_on_source_change",
+        "inventory_digest": "inventory-a"
+      }
+    },
+    "plan": {
+      "datasets": [
+        {
+          "slug": "docs",
+          "index": "incremental-http-docs",
+          "family": "code",
+          "specs": [
+            {
+              "name": "body",
+              "es_type": "text",
+              "cardinality_est": 9,
+              "cardinality_overflow": false,
+              "null_ratio": 0.1,
+              "avg_len": 245.44444444444446,
+              "coverage": 0.9,
+              "examples": []
+            }
+          ],
+          "sampled_records": 10,
+          "file_count": 0
+        }
+      ],
+      "files": {},
+      "junk_files": [],
+      "duplicate_files": [],
+      "alias_paths_indexed": false
+    },
+    "groups": []
+  },
+  "operations": [],
+  "operation_states": {},
+  "validated": false
+}

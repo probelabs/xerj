@@ -1575,7 +1575,15 @@ fn tokenize_script(s: &str, params: &HashMap<String, f64>) -> Option<Vec<Tok>> {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i] as char;
-        if c.is_whitespace() {
+        // ASCII-only, for the same reason `painless::tokenize` is (#207): this
+        // scanner walks BYTES (`bytes[i] as char` reinterprets each byte as
+        // Latin-1) but slices `&s[..]` as a `&str`. `is_whitespace()` is true
+        // for Latin-1 NEL (0x85) and NBSP (0xA0), and in valid UTF-8 both of
+        // those bytes are only ever *continuation* bytes — accepting them steps
+        // `i` into the middle of a character, and the next slice panics on a
+        // char boundary. No real script loses anything: those are the only two
+        // non-ASCII bytes the old test accepted.
+        if c.is_ascii_whitespace() {
             i += 1;
             continue;
         }
@@ -1614,7 +1622,19 @@ fn tokenize_script(s: &str, params: &HashMap<String, f64>) -> Option<Vec<Tok>> {
             continue;
         }
         // Two-character operators first.
-        if i + 1 < bytes.len() {
+        //
+        // `&s[i..i + 2]` is a `&str` slice on a byte index, so it panics unless
+        // BOTH ends sit on a character boundary. Every arm above this one is
+        // ASCII-only, so a multi-byte character's lead byte falls straight
+        // through to here and `i + 2` lands inside it —
+        // `{"bs":{"bucket_script":{"buckets_path":{"x":"s"},"script":"1 中 2"}}}`
+        // in an ordinary `_search` body was `end byte index 2 is not a char
+        // boundary`, and `panic = "abort"` makes that the process (#207).
+        // Every two-character operator is pure ASCII, so requiring both bytes
+        // to be ASCII keeps the slice on a boundary by construction; a
+        // non-ASCII byte falls to the `_ => return None` arm below, which is
+        // the right answer for an operator this subset cannot evaluate.
+        if i + 1 < bytes.len() && bytes[i].is_ascii() && bytes[i + 1].is_ascii() {
             let two = &s[i..i + 2];
             match two {
                 ">=" | "<=" | "==" | "!=" | "&&" | "||" => {
@@ -12378,7 +12398,11 @@ fn lex_script(src: &str) -> Result<Vec<PlTok>, String> {
     let mut out = Vec::new();
     while i < bytes.len() {
         let c = bytes[i] as char;
-        if c.is_whitespace() {
+        // ASCII-only — see the identical note in `tokenize_script` above and in
+        // `painless::tokenize`. Latin-1 NEL/NBSP read as whitespace here but are
+        // continuation bytes in UTF-8, so accepting them walks `i` into the
+        // middle of a character (#207).
+        if c.is_ascii_whitespace() {
             i += 1;
             continue;
         }
@@ -12435,8 +12459,17 @@ fn lex_script(src: &str) -> Result<Vec<PlTok>, String> {
             out.push(PlTok::Ident(src[start..i].to_string()));
             continue;
         }
-        // Two-char operators
-        if i + 1 < bytes.len() {
+        // Two-char operators.
+        //
+        // Both bytes must be ASCII before `&src[i..i + 2]` can be taken: this
+        // is a `&str` slice on a byte index and every arm above is ASCII-only,
+        // so a multi-byte character's lead byte reaches here and `i + 2` lands
+        // inside it. `{"m":{"scripted_metric":{"map_script":"中"}}}` in an
+        // ordinary `_search` body was `end byte index 2 is not a char
+        // boundary` — the process, not a 400, under `panic = "abort"` (#207).
+        // The operators are all ASCII, so nothing is lost; a non-ASCII byte
+        // now reaches the `unexpected char` error below.
+        if i + 1 < bytes.len() && bytes[i].is_ascii() && bytes[i + 1].is_ascii() {
             let two = &src[i..i + 2];
             let op: Option<&'static str> = match two {
                 ">=" => Some(">="),
