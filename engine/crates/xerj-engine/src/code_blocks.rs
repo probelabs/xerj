@@ -125,6 +125,13 @@ const GO_KINDS: &[&str] = &[
     "struct_type",
     "interface_type",
     "type_spec",
+    // Package-level `const`/`var` blocks are declarations a reader looks up by
+    // name, the same as a type or a func — XERJ's own code extractor already
+    // captures them as symbols, so the passage resolver must agree.
+    "const_declaration",
+    "const_spec",
+    "var_declaration",
+    "var_spec",
 ];
 
 const JAVA_KINDS: &[&str] = &[
@@ -134,6 +141,10 @@ const JAVA_KINDS: &[&str] = &[
     "enum_declaration",
     "constructor_declaration",
     "static_initializer",
+    // A class field is a named member a reader looks up, not a statement.
+    // (`variable_declaration` is deliberately absent: that is a local inside a
+    // method body, and returning one as a "block" would be noise.)
+    "field_declaration",
 ];
 
 const C_KINDS: &[&str] = &["function_definition", "struct_specifier", "enum_specifier"];
@@ -424,6 +435,37 @@ mod tests {
         assert!(
             block.starts_with("export function make"),
             "expected the smallest enclosing block (the function, nested inside the namespace), got: {block:?}"
+        );
+    }
+
+    #[test]
+    fn go_package_level_const_resolves_to_its_declaration() {
+        let body = "package p\n\nconst (\n\tDefaultTimeout = 30\n\tMaxRetries     = 5\n)\n\nfunc f() {}\n";
+        let needle = "MaxRetries";
+        let start = body.find(needle).unwrap();
+        let (s, e) = enclosing_block("go", body, start, start + needle.len())
+            .expect("expected an enclosing block");
+        // The innermost entity wins, so a grouped `const (...)` yields the
+        // individual spec rather than the whole group — same resolution probe
+        // gives, since it also lists both kinds and takes the smallest.
+        assert!(
+            body[s..e].starts_with("MaxRetries"),
+            "expected the const spec, got: {:?}",
+            &body[s..e]
+        );
+    }
+
+    #[test]
+    fn java_field_resolves_to_its_declaration_not_the_class() {
+        let body = "class A {\n    private final int timeoutMs = 30;\n    void run() {}\n}\n";
+        let needle = "timeoutMs";
+        let start = body.find(needle).unwrap();
+        let (s, e) = enclosing_block("java", body, start, start + needle.len())
+            .expect("expected an enclosing block");
+        let block = body[s..e].trim_start();
+        assert!(
+            block.starts_with("private final int timeoutMs"),
+            "expected the field declaration, not the enclosing class, got: {block:?}"
         );
     }
 
