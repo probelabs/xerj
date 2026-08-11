@@ -51,9 +51,11 @@ html[data-theme='day'] {
   --z-faint: #e3dfd4;
   --z-line:  #cfcbbf;
   /* Day accent — darker ochre in the same yellow family.
-     #ffc400 on cream is 1.7:1 (unreadable). #a06800 is 5.7:1 (AA body).
+     #ffc400 on cream is 1.7:1 (unreadable). #a06800 measured 4.27:1 on
+     cream — the old comment claiming 5.7:1 was miscalculated and failed
+     AA once day became the default. #7f5200 is 6.14:1 (AA body, AAA large).
      Still reads as "XERJ yellow", just at a different luminance. */
-  --z-accent: #a06800;
+  --z-accent: #7f5200;
   --z-cmp: #6f8aa8;
 }
 
@@ -2532,3 +2534,132 @@ svg.chart.is-interactive .ser:focus-visible {
   .chart-chip { font-size: 10px; padding: 3px 7px; gap: 6px; }
 }
 
+
+/* ---------- hero-center: the prompt is the page (2026-08-11) ----------
+   One job above the fold: copy the agent prompt. Everything else is
+   secondary. The animated gradient halo is the only moving thing on the
+   page, and it stops under prefers-reduced-motion. */
+.hero-center {
+  text-align: center;
+  /* horizontal gutter is var(--sp-6), NOT --page-x: body already pads
+     --page-x, and doubling it starved the h1 at laptop widths. */
+  padding: var(--sp-16) var(--sp-6) var(--sp-12);
+  max-width: var(--max-w);
+  margin: 0 auto;
+}
+.hero-kicker { justify-content: center; }
+.hero-center .hero {
+  margin: var(--sp-6) auto var(--sp-4);
+  /* The split-hero clamp died with .hero-split; without one the h1 is a
+     fixed 160px from 961px up — measured 1071px wide at 1024px viewports,
+     wrapping to four ragged lines and pushing the prompt below the fold. */
+  font-size: clamp(44px, 8vw, 140px);
+}
+.hero-sub {
+  font-family: var(--font-prose);
+  font-size: clamp(var(--fs-16), 1.6vw, var(--fs-20));
+  line-height: 1.55;
+  color: var(--z-mute);
+  max-width: 720px;
+  margin: 0 auto;
+}
+.prompt-stage {
+  position: relative;
+  max-width: 880px;
+  margin: var(--sp-10) auto var(--sp-6);
+}
+.prompt-stage::before {
+  content: '';
+  position: absolute;
+  inset: -26px;
+  border-radius: 28px;
+  background: linear-gradient(115deg,
+    #ffc400, #ff8a2a, #ff3d81, #8a5cff, #21c6ff, #ffc400);
+  background-size: 320% 320%;
+  filter: blur(44px);
+  opacity: 0.45;
+  animation: prompt-glow 9s ease-in-out infinite;
+  /* -1: without it the ::before joins the root stacking context and
+     washes over .hero-sub/.hero-proof text at its blurred edges. */
+  z-index: -1;
+  pointer-events: none;
+}
+html[data-theme='night'] .prompt-stage::before { opacity: 0.32; }
+@keyframes prompt-glow {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .prompt-stage::before { animation: none; }
+}
+.prompt-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  text-align: left;
+  background: var(--z-bg);
+  border: 1px solid var(--z-line);
+  border-radius: 14px;
+  padding: var(--sp-6) var(--sp-6) var(--sp-4);
+  box-shadow: 0 8px 40px rgba(0,0,0,0.10);
+}
+.prompt-label {
+  font-family: var(--font-data);
+  font-size: var(--fs-11);
+  font-weight: 600;
+  letter-spacing: var(--track-ui);
+  text-transform: uppercase;
+  color: var(--z-accent);
+}
+.prompt-card code {
+  font-family: var(--font-mono);
+  font-size: clamp(var(--fs-13), 1.25vw, 17px);
+  line-height: 1.6;
+  color: var(--z-ink);
+  user-select: all;
+}
+.prompt-copy {
+  align-self: flex-end;
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  font-weight: 700;
+  letter-spacing: var(--track-ui);
+  color: var(--z-bg);
+  background: var(--z-accent);
+  border: 1px solid var(--z-accent);
+  border-radius: 8px;
+  padding: 10px 22px;
+  cursor: pointer;
+}
+.prompt-copy:hover, .prompt-copy:focus-visible {
+  background: var(--z-ink);
+  border-color: var(--z-ink);
+  color: var(--z-bg);
+}
+.hero-proof {
+  font-family: var(--font-prose);
+  font-size: var(--fs-13);
+  line-height: 1.7;
+  color: var(--z-mute);
+  max-width: 760px;
+  margin: 0 auto;
+}
+.hero-alt-install {
+  font-family: var(--font-mono);
+  font-size: var(--fs-13);
+  color: var(--z-mute);
+  margin: var(--sp-4) auto 0;
+}
+.hero-alt-install code { color: var(--z-ink); }
+.hero-demo-center {
+  max-width: 880px;
+  margin: var(--sp-10) auto 0;
+}
+@media (max-width: 720px) {
+  .hero-center { padding-left: var(--sp-4); padding-right: var(--sp-4); }
+  .prompt-stage::before { inset: -14px; filter: blur(28px); }
+  .prompt-copy { align-self: stretch; text-align: center; }
+}
