@@ -23,6 +23,9 @@ jobs:
   cla-config:
     name: CLA gate config
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +36,20 @@ jobs:
         run: |
           jq -e 'type == "array" and all(.[]; type == "string")' .contributors
           jq -e 'index("dependabot[bot]") != null' .contributors
+
+      # cla-bot matches commit AUTHORS only, so a maintainer re-land whose
+      # commits carry the fork contributor's Co-authored-by trailer goes green
+      # without that contributor ever signing (issue #269; live instance
+      # PR #248 re-landing #166). Check the trailers too.
+      - name: Co-author CLA check unit tests
+        run: python3 scripts/test_cla_coauthors.py
+
+      - name: Co-authored-by trailers resolve to signed contributors
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 scripts/check_cla_coauthors.py --pr "$PR_NUMBER"
 
   lint:
     name: Format + Clippy
