@@ -2543,13 +2543,13 @@ svg.chart.is-interactive .ser:focus-visible {
   text-align: center;
   /* horizontal gutter is var(--sp-6), NOT --page-x: body already pads
      --page-x, and doubling it starved the h1 at laptop widths. */
-  padding: var(--sp-16) var(--sp-6) var(--sp-12);
+  padding: var(--sp-8) var(--sp-6) var(--sp-12);
   max-width: var(--max-w);
   margin: 0 auto;
 }
 .hero-kicker { justify-content: center; }
 .hero-center .hero {
-  margin: var(--sp-6) auto var(--sp-4);
+  margin: 0 auto var(--sp-4);
   /* The split-hero clamp died with .hero-split; without one the h1 is a
      fixed 160px from 961px up — measured 1071px wide at 1024px viewports,
      wrapping to four ragged lines and pushing the prompt below the fold. */
