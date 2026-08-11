@@ -348,6 +348,24 @@ fn mutation_inventory_is_concrete_unique_and_uses_closed_outcomes() {
                 "duplicate case in {}",
                 row["id"]
             );
+            if let Some(expectations) = row.get("case_expectations") {
+                for (case, expectation) in expectations.as_object().unwrap() {
+                    assert!(
+                        names.contains(case.as_str()),
+                        "expectation names undeclared case {case} in {}",
+                        row["id"]
+                    );
+                    assert!(matches!(
+                        expectation["expected_error_kind"].as_str().unwrap(),
+                        "CrossFieldMismatch" | "InvalidRenderedIdentity"
+                    ));
+                    assert!(!expectation["expected_reason_contains"]
+                        .as_str()
+                        .unwrap()
+                        .is_empty());
+                    assert_eq!(expectation.as_object().unwrap().len(), 2);
+                }
+            }
         }
     }
     assert_eq!(total, 28_797);
@@ -370,6 +388,51 @@ fn mutation_inventory_is_concrete_unique_and_uses_closed_outcomes() {
     }
 
     let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
+    let asserted_stage = |row_id: &str, case: &str, kind: &str, reason: &str| {
+        let expectation = &row(row_id)["case_expectations"][case];
+        assert_eq!(expectation["expected_error_kind"], kind);
+        assert_eq!(expectation["expected_reason_contains"], reason);
+    };
+    asserted_stage(
+        "strict-replay-content-join-matrix",
+        "data:changed-source-with-old-content-digest",
+        "CrossFieldMismatch",
+        "data replay content differs from prepared input or desired plan",
+    );
+    asserted_stage(
+        "strict-replay-content-join-matrix",
+        "data:changed-path-with-old-content-and-artifact-digests",
+        "CrossFieldMismatch",
+        "replay artifact digest differs from desired-plan tuple",
+    );
+    for case in [
+        "begin-expected-owner-mismatch-plan-owner",
+        "begin-expected-sequence-mismatch-plan-predecessor",
+    ] {
+        asserted_stage(
+            "persisted-cross-file-join-matrix",
+            case,
+            "CrossFieldMismatch",
+            "expected publication owner/sequence mismatch",
+        );
+    }
+    for case in [
+        "begin-publication-root-changed-owner-root-prefix-join-rejects",
+        "begin-publication-prefix-changed-owner-root-prefix-join-rejects",
+    ] {
+        asserted_stage(
+            "persisted-cross-file-join-matrix",
+            case,
+            "CrossFieldMismatch",
+            "publication owner does not match root/prefix",
+        );
+    }
+    asserted_stage(
+        "persisted-cross-file-join-matrix",
+        "begin-publication-incarnation-changed-data-route-name-join-rejects",
+        "CrossFieldMismatch",
+        "publication data route/name mismatch",
+    );
     let quota_cases = row("quota-persisted-matrix")["cases"].as_array().unwrap();
     assert_eq!(quota_cases.len(), 17);
     assert!(!quota_cases

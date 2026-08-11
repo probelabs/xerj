@@ -70,11 +70,11 @@
   },
   "incomplete_scope": [],
   "independent_generator": {
-    "bytes": 147554,
+    "bytes": 150028,
     "hash_methodology": "SHA-256 over the exact checked-in generate.py bytes read before output serialization; generator output files are not inputs to this hash.",
     "id": "independent-python-review11-v2",
     "path": "generate.py",
-    "sha256": "53d8019ea5d9fe55f4f8de829093defbb21e2e101e7ff3457f7dd27d9136a113"
+    "sha256": "115e3a3d2a78d7e3607d32d703a28732251d6714c59629b9a24172c462182383"
   },
   "mutation_execution": {
     "derivation": "Completion is true only when each recorded observation exactly matches the row/case expectations derived from this ledger and every row's classified execution gate passes.",

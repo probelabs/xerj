@@ -465,6 +465,28 @@ pub fn tuple_case(input: &[u8], case: usize) -> Vec<u8> {
     encoded
 }
 
+pub fn replace_replay_tuple_digest(input: &[u8], tuple_index: usize, digest: &str) -> Vec<u8> {
+    let mut layout = parse(input);
+    let old = layout.tuples[tuple_index].digest.clone();
+    assert_eq!(digest.len(), old.len());
+    let matches = layout
+        .prefix_before_mappings
+        .windows(old.len())
+        .enumerate()
+        .filter(|(_, window)| *window == old.as_bytes())
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "projection must carry this tuple digest once"
+    );
+    let offset = matches[0];
+    layout.prefix_before_mappings[offset..offset + digest.len()].copy_from_slice(digest.as_bytes());
+    layout.tuples[tuple_index].digest = digest.to_owned();
+    encode(layout)
+}
+
 pub fn ordering_case(input: &[u8], case: usize) -> Vec<u8> {
     let mut layout = parse(input);
     match case {

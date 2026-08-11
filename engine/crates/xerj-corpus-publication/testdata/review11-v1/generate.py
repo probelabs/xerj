@@ -2359,6 +2359,7 @@ def mutation_ledger(goldens: dict[str, Any]) -> dict[str, Any]:
         cases: list[str],
         *,
         case_ranges: list[dict[str, Any]] | None = None,
+        case_expectations: dict[str, dict[str, str]] | None = None,
     ) -> None:
         row: dict[str, Any] = {
             "id": row_id,
@@ -2380,6 +2381,13 @@ def mutation_ledger(goldens: dict[str, Any]) -> dict[str, Any]:
         }
         if case_ranges:
             row["case_ranges"] = case_ranges
+        if case_expectations:
+            unknown_cases = sorted(set(case_expectations) - set(cases))
+            if unknown_cases:
+                raise AssertionError(
+                    f"{row_id}: expectations name undeclared cases: {unknown_cases}"
+                )
+            row["case_expectations"] = case_expectations
         rows.append(row)
 
     digest_baselines = [
@@ -2811,6 +2819,20 @@ def mutation_ledger(goldens: dict[str, Any]) -> dict[str, Any]:
             "graph:token-mismatch",
             "graph:projection-mismatch",
         ],
+        case_expectations={
+            "data:changed-source-with-old-content-digest": {
+                "expected_error_kind": "CrossFieldMismatch",
+                "expected_reason_contains": (
+                    "data replay content differs from prepared input or desired plan"
+                ),
+            },
+            "data:changed-path-with-old-content-and-artifact-digests": {
+                "expected_error_kind": "CrossFieldMismatch",
+                "expected_reason_contains": (
+                    "replay artifact digest differs from desired-plan tuple"
+                ),
+            },
+        },
     )
     add(
         "replay-tuple-persisted-matrix",
@@ -2866,10 +2888,40 @@ def mutation_ledger(goldens: dict[str, Any]) -> dict[str, Any]:
             "graph-core-mismatch-prepared-plan-replay",
             "begin-expected-owner-mismatch-plan-owner",
             "begin-expected-sequence-mismatch-plan-predecessor",
-            "begin-expected-root-mismatch-plan-root",
-            "begin-expected-prefix-mismatch-plan-prefix",
-            "begin-expected-incarnation-mismatch-plan-incarnation",
+            "begin-publication-root-changed-owner-root-prefix-join-rejects",
+            "begin-publication-prefix-changed-owner-root-prefix-join-rejects",
+            "begin-publication-incarnation-changed-data-route-name-join-rejects",
         ],
+        case_expectations={
+            "begin-expected-owner-mismatch-plan-owner": {
+                "expected_error_kind": "CrossFieldMismatch",
+                "expected_reason_contains": (
+                    "expected publication owner/sequence mismatch"
+                ),
+            },
+            "begin-expected-sequence-mismatch-plan-predecessor": {
+                "expected_error_kind": "CrossFieldMismatch",
+                "expected_reason_contains": (
+                    "expected publication owner/sequence mismatch"
+                ),
+            },
+            "begin-publication-root-changed-owner-root-prefix-join-rejects": {
+                "expected_error_kind": "CrossFieldMismatch",
+                "expected_reason_contains": (
+                    "publication owner does not match root/prefix"
+                ),
+            },
+            "begin-publication-prefix-changed-owner-root-prefix-join-rejects": {
+                "expected_error_kind": "CrossFieldMismatch",
+                "expected_reason_contains": (
+                    "publication owner does not match root/prefix"
+                ),
+            },
+            "begin-publication-incarnation-changed-data-route-name-join-rejects": {
+                "expected_error_kind": "CrossFieldMismatch",
+                "expected_reason_contains": "publication data route/name mismatch",
+            },
+        },
     )
     add(
         "binary-framing-persisted-matrix",

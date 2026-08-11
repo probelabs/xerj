@@ -329,11 +329,32 @@ fn assert_runner(runner: &str, expected_cases: usize, outcome: &str) {
     assert_eq!(rows[0]["outcome"], outcome);
 }
 
+fn assert_case_expectation(runner: &str, case: &str, error: &ProtocolError) {
+    let fixture = matrix();
+    let row = fixture["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["runner"] == runner)
+        .unwrap_or_else(|| panic!("missing mutation row for {runner}"));
+    let expected = &row["case_expectations"][case];
+    assert_eq!(
+        expected["expected_error_kind"].as_str().unwrap(),
+        format!("{:?}", error.kind()),
+        "{runner}::{case}: {error}"
+    );
+    let reason = expected["expected_reason_contains"].as_str().unwrap();
+    assert!(
+        error.to_string().contains(reason),
+        "{runner}::{case}: expected reason containing {reason:?}, got {error}"
+    );
+}
+
 #[test]
 fn frozen_revision_two_registry_is_exact_and_executable() {
     assert_eq!(
         format!("{:x}", Sha256::digest(MATRIX)),
-        "61cad71a753fd3f614843271f29758bdcb99a61698330c2ccb63e5e195e69720",
+        "a8cef4d415680e9ebc49f4e723e300615bf55ac4a560e0836e0d772c3189a4da",
         "the frozen revision-2 ledger bytes changed"
     );
     let fixture = matrix();
@@ -1836,18 +1857,35 @@ fn strict_replay_content_join_matrix() {
     let mut case = PersistedBundle::from_fresh(&fresh);
     case.replay[1] = join_ndjson(&reverse_data);
     cases.push(case);
+    let changed_body = mutate_source_field(
+        &baseline.replay[1],
+        1,
+        "body",
+        Value::String("Omega links [[beta]].".to_owned()),
+    );
+    let mut stale_artifact_control = PersistedBundle::from_fresh(&fresh);
+    stale_artifact_control.replay[1] = changed_body.clone();
+    let stale_error = stale_artifact_control.rehydrate().unwrap_err();
+    assert_eq!(stale_error.kind(), ProtocolErrorKind::CrossFieldMismatch);
+    assert!(stale_error
+        .to_string()
+        .contains("replay artifact digest differs from desired-plan tuple"));
+
+    let mut case = PersistedBundle::from_fresh(&fresh);
+    case.replay[1] = changed_body;
+    let digest = replay_artifact_digest("data-bulk-ndjson", &case.replay[1]);
+    case.plan = mutation_plan::replace_replay_tuple_digest(&case.plan, 1, &digest);
+    let reparsed_plan = DesiredPublicationPlanV1::parse_canonical_preimage(&case.plan).unwrap();
+    let expected = ExpectedPublicationV1::absent(reparsed_plan.owner().clone());
+    case.begin = render_absent_sync_begin(&expected, &reparsed_plan);
+    cases.push(case);
+
     for changed in [
         mutate_source_field(
             &baseline.replay[1],
             1,
-            "body",
-            Value::String("changed".to_owned()),
-        ),
-        mutate_source_field(
-            &baseline.replay[1],
-            1,
             "path",
-            Value::String("changed.md".to_owned()),
+            Value::String("omega.md".to_owned()),
         ),
         mutate_json_line(&baseline.replay[1], 0, |action| {
             action["index"]["_id"] = Value::String("changed-id".to_owned());
@@ -1995,7 +2033,20 @@ fn strict_replay_content_join_matrix() {
 
     assert_eq!(cases.len(), 36);
     for (index, case) in cases.into_iter().enumerate() {
-        assert!(case.rehydrate().is_err(), "content join case {index}");
+        let error = case.rehydrate().unwrap_err();
+        match index {
+            2 => assert_case_expectation(
+                "mutations::strict_replay_content_join_matrix",
+                "data:changed-source-with-old-content-digest",
+                &error,
+            ),
+            3 => assert_case_expectation(
+                "mutations::strict_replay_content_join_matrix",
+                "data:changed-path-with-old-content-and-artifact-digests",
+                &error,
+            ),
+            _ => {}
+        }
     }
     assert_runner(
         "mutations::strict_replay_content_join_matrix",
@@ -2010,11 +2061,79 @@ fn mutate_begin_json(bytes: &[u8], change: impl FnOnce(&mut Value)) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()
 }
 
+fn replay_artifact_digest(kind: &str, bytes: &[u8]) -> String {
+    let mut preimage = b"xerj-replay-artifact-v1\0".to_vec();
+    support::reference_codec::s(&mut preimage, kind.as_bytes());
+    support::reference_codec::u64(&mut preimage, bytes.len() as u64);
+    preimage.extend_from_slice(bytes);
+    support::reference_codec::rendered("xerra1-sha256-", &preimage)
+}
+
+fn render_absent_sync_begin(
+    expected: &ExpectedPublicationV1,
+    plan: &DesiredPublicationPlanV1,
+) -> Vec<u8> {
+    assert_eq!(
+        expected.kind(),
+        xerj_corpus_publication::ExpectedPublicationKind::Absent
+    );
+    let mut expected_body = Vec::new();
+    support::reference_codec::u32(&mut expected_body, 0);
+    support::reference_codec::s(
+        &mut expected_body,
+        expected.owner().as_rendered_str().as_bytes(),
+    );
+    support::reference_codec::u64(&mut expected_body, 0);
+
+    let plan_bytes = plan.canonical_preimage().canonical_preimage();
+    let mut body = Vec::new();
+    support::reference_codec::u32(&mut body, 1);
+    body.extend_from_slice(&expected_body);
+    support::reference_codec::s(&mut body, expected.digest().as_rendered_str().as_bytes());
+    support::reference_codec::u64(&mut body, plan_bytes.len() as u64);
+    body.extend_from_slice(plan_bytes);
+    support::reference_codec::s(&mut body, plan.digest().as_rendered_str().as_bytes());
+    support::reference_codec::s(
+        &mut body,
+        plan.prepared_input_digest().as_rendered_str().as_bytes(),
+    );
+    support::reference_codec::s(
+        &mut body,
+        plan.replay_set_digest().as_rendered_str().as_bytes(),
+    );
+    let mut preimage = b"xerj-sync-begin-v1\0".to_vec();
+    preimage.extend_from_slice(&body);
+    let digest = support::reference_codec::rendered("xersb1-sha256-", &preimage);
+    let encoded = STANDARD.encode(plan_bytes);
+    format!(
+        "{{\"format_version\":1,\"expected_publication\":{},\"expected_publication_digest\":{},\"canonical_plan_bytes\":{},\"plan_digest\":{},\"prepared_input_digest\":{},\"replay_set_digest\":{},\"sync_begin_digest\":{}}}",
+        std::str::from_utf8(expected.canonical_json().canonical_json()).unwrap(),
+        serde_json::to_string(expected.digest().as_rendered_str()).unwrap(),
+        serde_json::to_string(&encoded).unwrap(),
+        serde_json::to_string(plan.digest().as_rendered_str()).unwrap(),
+        serde_json::to_string(plan.prepared_input_digest().as_rendered_str()).unwrap(),
+        serde_json::to_string(plan.replay_set_digest().as_rendered_str()).unwrap(),
+        serde_json::to_string(&digest).unwrap(),
+    )
+    .into_bytes()
+}
+
+fn replace_begin_expected(bytes: &[u8], expected: &ExpectedPublicationV1) -> Vec<u8> {
+    mutate_begin_json(bytes, |begin| {
+        begin["expected_publication"] =
+            serde_json::from_slice(expected.canonical_json().canonical_json()).unwrap();
+        begin["expected_publication_digest"] =
+            Value::String(expected.digest().as_rendered_str().to_owned());
+    })
+}
+
 #[test]
 fn persisted_cross_file_join_matrix() {
     let fresh = absent_bundle(1);
     let seven = absent_bundle(7);
     let two = absent_bundle(2);
+    let fixture = goldens();
+    let ordering = &fixture["ordering_matrix"];
     let mut cases: Vec<(&str, PersistedBundle)> = Vec::new();
 
     let mut case = PersistedBundle::from_fresh(&fresh);
@@ -2118,34 +2237,63 @@ fn persisted_cross_file_join_matrix() {
         cases.push((name, case));
     }
 
+    let present = present_bundle();
+    assert!(
+        SyncBeginV1::parse_closed_json(present.sync_begin().canonical_json().canonical_json())
+            .is_ok()
+    );
+    let ordering_publication = CorpusPublicationV1::parse_closed_json(
+        ordering["prior_publication"]["publication"]["canonical_json"]
+            .as_str()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let wrong_owner = ExpectedPublicationV1::present(ordering_publication).unwrap();
+    assert!(ExpectedPublicationV1::parse_closed_json(
+        wrong_owner.canonical_json().canonical_json()
+    )
+    .is_ok());
+    let mut case = PersistedBundle::from_fresh(&present);
+    case.begin = replace_begin_expected(&case.begin, &wrong_owner);
+    let stage_error = SyncBeginV1::parse_closed_json(&case.begin).unwrap_err();
+    assert_eq!(stage_error.kind(), ProtocolErrorKind::CrossFieldMismatch);
+    assert!(stage_error
+        .to_string()
+        .contains("expected publication owner/sequence mismatch"));
+    cases.push(("begin-expected-owner-mismatch-plan-owner", case));
+
+    let wrong_sequence = ExpectedPublicationV1::absent(present.desired_plan().owner().clone());
+    assert!(ExpectedPublicationV1::parse_closed_json(
+        wrong_sequence.canonical_json().canonical_json()
+    )
+    .is_ok());
+    let mut case = PersistedBundle::from_fresh(&present);
+    case.begin = replace_begin_expected(&case.begin, &wrong_sequence);
+    let stage_error = SyncBeginV1::parse_closed_json(&case.begin).unwrap_err();
+    assert_eq!(stage_error.kind(), ProtocolErrorKind::CrossFieldMismatch);
+    assert!(stage_error
+        .to_string()
+        .contains("expected publication owner/sequence mismatch"));
+    cases.push(("begin-expected-sequence-mismatch-plan-predecessor", case));
+
     for (name, field, value) in [
         (
-            "begin-expected-owner-mismatch-plan-owner",
-            "owner",
-            Value::String(format!("xercpo1-sha256-{}", "0".repeat(64))),
-        ),
-        (
-            "begin-publication-sequence-changed-with-seals-and-digest-held",
-            "sequence",
-            Value::from(2),
-        ),
-        (
-            "begin-expected-root-mismatch-plan-root",
+            "begin-publication-root-changed-owner-root-prefix-join-rejects",
             "root_identity",
             Value::String("/wrong".to_owned()),
         ),
         (
-            "begin-expected-prefix-mismatch-plan-prefix",
+            "begin-publication-prefix-changed-owner-root-prefix-join-rejects",
             "prefix",
             Value::String("wrong".to_owned()),
         ),
         (
-            "begin-expected-incarnation-mismatch-plan-incarnation",
+            "begin-publication-incarnation-changed-data-route-name-join-rejects",
             "incarnation",
             Value::String(format!("xercpi1-sha256-{}", "0".repeat(64))),
         ),
     ] {
-        let present = present_bundle();
         let mut case = PersistedBundle::from_fresh(&present);
         case.begin = mutate_begin_json(&case.begin, |begin| {
             begin["expected_publication"]["publication"]
@@ -2159,6 +2307,22 @@ fn persisted_cross_file_join_matrix() {
     assert_eq!(cases.len(), 25);
     for (name, case) in cases {
         let error = case.rehydrate().unwrap_err();
+        let exact_case = match name {
+            "begin-expected-owner-mismatch-plan-owner"
+            | "begin-expected-sequence-mismatch-plan-predecessor"
+            | "begin-publication-root-changed-owner-root-prefix-join-rejects"
+            | "begin-publication-prefix-changed-owner-root-prefix-join-rejects"
+            | "begin-publication-incarnation-changed-data-route-name-join-rejects" => Some(name),
+            _ => None,
+        };
+        if let Some(case_name) = exact_case {
+            assert_case_expectation(
+                "mutations::persisted_cross_file_join_matrix",
+                case_name,
+                &error,
+            );
+            continue;
+        }
         assert!(
             matches!(
                 error.kind(),
