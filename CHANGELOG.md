@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Default `_search` source payloads omit engine-generated embedding companions.** A
+  search with no `_source` now returns ordinary source fields without
+  `<field>_vector` and `<field>_vector_chunks`; measured payload size fell from
+  211,432 to 21,069 bytes for 5 hits (about 90%). Explicit `"_source": true`,
+  `"_source": ["field"]`, and include/exclude forms are unchanged. Add
+  `"_source": true` to restore the previous complete payload, including vectors.
+
 ### Fixed
 
 - **`PUT /{index}/_settings {"index.lifecycle.name": null}` actually detaches
