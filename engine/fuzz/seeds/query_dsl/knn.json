@@ -1,0 +1,1 @@
+{"knn":{"field":"vec","query_vector":[0.1,0.2,0.3],"k":10,"num_candidates":100},"size":10}

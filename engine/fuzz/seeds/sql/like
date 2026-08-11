@@ -1,0 +1,1 @@
+SELECT * FROM idx WHERE msg LIKE '%timeout%' OR msg IS NOT NULL

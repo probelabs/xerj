@@ -15162,8 +15162,14 @@ fn resolve_date_math_expr(expr: &str) -> String {
         None => return expr.to_string(),
     };
     let brace_end = match expr.rfind('}') {
-        Some(i) => i,
-        None => return expr.to_string(),
+        // The closing brace must come AFTER the opening one, or the slice below
+        // is `expr[4..0]` — a panic, not an empty string. `<}<}<>{>{}>` is
+        // enough, and `panic = "abort"` makes it the process rather than a 400
+        // (#207). Braces in the wrong order are not date math, so the name
+        // passes through. Second copy of the same defect in
+        // `xerj-engine::index::resolve_date_math_inner`.
+        Some(i) if i > brace_start => i,
+        _ => return expr.to_string(),
     };
 
     let prefix = &expr[..brace_start];
@@ -15171,7 +15177,11 @@ fn resolve_date_math_expr(expr: &str) -> String {
 
     // Split on an inner `{` for optional format: `now/d{yyyy.MM.dd}`.
     let (math_expr, fmt) = if let Some(inner_brace) = date_part.find('{') {
-        let inner_end = date_part.rfind('}').unwrap_or(date_part.len());
+        // Same ordering requirement as the outer pair, for the same reason.
+        let inner_end = date_part
+            .rfind('}')
+            .filter(|end| *end > inner_brace)
+            .unwrap_or(date_part.len());
         (
             &date_part[..inner_brace],
             &date_part[inner_brace + 1..inner_end],
@@ -15221,6 +15231,26 @@ fn resolve_date_math_expr(expr: &str) -> String {
 
 /// Apply the math portion of an anchored expression (everything after `||`).
 /// Handles `-1d`, `+2h`, `/d`, and empty tail.
+///
+/// Third copy of the date-math defect the `date_math` fuzz target found in
+/// `xerj_query::dates::add_unit` (#207), and the one the first pass at that
+/// issue missed: this is the *anchored* branch of the index-name resolver
+/// (`<logs-{2026-01-01||+1d}>`), sixty lines above the `now` branch that was
+/// patched. Everything below is reached from a request URI through the public
+/// `resolve_date_math_index` — the index path parameter of every create/index
+/// call and the `_search` index list — and the release profile sets
+/// `panic = "abort"`, so each of these was an unauthenticated process kill:
+///
+/// * `+9999999999999d`  → `TimeDelta::days out of bounds`
+/// * `+99999999999h`    → `DateTime + TimeDelta overflowed`
+/// * `+9223372036854775807M` → `n * 30` overflows before `Duration` is asked
+/// * `+1中` / `/中`     → `byte index 1 is not a char boundary`
+///
+/// The fixes are the same three the `now` branch got: read the unit as one
+/// CHARACTER, build the offset with the fallible `try_*` constructors and
+/// `checked_mul`, and add it with `checked_add_signed`. An unrepresentable
+/// offset degrades to "no offset", which is what this resolver already does
+/// with an unrecognised unit — it has no error channel to report into.
 fn apply_date_math_tail(
     tail: &str,
     base: chrono::DateTime<chrono::Utc>,
@@ -15234,28 +15264,30 @@ fn apply_date_math_tail(
             let (num_str, r2) =
                 r.split_at(r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len()));
             let n: i64 = num_str.parse().unwrap_or(0) * sign;
-            let (unit, r3) = if !r2.is_empty() {
-                (&r2[..1], &r2[1..])
-            } else {
-                ("", r2)
+            // One character, not one byte: the digit scan stops at the first
+            // non-digit, which may be multi-byte, and `r2[..1]` would split it.
+            let (unit, r3) = match r2.chars().next() {
+                Some(c) => r2.split_at(c.len_utf8()),
+                None => ("", r2),
             };
             let offset = match unit {
-                "d" => Duration::days(n),
-                "h" => Duration::hours(n),
-                "m" => Duration::minutes(n),
-                "s" => Duration::seconds(n),
-                "w" => Duration::weeks(n),
-                "M" => Duration::days(n * 30),
-                "y" => Duration::days(n * 365),
-                _ => Duration::zero(),
-            };
-            dt += offset;
+                "d" => Duration::try_days(n),
+                "h" => Duration::try_hours(n),
+                "m" => Duration::try_minutes(n),
+                "s" => Duration::try_seconds(n),
+                "w" => Duration::try_weeks(n),
+                "M" => n.checked_mul(30).and_then(Duration::try_days),
+                "y" => n.checked_mul(365).and_then(Duration::try_days),
+                _ => Some(Duration::zero()),
+            }
+            .unwrap_or_else(Duration::zero);
+            dt = dt.checked_add_signed(offset).unwrap_or(dt);
             rest = r3;
         } else if let Some(r) = rest.strip_prefix('/') {
-            let (unit, r2) = if !r.is_empty() {
-                (&r[..1], &r[1..])
-            } else {
-                ("", r)
+            // Same one-character read as above: `/中` panicked on `r[..1]`.
+            let (unit, r2) = match r.chars().next() {
+                Some(c) => r.split_at(c.len_utf8()),
+                None => ("", r),
             };
             dt = round_date_down(dt, unit);
             rest = r2;
@@ -15316,23 +15348,37 @@ fn resolve_now_expr(
                 .unwrap_or(rest.len()),
         );
         let n: i64 = num_str.parse().unwrap_or(0) * sign;
-        // Parse unit.
-        let (unit, rest) = if !rest.is_empty() {
-            (&rest[..1], &rest[1..])
-        } else {
-            ("", rest)
+        // Parse unit — one CHARACTER, not one byte. The digit scan stops at
+        // the first non-digit, which may be multi-byte, and `rest[..1]` would
+        // then split it in half and panic. `panic = "abort"` makes that the
+        // process, from an index name in a request URI. Second copy of what the
+        // `index_name_date_math` fuzz target found in `index.rs` (#207).
+        let (unit, rest) = match rest.chars().next() {
+            Some(c) => rest.split_at(c.len_utf8()),
+            None => ("", rest),
         };
+        // `Duration::days` and friends PANIC on a count that does not fit a
+        // `TimeDelta`, and `n * 30` overflows first. `expr` is the date math
+        // inside an index name (`<logs-{now-9999999999999d}>`) taken from a
+        // request URI, so a panic here is an unauthenticated crash. Third copy
+        // of the defect the `date_math` fuzz target found in
+        // `xerj_query::dates::add_unit`.
+        //
+        // An unrepresentable offset degrades to "no offset" — the same thing
+        // this resolver already does with an unrecognised unit, and it has no
+        // error channel to report into.
         let offset = match unit {
-            "d" => Duration::days(n),
-            "h" => Duration::hours(n),
-            "m" => Duration::minutes(n),
-            "s" => Duration::seconds(n),
-            "w" => Duration::weeks(n),
-            "M" => Duration::days(n * 30),
-            "y" => Duration::days(n * 365),
-            _ => Duration::zero(),
-        };
-        (base + offset, rest)
+            "d" => Duration::try_days(n),
+            "h" => Duration::try_hours(n),
+            "m" => Duration::try_minutes(n),
+            "s" => Duration::try_seconds(n),
+            "w" => Duration::try_weeks(n),
+            "M" => n.checked_mul(30).and_then(Duration::try_days),
+            "y" => n.checked_mul(365).and_then(Duration::try_days),
+            _ => Some(Duration::zero()),
+        }
+        .unwrap_or_else(Duration::zero);
+        (base.checked_add_signed(offset).unwrap_or(base), rest)
     } else {
         (base, rest)
     };

@@ -1,0 +1,1 @@
+double d = doc["v"].value; if (d > 1.0) { return d; } return 0;

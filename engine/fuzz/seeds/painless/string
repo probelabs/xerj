@@ -1,0 +1,1 @@
+return doc["title"].value.length() + params.name.length();

@@ -1,0 +1,1 @@
+{"query":{"bool":{"filter":[{"ids":{"values":["1","2","3"]}},{"terms":{"tag":["a","b"]}},{"wildcard":{"path":"/a/*/c"}}]}},"search_after":[1,"x"]}

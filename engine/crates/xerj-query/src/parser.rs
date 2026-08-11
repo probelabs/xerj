@@ -1718,7 +1718,12 @@ fn qs_parse_cmp_range(q: &str, field: &str, rest: &str, mut i: usize) -> Result<
     };
     while i < bytes.len() {
         let c = bytes[i] as char;
-        if c.is_whitespace() || c == '(' || c == ')' {
+        // ASCII-only: this returns `i` to `tokenize_query_string`, which
+        // resumes scanning there and slices `&q[..]` from it. Stopping on a
+        // Latin-1-looking continuation byte (0xA0) would hand back an offset in
+        // the middle of a character and panic the caller's slice — see the
+        // invariant documented on `tokenize_query_string`.
+        if c.is_ascii_whitespace() || c == '(' || c == ')' {
             break;
         }
         val.push(c);
@@ -1752,13 +1757,32 @@ fn qs_parse_cmp_range(q: &str, field: &str, rest: &str, mut i: usize) -> Result<
 /// Tokenize a Lucene query string. `Ok(None)` means "can't tokenize — fall
 /// back to the opaque QueryString path"; `Err` is a hard parse error
 /// (malformed range syntax must not degrade to a term match).
+/// Tokenise a Lucene `query_string`.
+///
+/// SAFETY-OF-SLICING INVARIANT: this scanner walks BYTES — `bytes[i] as char`
+/// reinterprets each byte as Latin-1 — but slices `&q[start..i]` as a `&str`.
+/// That is only sound if every position it can stop at is a character
+/// boundary, which is why every delimiter test below is `is_ascii_*`: the bytes
+/// of a multi-byte UTF-8 character are all >= 0x80, so an ASCII test can never
+/// match one, and the scan can never stop inside a character.
+///
+/// It used to test `is_whitespace()`, which is true for Latin-1 NBSP (0xA0) —
+/// a *continuation byte*. `query_string: "…_٠…"` (U+0660, encoded D9 A0) broke
+/// the token scan between the two bytes and panicked on the slice. The release
+/// profile sets `panic = "abort"`, so that was not a 400 on an unauthenticated
+/// `?q=`, it was the process. Found by the `query_string` fuzz target (#207).
+///
+/// Nothing is lost by the narrowing: the only non-ASCII bytes `is_whitespace()`
+/// accepted were 0x85 and 0xA0, and both are continuation bytes, never a
+/// standalone character in valid UTF-8. Real Unicode whitespace (U+3000 and
+/// friends) was already token content here.
 fn tokenize_query_string(q: &str) -> Result<Option<Vec<QsTok>>> {
     let bytes = q.as_bytes();
     let mut out: Vec<QsTok> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i] as char;
-        if c.is_whitespace() {
+        if c.is_ascii_whitespace() {
             i += 1;
             continue;
         }
@@ -1817,7 +1841,8 @@ fn tokenize_query_string(q: &str) -> Result<Option<Vec<QsTok>>> {
         let start = i;
         while i < bytes.len() {
             let ch = bytes[i] as char;
-            if ch.is_whitespace() || ch == '(' || ch == ')' {
+            // ASCII-only, per the slicing invariant on this function.
+            if ch.is_ascii_whitespace() || ch == '(' || ch == ')' {
                 break;
             }
             i += 1;
@@ -6047,6 +6072,54 @@ mod tests {
             let err = parse_query(&query).expect_err("an over-wide clause list must be refused");
             assert!(err.to_string().contains("too_many_clauses"), "got {err}");
         }
+    }
+
+    /// Regression for the crash the `query_string` fuzz target found (#207).
+    ///
+    /// The tokeniser walks bytes and slices `&q[start..i]` as a `&str`, and it
+    /// used to break on `is_whitespace()` — which is true for Latin-1 NBSP
+    /// (0xA0). In valid UTF-8 that byte is only ever a *continuation* byte, so
+    /// `_٠` (U+0660, encoded D9 A0) stopped the scan between the two bytes and
+    /// the slice panicked on a character boundary. `query_string` is reachable
+    /// unauthenticated from a request body and from `?q=`, and the release
+    /// profile sets `panic = "abort"` — so this was the process, not a 400.
+    ///
+    /// Before the fix these abort the test process rather than failing.
+    #[test]
+    fn a_non_ascii_query_string_is_parsed_or_refused_but_never_panics() {
+        // The character libFuzzer landed on, plus other multi-byte widths and
+        // the two bytes `is_whitespace()` used to accept (0x85, 0xA0).
+        for query in [
+            "?:\"i(`:\"||+(l0O)_\u{660}\u{556}_ti(?:\"kk:))",
+            "_\u{660}",
+            "\u{660}",
+            "a\u{660}b c",
+            "field:\u{660}",
+            "field:>\u{660}",
+            "field:[\u{660} TO \u{661}]",
+            "\u{4e2d}\u{6587} AND \u{e9}t\u{e9}",
+            "caf\u{e9}\u{85}bar",
+            "caf\u{e9}\u{a0}bar",
+            "\u{1f600}",
+        ] {
+            for body in [
+                json!({ "query_string": { "query": query, "default_field": "body" } }),
+                json!({ "query_string": { "query": query } }),
+                json!({ "simple_query_string": { "query": query } }),
+            ] {
+                // Parsing may fail. It may not take the process with it.
+                let _ = parse_query(&body);
+            }
+        }
+
+        // ASCII query strings still parse to the same shapes.
+        let node = q(json!({
+            "query_string": { "query": "title:quick AND body:fox", "default_field": "body" }
+        }));
+        assert!(
+            matches!(node, QueryNode::Bool { .. }),
+            "an ordinary fielded query_string must still lower to a bool: {node:?}"
+        );
     }
 
     // ── Capability manifest (issue #211) ─────────────────────────────────────

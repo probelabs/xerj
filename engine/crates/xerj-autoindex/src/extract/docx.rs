@@ -83,7 +83,18 @@ fn extract_bounded(
                 // Stop appending once one paragraph reaches the body cap; the
                 // per-paragraph text a real document holds is far below it.
                 if para.len() < max_body_bytes {
-                    para.push_str(&t.unescape().unwrap_or_default());
+                    para.push_str(&t.xml10_content().unwrap_or_default());
+                }
+            }
+            // quick-xml >= 0.38 emits `&amp;` and friends as their own event
+            // instead of folding them into the neighbouring text, so a
+            // paragraph containing an entity loses its `&`/`<`/`>` unless this
+            // arm puts it back.
+            Ok(Event::GeneralRef(r)) => {
+                if para.len() < max_body_bytes {
+                    if let Some(resolved) = super::xml_x::resolve_general_ref(&r) {
+                        para.push_str(&resolved);
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -184,6 +195,31 @@ mod tests {
     /// range read?" is answerable exactly rather than by size heuristics.
     fn marker(i: usize) -> String {
         format!("m{i:06}")
+    }
+
+    /// quick-xml >= 0.38 emits `&amp;` as its own `Event::GeneralRef` instead
+    /// of folding it into the neighbouring `Event::Text`, so a reader that only
+    /// handles `Event::Text` drops every ampersand, angle bracket and numeric
+    /// character reference in the document — silently, since the surrounding
+    /// words still arrive. This pins that they come back.
+    #[test]
+    fn entity_and_character_references_survive_extraction() {
+        let xml = format!(
+            "{XML_HEAD}{}{XML_TAIL}",
+            r#"<w:p><w:r><w:t>Ben &amp; Jerry &lt;tag&gt; caf&#233;</w:t></w:r></w:p>"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("entities.docx");
+        write_docx(&path, &xml);
+
+        let (sections, stats) = extract_sections(&path, 1 << 20, 1 << 20);
+        assert_eq!(stats.junk, 0);
+        assert_eq!(
+            sections.concat().trim(),
+            "Ben & Jerry <tag> café",
+            "entity and numeric character references must resolve, and the text \
+             around them must not be re-split or lose its spaces"
+        );
     }
 
     #[test]

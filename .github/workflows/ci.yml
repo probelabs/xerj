@@ -64,6 +64,100 @@ jobs:
         working-directory: engine
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # XERJ's security pitch is "no JVM, so none of the Log4Shell class of supply
+  # chain CVEs" — which is only worth anything if somebody is actually watching
+  # the 660-odd crates we do depend on. This job is that somebody. It was
+  # documented as existing long before it did (#207); a claimed gate that no
+  # runner executes is worse than no gate, because readers price it in.
+  #
+  # Failure policy: RUSTSEC *vulnerabilities* fail the build. Informational
+  # warnings (unmaintained / unsound / yanked) are printed and do not, because
+  # most of ours sit in transitive crates we cannot upgrade unilaterally and a
+  # gate that is red for reasons nobody can act on gets ignored, then disabled.
+  # They are still in the log on every run, which is the point.
+  security-audit:
+    name: Dependency advisory audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the binary, not the advisory database — the database is the part
+      # that must be fetched fresh on every run. Bump the `-vN` suffix to force
+      # a cargo-audit upgrade (a very old binary can fail to read a newer
+      # advisory-db schema).
+      - name: Cache cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ci-cargo-audit-bin-v1
+
+      - name: Install cargo-audit
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+
+      - name: cargo audit
+        working-directory: engine
+        run: cargo audit
+
+  # Real fuzzing, for the same reason: `user-feedback/09-security/` promised
+  # "fuzz testing (cargo-fuzz) on all input parsing paths" while the tree held
+  # no fuzz target at all (#207). The harnesses live in engine/fuzz and cover
+  # the parsers an unauthenticated request reaches: the ES query DSL, the
+  # Lucene query_string grammar, date math and date formats, SQL, and Painless.
+  #
+  # On a pull request this is mostly a *regression* run — every checked-in seed
+  # is replayed through every target, and the leftover budget explores. For a
+  # real campaign, run the same script with a bigger budget:
+  #   FUZZ_SECONDS=3600 bash .github/scripts/fuzz-smoke.sh
+  fuzz:
+    name: Fuzz harnesses (cargo-fuzz)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # libFuzzer + the sanitizer runtimes are nightly-only.
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-fuzz
+            engine/fuzz/target
+          key: ci-fuzz-${{ hashFiles('engine/Cargo.lock', 'engine/fuzz/Cargo.toml') }}
+          restore-keys: ci-fuzz-
+
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
+
+      # The fuzz crate is its own workspace, so the `lint` job's
+      # `cargo fmt --all` never sees it. No `--all` here: it would follow the
+      # path dependencies back into the engine and re-check what `lint` covers.
+      - name: rustfmt the fuzz crate
+        working-directory: engine
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --check
+
+      - name: Build + run every fuzz target
+        run: bash .github/scripts/fuzz-smoke.sh
+
+      # A crashing input is the entire product of this job; losing it would
+      # mean the failure is unreproducible.
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: engine/fuzz/artifacts/
+          if-no-files-found: ignore
+
   build-test:
     name: Build + Test
     runs-on: ubuntu-latest
