@@ -302,6 +302,7 @@ fn xerj_error_type(e: &XerjError) -> String {
         XerjError::InvalidDocumentJson { .. } => "json_parse_exception",
         // ── Configuration ─────────────────────────────────────────────────
         XerjError::ConfigError { .. } => "action_request_validation_exception",
+        XerjError::ClusterStateUnavailable => "cluster_state_unavailable",
         // ── Auth ──────────────────────────────────────────────────────────
         XerjError::AuthError { .. } => "security_exception",
         // ── TLS ───────────────────────────────────────────────────────────

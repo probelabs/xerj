@@ -1,0 +1,1 @@
+{"version":1,"index_templates":{},"legacy_templates":{"logs":{"settings":{"refresh_interval":"1s","refresh_interval":"5s"}}},"component_templates":{},"pipelines":{},"data_streams":{},"ilm_policies":{}}

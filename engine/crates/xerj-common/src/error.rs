@@ -78,6 +78,14 @@ pub enum XerjError {
     #[error("config error: {reason}")]
     ConfigError { reason: String },
 
+    /// Durable cluster metadata was not accepted during the one boot-time
+    /// format check. The process remains live for health diagnosis, but it is
+    /// not ready and must not activate or mutate storage.
+    #[error(
+        "cluster state is unavailable: start a compatible XERJ build or restore supported cluster_state.json bytes, then restart"
+    )]
+    ClusterStateUnavailable,
+
     // ── Auth ───────────────────────────────────────────────────────────────
     /// Authentication or authorization failure.
     #[error("auth error: {reason}")]
@@ -215,6 +223,10 @@ impl XerjError {
         }
     }
 
+    pub fn cluster_state_unavailable() -> Self {
+        Self::ClusterStateUnavailable
+    }
+
     pub fn auth(reason: impl Into<String>) -> Self {
         Self::AuthError {
             reason: reason.into(),
@@ -289,7 +301,7 @@ impl XerjError {
             Self::IndexBlocked { .. } => 403,
             // The index exists but has no serving copy — ES answers the same
             // shape (no_shard_available_action_exception) with 503.
-            Self::IndexUnavailable { .. } => 503,
+            Self::IndexUnavailable { .. } | Self::ClusterStateUnavailable => 503,
             Self::AuthError { .. } => 401,
             Self::ResourceExhausted { .. } | Self::CircuitBreaking { .. } => 429,
             Self::StorageError { .. }

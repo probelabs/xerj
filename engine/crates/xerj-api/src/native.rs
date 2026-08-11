@@ -731,6 +731,13 @@ pub async fn liveness() -> impl IntoResponse {
 }
 
 pub async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.engine.cluster_state_boot_status().is_writable() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: persisted cluster metadata was not accepted at boot; inspect server logs",
+        )
+            .into_response();
+    }
     let h = state.engine.health().await;
     // Read the node's own state, not a principal's filtered view: this path is
     // exempt from authentication so a kubelet can probe a hardened node, and

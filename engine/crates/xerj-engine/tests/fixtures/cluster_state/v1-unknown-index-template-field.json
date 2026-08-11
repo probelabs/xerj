@@ -1,0 +1,1 @@
+{"version":1,"index_templates":{"logs":{"index_patterns":["logs-*"],"settings":{},"mappings":{},"priority":0,"future":true}},"legacy_templates":{},"component_templates":{},"pipelines":{},"data_streams":{},"ilm_policies":{}}

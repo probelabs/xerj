@@ -19,6 +19,7 @@
 pub mod aggs;
 pub mod audit;
 pub mod bulk;
+mod cluster_state;
 mod collection_publication;
 pub mod engine;
 pub mod governor;
@@ -43,6 +44,7 @@ mod bounded_ingest_resources_tests;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
+pub use cluster_state::{ClusterStateBlockKind, ClusterStateBootStatus};
 pub use engine::{EmbeddingExecutionIdentity, Engine, HealthStatus, IndexInfo};
 pub use index::{
     detect_log_format, resolve_date_math, resolve_field_alias, EnrichTable, FieldEncodingInfo,

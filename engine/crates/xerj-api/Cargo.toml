@@ -44,3 +44,4 @@ libc         = "0.2"
 tempfile     = { workspace = true }
 tower        = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+sha2         = "0.10"

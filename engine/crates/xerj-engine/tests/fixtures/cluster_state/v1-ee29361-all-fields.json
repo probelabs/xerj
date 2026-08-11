@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "index_templates": {
+    "logs": {
+      "index_patterns": [
+        "logs-*"
+      ],
+      "settings": {
+        "number_of_replicas": 0
+      },
+      "mappings": {
+        "properties": {
+          "host": {
+            "type": "keyword"
+          }
+        }
+      },
+      "priority": 200
+    }
+  },
+  "legacy_templates": {
+    "legacy-logs": {
+      "index_patterns": [
+        "legacy-*"
+      ],
+      "settings": {
+        "index.number_of_shards": "1"
+      }
+    }
+  },
+  "component_templates": {
+    "base-settings": {
+      "template": {
+        "settings": {
+          "number_of_replicas": 1
+        }
+      }
+    }
+  },
+  "pipelines": {
+    "tagger": {
+      "description": "tag every doc",
+      "stages": [
+        {
+          "type": "set",
+          "config": {
+            "field": "tagged",
+            "value": "yes"
+          }
+        }
+      ]
+    }
+  },
+  "data_streams": {
+    "metrics-app": {
+      "name": "metrics-app",
+      "backing_indices": [
+        ".ds-metrics-app-000001"
+      ],
+      "timestamp_field": "@timestamp",
+      "generation": 1
+    }
+  },
+  "ilm_policies": {
+    "hot-warm": {
+      "policy": {
+        "phases": {
+          "hot": {
+            "actions": {}
+          }
+        }
+      }
+    }
+  }
+}

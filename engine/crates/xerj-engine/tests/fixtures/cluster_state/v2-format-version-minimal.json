@@ -1,0 +1,1 @@
+{"format_version":2,"data_streams":{"events":{"name":"events","backing_indices":[".ds-events-000001"],"timestamp_field":"@timestamp","generation":1}},"corpus_publications":{}}

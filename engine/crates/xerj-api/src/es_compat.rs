@@ -1116,7 +1116,9 @@ pub async fn create_index(
             if !mappings_val.is_null() {
                 // Persists es_mapping.json into the index dir (atomic) so
                 // the create-time mapping survives a restart.
-                state.engine.put_index_mapping(&index, mappings_val.clone());
+                if let Err(error) = state.engine.put_index_mapping(&index, mappings_val.clone()) {
+                    return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+                }
             }
             if let Some(aliases) = body.get("aliases").and_then(Value::as_object) {
                 // Alias keys can also contain date math
@@ -1127,7 +1129,9 @@ pub async fn create_index(
                 for (alias, opts) in aliases {
                     let resolved = resolve_date_math_index(alias);
                     resolved_aliases.insert(resolved.clone(), opts.clone());
-                    state.engine.add_alias(&resolved, &index);
+                    if let Err(error) = state.engine.add_alias(&resolved, &index) {
+                        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+                    }
                 }
                 state
                     .engine
@@ -2314,7 +2318,9 @@ pub async fn put_mapping(
     for (idx_name, _, existing, _) in plans {
         // Persists es_mapping.json into the index dir (atomic) so the
         // merged mapping survives a restart.
-        state.engine.put_index_mapping(&idx_name, existing);
+        if let Err(error) = state.engine.put_index_mapping(&idx_name, existing) {
+            return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+        }
     }
 
     Json(json!({ "acknowledged": true })).into_response()
@@ -17292,12 +17298,16 @@ pub async fn post_aliases(
         match step {
             Resolved::Add(add, targets) => {
                 for target in targets {
-                    state.engine.add_alias(&add.alias, target);
+                    if let Err(error) = state.engine.add_alias(&add.alias, target) {
+                        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+                    }
                 }
             }
             Resolved::Remove(remove, targets) => {
                 for target in targets {
-                    state.engine.remove_alias(&remove.alias, target);
+                    if let Err(error) = state.engine.remove_alias(&remove.alias, target) {
+                        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+                    }
                 }
             }
         }
@@ -17465,8 +17475,8 @@ pub async fn put_alias(
         .filter(|v| v.as_object().map(|o| !o.is_empty()).unwrap_or(false))
         .unwrap_or(json!({}));
 
-    let attach = |idx_name: &str| {
-        state.engine.add_alias(&alias, idx_name);
+    let attach = |idx_name: &str| -> xerj_engine::Result<()> {
+        state.engine.add_alias(&alias, idx_name)?;
         if !alias_meta.as_object().map(|o| o.is_empty()).unwrap_or(true) {
             let mut existing = state
                 .engine
@@ -17484,6 +17494,7 @@ pub async fn put_alias(
                 .index_alias_metadata
                 .insert(idx_name.to_string(), existing);
         }
+        Ok(())
     };
 
     if targets.is_empty() {
@@ -17499,7 +17510,9 @@ pub async fn put_alias(
         return ApiError::new(e).into_response();
     }
     for idx in &targets {
-        attach(idx);
+        if let Err(error) = attach(idx) {
+            return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+        }
     }
     Json(json!({ "acknowledged": true })).into_response()
 }
@@ -17510,10 +17523,14 @@ pub async fn delete_alias(
 ) -> impl IntoResponse {
     let targets = resolve_index_selector(&state, &index).await;
     if targets.is_empty() {
-        state.engine.remove_alias(&alias, &index);
+        if let Err(error) = state.engine.remove_alias(&alias, &index) {
+            return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+        }
     } else {
         for idx in &targets {
-            state.engine.remove_alias(&alias, idx);
+            if let Err(error) = state.engine.remove_alias(&alias, idx) {
+                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+            }
         }
     }
     Json(json!({ "acknowledged": true })).into_response()
@@ -22714,7 +22731,9 @@ pub async fn put_settings(
                 // tombstone for a ghost is unbounded state writable from
                 // the public port (#262 hit exactly this in review).
                 if state.engine.get_index(idx).is_ok() {
-                    state.engine.detach_lifecycle(idx);
+                    if let Err(error) = state.engine.detach_lifecycle(idx) {
+                        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+                    }
                 }
             }
         }
@@ -24722,7 +24741,9 @@ pub async fn put_ilm_policy(
     if let Err(e) = state.engine.put_ilm_policy(name.clone(), body.clone()) {
         return ApiError::new(xerj_common::XerjError::from(e)).into_response();
     }
-    state.engine.put_ism_policy(name, policy);
+    if let Err(error) = state.engine.put_ism_policy(name, policy) {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     Json(json!({ "acknowledged": true })).into_response()
 }
 
@@ -24786,7 +24807,9 @@ pub async fn delete_ilm_policy(
     // lifecycle engine's storage rather than to this handler.
     match state.engine.delete_ilm_policy(&name) {
         Ok(true) => {
-            state.engine.remove_ism_policy(&name);
+            if let Err(error) = state.engine.remove_ism_policy(&name) {
+                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+            }
             Json(json!({ "acknowledged": true })).into_response()
         }
         Ok(false) => {
@@ -24926,7 +24949,9 @@ pub async fn remove_ilm_policy_from_index(
         Err(e) => return ApiError::new(e).into_response(),
     };
     for name in &targets {
-        state.engine.detach_lifecycle(name);
+        if let Err(error) = state.engine.detach_lifecycle(name) {
+            return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+        }
     }
     Json(json!({ "has_failures": false, "failed_indexes": [] })).into_response()
 }
@@ -28432,7 +28457,7 @@ pub async fn security_create_api_key(
     // across restarts via `persist_api_key` (item 6: `<data_dir>/api_keys.json`).
     let now_ms = Utc::now().timestamp_millis().max(0) as u64;
     let expiration_ms = parse_api_key_expiration_ms(expiration.as_str(), now_ms);
-    state.engine.persist_api_key(
+    if let Err(error) = state.engine.persist_api_key(
         key_id.clone(),
         xerj_engine::engine::ApiKeyRecord::new(
             name.clone(),
@@ -28441,7 +28466,9 @@ pub async fn security_create_api_key(
             expiration_ms,
             roles,
         ),
-    );
+    ) {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     state.engine.audit.append(
         "security.api_key.create",
         principal.label(),
@@ -28833,7 +28860,12 @@ pub async fn security_invalidate_api_key(
     };
 
     let now_ms = Utc::now().timestamp_millis().max(0) as u64;
-    let (invalidated, previously) = state.engine.invalidate_api_keys(&target_ids, now_ms);
+    let (invalidated, previously) = match state.engine.invalidate_api_keys(&target_ids, now_ms) {
+        Ok(result) => result,
+        Err(error) => {
+            return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+        }
+    };
     state.engine.audit.append(
         "security.api_key.invalidate",
         principal.label(),

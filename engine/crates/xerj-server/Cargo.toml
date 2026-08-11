@@ -95,3 +95,4 @@ protox = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 flate2 = "1"
+tokio-stream = "0.1"

@@ -1728,7 +1728,7 @@ async fn test_alias_search() {
         .unwrap();
 
     // Add alias "my_alias" → "real_index".
-    engine.add_alias("my_alias", "real_index");
+    engine.add_alias("my_alias", "real_index").unwrap();
 
     // Search via alias should return the same results as searching via the real name.
     let idx_via_alias = engine.get_index("my_alias").unwrap();
@@ -1746,7 +1746,7 @@ async fn test_alias_search() {
     assert!(ids.contains(&"a2"));
 
     // Remove alias and verify it no longer resolves.
-    engine.remove_alias("my_alias", "real_index");
+    engine.remove_alias("my_alias", "real_index").unwrap();
     let resolved = engine.resolve_alias("my_alias");
     assert_eq!(
         resolved,
