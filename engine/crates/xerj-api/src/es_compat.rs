@@ -18821,6 +18821,13 @@ pub async fn reindex(
             "query": query_val,
             "size": page_size,
             "sort": [{ "_id": "asc" }],
+            // Reindex copies documents verbatim, so it must always read the
+            // COMPLETE `_source` — including engine-generated embedding
+            // companions. Omitting `_source` would inherit the search default,
+            // which deliberately hides those companions from ordinary API
+            // responses; inheriting it here would silently drop embeddings from
+            // every reindexed document.
+            "_source": true,
         });
         if let Some(ref sa) = search_after {
             search_body_val["search_after"] = sa.clone();
@@ -26217,6 +26224,10 @@ async fn clone_index_to(state: &AppState, source: &str, target: &str) -> Result<
         "query": { "match_all": {} },
         "size": 10000,
         "from": 0,
+        // Cloning copies documents verbatim: always read the COMPLETE `_source`,
+        // including engine-generated embedding companions, rather than inheriting
+        // the search default which hides them from ordinary API responses.
+        "_source": true,
     }))
     .map_err(|e| ApiError::new(xerj_common::XerjError::invalid_query(e.to_string())))?;
 
@@ -26388,7 +26399,11 @@ pub async fn execute_enrich_policy(
     // enrich index, preserving doc ids.
     let req = match parse_request(&json!({
         "query": { "match_all": {} },
-        "size": 10000
+        "size": 10000,
+        // Enrich policies materialise source documents into a lookup index, so
+        // they must read the COMPLETE `_source` rather than inheriting the
+        // search default which hides engine-generated embedding companions.
+        "_source": true,
     })) {
         Ok(r) => r,
         Err(e) => {

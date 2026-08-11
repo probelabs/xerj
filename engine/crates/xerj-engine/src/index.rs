@@ -10006,7 +10006,18 @@ impl Index {
             candidates = scored.len(),
             "knn served via HNSW (coverage gate passed)"
         );
-        Some(knn_result_from_scored(request, field, scored, k, started))
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        Some(knn_result_from_scored(
+            request,
+            field,
+            scored,
+            k,
+            started,
+            &generated_companion_fields,
+        ))
     }
 
     /// Brute-force exact KNN against every doc's stored source.
@@ -10477,7 +10488,18 @@ impl Index {
         // ── Rank, cap the candidate pool at k, then paginate ──────────
         // (shared with the HNSW path so hits format / total semantics
         // cannot drift between the exact and approximate executors)
-        let mut result = knn_result_from_scored(request, field, scored, k, started);
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        let mut result = knn_result_from_scored(
+            request,
+            field,
+            scored,
+            k,
+            started,
+            &generated_companion_fields,
+        );
         result.timed_out = timed_out;
         if timed_out {
             result.total.relation = TotalHitsRelation::Gte;
@@ -10560,7 +10582,18 @@ impl Index {
         // passage metadata. Child clauses retain ordinary ranking semantics;
         // provenance is intentionally omitted until per-clause ownership is
         // represented in the merged winner.
-        let mut result = knn_result_from_scored(request, "", merged, k_sum, started);
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        let mut result = knn_result_from_scored(
+            request,
+            "",
+            merged,
+            k_sum,
+            started,
+            &generated_companion_fields,
+        );
         result.timed_out = any_timed_out;
         if any_timed_out {
             result.total.relation = TotalHitsRelation::Gte;
@@ -16996,7 +17029,11 @@ impl Index {
         };
 
         // --- Apply _source filtering ---
-        let page = apply_source_filter(page, &request.source);
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        let page = apply_source_filter(page, &request.source, &generated_companion_fields);
 
         // --- Build profile data if requested ---
         let profile = if request.profile {
@@ -24023,7 +24060,11 @@ fn es_format_to_epoch_ms(s: &str, fmt: &str) -> Option<i64> {
     None
 }
 
-fn apply_source_filter(hits: Vec<Hit>, filter: &SourceFilter) -> Vec<Hit> {
+fn apply_source_filter(
+    hits: Vec<Hit>,
+    filter: &SourceFilter,
+    generated_companion_fields: &HashSet<String>,
+) -> Vec<Hit> {
     let hits: Vec<Hit> = hits
         .into_iter()
         .map(|mut hit| {
@@ -24031,7 +24072,16 @@ fn apply_source_filter(hits: Vec<Hit>, filter: &SourceFilter) -> Vec<Hit> {
             hit
         })
         .collect();
+    let generated_companion_fields: Vec<String> =
+        generated_companion_fields.iter().cloned().collect();
     match filter {
+        SourceFilter::Default => hits
+            .into_iter()
+            .map(|mut h| {
+                h.source = filter_object(&h.source, &[], &generated_companion_fields);
+                h
+            })
+            .collect(),
         SourceFilter::Enabled(true) => hits,
         // `_source: false`: keep the raw source so the response layer can
         // still resolve `fields` / `_ignored` / `highlight` against it —
@@ -24052,6 +24102,27 @@ fn apply_source_filter(hits: Vec<Hit>, filter: &SourceFilter) -> Vec<Hit> {
             })
             .collect(),
     }
+}
+
+/// Return the engine-generated embedding companions for a schema.
+///
+/// This is deliberately derived from `FieldConfig.embedding` rather than from
+/// field-name suffixes: a user-owned field called `body_vector` is ordinary
+/// source data unless an embedding mapping designates it as a target.
+fn generated_embedding_companion_fields(schema: &Schema) -> HashSet<String> {
+    let mut companions = HashSet::new();
+    for field in &schema.fields {
+        let Some(embedding) = &field.embedding else {
+            continue;
+        };
+        let target = embedding
+            .target_field
+            .clone()
+            .unwrap_or_else(|| format!("{}_vector", field.name));
+        companions.insert(target.clone());
+        companions.insert(format!("{target}_chunks"));
+    }
+    companions
 }
 
 /// Return a filtered copy of a JSON object keeping `includes` and removing `excludes`.
@@ -24181,6 +24252,142 @@ fn filter_object(source: &Value, includes: &[String], excludes: &[String]) -> Va
     }
 
     collect_and_filter(source, "", includes, excludes)
+}
+
+#[cfg(test)]
+mod source_filter_tests {
+    use super::*;
+    use serde_json::json;
+    use xerj_common::types::{EmbeddingConfig, FieldConfig, FieldType};
+
+    fn embedded_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(
+                FieldConfig::new("body", FieldType::Text).with_embedding(EmbeddingConfig {
+                    endpoint: None,
+                    model: None,
+                    target_field: None,
+                }),
+            )
+            .unwrap();
+        schema
+    }
+
+    fn hit(id: &str, score: f32, source: Value) -> Hit {
+        Hit {
+            id: id.to_string(),
+            score,
+            source,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        }
+    }
+
+    fn generated_source() -> Value {
+        json!({
+            "body": "the source text",
+            "body_vector": [0.1, 0.2, 0.3],
+            "body_vector_chunks": [[0.1, 0.2], [0.2, 0.3]],
+            "title": "a user field"
+        })
+    }
+
+    #[test]
+    fn omitted_source_excludes_mapping_derived_companions_only() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let hits = vec![
+            hit("first", 0.9, generated_source()),
+            hit("second", 0.4, generated_source()),
+        ];
+
+        let filtered = apply_source_filter(hits, &SourceFilter::Default, &companions);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|hit| (hit.id.as_str(), hit.score))
+                .collect::<Vec<_>>(),
+            vec![("first", 0.9), ("second", 0.4)]
+        );
+        for hit in filtered {
+            assert_eq!(
+                hit.source,
+                json!({
+                    "body": "the source text",
+                    "title": "a user field"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_source_true_keeps_mapping_derived_companions() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let original = generated_source();
+        let filtered = apply_source_filter(
+            vec![hit("doc", 0.9, original.clone())],
+            &SourceFilter::Enabled(true),
+            &companions,
+        );
+
+        assert_eq!(filtered[0].source, original);
+    }
+
+    #[test]
+    fn explicit_source_include_still_returns_a_generated_companion() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filtered = apply_source_filter(
+            vec![hit("doc", 0.9, generated_source())],
+            &SourceFilter::Includes(vec!["body_vector".to_string()]),
+            &companions,
+        );
+
+        assert_eq!(filtered[0].source, json!({"body_vector": [0.1, 0.2, 0.3]}));
+    }
+
+    #[test]
+    fn omitted_source_measures_companion_payload_reduction() {
+        let vector = Value::Array((0..384).map(|_| json!(0.123456)).collect());
+        let chunks = Value::Array((0..660).map(|_| vector.clone()).collect());
+        let source = json!({
+            "body": "x".repeat(250_000),
+            "body_vector": vector,
+            "body_vector_chunks": chunks
+        });
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let before = hit("doc", 0.9, source);
+        let before_bytes = serde_json::to_vec(&before).unwrap().len();
+        let after = apply_source_filter(vec![before], &SourceFilter::Default, &companions);
+        let after_bytes = serde_json::to_vec(&after[0]).unwrap().len();
+
+        eprintln!("default _search hit payload bytes: before={before_bytes}, after={after_bytes}");
+        assert!(before_bytes > 2_000_000);
+        assert!(after_bytes < 300_000);
+        assert!(after_bytes * 8 < before_bytes);
+    }
+
+    #[test]
+    fn user_declared_vector_suffix_without_embedding_is_not_stripped() {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body_vector", FieldType::Keyword))
+            .unwrap();
+        let companions = generated_embedding_companion_fields(&schema);
+        assert!(companions.is_empty());
+
+        let original = json!({"body_vector": "user-owned value"});
+        let filtered = apply_source_filter(
+            vec![hit("doc", 0.9, original.clone())],
+            &SourceFilter::Default,
+            &companions,
+        );
+
+        assert_eq!(filtered[0].source, original);
+    }
 }
 
 /// Simple field pattern matching — supports trailing `*` wildcard.
@@ -26690,6 +26897,7 @@ fn knn_result_from_scored(
     mut scored: Vec<(String, f32, Value, Option<u32>)>,
     k: usize,
     started: std::time::Instant,
+    generated_companion_fields: &HashSet<String>,
 ) -> SearchResult {
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     // `k` bounds the kNN candidate pool; `from`/`size` then window into
@@ -26749,7 +26957,7 @@ fn knn_result_from_scored(
         }
     })
     .collect();
-    let hits = apply_source_filter(hits, &request.source);
+    let hits = apply_source_filter(hits, &request.source, generated_companion_fields);
 
     SearchResult {
         hits,
