@@ -48,10 +48,25 @@
       <span>2026</span>
     </div>
 
-    <h1 class="hero"><span class="accent">XERJ.</span><br>ONE ENGINE.<br>ZERO STACK.</h1>
+    <h1 class="hero"><span class="accent">XERJ.</span><br>STOP RE-DERIVING.<br>START LOOKING UP.</h1>
 
     <div class="hero-install">
-      <div class="hero-install-label">INSTALL · ONE COMMAND · SHA-256 CHECKSUMS</div>
+      <div class="hero-install-agent" style="margin-top:0;">
+        <span class="hero-install-label">PASTE THIS TO YOUR AI AGENT · THE WHOLE SETUP</span>
+        <div class="hero-install-cmd">
+          <code>Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.</code>
+          <button type="button" class="hero-install-copy" data-copy="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">COPY</button>
+        </div>
+        <p class="hero-install-agent-line">One prompt is enough — llms.txt gives your agent
+          the ordered steps: install, start the server, <code>xerj autoindex .</code>,
+          query with any Elasticsearch client, and the reference-coding loop.
+          Measured: <strong>2.7× fewer output tokens</strong> than grep-driven Claude Code,
+          <strong>26× fewer</strong> than memory alone —
+          <a href="/case-studies/reference-coding.html">the case study</a>. Users report
+          <strong>~5×</strong> across real product development —
+          <a href="https://github.com/xerj-org/xerj/blob/main/user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md">field reports</a>.</p>
+      </div>
+      <div class="hero-install-label" style="margin-top:var(--sp-3);">OR INSTALL BY HAND · ONE COMMAND · SHA-256 CHECKSUMS</div>
       <div class="hero-install-cmd">
         <code>curl -fsSL https://xerj.org/get | sh</code>
         <button type="button" class="hero-install-copy" data-copy="curl -fsSL https://xerj.org/get | sh">COPY</button>
@@ -60,29 +75,20 @@
         <span class="mono">WINDOWS · <code>irm https://xerj.org/get.ps1 | iex</code></span>
         <button type="button" class="hero-install-copy" data-copy="irm https://xerj.org/get.ps1 | iex">COPY</button>
       </div>
-      <div class="hero-install-agent">
-        <span class="hero-install-label">OR PASTE THIS TO YOUR AI AGENT</span>
-        <div class="hero-install-cmd">
-          <code>Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.</code>
-          <button type="button" class="hero-install-copy" data-copy="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">COPY</button>
-        </div>
-        <p class="hero-install-agent-line">One prompt is enough — llms.txt gives your agent
-          the ordered steps: install, start the server, <code>xerj autoindex .</code>,
-          query with any Elasticsearch client, and the reference-coding loop.</p>
-      </div>
     </div>
 
     <p class="lead">
-      The unified search engine for AI — connect it, run
+      The AI-native search engine — connect it, run
       <code class="inline">xerj&nbsp;autoindex</code>, and it works: any folder
       becomes typed, queryable indices — <strong>zero configuration</strong>.
-      Give agents <strong>long-term memory</strong>, <strong>semantic search
-      &amp; RAG</strong>, <strong>hybrid</strong> BM25&nbsp;+&nbsp;vector
-      retrieval, <strong>auto-embedding</strong> on ingest, and
-      <strong>anomaly detection</strong> — no bolt-on vector database, no
-      glue code. One binary that speaks the Elasticsearch wire protocol,
-      released under <strong>Apache&#8209;2.0</strong>: no lock-in, no SSPL,
-      no per-feature gates. Yours to run, fork, and build on.
+      Give agents <strong>reference coding</strong>, <strong>long-term
+      memory</strong>, <strong>semantic search &amp; RAG</strong>,
+      <strong>hybrid</strong> BM25&nbsp;+&nbsp;vector retrieval,
+      <strong>auto-embedding</strong> on ingest, and <strong>anomaly
+      detection</strong> — no bolt-on vector database, no glue code. One binary
+      that speaks the Elasticsearch wire protocol, released under
+      <strong>Apache&#8209;2.0</strong>: no lock-in, no SSPL, no per-feature
+      gates. Yours to run, fork, and build on.
     </p>
   </div>
 
@@ -112,9 +118,42 @@
   <p class="viz-caption">Five LLM models tracked in real time. P95 latency, 60-second window. Ribbon depth encodes model generation. This is one XERJ query — not five dashboards stitched together.</p>
 </section>
 
-<!-- 01 — POINT XERJ AT A FOLDER ------------------------------->
+<!-- 01 — REFERENCE CODING ------------------------------------->
 <section class="scene-section">
-  <div class="kicker"><span class="accent">01</span><span class="dash">·</span><span>POINT XERJ AT A FOLDER · ZERO CONFIG</span></div>
+  <div class="kicker"><span class="accent">01</span><span class="dash">·</span><span>REFERENCE CODING · THE CODING USE CASE</span></div>
+  <h2 class="scene">GREP RE-READS.<br><span class="accent">XERJ RETRIEVES.</span></h2>
+
+  <p class="wide">
+    A coding agent hitting an API it hasn't memorised invents method names,
+    fails to compile, and loops — spending <em>output</em> tokens, the
+    expensive kind, on every lap. Grep doesn't save it: grep tells the agent
+    where to look, and the recovery is still reading source into context —
+    up to <strong>1.06M input tokens</strong> on one corpus in our
+    measurements. Reference coding flips the loop: clone the open-source
+    repos closest to what you're building,
+    <code class="inline">xerj autoindex</code> them once, and the agent
+    retrieves the exact definition — with its contract — before writing.
+    Measured (8 tasks across 4 languages, 16 runs per arm, real
+    <code class="inline">claude -p</code> token counts): <strong>2.7× fewer
+    output tokens</strong> than grep-driven Claude Code at the same 16/16
+    solve rate, <strong>26× fewer</strong> than working from memory
+    (260,916 → 9,982), <strong>2.1× cheaper</strong> ($1.58 vs $3.27). In a
+    companion run on a Rust library the model had never seen:
+    <strong>9/9 with retrieval vs 0/9 from memory</strong>. The three helper
+    scripts below ship with the case study — the hero prompt sets them up.
+  </p>
+
+<pre class="code">$ xc-corpus.sh xerj-storage https://github.com/spacejam/sled …   # clone the peers, once
+$ xc-index.sh  xerj-storage                                       # xerj autoindex, once per corpus
+$ xc.py xerj-storage "how does sled fsync its WAL segment on rotation?"
+→ the exact function, file:line, contract included — a passage to read, not a tree to grep</pre>
+
+  <p class="viz-caption"><a class="mono" href="/case-studies/reference-coding.html" style="color:var(--z-mute);">THE FULL CASE STUDY — EVERY NUMBER, EVERY TASK, THE EXACT PROMPT →</a></p>
+</section>
+
+<!-- 02 — POINT XERJ AT A FOLDER ------------------------------->
+<section class="scene-section">
+  <div class="kicker"><span class="accent">02</span><span class="dash">·</span><span>POINT XERJ AT A FOLDER · ZERO CONFIG</span></div>
   <h2 class="scene">ONE COMMAND.<br><span class="accent">ANY FOLDER.</span></h2>
 
   <p class="wide">
@@ -176,9 +215,9 @@ next: `xerj autoindex map --url http://localhost:9280` for the data map; search 
   <p class="viz-caption"><a class="mono" href="/docs/recipes/zero-config-autoindex.html" style="color:var(--z-mute);">THE FULL RECIPE, EVERY NUMBER TRACED TO A RUN →</a></p>
 </section>
 
-<!-- 02 — BUILT FOR AGENTS ------------------------------------->
+<!-- 03 — BUILT FOR AGENTS ------------------------------------->
 <section class="scene-section">
-  <div class="kicker"><span class="accent">02</span><span class="dash">·</span><span>BUILT FOR AGENTS · MEMORY · RECIPES</span></div>
+  <div class="kicker"><span class="accent">03</span><span class="dash">·</span><span>BUILT FOR AGENTS · MEMORY · RECIPES</span></div>
   <h2 class="scene">AGENTS ARE<br><span class="accent">THE CUSTOMER.</span></h2>
 
   <p class="wide">
@@ -225,9 +264,9 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   <p class="viz-caption"><a class="mono" href="/for-agents.html" style="color:var(--z-mute);">THE FULL AGENT SURFACE — SEVEN OPERATIONS + LLMS.TXT →</a></p>
 </section>
 
-<!-- 03 — UNIFIED DATA LAYER ---------------------------------->
+<!-- 04 — UNIFIED DATA LAYER ---------------------------------->
 <section class="scene-section">
-  <div class="kicker"><span class="accent">03</span><span class="dash">·</span><span>XERJ REPLACES THREE SYSTEMS</span></div>
+  <div class="kicker"><span class="accent">04</span><span class="dash">·</span><span>XERJ REPLACES THREE SYSTEMS</span></div>
   <h2 class="scene">LOGS.<br>VECTORS.<br><span class="accent">AGENT MEMORY.</span></h2>
 
   <p class="wide">
@@ -256,9 +295,9 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   </div>
 </section>
 
-<!-- 04 — HYBRID SEARCH ---------------------------------------->
+<!-- 05 — HYBRID SEARCH ---------------------------------------->
 <section class="scene-section">
-  <div class="kicker"><span class="accent">04</span><span class="dash">·</span><span>XERJ NATIVE HYBRID SEARCH</span></div>
+  <div class="kicker"><span class="accent">05</span><span class="dash">·</span><span>XERJ NATIVE HYBRID SEARCH</span></div>
   <h2 class="scene">ONE PASS.<br><span class="accent">ONE HOP.</span></h2>
 
   <p class="wide">
@@ -305,10 +344,10 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   </div>
 </section>
 
-<!-- 05 — COST VISIBILITY -------------------------------------->
+<!-- 06 — COST VISIBILITY -------------------------------------->
 <section class="scene-section section-split">
   <div class="split-copy">
-    <div class="kicker"><span class="accent">05</span><span class="dash">·</span><span>XERJ COST VISIBILITY</span></div>
+    <div class="kicker"><span class="accent">06</span><span class="dash">·</span><span>XERJ COST VISIBILITY</span></div>
     <h2 class="scene">WATCH THE<br><span class="accent">MONEY MOVE.</span></h2>
     <p class="wide">
       Spend shouldn't be a monthly surprise. XERJ encodes cost directly
@@ -344,7 +383,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
 
 <!-- BENCHMARKS — SUPPORTING EVIDENCE -------------------------->
 <section class="scene-section">
-  <div class="kicker"><span class="accent">06</span><span class="dash">·</span><span>SUPPORTING EVIDENCE · XERJ vs ELASTICSEARCH 8.13.4</span></div>
+  <div class="kicker"><span class="accent">07</span><span class="dash">·</span><span>SUPPORTING EVIDENCE · XERJ vs ELASTICSEARCH 8.13.4</span></div>
   <div class="ticker">
     <div class="tk">
       <div class="eyebrow">FULL QUERY MATRIX · CLOSED-LOOP · CACHE OFF</div>
@@ -367,7 +406,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
 
 <!-- ENGINE --------------------------------------------------->
 <section class="scene-section" id="engine" style="border-top:0;">
-  <div class="kicker"><span class="accent">07</span><span class="dash">·</span><span>INSIDE XERJ</span></div>
+  <div class="kicker"><span class="accent">08</span><span class="dash">·</span><span>INSIDE XERJ</span></div>
   <h2 class="scene">ONE BINARY.<br>NO JVM.<br><span class="accent">NO COMPROMISES.</span></h2>
 
   <p class="wide">

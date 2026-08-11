@@ -4,7 +4,62 @@ XERJ is a search engine for AI agents. Point it at a folder and one command make
 your code, docs, logs and PDFs queryable, so an agent asks questions instead of
 reading files into its context window.
 
-## Install
+[![CI](https://github.com/xerj-org/xerj/actions/workflows/ci.yml/badge.svg)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+[![Release](https://img.shields.io/github/v/release/xerj-org/xerj?include_prereleases&sort=semver)](https://github.com/xerj-org/xerj/releases)
+[![ES conformance](https://img.shields.io/badge/ES%20conformance-1365%2F1368-brightgreen.svg)](https://xerj.org/benchmarks)
+
+## Paste this to your AI agent
+
+The whole setup is one prompt:
+
+```text
+Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
+reference coding: clone and index the open-source repos closest to what we're building,
+and search how they solved a problem before writing code.
+```
+
+[llms.txt](https://xerj.org/llms.txt) gives your agent the ordered steps: install,
+start the server, `xerj autoindex .`, query with any Elasticsearch client, and the
+reference-coding loop (clone similar OSS, index it, retrieve the mechanism before
+writing, cite what you use, respect licenses).
+
+Why you would: an agent working from memory retry-loops on any API it hasn't
+memorised, and grep only tells it where to look — the recovery is still reading
+source into context, up to 1.06M input tokens on one corpus in our measurements.
+An agent that queries XERJ reads the exact passage instead.
+
+The numbers, measured end-to-end on code the model had not memorised
+([the case study](https://xerj.org/case-studies/reference-coding.html), 8 tasks
+across 4 languages, 16 runs per arm, real `claude -p` token counts): **2.7× fewer
+output tokens** than grep-driven Claude Code (9,982 vs 26,477) at the same 16/16
+solve rate, **26× fewer** than working from memory alone (260,916 → 9,982), and
+**2.1× cheaper** ($1.58 vs $3.27). In a companion run on a Rust library the model
+had never seen: **9/9 correct with retrieval versus 0/9 from memory**. Beyond the
+lab, users report roughly **5× fewer tokens** across real product development —
+fewer retry loops, sharper requests
+([field reports](./user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md)).
+
+More prompts that work on a fresh install:
+
+- *"Read https://xerj.org/llms.txt, set XERJ up as your search backend, index `./docs`,
+  and show me one example query per index it created."*
+- *"Run `xerj autoindex map` and tell me what is in this data — types, counts and the
+  gotchas it recorded — then answer my questions with search instead of reading files."*
+- *"Use XERJ's `/_memory/notes` API as your long-term memory for this project: store what
+  you learn as you work, and recall it by meaning next session."*
+
+Worked, validated examples for each capability: [xerj.org/docs/recipes](https://xerj.org/docs/recipes/).
+
+<video src="https://xerj.org/xerj-biz-demo.mp4" poster="docs/media/demo-poster.png" controls muted playsinline width="840">
+  <a href="https://xerj.org/aise-demo.html"><img src="docs/media/demo-poster.png" width="840" alt="Watch the XERJ demo: boot, ingest, search, vectors, dashboards"></a>
+</video>
+
+<sub>Boot, bulk ingest, search, vector kNN, live dashboards, no cuts.
+<a href="https://xerj.org/aise-demo.html">Watch it on xerj.org</a> or
+<a href="https://xerj.org/playground/">try the live playground</a>.</sub>
+
+## Install by hand
 
 ```sh
 curl -fsSL https://xerj.org/get | sh
@@ -25,43 +80,6 @@ First commands after install (the installer prints where `xerj` landed — add i
 your PATH if needed): `xerj --insecure --data-dir ./data &`, wait until
 `http://localhost:9200` responds, then `xerj autoindex ~/my-project` — see
 [Index a folder](#index-a-folder).
-
-### Or paste this to your AI agent
-
-```text
-Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
-reference coding: clone and index the open-source repos closest to what we're building,
-and search how they solved a problem before writing code.
-```
-
-One prompt is enough — [llms.txt](https://xerj.org/llms.txt) gives your agent the
-ordered steps: install, start the server, `xerj autoindex .`, query with any
-Elasticsearch client, and the reference-coding loop (clone similar OSS, index it,
-retrieve the mechanism before writing, cite what you use, respect licenses).
-
-More prompts that work on a fresh install:
-
-- *"Read https://xerj.org/llms.txt, set XERJ up as your search backend, index `./docs`,
-  and show me one example query per index it created."*
-- *"Run `xerj autoindex map` and tell me what is in this data — types, counts and the
-  gotchas it recorded — then answer my questions with search instead of reading files."*
-- *"Use XERJ's `/_memory/notes` API as your long-term memory for this project: store what
-  you learn as you work, and recall it by meaning next session."*
-
-Worked, validated examples for each capability: [xerj.org/recipes](https://xerj.org/recipes).
-
-[![CI](https://github.com/xerj-org/xerj/actions/workflows/ci.yml/badge.svg)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
-[![Release](https://img.shields.io/github/v/release/xerj-org/xerj?include_prereleases&sort=semver)](https://github.com/xerj-org/xerj/releases)
-[![ES conformance](https://img.shields.io/badge/ES%20conformance-1365%2F1368-brightgreen.svg)](https://xerj.org/benchmarks)
-
-<video src="https://xerj.org/xerj-biz-demo.mp4" poster="docs/media/demo-poster.png" controls muted playsinline width="840">
-  <a href="https://xerj.org/aise-demo.html"><img src="docs/media/demo-poster.png" width="840" alt="Watch the XERJ demo: boot, ingest, search, vectors, dashboards"></a>
-</video>
-
-<sub>Boot, bulk ingest, search, vector kNN, live dashboards, no cuts.
-<a href="https://xerj.org/aise-demo.html">Watch it on xerj.org</a> or
-<a href="https://xerj.org/playground/">try the live playground</a>.</sub>
 
 ## Index a folder
 
@@ -122,6 +140,7 @@ load about half a percent of the tree.
 
 ## Use cases
 
+- **[Reference coding](https://xerj.org/case-studies/reference-coding.html)**: your coding agent retrieves how peer projects already solved it instead of re-deriving — measured 2.7× fewer output tokens than grep-driven coding (26× vs memory alone); users report ~5× in real development
 - **[Code search and security audits](https://xerj.org/use-cases/code-security-audit.html)**: AST-aware indexing, so an agent finds a function instead of a line
 - **[AI search and RAG](https://xerj.org/use-cases/ai-search-retrieval.html)**: full-text, vector and hybrid retrieval in one query, with no separate vector database
 - **[Agent memory](https://xerj.org/use-cases/second-brain.html)**: durable recall with a knowledge graph over your own documents
