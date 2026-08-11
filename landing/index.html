@@ -321,7 +321,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   </div>
 </section>
 
-<a href="#demo" class="cta">
+<a href="#prompt" class="cta" id="ctaCopy" data-prompt="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">
   <span>GET XERJ</span>
   <span class="arrow">↑</span>
 </a>
@@ -366,6 +366,21 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
           document.body.removeChild(ta);
           done();
         }
+      });
+    }
+    const cta = document.getElementById('ctaCopy');
+    if (cta) {
+      cta.addEventListener('click', () => {
+        const label = cta.querySelector('span');
+        const done = () => {
+          const orig = label.textContent;
+          label.textContent = 'PROMPT COPIED ✓';
+          setTimeout(() => { label.textContent = orig; }, 1600);
+        };
+        const text = cta.getAttribute('data-prompt');
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done).catch(done);
+        } else { done(); }
       });
     }
   })();
