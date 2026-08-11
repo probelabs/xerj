@@ -289,6 +289,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     specifying 7 routes out of the 200-plus the router registers. It is now
     titled and versioned as a partial spec, and says so.
 
+- **`autoindex` estimates the job on the user's own machine and hands the
+  decision back before it takes their laptop.** Phase A already reads and
+  parses every file to sniff and sample it, so it now *times* that work per
+  format family and turns it into a range with its basis printed next to it —
+  `code 500 files 749.3 MB at 11.7 MB/s measured over 500 file(s) → 64.2 s` —
+  rather than a constant calibrated on someone else's hardware. A family is
+  priced only from files phase A **provably** read end to end (whole-file
+  parsers always; streaming parsers only when the file was under the sampling
+  byte cap *and* stopped short of the record cap; never `sqlite`, never
+  gzip), and everything else is named under `unmeasured_families` with its
+  bytes instead of being priced at another family's rate. If nothing could be
+  measured there is no number at all and no gate. The two ends are the
+  classical list-scheduling bounds (Graham, 1969) over the phase-B worker
+  count that #240's resource policy chose.
+  The number is a **floor**, labelled as one on every surface: it covers
+  client-side extraction only, because measuring the server, the network or
+  embedding would mean writing to the index the estimate exists to ask
+  permission for. Measured on a 68 MB source tree the floor was 0.1 s against
+  a real 8.9 s run; on a 793 MB one, 64.2 s against ~350 s. The gate therefore
+  under-asks and never over-asks, and says so where a reader would otherwise
+  mistake silence for a promise.
+- **`--max-minutes` (default 10) stops the run and asks instead of deciding.**
+  Past the threshold with no answer, autoindex indexes nothing, writes a JSON
+  decision request to stdout and exits **4** — a code of its own, because exit
+  1 is already the catch-all for every real failure and an agent must be able
+  to tell "choose something" from "your endpoint is down". The payload carries
+  the estimate and its basis, file/byte counts, the per-band work order, the
+  heaviest directories with real byte counts (flagged when they match the
+  vendored/generated rule), and four options: `proceed`, `fast`, `narrower`,
+  `cancel`. Answer with `--approve <id>` (`--yes` = proceed), which skips the
+  gate; `--max-minutes 0` disables it. A person at a terminal gets the same
+  facts as prose plus a prompt; a piped or agent-driven run is **never**
+  blocked on stdin, and an unanswerable prompt is a cancel, never consent.
+  `--approve fast` really applies `--no-semantic --no-graph`, and `--approve
+  narrower` is refused with instructions rather than accepted and ignored
+  (#204). The `fast` option states no speed-up factor: it reports the datasets
+  and file count it changes and says plainly that this run did not measure the
+  factor.
+  The gate governs the phase-B route. An **incremental reconcile of an already
+  committed generation** (a `--no-graph` re-run over a folder that already has
+  one) processes only what changed and publishes from a sealed snapshot, so
+  `--max-minutes` does not apply there — and that route now *says so* on
+  stderr rather than accepting the flag and quietly not honouring it.
+
+### Changed
+
+- **`autoindex` indexes what matters first.** Phase B's queue was sorted by
+  size alone — right about scheduling, silent about value, so a user who
+  stopped early got whatever was largest, which on a source tree is
+  `node_modules`. Work is now ordered by value band (source and documents →
+  configuration → structured data → logs and line files → vendored, generated
+  and minified paths), with the old biggest-first rule kept *inside* each band
+  so a large file still runs alongside its band instead of becoming the tail;
+  a single-worker run goes smallest-first, where there is no tail to hide in.
+  One exception keeps the new order from costing wall clock: a file whose own
+  extraction outlasts everything ranked above it (`size × workers > the rest`)
+  starts first regardless of band. The bands, their file/byte counts and the
+  reason each sits where it does are printed with the plan and included in the
+  decision payload as `priority_order` — an unexplained order is
+  indistinguishable from an arbitrary one. Verified live on a 28 MB mixed
+  corpus at two workers: the first second of phase B was spent on
+  `src/mod_*.rs`, and the 1.7 MB `node_modules/**` files — the largest in the
+  corpus, and therefore *first* under the old rule — drained last.
+  Bytes-based progress and its percent are unaffected: reordering does not
+  change the denominator.
+
 ## [1.0.0-rc.15] - 2026-08-10
 
 ### Known issues in this release

@@ -274,6 +274,12 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         no_semantic: true,
         brain: Some("notes".into()),
         no_graph: false,
+        // The gate is switched off in these fixtures on purpose: they assert
+        // indexing, resume and edge behaviour, and a timing-derived stop would
+        // make them depend on how loaded the runner was. The gate's own
+        // behaviour is covered in `gate_tests` and `cli::tests`.
+        max_minutes: 0,
+        approve: None,
         dry_run: false,
         json: false,
         quiet: true,
