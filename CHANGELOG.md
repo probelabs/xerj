@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Default `_search` source payloads omit engine-generated embedding companions.** A
+  search with no `_source` now returns ordinary source fields without
+  `<field>_vector` and `<field>_vector_chunks`; measured payload size fell from
+  211,432 to 21,069 bytes for 5 hits (about 90%). Explicit `"_source": true`,
+  `"_source": ["field"]`, and include/exclude forms are unchanged. Add
+  `"_source": true` to restore the previous complete payload, including vectors.
+
 ### Security
 
 - **`cargo-audit` and `cargo-fuzz` now actually run in CI — they were only ever
@@ -1371,7 +1380,6 @@ documented "at most one bar per 15 s" floor is really 12.5 s.
   `embedding.default_endpoint` falls back to lexical at startup and
   `/v1/embedding/identity` reports `lexical` — the backend the server will
   really use — rather than `proxy`.
-
 ## [1.0.0-rc.10] - 2026-08-03
 
 ### Security

@@ -99,6 +99,11 @@ Content types:
   `inference_id` / `inference_endpoint`, or index your own vectors into a `dense_vector`
   field and use `knn`.
 
+- Default `_search` source is compact. When `_source` is omitted, ordinary source fields
+  are returned but engine-generated `<field>_vector` and `<field>_vector_chunks` companions
+  are omitted. Explicit `_source: true`, field lists, and include/exclude projections are
+  unchanged; add `_source: true` when the vectors are needed.
+
 - Ingest scale: streaming and resumable, multi-GB verified — NOT TB-scale end-to-end.
   The `autoindex` ingest pipeline streams with flat client memory (peak client RSS
   ~250 MB even at 5× input growth) and resumes after `kill -9` via a journal with
