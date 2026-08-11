@@ -7106,6 +7106,86 @@ fn unknown_field_hint(index: &str, body: &EsSearchBody, schema: &xerj_common::ty
     }))
 }
 
+/// `term`/`terms` clauses in a query, as (field, value) pairs.
+///
+/// Only exact-match clauses: a `match` against text is analysed and a zero
+/// result there is ordinary, not a taxonomy mistake.
+fn exact_term_clauses(q: &Value, out: &mut Vec<(String, String)>) {
+    match q {
+        Value::Object(o) => {
+            for (k, v) in o {
+                match k.as_str() {
+                    "term" => {
+                        if let Value::Object(inner) = v {
+                            for (f, val) in inner {
+                                let s = val
+                                    .get("value")
+                                    .unwrap_or(val)
+                                    .as_str()
+                                    .map(str::to_string);
+                                if let Some(s) = s {
+                                    out.push((f.clone(), s));
+                                }
+                            }
+                        }
+                    }
+                    "terms" => {
+                        if let Value::Object(inner) = v {
+                            for (f, val) in inner {
+                                if let Value::Array(a) = val {
+                                    for s in a.iter().filter_map(Value::as_str) {
+                                        out.push((f.clone(), s.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => referenced_or_recurse(v, out),
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|v| exact_term_clauses(v, out)),
+        _ => {}
+    }
+}
+
+fn referenced_or_recurse(v: &Value, out: &mut Vec<(String, String)>) {
+    exact_term_clauses(v, out);
+}
+
+/// Build the "you filtered on a value that does not exist" hint.
+///
+/// `present` is a bounded sample of the values actually stored in the field.
+/// A blind usability run filtered `ax_format: "markdown"` — an entirely
+/// reasonable guess — and got a silent zero, because this corpus classifies
+/// Markdown as `txt-prose`/`txt-lines`. Discovering that cost the agent two
+/// round trips and a terms aggregation it had to think to write.
+fn unknown_value_hint(index: &str, field: &str, value: &str, present: &[String]) -> Value {
+    json!({
+        "hints": [{
+            "code": "unknown_value",
+            // "include", not "are": this comes from a bounded sample, so a rare
+            // value may be missing from the list. Presenting a sample as the
+            // complete set would let a caller conclude a value does not exist
+            // when it simply was not sampled — a worse error than the one this
+            // hint is fixing.
+            "reason": format!(
+                "no results: `{field}` has no value `{value}` in `{index}`. \
+                 Values seen in a sample of this index include: {}. \
+                 For the complete set, aggregate on the field.",
+                present.join(", ")
+            ),
+            "try": {
+                "request": format!("POST /{index}/_search"),
+                "body": {
+                    "query": {"term": {field: present.first().cloned().unwrap_or_default()}},
+                    "_source": ["ax_path", "title"],
+                },
+            },
+        }],
+    })
+}
+
 /// Hint attached to an oversized `GET /{index}/_doc/{id}` response.
 ///
 /// A document fetch cannot be narrowed the way a search can, so the recovery is
@@ -12745,6 +12825,53 @@ async fn search_impl(
             if let Some(h) = unknown_field_hint(&index, &body, &schema) {
                 if let Some(Value::Array(items)) = h.get("hints") {
                     all_hints.extend(items.iter().cloned());
+                }
+            }
+            // A zero-hit exact filter on a real keyword field is nearly always
+            // a wrong-value guess rather than a genuine absence, and the reply
+            // gives no way to tell which. Sample a bounded slice of documents
+            // and name the values that do exist. Only on zero hits, only for
+            // exact clauses, and capped — this must never cost anything on a
+            // query that worked.
+            if all_hints.is_empty() && hits.is_empty() {
+                let mut clauses = Vec::new();
+                if let Some(q) = body.query.as_ref() {
+                    exact_term_clauses(q, &mut clauses);
+                }
+                for (field, value) in clauses.into_iter().take(2) {
+                    let base = field.split('.').next().unwrap_or(&field).to_string();
+                    let is_keyword = schema
+                        .field(&base)
+                        .is_some_and(|f| matches!(f.field_type, xerj_common::types::FieldType::Keyword));
+                    if !is_keyword {
+                        continue;
+                    }
+                    let Ok(sample_req) =
+                        xerj_query::parse_request(&json!({"query": {"match_all": {}}, "size": 256}))
+                    else {
+                        continue;
+                    };
+                    let Ok(sample) = idx.search(&sample_req).await else {
+                        continue;
+                    };
+                    let mut seen = std::collections::BTreeSet::new();
+                    for hit in &sample.hits {
+                        if let Some(v) = hit.source.get(&base).and_then(Value::as_str) {
+                            seen.insert(v.to_string());
+                        }
+                    }
+                    // High-cardinality fields (ids, paths) would produce a
+                    // useless wall of values; only enumerate a real taxonomy.
+                    if seen.is_empty() || seen.len() > 25 || seen.contains(&value) {
+                        continue;
+                    }
+                    let present: Vec<String> = seen.into_iter().collect();
+                    if let Some(Value::Array(items)) =
+                        unknown_value_hint(&index, &base, &value, &present).get("hints")
+                    {
+                        all_hints.extend(items.iter().cloned());
+                    }
+                    break;
                 }
             }
         }
