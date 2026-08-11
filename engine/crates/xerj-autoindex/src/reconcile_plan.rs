@@ -460,6 +460,7 @@ mod tests {
                 binary_kind: None,
                 csv: None,
                 encoding: "utf-8",
+                logical_name: None,
             }),
             sketches: vec![crate::GroupSketch {
                 group: None,

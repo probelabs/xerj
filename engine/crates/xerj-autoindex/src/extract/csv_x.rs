@@ -97,6 +97,7 @@ mod tests {
                 decimal_comma,
             }),
             encoding: "utf-8",
+            logical_name: None,
         }
     }
 

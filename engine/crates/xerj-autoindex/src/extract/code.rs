@@ -112,9 +112,14 @@ fn registry() -> &'static [LangDef] {
     })
 }
 
-pub fn extract(path: &Path, sink: Sink) -> Result<ExtractStats> {
+pub fn extract(path: &Path, sn: &crate::sniff::Sniffed, sink: Sink) -> Result<ExtractStats> {
     let mut stats = ExtractStats::default();
-    let ext = path
+    // Grammar lookup and title are keyed on the LOGICAL name from `Sniffed`,
+    // never on `path`: durable preparation reads content-addressed snapshot
+    // blobs (`blobs/00000000`), so an extension recovered from the content
+    // path is empty there and classified every code file as junk (#294).
+    let named = sn.logical_name.as_deref().unwrap_or(path);
+    let ext = named
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -132,7 +137,7 @@ pub fn extract(path: &Path, sink: Sink) -> Result<ExtractStats> {
     // Parse + capture definitions. A parse failure (or an over-deep tree) is not
     // fatal — index the file as plain text so its content is still searchable.
     let symbols = parse_symbols(def, &text).unwrap_or_default();
-    emit_code_doc(path, def.name, &text, &symbols, &mut stats, sink);
+    emit_code_doc(named, def.name, &text, &symbols, &mut stats, sink);
     Ok(stats)
 }
 
@@ -530,6 +535,27 @@ mod tests {
     fn all_queries_compile() {
         // registry() builds every Query; a malformed query panics here.
         assert!(registry().len() >= 13);
+    }
+
+    /// #294 at this extractor's own boundary: content in an extensionless
+    /// snapshot blob, language resolved from the logical name on `Sniffed`.
+    #[test]
+    fn extracts_from_extensionless_blob_via_sniffed_logical_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("00000000");
+        std::fs::write(&blob, "def alpha_helper():\n    return 1\n").unwrap();
+        let sn = crate::sniff::sniff_with_name(&blob, Path::new("src/app.py")).unwrap();
+        assert_eq!(sn.family, crate::sniff::Family::Code);
+        let mut records: Vec<RawRecord> = Vec::new();
+        let stats = extract(&blob, &sn, &mut |record| {
+            records.push(record);
+            true
+        })
+        .unwrap();
+        assert_eq!((stats.records, stats.junk), (1, 0));
+        assert_eq!(records[0].fields["language"], "python");
+        // Title comes from the logical name, not the blob ordinal.
+        assert_eq!(records[0].fields["title"], "app.py");
     }
 
     #[test]
