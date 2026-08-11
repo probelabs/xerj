@@ -6556,20 +6556,21 @@ impl Index {
         // Auto-evolve schema for new fields.
         // Fast path: skip the schema read lock every doc when schema is stable.
         // We cache a hash of the document field keys and only re-check schema
-        // evolution every 100 docs (or when field keys change).
+        // evolution every 100 docs (or when field keys change). The hash
+        // walks NESTED field names too, not just the top-level ones (see
+        // `hash_all_field_names`) -- a document whose top-level key set is
+        // unchanged but whose nested shape changed (e.g. metadata.kind on
+        // one document, metadata.project on the next) must still produce a
+        // different hash, or this throttle would silently suppress the
+        // evolve call that the newly-nested key needs, for up to 100
+        // documents -- exactly the failure mode the recursive dynamic-
+        // mapping fix (`merge_dynamic_children_into`) exists to close, one
+        // layer further up the call chain.
         let should_evolve = {
             let current_count = self.doc_count.load(Ordering::Relaxed);
             let last_epoch = self.schema_hash_epoch.load(Ordering::Relaxed);
-            // Compute a quick hash of the doc's field names.
             let mut h: u64 = 0xcbf29ce484222325;
-            if let Some(obj) = source.as_object() {
-                for k in obj.keys() {
-                    for b in k.bytes() {
-                        h ^= b as u64;
-                        h = h.wrapping_mul(0x00000100000001b3);
-                    }
-                }
-            }
+            hash_all_field_names(&source, &mut h);
             let cached = self.schema_hash_cache.load(Ordering::Relaxed);
             if cached != h {
                 // Field set changed — must evolve and update cache.
@@ -6947,22 +6948,35 @@ impl Index {
             );
             // Fast-path: for a stable, non-dynamic schema we can skip
             // the entire per-doc evolve pass.  Under dynamic mapping we
-            // cheaply collect the union of unknown field names seen in
-            // this batch under the read lock, then only upgrade to a
-            // write lock if we actually found any.
-            let mut unknown_field_sources: Vec<&Value> = Vec::new();
+            // cheaply collect the sources that might actually change the
+            // schema under the read lock, then only upgrade to a write
+            // lock (inside `evolve_schema_from_doc`, called per source
+            // below) for the ones that do. "Might change the schema" is
+            // two things, not one: a brand-new top-level field (as
+            // before), OR a new nested child under a top-level field the
+            // schema already has (`field_config_needs_merge`) -- without
+            // the second check, a document whose only new content is
+            // nested (e.g. `metadata.project` after `metadata.kind` was
+            // already known) would never reach `evolve_schema_from_doc` at
+            // all here, no matter how many times it fixed this same gap
+            // internally.
+            let mut sources_needing_evolve: Vec<&Value> = Vec::new();
             if is_dynamic {
                 for ingest in &processed {
                     if let Some(obj) = ingest.source.as_object() {
-                        let has_unknown = obj.keys().any(|k| !schema_guard.schema.has_field(k));
-                        if has_unknown {
-                            unknown_field_sources.push(ingest.source.as_ref());
+                        let needs_evolve =
+                            obj.iter().any(|(k, v)| match schema_guard.schema.field(k) {
+                                None => true,
+                                Some(existing) => field_config_needs_merge(existing, v),
+                            });
+                        if needs_evolve {
+                            sources_needing_evolve.push(ingest.source.as_ref());
                         }
                     }
                 }
             }
             drop(schema_guard);
-            for src in unknown_field_sources {
+            for src in sources_needing_evolve {
                 self.evolve_schema_from_doc(src).await;
             }
         }
@@ -18278,13 +18292,26 @@ impl Index {
     /// added under a single write lock, which re-checks `has_field` exactly
     /// like the per-doc slow path does.
     async fn evolve_schema_from_docs(&self, sources: &[Arc<Value>]) {
-        let new_fields: Vec<(String, FieldConfig)> = {
+        // Fast path: read-lock scan for TWO kinds of change, not just one --
+        // a brand-new top-level field (as before), or a NEW NESTED CHILD
+        // under a top-level field the schema already knows about (the fix
+        // for a real gap found in review: gating purely on "does the
+        // top-level key already exist" meant a later document introducing
+        // e.g. `metadata.project` after an earlier one already registered
+        // `metadata` from its own `{"kind": ...}` was never inspected again,
+        // no matter how many more documents arrived -- see
+        // `field_config_needs_merge`'s doc comment for the full story).
+        // Stores the raw value (not a precomputed FieldConfig) for both
+        // kinds, so the write-lock section below can re-derive against the
+        // live schema rather than trusting a possibly-stale read-lock
+        // snapshot.
+        let (new_top_level, needs_merge): (Vec<(String, Value)>, Vec<(String, Value)>) = {
             let schema = self.schema.read().await;
             if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
                 return;
             }
-            let date_detection = self.date_detection_enabled();
-            let mut out: Vec<(String, FieldConfig)> = Vec::new();
+            let mut new_top_level = Vec::new();
+            let mut needs_merge = Vec::new();
             for source in sources {
                 let Some(obj) = source.as_object() else {
                     continue;
@@ -18293,16 +18320,20 @@ impl Index {
                     if key.starts_with(PASSAGE_METADATA_PREFIX) {
                         continue;
                     }
-                    if !schema.schema.has_field(key) && !out.iter().any(|(k, _)| k == key) {
-                        let fc = dynamic_field_config(key, val, date_detection);
-                        out.push((key.clone(), fc));
+                    match schema.schema.field(key) {
+                        None => new_top_level.push((key.clone(), val.clone())),
+                        Some(existing) => {
+                            if field_config_needs_merge(existing, val) {
+                                needs_merge.push((key.clone(), val.clone()));
+                            }
+                        }
                     }
                 }
             }
-            out
+            (new_top_level, needs_merge)
         };
 
-        if new_fields.is_empty() {
+        if new_top_level.is_empty() && needs_merge.is_empty() {
             return;
         }
 
@@ -18311,15 +18342,20 @@ impl Index {
         // same limit, but the engine's dynamic-mapping path calls
         // `Schema::add_field` directly, which previously bypassed the cap.
         // An authenticated client could ingest documents with arbitrarily many
-        // distinct field names, bloating the schema unbounded.
+        // distinct field names, bloating the schema unbounded. This is an
+        // approximate early exit on `new_top_level` alone (a `needs_merge`
+        // entry might add zero fields or several, not knowable without
+        // walking it against the live schema, which the write-lock section
+        // below does anyway) -- the write lock's own per-field checks are
+        // the real, exact enforcement.
         {
             let schema = self.schema.read().await;
             let current = schema.schema.field_count() as u32;
-            let projected = current.saturating_add(new_fields.len() as u32);
+            let projected = current.saturating_add(new_top_level.len() as u32);
             if projected > self.max_fields_per_index {
                 tracing::warn!(
                     current_fields = current,
-                    new_fields = new_fields.len(),
+                    new_fields = new_top_level.len(),
                     limit = self.max_fields_per_index,
                     "rejecting schema evolution: field limit exceeded"
                 );
@@ -18327,29 +18363,63 @@ impl Index {
             }
         }
 
+        let date_detection = self.date_detection_enabled();
         let mut schema = self.schema.write().await;
         if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
             return;
         }
-        // Re-check under the write lock: another concurrent ingest may have
-        // already added fields up to the limit between the read-lock check
-        // above and this write lock.
+        // Re-derive against the live schema under the write lock rather than
+        // trusting the read-lock snapshot: another concurrent ingest may
+        // have already added fields (up to the limit, or the exact ones
+        // this batch also wants) between the read-lock check above and this
+        // write lock.
         let mut schema_changed = false;
-        for (_, fc) in new_fields {
-            if !schema.schema.has_field(&fc.name) {
-                if schema.schema.field_count() as u32 >= self.max_fields_per_index {
-                    tracing::warn!(
-                        field = %fc.name,
-                        limit = self.max_fields_per_index,
-                        "rejecting new field: field limit reached"
-                    );
-                    break;
+        let mut field_count = schema.schema.field_count() as u32;
+        for (key, val) in new_top_level {
+            if let Some(existing) = schema.schema.field_mut(&key) {
+                // Raced in since the read-lock scan -- merge into it
+                // instead of skipping outright, so a key another doc in
+                // this same batch also introduces isn't lost.
+                if merge_dynamic_children_into(
+                    existing,
+                    &val,
+                    date_detection,
+                    1,
+                    &mut field_count,
+                    self.max_fields_per_index,
+                ) {
+                    schema_changed = true;
                 }
-                if matches!(fc.field_type, FieldType::Date) {
-                    self.has_date_fields.store(true, Ordering::Relaxed);
+                continue;
+            }
+            if field_count >= self.max_fields_per_index {
+                tracing::warn!(
+                    field = %key,
+                    limit = self.max_fields_per_index,
+                    "rejecting new field: field limit reached"
+                );
+                break;
+            }
+            let fc = dynamic_field_config(&key, &val, date_detection);
+            if matches!(fc.field_type, FieldType::Date) {
+                self.has_date_fields.store(true, Ordering::Relaxed);
+            }
+            field_count += 1;
+            let _ = schema.schema.add_field(fc);
+            schema_changed = true;
+        }
+        for (key, val) in needs_merge {
+            if let Some(existing) = schema.schema.field_mut(&key) {
+                if merge_dynamic_children_into(
+                    existing,
+                    &val,
+                    date_detection,
+                    1,
+                    &mut field_count,
+                    self.max_fields_per_index,
+                ) {
+                    schema_changed = true;
                 }
-                let _ = schema.schema.add_field(fc);
-                schema_changed = true;
             }
         }
         if schema_changed {
@@ -18366,35 +18436,46 @@ impl Index {
         // Fast path: check with a read lock first to avoid taking a write lock
         // on every document when all fields are already known.  This is the
         // common case after the first few documents and avoids the write lock
-        // bottleneck that otherwise limits indexing throughput.
-        let new_fields: Vec<(String, FieldConfig)> = {
+        // bottleneck that otherwise limits indexing throughput. `needs_write`
+        // covers both a brand-new top-level field and a new nested child
+        // under an already-known one -- see `evolve_schema_from_docs` for
+        // the full rationale (same fix, single-document form).
+        let needs_write = {
             let schema = self.schema.read().await;
             if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
                 return;
             }
-            let date_detection = self.date_detection_enabled();
-            obj.iter()
-                .filter(|(key, _)| {
-                    !key.starts_with(PASSAGE_METADATA_PREFIX) && !schema.schema.has_field(key)
-                })
-                .map(|(key, val)| (key.clone(), dynamic_field_config(key, val, date_detection)))
-                .collect()
+            obj.iter().any(|(key, val)| {
+                if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                    return false;
+                }
+                match schema.schema.field(key) {
+                    None => true,
+                    Some(existing) => field_config_needs_merge(existing, val),
+                }
+            })
         };
 
-        if new_fields.is_empty() {
-            // No new fields — skip the write lock entirely (hot path).
+        if !needs_write {
+            // Nothing new — skip the write lock entirely (hot path).
             return;
         }
 
-        // Mapping-explosion guard (see evolve_schema_from_docs for rationale).
+        // Mapping-explosion guard (see evolve_schema_from_docs for rationale
+        // -- this single-document form only ever contributes at most
+        // `obj.len()` brand-new top-level fields, so that bound is used for
+        // the same approximate early exit; a merge's real growth is
+        // enforced exactly under the write lock below).
         {
             let schema = self.schema.read().await;
             let current = schema.schema.field_count() as u32;
-            let projected = current.saturating_add(new_fields.len() as u32);
+            let new_top_level_upper_bound =
+                obj.keys().filter(|k| !schema.schema.has_field(k)).count() as u32;
+            let projected = current.saturating_add(new_top_level_upper_bound);
             if projected > self.max_fields_per_index {
                 tracing::warn!(
                     current_fields = current,
-                    new_fields = new_fields.len(),
+                    new_fields = new_top_level_upper_bound,
                     limit = self.max_fields_per_index,
                     "rejecting schema evolution: field limit exceeded"
                 );
@@ -18402,29 +18483,47 @@ impl Index {
             }
         }
 
-        // Slow path: at least one new field found.  Upgrade to write lock and
-        // persist the updated schema.
+        // Slow path: at least one new field or new nested child found.
+        // Upgrade to write lock and persist the updated schema.
+        let date_detection = self.date_detection_enabled();
         let mut schema = self.schema.write().await;
         if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
             return;
         }
         let mut schema_changed = false;
-        for (_, fc) in new_fields {
-            if !schema.schema.has_field(&fc.name) {
-                if schema.schema.field_count() as u32 >= self.max_fields_per_index {
-                    tracing::warn!(
-                        field = %fc.name,
-                        limit = self.max_fields_per_index,
-                        "rejecting new field: field limit reached"
-                    );
-                    break;
-                }
-                if matches!(fc.field_type, FieldType::Date) {
-                    self.has_date_fields.store(true, Ordering::Relaxed);
-                }
-                let _ = schema.schema.add_field(fc);
-                schema_changed = true;
+        let mut field_count = schema.schema.field_count() as u32;
+        for (key, val) in obj {
+            if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                continue;
             }
+            if let Some(existing) = schema.schema.field_mut(key) {
+                if merge_dynamic_children_into(
+                    existing,
+                    val,
+                    date_detection,
+                    1,
+                    &mut field_count,
+                    self.max_fields_per_index,
+                ) {
+                    schema_changed = true;
+                }
+                continue;
+            }
+            if field_count >= self.max_fields_per_index {
+                tracing::warn!(
+                    field = %key,
+                    limit = self.max_fields_per_index,
+                    "rejecting new field: field limit reached"
+                );
+                break;
+            }
+            let fc = dynamic_field_config(key, val, date_detection);
+            if matches!(fc.field_type, FieldType::Date) {
+                self.has_date_fields.store(true, Ordering::Relaxed);
+            }
+            field_count += 1;
+            let _ = schema.schema.add_field(fc);
+            schema_changed = true;
         }
         if schema_changed {
             let _ = self.save_schema(&schema).await;
@@ -28576,10 +28675,21 @@ fn infer_field_type(val: &Value, date_detection: bool) -> FieldType {
 /// `KeywordFieldMapper("keyword").ignoreAbove(256)`).
 const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
 
-/// ES default `index.mapping.depth.limit` — how many `properties` levels a
-/// dynamically discovered document may nest before recursion stops. Applies
-/// only to the nested-object walk below; it does not change how deep an
-/// *explicit* `_mapping` PUT may nest (that path is unaffected by this cap).
+/// Same numeric default as ES's `index.mapping.depth.limit` -- but NOT the
+/// same behavior. Real ES rejects the document with a `MapperParsingException`
+/// once nesting exceeds the limit; this cap silently stops recursing and
+/// maps everything past it as an opaque, un-recursed `Object`, the same way
+/// the whole dynamic-mapping-evolution path already treats
+/// `max_fields_per_index` (see `evolve_schema_from_docs`'s own
+/// silently-skip-and-`tracing::warn!` handling right next to where this cap
+/// is consulted) -- every guard in this call chain is fire-and-forget by
+/// design today, not just this one. Making depth rejection hard (a real
+/// client-visible error, the #204 "accepted-and-ignored" class this repo
+/// otherwise avoids) would mean giving `evolve_schema_from_doc`/
+/// `evolve_schema_from_docs` a `Result` and deciding how a mixed bulk
+/// request (one oversized document among many) should behave -- a bigger,
+/// separate change than this cap alone, tracked as a follow-up rather than
+/// bundled in here inconsistently with the neighboring guard.
 const DYNAMIC_MAPPING_DEPTH_LIMIT: usize = 20;
 
 /// Build the [`FieldConfig`] for a dynamically discovered field.
@@ -28633,13 +28743,7 @@ fn dynamic_field_config_at_depth(
             fc.fields.push(kw);
         }
         FieldType::Object if depth < DYNAMIC_MAPPING_DEPTH_LIMIT => {
-            // `val` itself may be the Array whose first element inferred
-            // Object (see doc comment) -- unwrap to whichever object is the
-            // real source of the nested keys.
-            let obj = val
-                .as_object()
-                .or_else(|| val.as_array()?.iter().find(|v| !v.is_null())?.as_object());
-            if let Some(obj) = obj {
+            if let Some(obj) = object_keys_of(val) {
                 for (sub_key, sub_val) in obj {
                     fc.fields.push(dynamic_field_config_at_depth(
                         sub_key,
@@ -28653,6 +28757,137 @@ fn dynamic_field_config_at_depth(
         _ => {}
     }
     fc
+}
+
+/// Unwrap `val` to whichever object actually carries a set of keys to walk
+/// -- either `val` itself, or (mirroring `infer_field_type`'s own
+/// first-non-null-element handling for arrays) the first non-null element
+/// of an array whose inferred type is `Object`. Shared by the fresh-field
+/// discovery path above and the existing-field merge path below so both
+/// treat array-of-objects the same way.
+fn object_keys_of(val: &Value) -> Option<&serde_json::Map<String, Value>> {
+    val.as_object()
+        .or_else(|| val.as_array()?.iter().find(|v| !v.is_null())?.as_object())
+}
+
+/// FNV-1a hash of every field NAME in `val`, at EVERY nesting depth, into
+/// `h` -- not just the top-level keys. Used by the single-doc ingest path's
+/// schema-evolution throttle (`index_document_with_version_inner_guarded`)
+/// to fingerprint "does this document's field-name shape differ from the
+/// last one we evolved the schema for". A shallow, top-level-only hash
+/// would miss a document whose top-level keys are unchanged but whose
+/// NESTED shape changed -- e.g. `metadata.kind` on one document,
+/// `metadata.project` on the next -- silently suppressing the schema-evolve
+/// call that new nested key needs, for up to 100 documents. For a
+/// document with no nested objects this hashes exactly the same bytes in
+/// the same order as hashing only the top-level keys, so it's a strict
+/// superset, not a behavior change, for the common flat-document case.
+fn hash_all_field_names(val: &Value, h: &mut u64) {
+    let Some(obj) = val.as_object() else {
+        return;
+    };
+    for (k, v) in obj {
+        for b in k.bytes() {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x00000100000001b3);
+        }
+        hash_all_field_names(v, h);
+    }
+}
+
+/// Cheap, read-only check: would merging `val`'s keys into `existing`
+/// actually add anything new? Mirrors `merge_dynamic_children_into`'s walk
+/// without mutating, so `evolve_schema_from_doc`/`evolve_schema_from_docs`
+/// can decide whether a write lock is worth taking at all -- the common
+/// case, once a field's shape has stabilized, is "no" for every field in
+/// most documents.
+fn field_config_needs_merge(existing: &FieldConfig, val: &Value) -> bool {
+    if !matches!(existing.field_type, FieldType::Object | FieldType::Nested) {
+        return false;
+    }
+    let Some(obj) = object_keys_of(val) else {
+        return false;
+    };
+    obj.iter().any(
+        |(key, sub_val)| match existing.fields.iter().find(|f| f.name == *key) {
+            Some(child) => field_config_needs_merge(child, sub_val),
+            None => true,
+        },
+    )
+}
+
+/// Merge newly-seen dynamic children from `val` into `field`'s existing
+/// `fields`, recursively -- the fix for a real gap found in review:
+/// dynamic mapping used to gate purely on whether a field's TOP-LEVEL name
+/// already existed in the schema, so once e.g. `metadata` was known from a
+/// first document's `{"kind": "..."}`, a later document's
+/// `metadata.project` was never inspected again no matter how many more
+/// documents arrived, even though it stayed perfectly queryable via
+/// `_source` dotted-path resolution the whole time -- the exact
+/// "queryable but invisible" symptom this whole fix is about, one level
+/// down. Real ES doesn't have this gap: it registers dynamic mappers keyed
+/// on the full dotted path, so a later document introducing a new nested
+/// key is mapped normally.
+///
+/// `field_count`/`limit` enforce the same per-schema `max_fields_per_index`
+/// budget the top-level dynamic-mapping loop already enforces (see
+/// `Schema::field_count`, which now counts nested children too) --
+/// `field_count` is threaded through and incremented in place so multiple
+/// calls sharing one document (or one bulk batch) share a single running
+/// budget rather than each independently getting the full limit.
+fn merge_dynamic_children_into(
+    field: &mut FieldConfig,
+    val: &Value,
+    date_detection: bool,
+    depth: usize,
+    field_count: &mut u32,
+    limit: u32,
+) -> bool {
+    if !matches!(field.field_type, FieldType::Object | FieldType::Nested) {
+        return false;
+    }
+    if depth >= DYNAMIC_MAPPING_DEPTH_LIMIT {
+        return false;
+    }
+    let Some(obj) = object_keys_of(val) else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, sub_val) in obj {
+        match field.fields.iter_mut().find(|f| f.name == *key) {
+            Some(existing) => {
+                if merge_dynamic_children_into(
+                    existing,
+                    sub_val,
+                    date_detection,
+                    depth + 1,
+                    field_count,
+                    limit,
+                ) {
+                    changed = true;
+                }
+            }
+            None => {
+                if *field_count >= limit {
+                    tracing::warn!(
+                        field = %key,
+                        limit,
+                        "rejecting new nested field: field limit reached"
+                    );
+                    break;
+                }
+                field.fields.push(dynamic_field_config_at_depth(
+                    key,
+                    sub_val,
+                    date_detection,
+                    depth + 1,
+                ));
+                *field_count += 1;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 // ── DocValues fast-path helpers ───────────────────────────────────────────────
@@ -36962,9 +37197,14 @@ mod date_detection_tests {
             cur = next;
             levels += 1;
         }
-        assert!(
-            levels < DYNAMIC_MAPPING_DEPTH_LIMIT + 5,
-            "recursion must stop before reaching the artificially deep bottom, got {levels} levels"
+        // Pin the exact stopping point, not just "somewhere before the
+        // bottom": the root itself is depth 1, so the last node the walk
+        // still recurses *into* is depth DYNAMIC_MAPPING_DEPTH_LIMIT -- one
+        // fewer hop than the limit's own value.
+        assert_eq!(
+            levels,
+            DYNAMIC_MAPPING_DEPTH_LIMIT - 1,
+            "recursion must stop at exactly the depth cap, got {levels} levels"
         );
 
         // Array of objects: infer_field_type already only looks at the
@@ -36983,6 +37223,122 @@ mod date_detection_tests {
             "only the first element's keys are discovered"
         );
         assert_eq!(fc.fields[0].name, "kind");
+    }
+
+    /// The core fix for a real gap found in review: a top-level field
+    /// already known to the schema (from an earlier document) must still
+    /// pick up a NEW nested child a later document introduces, instead of
+    /// staying frozen the moment it was first registered.
+    #[test]
+    fn merge_dynamic_children_into_adds_new_nested_keys_to_an_existing_field() {
+        let mut field =
+            dynamic_field_config("metadata", &serde_json::json!({"kind": "preference"}), true);
+        assert_eq!(field.fields.len(), 1);
+
+        let mut field_count = 10u32;
+        let changed = merge_dynamic_children_into(
+            &mut field,
+            &serde_json::json!({"project": "xerj"}),
+            true,
+            1,
+            &mut field_count,
+            100,
+        );
+        assert!(changed);
+        assert_eq!(field.fields.len(), 2, "{field:?}");
+        assert!(field.fields.iter().any(|f| f.name == "kind"));
+        assert!(field.fields.iter().any(|f| f.name == "project"));
+        assert_eq!(field_count, 11, "one new field was actually added");
+
+        // Re-merging the exact same shape adds nothing and reports no change.
+        let mut field_count2 = 11u32;
+        let changed_again = merge_dynamic_children_into(
+            &mut field,
+            &serde_json::json!({"project": "xerj"}),
+            true,
+            1,
+            &mut field_count2,
+            100,
+        );
+        assert!(!changed_again);
+        assert_eq!(field.fields.len(), 2);
+        assert_eq!(field_count2, 11);
+    }
+
+    #[test]
+    fn merge_dynamic_children_into_respects_the_field_count_budget() {
+        let mut field = dynamic_field_config("metadata", &serde_json::json!({"a": 1}), true);
+        let mut field_count = 5u32;
+        // Budget already exhausted -- must add nothing even though "b" is new.
+        let changed = merge_dynamic_children_into(
+            &mut field,
+            &serde_json::json!({"b": 2}),
+            true,
+            1,
+            &mut field_count,
+            5,
+        );
+        assert!(!changed);
+        assert_eq!(field.fields.len(), 1, "{field:?}");
+        assert_eq!(field_count, 5, "budget must not be exceeded");
+    }
+
+    #[test]
+    fn field_config_needs_merge_matches_merge_dynamic_children_into() {
+        let field =
+            dynamic_field_config("metadata", &serde_json::json!({"kind": "preference"}), true);
+
+        assert!(
+            field_config_needs_merge(&field, &serde_json::json!({"project": "xerj"})),
+            "a genuinely new nested key must be flagged"
+        );
+        assert!(
+            !field_config_needs_merge(&field, &serde_json::json!({"kind": "other"})),
+            "an already-known nested key changing VALUE (not shape) needs no merge"
+        );
+        assert!(
+            !field_config_needs_merge(&field, &serde_json::json!("not an object")),
+            "a non-object value has no keys to discover"
+        );
+    }
+
+    /// A document whose top-level key set is unchanged must still hash
+    /// differently once its NESTED shape changes -- otherwise the
+    /// single-doc ingest path's schema-evolution throttle
+    /// (`index_document_with_version_inner_guarded`) silently suppresses
+    /// the evolve call a new nested key needs, for up to 100 documents.
+    #[test]
+    fn hash_all_field_names_is_sensitive_to_nested_shape_not_just_top_level_keys() {
+        let mut h1: u64 = 0xcbf29ce484222325;
+        hash_all_field_names(
+            &serde_json::json!({"text": "x", "metadata": {"kind": "preference"}}),
+            &mut h1,
+        );
+
+        let mut h2: u64 = 0xcbf29ce484222325;
+        hash_all_field_names(
+            &serde_json::json!({"text": "x", "metadata": {"project": "xerj"}}),
+            &mut h2,
+        );
+
+        assert_ne!(
+            h1, h2,
+            "same top-level keys, different nested shape, must hash differently"
+        );
+
+        // Sanity: a flat document with no nested objects hashes the exact
+        // same bytes as hashing only its top-level keys would (no behavior
+        // change for the common case this throttle was written for).
+        let mut h_flat: u64 = 0xcbf29ce484222325;
+        hash_all_field_names(&serde_json::json!({"a": 1, "b": 2}), &mut h_flat);
+        let mut h_manual: u64 = 0xcbf29ce484222325;
+        for k in ["a", "b"] {
+            for b in k.bytes() {
+                h_manual ^= b as u64;
+                h_manual = h_manual.wrapping_mul(0x00000100000001b3);
+            }
+        }
+        assert_eq!(h_flat, h_manual);
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on
