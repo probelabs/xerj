@@ -565,7 +565,19 @@ fn read_plan_for_preflight(
                 }
             }
             Some(kind) if crate::sync::is_sync_record_kind(kind) => {
-                crate::sync::replay_record(&value, &mut committed_manifest, &mut pending_sync)?;
+                // Same contract as the authoritative replay in
+                // `open_after_preflight` (#283): this preflight runs first, so
+                // an invariant that leaks here bare is the one the user sees.
+                crate::sync::replay_record(&value, &mut committed_manifest, &mut pending_sync)
+                    .with_context(|| {
+                        format!(
+                            "the durable {kind} record at byte {record_start} in {} failed to \
+                             replay; the generation journal is not internally consistent, \
+                             and re-running will not repair it. No remote data was changed. \
+                             Rebuild with a new --state-dir and a new --prefix",
+                            path.display()
+                        )
+                    })?;
                 if matches!(kind, "sync_bootstrap" | "sync_commit") {
                     plan = committed_manifest
                         .as_ref()
@@ -838,11 +850,26 @@ impl Journal {
                                 embedding_identity_resumable = resumable;
                             }
                             Some(kind) if crate::sync::is_sync_record_kind(kind) => {
+                                // A durable record that no longer re-validates
+                                // is unrepairable by re-running; surface the
+                                // rebuild route instead of a bare internal
+                                // invariant, keeping the invariant as the
+                                // cause (#283).
                                 crate::sync::replay_record(
                                     &v,
                                     &mut committed_manifest,
                                     &mut pending_sync,
-                                )?;
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "the durable {kind} record at byte {record_start} in {} \
+                                         failed to replay; the generation journal is not \
+                                         internally consistent, and re-running will not repair \
+                                         it. No remote data was changed. Rebuild with a new \
+                                         --state-dir and a new --prefix",
+                                        jpath.display()
+                                    )
+                                })?;
                                 if matches!(kind, "sync_bootstrap" | "sync_commit") {
                                     plan = committed_manifest
                                         .as_ref()

@@ -407,7 +407,20 @@ fn begin_non_graph_generation(
         plan,
         groups,
     };
-    let pending = sync::PendingSync::new(tx_id, &base, desired)?;
+    // A failure here is the generation machinery contradicting itself about
+    // durable state, and the invariant text alone gives the user nothing to
+    // act on (#283). Name the recovery route; the invariant stays attached as
+    // the cause so the report keeps its diagnostic value.
+    let pending = sync::PendingSync::new(tx_id, &base, desired).with_context(|| {
+        format!(
+            "autoindex could not derive generation {} from committed generation {}; the durable \
+             generation state in {} is not internally consistent, and re-running will not repair \
+             it. No remote data was changed. Rebuild with a new --state-dir and a new --prefix",
+            base.generation + 1,
+            base.generation,
+            state_dir.display()
+        )
+    })?;
     journal.sync_begin(&pending)
 }
 
@@ -1374,6 +1387,17 @@ fn build_phase_a(
             file_count: c.members.len(),
         });
     }
+    // Aliases of junk/skipped content have no `plan.files` entry and therefore
+    // no manifest group to attach to, so keeping them made the generation
+    // cutover fail its own alias-projection invariant on any folder holding
+    // two byte-identical junk files — two empty files are enough (#283). The
+    // incremental projection already drops them (`reconcile_plan`'s
+    // `live_content` filter); the fresh plan must project the same way or a
+    // no-op re-run would see a changed plan and commit a spurious generation.
+    let duplicate_files = duplicate_files
+        .into_iter()
+        .filter(|alias| file_assignments.contains_key(&alias.file_key))
+        .collect();
     let plan = Plan {
         datasets,
         files: file_assignments,
