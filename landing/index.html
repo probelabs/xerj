@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="night">
+<html lang="en" data-theme="day">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -13,7 +13,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
-<link rel="stylesheet" href="/style.css?v=if2">
+<link rel="stylesheet" href="/style.css?v=if10">
 </head>
 <body>
 
@@ -33,74 +33,29 @@
   <a href="/playground.html">DASHBOARDS</a>
   <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
   <span class="theme">
-    <button type="button" data-theme="day">DAY</button>
+    <button type="button" data-theme="day" class="active">DAY</button>
     <span class="dash">·</span>
-    <button type="button" data-theme="night" class="active">NIGHT</button>
+    <button type="button" data-theme="night">NIGHT</button>
   </span>
 </nav>
 
-<!-- HERO ---------------------------------------------------->
-<section class="scene-section section-split hero-split">
-  <div class="split-copy">
-    <div class="kicker">
-      <span class="accent">XERJ.AI</span><span class="dash">·</span>
-      <span>THE AI-NATIVE SEARCH ENGINE</span><span class="dash">·</span>
-      <span>2026</span>
-    </div>
+<!-- HERO — one job: the prompt ----------------------------->
+<section class="hero-center">
+  <h1 class="hero">ONE PROMPT.<br>WORKING PRODUCT.<br><span class="hero-report-tag">USERS REPORT</span><span class="accent">~5× FEWER TOKENS.</span></h1>
 
-    <h1 class="hero"><span class="accent">XERJ.</span><br>STOP RE-DERIVING.<br>START LOOKING UP.</h1>
-
-    <div class="hero-install">
-      <div class="hero-install-agent" style="margin-top:0;">
-        <span class="hero-install-label">PASTE THIS TO YOUR AI AGENT · THE WHOLE SETUP</span>
-        <div class="hero-install-cmd agent-prompt">
-          <code>Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.</code>
-          <button type="button" class="hero-install-copy" data-copy="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">COPY</button>
-        </div>
-        <p class="hero-install-agent-line">One prompt is enough — llms.txt gives your agent
-          the ordered steps: install, start the server, <code>xerj autoindex .</code>,
-          query with any Elasticsearch client, and the reference-coding loop.
-          Measured: <strong>2.7× fewer output tokens</strong> than grep-driven Claude Code,
-          <strong>26× fewer</strong> than memory alone —
-          <a href="/case-studies/reference-coding.html">the case study</a>. Users report
-          <strong>~5×</strong> across real product development —
-          <a href="https://github.com/xerj-org/xerj/blob/main/user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md">field reports</a>.</p>
-      </div>
-      <div class="hero-install-label" style="margin-top:var(--sp-3);">OR INSTALL BY HAND · ONE COMMAND · SHA-256 CHECKSUMS</div>
-      <div class="hero-install-cmd">
-        <code>curl -fsSL https://xerj.org/get | sh</code>
-        <button type="button" class="hero-install-copy" data-copy="curl -fsSL https://xerj.org/get | sh">COPY</button>
-      </div>
-      <div class="hero-install-alt">
-        <span class="mono">WINDOWS · <code>irm https://xerj.org/get.ps1 | iex</code></span>
-        <button type="button" class="hero-install-copy" data-copy="irm https://xerj.org/get.ps1 | iex">COPY</button>
-      </div>
-    </div>
-
-    <p class="lead">
-      The AI-native search engine — connect it, run
-      <code class="inline">xerj&nbsp;autoindex</code>, and it works: any folder
-      becomes typed, queryable indices — <strong>zero configuration</strong>.
-      Give agents <strong>reference coding</strong>, <strong>long-term
-      memory</strong>, <strong>semantic search &amp; RAG</strong>,
-      <strong>hybrid</strong> BM25&nbsp;+&nbsp;vector retrieval,
-      <strong>auto-embedding</strong> on ingest, and <strong>anomaly
-      detection</strong> — no bolt-on vector database, no glue code. One binary
-      that speaks the Elasticsearch wire protocol, released under
-      <strong>Apache&#8209;2.0</strong>: no lock-in, no SSPL, no per-feature
-      gates. Yours to run, fork, and build on.
-    </p>
-  </div>
-
-  <div class="split-viz hero-demo">
-    <div class="hero-demo-stage" data-demo>
-      <video preload="metadata" playsinline src="/xerj-biz-demo.mp4"></video>
-      <button class="hero-demo-play" type="button" aria-label="Play the XERJ demo">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
-      </button>
-      <span class="hero-demo-label mono">XERJ · LIVE DEMO</span>
+  <div class="prompt-stage" id="prompt">
+    <div class="prompt-card">
+      <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
+      <code>Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.</code>
+      <button type="button" class="prompt-copy" data-copy="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">COPY THE PROMPT</button>
     </div>
   </div>
+
+  <p class="hero-sub">One paste — your agent installs XERJ, indexes your project and
+    the open-source repos worth learning from, and looks implementations up
+    instead of re-deriving them.</p>
+
+
 </section>
 
 <!-- 01 — REFERENCE CODING ------------------------------------->
@@ -286,87 +241,87 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   </div>
 </section>
 
-<section class="lead-capture" id="demo">
-  <div class="kicker"><span class="accent">XERJ.AI</span><span class="dash">·</span><span>OPEN THE PLAYGROUND</span></div>
-  <h3>TRY IT<br><span class="accent">RIGHT NOW.</span></h3>
-  <p>
-    Leave a work email and the live dashboards open immediately — explore the
-    query surface, vector search, aggregations, and agent memory on real data.
-    Stored only in your browser: no funnel, no sequenced drip, no "journey."
-  </p>
+<section class="scene-section" id="try">
+  <div class="kicker"><span class="accent">TRY IT</span><span class="dash">·</span><span>TWO MINUTES · NO SIGNUP</span></div>
+  <h2 class="scene">THREE WAYS <span class="accent">IN.</span></h2>
 
-  <form class="lead-form" id="leadForm" action="#" method="post" novalidate>
-    <div class="lead-form-input">
-      <input type="email" name="email" placeholder="you@company.com" required aria-label="Work email" autocomplete="email" />
+  <div class="recipes" style="grid-template-columns:repeat(3,1fr); margin-top:var(--sp-6);">
+    <a class="recipe" href="#prompt">
+      <span class="num">01 · WITH YOUR AGENT</span>
+      <span class="title">Paste the prompt</span>
+      <p class="lead">The prompt at the top of this page is the whole setup — install, index, reference coding. Copy it &rarr;</p>
+    </a>
+    <div class="recipe">
+      <span class="num">02 · IN A SHELL</span>
+      <span class="title">One command</span>
+      <p class="lead"><code>curl -fsSL https://xerj.org/get | sh</code>
+        <button type="button" class="hero-install-copy" data-copy="curl -fsSL https://xerj.org/get | sh">COPY</button><br>
+        Windows: <code>irm https://xerj.org/get.ps1 | iex</code>
+        <button type="button" class="hero-install-copy" data-copy="irm https://xerj.org/get.ps1 | iex">COPY</button></p>
     </div>
-    <button type="submit" class="demo">OPEN PLAYGROUND <span class="arrow">→</span></button>
-    <span class="note">We keep your email to follow up about XERJ — nothing else. No spam, no reselling.</span>
-  </form>
+    <a class="recipe" href="/playground/">
+      <span class="num">03 · IN THE BROWSER</span>
+      <span class="title">Open the playground</span>
+      <p class="lead">Live dashboards over real data — query surface, vectors, aggregations, agent memory. Nothing to install.</p>
+    </a>
+  </div>
+
+  <p class="hero-marks" style="margin-top:var(--sp-6);">
+    <a href="https://github.com/xerj-org/xerj/blob/main/user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md">FIELD REPORTS ~5×</a>
+    <span class="dash">·</span>
+    <a href="/case-studies/reference-coding.html">MEASURED 2.7× VS GREP-DRIVEN CLAUDE CODE</a>
+    <span class="dash">·</span>
+    <a href="/case-studies/reference-coding.html">21/21 VS 1/21 ON UNSEEN CONTRACTS</a>
+  </p>
 </section>
 
 <!-- BENCHMARKS — SUPPORTING EVIDENCE -------------------------->
-<section class="scene-section">
-  <div class="kicker"><span class="accent">05</span><span class="dash">·</span><span>SUPPORTING EVIDENCE · XERJ vs ELASTICSEARCH 8.13.4</span></div>
-  <div class="ticker">
-    <div class="tk">
-      <div class="eyebrow">FULL QUERY MATRIX · CLOSED-LOOP · CACHE OFF</div>
-      <div class="value"><span class="accent">55W</span> · 26T · 4L</div>
-      <div class="hint">vs live ES 8.13.4 · 3 N/A · the 4 losses are all read-under-write p99 (published too) · demo/playbooks/SCORECARD.md</div>
-    </div>
-    <div class="tk">
-      <div class="eyebrow">XERJ vs ES · BULK INGEST</div>
-      <div class="value"><span class="accent">1.72×</span> FASTER</div>
-      <div class="hint">191k vs 111k docs/s, same corpus, closed-loop · acked deletes survive SIGTERM/SIGKILL restarts (11/11 crash cells)</div>
-    </div>
-    <div class="tk">
-      <div class="eyebrow">XERJ vs ES · INDEX ON DISK</div>
-      <div class="value"><span class="accent">1.61×</span> SMALLER</div>
-      <div class="hint">index on-disk 176 MB vs ES 283 MB, same corpus · demo/playbooks/SCORECARD.md</div>
-    </div>
-  </div>
-  <p class="viz-caption" style="margin-top:var(--sp-4);">The engine numbers back the use cases up — they are not the product. kNN recall@10 measured 1.00 (unfiltered kNN is now HNSW-served with exact rescoring — re-measured 1.00 vs ES 8.13.4's 0.80 on the official bench cell). <a class="mono" href="/benchmarks/" style="color:var(--z-mute);">FULL BENCHMARK METHODOLOGY + REPRODUCTION →</a></p>
-</section>
-
-<!-- ENGINE --------------------------------------------------->
 <section class="scene-section" id="engine" style="border-top:0;">
-  <div class="kicker"><span class="accent">06</span><span class="dash">·</span><span>INSIDE XERJ</span></div>
-  <h2 class="scene">ONE BINARY.<br>NO JVM.<br><span class="accent">NO COMPROMISES.</span></h2>
+  <div class="kicker"><span class="accent">05</span><span class="dash">·</span><span>WHY XERJ · THE COMPETITIVE ADVANTAGE</span></div>
+  <h2 class="scene">THE ADVANTAGE,<br><span class="accent">FEATURE BY FEATURE.</span></h2>
 
   <p class="wide">
-    XERJ is written in Rust and ships as a single static binary.
-    No JVM to tune, no sidecars to deploy, no cluster coordinator to
-    install. The query planner, the vector index, the ingestion
-    pipeline, the embedded Raft consensus, and the HTTP server all
-    live in the same process.
+    Every feature exists to cut the thing agents actually spend: context.
+    Reading a file costs a context window; asking an index costs kilobytes.
+    XERJ puts everything an agent needs to <em>ask</em> — code, documents,
+    vectors, memory — behind one query surface.
   </p>
 
   <div class="row">
-    <div class="k">Query types</div>
-    <div class="v">50 query types, machine-checked against the parser dispatch table including native hybrid BM25 + kNN fusion — more than most dedicated vector databases</div>
+    <div class="k">AST code search</div>
+    <div class="v">Source is parsed with tree-sitter (13 languages) into symbols with kind and line number plus a searchable definitions field — the agent retrieves a <em>function with its contract</em>, not a grep line that needs the whole file opened to judge</div>
   </div>
   <div class="row">
-    <div class="k">Aggregations</div>
-    <div class="v">Metric + bucket + pipeline agg families · terms are <strong>~1.15×</strong> faster than ES because histograms are pre-computed at ingest</div>
+    <div class="k">Token economics</div>
+    <div class="v">In the <a href="/use-cases/code-security-audit.html">WordPress security audit</a>, an agent worked across 1,492 PHP files on roughly <strong>26,000 tokens</strong> — about half a percent of the tree read into context. That is the product; the speed is a side effect</div>
   </div>
   <div class="row">
-    <div class="k">Vector index</div>
-    <div class="v">HNSW-served kNN with exact rescoring on unfiltered queries (measured recall@10 1.00 on the official bench query) · exact brute-force scan for filtered / quantized / small-index shapes · cosine / L2 / dot · SQ8 / SQ4 / binary quantization · max 16,384 dims (ES caps at 4,096)</div>
+    <div class="k">Hybrid in one pass</div>
+    <div class="v">50 query types, machine-checked against the parser dispatch table, including native BM25 + kNN fusion (RRF) in a single query tree — no bolt-on vector database, no fusion glue between two systems</div>
   </div>
   <div class="row">
-    <div class="k">AI-native</div>
-    <div class="v">Auto-embed on ingest with a built-in lexical embedder (optional external proxy) · agent-memory store · anomaly detection · semantic search at query time</div>
+    <div class="k">Semantic without setup</div>
+    <div class="v">Auto-embed on ingest, fully offline. Honest by default: the built-in embedder is lexical feature-hashing (vocabulary overlap, not neural understanding); the in-binary neural encoder and the external-proxy mode are drop-in upgrades when you want them</div>
   </div>
   <div class="row">
-    <div class="k">Storage</div>
-    <div class="v">Columnar · 9 domain-aware encodings · ZSTD · <strong>1.20×</strong> smaller than ES on the benchmark corpus · mmap'd segments</div>
+    <div class="k">Agent memory + graph</div>
+    <div class="v">A namespaced <code class="inline">/_memory</code> REST API — store, recall by meaning / keyword / vector, filter, forget, physically isolated per agent — and a <code class="inline">/_graph</code> knowledge layer with evidence on every link</div>
   </div>
   <div class="row">
-    <div class="k">Cluster</div>
-    <div class="v">Embedded Raft consensus · metadata replication · region-based partitioning · no ZooKeeper / etcd</div>
+    <div class="k">Zero-config ingest</div>
+    <div class="v">One command sniffs 13 format families by content — code, CSV, JSON, PDF, DOCX, SQLite, logs — honours <code class="inline">.gitignore</code>, records junk instead of crashing on it, and resumes incrementally</div>
+  </div>
+  <div class="row">
+    <div class="k">Speaks Elasticsearch</div>
+    <div class="v">1,365 / 1,368 wire-conformance cases green on every commit — existing clients, dashboards and tooling connect unchanged. A migration bridge, not a clone: the engine underneath is designed for agents</div>
+  </div>
+  <div class="row">
+    <div class="k">One static binary</div>
+    <div class="v">Rust, no JVM, sub-second start, Apache-2.0 — laptop to server with the same artifact. Benchmarks with wins <em>and</em> losses published at <a href="/benchmarks">xerj.org/benchmarks</a></div>
   </div>
 </section>
 
-<a href="#demo" class="cta">
+<a href="#prompt" class="cta" id="ctaCopy" data-prompt="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">
   <span>GET XERJ</span>
   <span class="arrow">↑</span>
 </a>
@@ -393,8 +348,9 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
       btn.addEventListener('click', () => {
         const text = btn.getAttribute('data-copy');
         const done = () => {
+          const orig = btn.textContent;
           btn.textContent = 'COPIED';
-          setTimeout(() => { btn.textContent = 'COPY'; }, 1400);
+          setTimeout(() => { btn.textContent = orig; }, 1400);
         };
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(text).then(done, done);
@@ -412,20 +368,19 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
         }
       });
     }
-    const form = document.getElementById('leadForm');
-    if (form) {
-      form.addEventListener('submit', (e) => {
-        e.preventDefault();
-        const email = form.querySelector('input[type=email]').value.trim();
-        if (!email || !email.includes('@')) return;
-        console.log('[xerj lead]', email);
-        try { localStorage.setItem('xerj.playground.email', email); } catch (_) {}
-        // Capture the lead (fire-and-forget with keepalive so the redirect
-        // never waits on it), then open the live dashboards app.
-        try {
-          fetch('/lead', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, source: 'landing' }), keepalive: true }).catch(function () {});
-        } catch (_) {}
-        window.location.href = '/playground/';
+    const cta = document.getElementById('ctaCopy');
+    if (cta) {
+      cta.addEventListener('click', () => {
+        const label = cta.querySelector('span');
+        const done = () => {
+          const orig = label.textContent;
+          label.textContent = 'PROMPT COPIED ✓';
+          setTimeout(() => { label.textContent = orig; }, 1600);
+        };
+        const text = cta.getAttribute('data-prompt');
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done).catch(done);
+        } else { done(); }
       });
     }
   })();

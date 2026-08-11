@@ -4,14 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XERJ.ai — Reference-coding: the same Claude Code, a fraction of the tokens</title>
-<meta name="description" content="Paste one prompt and Claude Code stops re-deriving APIs it could look up. Measured across 13 purpose-built libraries in 5 languages: on code the model has not memorised, XERJ-retrieval makes the SAME model correct where memory fails (15/15 vs 1/15) at 1.5–2.7× fewer output tokens than native Claude Code. Every number verifiable; honest about where it doesn't help.">
+<meta name="description" content="Paste one prompt and Claude Code stops re-deriving APIs it could look up. Measured across 13 purpose-built libraries in 5 languages: on code the model has not memorised, XERJ-retrieval makes the SAME model correct where memory fails (21/21 vs 1/21) at 1.5–2.7× fewer output tokens than native Claude Code. Every number verifiable; honest about where it doesn't help.">
 <meta property="og:title" content="XERJ.ai — Reference-coding vs plain Claude Code">
 <meta property="og:description" content="One copy-paste prompt. 13 libraries, 5 languages, one hidden-test verdict, real tokens. Unfamiliar code: bare 1/21, XERJ-assisted 21/21 at 6.5× lower cost. Memorised code: honest overhead — and we say so.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
-<link rel="stylesheet" href="/style.css?v=cs0728">
+<link rel="stylesheet" href="/style.css?v=if9">
 <style>
   /* three-arm bars — self-contained, robust to the shared 2-col grid */
   .arm3 { margin: 12px 0 6px; }
@@ -67,7 +67,15 @@
 <!-- OPENER PROMPT -->
 <section class="scene-section" style="border-top:0; padding-top:0;">
   <div class="opener">
-    <div class="lbl">◆ Paste this into Claude Code to turn it on</div>
+    <div class="prompt-stage" id="prompt" style="max-width:880px; margin:0 auto 18px;">
+      <div class="prompt-card">
+        <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
+        <code>Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.</code>
+        <button type="button" class="prompt-copy" data-copy="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">COPY THE PROMPT</button>
+      </div>
+    </div>
+    <div class="hint">That is the current one-line setup — <a href="https://xerj.org/llms.txt" rel="external" style="color:var(--accent);">llms.txt</a> walks the agent through the full loop. The measurement below ran the study's original long-form prompt.</div>
+    <div class="lbl" style="margin-top:18px;">◆ The exact prompt the study measured</div>
     <pre>Set me up for reference-coding with XERJ and then use it automatically for the
 rest of our work, so I stop burning output tokens re-deriving APIs I could just
 look up.
@@ -129,6 +137,43 @@ Do this proactively for the rest of the session without me asking again.</pre>
     </ul>
   </div>
 </div>
+
+<!-- How it works, in depth -->
+<section class="scene-section">
+  <h2 class="scene" style="font-size:var(--fs-56);">HOW IT WORKS, <span class="accent">IN DEPTH.</span></h2>
+  <ul class="deep">
+    <li><strong>1 · The prompt resolves to llms.txt.</strong> The one-liner points the agent at
+      <a href="https://xerj.org/llms.txt" rel="external">xerj.org/llms.txt</a> — ordered machine-readable steps:
+      install from xerj.org/get, start the single binary, index, query over the Elasticsearch wire, and the
+      reference-coding rules (retrieve before writing, cite what you use, respect licences).</li>
+    <li><strong>2 · The corpus is chosen by problem domain, not language.</strong> The agent reads the project's
+      dependencies and domains, picks the open-source repos that already solve those problems, and
+      <code class="inline">xc-corpus.sh</code> shallow-clones them into a named corpus. Each repository's licence
+      is recorded in <code class="inline">corpus.json</code>; GPL/AGPL entries are approach-only — read the design,
+      never copy the code.</li>
+    <li><strong>3 · Indexing is AST-aware.</strong> <code class="inline">xc-index.sh</code> runs
+      <code class="inline">xerj autoindex</code>: every file is sniffed by content, and source files go through
+      tree-sitter grammars (13 languages) that emit the language, every symbol with its kind and line number, a
+      searchable <code class="inline">defs</code> field, and the full body. One index per dataset, incremental on
+      re-runs — re-index when the references change.</li>
+    <li><strong>4 · Retrieval is hybrid, with a stated fallback.</strong> <code class="inline">xc.py</code> runs
+      BM25 <code class="inline">multi_match</code> over <code class="inline">body</code>,
+      <code class="inline">defs</code> and <code class="inline">title</code> — with a measured (not hand-picked)
+      boost on <code class="inline">defs</code> so exact symbol names outrank prose — RRF-fused with a vector arm
+      where an index supports it. When no index does, it degrades to BM25-only and says so; a silently
+      lexical-only "hybrid" would be a lie. The default embedder is lexical feature-hashing — vocabulary overlap,
+      not neural understanding.</li>
+    <li><strong>5 · The loop has discipline.</strong> Before writing non-trivial code against an unfamiliar API the
+      agent retrieves, reads the returned definition with its <code class="inline">file:line</code>, adapts it,
+      cites the source, and checks the licence. If nothing relevant comes back it says so and falls back to normal
+      work — forcing a bad match in is worse than not retrieving.</li>
+    <li><strong>6 · Why the tokens collapse.</strong> A retry loop on an unmemorised API burns <em>output</em>
+      tokens — the kind priced 5× above input on Claude models. Grep recovery pulls source into context: up to
+      <strong>1.06M input tokens</strong> on one corpus in this study. A retrieved passage is a few hundred tokens
+      and carries the one thing a compiler can never leak — the runtime contract. The per-task table below shows
+      the collapse: thousands of tokens from memory, hundreds with retrieval.</li>
+  </ul>
+</section>
 
 <!-- Everything we built -->
 <section class="scene-section">
@@ -276,5 +321,20 @@ Do this proactively for the rest of the session without me asking again.</pre>
 </footer>
 
 <script src="/interact.js" defer></script>
+<style>
+  ul.deep { list-style:none; padding:0; max-width:900px; }
+  ul.deep li { margin:14px 0; line-height:1.65; color:var(--z-mute); font-size:15px; }
+  ul.deep li strong { color:var(--z-ink); }
+  ul.deep code.inline { color:var(--z-ink); }
+</style>
+<script>
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-copy]'); if (!btn) return;
+    navigator.clipboard.writeText(btn.getAttribute('data-copy')).then(function () {
+      var orig = btn.textContent; btn.textContent = 'COPIED';
+      setTimeout(function () { btn.textContent = orig; }, 1400);
+    });
+  });
+</script>
 </body>
 </html>
