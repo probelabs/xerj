@@ -1047,9 +1047,16 @@ impl Default for SearchRequest {
 }
 
 /// Controls which source fields are returned with each hit.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SourceFilter {
+    /// `_source` was omitted; the engine applies its default source projection.
+    ///
+    /// This is intentionally a unit variant.  With an untagged enum serde
+    /// serialises it as `null`, so it must stay before the value-carrying
+    /// variants for the corresponding round-trip to deserialize correctly.
+    #[default]
+    Default,
     /// `true` → return all source fields; `false` → return none.
     Enabled(bool),
     /// Return only the listed fields.
@@ -1061,12 +1068,6 @@ pub enum SourceFilter {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         excludes: Vec<String>,
     },
-}
-
-impl Default for SourceFilter {
-    fn default() -> Self {
-        SourceFilter::Enabled(true)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1137,4 +1138,69 @@ pub struct CollapseField {
     /// Optional inner_hits — return additional hits per group (opaque JSON for now).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inner_hits: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod source_filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn source_filter_shapes_round_trip_through_serde() {
+        let cases = [
+            (SourceFilter::Default, json!(null)),
+            (SourceFilter::Enabled(true), json!(true)),
+            (SourceFilter::Enabled(false), json!(false)),
+            (
+                SourceFilter::Includes(vec!["field".to_string()]),
+                json!(["field"]),
+            ),
+        ];
+
+        for (filter, expected_wire) in cases {
+            let wire = serde_json::to_value(&filter).unwrap();
+            assert_eq!(wire, expected_wire);
+            let round_tripped: SourceFilter = serde_json::from_value(wire).unwrap();
+            assert_eq!(round_tripped, filter);
+        }
+    }
+
+    #[test]
+    fn omitted_source_and_explicit_booleans_keep_distinct_variants() {
+        let omitted = crate::parser::parse_request(&json!({})).unwrap();
+        assert_eq!(omitted.source, SourceFilter::Default);
+
+        let explicitly_enabled = crate::parser::parse_request(&json!({
+            "_source": true
+        }))
+        .unwrap();
+        assert_eq!(explicitly_enabled.source, SourceFilter::Enabled(true));
+
+        let explicitly_disabled = crate::parser::parse_request(&json!({
+            "_source": false
+        }))
+        .unwrap();
+        assert_eq!(explicitly_disabled.source, SourceFilter::Enabled(false));
+    }
+
+    #[test]
+    fn search_request_source_shapes_round_trip_after_parsing() {
+        let cases = [
+            (json!({}), SourceFilter::Default),
+            (json!({"_source": true}), SourceFilter::Enabled(true)),
+            (json!({"_source": false}), SourceFilter::Enabled(false)),
+            (
+                json!({"_source": ["field"]}),
+                SourceFilter::Includes(vec!["field".to_string()]),
+            ),
+        ];
+
+        for (body, expected_source) in cases {
+            let request = crate::parser::parse_request(&body).unwrap();
+            assert_eq!(request.source, expected_source);
+            let serialized = serde_json::to_value(&request).unwrap();
+            let round_tripped: SearchRequest = serde_json::from_value(serialized).unwrap();
+            assert_eq!(round_tripped.source, expected_source);
+        }
+    }
 }
