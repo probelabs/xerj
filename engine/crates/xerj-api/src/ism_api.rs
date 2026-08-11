@@ -85,9 +85,12 @@ pub async fn put_ism_policy(
         let err = xerj_common::XerjError::invalid_query(format!("invalid ISM policy: {reason}"));
         return ApiError::new(err).into_response();
     }
-    state
+    if let Err(error) = state
         .engine
-        .put_ism_policy(policy_id.clone(), policy.clone());
+        .put_ism_policy(policy_id.clone(), policy.clone())
+    {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     Json(json!({
         "_id": policy_id,
         "_version": 1,
@@ -178,11 +181,14 @@ pub async fn delete_ism_policy(
     State(state): State<AppState>,
     Path(policy_id): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.remove_ism_policy(&policy_id) {
-        Json(json!({ "_id": policy_id, "result": "deleted" })).into_response()
-    } else {
-        let e = xerj_common::XerjError::index_not_found(format!("policy [{policy_id}] not found"));
-        ApiError::new(e).into_response()
+    match state.engine.remove_ism_policy(&policy_id) {
+        Ok(true) => Json(json!({ "_id": policy_id, "result": "deleted" })).into_response(),
+        Ok(false) => {
+            let e =
+                xerj_common::XerjError::index_not_found(format!("policy [{policy_id}] not found"));
+            ApiError::new(e).into_response()
+        }
+        Err(error) => ApiError::new(xerj_common::XerjError::from(error)).into_response(),
     }
 }
 
@@ -210,6 +216,9 @@ pub async fn add_ism_policy(
 /// `es_compat` (a single index↔policy association model, per the design —
 /// not two).
 pub async fn attach_policy(state: &AppState, index: &str, policy_id: &str) -> Response {
+    if let Err(error) = state.engine.ensure_cluster_state_writable() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     if state.engine.get_index(index).is_err() {
         let e = xerj_common::XerjError::index_not_found(index);
         return ApiError::new(e).into_response();
@@ -235,7 +244,9 @@ pub async fn attach_policy(state: &AppState, index: &str, policy_id: &str) -> Re
         .engine
         .managed_indices
         .insert(index.to_string(), managed);
-    state.engine.persist_managed_indices();
+    if let Err(error) = state.engine.persist_managed_indices() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
 
     Json(json!({
         "failures": false,
@@ -258,12 +269,8 @@ pub async fn attach_policy(state: &AppState, index: &str, policy_id: &str) -> Re
 /// unambiguously "not managed", so a plain removal is the whole fix.
 /// Returns whether the index was actually managed (false is not an error —
 /// detaching an already-unmanaged index is idempotent, matching real ES).
-pub fn detach_ilm_policy(state: &AppState, index: &str) -> bool {
-    let removed = state.engine.managed_indices.remove(index).is_some();
-    if removed {
-        state.engine.persist_managed_indices();
-    }
-    removed
+pub fn detach_ilm_policy(state: &AppState, index: &str) -> xerj_engine::Result<bool> {
+    state.engine.detach_lifecycle(index)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,8 +285,10 @@ pub async fn remove_ism_policy(
         // One shared detach path (engine method) for all three detach
         // routes, so the acknowledged detach is tombstoned and persisted
         // identically whichever surface the operator used (#282).
-        state.engine.detach_lifecycle(&index);
-        Json(single_index_success()).into_response()
+        match state.engine.detach_lifecycle(&index) {
+            Ok(_) => Json(single_index_success()).into_response(),
+            Err(error) => ApiError::new(xerj_common::XerjError::from(error)).into_response(),
+        }
     } else {
         Json(not_managed_failure(
             &index,
@@ -320,6 +329,9 @@ pub async fn change_ism_policy(
     Path(index): Path<String>,
     Json(body): Json<ChangePolicyBody>,
 ) -> impl IntoResponse {
+    if let Err(error) = state.engine.ensure_cluster_state_writable() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     let Some(mut managed) = state
         .engine
         .managed_indices
@@ -383,7 +395,9 @@ pub async fn change_ism_policy(
     managed.info_message = format!("policy changed to '{}'", body.policy_id);
     managed.last_updated_ms = lifecycle::now_ms();
     state.engine.managed_indices.insert(index, managed);
-    state.engine.persist_managed_indices();
+    if let Err(error) = state.engine.persist_managed_indices() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
 
     Json(single_index_success()).into_response()
 }
@@ -412,6 +426,9 @@ pub async fn retry_ism_index(
     Path(index): Path<String>,
     body: OptionalJson<RetryBody>,
 ) -> impl IntoResponse {
+    if let Err(error) = state.engine.ensure_cluster_state_writable() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     let body = body.0.unwrap_or_default();
     let Some(mut managed) = state
         .engine
@@ -462,7 +479,9 @@ pub async fn retry_ism_index(
     managed.info_message = "retrying".to_string();
     managed.last_updated_ms = lifecycle::now_ms();
     state.engine.managed_indices.insert(index, managed);
-    state.engine.persist_managed_indices();
+    if let Err(error) = state.engine.persist_managed_indices() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
 
     Json(single_index_success()).into_response()
 }

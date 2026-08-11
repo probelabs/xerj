@@ -51,10 +51,12 @@ fn engine_with_index(name: &str, semantic: bool) -> (TempDir, Engine) {
     }
     engine.create_index(name, schema).expect("create index");
     if semantic {
-        engine.put_index_mapping(
-            name,
-            json!({"properties": {"content": {"type": "semantic_text"}}}),
-        );
+        engine
+            .put_index_mapping(
+                name,
+                json!({"properties": {"content": {"type": "semantic_text"}}}),
+            )
+            .unwrap();
     }
     (dir, engine)
 }

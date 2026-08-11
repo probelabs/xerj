@@ -539,9 +539,13 @@ async fn execute_action(
                     format!("refusing lifecycle delete of '{index_name}': {reason}"),
                 )));
             }
+            // Before deleting the index: detach persists cluster metadata, so
+            // a blocked boot must refuse before any backing directory or live
+            // map changes.
+            engine.ensure_cluster_state_writable()?;
             engine.delete_index(index_name).await?;
             engine.managed_indices.remove(index_name);
-            engine.detach_data_stream_backing_index(index_name);
+            engine.detach_data_stream_backing_index(index_name)?;
             Ok(ActionOutcome::IndexDeleted)
         }
         LifecycleAction::ReadOnly(_) => {
@@ -688,7 +692,9 @@ pub async fn tick(engine: &Engine) {
     }
 
     if any_change {
-        engine.persist_managed_indices();
+        if let Err(error) = engine.persist_managed_indices() {
+            tracing::warn!(%error, "lifecycle state was not persisted");
+        }
     }
 }
 
@@ -722,6 +728,117 @@ pub fn explain_json(index_name: &str, managed: &ManagedIndexState) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cluster_state_format1_lifecycle_delete_and_detach_guard_before_side_effects() {
+        fn storage_snapshot(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+            fn walk(
+                root: &std::path::Path,
+                path: &std::path::Path,
+                out: &mut Vec<(String, Vec<u8>)>,
+            ) {
+                let mut entries: Vec<_> = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .collect();
+                entries.sort_by_key(|entry| entry.file_name());
+                for entry in entries {
+                    let path = entry.path();
+                    let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+                    let kind = entry.file_type().unwrap();
+                    if kind.is_dir() {
+                        out.push((format!("d:{relative}"), Vec::new()));
+                        walk(root, &path, out);
+                    } else {
+                        out.push((format!("f:{relative}"), std::fs::read(path).unwrap()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(root, root, &mut out);
+            out
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        {
+            let engine = Engine::new(config.clone()).unwrap();
+            engine
+                .create_index("logs-1", xerj_common::types::Schema::empty())
+                .unwrap();
+        }
+
+        let future =
+            include_bytes!("../tests/fixtures/cluster_state/v2-format-version-minimal.json");
+        let state_path = dir.path().join("cluster_state.json");
+        std::fs::write(&state_path, future).unwrap();
+        let engine = Engine::new(config).unwrap();
+        assert!(matches!(
+            engine.get_index("logs-1"),
+            Err(EngineError::Common(
+                xerj_common::XerjError::ClusterStateUnavailable
+            ))
+        ));
+        engine.data_streams.insert(
+            "events".to_owned(),
+            crate::engine::DataStream {
+                name: "events".to_owned(),
+                backing_indices: vec!["logs-1".to_owned(), "write-current".to_owned()],
+                timestamp_field: "@timestamp".to_owned(),
+                generation: 2,
+            },
+        );
+        let before_files = storage_snapshot(dir.path());
+        let before_stream = engine.data_streams.get("events").unwrap().clone();
+
+        let direct = engine.detach_data_stream_backing_index("logs-1");
+        assert!(matches!(
+            direct,
+            Err(EngineError::Common(
+                xerj_common::XerjError::ClusterStateUnavailable
+            ))
+        ));
+        assert_eq!(
+            engine.data_streams.get("events").unwrap().backing_indices,
+            before_stream.backing_indices,
+            "the direct detach mutator must fail before editing the live stream"
+        );
+        assert_eq!(
+            storage_snapshot(dir.path()),
+            before_files,
+            "the direct detach mutator must fail before rewriting any file"
+        );
+
+        let result = execute_action(
+            &engine,
+            "logs-1",
+            &LifecycleAction::Delete(EmptyParams {}),
+            1,
+            now_ms().saturating_sub(1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::Common(
+                xerj_common::XerjError::ClusterStateUnavailable
+            ))
+        ));
+        assert!(dir.path().join("logs-1").is_dir());
+        assert_eq!(
+            engine.data_streams.get("events").unwrap().backing_indices,
+            before_stream.backing_indices,
+            "the detach half must not edit the live stream"
+        );
+        assert_eq!(
+            storage_snapshot(dir.path()),
+            before_files,
+            "blocked lifecycle delete/detach must not rewrite any file"
+        );
+
+        assert_eq!(std::fs::read(state_path).unwrap(), future.as_slice());
+    }
 
     #[test]
     fn parse_duration_handles_all_units() {

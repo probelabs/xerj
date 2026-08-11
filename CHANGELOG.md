@@ -50,6 +50,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A binary that does not understand `cluster_state.json` now fails closed
+  before activating storage.** The previous loader accepted future and
+  partially-understood shapes, dropped fields it did not know, and could later
+  rewrite the reduced document over the original. Boot now accepts only the
+  complete shipped format-1 envelope, including duplicate-key and nested-shape
+  checks. A rejected document leaves liveness at 200 and readiness at 503, but
+  opens no user index, Console system index, WAL, segment, or durable audit
+  sink; Console bootstrap and storage background jobs remain disabled until a
+  supported restart. After the existing request-size, authentication, and
+  authorization gates, HTTP storage access returns the stable
+  `cluster_state_unavailable` 503; authenticated gRPC calls return
+  `UNAVAILABLE`. Existing 401/403/body-limit precedence is unchanged. Client
+  responses give the category and recovery action without a local path or
+  persisted object names; the server log carries the detailed classification
+  and path for the operator. The original bytes and any legacy staging file
+  stay in place, and a blocked boot creates no salvage copy. Format-1 rewrites
+  retain the existing
+  same-directory temp-file fsync and atomic rename; parent-directory sync is a
+  best-effort attempt whose errors are ignored, so this change does not claim
+  strict namespace durability across power loss. Data-directory creation,
+  `node.lock` acquisition/PID diagnostics, and the server's earlier
+  credential/TLS preparation retain their existing behavior; the no-open/no-
+  replay claim begins at the cluster-state classification and covers storage
+  stores, not those process-bootstrap files.
+
 - **`PUT /{index}/_settings {"index.lifecycle.name": null}` actually detaches
   the index, and the detach survives a restart** (#282, ported from #262). The
   null previously fell through a string-only settings reader, so the operator
@@ -1009,7 +1034,8 @@ documented "at most one bar per 15 s" floor is really 12.5 s.
     over a file whose bytes were perfectly good. The load failure now latches:
     every management mutation is refused with a 500 naming the file, and the
     file is not touched, until a boot loads it cleanly. The corrupt-parse arm
-    refuses too, and still keeps a `cluster_state.corrupt.json` copy.
+    refuses too. The later format-compatibility fence above tightens that
+    diagnostic boot further: it creates no `cluster_state.corrupt.json` copy.
   - `DELETE /_data_stream/<name>` recorded the removal before destroying the
     backing indices, so a crash in that window stranded `.ds-<name>-00000N`
     directories that no data-stream API could reach — GET and DELETE answered

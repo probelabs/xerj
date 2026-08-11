@@ -59,6 +59,7 @@ xerj-storage = { path = "../xerj-storage", features = ["test-hooks"] }
 tempfile  = { workspace = true }
 tokio     = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "search_bench"

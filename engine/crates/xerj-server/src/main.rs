@@ -1866,6 +1866,7 @@ async fn async_main() -> Result<()> {
 
     // 8. Engine (opens existing indices from disk)
     let engine = Engine::new(cfg.clone()).context("initialise engine")?;
+    let storage_available = engine.cluster_state_boot_status().is_writable();
 
     // This node's own cluster address, composed from the parsed bind IP.
     // Needed twice — by the transport (8b) and by the console's node identity
@@ -1874,7 +1875,7 @@ async fn async_main() -> Result<()> {
     let cluster_listen_addr = cfg.socket_addr(cfg.cluster.port);
 
     // 8b. Cluster runner (if cluster mode is enabled)
-    let _cluster_shutdown = if cfg.cluster.enabled {
+    let _cluster_shutdown = if cfg.cluster.enabled && storage_available {
         // Fail closed (issue #75). The cluster port carries Raft control
         // messages; without a shared secret every frame on it is
         // unauthenticated, so refuse to start rather than open it. This must
@@ -1945,6 +1946,11 @@ async fn async_main() -> Result<()> {
         }
 
         Some(shutdown_tx)
+    } else if cfg.cluster.enabled {
+        warn!(
+            "cluster transport is disabled while cluster-state storage is unavailable; restart with supported bytes before rejoining peers"
+        );
+        None
     } else {
         info!("Cluster mode disabled — running in single-node mode");
         None
@@ -1954,6 +1960,13 @@ async fn async_main() -> Result<()> {
     //    boot, persists a 32-byte master key under data_dir/.xerj_master_key
     //    (mode 0600), and prints the first-launch magic-link banner to
     //    stderr if no active user exists yet.  Idempotent on reboot.
+    //
+    //    This is storage activation, not cosmetic UI setup. When the engine's
+    //    cluster-state compatibility fence is blocked, boot must remain live
+    //    only for diagnostics: opening and seeding Console indices can replay
+    //    their WAL and flush a new segment. The Console surface is therefore
+    //    absent until a supported restart instead of mounting with a made-up
+    //    key or partially-initialized stores.
     let xerj_console_bind_url = format!(
         "http://{}:{}",
         if cfg.server.bind_address == "0.0.0.0" || cfg.server.bind_address == "::" {
@@ -1966,14 +1979,6 @@ async fn async_main() -> Result<()> {
         },
         cfg.server.es_compat_port,
     );
-    let xerj_console_outcome = xerj_console_api::bootstrap::run(
-        &engine,
-        Path::new(&cfg.server.data_dir),
-        &xerj_console_bind_url,
-    )
-    .await
-    .context("xerj-console bootstrap")?;
-
     let xerj_console_node_id: String = match (cfg.cluster.enabled, cluster_listen_addr) {
         // The same string the cluster transport registered as this node's id.
         (true, Some(addr)) => addr.to_string(),
@@ -2005,13 +2010,29 @@ async fn async_main() -> Result<()> {
             }
         );
     }
-    let xerj_console_state = ConsoleState::new(
-        engine.clone(),
-        xerj_console_node_id,
-        xerj_console_outcome.master_key,
-        xerj_console_cluster_mode,
-    )
-    .with_trusted_proxies(trusted_proxies);
+    let xerj_console_state = if storage_available {
+        let outcome = xerj_console_api::bootstrap::run(
+            &engine,
+            Path::new(&cfg.server.data_dir),
+            &xerj_console_bind_url,
+        )
+        .await
+        .context("xerj-console bootstrap")?;
+        Some(
+            ConsoleState::new(
+                engine.clone(),
+                xerj_console_node_id,
+                outcome.master_key,
+                xerj_console_cluster_mode,
+            )
+            .with_trusted_proxies(trusted_proxies),
+        )
+    } else {
+        warn!(
+            "Xerj Console bootstrap and routes are disabled while cluster-state storage is unavailable"
+        );
+        None
+    };
 
     // 9b. Application state
     let state = AppState::new(cfg.clone(), engine, metrics);
@@ -2025,7 +2046,9 @@ async fn async_main() -> Result<()> {
     //       / wal_size_bytes / memory_usage live (otherwise a flat zero even at
     //       millions of docs, hiding the RSS-runaway and WAL-growth signals).
     xerj_engine::set_engine_metrics(state.metrics.clone());
-    tokio::spawn(xerj_api::es_compat::run_metrics_gauge_loop(state.clone()));
+    if storage_available {
+        tokio::spawn(xerj_api::es_compat::run_metrics_gauge_loop(state.clone()));
+    }
 
     // 9c. Routers — engine and Xerj Console are *peer* surfaces.  Each crate
     //     builds a complete Router (routes + its own auth + its own
@@ -2035,9 +2058,13 @@ async fn async_main() -> Result<()> {
     //     /_xerj-console/api/v1/* routes.  Yanking xerj-console-api out of this
     //     merge would leave xerj-api compiling and serving on its own
     //     — a property worth preserving.
-    let xerj_console_router = xerj_console_api::xerj_console_router(xerj_console_state);
-    let native_router = build_native_router(state.clone()).merge(xerj_console_router.clone());
-    let es_router = build_es_compat_router(state.clone()).merge(xerj_console_router);
+    let mut native_router = build_native_router(state.clone());
+    let mut es_router = build_es_compat_router(state.clone());
+    if let Some(console_state) = xerj_console_state {
+        let xerj_console_router = xerj_console_api::xerj_console_router(console_state);
+        native_router = native_router.merge(xerj_console_router.clone());
+        es_router = es_router.merge(xerj_console_router);
+    }
 
     // 10. Banner (includes total startup time)
     let startup_ms = startup_start.elapsed().as_millis();
@@ -2065,24 +2092,30 @@ async fn async_main() -> Result<()> {
         .with_context(|| bad_bind_address(&cfg))?;
 
     // 12. Background flush timer
-    let flusher = spawn_periodic_flusher(
-        state.engine.clone(),
-        std::time::Duration::from_secs(cfg.storage.flush_interval_secs),
-    );
+    let flusher = storage_available.then(|| {
+        spawn_periodic_flusher(
+            state.engine.clone(),
+            std::time::Duration::from_secs(cfg.storage.flush_interval_secs),
+        )
+    });
 
     // 12b. Resource governor sampler (RC4 W3 items 1 & 3): refreshes the
     //      process-wide memtable / RSS / disk-usage atomics that drive the
     //      parent circuit breaker and the disk flood-stage write block. This
     //      is the structural guard against the 112 GiB OOM class — writes get
     //      a 429 circuit_breaking_exception before the kernel OOM-kills us.
-    state.engine.spawn_resource_sampler();
+    if storage_available {
+        state.engine.spawn_resource_sampler();
+    }
 
     // 12c. ISM/ILM lifecycle-management background job: drives every
     //      managed index's state machine (actions, then transitions) on
     //      `lifecycle.tick_interval_secs` (default 5 minutes).
-    state.engine.spawn_lifecycle_manager();
+    if storage_available {
+        state.engine.spawn_lifecycle_manager();
+    }
 
-    let _ingest_memory_trace = ingest_memory_trace::spawn(&state.engine);
+    let _ingest_memory_trace = storage_available.then(|| ingest_memory_trace::spawn(&state.engine));
     // 13. Start servers concurrently
     let rest_tls = tls_config.clone();
     let rest = tokio::spawn(async move {
@@ -2122,7 +2155,9 @@ async fn async_main() -> Result<()> {
     // boot, flush-permit exhaustion on the last write) sat in memory —
     // pinning its WAL generations on disk — until shutdown or the next
     // explicit `_flush`.
-    flusher.abort();
+    if let Some(flusher) = flusher {
+        flusher.abort();
+    }
 
     // 15. Final synchronous flush across every index.
     //
@@ -2135,10 +2170,12 @@ async fn async_main() -> Result<()> {
     // sessions) loses 100 % of its data on restart because startup index
     // discovery looks for segment-bearing directories first.  See POV
     // report 2026-04-24T23-58-00 (B-2) for the full failure mode.
-    info!("flushing in-memory state before exit…");
-    let flush_started = std::time::Instant::now();
-    state.engine.flush_all_force().await;
-    info!("final flush complete in {:.0?}", flush_started.elapsed());
+    if storage_available {
+        info!("flushing in-memory state before exit…");
+        let flush_started = std::time::Instant::now();
+        state.engine.flush_all_force().await;
+        info!("final flush complete in {:.0?}", flush_started.elapsed());
+    }
 
     info!("xerj v{} stopped. Goodbye.", env!("CARGO_PKG_VERSION"));
     Ok(())
