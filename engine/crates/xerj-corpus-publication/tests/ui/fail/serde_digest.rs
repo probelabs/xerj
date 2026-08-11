@@ -1,0 +1,1 @@
+fn main() { let digest: xerj_corpus_publication::ManifestDigest = "xerm1-sha256-0000000000000000000000000000000000000000000000000000000000000000".parse().unwrap(); let _ = serde_json::to_vec(&digest); }

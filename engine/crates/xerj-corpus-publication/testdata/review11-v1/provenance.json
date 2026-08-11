@@ -1,0 +1,185 @@
+{
+  "attestation_commit": {
+    "changes_evidence_metadata_only": true,
+    "pinned_preceding_commit": "fc04d9aba39ced1dfcff78bce67ba3b39a660a4e",
+    "pinned_preceding_tree": "13c75a660b63629e53860d5d8792266862f7f835",
+    "self_pins": false,
+    "statement": "The final attestation commit is deliberately outside the pinned repaired source identity. It supersedes the earlier attestation, records the already-committed repair identity, and updates only the generated evidence metadata and assertions that verify it.",
+    "superseded_candidate_commit": "a214f1587df2d39f38e1017b4ebe4766715e3716",
+    "superseded_candidate_tree": "3eae5b0efbac8598d9939c76272e585874124a4a",
+    "supersedes_attestation_commit": "5eaecbcecbfebaece8c03a83bab4250a5a95ea9d"
+  },
+  "authority_plan": {
+    "bytes": 220497,
+    "path": "benchmarks/wordpress-autoindex-2026-08-10/CORPUS_PUBLICATION_AUTHORITY_PLAN.md",
+    "sha256": "bacf93cbaa1d522b1292d895d306b17edf26d4f950f6c71a6422a6abd01996bf"
+  },
+  "candidate_source": {
+    "base_commit": "aa142d6772a046baa9d5728328737020d3d05818",
+    "base_tree": "2f9e469b1f1e12ab9005e0f666ddb1ff2cd680b9",
+    "candidate_commit": "fc04d9aba39ced1dfcff78bce67ba3b39a660a4e",
+    "candidate_tree": "13c75a660b63629e53860d5d8792266862f7f835",
+    "claim": "This final attestation supersedes the earlier attestation and pins the exact repaired source commit and tree. The final provenance-attestation commit changes evidence metadata and oracle assertions only; it intentionally does not and cannot self-pin its own commit or tree.",
+    "status": "final_attested_repaired_source_commit"
+  },
+  "fence_prerequisite": "d8b243023f3c325c3c433cd384ad74ca4e12af51",
+  "first_slice_plan": {
+    "bytes": 66522,
+    "path": "benchmarks/wordpress-autoindex-2026-08-10/PUBLICATION_AUTHORITY_FIRST_SLICE_PLAN.md",
+    "sha256": "c408734596551662255b7615046c61b044978e01116d0ed5324ef703eb391cb6"
+  },
+  "first_slice_sections": [
+    {
+      "first_slice_plan_lines": "48-172",
+      "heading": "Implementation-adjudication closure"
+    },
+    {
+      "first_slice_plan_lines": "957-991",
+      "heading": "Golden and provenance contract"
+    },
+    {
+      "first_slice_plan_lines": "992-1059",
+      "heading": "Required complete goldens"
+    },
+    {
+      "first_slice_plan_lines": "1061-1073",
+      "heading": "Two-row ordering oracle"
+    },
+    {
+      "first_slice_plan_lines": "1075-1102",
+      "heading": "Comparator-complete two-distinct-row matrix"
+    },
+    {
+      "first_slice_plan_lines": "1104-1157",
+      "heading": "Mutation matrix"
+    }
+  ],
+  "format_version": 2,
+  "generated_at": "2026-08-12T00:10:39+02:00",
+  "generated_extensions": true,
+  "generation_policy": "The generator derives every expectation from literal protocol domains and independent U32/U64/S/A encoders. It never imports, calls, or harvests the Rust crate.",
+  "generator_scope": [
+    "primary, generation-7, present-transition and comparator complete chains",
+    "mapping reservations, mapping array, exact quota and revised desired plans",
+    "canonical catalog/data/graph-edge/graph-node replay order",
+    "all four persisted byte classes and fresh-versus-rehydrate expected identities",
+    "two-empty same-kind and two-nonempty positional fixtures",
+    "concrete tiered mutation ledger with derived runner/case totals and gate-derived Rust execution evidence"
+  ],
+  "implementation_remediation_ledger": {
+    "bytes": 24231,
+    "path": "benchmarks/wordpress-autoindex-2026-08-10/PUBLICATION_AUTHORITY_FIRST_SLICE_IMPLEMENTATION_REMEDIATION.md",
+    "sha256": "2e035b2a1ae998f87876e46a3a7f100d4b64375b72d8276abdb0611eba1618b0"
+  },
+  "incomplete_scope": [],
+  "independent_generator": {
+    "bytes": 150536,
+    "hash_methodology": "SHA-256 over the exact checked-in generate.py bytes read before output serialization; generator output files are not inputs to this hash.",
+    "id": "independent-python-review11-v2",
+    "path": "generate.py",
+    "sha256": "e8f4c901b4dbe9eee60f4d5c2cdb60f126c961b4c9e02ddc59baee4f5ad4656e"
+  },
+  "mutation_execution": {
+    "derivation": "Completion is true only when each recorded observation exactly matches the row/case expectations derived from this ledger and every row's classified execution gate passes.",
+    "execution_complete": true,
+    "gates": {
+      "compile": {
+        "expected": {
+          "fixtures": 24,
+          "rows": 1
+        },
+        "observed": {
+          "command": "cargo test -p xerj-corpus-publication --test ui public_surface_and_privacy_contract",
+          "failed_fixtures": 0,
+          "passed_fixtures": 24
+        },
+        "status": "passed"
+      },
+      "integration": {
+        "expected": {
+          "registry_cases": 28797,
+          "registry_rows": 30,
+          "runner_cases": 28638,
+          "runner_functions": 26,
+          "test_functions_including_registry": 27
+        },
+        "observed": {
+          "command": "cargo test -p xerj-corpus-publication --test mutations --no-fail-fast",
+          "failed_test_functions": 0,
+          "passed_test_functions": 27,
+          "registry_cases": 28797,
+          "registry_exact": true,
+          "registry_rows": 30
+        },
+        "status": "passed"
+      },
+      "resource_key_nul": {
+        "expected": {
+          "cases": 125,
+          "rows": 1
+        },
+        "observed": {
+          "command": "cargo test -p xerj-corpus-publication --test resource_key_nul embedded_nul_is_rejected_at_every_position",
+          "failed_cases": 0,
+          "passed_cases": 125
+        },
+        "status": "passed"
+      },
+      "unit": {
+        "expected": {
+          "cases": 10,
+          "rows": 2
+        },
+        "observed": {
+          "command": "cargo test -p xerj-corpus-publication --lib codec::tests::checked_arithmetic_matrix",
+          "failed_cases": 0,
+          "passed_cases": 10
+        },
+        "status": "passed"
+      }
+    },
+    "generator_boundary": "The Python generator records this Rust evidence but still never imports or invokes the production crate.",
+    "ledger_cases": 28797,
+    "ledger_rows": 30,
+    "status": "complete"
+  },
+  "oracle_sections": [
+    {
+      "authority_plan_lines": "1374-1516",
+      "heading": "Normative binary encoding and widths",
+      "use": "binary framing, publication/prepared/replay/desired-plan formulas"
+    },
+    {
+      "authority_plan_lines": "1518-1713",
+      "heading": "Normative component identities and projection preimages",
+      "use": "identity domains, artifacts, projections, storage incarnations and seals"
+    },
+    {
+      "authority_plan_lines": "1715-1873",
+      "heading": "Checked-in golden bytes and digests",
+      "use": "published primary preimages and rendered digests"
+    },
+    {
+      "authority_plan_lines": "1875-1921",
+      "heading": "Review-5 target-bearing artifact oracles",
+      "use": "published primary NDJSON bytes and typed empty vectors"
+    }
+  ],
+  "plan_published_vectors_copied_exactly": true,
+  "reference_encoder": {
+    "bytes": 1119,
+    "path": "../../tests/support/reference_codec.rs",
+    "sha256": "cccc1085a9b40c5b8231a0cfb66f873a893406f3e051153285da340519f56ba8",
+    "status": "pinned_in_repaired_source_commit; unchanged_by_final_attestation"
+  },
+  "review_11": {
+    "bytes": 16338,
+    "path": "benchmarks/wordpress-autoindex-2026-08-10/CORPUS_PUBLICATION_AUTHORITY_REVIEW_11.md",
+    "sha256": "e397e80588fd7242a98bca73708d7344311c39e6c5f4c1e7fb6b4b8693593201"
+  },
+  "reviewed_source": {
+    "commit": "18f85755b2f25d2a4eefb6b7539a129f017ef6b9",
+    "tree": "20a6a8c450ba7aa86979d78bb3a90c0fdef783df"
+  },
+  "toolchain": "Python 3.13.5 hashlib/json/base64/ctypes plus system libxxhash.so.0 for independently specified XXH3-128"
+}

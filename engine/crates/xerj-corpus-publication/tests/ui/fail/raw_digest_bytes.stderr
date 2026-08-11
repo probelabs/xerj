@@ -1,0 +1,5 @@
+error[E0599]: no method named `as_ref` found for struct `CorpusOwnerId` in the current scope
+ --> tests/ui/fail/raw_digest_bytes.rs:2:182
+  |
+2 | ...0000000000000").unwrap(); let _: &[u8] = id.as_ref(); }
+  |                                                ^^^^^^ method not found in `CorpusOwnerId`

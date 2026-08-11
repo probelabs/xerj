@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/cross_digest_domain.rs:2:28
+  |
+2 | fn main() { needs_manifest(xerj_corpus_publication::DataMappingV1::parse_json(b"{}").unwrap().digest().clone()); }
+  |             -------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `ManifestDigest`, found `MappingDigest`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/cross_digest_domain.rs:1:4
+  |
+1 | fn needs_manifest(_: xerj_corpus_publication::ManifestDigest) {}
+  |    ^^^^^^^^^^^^^^ ------------------------------------------

@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/fail/construct_canonical_bytes.rs:1:21
+  |
+1 | fn main() { let _ = xerj_corpus_publication::PreparedInputBytes(Box::new([])); }
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/prepared.rs
+  |
+  | pub struct PreparedInputBytes(Box<[u8]>);
+  |                               ^^^^^^^^^ private field

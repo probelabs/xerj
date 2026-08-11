@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/extractor_identity_for_brain.rs:6:30
+  |
+6 |     needs_extractor_identity(xerj_corpus_publication::BrainName::from_str("life").unwrap());
+  |     ------------------------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `ExtractorIdentity`, found `BrainName`
+  |     |
+  |     arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/extractor_identity_for_brain.rs:3:4
+  |
+3 | fn needs_extractor_identity(_: xerj_corpus_publication::ExtractorIdentity) {}
+  |    ^^^^^^^^^^^^^^^^^^^^^^^^ ---------------------------------------------

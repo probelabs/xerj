@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/generation_for_sequence.rs:4:22
+  |
+4 |     needs_generation(xerj_corpus_publication::Sequence::new(1));
+  |     ---------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Generation`, found `Sequence`
+  |     |
+  |     arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/generation_for_sequence.rs:1:4
+  |
+1 | fn needs_generation(_: xerj_corpus_publication::Generation) {}
+  |    ^^^^^^^^^^^^^^^^ --------------------------------------

@@ -1,0 +1,19 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/fail/private_fields.rs:1:21
+  |
+1 | fn main() { let _ = xerj_corpus_publication::Sequence(1); }
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/scalar.rs
+  |
+  |         pub struct $name(u64);
+  |                          ^^^ private field
+...
+  | integer_scalar!(Sequence);
+  | ------------------------- in this macro invocation
+  = note: this error originates in the macro `integer_scalar` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you might have meant to use the `new` associated function
+  |
+1 | fn main() { let _ = xerj_corpus_publication::Sequence::new(1); }
+  |                                                      +++++

@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/swap_brain_extractor.rs:3:25
+  |
+3 | fn main() { needs_brain(xerj_corpus_publication::ExtractorIdentity::from_str("extractor@1").unwrap()); }
+  |             ----------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `BrainName`, found `ExtractorIdentity`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/swap_brain_extractor.rs:2:4
+  |
+2 | fn needs_brain(_: xerj_corpus_publication::BrainName) {}
+  |    ^^^^^^^^^^^ -------------------------------------

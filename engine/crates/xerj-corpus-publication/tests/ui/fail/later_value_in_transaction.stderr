@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/later_value_in_transaction.rs:2:182
+  |
+2 | ...000000000".parse().unwrap(); needs_manifest(plan); }
+  |                                 -------------- ^^^^ expected `ManifestDigest`, found `DesiredPlanDigest`
+  |                                 |
+  |                                 arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/later_value_in_transaction.rs:1:4
+  |
+1 | fn needs_manifest(_: xerj_corpus_publication::ManifestDigest) {}
+  |    ^^^^^^^^^^^^^^ ------------------------------------------

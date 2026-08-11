@@ -1,0 +1,13 @@
+error[E0603]: module `codec` is private
+ --> tests/ui/fail/private_codec.rs:1:46
+  |
+1 | fn main() { let _ = xerj_corpus_publication::codec::Encoder::default(); }
+  |                                              ^^^^^  ------- struct `Encoder` is not publicly re-exported
+  |                                              |
+  |                                              private module
+  |
+note: the module `codec` is defined here
+ --> src/lib.rs
+  |
+  | mod codec;
+  | ^^^^^^^^^

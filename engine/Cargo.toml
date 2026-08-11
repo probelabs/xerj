@@ -17,6 +17,7 @@ members = [
     "crates/xerj-cluster",
     "crates/xerj-console-api",
     "crates/xerj-autoindex",
+    "crates/xerj-corpus-publication",
     "tests/es-compat-yaml",
 ]
 

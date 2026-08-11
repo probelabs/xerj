@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/swap_root_prefix.rs:3:24
+  |
+3 | fn main() { needs_root(xerj_corpus_publication::CorpusPrefix::from_str("life").unwrap()); }
+  |             ---------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `RootIdentity`, found `CorpusPrefix`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/swap_root_prefix.rs:2:4
+  |
+2 | fn needs_root(_: xerj_corpus_publication::RootIdentity) {}
+  |    ^^^^^^^^^^ ----------------------------------------
