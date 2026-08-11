@@ -13,7 +13,7 @@ use axum::{
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 use xerj_common::types::{FieldConfig, FieldType, Schema};
 use xerj_query::parse_request;
@@ -2430,6 +2430,85 @@ fn merge_dotted_property(
     merge_dotted_property(sub_obj, &rest, leaf_value);
 }
 
+/// Merge a stored (explicit, cached-at-index-creation) mapping's
+/// `properties` with the live schema-derived `properties`
+/// (`schema_to_es_properties`).
+///
+/// The stored declaration wins for any field it names -- it may carry
+/// explicit settings (`ignore_above`, `analyzer`, `dense_vector` options,
+/// ...) the schema's own type inference wouldn't reconstruct identically.
+/// But a field the live schema knows about and the stored blob doesn't is
+/// still included, instead of being permanently invisible: without this,
+/// GET _mapping/_field_caps serve the ORIGINAL index-creation-time blob
+/// forever, and any field discovered dynamically since -- flat or nested,
+/// at any depth -- never appears in either, no matter how long the index
+/// has been receiving new documents.
+///
+/// Recurses into whichever nested-children key each side actually uses
+/// (`properties` for Object/Nested, `fields` for a leaf's multi-fields),
+/// so a field explicitly declared without its own nested declaration
+/// (e.g. a bare `{"type": "object"}`) still picks up children discovered
+/// dynamically since, rather than only ever getting top-level treatment.
+fn merge_mapping_properties(
+    stored_properties: &serde_json::Map<String, Value>,
+    live_properties: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    let mut merged = stored_properties.clone();
+    for (key, live_val) in live_properties {
+        match merged.get_mut(key) {
+            None => {
+                merged.insert(key.clone(), live_val.clone());
+            }
+            Some(stored_val) => {
+                for children_key in ["properties", "fields"] {
+                    let Some(live_children) =
+                        live_val.get(children_key).and_then(|v| v.as_object())
+                    else {
+                        continue;
+                    };
+                    let stored_children = stored_val
+                        .get(children_key)
+                        .and_then(|v| v.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    let merged_children = merge_mapping_properties(&stored_children, live_children);
+                    if let Some(obj) = stored_val.as_object_mut() {
+                        obj.insert(children_key.to_string(), Value::Object(merged_children));
+                    }
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Companion `dense_vector` fields the engine auto-creates for each
+/// `semantic_text` field (e.g. `body` -> `body_vector`, or `target_field`
+/// if the caller declared one) are an implementation detail, never meant
+/// to be user-visible -- nothing in the caller's own mapping ever names
+/// them. Once a document makes the live schema aware of a companion field,
+/// `merge_mapping_properties` above would otherwise happily surface it in
+/// `GET _mapping`/`_field_caps`, even though it was never declared under
+/// that name by anyone. Scans `stored_properties` (the only place a
+/// `semantic_text` field can legitimately be declared -- dynamic mapping
+/// never infers that type) for each one and returns the companion name
+/// `semantic_mapping_contract` computes for it, so callers can filter
+/// those out of what they feed into `merge_mapping_properties`.
+fn semantic_companion_field_names(
+    stored_properties: &serde_json::Map<String, Value>,
+) -> HashSet<String> {
+    stored_properties
+        .iter()
+        .filter_map(|(name, def)| {
+            let obj = def.as_object()?;
+            (obj.get("type").and_then(Value::as_str) == Some("semantic_text")).then(|| {
+                let (target, _dimensions, _similarity) = semantic_mapping_contract(name, obj);
+                target
+            })
+        })
+        .collect()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /{index}/_mapping
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2476,17 +2555,43 @@ pub async fn get_mapping(
             .get(name)
             .map(|v| v.clone())
             .unwrap_or(Value::Null);
-        let mut mappings = if stored.is_null() {
-            match &idx {
-                Some(i) => {
-                    let schema = i.schema().await;
-                    let properties = schema_to_es_properties(&schema);
-                    json!({ "properties": properties })
-                }
-                None => json!({ "properties": {} }),
+        let mut mappings = match (&idx, stored.is_null()) {
+            (Some(i), true) => {
+                let schema = i.schema().await;
+                let properties = schema_to_es_properties(&schema);
+                json!({ "properties": properties })
             }
-        } else {
-            stored
+            // A live index with a stored (explicit-at-creation) mapping:
+            // merge in anything the live schema has picked up dynamically
+            // since -- otherwise a field discovered after index creation
+            // (flat or nested, at any depth) is permanently invisible here,
+            // forever serving the exact blob index creation started with.
+            (Some(i), false) => {
+                let schema = i.schema().await;
+                let mut live_properties = schema_to_es_properties(&schema);
+                let stored_properties = stored
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                // semantic_text's own companion dense_vector fields are an
+                // engine-internal implementation detail, never declared by
+                // the caller under that name -- exclude them from what the
+                // live schema contributes, same as they were never visible
+                // before this merge existed (see semantic_companion_field_names).
+                let companions = semantic_companion_field_names(&stored_properties);
+                live_properties.retain(|k, _| !companions.contains(k));
+                let merged = merge_mapping_properties(&stored_properties, &live_properties);
+                let mut m = stored.clone();
+                if let Some(obj) = m.as_object_mut() {
+                    obj.insert("properties".to_string(), Value::Object(merged));
+                }
+                m
+            }
+            // No live index (failed index, #206) -- nothing to merge with,
+            // serve whatever's recoverable as-is.
+            (None, false) => stored,
+            (None, true) => json!({ "properties": {} }),
         };
         // ES injects default `rescore_vector.oversample: 3.0` on any
         // dense_vector whose `index_options.type` is BBQ-quantised
@@ -18818,6 +18923,77 @@ pub struct FieldCapsParams {
     pub fields: Option<String>,
 }
 
+/// Register one `_field_caps` entry for `field`, dotted-path-qualified by
+/// `dotted_prefix`, then recurse into its own nested `properties` children
+/// (Object/Nested only) so those get their own dotted-path entries too --
+/// e.g. a `metadata` object field with a `kind` child registers both
+/// `metadata` AND `metadata.kind`, not just the former.
+///
+/// Deliberately does NOT recurse into a leaf field's `fields` (multi-field
+/// siblings like `.keyword`) -- that's a different concept (the same value
+/// indexed a second way, not a distinct child field) and stays the job of
+/// `collect_multi_fields`, called separately with the same merged
+/// `properties` this function is given. Before this function existed, the
+/// per-field loop only ever looked at the top-level `schema.fields`, so a
+/// nested object's own children (`metadata.kind` itself, not just further
+/// multi-fields under it like `metadata.kind.keyword`) were never their
+/// own `_field_caps` entry, even once the mapping/properties correctly
+/// described them.
+#[allow(clippy::too_many_arguments)]
+fn register_field_cap_entry(
+    field: &FieldConfig,
+    dotted_prefix: &str,
+    properties: &Value,
+    fields_filter: &str,
+    idx_name: &str,
+    fields_map: &mut HashMap<String, serde_json::Map<String, Value>>,
+) {
+    let dotted_name = if dotted_prefix.is_empty() {
+        field.name.clone()
+    } else {
+        format!("{dotted_prefix}.{}", field.name)
+    };
+
+    let matches = fields_filter == "*"
+        || fields_filter
+            .split(',')
+            .any(|f| source_field_matches(&dotted_name, f.trim()));
+    if matches {
+        let native_es_type = native_type_to_es_str(&field.field_type);
+        let es_type = declared_flattened_type(properties, &dotted_name)
+            .or_else(|| declared_numeric_type(properties, &dotted_name))
+            .unwrap_or(native_es_type);
+        let searchable = field.is_searchable();
+        let aggregatable = field.is_aggregatable();
+
+        let type_map = fields_map.entry(dotted_name.clone()).or_default();
+        let type_entry = type_map.entry(es_type.to_string()).or_insert_with(|| {
+            json!({
+                "type": es_type,
+                "searchable": searchable,
+                "aggregatable": aggregatable,
+                "indices": []
+            })
+        });
+        if let Some(arr) = type_entry["indices"].as_array_mut() {
+            arr.push(Value::String(idx_name.to_string()));
+        }
+    }
+
+    if matches!(field.field_type, FieldType::Object | FieldType::Nested) {
+        for child in &field.fields {
+            register_field_cap_entry(
+                child,
+                &dotted_name,
+                properties,
+                fields_filter,
+                idx_name,
+                fields_map,
+            );
+        }
+    }
+}
+
 pub async fn field_caps(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -18867,45 +19043,42 @@ pub async fn field_caps(
             .get(idx_name.as_str())
             .map(|v| v.clone())
             .unwrap_or(Value::Null);
+        let mut live_properties = schema_to_es_properties(&schema);
         let properties = if stored_mapping.is_null() {
-            Value::Object(schema_to_es_properties(&schema))
+            Value::Object(live_properties)
         } else {
-            stored_mapping
+            // Merge, don't just fall back to the cached blob: a field the
+            // live schema has discovered since index creation (flat or
+            // nested, at any depth) must still surface here, not only ever
+            // the fields the index started with (see get_mapping, same
+            // fix). `declared_flattened_type`/`declared_numeric_type`
+            // below need the stored declaration where there is one, hence
+            // merging rather than switching to `live_properties` outright.
+            let stored_properties = stored_mapping
                 .get("properties")
+                .and_then(|p| p.as_object())
                 .cloned()
-                .unwrap_or_else(|| json!({}))
+                .unwrap_or_default();
+            // Exclude semantic_text's own companion dense_vector fields --
+            // never declared by the caller under that name, see
+            // semantic_companion_field_names (same exclusion as get_mapping).
+            let companions = semantic_companion_field_names(&stored_properties);
+            live_properties.retain(|k, _| !companions.contains(k));
+            Value::Object(merge_mapping_properties(
+                &stored_properties,
+                &live_properties,
+            ))
         };
 
         for field in &schema.fields {
-            // Support comma-separated field list and wildcard suffix.
-            if fields_filter != "*" {
-                let matches = fields_filter
-                    .split(',')
-                    .any(|f| source_field_matches(&field.name, f.trim()));
-                if !matches {
-                    continue;
-                }
-            }
-
-            let native_es_type = native_type_to_es_str(&field.field_type);
-            let es_type = declared_flattened_type(&properties, &field.name)
-                .or_else(|| declared_numeric_type(&properties, &field.name))
-                .unwrap_or(native_es_type);
-            let searchable = field.is_searchable();
-            let aggregatable = field.is_aggregatable();
-
-            let type_map = fields_map.entry(field.name.clone()).or_default();
-            let type_entry = type_map.entry(es_type.to_string()).or_insert_with(|| {
-                json!({
-                    "type": es_type,
-                    "searchable": searchable,
-                    "aggregatable": aggregatable,
-                    "indices": []
-                })
-            });
-            if let Some(arr) = type_entry["indices"].as_array_mut() {
-                arr.push(Value::String(idx_name.clone()));
-            }
+            register_field_cap_entry(
+                field,
+                "",
+                &properties,
+                fields_filter,
+                idx_name,
+                &mut fields_map,
+            );
         }
 
         // Multi-fields (`"fields": {"keyword": {"type": "keyword"}}`) are

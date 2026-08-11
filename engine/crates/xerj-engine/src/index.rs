@@ -28088,6 +28088,12 @@ fn infer_field_type(val: &Value, date_detection: bool) -> FieldType {
 /// `KeywordFieldMapper("keyword").ignoreAbove(256)`).
 const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
 
+/// ES default `index.mapping.depth.limit` — how many `properties` levels a
+/// dynamically discovered document may nest before recursion stops. Applies
+/// only to the nested-object walk below; it does not change how deep an
+/// *explicit* `_mapping` PUT may nest (that path is unaffected by this cap).
+const DYNAMIC_MAPPING_DEPTH_LIMIT: usize = 20;
+
 /// Build the [`FieldConfig`] for a dynamically discovered field.
 ///
 /// Wraps [`infer_field_type`] and mirrors the ES default dynamic mapping for
@@ -28101,13 +28107,62 @@ const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
 /// this records that contract in the schema rather than leaving it implicit.
 /// Sub-fields of a leaf parent are NOT top-level `schema.fields` entries, so
 /// the search path's text/keyword field sets are unaffected.
+///
+/// A nested JSON object gets the same treatment one level deeper: its own
+/// keys are recursively dynamic-mapped into child `FieldConfig`s under
+/// `fields`, the same way `Text` gets its `keyword` sibling -- `FieldConfig`
+/// and the ES-compat mapping renderer already both understand this dual
+/// meaning of `fields` (real `properties` on `Object`/`Nested`, multi-fields
+/// on a leaf type, see the doc comment on `FieldConfig::fields`); only the
+/// *dynamic-discovery* path was never populating it for `Object`, so a
+/// subfield like `metadata.kind` was genuinely queryable (the query path
+/// resolves dotted paths against `_source` regardless of the mapping) but
+/// invisible to `GET _mapping`/`_field_caps` -- indistinguishable from not
+/// existing to any client that discovers fields that way instead of already
+/// knowing the field name in advance (Kibana/OSD's own field list included).
+/// Array-of-objects is intentionally out of scope here: `infer_field_type`
+/// already only inspects an array's first element for its *type*, so this
+/// recurses into that same first element for consistency rather than
+/// attempting to reconcile a heterogeneous shape across array entries --
+/// no behavior change for arrays beyond what recursing into their inferred
+/// Object element already implies.
 fn dynamic_field_config(key: &str, val: &Value, date_detection: bool) -> FieldConfig {
+    dynamic_field_config_at_depth(key, val, date_detection, 1)
+}
+
+fn dynamic_field_config_at_depth(
+    key: &str,
+    val: &Value,
+    date_detection: bool,
+    depth: usize,
+) -> FieldConfig {
     let ft = infer_field_type(val, date_detection);
     let mut fc = FieldConfig::new(key.to_string(), ft);
-    if matches!(fc.field_type, FieldType::Text) {
-        let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
-        kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
-        fc.fields.push(kw);
+    match fc.field_type {
+        FieldType::Text => {
+            let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
+            kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
+            fc.fields.push(kw);
+        }
+        FieldType::Object if depth < DYNAMIC_MAPPING_DEPTH_LIMIT => {
+            // `val` itself may be the Array whose first element inferred
+            // Object (see doc comment) -- unwrap to whichever object is the
+            // real source of the nested keys.
+            let obj = val
+                .as_object()
+                .or_else(|| val.as_array()?.iter().find(|v| !v.is_null())?.as_object());
+            if let Some(obj) = obj {
+                for (sub_key, sub_val) in obj {
+                    fc.fields.push(dynamic_field_config_at_depth(
+                        sub_key,
+                        sub_val,
+                        date_detection,
+                        depth + 1,
+                    ));
+                }
+            }
+        }
+        _ => {}
     }
     fc
 }
@@ -36340,13 +36395,14 @@ mod date_detection_tests {
         assert!(matches!(fc.field_type, FieldType::Text));
         assert_eq!(fc.fields.len(), 1);
 
-        // Non-string inferences carry NO multi-field.
+        // Non-string leaf inferences carry NO multi-field. Object is
+        // exercised separately below (dynamic_object_recurses_into_nested_properties)
+        // since it now gets real child sub-fields, not zero.
         for (val, want_sub) in [
             (serde_json::json!(42), 0usize),
             (serde_json::json!(2.5), 0),
             (serde_json::json!(true), 0),
             (serde_json::json!("2026-07-25T10:30:00Z"), 0), // date-detected
-            (serde_json::json!({"a": 1}), 0),
         ] {
             let fc = dynamic_field_config("f", &val, true);
             assert_eq!(fc.fields.len(), want_sub, "value {val} sub-field count");
@@ -36356,6 +36412,89 @@ mod date_detection_tests {
         let fc = dynamic_field_config("ts", &serde_json::json!("2026-07-25T10:30:00Z"), false);
         assert!(matches!(fc.field_type, FieldType::Text));
         assert_eq!(fc.fields.len(), 1);
+    }
+
+    /// A dynamically discovered nested object must recurse into its own
+    /// keys instead of staying an opaque `{"type": "object"}` -- otherwise
+    /// a subfield like `metadata.kind` is genuinely queryable (the query
+    /// path resolves dotted paths against `_source` regardless of the
+    /// mapping) but invisible to `GET _mapping`/`_field_caps`, indistinguishable
+    /// from not existing to any client that discovers fields that way. Found
+    /// via `/_memory`'s `metadata` field, which is exactly this shape.
+    #[test]
+    fn dynamic_object_recurses_into_nested_properties() {
+        let fc = dynamic_field_config(
+            "metadata",
+            &serde_json::json!({"kind": "preference", "topic": "language"}),
+            true,
+        );
+        assert!(matches!(fc.field_type, FieldType::Object));
+        assert_eq!(fc.fields.len(), 2, "both nested keys should be discovered");
+
+        let kind = fc.fields.iter().find(|f| f.name == "kind").expect("kind");
+        assert!(matches!(kind.field_type, FieldType::Text));
+        // Recursion composes with #209: a nested Text field gets its own
+        // .keyword multi-field too, same as a top-level one would.
+        assert_eq!(kind.fields.len(), 1);
+        assert_eq!(kind.fields[0].name, "keyword");
+        assert!(matches!(kind.fields[0].field_type, FieldType::Keyword));
+
+        // Multi-level nesting: object -> object -> leaf.
+        let fc = dynamic_field_config("a", &serde_json::json!({"b": {"c": 1}}), true);
+        let b = &fc.fields[0];
+        assert_eq!(b.name, "b");
+        assert!(matches!(b.field_type, FieldType::Object));
+        let c = &b.fields[0];
+        assert_eq!(c.name, "c");
+        assert!(matches!(c.field_type, FieldType::Long));
+
+        // Mixed-type nested keys are inferred independently, like top-level
+        // dynamic mapping already does.
+        let fc = dynamic_field_config(
+            "metadata",
+            &serde_json::json!({"count": 3, "active": true, "label": "x"}),
+            true,
+        );
+        let by_name = |n: &str| fc.fields.iter().find(|f| f.name == n).unwrap();
+        assert!(matches!(by_name("count").field_type, FieldType::Long));
+        assert!(matches!(by_name("active").field_type, FieldType::Boolean));
+        assert!(matches!(by_name("label").field_type, FieldType::Text));
+
+        // Depth limit: recursion stops at DYNAMIC_MAPPING_DEPTH_LIMIT rather
+        // than walking an adversarially deep document forever (ES has the
+        // same guard via index.mapping.depth.limit, default 20).
+        let mut deep = serde_json::json!(1);
+        for _ in 0..DYNAMIC_MAPPING_DEPTH_LIMIT + 5 {
+            deep = serde_json::json!({"n": deep});
+        }
+        let fc = dynamic_field_config("root", &deep, true);
+        let mut cur = &fc;
+        let mut levels = 0;
+        while let Some(next) = cur.fields.first() {
+            cur = next;
+            levels += 1;
+        }
+        assert!(
+            levels < DYNAMIC_MAPPING_DEPTH_LIMIT + 5,
+            "recursion must stop before reaching the artificially deep bottom, got {levels} levels"
+        );
+
+        // Array of objects: infer_field_type already only looks at the
+        // first non-null element to decide the *type* (Object); the
+        // dynamic-mapping walk mirrors that by recursing into the same
+        // element rather than reconciling every array entry's shape.
+        let fc = dynamic_field_config(
+            "tags",
+            &serde_json::json!([{"kind": "x"}, {"kind": "y", "extra": true}]),
+            true,
+        );
+        assert!(matches!(fc.field_type, FieldType::Object));
+        assert_eq!(
+            fc.fields.len(),
+            1,
+            "only the first element's keys are discovered"
+        );
+        assert_eq!(fc.fields[0].name, "kind");
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on

@@ -183,10 +183,22 @@ async fn ensure_backing_index(
     // similarity. 384 mirrors the built-in embedder width (xerj_ai DEFAULT_DIMS);
     // kept as a literal to avoid a build-graph edge from xerj-api onto xerj-ai
     // (same convention as es_compat's semantic_text mapper).
+    //
+    // `metadata` is deliberately NOT pre-declared here (unlike `text`/
+    // `stored_at`, which are always present and same-shaped). Its own shape
+    // is caller-defined and varies per memory, so pinning it to a bare
+    // `{"type": "object"}` up front would permanently prevent its keys from
+    // ever being dynamically mapped -- once a field has ANY explicit
+    // mapping entry, later documents no longer go through dynamic
+    // discovery for it, even a shallow one with no `properties`. Leaving it
+    // out lets the first stored memory's `metadata` keys flow through the
+    // engine's normal dynamic-mapping path instead, which now recurses
+    // into nested objects (see xerj-engine's `dynamic_field_config`), so
+    // `metadata.kind`/`metadata.topic`/etc. become real, `_mapping`-visible
+    // fields instead of being permanently opaque.
     let mut properties = json!({
         "text": { "type": "semantic_text", "dimensions": 384 },
-        "stored_at": { "type": "long" },
-        "metadata": { "type": "object" }
+        "stored_at": { "type": "long" }
     });
     if let Some(dims) = vector_dims {
         if dims == 0 {
