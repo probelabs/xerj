@@ -228,6 +228,9 @@ pub async fn attach_policy(state: &AppState, index: &str, policy_id: &str) -> Re
         policy.default_state.clone(),
         lifecycle::now_ms(),
     );
+    // An explicit attach overrides an earlier detach: clear the tombstone
+    // (#282) before inserting so the persisted state says one thing.
+    state.engine.lifecycle_detached.remove(index);
     state
         .engine
         .managed_indices
@@ -271,8 +274,11 @@ pub async fn remove_ism_policy(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.managed_indices.remove(&index).is_some() {
-        state.engine.persist_managed_indices();
+    if state.engine.managed_indices.contains_key(&index) {
+        // One shared detach path (engine method) for all three detach
+        // routes, so the acknowledged detach is tombstoned and persisted
+        // identically whichever surface the operator used (#282).
+        state.engine.detach_lifecycle(&index);
         Json(single_index_success()).into_response()
     } else {
         Json(not_managed_failure(

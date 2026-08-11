@@ -13,7 +13,7 @@ use axum::{
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 use xerj_common::types::{FieldConfig, FieldType, Schema};
 use xerj_query::parse_request;
@@ -1142,9 +1142,7 @@ pub async fn create_index(
             // silent on a missing/untranslatable policy — real ILM is
             // equally lenient here: it discovers the policy by name lazily
             // and simply doesn't start managing until one exists.
-            if let LifecycleDirective::Attach(policy_name) =
-                ilm_lifecycle_directive_from_settings(&body)
-            {
+            if let Some(Some(policy_name)) = ilm_lifecycle_directive_from_settings(&body) {
                 let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
             }
 
@@ -2432,6 +2430,85 @@ fn merge_dotted_property(
     merge_dotted_property(sub_obj, &rest, leaf_value);
 }
 
+/// Merge a stored (explicit, cached-at-index-creation) mapping's
+/// `properties` with the live schema-derived `properties`
+/// (`schema_to_es_properties`).
+///
+/// The stored declaration wins for any field it names -- it may carry
+/// explicit settings (`ignore_above`, `analyzer`, `dense_vector` options,
+/// ...) the schema's own type inference wouldn't reconstruct identically.
+/// But a field the live schema knows about and the stored blob doesn't is
+/// still included, instead of being permanently invisible: without this,
+/// GET _mapping/_field_caps serve the ORIGINAL index-creation-time blob
+/// forever, and any field discovered dynamically since -- flat or nested,
+/// at any depth -- never appears in either, no matter how long the index
+/// has been receiving new documents.
+///
+/// Recurses into whichever nested-children key each side actually uses
+/// (`properties` for Object/Nested, `fields` for a leaf's multi-fields),
+/// so a field explicitly declared without its own nested declaration
+/// (e.g. a bare `{"type": "object"}`) still picks up children discovered
+/// dynamically since, rather than only ever getting top-level treatment.
+fn merge_mapping_properties(
+    stored_properties: &serde_json::Map<String, Value>,
+    live_properties: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    let mut merged = stored_properties.clone();
+    for (key, live_val) in live_properties {
+        match merged.get_mut(key) {
+            None => {
+                merged.insert(key.clone(), live_val.clone());
+            }
+            Some(stored_val) => {
+                for children_key in ["properties", "fields"] {
+                    let Some(live_children) =
+                        live_val.get(children_key).and_then(|v| v.as_object())
+                    else {
+                        continue;
+                    };
+                    let stored_children = stored_val
+                        .get(children_key)
+                        .and_then(|v| v.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    let merged_children = merge_mapping_properties(&stored_children, live_children);
+                    if let Some(obj) = stored_val.as_object_mut() {
+                        obj.insert(children_key.to_string(), Value::Object(merged_children));
+                    }
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Companion `dense_vector` fields the engine auto-creates for each
+/// `semantic_text` field (e.g. `body` -> `body_vector`, or `target_field`
+/// if the caller declared one) are an implementation detail, never meant
+/// to be user-visible -- nothing in the caller's own mapping ever names
+/// them. Once a document makes the live schema aware of a companion field,
+/// `merge_mapping_properties` above would otherwise happily surface it in
+/// `GET _mapping`/`_field_caps`, even though it was never declared under
+/// that name by anyone. Scans `stored_properties` (the only place a
+/// `semantic_text` field can legitimately be declared -- dynamic mapping
+/// never infers that type) for each one and returns the companion name
+/// `semantic_mapping_contract` computes for it, so callers can filter
+/// those out of what they feed into `merge_mapping_properties`.
+fn semantic_companion_field_names(
+    stored_properties: &serde_json::Map<String, Value>,
+) -> HashSet<String> {
+    stored_properties
+        .iter()
+        .filter_map(|(name, def)| {
+            let obj = def.as_object()?;
+            (obj.get("type").and_then(Value::as_str) == Some("semantic_text")).then(|| {
+                let (target, _dimensions, _similarity) = semantic_mapping_contract(name, obj);
+                target
+            })
+        })
+        .collect()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /{index}/_mapping
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2478,17 +2555,43 @@ pub async fn get_mapping(
             .get(name)
             .map(|v| v.clone())
             .unwrap_or(Value::Null);
-        let mut mappings = if stored.is_null() {
-            match &idx {
-                Some(i) => {
-                    let schema = i.schema().await;
-                    let properties = schema_to_es_properties(&schema);
-                    json!({ "properties": properties })
-                }
-                None => json!({ "properties": {} }),
+        let mut mappings = match (&idx, stored.is_null()) {
+            (Some(i), true) => {
+                let schema = i.schema().await;
+                let properties = schema_to_es_properties(&schema);
+                json!({ "properties": properties })
             }
-        } else {
-            stored
+            // A live index with a stored (explicit-at-creation) mapping:
+            // merge in anything the live schema has picked up dynamically
+            // since -- otherwise a field discovered after index creation
+            // (flat or nested, at any depth) is permanently invisible here,
+            // forever serving the exact blob index creation started with.
+            (Some(i), false) => {
+                let schema = i.schema().await;
+                let mut live_properties = schema_to_es_properties(&schema);
+                let stored_properties = stored
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                // semantic_text's own companion dense_vector fields are an
+                // engine-internal implementation detail, never declared by
+                // the caller under that name -- exclude them from what the
+                // live schema contributes, same as they were never visible
+                // before this merge existed (see semantic_companion_field_names).
+                let companions = semantic_companion_field_names(&stored_properties);
+                live_properties.retain(|k, _| !companions.contains(k));
+                let merged = merge_mapping_properties(&stored_properties, &live_properties);
+                let mut m = stored.clone();
+                if let Some(obj) = m.as_object_mut() {
+                    obj.insert("properties".to_string(), Value::Object(merged));
+                }
+                m
+            }
+            // No live index (failed index, #206) -- nothing to merge with,
+            // serve whatever's recoverable as-is.
+            (None, false) => stored,
+            (None, true) => json!({ "properties": {} }),
         };
         // ES injects default `rescore_vector.oversample: 3.0` on any
         // dense_vector whose `index_options.type` is BBQ-quantised
@@ -18820,6 +18923,77 @@ pub struct FieldCapsParams {
     pub fields: Option<String>,
 }
 
+/// Register one `_field_caps` entry for `field`, dotted-path-qualified by
+/// `dotted_prefix`, then recurse into its own nested `properties` children
+/// (Object/Nested only) so those get their own dotted-path entries too --
+/// e.g. a `metadata` object field with a `kind` child registers both
+/// `metadata` AND `metadata.kind`, not just the former.
+///
+/// Deliberately does NOT recurse into a leaf field's `fields` (multi-field
+/// siblings like `.keyword`) -- that's a different concept (the same value
+/// indexed a second way, not a distinct child field) and stays the job of
+/// `collect_multi_fields`, called separately with the same merged
+/// `properties` this function is given. Before this function existed, the
+/// per-field loop only ever looked at the top-level `schema.fields`, so a
+/// nested object's own children (`metadata.kind` itself, not just further
+/// multi-fields under it like `metadata.kind.keyword`) were never their
+/// own `_field_caps` entry, even once the mapping/properties correctly
+/// described them.
+#[allow(clippy::too_many_arguments)]
+fn register_field_cap_entry(
+    field: &FieldConfig,
+    dotted_prefix: &str,
+    properties: &Value,
+    fields_filter: &str,
+    idx_name: &str,
+    fields_map: &mut HashMap<String, serde_json::Map<String, Value>>,
+) {
+    let dotted_name = if dotted_prefix.is_empty() {
+        field.name.clone()
+    } else {
+        format!("{dotted_prefix}.{}", field.name)
+    };
+
+    let matches = fields_filter == "*"
+        || fields_filter
+            .split(',')
+            .any(|f| source_field_matches(&dotted_name, f.trim()));
+    if matches {
+        let native_es_type = native_type_to_es_str(&field.field_type);
+        let es_type = declared_flattened_type(properties, &dotted_name)
+            .or_else(|| declared_numeric_type(properties, &dotted_name))
+            .unwrap_or(native_es_type);
+        let searchable = field.is_searchable();
+        let aggregatable = field.is_aggregatable();
+
+        let type_map = fields_map.entry(dotted_name.clone()).or_default();
+        let type_entry = type_map.entry(es_type.to_string()).or_insert_with(|| {
+            json!({
+                "type": es_type,
+                "searchable": searchable,
+                "aggregatable": aggregatable,
+                "indices": []
+            })
+        });
+        if let Some(arr) = type_entry["indices"].as_array_mut() {
+            arr.push(Value::String(idx_name.to_string()));
+        }
+    }
+
+    if matches!(field.field_type, FieldType::Object | FieldType::Nested) {
+        for child in &field.fields {
+            register_field_cap_entry(
+                child,
+                &dotted_name,
+                properties,
+                fields_filter,
+                idx_name,
+                fields_map,
+            );
+        }
+    }
+}
+
 pub async fn field_caps(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -18869,45 +19043,42 @@ pub async fn field_caps(
             .get(idx_name.as_str())
             .map(|v| v.clone())
             .unwrap_or(Value::Null);
+        let mut live_properties = schema_to_es_properties(&schema);
         let properties = if stored_mapping.is_null() {
-            Value::Object(schema_to_es_properties(&schema))
+            Value::Object(live_properties)
         } else {
-            stored_mapping
+            // Merge, don't just fall back to the cached blob: a field the
+            // live schema has discovered since index creation (flat or
+            // nested, at any depth) must still surface here, not only ever
+            // the fields the index started with (see get_mapping, same
+            // fix). `declared_flattened_type`/`declared_numeric_type`
+            // below need the stored declaration where there is one, hence
+            // merging rather than switching to `live_properties` outright.
+            let stored_properties = stored_mapping
                 .get("properties")
+                .and_then(|p| p.as_object())
                 .cloned()
-                .unwrap_or_else(|| json!({}))
+                .unwrap_or_default();
+            // Exclude semantic_text's own companion dense_vector fields --
+            // never declared by the caller under that name, see
+            // semantic_companion_field_names (same exclusion as get_mapping).
+            let companions = semantic_companion_field_names(&stored_properties);
+            live_properties.retain(|k, _| !companions.contains(k));
+            Value::Object(merge_mapping_properties(
+                &stored_properties,
+                &live_properties,
+            ))
         };
 
         for field in &schema.fields {
-            // Support comma-separated field list and wildcard suffix.
-            if fields_filter != "*" {
-                let matches = fields_filter
-                    .split(',')
-                    .any(|f| source_field_matches(&field.name, f.trim()));
-                if !matches {
-                    continue;
-                }
-            }
-
-            let native_es_type = native_type_to_es_str(&field.field_type);
-            let es_type = declared_flattened_type(&properties, &field.name)
-                .or_else(|| declared_numeric_type(&properties, &field.name))
-                .unwrap_or(native_es_type);
-            let searchable = field.is_searchable();
-            let aggregatable = field.is_aggregatable();
-
-            let type_map = fields_map.entry(field.name.clone()).or_default();
-            let type_entry = type_map.entry(es_type.to_string()).or_insert_with(|| {
-                json!({
-                    "type": es_type,
-                    "searchable": searchable,
-                    "aggregatable": aggregatable,
-                    "indices": []
-                })
-            });
-            if let Some(arr) = type_entry["indices"].as_array_mut() {
-                arr.push(Value::String(idx_name.clone()));
-            }
+            register_field_cap_entry(
+                field,
+                "",
+                &properties,
+                fields_filter,
+                idx_name,
+                &mut fields_map,
+            );
         }
 
         // Multi-fields (`"fields": {"keyword": {"type": "keyword"}}`) are
@@ -22118,62 +22289,71 @@ pub async fn put_settings(
         sync_display_blocks(&state, name).await;
     }
 
-    // Same lazy, best-effort `index.lifecycle.name` attach as create_index —
-    // `PUT {index}/_settings {"index.lifecycle.name": "policy"}` is the
-    // other real ILM entry point (attaching to an index that already
-    // exists, not just at creation) — and, symmetrically, this is also
-    // where a real client detaches: `{"index.lifecycle.name": null}`.
+    // `PUT {index}/_settings` is the other real ILM entry point — for
+    // attaching (`"index.lifecycle.name": "policy"`) AND for detaching
+    // (`"index.lifecycle.name": null`, issue #282). The detach goes through
+    // `Engine::detach_lifecycle`, which tombstones and persists it: the
+    // `acknowledged: true` this handler returns must still be true after a
+    // restart, and must stop the delete phase immediately.
     match ilm_lifecycle_directive_from_settings(&body) {
-        LifecycleDirective::Attach(policy_name) => {
+        Some(Some(policy_name)) => {
             for idx in &targets {
                 let _ = crate::ism_api::attach_policy(&state, idx, &policy_name).await;
             }
         }
-        LifecycleDirective::Detach => {
+        Some(None) => {
             for idx in &targets {
-                crate::ism_api::detach_ilm_policy(&state, idx);
+                // Never tombstone a name that is not an index: a persisted
+                // tombstone for a ghost is unbounded state writable from
+                // the public port (#262 hit exactly this in review).
+                if state.engine.get_index(idx).is_ok() {
+                    state.engine.detach_lifecycle(idx);
+                }
             }
         }
-        LifecycleDirective::Absent => {}
+        None => {}
     }
 
     Json(json!({ "acknowledged": true })).into_response()
 }
 
-/// What a settings body says about `index.lifecycle.name`. A bare
-/// `Option<String>` cannot tell "the key was not mentioned" apart from
-/// "the key was explicitly set to `null`" — and those mean opposite things:
-/// the first is "leave lifecycle management alone", the second is "stop
-/// managing this index" (real ES's documented detach idiom). Collapsing
-/// them into one `None` is exactly the bug found in #262 (closed as
-/// superseded by this engine, but its finding stood): a client's
-/// `PUT {index}/_settings {"index.lifecycle.name": null}` got back
-/// `{"acknowledged": true}` while the index stayed attached and was later
-/// deleted by its policy anyway — confirmed live against this engine before
-/// this fix, `GET` on the "detached" index returned 404 after the next
-/// lifecycle tick.
-enum LifecycleDirective {
-    Absent,
-    Detach,
-    Attach(String),
-}
-
-/// Extract the `index.lifecycle.name` directive from an index-settings body,
-/// accepting both the nested (`{"index":{"lifecycle":{"name":"..."}}}`,
-/// `{"settings":{...}}`-wrapped at create time) and flat dotted-key
-/// (`{"index.lifecycle.name":"..."}`) forms ES accepts for every index
-/// setting. A non-string, non-null value (malformed input) is treated as
-/// absent rather than erroring — matches the pre-existing leniency this
-/// function already had for every other shape it didn't recognize.
-fn ilm_lifecycle_directive_from_settings(body: &Value) -> LifecycleDirective {
+/// What a settings body asks lifecycle management to do about the index's
+/// attachment, reading both the nested (`{"index":{"lifecycle":{"name":
+/// "..."}}}`, `{"settings":{...}}`-wrapped at create time) and flat
+/// dotted-key (`{"index.lifecycle.name":"..."}`) forms ES accepts for every
+/// index setting.
+///
+/// Three-valued on purpose (issue #282, ported from #262's
+/// `lifecycle_directive_from_settings`), because `Option<String>` cannot
+/// tell "the caller said nothing about `index.lifecycle.name`" apart from
+/// "the caller said `null`", and those mean opposite things:
+///
+///  * `None` — the body does not mention `index.lifecycle.name`. Leave the
+///    attachment exactly as it is.
+///  * `Some(None)` — explicit `null` (or an empty string): **detach**, ES's
+///    documented way to stop managing an index. Before #282 this arm did
+///    not exist: the null fell through `Value::as_str` and the index stayed
+///    attached to a policy whose delete phase later fired — the data-loss
+///    defect found in #262's review.
+///  * `Some(Some(policy))` — attach to `policy`.
+fn ilm_lifecycle_directive_from_settings(body: &Value) -> Option<Option<String>> {
     let settings = body.get("settings").unwrap_or(body);
-    let raw = settings
+    let v = settings
         .pointer("/index/lifecycle/name")
-        .or_else(|| settings.get("index.lifecycle.name"));
-    match raw {
-        Some(Value::String(s)) => LifecycleDirective::Attach(s.clone()),
-        Some(Value::Null) => LifecycleDirective::Detach,
-        _ => LifecycleDirective::Absent,
+        .or_else(|| settings.get("index.lifecycle.name"))?;
+    match v {
+        Value::Null => Some(None),
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Some(None)
+            } else {
+                Some(Some(t.to_string()))
+            }
+        }
+        // Any other JSON type is not a policy name. Treat it as "said
+        // nothing" rather than guessing a detach out of a malformed body.
+        _ => None,
     }
 }
 
@@ -24106,41 +24286,37 @@ pub async fn put_ilm_policy(
     Path(name): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Translate into the shared internal model (`xerj_engine::lifecycle`)
+    // FIRST, and refuse the PUT outright if any part of the policy is not
+    // executable (issue #282, ported from #262's `validate_policy`
+    // allowlist). This used to accept the policy with an advisory
+    // `"xerj_lifecycle_execution": "unsupported"` note in the response —
+    // but nothing reads a response note twice: the policy sat stored and
+    // GET-able, looking configured, while executing less than it said (or
+    // nothing at all). Accepted-and-ignored is this repo's dominant bug
+    // class (#204); a 400 naming the action is the honest answer.
+    let policy = match xerj_engine::lifecycle::translate_ilm_policy(&body) {
+        Ok(policy) => policy,
+        Err(reason) => {
+            return ApiError::new(xerj_common::XerjError::invalid_query(format!(
+                "ILM policy '{name}' was refused, not stored: {reason}"
+            )))
+            .into_response();
+        }
+    };
+
     // Persist the raw policy verbatim in the ILM store; `get_ilm_policy`
     // reads it back out of this same DashMap, so PUT then GET round-trips
-    // faithfully regardless of whether translation below succeeds — and the
-    // store is written to `<data_dir>/cluster_state.json`, so it round-trips
-    // after a restart too (issue #203). This write goes first because it is
-    // the one that can fail loudly: if the document cannot be persisted the
-    // request is a 500 and nothing has happened yet, rather than an
-    // `acknowledged` that a reboot silently undoes.
+    // faithfully — and the store is written to
+    // `<data_dir>/cluster_state.json`, so it round-trips after a restart
+    // too (issue #203). If the document cannot be persisted the request is
+    // a 500 and nothing has happened, rather than an `acknowledged` that a
+    // reboot silently undoes.
     if let Err(e) = state.engine.put_ilm_policy(name.clone(), body.clone()) {
         return ApiError::new(xerj_common::XerjError::from(e)).into_response();
     }
-
-    // Translate into the shared internal model (`xerj_engine::lifecycle`)
-    // so the SAME background job that drives native ISM policies also
-    // drives this one — see that module's doc comment for why. Real ILM
-    // is lenient about phase actions it can't reproduce internally too
-    // (e.g. `searchable_snapshot` is best-effort); mirroring that, a
-    // translation failure here doesn't fail the PUT — the policy is
-    // still stored and GET-able, it just won't actually execute (no entry
-    // lands in `ism_policies`) until it's fixed. Surfaced back in the
-    // response so this isn't silent.
-    match xerj_engine::lifecycle::translate_ilm_policy(&body) {
-        Ok(policy) => {
-            state.engine.put_ism_policy(name, policy);
-            Json(json!({ "acknowledged": true })).into_response()
-        }
-        Err(reason) => Json(json!({
-            "acknowledged": true,
-            "xerj_lifecycle_execution": {
-                "status": "unsupported",
-                "reason": reason,
-            }
-        }))
-        .into_response(),
-    }
+    state.engine.put_ism_policy(name, policy);
+    Json(json!({ "acknowledged": true })).into_response()
 }
 
 // GET _ilm/policy (no name segment) — the form Kibana's own ILM UI calls to
@@ -24297,23 +24473,86 @@ pub async fn ilm_explain(
     Json(json!({ "indices": Value::Object(indices) })).into_response()
 }
 
-/// `POST {index}/_ilm/remove` — real ES's dedicated detach verb, sharing
-/// the same removal path the `index.lifecycle.name: null` settings
-/// directive uses (`ism_api::detach_ilm_policy`). Validates the index
-/// exists first (404 otherwise) rather than silently acknowledging a call
-/// against a name that was never real — the same accept-and-ignore shape
-/// #262 found and fixed on this exact endpoint in its own (closed,
-/// superseded) implementation.
-pub async fn ilm_remove(
+/// Resolve an index spec for the ILM endpoints that refuse ghosts: every
+/// *named* (non-wildcard) part must be an existing index or alias, and the
+/// result is filtered to indices that actually exist. A wildcard matching
+/// nothing is a legal empty answer (ES's `allow_no_indices=true` default);
+/// a literal that names nothing is a 404 `index_not_found_exception`.
+///
+/// Exists because `resolve_index_selector`'s documented fallback returns a
+/// literal name whether or not it exists — the right default for lenient
+/// read endpoints, and exactly wrong for a detach that writes a persisted
+/// tombstone per target (#262 shipped that bug first and fixed it as
+/// `resolve_existing_index_targets`; same name, same rule here).
+async fn resolve_existing_index_targets(
+    state: &AppState,
+    spec: &str,
+) -> Result<Vec<String>, xerj_common::XerjError> {
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part == "_all" || part.contains('*') {
+            continue;
+        }
+        if state.engine.get_index(part).is_err() && !state.engine.aliases.contains_key(part) {
+            return Err(xerj_common::XerjError::index_not_found(part));
+        }
+    }
+    Ok(resolve_index_selector(state, spec)
+        .await
+        .into_iter()
+        .filter(|t| state.engine.get_index(t).is_ok())
+        .collect())
+}
+
+/// `POST /{index}/_ilm/remove` — stop managing these indices (issue #282).
+///
+/// ES's own verb for detaching; until #282 the only detach route was `PUT
+/// /{index}/_settings {"index.lifecycle.name": null}` — which was itself
+/// silently ignored. Both now go through [`xerj_engine::Engine::detach_lifecycle`],
+/// so a detach is recorded (tombstoned + persisted) once, whichever surface
+/// the operator used.
+pub async fn remove_ilm_policy_from_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.get_index(&index).is_err() {
-        let e = xerj_common::XerjError::index_not_found(&index);
-        return ApiError::new(e).into_response();
+    let targets = match resolve_existing_index_targets(&state, &index).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    for name in &targets {
+        state.engine.detach_lifecycle(name);
     }
-    crate::ism_api::detach_ilm_policy(&state, &index);
     Json(json!({ "has_failures": false, "failed_indexes": [] })).into_response()
+}
+
+/// `GET /_ilm/status` — `RUNNING`/`STOPPED` plus XERJ's honest counters
+/// (issue #282). An operator halting retention needs to see that the halt
+/// took; a status endpoint that cannot disagree with the executor is the
+/// receipt (`operation_mode` reads the same flag `lifecycle::tick` checks).
+pub async fn get_ilm_status(State(state): State<AppState>) -> impl IntoResponse {
+    let running = state.engine.lifecycle_execution_running();
+    Json(json!({
+        "operation_mode": if running { "RUNNING" } else { "STOPPED" },
+        "xerj": {
+            "managed_indices": state.engine.managed_indices.len(),
+            "detached_indices": state.engine.lifecycle_detached.len(),
+            "policies": state.engine.ism_policies.len(),
+        }
+    }))
+    .into_response()
+}
+
+/// `POST /_ilm/start` and `POST /_ilm/stop` — the operator's kill switch
+/// (issue #282): halt lifecycle execution without stopping the node. The
+/// flag is in-memory (a restart resumes execution — erring on the side of
+/// retention running); the detach tombstone is the durable per-index stop.
+pub async fn start_ilm(State(state): State<AppState>) -> impl IntoResponse {
+    state.engine.set_lifecycle_execution_running(true);
+    Json(json!({ "acknowledged": true, "operation_mode": "RUNNING" })).into_response()
+}
+
+pub async fn stop_ilm(State(state): State<AppState>) -> impl IntoResponse {
+    state.engine.set_lifecycle_execution_running(false);
+    Json(json!({ "acknowledged": true, "operation_mode": "STOPPED" })).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
