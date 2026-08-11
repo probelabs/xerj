@@ -165,6 +165,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that is not an index answers 404 rather than writing a tombstone for a
   ghost.
 
+- **A dynamically-discovered nested object field is no longer permanently
+  opaque to `GET _mapping`/`_field_caps`.** A subfield like `metadata.kind`
+  was already queryable (dotted-path resolution against `_source` doesn't
+  care about the mapping) but had no way to be *discovered* by a client that
+  reads the mapping instead of already knowing the field name — indistinguishable
+  from not existing to Kibana/OSD's own field-list UI. Three compounding gaps,
+  all fixed together: dynamic mapping never recursed into `Value::Object`
+  (`{"type": "object"}` was a terminal, not real ES/OS default behavior);
+  `GET _mapping`/`_field_caps` served the index-creation-time explicit mapping
+  blob verbatim forever, so *any* field discovered dynamically after creation
+  — flat or nested — never surfaced, no matter how many documents arrived; and
+  `_field_caps`'s per-field walk only ever registered top-level names, so a
+  nested object's own children were still invisible even once the mapping
+  correctly described them. Measured end-to-end on `/_memory`'s own backing
+  index: `GET .xerj-memory-{ns}/_field_caps?fields=metadata.kind` returned
+  `{"fields": {}}` before, the real entry after. The cluster-wide
+  `GET /_field_caps` (as opposed to the per-index `GET /{index}/_field_caps`)
+  had the same gaps independently and is fixed the same way — the two no
+  longer disagree about which fields exist.
+  **Known limitation**: this only benefits indices created after this
+  ships. An index (a `/_memory` namespace or otherwise) created before it
+  already has its stored mapping written, and that isn't retroactively
+  edited — existing indices need either re-creation or an explicit
+  `PUT _mapping` to pick up the fix. No automatic migration is included.
+
 - **A crafted filename can no longer forge records on the agent progress
   stream** (the first rc.15 known issue below). Every externally-controlled
   string — in-flight paths, the paths and error text interpolated into human

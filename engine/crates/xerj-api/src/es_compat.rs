@@ -19032,7 +19032,6 @@ pub struct FieldCapsParams {
 /// multi-fields under it like `metadata.kind.keyword`) were never their
 /// own `_field_caps` entry, even once the mapping/properties correctly
 /// described them.
-#[allow(clippy::too_many_arguments)]
 fn register_field_cap_entry(
     field: &FieldConfig,
     dotted_prefix: &str,
@@ -19084,6 +19083,168 @@ fn register_field_cap_entry(
                 fields_map,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mapping_merge_tests {
+    //! Direct, non-HTTP coverage for `merge_mapping_properties`,
+    //! `semantic_companion_field_names`, and `register_field_cap_entry` --
+    //! the highest-risk code in the nested-object-mapping fix (recursive,
+    //! and where the one regression found before this landed actually
+    //! lived: semantic_text's own companion field leaking into the
+    //! merge). Complements the HTTP-level end-to-end coverage elsewhere
+    //! (`dynamic_string_mapping_advertises_keyword_multi_field`,
+    //! `api_semantic_bulk_builds_complete_hnsw_and_survives_restart`) with
+    //! fast, precise checks of the merge/registration logic in isolation.
+    use super::*;
+
+    #[test]
+    fn stored_declaration_wins_over_live_for_a_field_both_know_about() {
+        let stored = json!({"price": {"type": "keyword", "ignore_above": 64}})
+            .as_object()
+            .unwrap()
+            .clone();
+        // The live schema inferred a plainer shape for the same field --
+        // the stored declaration's own settings must survive the merge.
+        let live = json!({"price": {"type": "text"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let merged = merge_mapping_properties(&stored, &live);
+        assert_eq!(merged["price"]["type"], "keyword");
+        assert_eq!(merged["price"]["ignore_above"], 64);
+    }
+
+    #[test]
+    fn live_only_field_is_included_not_dropped() {
+        let stored = json!({"a": {"type": "text"}}).as_object().unwrap().clone();
+        let live = json!({"a": {"type": "text"}, "b": {"type": "long"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let merged = merge_mapping_properties(&stored, &live);
+        assert_eq!(
+            merged["b"]["type"], "long",
+            "a field only the live schema knows about must still surface: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn bare_object_declaration_picks_up_live_nested_children() {
+        // Exactly /_memory's own historical shape before the memory_api.rs
+        // fix: a field explicitly declared as a bare {"type":"object"}
+        // with no properties of its own.
+        let stored = json!({"metadata": {"type": "object"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let live = json!({
+            "metadata": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}}
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let merged = merge_mapping_properties(&stored, &live);
+        assert_eq!(merged["metadata"]["properties"]["kind"]["type"], "text");
+        assert_eq!(
+            merged["metadata"]["properties"]["kind"]["fields"]["keyword"]["type"],
+            "keyword"
+        );
+    }
+
+    #[test]
+    fn nested_merge_is_recursive_not_just_one_level() {
+        let stored = json!({"a": {"type": "object", "properties": {"b": {"type": "object"}}}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let live = json!({
+            "a": {"type": "object", "properties": {
+                "b": {"type": "object", "properties": {"c": {"type": "long"}}}
+            }}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let merged = merge_mapping_properties(&stored, &live);
+        assert_eq!(
+            merged["a"]["properties"]["b"]["properties"]["c"]["type"],
+            "long"
+        );
+    }
+
+    #[test]
+    fn semantic_companion_field_names_finds_default_and_explicit_target() {
+        let stored = json!({
+            "body": {"type": "semantic_text", "dimensions": 32},
+            "summary": {"type": "semantic_text", "target_field": "summary_emb"},
+            "title": {"type": "text"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let companions = semantic_companion_field_names(&stored);
+        assert!(companions.contains("body_vector"), "{companions:?}");
+        assert!(companions.contains("summary_emb"), "{companions:?}");
+        assert_eq!(
+            companions.len(),
+            2,
+            "a non-semantic_text field must not contribute a companion name: {companions:?}"
+        );
+    }
+
+    #[test]
+    fn register_field_cap_entry_registers_nested_object_children_directly() {
+        let mut metadata = FieldConfig::new("metadata", FieldType::Object);
+        metadata
+            .fields
+            .push(FieldConfig::new("kind", FieldType::Text));
+
+        let mut fields_map: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
+        register_field_cap_entry(&metadata, "", &json!({}), "*", "idx", &mut fields_map);
+
+        assert!(fields_map.contains_key("metadata"), "{fields_map:?}");
+        assert!(
+            fields_map.contains_key("metadata.kind"),
+            "the nested child itself must get its own dotted entry, not just its own further multi-fields: {fields_map:?}"
+        );
+    }
+
+    #[test]
+    fn register_field_cap_entry_respects_the_fields_filter() {
+        let mut metadata = FieldConfig::new("metadata", FieldType::Object);
+        metadata
+            .fields
+            .push(FieldConfig::new("kind", FieldType::Text));
+        metadata
+            .fields
+            .push(FieldConfig::new("topic", FieldType::Text));
+
+        let mut fields_map: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
+        register_field_cap_entry(
+            &metadata,
+            "",
+            &json!({}),
+            "metadata.kind",
+            "idx",
+            &mut fields_map,
+        );
+
+        assert!(fields_map.contains_key("metadata.kind"), "{fields_map:?}");
+        assert!(
+            !fields_map.contains_key("metadata.topic"),
+            "a filter naming one nested child must not also register its sibling: {fields_map:?}"
+        );
+        assert!(
+            !fields_map.contains_key("metadata"),
+            "a filter naming only the nested child must not also register the parent: {fields_map:?}"
+        );
     }
 }
 
@@ -19580,6 +19741,152 @@ mod flat_object_field_caps_tests {
         assert_eq!(
             caps["fields"]["city.keyword"]["keyword"]["type"], "keyword",
             "city.keyword must appear in _field_caps, got: {caps}"
+        );
+    }
+
+    /// The cluster-wide `GET /_field_caps` (routed to `global_field_caps`)
+    /// used to be a near-duplicate of the per-index `field_caps` body from
+    /// *before* the nested-object-mapping fix: same stale cached-mapping
+    /// read, same top-level-only field loop, and it never called
+    /// `collect_multi_fields` at all -- so `GET /{index}/_field_caps` and
+    /// `GET /_field_caps` could (and did) disagree about which fields
+    /// exist. Proves both now agree, on the exact nested-object shape the
+    /// whole fix is about.
+    #[tokio::test]
+    async fn global_field_caps_agrees_with_per_index_field_caps_on_nested_objects() {
+        let router = crate::router::build_es_compat_router(test_state());
+
+        let write = router
+            .clone()
+            .oneshot(
+                Request::put("/global-caps-e2e/_doc/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"metadata": {"kind": "preference", "topic": "language"}})
+                            .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("write response");
+        assert!(write.status().is_success());
+
+        let per_index_resp = router
+            .clone()
+            .oneshot(
+                Request::get("/global-caps-e2e/_field_caps?fields=*")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("per-index field_caps response");
+        assert!(per_index_resp.status().is_success());
+        let per_index_bytes = to_bytes(per_index_resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let per_index: Value = serde_json::from_slice(&per_index_bytes).expect("JSON response");
+
+        let global_resp = router
+            .oneshot(
+                Request::get("/_field_caps?fields=*")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("global field_caps response");
+        assert!(global_resp.status().is_success());
+        let global_bytes = to_bytes(global_resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let global: Value = serde_json::from_slice(&global_bytes).expect("JSON response");
+
+        for field in [
+            "metadata",
+            "metadata.kind",
+            "metadata.kind.keyword",
+            "metadata.topic",
+        ] {
+            assert!(
+                per_index["fields"].get(field).is_some(),
+                "sanity: per-index _field_caps must itself have {field}, got: {per_index}"
+            );
+            assert_eq!(
+                global["fields"][field], per_index["fields"][field],
+                "global and per-index _field_caps disagree on '{field}' -- global: {global}, per-index: {per_index}"
+            );
+        }
+    }
+
+    /// The exact case a reviewer asked for on the original nested-object-
+    /// mapping PR: a SECOND document introducing a NEW nested key under a
+    /// top-level field the schema already knows about. Before this test's
+    /// fix, dynamic mapping gated purely on whether `metadata` (the
+    /// top-level key) already existed -- once the first document
+    /// registered it (from `{"kind": ...}`), `dynamic_field_config` was
+    /// never called for it again, so a second document's `metadata.project`
+    /// was permanently invisible to `_mapping`/`_field_caps`, no matter how
+    /// many more documents arrived, despite staying perfectly queryable via
+    /// `_source` dotted-path resolution the whole time -- the exact
+    /// "queryable but invisible" symptom the whole fix is about, one level
+    /// down. `/_memory`'s own `metadata` field is exactly this shape (its
+    /// keys are caller-defined and legitimately vary memory to memory), so
+    /// this reproduces it through the real `/_memory` API rather than a
+    /// synthetic index.
+    #[tokio::test]
+    async fn a_later_document_introducing_a_new_nested_key_is_not_permanently_invisible() {
+        let router = crate::router::build_es_compat_router(test_state());
+
+        let store_one = router
+            .clone()
+            .oneshot(
+                Request::post("/_memory/repro")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"text": "first", "metadata": {"kind": "preference"}}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("first store response");
+        assert!(store_one.status().is_success());
+
+        let store_two = router
+            .clone()
+            .oneshot(
+                Request::post("/_memory/repro")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"text": "second", "metadata": {"project": "xerj"}}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("second store response");
+        assert!(store_two.status().is_success());
+
+        let caps_resp = router
+            .oneshot(
+                Request::get("/.xerj-memory-repro/_field_caps?fields=*")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("field_caps response");
+        assert!(caps_resp.status().is_success());
+        let bytes = to_bytes(caps_resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let caps: Value = serde_json::from_slice(&bytes).expect("JSON response");
+
+        assert!(
+            caps["fields"].get("metadata.kind").is_some(),
+            "the FIRST document's nested key must still be visible: {caps}"
+        );
+        assert!(
+            caps["fields"].get("metadata.project").is_some(),
+            "the SECOND document's nested key, introduced after 'metadata' was already \
+             a known top-level field, must also become visible -- not permanently invisible \
+             just because it lost the race to be first: {caps}"
         );
     }
 
@@ -29528,7 +29835,7 @@ pub async fn global_field_caps(
     let index_names: Vec<String> = indices.iter().map(|i| i.name.clone()).collect();
     let fields_filter = params.fields.as_deref().unwrap_or("*");
 
-    let mut fields_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let mut fields_map: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
 
     for index_info in &indices {
         let idx = match state.engine.get_index(&index_info.name) {
@@ -29547,60 +29854,81 @@ pub async fn global_field_caps(
             .get(index_info.name.as_str())
             .map(|v| v.clone())
             .unwrap_or(Value::Null);
+        let mut live_properties = schema_to_es_properties(&schema);
         let properties = if stored_mapping.is_null() {
-            Value::Object(schema_to_es_properties(&schema))
+            Value::Object(live_properties)
         } else {
-            stored_mapping
+            // Same merge as `field_caps` (per-index) -- without it, a field
+            // discovered dynamically since this index was created (flat or
+            // nested, at any depth) is invisible here too, and this
+            // cluster-wide endpoint would silently disagree with the
+            // per-index one about which fields exist.
+            let stored_properties = stored_mapping
                 .get("properties")
+                .and_then(|p| p.as_object())
                 .cloned()
-                .unwrap_or_else(|| json!({}))
+                .unwrap_or_default();
+            let companions = semantic_companion_field_names(&stored_properties);
+            live_properties.retain(|k, _| !companions.contains(k));
+            Value::Object(merge_mapping_properties(
+                &stored_properties,
+                &live_properties,
+            ))
         };
 
         for field in &schema.fields {
+            register_field_cap_entry(
+                field,
+                "",
+                &properties,
+                fields_filter,
+                &index_info.name,
+                &mut fields_map,
+            );
+        }
+
+        // Multi-fields (`"fields": {"keyword": {...}}`) -- same #209
+        // mechanism as `field_caps` (per-index); this cluster-wide form
+        // never had it at all.
+        let mut multi_fields = Vec::new();
+        collect_multi_fields(&properties, "", &mut multi_fields);
+        for (name, es_type) in multi_fields {
             if fields_filter != "*" {
-                // Support comma-separated field list and simple wildcard suffix.
                 let matches = fields_filter
                     .split(',')
-                    .any(|f| field_name_matches(&field.name, f.trim()));
+                    .any(|f| source_field_matches(&name, f.trim()));
                 if !matches {
                     continue;
                 }
             }
-
-            let native_es_type = native_type_to_es_str(&field.field_type);
-            let es_type = declared_flattened_type(&properties, &field.name)
-                .or_else(|| declared_numeric_type(&properties, &field.name))
-                .unwrap_or(native_es_type);
-            let searchable = field.is_searchable();
-            let aggregatable = field.is_aggregatable();
-
-            let type_entry = fields_map
-                .entry(field.name.clone())
-                .or_default()
-                .entry(es_type.to_string())
-                .or_insert_with(|| {
-                    json!({
-                        "type": es_type,
-                        "searchable": searchable,
-                        "aggregatable": aggregatable,
-                        "indices": []
-                    })
-                });
-
-            // Append this index to the indices list for this type entry.
+            let (searchable, aggregatable) = match es_type.as_str() {
+                "text" => (true, false),
+                _ => (true, true),
+            };
+            let type_map = fields_map.entry(name).or_default();
+            let type_entry = type_map.entry(es_type.clone()).or_insert_with(|| {
+                json!({
+                    "type": es_type,
+                    "searchable": searchable,
+                    "aggregatable": aggregatable,
+                    "indices": []
+                })
+            });
             if let Some(arr) = type_entry["indices"].as_array_mut() {
-                arr.push(Value::String(index_info.name.clone()));
+                if !arr
+                    .iter()
+                    .any(|v| v.as_str() == Some(index_info.name.as_str()))
+                {
+                    arr.push(Value::String(index_info.name.clone()));
+                }
             }
         }
     }
 
-    // Convert HashMap<String, HashMap<String, Value>> to the ES format.
     let fields_val: Value = Value::Object(
         fields_map
             .into_iter()
-            .map(|(field_name, type_map)| {
-                (field_name, Value::Object(type_map.into_iter().collect()))
-            })
+            .map(|(field_name, type_map)| (field_name, Value::Object(type_map)))
             .collect(),
     );
 

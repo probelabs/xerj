@@ -165,7 +165,8 @@ fn index_exists(state: &AppState, index: &str) -> bool {
 /// Ensure the backing index exists with an appropriate mapping. Created lazily
 /// on first store. When the first stored memory carries a vector, the index is
 /// created with a `dense_vector` field sized to that vector so kNN recall works
-/// out of the box; text and metadata are always mapped.
+/// out of the box. `text` is always explicitly mapped; `metadata` deliberately
+/// is not -- see the comment where `properties` is built below.
 async fn ensure_backing_index(
     state: &AppState,
     index: &str,
@@ -196,6 +197,16 @@ async fn ensure_backing_index(
     // into nested objects (see xerj-engine's `dynamic_field_config`), so
     // `metadata.kind`/`metadata.topic`/etc. become real, `_mapping`-visible
     // fields instead of being permanently opaque.
+    //
+    // KNOWN LIMITATION, deliberately not addressed here: this only helps
+    // namespaces whose backing index is created AFTER this change ships. A
+    // `.xerj-memory-*` index created before it already has `metadata`
+    // declared as a bare `{"type": "object"}` in ITS OWN stored mapping --
+    // that declaration was written once, at that index's creation time,
+    // and is not retroactively edited by a code change. No migration for
+    // already-existing namespaces is included in this change; one would
+    // need to either re-create the index or explicitly `PUT _mapping` a
+    // corrected `metadata.properties` shape onto it by hand.
     let mut properties = json!({
         "text": { "type": "semantic_text", "dimensions": 384 },
         "stored_at": { "type": "long" }
