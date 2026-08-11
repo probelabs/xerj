@@ -124,21 +124,44 @@ fn every_checked_in_binary_or_json_oracle_is_complete_and_self_consistent() {
     let mutations: Value =
         serde_json::from_slice(include_bytes!("../testdata/review11-v1/mutations.json")).unwrap();
     let incomplete_scope = provenance["incomplete_scope"].as_array().unwrap();
-    assert_eq!(incomplete_scope.len(), 1);
-    assert_eq!(
-        incomplete_scope[0]["requirement"],
-        "committed candidate source identity"
-    );
-    assert_eq!(
-        incomplete_scope[0]["reason"],
-        "The candidate is still dirty/uncommitted; no candidate commit or tree is fabricated."
-    );
+    assert!(incomplete_scope.is_empty());
     assert_eq!(
         provenance["candidate_source"]["status"],
-        "dirty_uncommitted_candidate"
+        "attested_preceding_source_commit"
     );
-    assert!(provenance["candidate_source"]["candidate_commit"].is_null());
-    assert!(provenance["candidate_source"]["candidate_tree"].is_null());
+    assert_eq!(
+        provenance["candidate_source"]["base_commit"],
+        "aa142d6772a046baa9d5728328737020d3d05818"
+    );
+    assert_eq!(
+        provenance["candidate_source"]["base_tree"],
+        "2f9e469b1f1e12ab9005e0f666ddb1ff2cd680b9"
+    );
+    assert_eq!(
+        provenance["candidate_source"]["candidate_commit"],
+        "a214f1587df2d39f38e1017b4ebe4766715e3716"
+    );
+    assert_eq!(
+        provenance["candidate_source"]["candidate_tree"],
+        "3eae5b0efbac8598d9939c76272e585874124a4a"
+    );
+    assert_eq!(
+        provenance["candidate_source"]["claim"],
+        "This attestation pins the exact preceding source commit and tree. The final provenance-attestation commit changes evidence metadata and oracle assertions only; it intentionally does not and cannot self-pin its own commit or tree."
+    );
+    assert_eq!(
+        provenance["attestation_commit"]["changes_evidence_metadata_only"],
+        true
+    );
+    assert_eq!(provenance["attestation_commit"]["self_pins"], false);
+    assert_eq!(
+        provenance["attestation_commit"]["pinned_preceding_commit"],
+        provenance["candidate_source"]["candidate_commit"]
+    );
+    assert_eq!(
+        provenance["attestation_commit"]["pinned_preceding_tree"],
+        provenance["candidate_source"]["candidate_tree"]
+    );
     let execution_complete = mutations["execution_complete"].as_bool().unwrap();
     let execution_status = if execution_complete {
         "complete"
@@ -179,6 +202,10 @@ fn every_checked_in_binary_or_json_oracle_is_complete_and_self_consistent() {
         format!("{:x}", Sha256::digest(generator))
     );
     let reference_encoder = include_bytes!("support/reference_codec.rs");
+    assert_eq!(
+        provenance["reference_encoder"]["status"],
+        "pinned_in_preceding_source_commit; unchanged_by_attestation"
+    );
     assert_eq!(
         provenance["reference_encoder"]["sha256"].as_str().unwrap(),
         format!("{:x}", Sha256::digest(reference_encoder))

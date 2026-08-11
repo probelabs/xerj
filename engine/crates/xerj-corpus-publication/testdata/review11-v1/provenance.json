@@ -1,4 +1,11 @@
 {
+  "attestation_commit": {
+    "changes_evidence_metadata_only": true,
+    "pinned_preceding_commit": "a214f1587df2d39f38e1017b4ebe4766715e3716",
+    "pinned_preceding_tree": "3eae5b0efbac8598d9939c76272e585874124a4a",
+    "self_pins": false,
+    "statement": "The attestation commit is deliberately outside the pinned source identity. Its only purpose is to record that already-committed source identity and update the assertions that verify this evidence."
+  },
   "authority_plan": {
     "bytes": 220497,
     "path": "benchmarks/wordpress-autoindex-2026-08-10/CORPUS_PUBLICATION_AUTHORITY_PLAN.md",
@@ -7,10 +14,10 @@
   "candidate_source": {
     "base_commit": "aa142d6772a046baa9d5728328737020d3d05818",
     "base_tree": "2f9e469b1f1e12ab9005e0f666ddb1ff2cd680b9",
-    "candidate_commit": null,
-    "candidate_tree": null,
-    "claim": "No candidate commit/tree is pinned before the transplanted leaf receives its source commit. Repin this provenance immediately after that commit and before final source review.",
-    "status": "dirty_uncommitted_candidate"
+    "candidate_commit": "a214f1587df2d39f38e1017b4ebe4766715e3716",
+    "candidate_tree": "3eae5b0efbac8598d9939c76272e585874124a4a",
+    "claim": "This attestation pins the exact preceding source commit and tree. The final provenance-attestation commit changes evidence metadata and oracle assertions only; it intentionally does not and cannot self-pin its own commit or tree.",
+    "status": "attested_preceding_source_commit"
   },
   "fence_prerequisite": "d8b243023f3c325c3c433cd384ad74ca4e12af51",
   "first_slice_plan": {
@@ -45,7 +52,7 @@
     }
   ],
   "format_version": 2,
-  "generated_at": "2026-08-11T22:48:25+02:00",
+  "generated_at": "2026-08-12T00:10:39+02:00",
   "generated_extensions": true,
   "generation_policy": "The generator derives every expectation from literal protocol domains and independent U32/U64/S/A encoders. It never imports, calls, or harvests the Rust crate.",
   "generator_scope": [
@@ -61,18 +68,13 @@
     "path": "benchmarks/wordpress-autoindex-2026-08-10/PUBLICATION_AUTHORITY_FIRST_SLICE_IMPLEMENTATION_REMEDIATION.md",
     "sha256": "2e035b2a1ae998f87876e46a3a7f100d4b64375b72d8276abdb0611eba1618b0"
   },
-  "incomplete_scope": [
-    {
-      "reason": "The candidate is still dirty/uncommitted; no candidate commit or tree is fabricated.",
-      "requirement": "committed candidate source identity"
-    }
-  ],
+  "incomplete_scope": [],
   "independent_generator": {
-    "bytes": 147060,
+    "bytes": 147554,
     "hash_methodology": "SHA-256 over the exact checked-in generate.py bytes read before output serialization; generator output files are not inputs to this hash.",
     "id": "independent-python-review11-v2",
     "path": "generate.py",
-    "sha256": "16bc821890673d0eb0d10ceb86150fc3e8c6779a9c03ecc6f983c62e658a9f0b"
+    "sha256": "53d8019ea5d9fe55f4f8de829093defbb21e2e101e7ff3457f7dd27d9136a113"
   },
   "mutation_execution": {
     "derivation": "Completion is true only when each recorded observation exactly matches the row/case expectations derived from this ledger and every row's classified execution gate passes.",
@@ -165,7 +167,7 @@
     "bytes": 1119,
     "path": "../../tests/support/reference_codec.rs",
     "sha256": "cccc1085a9b40c5b8231a0cfb66f873a893406f3e051153285da340519f56ba8",
-    "status": "candidate_test_source; repin after the final committed candidate"
+    "status": "pinned_in_preceding_source_commit; unchanged_by_attestation"
   },
   "review_11": {
     "bytes": 16338,
