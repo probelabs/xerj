@@ -1,0 +1,6 @@
+running 3 tests
+test all_thirteen_public_rendered_digest_types_reject_the_full_spelling_class ... ok
+test mutation_inventory_is_concrete_unique_and_uses_closed_outcomes ... ok
+test publication_expectation_and_begin_reject_closed_top_level_member_mutations ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in <DURATION>

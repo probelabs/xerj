@@ -1,0 +1,17 @@
+diff --git a/engine/crates/xerj-corpus-publication/src/plan.rs b/engine/crates/xerj-corpus-publication/src/plan.rs
+index 55315ce4..ae83417c 100644
+--- a/engine/crates/xerj-corpus-publication/src/plan.rs
++++ b/engine/crates/xerj-corpus-publication/src/plan.rs
+@@ -836,12 +836,6 @@ pub(crate) fn parse_plan(input: &[u8]) -> Result<PlanIdentity> {
+             "declared replay tuple cardinality overflow",
+         )
+     })?;
+-    if tuples.len() != required_tuple_count {
+-        return Err(error(
+-            ProtocolErrorKind::CrossFieldMismatch,
+-            "replay tuple cardinality does not match declared projections",
+-        ));
+-    }
+     if mappings.len() != required_tuple_count || resources.len() != required_tuple_count {
+         return Err(error(
+             ProtocolErrorKind::CrossFieldMismatch,

@@ -1,0 +1,17 @@
+diff --git a/engine/crates/xerj-corpus-publication/src/plan.rs b/engine/crates/xerj-corpus-publication/src/plan.rs
+index 55315ce4..2cde64bc 100644
+--- a/engine/crates/xerj-corpus-publication/src/plan.rs
++++ b/engine/crates/xerj-corpus-publication/src/plan.rs
+@@ -1026,11 +1026,6 @@ fn require_tuple(
+             "plan projection does not join exactly one replay tuple",
+         ));
+     }
+-    if tuple.count != expected_count {
+-        return Err(error(
+-            ProtocolErrorKind::CrossFieldMismatch,
+-            "replay tuple operation count does not match declared projection count",
+-        ));
+-    }
++    let _ = (tuple, expected_count);
+     Ok(())
+ }

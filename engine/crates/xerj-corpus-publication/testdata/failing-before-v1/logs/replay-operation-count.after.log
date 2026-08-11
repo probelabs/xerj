@@ -1,0 +1,4 @@
+running 1 test
+test replay_tuple_operation_counts_must_match_declared_projection_counts ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in <DURATION>

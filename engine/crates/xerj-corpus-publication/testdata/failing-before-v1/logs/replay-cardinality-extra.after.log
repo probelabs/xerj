@@ -1,0 +1,4 @@
+running 1 test
+test extra_internally_valid_replay_tuple_is_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in <DURATION>

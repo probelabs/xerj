@@ -1,0 +1,17 @@
+running 1 test
+
+thread 'generation_is_typed_and_independent_of_sequence' (<THREAD>) panicked at crates/xerj-corpus-publication/tests/goldens.rs:162:5:
+assertion `left != right` failed
+  left: DesiredPlanDigest("xerdp1-sha256-d89848a7c515772c16724522b3b0e27aca4fd0a871fa7cd4ea46ab9967956963")
+ right: DesiredPlanDigest("xerdp1-sha256-d89848a7c515772c16724522b3b0e27aca4fd0a871fa7cd4ea46ab9967956963")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test generation_is_typed_and_independent_of_sequence ... FAILED
+
+failures:
+
+failures:
+    generation_is_typed_and_independent_of_sequence
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in <DURATION>
+
+error: test failed, to rerun pass `-p xerj-corpus-publication --test goldens`

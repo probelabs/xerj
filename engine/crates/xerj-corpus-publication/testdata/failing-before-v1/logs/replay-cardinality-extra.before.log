@@ -1,0 +1,20 @@
+running 1 test
+extra_internally_valid_replay_tuple_is_rejected --- FAILED
+
+failures:
+
+---- extra_internally_valid_replay_tuple_is_rejected stdout ----
+
+thread 'extra_internally_valid_replay_tuple_is_rejected' (<THREAD>) panicked at crates/xerj-corpus-publication/tests/replay_tuple_validation.rs:397:5:
+assertion `left == right` failed
+  left: "mapping/resource/replay cardinalities do not match declared projections"
+ right: "replay tuple cardinality does not match declared projections"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    extra_internally_valid_replay_tuple_is_rejected
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in <DURATION>
+
+error: test failed, to rerun pass `-p xerj-corpus-publication --test replay_tuple_validation`

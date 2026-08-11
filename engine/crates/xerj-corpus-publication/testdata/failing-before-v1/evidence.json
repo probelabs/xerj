@@ -1,0 +1,266 @@
+{
+  "schema": "xerj-failing-before-evidence/1",
+  "subject": {
+    "commit": "de1c63d90cbc4bc5a77faadf50220f1705f9ca37",
+    "tree": "02390ea1fc5e9bb664614dbfb9f7a6507b0b3ce0"
+  },
+  "classification": {
+    "kind": "deliberate_semantic_controls",
+    "upstream_comparison": "not_applicable",
+    "reason": "The upstream base has no xerj-corpus-publication package; these controls mutate the exact final package and are not unmodified-upstream regressions."
+  },
+  "normalization": {
+    "id": "cargo-test-log/1",
+    "rules": [
+      "decode as UTF-8 and convert CRLF or CR to LF",
+      "remove ANSI CSI sequences",
+      "discard all text before the first line matching ^running [0-9]+ tests?$",
+      "replace only the numeric panic thread id with <THREAD>",
+      "replace test-harness elapsed seconds with <DURATION>",
+      "remove trailing horizontal whitespace and end with exactly one LF"
+    ]
+  },
+  "controls": [
+    {
+      "id": "generation-sequence",
+      "patch": {
+        "path": "patches/generation-sequence.patch",
+        "sha256": "a3e826fbf65b7895a5526b4b24acce4b65bd78372316ce294dc623d8b92a072b",
+        "target_path": "src/plan.rs",
+        "target_sha256": "7e0a183a178b3ec94682648147aa9aed61b063fb6eabef1fba05b4acacd8b718"
+      },
+      "ledger_cases": [],
+      "runs": [
+        {
+          "id": "mutated-before",
+          "phase": "mutated_before",
+          "command": "cargo test -p xerj-corpus-publication --test goldens generation_is_typed_and_independent_of_sequence -- --exact --nocapture",
+          "expected_exit": "nonzero",
+          "observed_exit_code": 101,
+          "log": {
+            "path": "logs/generation-sequence.before.log",
+            "sha256": "1f7cf019aac847c8b847dc8c19965694b9d82dbea10bea32dd4778d86e57c595"
+          },
+          "required_substrings": [
+            "assertion `left != right` failed",
+            "DesiredPlanDigest(\"xerdp1-sha256-d89848a7c515772c16724522b3b0e27aca4fd0a871fa7cd4ea46ab9967956963\")",
+            "test result: FAILED."
+          ]
+        },
+        {
+          "id": "unmodified-after",
+          "phase": "unmodified_after",
+          "command": "cargo test -p xerj-corpus-publication --test goldens generation_is_typed_and_independent_of_sequence -- --exact --nocapture",
+          "expected_exit": "zero",
+          "observed_exit_code": 0,
+          "log": {
+            "path": "logs/generation-sequence.after.log",
+            "sha256": "2383d74e857a733ba448888d1ef68dd47f182993b7e2c1007f75e3c18b392190"
+          },
+          "required_substrings": [
+            "test generation_is_typed_and_independent_of_sequence ... ok",
+            "test result: ok."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "replay-cardinality",
+      "patch": {
+        "path": "patches/replay-cardinality.patch",
+        "sha256": "de2d97df38231e00c1db9c1c30e59c77ee138833ae69368cc7efe08dbcc8f05c",
+        "target_path": "src/plan.rs",
+        "target_sha256": "7e0a183a178b3ec94682648147aa9aed61b063fb6eabef1fba05b4acacd8b718"
+      },
+      "ledger_cases": [],
+      "runs": [
+        {
+          "id": "removed-tuple-mutated-before",
+          "phase": "mutated_before",
+          "command": "cargo test -q -p xerj-corpus-publication --test replay_tuple_validation removed_replay_tuple_with_recomputed_digest_is_rejected_by_cardinality -- --exact",
+          "expected_exit": "nonzero",
+          "observed_exit_code": 101,
+          "log": {
+            "path": "logs/replay-cardinality-removed.before.log",
+            "sha256": "10776098591f6b63f06d1c5cd8aea06958fb74841a568471fa1ffb4fa168dd19"
+          },
+          "required_substrings": [
+            "left: \"mapping/resource/replay cardinalities do not match declared projections\"",
+            "right: \"replay tuple cardinality does not match declared projections\"",
+            "test result: FAILED."
+          ]
+        },
+        {
+          "id": "removed-tuple-unmodified-after",
+          "phase": "unmodified_after",
+          "command": "cargo test --locked -p xerj-corpus-publication --test replay_tuple_validation removed_replay_tuple_with_recomputed_digest_is_rejected_by_cardinality -- --exact --nocapture",
+          "expected_exit": "zero",
+          "observed_exit_code": 0,
+          "log": {
+            "path": "logs/replay-cardinality-removed.after.log",
+            "sha256": "2c2d2f89092d830e5e887c92841c9e04311cfa6755e98dd64ff24afd311cf511"
+          },
+          "required_substrings": [
+            "test removed_replay_tuple_with_recomputed_digest_is_rejected_by_cardinality ... ok",
+            "test result: ok."
+          ]
+        },
+        {
+          "id": "extra-tuple-mutated-before",
+          "phase": "mutated_before",
+          "command": "cargo test -q -p xerj-corpus-publication --test replay_tuple_validation extra_internally_valid_replay_tuple_is_rejected -- --exact",
+          "expected_exit": "nonzero",
+          "observed_exit_code": 101,
+          "log": {
+            "path": "logs/replay-cardinality-extra.before.log",
+            "sha256": "f5ae5ea909fc96bb33d28e26182175760cb96bd5f7c1572d67d6b90483d2dd52"
+          },
+          "required_substrings": [
+            "left: \"mapping/resource/replay cardinalities do not match declared projections\"",
+            "right: \"replay tuple cardinality does not match declared projections\"",
+            "test result: FAILED."
+          ]
+        },
+        {
+          "id": "extra-tuple-unmodified-after",
+          "phase": "unmodified_after",
+          "command": "cargo test --locked -p xerj-corpus-publication --test replay_tuple_validation extra_internally_valid_replay_tuple_is_rejected -- --exact --nocapture",
+          "expected_exit": "zero",
+          "observed_exit_code": 0,
+          "log": {
+            "path": "logs/replay-cardinality-extra.after.log",
+            "sha256": "f6644b43d0b97101e777b510a725921a6a899fcd8588a477df0c0f3279373203"
+          },
+          "required_substrings": [
+            "test extra_internally_valid_replay_tuple_is_rejected ... ok",
+            "test result: ok."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "replay-operation-count",
+      "patch": {
+        "path": "patches/replay-operation-count.patch",
+        "sha256": "1ee3892e264b889ed9a2a1c246fb2320587523a23481b5e312306aab7c9989c8",
+        "target_path": "src/plan.rs",
+        "target_sha256": "7e0a183a178b3ec94682648147aa9aed61b063fb6eabef1fba05b4acacd8b718"
+      },
+      "ledger_cases": [],
+      "runs": [
+        {
+          "id": "mutated-before",
+          "phase": "mutated_before",
+          "command": "cargo test -q -p xerj-corpus-publication --test replay_tuple_validation replay_tuple_operation_counts_must_match_declared_projection_counts -- --exact",
+          "expected_exit": "nonzero",
+          "observed_exit_code": 101,
+          "log": {
+            "path": "logs/replay-operation-count.before.log",
+            "sha256": "43b74792ed5160e89edacb0699e342697de0c387c9be7eb605852a1fbdb7d347"
+          },
+          "required_substrings": [
+            "left: \"quota charge does not recompute from persisted plan bytes\"",
+            "right: \"replay tuple operation count does not match declared projection count\"",
+            "test result: FAILED."
+          ]
+        },
+        {
+          "id": "unmodified-after",
+          "phase": "unmodified_after",
+          "command": "cargo test --locked -p xerj-corpus-publication --test replay_tuple_validation replay_tuple_operation_counts_must_match_declared_projection_counts -- --exact --nocapture",
+          "expected_exit": "zero",
+          "observed_exit_code": 0,
+          "log": {
+            "path": "logs/replay-operation-count.after.log",
+            "sha256": "4dc690b0eb1661258d1728e140c7e374a5269514ce5b1a516c6e2e47f2f89d32"
+          },
+          "required_substrings": [
+            "test replay_tuple_operation_counts_must_match_declared_projection_counts ... ok",
+            "test result: ok."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "historical-seven-case-ledger",
+      "patch": {
+        "path": "patches/historical-ledger.patch",
+        "sha256": "b4767fb694c63dc3ba2942850842d102ec54cca356bdace70f5bf659a28fa2e5",
+        "target_path": "testdata/review11-v1/mutations.json",
+        "target_sha256": "a8cef4d415680e9ebc49f4e723e300615bf55ac4a560e0836e0d772c3189a4da"
+      },
+      "ledger_cases": [
+        "data:changed-source-with-old-content-digest",
+        "data:changed-path-with-old-content-and-artifact-digests",
+        "begin-expected-owner-mismatch-plan-owner",
+        "begin-expected-sequence-mismatch-plan-predecessor",
+        "begin-publication-root-changed-owner-root-prefix-join-rejects",
+        "begin-publication-prefix-changed-owner-root-prefix-join-rejects",
+        "begin-publication-incarnation-changed-data-route-name-join-rejects"
+      ],
+      "runs": [
+        {
+          "id": "historical-ledger-mutated-before",
+          "phase": "mutated_before",
+          "command": "cargo test --locked -p xerj-corpus-publication --test oracle_mutation_matrix mutation_inventory_is_concrete_unique_and_uses_closed_outcomes -- --exact --nocapture",
+          "expected_exit": "nonzero",
+          "observed_exit_code": 101,
+          "log": {
+            "path": "logs/historical-ledger.before.log",
+            "sha256": "6fb0c488f5e5afd50df4011649f2c2330fca2525fd93f382a80ae869abded650"
+          },
+          "required_substrings": [
+            "left: Null",
+            "right: \"CrossFieldMismatch\"",
+            "test result: FAILED."
+          ]
+        },
+        {
+          "id": "oracle-unmodified-after",
+          "phase": "unmodified_after",
+          "command": "cargo test --locked -p xerj-corpus-publication --test oracle_mutation_matrix -- --nocapture --test-threads=1",
+          "expected_exit": "zero",
+          "observed_exit_code": 0,
+          "log": {
+            "path": "logs/historical-ledger-oracle.after.log",
+            "sha256": "5b6d12bb2248d6f24c7ed481fcd9bb1fd2ea9ad548d5ea26b15416fbb94001a1"
+          },
+          "required_substrings": [
+            "test mutation_inventory_is_concrete_unique_and_uses_closed_outcomes ... ok",
+            "test result: ok. 3 passed; 0 failed;"
+          ]
+        },
+        {
+          "id": "strict-replay-unmodified-after",
+          "phase": "unmodified_after",
+          "command": "cargo test --locked -p xerj-corpus-publication --test mutations strict_replay_content_join_matrix -- --exact --nocapture --test-threads=1",
+          "expected_exit": "zero",
+          "observed_exit_code": 0,
+          "log": {
+            "path": "logs/historical-ledger-strict-replay.after.log",
+            "sha256": "f0deb4b93e8c548771f148830a83c03dc612cc2a5edbddde030b77eae32e9c54"
+          },
+          "required_substrings": [
+            "test strict_replay_content_join_matrix ... ok",
+            "test result: ok."
+          ]
+        },
+        {
+          "id": "cross-file-unmodified-after",
+          "phase": "unmodified_after",
+          "command": "cargo test --locked -p xerj-corpus-publication --test mutations persisted_cross_file_join_matrix -- --exact --nocapture --test-threads=1",
+          "expected_exit": "zero",
+          "observed_exit_code": 0,
+          "log": {
+            "path": "logs/historical-ledger-cross-file.after.log",
+            "sha256": "33fd55af733b1dfa648ea9544cb19fed2e4be2bdc9a33d3504fdb3ecd69032bd"
+          },
+          "required_substrings": [
+            "test persisted_cross_file_join_matrix ... ok",
+            "test result: ok."
+          ]
+        }
+      ]
+    }
+  ]
+}

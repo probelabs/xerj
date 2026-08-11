@@ -1,0 +1,17 @@
+running 1 test
+
+thread 'mutation_inventory_is_concrete_unique_and_uses_closed_outcomes' (<THREAD>) panicked at crates/xerj-corpus-publication/tests/oracle_mutation_matrix.rs:393:9:
+assertion `left == right` failed
+  left: Null
+ right: "CrossFieldMismatch"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test mutation_inventory_is_concrete_unique_and_uses_closed_outcomes ... FAILED
+
+failures:
+
+failures:
+    mutation_inventory_is_concrete_unique_and_uses_closed_outcomes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in <DURATION>
+
+error: test failed, to rerun pass `-p xerj-corpus-publication --test oracle_mutation_matrix`

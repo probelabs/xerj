@@ -1,0 +1,63 @@
+diff --git a/engine/crates/xerj-corpus-publication/testdata/review11-v1/mutations.json b/engine/crates/xerj-corpus-publication/testdata/review11-v1/mutations.json
+index 59fd8564..594fc739 100644
+--- a/engine/crates/xerj-corpus-publication/testdata/review11-v1/mutations.json
++++ b/engine/crates/xerj-corpus-publication/testdata/review11-v1/mutations.json
+@@ -1488,16 +1488,6 @@
+     {
+       "baseline": "primary and comparator prepared summaries, plan projections, and replay rows",
+       "case_count": 36,
+-      "case_expectations": {
+-        "data:changed-path-with-old-content-and-artifact-digests": {
+-          "expected_error_kind": "CrossFieldMismatch",
+-          "expected_reason_contains": "replay artifact digest differs from desired-plan tuple"
+-        },
+-        "data:changed-source-with-old-content-digest": {
+-          "expected_error_kind": "CrossFieldMismatch",
+-          "expected_reason_contains": "data replay content differs from prepared input or desired plan"
+-        }
+-      },
+       "cases": [
+         "data:duplicate-id-row",
+         "data:reverse-row-order",
+@@ -1576,28 +1566,6 @@
+     {
+       "baseline": "all four primary persisted classes",
+       "case_count": 25,
+-      "case_expectations": {
+-        "begin-expected-owner-mismatch-plan-owner": {
+-          "expected_error_kind": "CrossFieldMismatch",
+-          "expected_reason_contains": "expected publication owner/sequence mismatch"
+-        },
+-        "begin-expected-sequence-mismatch-plan-predecessor": {
+-          "expected_error_kind": "CrossFieldMismatch",
+-          "expected_reason_contains": "expected publication owner/sequence mismatch"
+-        },
+-        "begin-publication-incarnation-changed-data-route-name-join-rejects": {
+-          "expected_error_kind": "CrossFieldMismatch",
+-          "expected_reason_contains": "publication data route/name mismatch"
+-        },
+-        "begin-publication-prefix-changed-owner-root-prefix-join-rejects": {
+-          "expected_error_kind": "CrossFieldMismatch",
+-          "expected_reason_contains": "publication owner does not match root/prefix"
+-        },
+-        "begin-publication-root-changed-owner-root-prefix-join-rejects": {
+-          "expected_error_kind": "CrossFieldMismatch",
+-          "expected_reason_contains": "publication owner does not match root/prefix"
+-        }
+-      },
+       "cases": [
+         "standalone-plan-bytes-from-generation-7-with-generation-1-begin",
+         "standalone-plan-byte-change-with-begin-held",
+@@ -1621,9 +1589,9 @@
+         "graph-core-mismatch-prepared-plan-replay",
+         "begin-expected-owner-mismatch-plan-owner",
+         "begin-expected-sequence-mismatch-plan-predecessor",
+-        "begin-publication-root-changed-owner-root-prefix-join-rejects",
+-        "begin-publication-prefix-changed-owner-root-prefix-join-rejects",
+-        "begin-publication-incarnation-changed-data-route-name-join-rejects"
++        "begin-expected-root-mismatch-plan-root",
++        "begin-expected-prefix-mismatch-plan-prefix",
++        "begin-expected-incarnation-mismatch-plan-incarnation"
+       ],
+       "execution_gate": "integration",
+       "execution_status": "executed_passed",

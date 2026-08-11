@@ -1,0 +1,20 @@
+running 1 test
+removed_replay_tuple_with_recomputed_digest_is_rejected_by_cardinality --- FAILED
+
+failures:
+
+---- removed_replay_tuple_with_recomputed_digest_is_rejected_by_cardinality stdout ----
+
+thread 'removed_replay_tuple_with_recomputed_digest_is_rejected_by_cardinality' (<THREAD>) panicked at crates/xerj-corpus-publication/tests/replay_tuple_validation.rs:327:9:
+assertion `left == right` failed: projection data
+  left: "mapping/resource/replay cardinalities do not match declared projections"
+ right: "replay tuple cardinality does not match declared projections"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    removed_replay_tuple_with_recomputed_digest_is_rejected_by_cardinality
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in <DURATION>
+
+error: test failed, to rerun pass `-p xerj-corpus-publication --test replay_tuple_validation`

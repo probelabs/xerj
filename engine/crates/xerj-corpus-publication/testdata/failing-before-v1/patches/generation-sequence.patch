@@ -1,0 +1,12 @@
+diff --git a/engine/crates/xerj-corpus-publication/src/plan.rs b/engine/crates/xerj-corpus-publication/src/plan.rs
+index 55315ce4..7099134f 100644
+--- a/engine/crates/xerj-corpus-publication/src/plan.rs
++++ b/engine/crates/xerj-corpus-publication/src/plan.rs
+@@ -204,6 +204,7 @@ impl PlannedCorpusV1 {
+         transition: SequenceTransitionV1,
+         generation: Generation,
+     ) -> Result<Self, ProtocolError> {
++        let generation = Generation::new(transition.desired().get());
+         let mut derived = projection::derive(
+             &prepared,
+             transition.expected(),

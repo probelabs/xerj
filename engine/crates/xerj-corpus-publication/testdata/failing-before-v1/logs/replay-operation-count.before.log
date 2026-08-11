@@ -1,0 +1,20 @@
+running 1 test
+replay_tuple_operation_counts_must_match_declared_projection_counts --- FAILED
+
+failures:
+
+---- replay_tuple_operation_counts_must_match_declared_projection_counts stdout ----
+
+thread 'replay_tuple_operation_counts_must_match_declared_projection_counts' (<THREAD>) panicked at crates/xerj-corpus-publication/tests/replay_tuple_validation.rs:423:9:
+assertion `left == right` failed: projection data
+  left: "quota charge does not recompute from persisted plan bytes"
+ right: "replay tuple operation count does not match declared projection count"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    replay_tuple_operation_counts_must_match_declared_projection_counts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in <DURATION>
+
+error: test failed, to rerun pass `-p xerj-corpus-publication --test replay_tuple_validation`
