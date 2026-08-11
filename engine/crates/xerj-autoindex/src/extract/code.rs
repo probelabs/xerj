@@ -409,12 +409,28 @@ const RUBY_Q: &str = r#"
 (module name: (constant) @module)
 "#;
 
+// `enum_declaration` was missing entirely, which is worse than a missing kind:
+// a PHP 8.1 enum file declares no class, interface or trait, so it extracted
+// ZERO symbols and could not be reached by symbol search at all (#170).
+//
+// `const_declaration` covers both a class/interface/enum constant and a
+// file-scope `const`, in one pattern — the grammar uses the same node for
+// both, with `const_element` holding the name. This is the only way to write a
+// named constant inside a PHP type, so without it a class of nothing but
+// constants was invisible.
+//
+// No anchoring here, unlike C/Go/Rust: PHP has no function-local `const`
+// statement, so there is no locals trap to guard against. (`define()` is a
+// function call, a different node, and is deliberately not captured.)
 const PHP_Q: &str = r#"
 (function_definition name: (name) @function)
 (method_declaration name: (name) @method)
 (class_declaration name: (name) @class)
 (interface_declaration name: (name) @interface)
 (trait_declaration name: (name) @trait)
+(enum_declaration name: (name) @enum)
+(enum_case name: (name) @const)
+(const_declaration (const_element (name) @const))
 "#;
 
 // Also no constant capture, for a blunter reason than Java: there were 4 C#
@@ -720,6 +736,31 @@ mod tests {
         assert!(has(&s, "C", "class"));
         assert!(has(&s, "m", "method"));
         assert!(has(&s, "I", "interface"));
+    }
+
+    /// PHP 8.1 enums and class constants. `enum_declaration` was absent from
+    /// PHP_Q entirely, so an enum file extracted zero symbols and was
+    /// unreachable by symbol search; class constants — PHP's only way to write
+    /// a named constant inside a type — were invisible for the same reason.
+    /// PHP has no function-local `const` statement, so unlike C/Go/Rust these
+    /// patterns need no anchoring.
+    #[test]
+    fn php_enum_and_const() {
+        let s = syms(
+            "php",
+            "<?php\n\
+             enum Suit: string { case Hearts = 'H'; case Spades = 'S'; }\n\
+             class C { const LIMIT = 5; public const int TYPED = 1; }\n\
+             interface I { const IFACE_CONST = 2; }\n\
+             const TOP_LEVEL = 3;\n",
+        );
+        assert!(has(&s, "Suit", "enum"), "got {s:?}");
+        assert!(has(&s, "Hearts", "const"), "got {s:?}");
+        assert!(has(&s, "Spades", "const"), "got {s:?}");
+        assert!(has(&s, "LIMIT", "const"), "got {s:?}");
+        assert!(has(&s, "TYPED", "const"), "got {s:?}");
+        assert!(has(&s, "IFACE_CONST", "const"), "got {s:?}");
+        assert!(has(&s, "TOP_LEVEL", "const"), "got {s:?}");
     }
     #[test]
     fn csharp() {
