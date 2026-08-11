@@ -5564,8 +5564,11 @@ impl Index {
 
         // Load persisted settings BEFORE opening the store so the WAL shard
         // count (index.xerj_ingest_shards) matches what create used — the WAL
-        // write layout (root vs s{N}/) and doc routing depend on it.
-        let settings = load_settings(&index_dir).unwrap_or(Value::Null);
+        // write layout (root vs s{N}/) and doc routing depend on it. An
+        // unparseable settings.json is refused rather than defaulted to null:
+        // the shard count, the custom analyzers and the index blocks all live
+        // in here, so "null" is a different index, not a safe fallback.
+        let settings = load_settings(&index_dir)?.unwrap_or(Value::Null);
         let store_config = store_config_from(config, wal_shards_override_from_settings(&settings));
         let store = IndexStore::open(&index_dir, store_config)?;
 
@@ -5574,8 +5577,11 @@ impl Index {
         let segment_doc_count: u64 = snap.segments.iter().map(|s| s.doc_count).sum();
         drop(snap);
 
-        // Load schema from disk if it exists.
-        let schema = load_schema(&index_dir).unwrap_or_else(|_| ManagedSchema::dynamic());
+        // Load schema from disk if it exists. Absent → dynamic mapping (a
+        // pre-persistence index legitimately has no schema.json). Present but
+        // unparseable → refuse: the explicit mapping is gone and every field
+        // type would be silently re-inferred from the next writes (#202).
+        let schema = load_schema(&index_dir)?.unwrap_or_else(ManagedSchema::dynamic);
         validate_embedding_identity(
             &index_dir,
             &schema.schema,
@@ -17357,9 +17363,13 @@ impl Index {
                 );
             }
         }
+        // Atomic, like every other settings.json writer (create and the index
+        // block path). This was the one plain `fs::write` left, i.e. the one
+        // way to actually produce the torn settings.json that `Index::open`
+        // now refuses (#202) — a kill -9 mid-update left a half-written file.
         let path = self.data_dir.join("settings.json");
         let bytes = serde_json::to_vec_pretty(&new_settings)?;
-        std::fs::write(&path, bytes).map_err(EngineError::Io)?;
+        write_file_atomic(&path, &bytes).map_err(EngineError::Io)?;
         *self.settings.write().await = new_settings;
         Ok(())
     }
@@ -25783,21 +25793,59 @@ fn store_config_from(config: &Config, wal_shards_override: Option<usize>) -> Ind
     }
 }
 
+/// Per-process sequence that makes every in-flight temp file name unique.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A staging path next to `path` that no other writer can be using.
+///
+/// `path.with_extension("tmp")` — what this used to be — is the *same* name for
+/// every writer of that file, so two concurrent `write_file_atomic` calls on one
+/// sidecar both opened it `O_TRUNC` and interleaved their bytes before either
+/// renamed. Measured on this tree with the old shared name, 4 threads writing
+/// two different-length settings bodies for 200 rounds, four runs: 86–294 of
+/// the 800 writes failed outright with ENOENT (the loser renaming a file the
+/// winner had already moved), and with those errors swallowed — which is what
+/// the callers did — 1–16 of the 200 rounds left a `settings.json` that does
+/// not parse. The counts move with machine load; both being non-zero on every
+/// run does not. That torn file is exactly what `Index::open` now refuses
+/// (#202), so the writer must not be able to manufacture it.
+///
+/// Prior art: tantivy stages atomic writes in a *unique* temp file created in
+/// the destination's own directory and then persists it over the target
+/// (`tempfile::Builder::tempfile_in` → `persist`,
+/// tantivy `src/directory/mmap_directory/mod.rs:362-378`, MIT). Same-directory
+/// keeps the rename on one filesystem; unique keeps concurrent writers apart.
+/// Adapted, not copied — we name the file ourselves rather than take a runtime
+/// dependency on `tempfile`, and we additionally fsync the parent directory.
+pub(crate) fn staging_path(path: &Path) -> std::path::PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sidecar".to_string());
+    path.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()))
+}
+
 /// Write `bytes` to `path` atomically: write a same-directory temp file,
 /// fsync it, then rename over the target.  A kill -9 mid-write leaves
 /// either the old file or the new file on disk, never a truncated one.
-/// This matters for `schema.json`: `load_schema` treats a torn file as
-/// "no schema" and silently falls back to an empty dynamic mapping,
-/// which is a mapping-loss corruption after crash.
+/// This matters for `schema.json` and `settings.json`: since #202 a torn
+/// sidecar is refused at open rather than silently replaced by a default, so
+/// the write path has to be the one thing that cannot produce one.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
+    let tmp = staging_path(path);
+    let staged = (|| -> std::io::Result<()> {
         use std::io::Write as _;
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        f.sync_all()
+    })();
+    // A unique staging name means a failed write leaves debris nobody will
+    // overwrite, so clean it up here rather than at the next write.
+    if let Err(e) = staged.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
     // Make the rename itself durable across power loss.
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
@@ -25807,16 +25855,57 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn load_schema(index_dir: &Path) -> std::result::Result<ManagedSchema, ()> {
-    let path = index_dir.join("schema.json");
-    let bytes = std::fs::read(path).map_err(|_| ())?;
-    serde_json::from_slice(&bytes).map_err(|_| ())
+/// Read one of the index's JSON sidecar files, keeping ABSENT and UNPARSEABLE
+/// apart (issue #202).
+///
+/// * `Ok(None)`  — the file is genuinely not there. That is a legitimate state
+///   (`schema.json` was only written by `put_mapping` before create-time
+///   persistence landed; `settings.json` is only written when settings are
+///   non-null), and the caller's default is the correct answer.
+/// * `Err(..)`   — the file exists but cannot be read or does not deserialize.
+///   The recorded mapping/settings are *lost*: substituting a default here does
+///   not preserve behaviour, it silently re-derives every field type from the
+///   next documents to arrive (verified: a `keyword` field came back as `long`
+///   after one post-corruption write). The caller must refuse to open, exactly
+///   as a segment with an unexpected header is refused rather than guessed at
+///   (`xerj-storage/src/segment.rs:243-246`).
+///
+/// Prior art for failing loudly on unparseable index metadata rather than
+/// defaulting: tantivy's `load_metas` turns a `meta.json` that does not
+/// deserialize into `DataCorruption` naming the file
+/// (tantivy `src/index/index.rs:29-49`), while absence is a *separate*
+/// pre-check (`Index::exists`, `src/index/index.rs:324-326`) that routes to
+/// create; sled likewise raises `InvalidData` on any unreadable metadata frame
+/// instead of skipping it (sled `src/metadata_store.rs:518,546,582`).
+fn load_sidecar<T: serde::de::DeserializeOwned>(index_dir: &Path, file: &str) -> Result<Option<T>> {
+    let path = index_dir.join(file);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A file we cannot read is not a file that is absent: an EACCES or an
+        // EIO here used to be indistinguishable from "never written".
+        Err(e) => {
+            return Err(EngineError::CorruptIndexMetadata {
+                file: path.display().to_string(),
+                reason: e.to_string(),
+            })
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => Err(EngineError::CorruptIndexMetadata {
+            file: path.display().to_string(),
+            reason: format!("{e} ({} bytes on disk)", bytes.len()),
+        }),
+    }
 }
 
-fn load_settings(index_dir: &Path) -> std::result::Result<Value, ()> {
-    let path = index_dir.join("settings.json");
-    let bytes = std::fs::read(path).map_err(|_| ())?;
-    serde_json::from_slice(&bytes).map_err(|_| ())
+fn load_schema(index_dir: &Path) -> Result<Option<ManagedSchema>> {
+    load_sidecar(index_dir, "schema.json")
+}
+
+fn load_settings(index_dir: &Path) -> Result<Option<Value>> {
+    load_sidecar(index_dir, "settings.json")
 }
 
 // ── Date math in index names ──────────────────────────────────────────────────
@@ -27999,6 +28088,12 @@ fn infer_field_type(val: &Value, date_detection: bool) -> FieldType {
 /// `KeywordFieldMapper("keyword").ignoreAbove(256)`).
 const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
 
+/// ES default `index.mapping.depth.limit` — how many `properties` levels a
+/// dynamically discovered document may nest before recursion stops. Applies
+/// only to the nested-object walk below; it does not change how deep an
+/// *explicit* `_mapping` PUT may nest (that path is unaffected by this cap).
+const DYNAMIC_MAPPING_DEPTH_LIMIT: usize = 20;
+
 /// Build the [`FieldConfig`] for a dynamically discovered field.
 ///
 /// Wraps [`infer_field_type`] and mirrors the ES default dynamic mapping for
@@ -28012,13 +28107,62 @@ const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
 /// this records that contract in the schema rather than leaving it implicit.
 /// Sub-fields of a leaf parent are NOT top-level `schema.fields` entries, so
 /// the search path's text/keyword field sets are unaffected.
+///
+/// A nested JSON object gets the same treatment one level deeper: its own
+/// keys are recursively dynamic-mapped into child `FieldConfig`s under
+/// `fields`, the same way `Text` gets its `keyword` sibling -- `FieldConfig`
+/// and the ES-compat mapping renderer already both understand this dual
+/// meaning of `fields` (real `properties` on `Object`/`Nested`, multi-fields
+/// on a leaf type, see the doc comment on `FieldConfig::fields`); only the
+/// *dynamic-discovery* path was never populating it for `Object`, so a
+/// subfield like `metadata.kind` was genuinely queryable (the query path
+/// resolves dotted paths against `_source` regardless of the mapping) but
+/// invisible to `GET _mapping`/`_field_caps` -- indistinguishable from not
+/// existing to any client that discovers fields that way instead of already
+/// knowing the field name in advance (Kibana/OSD's own field list included).
+/// Array-of-objects is intentionally out of scope here: `infer_field_type`
+/// already only inspects an array's first element for its *type*, so this
+/// recurses into that same first element for consistency rather than
+/// attempting to reconcile a heterogeneous shape across array entries --
+/// no behavior change for arrays beyond what recursing into their inferred
+/// Object element already implies.
 fn dynamic_field_config(key: &str, val: &Value, date_detection: bool) -> FieldConfig {
+    dynamic_field_config_at_depth(key, val, date_detection, 1)
+}
+
+fn dynamic_field_config_at_depth(
+    key: &str,
+    val: &Value,
+    date_detection: bool,
+    depth: usize,
+) -> FieldConfig {
     let ft = infer_field_type(val, date_detection);
     let mut fc = FieldConfig::new(key.to_string(), ft);
-    if matches!(fc.field_type, FieldType::Text) {
-        let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
-        kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
-        fc.fields.push(kw);
+    match fc.field_type {
+        FieldType::Text => {
+            let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
+            kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
+            fc.fields.push(kw);
+        }
+        FieldType::Object if depth < DYNAMIC_MAPPING_DEPTH_LIMIT => {
+            // `val` itself may be the Array whose first element inferred
+            // Object (see doc comment) -- unwrap to whichever object is the
+            // real source of the nested keys.
+            let obj = val
+                .as_object()
+                .or_else(|| val.as_array()?.iter().find(|v| !v.is_null())?.as_object());
+            if let Some(obj) = obj {
+                for (sub_key, sub_val) in obj {
+                    fc.fields.push(dynamic_field_config_at_depth(
+                        sub_key,
+                        sub_val,
+                        date_detection,
+                        depth + 1,
+                    ));
+                }
+            }
+        }
+        _ => {}
     }
     fc
 }
@@ -36251,13 +36395,14 @@ mod date_detection_tests {
         assert!(matches!(fc.field_type, FieldType::Text));
         assert_eq!(fc.fields.len(), 1);
 
-        // Non-string inferences carry NO multi-field.
+        // Non-string leaf inferences carry NO multi-field. Object is
+        // exercised separately below (dynamic_object_recurses_into_nested_properties)
+        // since it now gets real child sub-fields, not zero.
         for (val, want_sub) in [
             (serde_json::json!(42), 0usize),
             (serde_json::json!(2.5), 0),
             (serde_json::json!(true), 0),
             (serde_json::json!("2026-07-25T10:30:00Z"), 0), // date-detected
-            (serde_json::json!({"a": 1}), 0),
         ] {
             let fc = dynamic_field_config("f", &val, true);
             assert_eq!(fc.fields.len(), want_sub, "value {val} sub-field count");
@@ -36267,6 +36412,89 @@ mod date_detection_tests {
         let fc = dynamic_field_config("ts", &serde_json::json!("2026-07-25T10:30:00Z"), false);
         assert!(matches!(fc.field_type, FieldType::Text));
         assert_eq!(fc.fields.len(), 1);
+    }
+
+    /// A dynamically discovered nested object must recurse into its own
+    /// keys instead of staying an opaque `{"type": "object"}` -- otherwise
+    /// a subfield like `metadata.kind` is genuinely queryable (the query
+    /// path resolves dotted paths against `_source` regardless of the
+    /// mapping) but invisible to `GET _mapping`/`_field_caps`, indistinguishable
+    /// from not existing to any client that discovers fields that way. Found
+    /// via `/_memory`'s `metadata` field, which is exactly this shape.
+    #[test]
+    fn dynamic_object_recurses_into_nested_properties() {
+        let fc = dynamic_field_config(
+            "metadata",
+            &serde_json::json!({"kind": "preference", "topic": "language"}),
+            true,
+        );
+        assert!(matches!(fc.field_type, FieldType::Object));
+        assert_eq!(fc.fields.len(), 2, "both nested keys should be discovered");
+
+        let kind = fc.fields.iter().find(|f| f.name == "kind").expect("kind");
+        assert!(matches!(kind.field_type, FieldType::Text));
+        // Recursion composes with #209: a nested Text field gets its own
+        // .keyword multi-field too, same as a top-level one would.
+        assert_eq!(kind.fields.len(), 1);
+        assert_eq!(kind.fields[0].name, "keyword");
+        assert!(matches!(kind.fields[0].field_type, FieldType::Keyword));
+
+        // Multi-level nesting: object -> object -> leaf.
+        let fc = dynamic_field_config("a", &serde_json::json!({"b": {"c": 1}}), true);
+        let b = &fc.fields[0];
+        assert_eq!(b.name, "b");
+        assert!(matches!(b.field_type, FieldType::Object));
+        let c = &b.fields[0];
+        assert_eq!(c.name, "c");
+        assert!(matches!(c.field_type, FieldType::Long));
+
+        // Mixed-type nested keys are inferred independently, like top-level
+        // dynamic mapping already does.
+        let fc = dynamic_field_config(
+            "metadata",
+            &serde_json::json!({"count": 3, "active": true, "label": "x"}),
+            true,
+        );
+        let by_name = |n: &str| fc.fields.iter().find(|f| f.name == n).unwrap();
+        assert!(matches!(by_name("count").field_type, FieldType::Long));
+        assert!(matches!(by_name("active").field_type, FieldType::Boolean));
+        assert!(matches!(by_name("label").field_type, FieldType::Text));
+
+        // Depth limit: recursion stops at DYNAMIC_MAPPING_DEPTH_LIMIT rather
+        // than walking an adversarially deep document forever (ES has the
+        // same guard via index.mapping.depth.limit, default 20).
+        let mut deep = serde_json::json!(1);
+        for _ in 0..DYNAMIC_MAPPING_DEPTH_LIMIT + 5 {
+            deep = serde_json::json!({"n": deep});
+        }
+        let fc = dynamic_field_config("root", &deep, true);
+        let mut cur = &fc;
+        let mut levels = 0;
+        while let Some(next) = cur.fields.first() {
+            cur = next;
+            levels += 1;
+        }
+        assert!(
+            levels < DYNAMIC_MAPPING_DEPTH_LIMIT + 5,
+            "recursion must stop before reaching the artificially deep bottom, got {levels} levels"
+        );
+
+        // Array of objects: infer_field_type already only looks at the
+        // first non-null element to decide the *type* (Object); the
+        // dynamic-mapping walk mirrors that by recursing into the same
+        // element rather than reconciling every array entry's shape.
+        let fc = dynamic_field_config(
+            "tags",
+            &serde_json::json!([{"kind": "x"}, {"kind": "y", "extra": true}]),
+            true,
+        );
+        assert!(matches!(fc.field_type, FieldType::Object));
+        assert_eq!(
+            fc.fields.len(),
+            1,
+            "only the first element's keys are discovered"
+        );
+        assert_eq!(fc.fields[0].name, "kind");
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on

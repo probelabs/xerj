@@ -515,6 +515,10 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         state_dir: None,
         fresh: cfg.fresh,
         follow_symlinks: false,
+        // `xerj brain` composes autoindex, so it inherits its ignore rules
+        // rather than inventing its own: build output does not belong in a
+        // second brain either (#276).
+        ignore: xerj_autoindex::ignore_rules::IgnoreOptions::default(),
         max_file_gb: 2,
         sample: 500,
         no_semantic: false,

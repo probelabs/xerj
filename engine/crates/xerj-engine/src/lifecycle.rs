@@ -355,20 +355,20 @@ fn translate_ilm_phase_actions(
             }
             "delete" => LifecycleAction::Delete(EmptyParams {}),
             "readonly" => LifecycleAction::ReadOnly(EmptyParams {}),
-            "set_priority" | "allocate" | "unfollow" | "shrink" | "forcemerge" | "freeze" => {
-                // Real ILM actions with no XERJ equivalent (no shard
-                // allocation awareness, no shrink/forcemerge-as-a-lifecycle-
-                // step wiring, no CCR). Skipped rather than erroring the
-                // whole policy translation — matches this engine's existing
-                // "explicit error only where behavior would be silently
-                // wrong" policy: skipping a no-op-shaped action is honest
-                // (nothing was promised and not delivered), unlike
-                // replica_count which IS user-visible if silently ignored.
-                continue;
-            }
+            // Fail-closed allowlist (issue #282, ported from #262's
+            // `validate_policy`): an action this engine cannot execute is
+            // refused with its name, never silently dropped. This used to
+            // skip `set_priority`/`allocate`/`unfollow`/`shrink`/
+            // `forcemerge`/`freeze` on the argument that a no-op-shaped
+            // action is harmless — but a policy is a contract, and
+            // accepting one while quietly not honouring part of it is this
+            // repo's dominant bug class (#204). The operator can remove the
+            // action from the policy; they cannot remove a silent skip.
             other => {
                 return Err(format!(
-                    "phase '{phase_name}' action '{other}' has no ISM/XERJ equivalent"
+                    "phase '{phase_name}' action '{other}' is not executable by this engine \
+                     (executable ILM actions: rollover, delete, readonly) — refusing the \
+                     policy rather than accepting it and skipping the action"
                 ))
             }
         };
@@ -451,11 +451,60 @@ pub enum ActionOutcome {
     IndexDeleted,
 }
 
+/// Why the delete action must not fire on `index`, if it must not — the
+/// delete rails (issue #282, ported from #262's `ilm_delete_block_reason`).
+///
+/// One function, one answer: the executor's refusal and the operator-visible
+/// failure message can never disagree about what happened.
+///
+///  * Dot-prefixed names are XERJ/Kibana internals (`.xerj-memory-*`
+///    brains, `.kibana*`, security stores). A wildcard settings update or a
+///    copy-pasted attach must not be able to point a 7-day retention policy
+///    at a user's second brain. Data-stream backing indices (`.ds-*`) are
+///    the one dotted family lifecycle deletion is *for*, so they are exempt
+///    from this rail (and covered by the next one while current).
+///  * A data stream's current write index is where new documents are
+///    landing right now; ES's own delete phase refuses it too.
+///  * An index whose age cannot be established must be skipped, never
+///    deleted on a guess (quickwit's janitor makes the same call for
+///    undatable splits — `retention_policy_execution.rs:65-76`, Apache-2.0,
+///    approach adapted). In this engine's cursor model the age clock is
+///    `state_entered_at_ms`; a cursor whose entry time is missing (0, from
+///    a hand-edited or partially-corrupt state file) or in the future
+///    (clock skew) establishes nothing.
+fn delete_block_reason(engine: &Engine, index: &str, state_entered_at_ms: i64) -> Option<String> {
+    if index.starts_with('.') && !index.starts_with(".ds-") {
+        return Some(
+            "dot-prefixed internal index — the lifecycle delete action never removes one"
+                .to_string(),
+        );
+    }
+    let write_index_owner =
+        engine
+            .data_streams
+            .iter()
+            .find_map(|e| match e.value().backing_indices.last() {
+                Some(write_index) if write_index == index => Some(e.key().clone()),
+                _ => None,
+            });
+    if let Some(stream) = write_index_owner {
+        return Some(format!("current write index of data stream '{stream}'"));
+    }
+    if state_entered_at_ms <= 0 || now_ms() < state_entered_at_ms {
+        return Some(
+            "index age cannot be established (state-entry time is missing or in the future)"
+                .to_string(),
+        );
+    }
+    None
+}
+
 async fn execute_action(
     engine: &Engine,
     index_name: &str,
     action: &LifecycleAction,
     state_age_ms: i64,
+    state_entered_at_ms: i64,
 ) -> Result<ActionOutcome> {
     match action {
         LifecycleAction::Rollover(rollover) => {
@@ -483,8 +532,16 @@ async fn execute_action(
             Ok(ActionOutcome::Done)
         }
         LifecycleAction::Delete(_) => {
+            if let Some(reason) = delete_block_reason(engine, index_name, state_entered_at_ms) {
+                // An Err here surfaces as `failed: true` + this message in
+                // explain — visible refusal, not a silent skip (#204).
+                return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                    format!("refusing lifecycle delete of '{index_name}': {reason}"),
+                )));
+            }
             engine.delete_index(index_name).await?;
             engine.managed_indices.remove(index_name);
+            engine.detach_data_stream_backing_index(index_name);
             Ok(ActionOutcome::IndexDeleted)
         }
         LifecycleAction::ReadOnly(_) => {
@@ -513,6 +570,11 @@ async fn execute_action(
 /// actions have completed — evaluate its transitions in order and move to
 /// the first one whose conditions are met.
 pub async fn tick(engine: &Engine) {
+    // Operator kill switch (`POST /_ilm/stop`, issue #282): while stopped,
+    // a tick observes nothing and touches nothing.
+    if !engine.lifecycle_execution_running() {
+        return;
+    }
     let snapshot: Vec<(String, ManagedIndexState)> = engine
         .managed_indices
         .iter()
@@ -551,7 +613,15 @@ pub async fn tick(engine: &Engine) {
 
         if managed.next_action_index < state_def.actions.len() {
             let action = &state_def.actions[managed.next_action_index];
-            match execute_action(engine, &index_name, action, state_age_ms).await {
+            match execute_action(
+                engine,
+                &index_name,
+                action,
+                state_age_ms,
+                managed.state_entered_at_ms,
+            )
+            .await
+            {
                 Ok(ActionOutcome::Done) => {
                     managed.next_action_index += 1;
                     managed.failed = false;
@@ -827,7 +897,11 @@ mod tests {
     }
 
     #[test]
-    fn translate_ilm_skips_unmapped_actions_errors_on_unknown() {
+    fn translate_ilm_refuses_unexecutable_actions_naming_them() {
+        // Issue #282: `set_priority` (and friends) used to be silently
+        // skipped; the fail-closed allowlist refuses them with the action
+        // named so the operator learns at PUT time, not from a policy that
+        // quietly does less than it says.
         let ilm = json!({
             "policy": {
                 "phases": {
@@ -837,12 +911,16 @@ mod tests {
                 }
             }
         });
-        let policy = translate_ilm_policy(&ilm).unwrap();
-        assert!(policy.states[0].actions.is_empty());
+        let err = translate_ilm_policy(&ilm).unwrap_err();
+        assert!(err.contains("set_priority"), "must name the action: {err}");
 
         let ilm_bad = json!({
             "policy": { "phases": { "hot": { "actions": { "totally_made_up": {} } } } }
         });
-        assert!(translate_ilm_policy(&ilm_bad).is_err());
+        let err = translate_ilm_policy(&ilm_bad).unwrap_err();
+        assert!(
+            err.contains("totally_made_up"),
+            "must name the action: {err}"
+        );
     }
 }
