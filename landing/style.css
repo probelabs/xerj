@@ -2553,7 +2553,35 @@ svg.chart.is-interactive .ser:focus-visible {
   /* The split-hero clamp died with .hero-split; without one the h1 is a
      fixed 160px from 961px up — measured 1071px wide at 1024px viewports,
      wrapping to four ragged lines and pushing the prompt below the fold. */
-  font-size: clamp(44px, 8vw, 140px);
+  font-size: clamp(38px, 8vw, 140px);
+}
+.hero-report-tag {
+  display: block;
+  font-family: var(--font-data);
+  font-size: clamp(12px, 1.2vw, 16px);
+  font-weight: 600;
+  letter-spacing: var(--track-ui);
+  color: var(--z-mute);
+  margin: var(--sp-2) 0 2px;
+}
+/* Phones: the desktop clamp floor made the hero read TINY on iPhone
+   (user report). Phones get viewport-relative type + tighter gutters
+   instead. Fit math against real Big Shoulders 900 metrics: the accent
+   line needs 7.22px of width per font-px ('~5× FEWER TOKENS.' = 1155px
+   @160px), so 12vw with sp-3 gutters clears every width ≥331px; the
+   ≤330px step pins the floor. */
+@media (max-width: 720px) {
+  .hero-center { padding-left: var(--sp-3); padding-right: var(--sp-3); }
+  .hero-center .hero { font-size: clamp(36px, 12vw, 64px); }
+  .hero-report-tag { font-size: 13px; }
+  .hero-sub { font-size: var(--fs-16); }
+  .hero-proof { font-size: 14px; }
+  .prompt-label { font-size: 12px; }
+  .prompt-card code { font-size: 15px; }
+  .hero-alt-install { font-size: 12px; }
+}
+@media (max-width: 330px) {
+  .hero-center .hero { font-size: 36px; }
 }
 .hero-sub {
   font-family: var(--font-prose);
