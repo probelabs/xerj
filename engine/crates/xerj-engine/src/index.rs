@@ -27122,11 +27122,13 @@ fn passage_match_from_source(
         return None;
     }
     let page = passage_page_from_source(source);
+    let (start_usize, end_usize) = refine_code_passage(source, field, text, start_usize, end_usize)
+        .unwrap_or((start_usize, end_usize));
     Some(PassageMatch {
         field: field.to_string(),
         ordinal,
-        start_offset: start,
-        end_offset: end,
+        start_offset: start_usize as u64,
+        end_offset: end_usize as u64,
         text: text[start_usize..end_usize].to_string(),
         page,
     })
@@ -27139,6 +27141,40 @@ fn passage_page_from_source(source: &Value) -> Option<u64> {
         .or_else(|| get_field_value(source, "page_number"))
         .or_else(|| get_field_value(source, "metadata.page"))
         .and_then(|value| value.as_u64())
+}
+
+/// For CODE documents only, widen a computed `_passage` window to the
+/// smallest enclosing semantic block (function/method/class/...) instead of
+/// the raw byte window (a 512-char index-time chunk for semantic hits, a
+/// line-snapped query-time window for lexical hits) — see `code_blocks`
+/// (#174 follow-up). `None` means "leave the window exactly as computed",
+/// which is what every non-code document gets: unconditionally.
+///
+/// Deliberately conservative about what counts as "a code document": the
+/// `language` field alone is not enough signal, since an unrelated document
+/// is free to carry a field literally named `language` (e.g. a
+/// `"language": "python"` tag on a course-catalog entry) without being
+/// source code. Only documents that ALSO carry autoindex's code-extractor
+/// signature (`symbol_count`, a number — see
+/// `xerj-autoindex/src/extract/code.rs`) qualify, and only their canonical
+/// `body` field (the one that extractor always populates) is ever handed to
+/// a parser — never an arbitrary field name.
+fn refine_code_passage(
+    source: &Value,
+    field: &str,
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    if field != "body" {
+        return None;
+    }
+    if !matches!(get_field_value(source, "symbol_count"), Some(Value::Number(_))) {
+        return None;
+    }
+    let language = get_field_value(source, "language")?;
+    let language = language.as_str()?;
+    crate::code_blocks::enclosing_block(language, text, start, end)
 }
 
 /// Maximum byte length of a query-time lexical `_passage` window.
@@ -27527,6 +27563,38 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                     select_lexical_passage(text, lower, map, &weighted_terms)
                 {
                     if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                        // `[start, end)` is the already CONTEXT-PADDED window
+                        // (matched line plus surrounding lines up to the
+                        // byte budget) — handing that whole span to
+                        // `refine_code_passage` would usually force it back
+                        // to the tree root (the padding routinely spills
+                        // outside the enclosing function) and silently no-op
+                        // the refinement. Anchor on one actual query-term
+                        // occurrence inside the window instead — any point
+                        // inside the matched region resolves to the same
+                        // enclosing block. ASCII-lowercase only (not the
+                        // Unicode-aware `lower`/`map` used above): it never
+                        // changes byte length, so `pos` lines up with `text`
+                        // without a second offset table; source identifiers
+                        // are ASCII in the overwhelming case, and a missed
+                        // non-ASCII anchor just skips the refinement, not a
+                        // correctness bug.
+                        let (start, end) = weighted_terms
+                            .iter()
+                            .find_map(|&(term, _)| {
+                                if term.is_empty() {
+                                    return None;
+                                }
+                                text.get(start..end)?
+                                    .to_ascii_lowercase()
+                                    .find(term)
+                                    .map(|pos| start + pos)
+                            })
+                            .and_then(|anchor| {
+                                let anchor_end = (anchor + 1).min(text.len());
+                                refine_code_passage(&hit.source, field_name, text, anchor, anchor_end)
+                            })
+                            .unwrap_or((start, end));
                         best = Some((
                             score,
                             PassageMatch {
@@ -39017,6 +39085,102 @@ mod lexical_passage_tests {
         );
     }
 
+    /// #174: the lexical path must widen a code hit's passage to its
+    /// enclosing function too, exactly like the semantic path.
+    #[test]
+    fn code_hit_passage_widens_to_enclosing_function() {
+        let body = format!(
+            "{}fn target(x: i32) -> i32 {{\n    let y = x + 1;\n    y * needle_marker\n}}\n{}",
+            "// filler line of no consequence\n".repeat(80),
+            "// trailing filler\n".repeat(80)
+        );
+        let query = QueryNode::Match {
+            field: "body".into(),
+            query: "needle_marker".into(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+        };
+        let hit = Hit {
+            id: "doc-1".into(),
+            score: 1.0,
+            source: json!({"body": body, "language": "rust", "symbol_count": 1}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![hit], &query);
+        let passage = out[0].passage.as_ref().expect("lexical passage filled");
+        assert!(
+            passage.text.starts_with("fn target"),
+            "passage must start at the enclosing function's declaration, got: {:?}",
+            passage.text
+        );
+        assert_eq!(
+            passage.text,
+            &body[passage.start_offset as usize..passage.end_offset as usize]
+        );
+    }
+
+    /// #174: a document that merely carries a field named `language` (not
+    /// autoindex's code-extractor shape — no `symbol_count`) must keep the
+    /// exact line-snapped window the lexical selector already computed.
+    #[test]
+    fn non_code_document_lexical_passage_ignores_stray_language_field() {
+        let body = format!(
+            "{}fn target(x: i32) -> i32 {{\n    let y = x + 1;\n    y * needle_marker\n}}\n{}",
+            "// filler line of no consequence\n".repeat(80),
+            "// trailing filler\n".repeat(80)
+        );
+        let query = QueryNode::Match {
+            field: "body".into(),
+            query: "needle_marker".into(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+        };
+        let plain_hit = Hit {
+            id: "doc-1".into(),
+            score: 1.0,
+            source: json!({"body": body}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let tagged_hit = Hit {
+            id: "doc-2".into(),
+            score: 1.0,
+            // Same body, but with a stray `language` field and no
+            // `symbol_count` — not autoindex's code-doc shape.
+            source: json!({"body": body, "language": "rust"}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let plain_out = apply_lexical_passages(vec![plain_hit], &query);
+        let tagged_out = apply_lexical_passages(vec![tagged_hit], &query);
+        let plain_passage = plain_out[0].passage.as_ref().expect("plain passage filled");
+        let tagged_passage = tagged_out[0]
+            .passage
+            .as_ref()
+            .expect("tagged passage filled");
+        assert_eq!(plain_passage.start_offset, tagged_passage.start_offset);
+        assert_eq!(plain_passage.end_offset, tagged_passage.end_offset);
+        assert_eq!(plain_passage.text, tagged_passage.text);
+        assert!(
+            !plain_passage.text.starts_with("fn target"),
+            "without symbol_count this must stay the raw line-snapped window, not a widened block"
+        );
+    }
+
     /// A semantic-path passage (exact ingest-time chunk provenance) must
     /// never be overwritten by the query-time selector.
     #[test]
@@ -39539,6 +39703,69 @@ mod chunk_embed_tests {
             passage_match_from_source(&malformed, "embedding", Some(0)).is_none(),
             "offset inside the multibyte 'P/é' sequence must be refused"
         );
+    }
+
+    /// #174 AST-aligned passages: a document that merely carries a field
+    /// literally named `language` (e.g. a course-catalog entry tagged
+    /// `"language": "rust"`, not a source file) must NOT trigger AST
+    /// refinement — `refine_code_passage` also requires autoindex's
+    /// code-extractor signature (`symbol_count`) and the canonical `body`
+    /// field. Every non-code document must come back byte-identical to the
+    /// window computed from the stored chunk offsets, unconditionally.
+    #[test]
+    fn non_code_document_passage_is_byte_identical_regardless_of_language_field() {
+        // Deliberately shaped like the reported bug (a dangling brace mid
+        // window) so a wrongly-triggered AST pass would have visibly changed
+        // the span rather than silently agreeing with it.
+        let text = "\t}\n\n\tif ( isset( $x ) ) {\n\t\tdo_thing();\n\t}\n";
+        let start = text.find("if (").unwrap();
+        let end = start + "if ( isset( $x ) )".len();
+        let source = serde_json::json!({
+            "body": text,
+            "language": "rust",
+            "__xerj_passage_meta__embedding": {
+                "field": "body",
+                "chunks": [[start, end]]
+            }
+        });
+        let passage = passage_match_from_source(&source, "embedding", Some(0)).unwrap();
+        assert_eq!(passage.start_offset as usize, start);
+        assert_eq!(passage.end_offset as usize, end);
+        assert_eq!(passage.text, &text[start..end]);
+    }
+
+    /// #174: a CODE document (autoindex's `language` + `symbol_count` +
+    /// `body` shape) whose stored chunk offsets land mid-statement inside a
+    /// function — exactly the reported bug, a passage opening on a dangling
+    /// brace — must be widened to the smallest enclosing function.
+    #[test]
+    fn code_document_passage_widens_to_enclosing_function() {
+        let body = "fn before() {\n    1\n}\n\nfn target(x: i32) -> i32 {\n    let y = x + 1;\n    y * 2\n}\n\nfn after() {\n    2\n}\n";
+        let needle = "y * 2";
+        let start = body.find(needle).unwrap();
+        let end = start + needle.len();
+        let source = serde_json::json!({
+            "body": body,
+            "language": "rust",
+            "symbol_count": 3,
+            "__xerj_passage_meta__embedding": {
+                "field": "body",
+                "chunks": [[start, end]]
+            }
+        });
+        let passage = passage_match_from_source(&source, "embedding", Some(0)).unwrap();
+        assert!(
+            passage.text.starts_with("fn target"),
+            "passage must start at the enclosing function's declaration, got: {:?}",
+            passage.text
+        );
+        assert_eq!(
+            passage.text,
+            &body[passage.start_offset as usize..passage.end_offset as usize],
+            "start/end offsets must still slice exactly onto `text`"
+        );
+        assert!(!passage.text.contains("before"));
+        assert!(!passage.text.contains("after"));
     }
 
     #[test]

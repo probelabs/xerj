@@ -20,6 +20,7 @@ pub mod aggs;
 pub mod audit;
 pub mod bulk;
 mod cluster_state;
+mod code_blocks;
 mod collection_publication;
 pub mod engine;
 pub mod governor;
