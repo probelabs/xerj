@@ -13,7 +13,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
-<link rel="stylesheet" href="/style.css?v=if8">
+<link rel="stylesheet" href="/style.css?v=if9">
 </head>
 <body>
 
@@ -43,7 +43,7 @@
 <section class="hero-center">
   <h1 class="hero">ONE PROMPT.<br>WORKING PRODUCT.<br><span class="hero-report-tag">USERS REPORT</span><span class="accent">~5× FEWER TOKENS.</span></h1>
 
-  <div class="prompt-stage">
+  <div class="prompt-stage" id="prompt">
     <div class="prompt-card">
       <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
       <code>Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.</code>
@@ -55,19 +55,6 @@
     the open-source repos worth learning from, and looks implementations up
     instead of re-deriving them.</p>
 
-  <p class="hero-marks">
-    <a href="https://github.com/xerj-org/xerj/blob/main/user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md">FIELD REPORTS ~5×</a>
-    <span class="dash">·</span>
-    <a href="/case-studies/reference-coding.html">MEASURED 2.7× VS GREP-DRIVEN CLAUDE CODE</a>
-    <span class="dash">·</span>
-    <a href="/case-studies/reference-coding.html">21/21 VS 1/21 ON UNSEEN CONTRACTS</a>
-  </p>
-
-  <p class="hero-alt-install">No agent handy?
-    <code>curl -fsSL https://xerj.org/get | sh</code>
-    <button type="button" class="hero-install-copy" data-copy="curl -fsSL https://xerj.org/get | sh">COPY</button>
-    <span class="dash">·</span> <a href="/docs/index.html">Windows &amp; more &rarr;</a>
-  </p>
 
 </section>
 
@@ -254,22 +241,38 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   </div>
 </section>
 
-<section class="lead-capture" id="demo">
-  <div class="kicker"><span class="accent">XERJ.AI</span><span class="dash">·</span><span>OPEN THE PLAYGROUND</span></div>
-  <h3>TRY IT<br><span class="accent">RIGHT NOW.</span></h3>
-  <p>
-    Leave a work email and the live dashboards open immediately — explore the
-    query surface, vector search, aggregations, and agent memory on real data.
-    Stored only in your browser: no funnel, no sequenced drip, no "journey."
-  </p>
+<section class="scene-section" id="try">
+  <div class="kicker"><span class="accent">TRY IT</span><span class="dash">·</span><span>TWO MINUTES · NO SIGNUP</span></div>
+  <h2 class="scene">THREE WAYS <span class="accent">IN.</span></h2>
 
-  <form class="lead-form" id="leadForm" action="#" method="post" novalidate>
-    <div class="lead-form-input">
-      <input type="email" name="email" placeholder="you@company.com" required aria-label="Work email" autocomplete="email" />
+  <div class="recipes" style="grid-template-columns:repeat(3,1fr); margin-top:var(--sp-6);">
+    <a class="recipe" href="#prompt">
+      <span class="num">01 · WITH YOUR AGENT</span>
+      <span class="title">Paste the prompt</span>
+      <p class="lead">The prompt at the top of this page is the whole setup — install, index, reference coding. Copy it &rarr;</p>
+    </a>
+    <div class="recipe">
+      <span class="num">02 · IN A SHELL</span>
+      <span class="title">One command</span>
+      <p class="lead"><code>curl -fsSL https://xerj.org/get | sh</code>
+        <button type="button" class="hero-install-copy" data-copy="curl -fsSL https://xerj.org/get | sh">COPY</button><br>
+        Windows: <code>irm https://xerj.org/get.ps1 | iex</code>
+        <button type="button" class="hero-install-copy" data-copy="irm https://xerj.org/get.ps1 | iex">COPY</button></p>
     </div>
-    <button type="submit" class="demo">OPEN PLAYGROUND <span class="arrow">→</span></button>
-    <span class="note">We keep your email to follow up about XERJ — nothing else. No spam, no reselling.</span>
-  </form>
+    <a class="recipe" href="/playground/">
+      <span class="num">03 · IN THE BROWSER</span>
+      <span class="title">Open the playground</span>
+      <p class="lead">Live dashboards over real data — query surface, vectors, aggregations, agent memory. Nothing to install.</p>
+    </a>
+  </div>
+
+  <p class="hero-marks" style="margin-top:var(--sp-6);">
+    <a href="https://github.com/xerj-org/xerj/blob/main/user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md">FIELD REPORTS ~5×</a>
+    <span class="dash">·</span>
+    <a href="/case-studies/reference-coding.html">MEASURED 2.7× VS GREP-DRIVEN CLAUDE CODE</a>
+    <span class="dash">·</span>
+    <a href="/case-studies/reference-coding.html">21/21 VS 1/21 ON UNSEEN CONTRACTS</a>
+  </p>
 </section>
 
 <!-- BENCHMARKS — SUPPORTING EVIDENCE -------------------------->
@@ -379,22 +382,6 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
           document.body.removeChild(ta);
           done();
         }
-      });
-    }
-    const form = document.getElementById('leadForm');
-    if (form) {
-      form.addEventListener('submit', (e) => {
-        e.preventDefault();
-        const email = form.querySelector('input[type=email]').value.trim();
-        if (!email || !email.includes('@')) return;
-        console.log('[xerj lead]', email);
-        try { localStorage.setItem('xerj.playground.email', email); } catch (_) {}
-        // Capture the lead (fire-and-forget with keepalive so the redirect
-        // never waits on it), then open the live dashboards app.
-        try {
-          fetch('/lead', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, source: 'landing' }), keepalive: true }).catch(function () {});
-        } catch (_) {}
-        window.location.href = '/playground/';
       });
     }
   })();
