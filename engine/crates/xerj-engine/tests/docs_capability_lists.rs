@@ -733,3 +733,160 @@ fn published_capability_counts_match_the_constants() {
          markers and its number is now unchecked"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Release freshness (issue #298).
+//
+// Issue #298 pins ROADMAP.md as the authoritative "where the project is
+// going" document and advertises that parts of it are machine-checked. The
+// checks above pin the capability *counts* — none of them noticed that the
+// `release: cut 1.0.0-rc.16` commit moved CHANGELOG.md's `[Unreleased]`
+// section under a 1.0.0-rc.16 heading while ROADMAP.md went on describing
+// rc.16 as the *next* release: five merged PRs listed as "in flight", four
+// closed issues listed as open gate items, and a review line naming rc.15 as
+// the release the statuses were verified against. Every test in this file was
+// green the whole time.
+//
+// So the release cut itself is now inside the checked surface: cutting a
+// release (the CHANGELOG heading) without rolling ROADMAP.md forward fails
+// the build, exactly like adding a query type without updating the lists.
+// ---------------------------------------------------------------------------
+
+/// A release version as XERJ writes them (`1.0.0-rc.16`, one day `1.0.0`),
+/// as a totally ordered tuple. An `-rc.N` sorts before the bare release it
+/// leads up to, so the final component is the rc number or `u64::MAX`.
+///
+/// Trailing decorations after whitespace (`v1.0.0 (GA)`) are ignored; a
+/// leading `v` is stripped. Returns `None` for anything that is not a
+/// three-part version, so callers can keep scanning past prose.
+fn parse_release_version(text: &str) -> Option<(u64, u64, u64, u64)> {
+    let token = text
+        .trim()
+        .trim_start_matches('v')
+        .split_whitespace()
+        .next()?;
+    let (core, rc) = match token.split_once("-rc.") {
+        Some((core, n)) => (core, n.parse().ok()?),
+        None => (token, u64::MAX),
+    };
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    let (maj, min, pat) = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((maj, min, pat, rc))
+}
+
+/// The most recently cut release: the first `## [<version>]` heading in
+/// CHANGELOG.md whose bracket content parses as a version. `[Unreleased]`
+/// and prose headings are skipped, so the changelog may carry a pending
+/// section above the latest cut.
+fn latest_cut_release(changelog: &str) -> (String, (u64, u64, u64, u64)) {
+    for line in changelog.lines() {
+        let Some(rest) = line.strip_prefix("## [") else {
+            continue;
+        };
+        let Some(name) = rest.split(']').next() else {
+            continue;
+        };
+        if let Some(version) = parse_release_version(name) {
+            return (name.to_string(), version);
+        }
+    }
+    panic!(
+        "CHANGELOG.md has no `## [<version>]` release heading — the release \
+         history is the reference the roadmap-freshness checks compare \
+         against, and it cannot be empty"
+    );
+}
+
+/// The heading that opens ROADMAP.md's next-release section. The link text is
+/// the version; the link target is the milestone.
+const NEXT_RELEASE_MARKER: &str = "## Next release — [";
+
+#[test]
+fn the_roadmap_next_release_has_not_already_been_cut() {
+    let root = repo_root();
+    let changelog = read_surface_or_panic(&root.join("CHANGELOG.md"));
+    let roadmap = read_surface_or_panic(&root.join("ROADMAP.md"));
+    let (cut_name, cut) = latest_cut_release(&changelog);
+
+    let at = roadmap.find(NEXT_RELEASE_MARKER).unwrap_or_else(|| {
+        panic!(
+            "ROADMAP.md has no `{NEXT_RELEASE_MARKER}…]` heading. Issue #298 \
+             points readers at that section for the short-term roadmap; if the \
+             section was renamed (say, after 1.0.0 ships), update this test \
+             rather than leaving release freshness unchecked."
+        )
+    });
+    let link_text = roadmap[at + NEXT_RELEASE_MARKER.len()..]
+        .split(']')
+        .next()
+        .expect("split always yields a first piece");
+    let next = parse_release_version(link_text).unwrap_or_else(|| {
+        panic!(
+            "ROADMAP.md line {} names `{link_text}` as the next release, which \
+             does not parse as a version",
+            line_of(&roadmap, at)
+        )
+    });
+
+    assert!(
+        next > cut,
+        "ROADMAP.md line {} still advertises `{link_text}` as the next \
+         release, but CHANGELOG.md records `{cut_name}` as already cut. The \
+         release cut did not roll the roadmap forward, so the section issue \
+         #298 calls the short-term roadmap describes the past: its \"in \
+         flight\" PRs have merged and its open defects belong to the next \
+         milestone. Re-review ROADMAP.md against the new release and point \
+         the heading at the next milestone.",
+        line_of(&roadmap, at)
+    );
+}
+
+#[test]
+fn the_roadmap_review_line_names_the_latest_cut_release() {
+    let root = repo_root();
+    let changelog = read_surface_or_panic(&root.join("CHANGELOG.md"));
+    let roadmap = read_surface_or_panic(&root.join("ROADMAP.md"));
+    let (cut_name, _) = latest_cut_release(&changelog);
+
+    let marker = "Last reviewed:";
+    let at = roadmap.find(marker).unwrap_or_else(|| {
+        panic!(
+            "ROADMAP.md has no `{marker}` line — the review line is what lets \
+             a reader date the statuses; removing it removes the honesty \
+             anchor issue #298 promises"
+        )
+    });
+    let line_end = roadmap[at..].find('\n').map_or(roadmap.len(), |n| at + n);
+    let review_line = &roadmap[at..line_end];
+
+    let against = "(against `";
+    let from = review_line.find(against).unwrap_or_else(|| {
+        panic!(
+            "ROADMAP.md's review line does not say which release the statuses \
+             were verified against — expected `{against}v…\\`` on line {}",
+            line_of(&roadmap, at)
+        )
+    }) + against.len();
+    let reviewed = review_line[from..]
+        .split('`')
+        .next()
+        .expect("split always yields a first piece");
+
+    assert_eq!(
+        reviewed.trim_start_matches('v'),
+        cut_name,
+        "ROADMAP.md line {} says the statuses were last verified against \
+         `{reviewed}`, but the latest cut release in CHANGELOG.md is \
+         `{cut_name}`. A cut release the roadmap has not been re-reviewed \
+         against is exactly the drift issue #298 says cannot happen — \
+         re-verify the statuses and update the review line.",
+        line_of(&roadmap, at)
+    );
+}
