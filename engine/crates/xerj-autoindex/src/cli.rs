@@ -1,5 +1,6 @@
 //! Hand-rolled arg parser (house style of xerj-server — no clap).
 
+use crate::ignore_rules::IgnoreOptions;
 use crate::progress::ProgressMode;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,6 +31,9 @@ pub struct IndexCfg {
     pub state_dir: Option<PathBuf>,
     pub fresh: bool,
     pub follow_symlinks: bool,
+    /// `.gitignore` / `.xerjignore` / built-in build-output rules (#276).
+    /// `deep_count` is set from `--dry-run`.
+    pub ignore: IgnoreOptions,
     pub max_file_gb: u64,
     pub sample: usize,
     pub no_semantic: bool,
@@ -114,6 +118,12 @@ pub fn print_help() {
                                   bytes (default 64); excludes filesystem/manifest overhead\n\
              --fresh              {fresh_help}\n\
              --follow-symlinks    follow symlinks (loop-safe); off by default\n\
+             --no-ignore          index everything: no .gitignore, no .xerjignore, no\n\
+                                  .git/info/exclude, no built-in defaults. Hidden files\n\
+                                  (.env, .git/, .ssh) stay skipped either way — that is\n\
+                                  not an ignore rule, it is what keeps secrets out.\n\
+             --no-default-ignores keep the ignore files, drop only the built-in list\n\
+                                  ({defaults})\n\
              --max-file-gb <N>    skip+record oversized non-streamable files (default 2)\n\
              --sample <N>         records sampled per file for inference (default 500)\n\
              --no-semantic        skip semantic_text on body fields (pure BM25+keyword)\n\
@@ -135,6 +145,30 @@ pub fn print_help() {
              --quiet              errors only (implies --progress none)\n\
              --dataset <SLUG>     (map) show a single dataset\n\
              --help, -h           this help\n\
+         \n\
+         IGNORE RULES:\n\
+             The fastest file is the one that is never read, so junk is dropped during\n\
+             the walk, not after it. Honoured, highest precedence first:\n\
+               .xerjignore  same syntax as .gitignore, XERJ-only. Use it to exclude\n\
+                            something git tracks, or to re-include (!pattern) something\n\
+                            git ignores. Outranks .gitignore at any depth.\n\
+               .gitignore   including nested ones and negation; the closest file wins.\n\
+               .git/info/exclude  per-checkout excludes, including nested checkouts.\n\
+               built-in     {defaults}\n\
+             Both git-owned kinds stop at a repository boundary, exactly as git does:\n\
+             a .gitignore above a nested checkout does not judge files inside it, so\n\
+             vendored and submoduled trees keep their own rules. .xerjignore and the\n\
+             built-in list are XERJ's, not git's, and apply throughout the folder.\n\
+             Your global gitignore (core.excludesFile) is NOT read: a machine-wide\n\
+             preference should not silently decide what is in your index.\n\
+             A directory the rules reject is never descended, so nothing inside it is\n\
+             stat-ed, hashed or sent. Every run prints what was dropped and by which\n\
+             rule; --dry-run additionally counts the non-hidden files inside each\n\
+             pruned directory (bounded — past the budget the count is reported as\n\
+             `at least N`, and xerj-done carries\n\
+             ignored_files_in_pruned_dirs_exact=false to say so).\n\
+             The folder you name is never rejected: if it is itself ignored, it is\n\
+             indexed anyway and the run says which rule it would have matched.\n\
          \n\
          PDF EXTRACTION:\n\
              Each PDF uses a fresh process. Limits: 512 MiB input, 32 MiB worker output,\n\
@@ -182,9 +216,27 @@ pub fn print_help() {
              (A run killed by a signal cannot print one either; a missing\n\
              terminal line after the process is gone means it died, not that it\n\
              finished.)\n\
-             --progress plain emits `xerj-progress phase=… pct=… eta_s=…` lines;\n\
+             --progress plain writes TWO lines per tick, in one write:\n\
+             xerj-bar [######################--] 93.4% | index | 8082/8083 items | eta 7s\n\
+             xerj-progress phase=index basis=bytes pct=93.4 items=8082/8083 eta_s=7.2 …\n\
+             `xerj-bar` is the DISPLAY line — self-contained, meant to be shown\n\
+             to a person verbatim by whatever is relaying the run. It is spaced\n\
+             at most one per 15s, plus one per phase change and never two closer\n\
+             than 2s, so it does not flood a transcript. Short phases therefore\n\
+             draw fewer bars than transitions — read the machine line for those.\n\
+             `xerj-progress` is the MACHINE line and keeps\n\
+             the --progress-interval cadence; parse that one. --progress json\n\
+             stays one object per line and carries the same rendered string in\n\
+             a `bar` field on the same schedule: a string on the ticks that owe\n\
+             a bar, null in between.\n\
+             Every record is identified by its leading token, and that is\n\
+             enforced: paths and other outside text are stripped of control\n\
+             characters and bounded before they reach any line, so a crafted\n\
+             filename cannot forge a record or repaint your terminal.\n\
              `pct`/`eta_s` are the literal word `unknown` (JSON null) whenever they\n\
-             cannot be computed honestly, never a filler number.\n\
+             cannot be computed honestly, never a filler number — and the drawn\n\
+             bar obeys the same rule: `[????…]` when there is no denominator,\n\
+             and a full bar only at a real 100%.\n\
          \n\
          RESUME POLICY:\n\
              {resume_policy_help}.\n\
@@ -208,7 +260,8 @@ pub fn print_help() {
                      2 usage; 1 endpoint/journal failure, a refused corpus removal, or a\n\
                      refused unsafe state transition\n",
         fresh_help = FRESH_HELP,
-        resume_policy_help = RESUME_POLICY_HELP
+        resume_policy_help = RESUME_POLICY_HELP,
+        defaults = crate::ignore_rules::DEFAULT_IGNORE_PATTERNS.join(" ")
     );
 }
 
@@ -233,6 +286,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut state_dir: Option<PathBuf> = None;
     let mut fresh = false;
     let mut follow_symlinks = false;
+    let mut no_ignore = false;
+    let mut no_default_ignores = false;
     let mut max_file_gb = 2u64;
     let mut sample = 500usize;
     let mut no_semantic = false;
@@ -320,6 +375,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--state-dir" => state_dir = it.next().map(PathBuf::from),
             "--fresh" => fresh = true,
             "--follow-symlinks" => follow_symlinks = true,
+            "--no-ignore" => no_ignore = true,
+            "--no-default-ignores" => no_default_ignores = true,
             "--max-file-gb" => {
                 max_file_gb = it
                     .next()
@@ -403,6 +460,21 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     } else {
         progress.unwrap_or(ProgressMode::Auto)
     };
+    // Redundant-but-honoured is fine; accepted-and-ignored is the #204 class.
+    // `--no-ignore` already removes the built-in defaults, so there is nothing
+    // left for `--no-default-ignores` to do — say so instead of taking a flag
+    // that changes nothing.
+    // Only meaningful for a run that walks a folder. On `map`/`status` neither
+    // flag does anything at all, and the arm below says so — a message about
+    // one flag subsuming the other would imply the pair is otherwise honoured.
+    let sub_walks_a_folder = !matches!(sub.as_deref(), Some("map") | Some("status"));
+    if no_ignore && no_default_ignores && sub_walks_a_folder {
+        return Err(
+            "--no-ignore already turns off the built-in default rules that --no-default-ignores \
+             targets. Drop one of the two"
+                .into(),
+        );
+    }
     if progress_interval.is_some() && progress == ProgressMode::None {
         return Err(
             "--progress-interval sets the cadence of a progress stream that --progress none / \
@@ -411,11 +483,37 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         );
     }
 
+    // `map` reads the catalog off the server and `status` reads the local
+    // journal; neither walks a filesystem, so an ignore flag on either cannot
+    // change one byte of the output. Measured before this check existed:
+    // `xerj autoindex map --no-ignore` was byte-identical to `xerj autoindex
+    // map`. Accepting it was the #204 accept-and-ignore class (#279).
+    let ignore_flags_used: Vec<&str> = [
+        ("--no-ignore", no_ignore),
+        ("--no-default-ignores", no_default_ignores),
+    ]
+    .into_iter()
+    .filter_map(|(name, used)| used.then_some(name))
+    .collect();
+
     match (sub.as_deref(), folder) {
         (Some("map"), _) | (Some("status"), _) if progress_explicit => Err(format!(
             "--progress/--progress-interval apply only to indexing, not `autoindex {}`",
             sub.as_deref().unwrap_or_default()
         )),
+        (Some("map"), _) | (Some("status"), _) if !ignore_flags_used.is_empty() => {
+            let sub = sub.as_deref().unwrap_or_default();
+            let (verb, them) = if ignore_flags_used.len() == 1 {
+                ("applies", "it")
+            } else {
+                ("apply", "them")
+            };
+            Err(format!(
+                "{} {verb} only to indexing, not `autoindex {sub}`: that subcommand never walks \
+                 a folder, so there is nothing for an ignore rule to skip. Drop {them}",
+                ignore_flags_used.join(" and "),
+            ))
+        }
         (Some("map"), _) if bulk_timeout_explicit => {
             Err("--bulk-timeout-secs applies only to indexing, not `autoindex map`".into())
         }
@@ -453,6 +551,13 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 state_dir,
                 fresh,
                 follow_symlinks,
+                ignore: IgnoreOptions {
+                    enabled: !no_ignore,
+                    defaults: !no_ignore && !no_default_ignores,
+                    // Only --dry-run pays for counting what is inside a pruned
+                    // directory; a real run's whole point is not touching it.
+                    deep_count: dry_run,
+                },
                 max_file_gb,
                 sample: sample.max(50),
                 no_semantic,
@@ -688,5 +793,79 @@ mod tests {
             let err = parse(args.into_iter().map(str::to_string).collect()).unwrap_err();
             assert!(err.contains("applies only to indexing"), "{err}");
         }
+    }
+
+    /// #276. Ignore rules are on by default — that is the whole point of the
+    /// issue — and each flag turns off exactly what it names.
+    #[test]
+    fn ignore_rules_default_on_and_each_flag_turns_off_what_it_names() {
+        let cfg = index(&["data"]);
+        assert!(cfg.ignore.enabled);
+        assert!(cfg.ignore.defaults);
+        assert!(!cfg.ignore.deep_count, "only --dry-run pays for the count");
+
+        let none = index(&["data", "--no-ignore"]);
+        assert!(!none.ignore.enabled);
+        assert!(!none.ignore.defaults);
+
+        let keep_files = index(&["data", "--no-default-ignores"]);
+        assert!(keep_files.ignore.enabled, "ignore files still apply");
+        assert!(!keep_files.ignore.defaults);
+
+        assert!(index(&["data", "--dry-run"]).ignore.deep_count);
+    }
+
+    /// A flag that cannot change anything is refused rather than accepted and
+    /// quietly dropped (#204's class).
+    #[test]
+    fn no_default_ignores_under_no_ignore_is_refused() {
+        let err = err(&["data", "--no-ignore", "--no-default-ignores"]);
+        assert!(err.contains("--no-ignore already turns off"), "{err}");
+    }
+
+    /// #279, same class. `map` reads the catalog off the server and `status`
+    /// reads the local journal; neither walks a folder, so an ignore flag on
+    /// either changes nothing. Both were accepted, and `xerj autoindex map
+    /// --no-ignore` was measured byte-identical to `xerj autoindex map`.
+    #[test]
+    fn ignore_flags_are_rejected_for_non_index_subcommands_in_any_position() {
+        for args in [
+            vec!["map", "--no-ignore"],
+            vec!["--no-ignore", "map"],
+            vec!["map", "--no-default-ignores"],
+            vec!["--no-default-ignores", "map"],
+            vec!["status", "--no-ignore"],
+            vec!["--no-ignore", "status"],
+            vec!["status", "--no-default-ignores"],
+            vec!["--no-default-ignores", "status"],
+        ] {
+            let err = parse(args.iter().map(|a| a.to_string()).collect()).unwrap_err();
+            assert!(
+                err.contains("applies only to indexing") && err.contains("never walks a folder"),
+                "{args:?} -> {err}"
+            );
+        }
+    }
+
+    /// Both flags on `map` must be refused for the reason that is actually
+    /// true there — neither applies at all — not for the indexing-only reason
+    /// that one subsumes the other, which would imply the pair is honoured.
+    #[test]
+    fn both_ignore_flags_on_map_are_refused_as_inapplicable_not_as_redundant() {
+        let err = err(&["map", "--no-ignore", "--no-default-ignores"]);
+        assert!(err.contains("never walks a folder"), "{err}");
+        assert!(!err.contains("already turns off"), "{err}");
+        assert!(
+            err.contains("--no-ignore") && err.contains("--no-default-ignores"),
+            "both flags must be named: {err}"
+        );
+    }
+
+    /// …and the index path is untouched: the flags still work where they mean
+    /// something.
+    #[test]
+    fn ignore_flags_still_apply_to_an_index_run() {
+        assert!(!index(&["data", "--no-ignore"]).ignore.enabled);
+        assert!(!index(&["data", "--no-default-ignores"]).ignore.defaults);
     }
 }

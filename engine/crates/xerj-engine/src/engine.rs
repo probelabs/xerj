@@ -138,6 +138,45 @@ pub struct IndexTemplate {
     pub priority: i32,
 }
 
+/// Version stamped into `cluster_state.json`. Bump only when the on-disk
+/// shape changes in a way an older build cannot read; new *optional* fields
+/// (`#[serde(default)]`) do not need one.
+const CLUSTER_STATE_VERSION: u32 = 1;
+
+/// Everything in `<data_dir>/cluster_state.json` — the cluster-level
+/// management state that used to be in-memory only (issue #203).
+///
+/// `BTreeMap` rather than `HashMap` so the file is byte-stable for a given
+/// state: an operator diffing two nodes' `cluster_state.json`, or a backup
+/// tool deduplicating it, sees a change only when the state really changed.
+/// Every field is `#[serde(default)]`, so a file written by an older build
+/// (or by one that gains another map later) still loads.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedClusterState {
+    #[serde(default)]
+    version: u32,
+    /// v2 index templates — `PUT /_index_template/{name}`.
+    #[serde(default)]
+    index_templates: std::collections::BTreeMap<String, IndexTemplate>,
+    /// v1 legacy templates — `PUT /_template/{name}`.
+    #[serde(default)]
+    legacy_templates: std::collections::BTreeMap<String, Value>,
+    /// Component templates — `PUT /_component_template/{name}`.
+    #[serde(default)]
+    component_templates: std::collections::BTreeMap<String, Value>,
+    /// Ingest pipeline definitions — `PUT /_ingest/pipeline/{id}`. Stored as
+    /// the document `GET` hands back, and recompiled into an executable
+    /// pipeline on boot.
+    #[serde(default)]
+    pipelines: std::collections::BTreeMap<String, Value>,
+    /// Data streams — `PUT /_data_stream/{name}` plus every rollover.
+    #[serde(default)]
+    data_streams: std::collections::BTreeMap<String, DataStream>,
+    /// ILM policies — `PUT /_ilm/policy/{name}`.
+    #[serde(default)]
+    ilm_policies: std::collections::BTreeMap<String, Value>,
+}
+
 /// Active scroll context holding all matching hits.
 ///
 /// Each context pins a fully-hydrated `Vec<Hit>` snapshot, so its lifetime
@@ -376,8 +415,12 @@ impl ApiKeyRecord {
 /// default. Mirrors `index::write_file_atomic` but hardens the mode.
 fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    {
+    // Unique staging name, for the same reason as `index::write_file_atomic`:
+    // two concurrent key mints sharing one `api_keys.tmp` can interleave into a
+    // key store that no longer parses, and a corrupt key store silently drops
+    // every persisted key at the next boot.
+    let tmp = crate::index::staging_path(path);
+    let staged = (|| -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -388,14 +431,19 @@ fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        // Belt and braces: pin 0600 even if the platform ignored the open mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    // Never leave a staging file behind on failure — it holds key material.
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    // Tighten an already-existing tmp inode too (create() reuses perms).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
@@ -417,11 +465,17 @@ pub struct Engine {
     data_dir: PathBuf,
     /// alias_name → list of index names
     pub aliases: Arc<DashMap<String, Vec<String>>>,
-    /// template_name → IndexTemplate
+    /// template_name → IndexTemplate. Persisted in
+    /// `<data_dir>/cluster_state.json`; mutate only through
+    /// [`Engine::put_index_template`] / [`Engine::delete_index_template`],
+    /// or the change will not survive a restart (issue #203).
     pub templates: Arc<DashMap<String, IndexTemplate>>,
     /// scroll_id → ScrollContext
     pub scrolls: Arc<DashMap<String, ScrollContext>>,
-    /// pipeline_id → pipeline definition JSON
+    /// pipeline_id → pipeline definition JSON. Persisted in
+    /// `<data_dir>/cluster_state.json`; mutate only through
+    /// [`Engine::put_pipeline`] / [`Engine::delete_pipeline`], or the change
+    /// will not survive a restart (issue #203).
     pub pipelines: Arc<DashMap<String, Value>>,
     /// pipeline_id → why the stored definition has no compiled counterpart.
     ///
@@ -433,7 +487,10 @@ pub struct Engine {
     pub unrunnable_pipelines: Arc<DashMap<String, String>>,
     /// index_name → open/closed state (true = closed)
     pub closed_indices: Arc<DashMap<String, bool>>,
-    /// data stream name → DataStream
+    /// data stream name → DataStream. Persisted in
+    /// `<data_dir>/cluster_state.json`; mutate only through the
+    /// `*_data_stream` methods, or the change will not survive a restart
+    /// (issue #203).
     pub data_streams: Arc<DashMap<String, DataStream>>,
     /// ILM policy name → raw policy JSON, kept verbatim for `GET _ilm/policy`
     /// round-trip fidelity. The REAL execution engine reads `ism_policies`
@@ -441,20 +498,50 @@ pub struct Engine {
     /// `xerj_api::es_compat::put_ilm_policy`), translating into the shared
     /// internal model. See `crate::lifecycle` for why one engine drives both
     /// surfaces.
+    ///
+    /// This map — the verbatim ILM document — is persisted in
+    /// `<data_dir>/cluster_state.json`; mutate only through
+    /// [`Engine::put_ilm_policy`] / [`Engine::delete_ilm_policy`], or the
+    /// change will not survive a restart (issue #203). The translated
+    /// `ism_policies` model has its own file (`ism_policies.json`, issue
+    /// #199) — the two never write each other's file.
     pub ilm_policies: Arc<DashMap<String, Value>>,
     /// policy id → the internal ISM-shaped model every managed index is
     /// actually driven by, regardless of whether the policy was created via
     /// `_plugins/_ism/policies` (native) or `_ilm/policy` (translated).
+    /// Persisted separately in `<data_dir>/ism_policies.json` — see
+    /// [`Engine::put_ism_policy`].
     pub ism_policies: Arc<DashMap<String, crate::lifecycle::LifecyclePolicy>>,
     /// index name → lifecycle execution cursor (current state, pending
     /// action, timestamps). Presence in this map is what "managed" means —
     /// an index with no entry here is not touched by the background job.
     pub managed_indices: Arc<DashMap<String, crate::lifecycle::ManagedIndexState>>,
+    /// Persisted detach tombstones (issue #282, ported from #262): an index
+    /// name lands here when an operator explicitly detached it — `PUT
+    /// /{index}/_settings {"index.lifecycle.name": null}`, `POST
+    /// /{index}/_ilm/remove`, or `POST /_plugins/_ism/remove/{index}`. An
+    /// acknowledged detach must be authoritative across restarts: mere
+    /// *absence* from `managed_indices` cannot distinguish "never managed"
+    /// from "operator said stop", and any future code path that re-derives
+    /// attachments (e.g. from persisted index settings, which may still
+    /// carry a stale `index.lifecycle.name`) MUST consult this set first.
+    /// Cleared by an explicit re-attach or by deleting the index. Persisted
+    /// in `ism_managed_indices.json` alongside the cursors.
+    pub lifecycle_detached: Arc<DashMap<String, ()>>,
+    /// Operator kill switch for lifecycle execution (`POST /_ilm/stop` /
+    /// `/_ilm/start`): while false, `lifecycle::tick` returns without
+    /// acting. In-memory only, matching #262's rc — a restart resumes
+    /// execution, which errs on the side of retention running.
+    pub lifecycle_running: Arc<std::sync::atomic::AtomicBool>,
     /// index name → creation time (epoch ms), for `min_index_age` and for
     /// `GET /{index}`'s `creation_date` (previously synthesized as
     /// `Utc::now()` on every request — see `record_index_created_at`).
     pub index_created_at: Arc<DashMap<String, i64>>,
-    /// component template name → template JSON
+    /// component template name → template JSON. Persisted in
+    /// `<data_dir>/cluster_state.json`; mutate only through
+    /// [`Engine::put_component_template`] /
+    /// [`Engine::delete_component_template`], or the change will not survive
+    /// a restart (issue #203).
     pub component_templates: Arc<DashMap<String, Value>>,
     /// snapshot repository name → repo config JSON
     pub snapshot_repos: Arc<DashMap<String, Value>>,
@@ -496,7 +583,10 @@ pub struct Engine {
     /// subsequent poll, but nothing actually gates on them yet.
     /// In-memory only (lost on restart).
     pub application_privileges: Arc<DashMap<String, Value>>,
-    /// legacy index template name (v1 /_template) → template JSON
+    /// legacy index template name (v1 /_template) → template JSON.
+    /// Persisted in `<data_dir>/cluster_state.json`; mutate only through
+    /// [`Engine::put_legacy_template`] / [`Engine::delete_legacy_template`],
+    /// or the change will not survive a restart (issue #203).
     pub legacy_templates: Arc<DashMap<String, Value>>,
     /// pipeline_name → compiled, executable Pipeline (typed transform pipeline)
     pub transform_pipelines: Arc<DashMap<String, xerj_wasm::pipeline::Pipeline>>,
@@ -557,6 +647,51 @@ pub struct Engine {
     /// the process: a `kill -9` releases it automatically and a stale
     /// `node.lock` file never blocks the next boot.
     _node_lock: Arc<std::fs::File>,
+
+    /// Serializes rewrites of `<data_dir>/cluster_state.json` (issue #203).
+    ///
+    /// The atomic rewrite stages through a single fixed path
+    /// (`cluster_state.tmp`), so two concurrent flushes — two provisioning
+    /// PUTs arriving together is all it takes — would create/truncate the
+    /// *same* temp file and rename each other's half-written bytes over the
+    /// real one. Holding this across snapshot-and-write makes the whole
+    /// rewrite one critical section; the last writer's snapshot necessarily
+    /// includes every mutation that had already been applied to the maps, so
+    /// serializing loses nothing.
+    ///
+    /// Never taken while holding a `DashMap` guard.
+    cluster_state_write: Arc<parking_lot::Mutex<()>>,
+
+    /// False once `<data_dir>/cluster_state.json` was found on disk and could
+    /// not be loaded — unreadable (`EACCES` after a uid change on a container
+    /// volume, `EIO`, `EMFILE` at boot) or unparseable. While false,
+    /// `flush_cluster_state` refuses to write and every management PUT
+    /// answers 500.
+    ///
+    /// Without this the failure is silent *and* destructive. The maps boot
+    /// empty, so the first `PUT /_index_template/...` snapshots six empty
+    /// maps and `write_file_atomic` renames `cluster_state.tmp` over the
+    /// target — and `rename(2)` needs only write permission on the
+    /// *directory*, so an unreadable-but-perfectly-intact document is
+    /// unlinked by a write that answers `{"acknowledged": true}`. Every
+    /// trigger listed above is transient or trivially repairable *until*
+    /// xerj overwrites the file, which is the one outcome that is not.
+    ///
+    /// Refusing is also the honest answer rather than merely the safe one:
+    /// the node is running without the templates that shape new indices and
+    /// the pipelines `?pipeline=x` names, so accepting more configuration on
+    /// top of a config that is silently a subset is the same
+    /// accepted-and-ignored shape issue #204 tracks.
+    ///
+    /// Cleared only by a boot that loads cleanly — fix or move the file
+    /// aside and restart. redb takes the same position after a failed
+    /// integrity check or a failed I/O: an `AtomicBool` on the backend makes
+    /// every later write return `StorageError::PreviousIo`, whose message is
+    /// "Please close and re-open the database"
+    /// (`redb/src/tree_store/page_store/cached_file.rs:125-145`,
+    /// `redb/src/error.rs:65`; Apache-2.0/MIT, shape adapted, no code
+    /// copied).
+    cluster_state_loaded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Engine {
@@ -623,6 +758,8 @@ impl Engine {
             ilm_policies: Arc::new(DashMap::new()),
             ism_policies: Arc::new(DashMap::new()),
             managed_indices: Arc::new(DashMap::new()),
+            lifecycle_detached: Arc::new(DashMap::new()),
+            lifecycle_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             index_created_at: Arc::new(DashMap::new()),
             component_templates: Arc::new(DashMap::new()),
             snapshot_repos: Arc::new(DashMap::new()),
@@ -669,6 +806,8 @@ impl Engine {
                 xerj_cluster::router::ShardRouter::new(1),
             )),
             _node_lock: node_lock,
+            cluster_state_write: Arc::new(parking_lot::Mutex::new(())),
+            cluster_state_loaded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
         // Scan data_dir for existing index directories.
@@ -699,8 +838,14 @@ impl Engine {
                         // Restore the raw ES mapping blob (analyzers, formats,
                         // dims — full fidelity) BEFORE any ingest/query can run,
                         // so GET /_mapping and mapping-dependent code paths see
-                        // the same mapping as pre-restart.
-                        engine.load_persisted_es_mapping(&name_str);
+                        // the same mapping as pre-restart. A corrupt blob fails
+                        // the index (#202) rather than serving it with a
+                        // silently reduced mapping.
+                        if let Err(e) = engine.load_persisted_es_mapping(&name_str) {
+                            warn!(name = name_str.as_str(), error = %e, "failed to open index");
+                            engine.record_failed_index(&name_str, e.to_string());
+                            continue;
+                        }
                         // The index isn't registered yet, so the propagation
                         // inside load can't find it — set the toggles on the
                         // local handle instead.
@@ -718,8 +863,19 @@ impl Engine {
                         // (`GET /{index}`, `GET /{index}/_mapping`) can still
                         // tell the operator what was in the index they are
                         // trying to recover. Propagation into the (absent)
-                        // handle no-ops.
-                        engine.load_persisted_es_mapping(&name_str);
+                        // handle no-ops. Since #202 this load can itself fail
+                        // (unreadable/unparseable `es_mapping.json`); the index
+                        // is already being quarantined for the store error, so
+                        // the extra failure is reported rather than dropped —
+                        // it tells the operator a second file needs repairing.
+                        if let Err(map_err) = engine.load_persisted_es_mapping(&name_str) {
+                            warn!(
+                                name = name_str.as_str(),
+                                error = %map_err,
+                                "es_mapping.json is also unreadable; the mapping surfaces \
+                                 cannot show what this index held"
+                            );
+                        }
                         engine.record_failed_index(&name_str, e.to_string());
                     }
                 }
@@ -739,9 +895,29 @@ impl Engine {
         // migration by another instance).
         engine.load_persisted_aliases();
 
+        // Restore the cluster-level management state — index templates,
+        // legacy templates, component templates, ingest pipelines, data
+        // streams, ILM policies (issue #203). Before this, "replace the
+        // binary and restart" silently reverted every one of them: the
+        // documents kept flowing, into indices that no longer had the shape
+        // the operator designed. Must run after the index scan above, so a
+        // restored data stream can report which of its backing indices are
+        // actually present, and before the server accepts requests.
+        engine.load_cluster_state();
+
+        // Then say plainly which `.ds-*` indices no restored stream claims.
+        // Nothing is deleted — see the doc comment; this is the log line that
+        // stops an unreachable backing index from being invisible.
+        engine.warn_orphaned_backing_indices();
+
         // Restore ISM/ILM policies and managed-index execution state so a
         // policy attached before a restart keeps running afterward instead
-        // of silently going idle.
+        // of silently going idle. Separate files (`ism_policies.json`,
+        // `ism_managed_indices.json`) from `cluster_state.json` above, and
+        // deliberately so: that file holds the verbatim documents an
+        // operator PUT, this holds the executor's own cursor. Loaded after
+        // `load_cluster_state` because a restored data stream is what a
+        // rollover action operates on.
         engine.load_persisted_ism_policies();
         engine.load_persisted_managed_indices();
 
@@ -1041,9 +1217,11 @@ impl Engine {
         }
 
         // The name is taken by an index that exists on disk but would not
-        // open. Creating over it would run the store open again and surface a
-        // storage error that says nothing about the operator's options, so
-        // refuse here with the recorded reason instead (issue #206).
+        // open. Creating over it would run `Index::create` across the existing
+        // store and overwrite `schema.json` with an empty mapping — the very
+        // mapping loss #202 is about, reached through the other door, and it
+        // would destroy the evidence too. Refuse here with the recorded reason
+        // instead (issue #206).
         if let Some(f) = self.failed_indices.get(name) {
             return Err(EngineError::Common(
                 xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
@@ -1161,19 +1339,36 @@ impl Engine {
     /// (re)opened from disk — boot scan and snapshot restore.  A missing
     /// file is fine (pre-fix indices, dynamic-only indices): readers fall
     /// back to schema-derived properties from `schema.json`.
-    fn load_persisted_es_mapping(&self, name: &str) {
+    ///
+    /// A file that is present but unreadable or unparseable is **not** fine and
+    /// is no longer logged-and-ignored (#202). This blob is the full-fidelity
+    /// mapping — analyzers, date formats, `dense_vector` dims — and is what
+    /// `GET /{index}/_mapping` answers with; dropping it leaves the index
+    /// serving a quietly emptier mapping than the one its own data was written
+    /// under. The caller fails the index instead, which turns cluster health
+    /// red and keeps the corrupt index out of the served set.
+    fn load_persisted_es_mapping(&self, name: &str) -> Result<()> {
         let path = self.data_dir.join(name).join("es_mapping.json");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(EngineError::CorruptIndexMetadata {
+                    file: path.display().to_string(),
+                    reason: e.to_string(),
+                })
+            }
         };
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(mapping) => {
                 self.propagate_date_detection(name, &mapping);
                 self.index_mappings.insert(name.to_string(), mapping);
+                Ok(())
             }
-            Err(e) => {
-                warn!(index = name, error = %e, "ignoring corrupt es_mapping.json");
-            }
+            Err(e) => Err(EngineError::CorruptIndexMetadata {
+                file: path.display().to_string(),
+                reason: format!("{e} ({} bytes on disk)", bytes.len()),
+            }),
         }
     }
 
@@ -1523,15 +1718,28 @@ impl Engine {
         }
     }
 
-    /// Persist the whole `managed_indices` map. Called by `lifecycle::tick`
-    /// after any change, and by the attach/detach handlers.
+    /// Persist the whole `managed_indices` map plus the detach tombstones
+    /// (issue #282). Called by `lifecycle::tick` after any change, and by
+    /// the attach/detach handlers.
+    ///
+    /// On-disk shape is an envelope — `{"managed": {...}, "detached":
+    /// [...]}` — so the acknowledged detaches survive a restart alongside
+    /// the cursors. `load_persisted_managed_indices` still accepts the
+    /// pre-#282 bare-map form.
     pub fn persist_managed_indices(&self) {
-        let snapshot: std::collections::HashMap<String, crate::lifecycle::ManagedIndexState> = self
+        let managed: std::collections::HashMap<String, crate::lifecycle::ManagedIndexState> = self
             .managed_indices
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
-        let bytes = match serde_json::to_vec_pretty(&snapshot) {
+        let mut detached: Vec<String> = self
+            .lifecycle_detached
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        detached.sort();
+        let envelope = serde_json::json!({ "managed": managed, "detached": detached });
+        let bytes = match serde_json::to_vec_pretty(&envelope) {
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "failed to serialize managed_indices for persistence");
@@ -1547,21 +1755,88 @@ impl Engine {
         let Ok(bytes) = std::fs::read(self.managed_indices_path()) else {
             return;
         };
-        match serde_json::from_slice::<
-            std::collections::HashMap<String, crate::lifecycle::ManagedIndexState>,
-        >(&bytes)
-        {
-            Ok(map) => {
-                let n = map.len();
-                for (index_name, state) in map {
-                    self.managed_indices.insert(index_name, state);
-                }
-                if n > 0 {
-                    info!(count = n, "restored persisted ISM managed-index state");
-                }
-            }
-            Err(e) => warn!(error = %e, "ignoring corrupt ism_managed_indices.json"),
+        // `deny_unknown_fields` is what keeps the two on-disk shapes
+        // unambiguous: without it, a pre-#282 bare-map file (index names as
+        // top-level keys) would "successfully" parse as an envelope with
+        // every cursor silently ignored as an unknown field — the exact
+        // accepted-and-ignored class this issue removes.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Envelope {
+            #[serde(default)]
+            managed: std::collections::HashMap<String, crate::lifecycle::ManagedIndexState>,
+            #[serde(default)]
+            detached: Vec<String>,
         }
+        let (map, detached) = match serde_json::from_slice::<Envelope>(&bytes) {
+            Ok(env) => (env.managed, env.detached),
+            Err(_) => match serde_json::from_slice::<
+                std::collections::HashMap<String, crate::lifecycle::ManagedIndexState>,
+            >(&bytes)
+            {
+                Ok(map) => (map, Vec::new()),
+                Err(e) => {
+                    warn!(error = %e, "ignoring corrupt ism_managed_indices.json");
+                    return;
+                }
+            },
+        };
+        let n = map.len();
+        for (index_name, state) in map {
+            self.managed_indices.insert(index_name, state);
+        }
+        for index_name in detached {
+            self.lifecycle_detached.insert(index_name, ());
+        }
+        if n > 0 {
+            info!(count = n, "restored persisted ISM managed-index state");
+        }
+    }
+
+    /// Detach `index` from lifecycle management and record a persisted
+    /// tombstone for it (issue #282). This is THE detach path — `PUT
+    /// /{index}/_settings {"index.lifecycle.name": null}`, `POST
+    /// /{index}/_ilm/remove` and `POST /_plugins/_ism/remove/{index}` all
+    /// land here, so a detach is recorded once and the executor cannot
+    /// disagree with the operator about which route it honoured (#262's
+    /// `set_index_lifecycle_policy` made the same call).
+    ///
+    /// Also scrubs `index.lifecycle.name` from the stored display settings:
+    /// ES drops the setting on removal rather than reporting a name that is
+    /// no longer in force, and a stale name here is exactly the input a
+    /// future settings-derived re-attach would trip over.
+    ///
+    /// Returns whether the index was managed before the call.
+    pub fn detach_lifecycle(&self, index: &str) -> bool {
+        let was_managed = self.managed_indices.remove(index).is_some();
+        self.lifecycle_detached.insert(index.to_string(), ());
+        if let Some(mut stored) = self.index_settings.get_mut(index) {
+            let v = stored.value_mut();
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("index.lifecycle.name");
+            }
+            if let Some(lifecycle) = v
+                .pointer_mut("/index/lifecycle")
+                .and_then(Value::as_object_mut)
+            {
+                lifecycle.remove("name");
+            }
+        }
+        self.persist_managed_indices();
+        was_managed
+    }
+
+    /// Whether `lifecycle::tick` is allowed to act — the `POST /_ilm/stop`
+    /// kill switch (issue #282).
+    pub fn lifecycle_execution_running(&self) -> bool {
+        self.lifecycle_running
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `POST /_ilm/start` / `POST /_ilm/stop`.
+    pub fn set_lifecycle_execution_running(&self, running: bool) {
+        self.lifecycle_running
+            .store(running, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Spawn the background lifecycle-execution job: every
@@ -1633,6 +1908,620 @@ impl Engine {
             }
         }
         self.record_index_created_at(name);
+    }
+
+    // ── Cluster metadata persistence (issue #203) ────────────────────────────
+    //
+    // Index templates, legacy (v1) templates, component templates, ingest
+    // pipelines, data streams and ILM policies used to live only in the
+    // in-memory maps above: `PUT /_index_template/logs` answered `200
+    // {"acknowledged": true}` and the template was gone after the next boot,
+    // with no error anywhere and the next matching index silently created
+    // unshaped. They are now snapshotted, as one consistent document, into
+    // `<data_dir>/cluster_state.json` on every mutation and reloaded in
+    // `Engine::new`.
+    //
+    // Durability contract: a full-file rewrite through
+    // `index::write_file_atomic` — write to `cluster_state.tmp`, `fsync` it,
+    // `rename` over the target, then `fsync` the parent directory so the
+    // rename itself survives power loss. The rename is the commit point, so
+    // a `kill -9` at any instant leaves either the previous complete
+    // document or the new one, never a half-written mix. The same shape peer
+    // engines use for their manifests (cf. `fjall/src/file.rs:17`
+    // `fsync_directory`, which fjall calls after every atomic rewrite;
+    // `sled/src/metadata_store.rs:696` discards leftover `*.tmp` files from
+    // an interrupted rewrite on the next boot, which `load_cluster_state`
+    // mirrors below).
+    //
+    // One file rather than six keeps the maps mutually consistent — a data
+    // stream and the template that shaped it can never be restored from
+    // different generations.
+
+    /// Path of the persisted cluster-metadata document
+    /// (`<data_dir>/cluster_state.json`).
+    fn cluster_state_path(&self) -> PathBuf {
+        self.data_dir.join("cluster_state.json")
+    }
+
+    /// `Err` when boot found `cluster_state.json` and could not load it — see
+    /// `cluster_state_loaded` for why that has to latch.
+    ///
+    /// Every management mutation calls this, not only the ones that reach
+    /// `flush_cluster_state` with something to write. A `DELETE` consults the
+    /// in-memory map first, and while the load has failed that map is empty,
+    /// so an unguarded delete answers `404 not found` about an object that is
+    /// sitting in the document on disk — the same lie in a different shape.
+    /// A 500 that names the file is the only honest answer while the node
+    /// cannot see the operator's configuration.
+    fn ensure_cluster_state_writable(&self) -> Result<()> {
+        if self
+            .cluster_state_loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let path = self.cluster_state_path();
+        error!(
+            path = %path.display(),
+            "refusing a cluster-metadata write: this node could not load \
+             cluster_state.json at boot, so its management state is not the \
+             operator's. Recover or move the file aside, then restart."
+        );
+        Err(EngineError::Common(xerj_common::XerjError::storage(
+            format!(
+                "refusing to write {} — it could not be loaded at boot, so \
+                 writing now would destroy cluster configuration that is still \
+                 on disk; recover or move it aside and restart xerj",
+                path.display()
+            ),
+        )))
+    }
+
+    /// Snapshot every persisted management map into one document.
+    fn cluster_state_snapshot(&self) -> PersistedClusterState {
+        fn dump<V: Clone>(map: &DashMap<String, V>) -> std::collections::BTreeMap<String, V> {
+            map.iter()
+                .map(|e| (e.key().clone(), e.value().clone()))
+                .collect()
+        }
+        PersistedClusterState {
+            version: CLUSTER_STATE_VERSION,
+            index_templates: dump(&self.templates),
+            legacy_templates: dump(&self.legacy_templates),
+            component_templates: dump(&self.component_templates),
+            pipelines: dump(&self.pipelines),
+            data_streams: dump(&self.data_streams),
+            ilm_policies: dump(&self.ilm_policies),
+        }
+    }
+
+    /// Durably write the current cluster metadata.
+    ///
+    /// Unlike `flush_aliases`, a failure here is **returned**, not swallowed:
+    /// every caller is an API write that would otherwise answer
+    /// `{"acknowledged": true}` for a change it cannot keep. Callers roll the
+    /// in-memory change back and surface a 500, so the operator finds out at
+    /// the moment of the write instead of at the next restart.
+    ///
+    /// Refuses outright when boot could not load the existing document — see
+    /// `cluster_state_loaded`. The snapshot below is taken from the live maps,
+    /// which in that state hold only what this process was told after boot, so
+    /// writing it would rename an empty-ish document over configuration that is
+    /// still intact on disk.
+    fn flush_cluster_state(&self) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
+        // One writer at a time — see `cluster_state_write`. Snapshotting
+        // inside the lock also means the bytes that land are never older
+        // than a rewrite that has already returned.
+        let _writing = self.cluster_state_write.lock();
+        let snapshot = self.cluster_state_snapshot();
+        let bytes = serde_json::to_vec_pretty(&snapshot)?;
+        crate::index::write_file_atomic(&self.cluster_state_path(), &bytes)?;
+        Ok(())
+    }
+
+    /// Highest generation `N` for which a backing index `.ds-<stream>-<N>` is
+    /// actually open in this data dir; `0` when there is none.
+    ///
+    /// Read off the open indices rather than the stream document, because the
+    /// point is to catch the case where the two disagree. Suffix parsing keeps
+    /// neighbouring streams apart on its own: for stream `a`, `.ds-a-b-000001`
+    /// leaves `b-000001`, which is not a number.
+    fn highest_backing_generation(&self, stream: &str) -> u64 {
+        let prefix = format!(".ds-{stream}-");
+        self.indices
+            .iter()
+            .filter_map(|e| {
+                e.key()
+                    .strip_prefix(&prefix)
+                    .and_then(|gen| gen.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Load `<data_dir>/cluster_state.json` back into the management maps.
+    ///
+    /// A missing file is normal (fresh node, or a data dir written by a build
+    /// that predates this). A file that is present but does not load is loud
+    /// *and* latching: it means the operator's templates, pipelines and data
+    /// streams are not coming back, which is exactly the silence this whole
+    /// mechanism exists to remove, so `cluster_state_loaded` goes false and
+    /// every subsequent management write is refused rather than allowed to
+    /// rename a snapshot of empty maps over the document on disk.
+    fn load_cluster_state(&self) {
+        // An interrupted rewrite can leave a partial `cluster_state.tmp`
+        // behind. It is never read (the rename is the commit point), but
+        // leaving it litters the data dir and invites a hand-edit that
+        // "restores" a torn document — sled sweeps the same leftovers on
+        // boot (`sled/src/metadata_store.rs:696`).
+        let tmp = self.cluster_state_path().with_extension("tmp");
+        if tmp.exists() {
+            warn!(
+                path = %tmp.display(),
+                "discarding an incomplete cluster_state rewrite left by an unclean shutdown"
+            );
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        let path = self.cluster_state_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                // The file is *there* and its bytes are almost certainly fine
+                // — `EACCES` after a uid change on a container volume, a
+                // backup tool's chmod, `EIO`, `EMFILE` at boot. Do not copy it
+                // aside (we cannot read it) and do not touch it: mark the load
+                // failed so no later write can rename a snapshot of empty maps
+                // over configuration that is still perfectly recoverable.
+                self.cluster_state_loaded
+                    .store(false, std::sync::atomic::Ordering::Release);
+                error!(
+                    path = %path.display(), error = %e,
+                    "could not READ cluster_state.json — index templates, ingest \
+                     pipelines, data streams and ILM policies are NOT restored, \
+                     and management writes will be refused until a boot loads it \
+                     (the file itself is left untouched)"
+                );
+                return;
+            }
+        };
+        let state: PersistedClusterState = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                // Same position as the read error above: the load failed, so
+                // the live maps are not the operator's configuration and
+                // nothing may be written over the document on disk. Refusing
+                // rather than salvaging-then-overwriting also closes the
+                // second-corruption hole in the `!salvage.exists()` guard
+                // below — with an overwrite still allowed, a second damaged
+                // document would be destroyed *and* not copied, because the
+                // copy from the first one is already there.
+                self.cluster_state_loaded
+                    .store(false, std::sync::atomic::Ordering::Release);
+                error!(
+                    path = %path.display(), error = %e,
+                    "cluster_state.json is corrupt — index templates, ingest \
+                     pipelines, data streams and ILM policies are NOT restored, \
+                     and management writes will be refused until a boot loads it"
+                );
+                // Keep a copy anyway. The original is now safe from xerj, but
+                // un-wedging the node means moving it aside by hand, and
+                // hand-recovering a template out of a damaged document is the
+                // operator's last option — leave them something to recover
+                // from that survives that step. The original is deliberately
+                // left in place so every boot keeps logging the error above
+                // until someone deals with it, and an existing copy is never
+                // clobbered: the first corruption is the informative one.
+                let salvage = path.with_extension("corrupt.json");
+                if !salvage.exists() {
+                    match std::fs::write(&salvage, &bytes) {
+                        Ok(()) => warn!(
+                            path = %salvage.display(),
+                            "kept a copy of the corrupt cluster_state for recovery"
+                        ),
+                        Err(e) => warn!(
+                            path = %salvage.display(), error = %e,
+                            "could not preserve a copy of the corrupt cluster_state"
+                        ),
+                    }
+                }
+                return;
+            }
+        };
+        if state.version > CLUSTER_STATE_VERSION {
+            warn!(
+                found = state.version,
+                supported = CLUSTER_STATE_VERSION,
+                "cluster_state.json was written by a newer xerj; loading what \
+                 this build understands (downgrade may drop metadata)"
+            );
+        }
+
+        for (name, tmpl) in state.index_templates {
+            self.templates.insert(name, tmpl);
+        }
+        for (name, body) in state.legacy_templates {
+            self.legacy_templates.insert(name, body);
+        }
+        for (name, body) in state.component_templates {
+            self.component_templates.insert(name, body);
+        }
+        for (name, body) in state.ilm_policies {
+            self.ilm_policies.insert(name, body);
+        }
+
+        // Data streams: restore the record, reconcile it against what is
+        // actually on disk, then say plainly when a backing index it names is
+        // not there. Reporting a stream whose data is gone as
+        // `"status": "GREEN"` without a word in the log is the same quiet lie
+        // this issue is about.
+        let mut reconciled_a_stream = false;
+        for (name, mut ds) in state.data_streams {
+            // `rollover_data_stream` creates the new backing index before it
+            // records the new generation, so `kill -9` in that window leaves
+            // `.ds-<name>-00000N` on disk while the document still says N-1.
+            // Restoring N-1 verbatim would wedge the stream permanently: the
+            // next rollover computes the same name, and `create_index`
+            // refuses it as `index_already_exists` — forever. Adopt the
+            // highest generation that actually exists instead, which is also
+            // what stops a second rollover writing into an index that already
+            // holds the first one's documents.
+            let on_disk = self.highest_backing_generation(&name);
+            if on_disk > ds.generation {
+                let adopted = format!(".ds-{name}-{on_disk:06}");
+                warn!(
+                    data_stream = name.as_str(),
+                    recorded = ds.generation,
+                    found = on_disk,
+                    adopted = adopted.as_str(),
+                    "adopting a backing index left behind by a rollover that \
+                     was interrupted before its generation reached disk"
+                );
+                if !ds.backing_indices.contains(&adopted) {
+                    ds.backing_indices.push(adopted);
+                }
+                ds.generation = on_disk;
+                reconciled_a_stream = true;
+            }
+
+            let missing: Vec<&str> = ds
+                .backing_indices
+                .iter()
+                .filter(|b| !self.indices.contains_key(b.as_str()))
+                .map(|b| b.as_str())
+                .collect();
+            if !missing.is_empty() {
+                warn!(
+                    data_stream = name.as_str(),
+                    missing = missing.join(","),
+                    "restored data stream references backing indices that are \
+                     not present in the data dir"
+                );
+            }
+            self.data_streams.insert(name, ds);
+        }
+
+        // Pipelines carry behaviour, not just a document to hand back from
+        // `GET /_ingest/pipeline`: the executable form has to be rebuilt or
+        // `?pipeline=x` would be accepted after a restart and quietly do
+        // nothing. Keep the stored document either way so GET round-trips
+        // exactly as it did before the restart.
+        let mut pipelines_restored = 0usize;
+        for (name, config) in state.pipelines {
+            self.pipelines.insert(name.clone(), config.clone());
+            match self.compile_pipeline(&name, config) {
+                Ok(()) => pipelines_restored += 1,
+                Err(e) => {
+                    // Issue #204: record WHY there is no executable form, so
+                    // every ingest path refuses loudly with the reason
+                    // instead of reporting a pipeline GET plainly shows as
+                    // "not found" — the same contract as a fresh PUT.
+                    self.unrunnable_pipelines.insert(
+                        name.clone(),
+                        format!(
+                            "the persisted definition could not be recompiled \
+                             at startup ({e}); no document can be ingested \
+                             through pipeline [{name}] — re-PUT the definition"
+                        ),
+                    );
+                    error!(
+                        pipeline = name.as_str(), error = %e,
+                        "persisted ingest pipeline could not be recompiled — it is \
+                         still visible to GET /_ingest/pipeline but will NOT \
+                         transform anything; re-PUT the definition"
+                    )
+                }
+            }
+        }
+
+        // Make an adopted generation durable straight away, so the recovery
+        // happens once rather than on every boot from here on.
+        if reconciled_a_stream {
+            if let Err(e) = self.flush_cluster_state() {
+                warn!(
+                    error = %e,
+                    "could not persist the reconciled data-stream generation; \
+                     it will be recomputed from disk on the next boot"
+                );
+            }
+        }
+
+        let n = self.templates.len()
+            + self.legacy_templates.len()
+            + self.component_templates.len()
+            + self.pipelines.len()
+            + self.data_streams.len()
+            + self.ilm_policies.len();
+        if n > 0 {
+            info!(
+                index_templates = self.templates.len(),
+                legacy_templates = self.legacy_templates.len(),
+                component_templates = self.component_templates.len(),
+                pipelines = pipelines_restored,
+                data_streams = self.data_streams.len(),
+                ilm_policies = self.ilm_policies.len(),
+                "restored persisted cluster metadata"
+            );
+        }
+    }
+
+    /// Name every `.ds-*` index on disk that no restored data stream claims.
+    ///
+    /// This does **not** reconcile anything — nothing is deleted, adopted or
+    /// repaired, because an orphan may hold the only copy of somebody's data.
+    /// It exists so the state is not *silent*: an orphaned backing index is
+    /// unreachable through the data-stream API (`GET` and `DELETE` on the
+    /// stream answer 404, while `PUT /_data_stream/<name>` answers
+    /// `409 resource_already_exists_exception` naming the orphan), so without
+    /// a line in the boot log the operator has no way to learn the name they
+    /// have to pass to `DELETE /<backing-index>` to clear it.
+    ///
+    /// Expected sources: a data dir written by a build that predates
+    /// `cluster_state.json` (data streams were not persisted at all then), or
+    /// a `DELETE /_data_stream` interrupted by a build that recorded the
+    /// removal before destroying the backing indices. Skipped entirely when
+    /// the cluster state did not load — then every stream is unknown and
+    /// every backing index would look orphaned.
+    fn warn_orphaned_backing_indices(&self) {
+        if !self
+            .cluster_state_loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        // Snapshot both maps before comparing them: nothing here may hold a
+        // shard guard on one map while taking one on the other.
+        let backing: Vec<String> = self
+            .indices
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|n| n.starts_with(".ds-"))
+            .collect();
+        if backing.is_empty() {
+            return;
+        }
+        let streams: Vec<(String, Vec<String>)> = self
+            .data_streams
+            .iter()
+            .map(|s| (s.key().clone(), s.value().backing_indices.clone()))
+            .collect();
+        let claimed = |index: &str| {
+            streams.iter().any(|(stream, indices)| {
+                indices.iter().any(|b| b == index)
+                    || index
+                        .strip_prefix(&format!(".ds-{stream}-"))
+                        .is_some_and(|gen| gen.parse::<u64>().is_ok())
+            })
+        };
+        let mut orphans: Vec<String> = backing.into_iter().filter(|n| !claimed(n)).collect();
+        if orphans.is_empty() {
+            return;
+        }
+        orphans.sort();
+        warn!(
+            count = orphans.len(),
+            indices = orphans.join(","),
+            "backing indices on disk belong to no known data stream — they are \
+             unreachable through the data-stream API and are NOT deleted \
+             automatically; remove each with DELETE /<index> once you have \
+             confirmed the data is not wanted"
+        );
+    }
+
+    /// Insert into a persisted map and durably record the result, rolling the
+    /// in-memory change back if the write fails so a 500 never leaves a
+    /// change that only this process can see.
+    fn persisted_insert<V: Clone>(
+        &self,
+        map: &DashMap<String, V>,
+        name: String,
+        value: V,
+    ) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
+        let previous = map.insert(name.clone(), value);
+        if let Err(e) = self.flush_cluster_state() {
+            match previous {
+                Some(old) => map.insert(name, old),
+                None => map.remove(&name).map(|(_, v)| v),
+            };
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Remove from a persisted map and durably record the result. Returns
+    /// `false` when there was nothing to remove (the caller answers 404);
+    /// an `Err` means the removal did not reach disk and was undone.
+    fn persisted_remove<V: Clone>(&self, map: &DashMap<String, V>, name: &str) -> Result<bool> {
+        // Before the map lookup: an empty map after a failed load would
+        // otherwise turn "I cannot see your configuration" into "it does not
+        // exist" — see `ensure_cluster_state_writable`.
+        self.ensure_cluster_state_writable()?;
+        let Some((key, removed)) = map.remove(name) else {
+            return Ok(false);
+        };
+        if let Err(e) = self.flush_cluster_state() {
+            map.insert(key, removed);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Create or replace a v2 index template (`PUT /_index_template/{name}`).
+    pub fn put_index_template(&self, name: String, template: IndexTemplate) -> Result<()> {
+        self.persisted_insert(&self.templates, name, template)
+    }
+
+    /// Delete a v2 index template; `false` when it did not exist.
+    pub fn delete_index_template(&self, name: &str) -> Result<bool> {
+        self.persisted_remove(&self.templates, name)
+    }
+
+    /// Create or replace a legacy v1 template (`PUT /_template/{name}`).
+    pub fn put_legacy_template(&self, name: String, body: Value) -> Result<()> {
+        self.persisted_insert(&self.legacy_templates, name, body)
+    }
+
+    /// Delete a legacy v1 template; `false` when it did not exist.
+    pub fn delete_legacy_template(&self, name: &str) -> Result<bool> {
+        self.persisted_remove(&self.legacy_templates, name)
+    }
+
+    /// Create or replace a component template.
+    pub fn put_component_template(&self, name: String, body: Value) -> Result<()> {
+        self.persisted_insert(&self.component_templates, name, body)
+    }
+
+    /// Delete a component template; `false` when it did not exist.
+    pub fn delete_component_template(&self, name: &str) -> Result<bool> {
+        self.persisted_remove(&self.component_templates, name)
+    }
+
+    /// Create or replace an ILM policy.
+    pub fn put_ilm_policy(&self, name: String, body: Value) -> Result<()> {
+        self.persisted_insert(&self.ilm_policies, name, body)
+    }
+
+    /// Delete an ILM policy; `false` when it did not exist.
+    pub fn delete_ilm_policy(&self, name: &str) -> Result<bool> {
+        self.persisted_remove(&self.ilm_policies, name)
+    }
+
+    /// Durably store an ingest pipeline definition and (re)build its
+    /// executable form. This is the only way a user-visible pipeline should
+    /// ever be created — `compile_pipeline` alone does not reach disk.
+    ///
+    /// `config` is the xerj-shaped pipeline config to compile, and is what
+    /// gets stored (and handed back by `GET /_ingest/pipeline/{id}`) when it
+    /// compiles — the shape this endpoint has always returned.
+    ///
+    /// `keep_if_uncompilable` says what to do when it does *not* compile, and
+    /// differs by surface:
+    ///
+    /// * `Some(doc)` — the ES-compat surface. It has always answered
+    ///   `acknowledged` and left the definition readable, so `doc` (the
+    ///   ES-shaped body as received) is stored and the compile error is
+    ///   returned as `Ok(Some(err))` for the caller to log.
+    /// * `None` — the xerj-native surface, which rejects a definition it
+    ///   cannot compile. Nothing is stored, nothing is flushed, and any
+    ///   pipeline already registered under this id is left untouched.
+    ///
+    /// Either way a compile failure drops the *executable* form under this
+    /// id. Leaving the old one behind would mean `?pipeline={id}` kept
+    /// running a definition `GET` no longer shows — and stopped running it at
+    /// the next restart. A definition must behave the same before and after a
+    /// reboot; that is the whole point of persisting it.
+    ///
+    /// `Err` means the definition did not reach disk. The in-memory change is
+    /// rolled back first, so the caller can report the write as failed
+    /// without leaving behind a pipeline only this process can see.
+    pub fn put_pipeline(
+        &self,
+        id: &str,
+        config: Value,
+        keep_if_uncompilable: Option<Value>,
+    ) -> Result<Option<xerj_wasm::WasmError>> {
+        // Up front, so a refused write never disturbs the compiled form of a
+        // pipeline that is still running.
+        self.ensure_cluster_state_writable()?;
+        let previous_doc = self.pipelines.get(id).map(|v| v.value().clone());
+        // Taken out up front so a failed compile cannot leave a stale
+        // executable behind; put back verbatim on every abort path.
+        let previous_compiled = self.transform_pipelines.remove(id).map(|(_, p)| p);
+        // `compile_pipeline` clears this on success; snapshot it so a failed
+        // flush can put the previous definition's unrunnable reason back too
+        // (issue #204 — a rolled-back write must not turn "stored but not
+        // runnable, and here is why" into a bare "not found").
+        let previous_reason = self.unrunnable_pipelines.get(id).map(|r| r.value().clone());
+
+        // `compile_pipeline` mutates nothing when it fails, so an abort only
+        // has to undo the two lines above.
+        let compile_err = match self.compile_pipeline(id, config) {
+            Ok(()) => None,
+            Err(e) => match keep_if_uncompilable {
+                None => {
+                    if let Some(p) = previous_compiled {
+                        self.transform_pipelines.insert(id.to_string(), p);
+                    }
+                    return Ok(Some(e));
+                }
+                Some(doc) => {
+                    self.pipelines.insert(id.to_string(), doc);
+                    // Issue #204: the kept definition is visible to `GET`, so
+                    // ingest through it must refuse WITH the reason rather
+                    // than claim the pipeline is missing.
+                    self.unrunnable_pipelines.insert(
+                        id.to_string(),
+                        format!(
+                            "the stored definition does not compile ({e}); no \
+                             document can be ingested through pipeline [{id}]"
+                        ),
+                    );
+                    Some(e)
+                }
+            },
+        };
+
+        if let Err(e) = self.flush_cluster_state() {
+            match previous_doc {
+                Some(d) => self.pipelines.insert(id.to_string(), d),
+                None => self.pipelines.remove(id).map(|(_, v)| v),
+            };
+            self.transform_pipelines.remove(id);
+            if let Some(p) = previous_compiled {
+                self.transform_pipelines.insert(id.to_string(), p);
+            }
+            match previous_reason {
+                Some(r) => self.unrunnable_pipelines.insert(id.to_string(), r),
+                None => self.unrunnable_pipelines.remove(id).map(|(_, v)| v),
+            };
+            return Err(e);
+        }
+
+        if let Some(e) = &compile_err {
+            warn!(pipeline = id, error = %e, "pipeline stored but failed to compile");
+        } else {
+            info!(name = id, "transform pipeline created");
+        }
+        Ok(compile_err)
+    }
+
+    /// Delete an ingest pipeline — both the stored definition and the
+    /// compiled form, so `?pipeline={name}` stops working at the same moment
+    /// `GET /_ingest/pipeline/{name}` starts answering 404. `false` when it
+    /// did not exist.
+    pub fn delete_pipeline(&self, name: &str) -> Result<bool> {
+        let removed = self.persisted_remove(&self.pipelines, name)?;
+        if removed {
+            self.transform_pipelines.remove(name);
+            // Issue #204: a deleted pipeline must not leave a stale
+            // "stored but not runnable" reason behind either — the next
+            // definition under this id starts from a clean slate.
+            self.unrunnable_pipelines.remove(name);
+        }
+        Ok(removed)
     }
 
     /// Add an alias pointing to an index.
@@ -1754,6 +2643,16 @@ impl Engine {
         self.index_settings.remove(name);
         self.index_mappings.remove(name);
         self.index_alias_metadata.remove(name);
+
+        // Lifecycle bookkeeping: a deleted index needs neither an execution
+        // cursor nor a detach tombstone (#282) — and clearing the tombstone
+        // here means a *recreated* index with the same name starts fresh
+        // rather than inheriting a years-old "operator said stop".
+        let had_lifecycle_state = self.managed_indices.remove(name).is_some()
+            | self.lifecycle_detached.remove(name).is_some();
+        if had_lifecycle_state {
+            self.persist_managed_indices();
+        }
     }
 
     /// Remove `<data_dir>/<name>` from disk, refusing anything that does not
@@ -1839,7 +2738,19 @@ impl Engine {
         let index_name = IndexName::new(name).map_err(EngineError::Common)?;
         match Index::open(index_name, &self.config, &self.data_dir) {
             Ok(idx) => {
-                self.load_persisted_es_mapping(name);
+                // The store opened, but the full-fidelity mapping blob is part
+                // of what makes this index serveable (#202). Putting the index
+                // back with a silently reduced mapping is exactly the defect
+                // the open refusal exists to prevent, so a retry that cannot
+                // read `es_mapping.json` stays failed and says why.
+                if let Err(e) = self.load_persisted_es_mapping(name) {
+                    let reason = e.to_string();
+                    self.record_failed_index(name, reason.clone());
+                    warn!(name, error = %reason, "retry of failed index did not succeed");
+                    return Err(EngineError::Common(
+                        xerj_common::XerjError::index_unavailable(name, reason),
+                    ));
+                }
                 if let Some(m) = self.index_mappings.get(name) {
                     Engine::apply_date_mapping_flags(&idx, m.value());
                 }
@@ -2141,6 +3052,10 @@ impl Engine {
 
     /// Create a new data stream with its first backing index.
     pub fn create_data_stream(&self, name: &str) -> Result<()> {
+        // Before `create_index` below, not just before the flush: refusing
+        // after the backing index exists would leave a `.ds-*` directory with
+        // no stream in front of it.
+        self.ensure_cluster_state_writable()?;
         if self.data_streams.contains_key(name) {
             return Err(EngineError::Common(
                 xerj_common::XerjError::index_already_exists(name),
@@ -2156,13 +3071,40 @@ impl Engine {
             timestamp_field: "@timestamp".to_string(),
             generation: 1,
         };
-        self.data_streams.insert(name.to_string(), ds);
+        // Durable before the caller is told it worked (issue #203): the
+        // backing index is already on disk, so a stream record that lives
+        // only in memory would come back after a restart as an orphaned
+        // `.ds-*` index with no stream in front of it.
+        self.persisted_insert(&self.data_streams, name.to_string(), ds)?;
         info!(name, "data stream created");
         Ok(())
     }
 
+    /// Drop a deleted backing index from its data stream's generation list
+    /// so the stream does not keep advertising an index that no longer
+    /// exists (#282, ported from #262's `detach_data_stream_backing_index`)
+    /// — and persist the shrunken list, or a restart would reload the
+    /// deleted generation from `cluster_state.json` as an orphan.
+    pub(crate) fn detach_data_stream_backing_index(&self, index: &str) {
+        let mut changed = false;
+        for mut entry in self.data_streams.iter_mut() {
+            let before = entry.backing_indices.len();
+            entry.backing_indices.retain(|b| b != index);
+            changed |= entry.backing_indices.len() != before;
+        }
+        if changed {
+            if let Err(e) = self.flush_cluster_state() {
+                warn!(error = %e, "failed to persist data-stream state after lifecycle delete");
+            }
+        }
+    }
+
     /// Roll over a data stream: create the next backing index and update the alias.
     pub fn rollover_data_stream(&self, name: &str) -> Result<String> {
+        // Same reason as `create_data_stream`, plus: the generation counter is
+        // the one value that must never be handed out twice, so a rollover
+        // that cannot record it must not create its backing index at all.
+        self.ensure_cluster_state_writable()?;
         let mut ds = self
             .data_streams
             .get_mut(name)
@@ -2188,6 +3130,10 @@ impl Engine {
         if let Some(mut ds) = self.data_streams.get_mut(name) {
             ds.backing_indices.push(new_backing.clone());
         }
+        // The generation counter is the thing that must not be lost: an
+        // unpersisted rollover would hand `.ds-<name>-000002` out twice after
+        // a restart and write into the previous generation's index.
+        self.flush_cluster_state()?;
 
         info!(
             name,
@@ -2199,22 +3145,98 @@ impl Engine {
 
     /// Delete a data stream and all its backing indices.
     pub async fn delete_data_stream(&self, name: &str) -> Result<()> {
+        // Before the map lookup, so an unloaded state cannot answer
+        // `index_not_found` for a stream that is recorded on disk — and, more
+        // importantly, cannot go on to destroy its backing indices.
+        self.ensure_cluster_state_writable()?;
         let ds = self
             .data_streams
             .remove(name)
             .map(|(_, v)| v)
             .ok_or_else(|| EngineError::Common(xerj_common::XerjError::index_not_found(name)))?;
 
-        // Remove the alias.
+        // Destroy the backing indices FIRST, and only then record the removal.
+        // The two orderings fail differently and only one of them is
+        // recoverable:
+        //
+        //   destroy → record (this one): a crash in the window leaves
+        //   `cluster_state.json` still describing the stream while some of its
+        //   `.ds-*` directories are already gone. The next boot restores the
+        //   stream and warns `restored data stream references backing indices
+        //   that are not present in the data dir` (see `load_cluster_state`),
+        //   `GET /_data_stream/<name>` still answers, and re-issuing the
+        //   DELETE finishes the job.
+        //
+        //   record → destroy: a crash in the window strands
+        //   `.ds-<name>-00000N` directories that no data-stream API can reach
+        //   — GET and DELETE answer 404 while `PUT /_data_stream/<name>`
+        //   answers `409 resource_already_exists_exception` forever, and boot
+        //   does not reconcile it. That is the same permanent wedge this PR
+        //   fixes for an interrupted rollover, so it is not the ordering to
+        //   ship.
+        //
+        // A backing index that cannot be destroyed therefore fails the
+        // delete: the stream is put back, the removal is never recorded, and
+        // the caller gets the error rather than being told `acknowledged`
+        // about data that is still on disk.
+        //
+        // Note what "fails" does *not* mean. The loop does not stop at the
+        // first error — every backing index that can be destroyed is
+        // destroyed, and only the ones that could not are still there. The
+        // 500 says the delete did not finish, not that nothing happened; the
+        // caller asked for the whole stream to go, so making the progress we
+        // can is the useful half. A retry is safe and completes the job — an
+        // already-deleted backing index is simply absent from `self.indices`
+        // on the next pass.
+        let mut delete_err: Option<EngineError> = None;
+        for backing in &ds.backing_indices {
+            let Some((_, idx)) = self.indices.remove(backing) else {
+                // Not open: nothing left to destroy under this name (a
+                // previous attempt already removed it).
+                continue;
+            };
+            match idx.delete_all_data().await {
+                Ok(()) => {}
+                // `remove_dir_all` reports an already-absent directory as
+                // NotFound, which is the outcome we were asking for.
+                Err(EngineError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(
+                        data_stream = name,
+                        backing = backing.as_str(), error = %e,
+                        "backing index could not be deleted — the data stream \
+                         is left in place so the DELETE can be retried"
+                    );
+                    // Put it back so a retry can try again, and so the stream
+                    // we are about to restore does not point at an index the
+                    // engine has forgotten how to reach.
+                    self.indices.insert(backing.clone(), idx);
+                    if delete_err.is_none() {
+                        delete_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = delete_err {
+            self.data_streams.insert(name.to_string(), ds);
+            return Err(e);
+        }
+
+        // Only now is the removal safe to make durable. A write failure here
+        // means the data is gone but the document still names the stream —
+        // the recoverable half of the window above, so put the stream back in
+        // memory as well, keeping memory and disk saying the same thing, and
+        // report the error instead of acknowledging.
+        if let Err(e) = self.flush_cluster_state() {
+            self.data_streams.insert(name.to_string(), ds);
+            return Err(e);
+        }
+
+        // Remove the alias. Last, so a failure anywhere above leaves the
+        // stream fully addressable for the retry.
         self.aliases.remove(name);
         self.flush_aliases();
 
-        // Delete every backing index.
-        for backing in &ds.backing_indices {
-            if let Ok(idx) = self.indices.remove(backing).map(|(_, v)| v).ok_or(()) {
-                let _ = idx.delete_all_data().await;
-            }
-        }
         info!(name, "data stream deleted");
         Ok(())
     }
@@ -2344,15 +3366,19 @@ impl Engine {
         })
     }
 
-    /// Compile and register a typed transform pipeline from a JSON config.
+    /// Compile and register a typed transform pipeline from a JSON config,
+    /// **in memory only**.
     ///
     /// `config_json` must be a valid [`PipelineConfig`](xerj_wasm::pipeline::PipelineConfig)
-    /// object.  The compiled pipeline is stored in `transform_pipelines` and
-    /// can be retrieved by name for use at ingest time.
+    /// object. The compiled pipeline is stored in `transform_pipelines` and
+    /// the raw JSON in `pipelines`, so the ES-compatible ingest API can hand
+    /// it back.
     ///
-    /// The raw JSON is also stored in `pipelines` so it can be returned by the
-    /// ES-compatible ingest pipeline API.
-    pub fn create_pipeline(
+    /// This is the primitive underneath [`Engine::put_pipeline`] and the boot
+    /// path; it deliberately does not touch disk, so it is private. Anything
+    /// that serves a user request must go through `put_pipeline`, or the
+    /// pipeline is gone at the next restart (issue #203).
+    fn compile_pipeline(
         &self,
         name: &str,
         config_json: Value,
@@ -2362,8 +3388,9 @@ impl Engine {
         let pipeline = xerj_wasm::pipeline::Pipeline::from_config(name, &cfg)?;
         self.pipelines.insert(name.to_string(), config_json);
         self.transform_pipelines.insert(name.to_string(), pipeline);
+        // Issue #204: a successful compile clears any recorded "stored but
+        // not runnable" reason left by a previous definition under this id.
         self.unrunnable_pipelines.remove(name);
-        info!(name, "transform pipeline created");
         Ok(())
     }
 
@@ -2380,16 +3407,49 @@ impl Engine {
     /// passing documents through untransformed. A previously-compiled pipeline
     /// under the same id is REMOVED — re-defining a pipeline must not leave the
     /// old stages quietly running under the new definition's name.
-    pub fn register_unrunnable_pipeline(&self, name: &str, definition: Value, reason: String) {
+    ///
+    /// Like [`Engine::put_pipeline`], the stored definition is flushed to
+    /// `cluster_state.json` before the caller may acknowledge it (issue
+    /// #203). `Err` means it did not reach disk; the in-memory change is
+    /// rolled back first. The *reason* itself is in-memory only: after a
+    /// restart the boot replay fails to recompile the stored definition and
+    /// re-records why, so the pipeline stays unrunnable — loudly — either way.
+    pub fn register_unrunnable_pipeline(
+        &self,
+        name: &str,
+        definition: Value,
+        reason: String,
+    ) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
+        let previous_doc = self.pipelines.get(name).map(|v| v.value().clone());
+        let previous_compiled = self.transform_pipelines.remove(name).map(|(_, p)| p);
+        let previous_reason = self
+            .unrunnable_pipelines
+            .get(name)
+            .map(|r| r.value().clone());
         self.pipelines.insert(name.to_string(), definition);
-        self.transform_pipelines.remove(name);
         self.unrunnable_pipelines
             .insert(name.to_string(), reason.clone());
+        if let Err(e) = self.flush_cluster_state() {
+            match previous_doc {
+                Some(d) => self.pipelines.insert(name.to_string(), d),
+                None => self.pipelines.remove(name).map(|(_, v)| v),
+            };
+            match previous_reason {
+                Some(r) => self.unrunnable_pipelines.insert(name.to_string(), r),
+                None => self.unrunnable_pipelines.remove(name).map(|(_, v)| v),
+            };
+            if let Some(p) = previous_compiled {
+                self.transform_pipelines.insert(name.to_string(), p);
+            }
+            return Err(e);
+        }
         warn!(
             name,
             reason = reason.as_str(),
             "ingest pipeline stored but NOT runnable — documents may not be ingested through it"
         );
+        Ok(())
     }
 
     /// Run `docs` through a named pipeline, returning `(action, doc)` pairs.
@@ -2686,11 +3746,22 @@ impl Engine {
                 Ok(idx) => {
                     // Snapshot dirs carry es_mapping.json — reload it so the
                     // restored index serves the same mapping it was saved with.
-                    self.load_persisted_es_mapping(idx_name);
+                    // A corrupt blob in the snapshot fails the restore of that
+                    // index instead of restoring it with a reduced mapping.
+                    if let Err(e) = self.load_persisted_es_mapping(idx_name) {
+                        warn!(index = idx_name, error = %e, "failed to reopen restored index");
+                        self.record_failed_index(idx_name, e.to_string());
+                        continue;
+                    }
                     if let Some(m) = self.index_mappings.get(idx_name) {
                         Engine::apply_date_mapping_flags(&idx, m.value());
                     }
                     self.indices.insert(idx_name.clone(), idx);
+                    // Restoring from a snapshot is *the* repair for an index
+                    // that failed to open, so clear the recorded failure —
+                    // otherwise cluster health stays red after the repair
+                    // actually worked.
+                    self.failed_indices.remove(idx_name);
                     info!(index = idx_name, "index restored from snapshot");
                 }
                 Err(e) => {

@@ -2504,8 +2504,13 @@ pub async fn put_pipeline(
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
-    match state.engine.create_pipeline(&name, body) {
-        Ok(()) => {
+    // `None` — this surface rejects a definition it cannot compile, so
+    // nothing is stored on a compile error. On success the pipeline is
+    // written to `<data_dir>/cluster_state.json` before we acknowledge it
+    // (issue #203): it used to live only in memory and vanish on restart,
+    // exactly like the ES-compat one.
+    match state.engine.put_pipeline(&name, body, None) {
+        Ok(None) => {
             let took_ms = started.elapsed().as_millis() as u64;
             let resp = NativeResponse::new(
                 serde_json::json!({ "pipeline": name, "acknowledged": true }),
@@ -2513,6 +2518,13 @@ pub async fn put_pipeline(
                 &request_id,
             );
             (StatusCode::OK, Json(resp)).into_response()
+        }
+        // The definition does not compile — same 500 this surface has always
+        // returned, and nothing was stored.
+        Ok(Some(compile_err)) => {
+            let ze = xerj_common::XerjError::internal(compile_err.to_string());
+            native_error(ze, Some(&request_id), started.elapsed().as_millis() as u64)
+                .into_response()
         }
         Err(e) => {
             let ze = xerj_common::XerjError::internal(e.to_string());

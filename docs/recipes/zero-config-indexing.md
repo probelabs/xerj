@@ -270,6 +270,26 @@ phase), `--prefix` to namespace the indices (default `ax`),
 print the inferred plan without indexing anything, `--follow-symlinks`
 (loop-safe), `--sample N` records per file for inference (default 500).
 
+Build output never reaches the index in the first place. The walk honours
+`.xerjignore`, `.gitignore` (nested files and `!negation` included) and
+`.git/info/exclude`, plus a built-in list — `node_modules/ vendor/ target/
+dist/ build/ .venv/ __pycache__/` — in that order of precedence; an excluded
+directory is never descended, so nothing inside it is stat-ed, hashed or sent.
+The two git-owned kinds stop at a repository boundary the way git does: a
+`.gitignore` above a nested checkout has no authority over the files inside it,
+so a vendored or submoduled tree keeps its own rules. `.xerjignore` and the
+built-in list are XERJ's rather than git's and apply throughout the folder you
+named. Hidden files (`.env`, `.git/`) are skipped by a separate, non-optional
+rule. Every run prints what was dropped and by which rule (`ignore rules: …` on
+stderr), and `--dry-run` also counts the non-hidden files inside each pruned
+directory, so "where did my file go?" always has an answer. `--no-ignore` turns
+the rules off; `--no-default-ignores` keeps your ignore files and drops only the
+built-in list. Both apply to an indexing run only — `autoindex map` and
+`autoindex status` never walk a folder and refuse them rather than accepting a
+flag that would do nothing. The folder you point at is never excluded: if it is
+itself ignored — say you run this on `~/proj/target` — it is indexed anyway and
+the run says which rule it would have matched.
+
 `--workers` is a ceiling, not a promise: when the server answers `429 Too Many
 Requests` the run halves its own bulk concurrency on the spot and probes back
 up one worker at a time only after a clean streak, so a busy server is not

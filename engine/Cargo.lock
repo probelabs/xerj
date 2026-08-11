@@ -530,6 +530,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1931,6 +1941,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "globset"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "grid"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2368,6 +2391,22 @@ checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ignore"
+version = "0.4.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b17771570a2b94107741a7b033f19132c2eee21d59d21b24d2ced26500bd66e"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
 ]
 
 [[package]]
@@ -6378,7 +6417,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-ai"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -6399,7 +6438,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-api"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6429,7 +6468,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-autoindex"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6437,6 +6476,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "fs2",
+ "ignore",
  "libc",
  "memchr",
  "pdf_oxide",
@@ -6471,7 +6511,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-cluster"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6496,7 +6536,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-common"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -6515,7 +6555,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-compress"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "byteorder",
  "bytes",
@@ -6528,7 +6568,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-console-api"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6564,7 +6604,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-engine"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6603,7 +6643,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-fts"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "bitpacking",
@@ -6629,7 +6669,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-logs"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -6647,7 +6687,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-mcp"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -6657,7 +6697,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-query"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6672,7 +6712,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-server"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "axum",
@@ -6718,7 +6758,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-storage"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6748,7 +6788,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-vector"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -6766,7 +6806,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-wasm"
-version = "1.0.0-rc.14"
+version = "1.0.0-rc.15"
 dependencies = [
  "anyhow",
  "bytes",

@@ -483,6 +483,15 @@ pub fn build_es_compat_router(state: AppState) -> Router {
                 .delete(es_compat::delete_ilm_policy),
         )
         .route("/:index/_ilm/explain", get(es_compat::ilm_explain))
+        // Operator surface (issue #282): status, the start/stop kill
+        // switch, and ES's own detach verb.
+        .route("/_ilm/status", get(es_compat::get_ilm_status))
+        .route("/_ilm/start", post(es_compat::start_ilm))
+        .route("/_ilm/stop", post(es_compat::stop_ilm))
+        .route(
+            "/:index/_ilm/remove",
+            post(es_compat::remove_ilm_policy_from_index),
+        )
         // ── ISM (OpenSearch Index State Management) ─────────────────────────
         // Same execution engine as ILM above — see `xerj_engine::lifecycle`.
         .route(
