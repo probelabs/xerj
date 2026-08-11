@@ -515,6 +515,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         state_dir: Some(state_dir.to_owned()),
         fresh: false,
         follow_symlinks: false,
+        ignore: crate::ignore_rules::IgnoreOptions::default(),
         max_file_gb: 1,
         sample: 50,
         no_semantic: true,

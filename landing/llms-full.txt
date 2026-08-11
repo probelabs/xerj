@@ -137,6 +137,7 @@ destabilize the server.
                           [--bulk-mb N] [--prefix ax] [--state-dir P] [--fresh]
                           [--follow-symlinks] [--max-file-gb N] [--sample N]
                           [--no-semantic] [--dry-run] [--json] [--quiet]
+                          [--no-ignore] [--no-default-ignores]
   xerj autoindex map      [--url U] [--json] [--dataset SLUG]
   xerj autoindex status   [--url U] [--state-dir P]
 
@@ -158,6 +159,27 @@ removed files with an "… and N more" tail; --json carries every entry. The
 shared autoindex-catalog and the old target require explicit cleanup. A
 --no-graph state directory written before the generation format cannot be
 adopted in place and must be rebuilt the same way.
+
+Ignore rules: the walk honours .xerjignore, .gitignore (nested files and
+!negation included) and .git/info/exclude, plus a built-in build-output list
+(node_modules/ vendor/ target/ dist/ build/ .venv/ __pycache__/), in that order
+of precedence. An excluded directory is never descended, so nothing inside it
+is stat-ed, hashed or sent. The two git-owned kinds stop at a repository
+boundary the way git does, so a .gitignore above a nested checkout does not
+judge files inside it; .xerjignore and the built-in list are XERJ's rather than
+git's and apply throughout the folder you named. Hidden files (.env, .git/,
+.ssh) are skipped by a separate rule that no flag turns off. Every run prints
+`ignore rules: ...` on stderr naming each rule and what it dropped; --dry-run
+also counts the non-hidden files inside each pruned directory and reports that
+count on xerj-done as ignored_files_in_pruned_dirs, alongside
+ignored_files_in_pruned_dirs_exact — false means the budget capped it and the
+number is a floor. --no-ignore turns the rules off entirely;
+--no-default-ignores keeps your ignore files and drops only the built-in list.
+Both are refused on `autoindex map` and `autoindex status`, which never walk a
+folder.
+Your global gitignore (core.excludesFile) is deliberately not read. The folder
+you point at is never excluded: if it is itself ignored, it is indexed anyway
+and the run says which rule it would have matched.
 
 Exit codes: 0 complete · 3 completed-with-junk (junk recorded, never fatal) ·
 2 usage · 1 endpoint/journal error, a refused corpus removal, or a refused

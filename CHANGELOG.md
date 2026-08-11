@@ -48,6 +48,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   de-duplicates the crate — 0.41 was already in the tree via `pdf_oxide`.
   `crossbeam-epoch` moved 0.9.18 → 0.9.20 for RUSTSEC-2026-0204.
 
+### Fixed
+
+- **`PUT /{index}/_settings {"index.lifecycle.name": null}` actually detaches
+  the index, and the detach survives a restart** (#282, ported from #262). The
+  null previously fell through a string-only settings reader, so the operator
+  got `200 acknowledged` while the index stayed attached — to a policy whose
+  delete phase then destroyed it. A detach now removes the execution cursor,
+  writes a persisted tombstone (`ism_managed_indices.json` grew a
+  `managed`/`detached` envelope; the old bare-map file is still read), and
+  scrubs the stale `index.lifecycle.name` from the stored settings.
+- **The lifecycle delete action gained #262's safety rails.** It now refuses —
+  visibly, in `explain`, never silently — to delete a dot-prefixed internal
+  index (`.ds-*` backing indices exempt), a data stream's current write index,
+  or an index whose age cannot be established from its execution cursor.
+- **An ILM policy naming an action the engine cannot execute is refused at PUT
+  time with the action named** (400), instead of being stored with the action
+  silently dropped — the accepted-and-ignored class (#204). Executable ILM
+  actions are `rollover`, `delete`, `readonly`.
+
+- **A `query_string` containing one non-ASCII character aborted the process.**
+  `{"query_string":{"query":"_\u0660"}}` — or the same text in `?q=` — took the
+  server down. The Lucene tokeniser walks bytes but slices `&q[start..i]` as a
+  `&str`, and it broke on `is_whitespace()`, which is true for Latin-1 NBSP
+  (0xA0). In valid UTF-8 that byte is only ever a *continuation* byte, so the
+  scan stopped between the two bytes of U+0660 and the slice panicked on a
+  character boundary. Every delimiter test in that scanner is now `is_ascii_*`,
+  which makes "the scan can only stop on a character boundary" true by
+  construction. Nothing is lost: the only non-ASCII bytes the old test accepted
+  were 0x85 and 0xA0, neither of which is a standalone character in UTF-8.
+
+- **An index name of `<{}{}>` aborted the process.** Index-name date math finds
+  the first `{` and the last `}` inside the braces; when the `}` comes first,
+  `date_part[2..0]` is a panic, not an empty slice. Reachable from any request
+  that names an index. The closing brace is now required to come after the
+  opening one.
+
+- **A Painless script containing one non-ASCII character aborted the process.**
+  The second thing the new fuzz harnesses found, inside a second. The tokeniser
+  walks *bytes* (`bytes[i] as char` reinterprets each byte as Latin-1) but
+  slices `&src[start..i]` as a `&str`. Every continuation byte of a multi-byte
+  character reads as an alphabetic Latin-1 char, so an identifier scan could
+  start or stop inside one and the slice panicked on a char boundary —
+  `end byte index 24 is not a char boundary; it is inside 'ʋ'`. Scripts arrive
+  in ordinary search and update bodies and the release profile sets
+  `panic = "abort"`, so this was not a 400, it was the whole server. The
+  identifier scan is now ASCII-only, which keeps both ends on a character
+  boundary by construction; a non-ASCII byte reaches the tokeniser's
+  `unexpected char` error instead. String literals still carry any Unicode.
+
+- **A search body could abort the whole process: `{"range":{"ts":{"gte":"now+33333333333333H"}}}`.**
+  The first thing the new `date_math` fuzz target found, 20 seconds into its
+  first run. `chrono`'s `Duration::hours` and its siblings **panic** when the
+  count does not fit a `TimeDelta`, and they run before the
+  `checked_add_signed` that was supposed to make
+  `xerj_query::dates::add_unit` total — so the careful checking around them
+  bought nothing. A range bound goes straight from the request body into this
+  code (`parser.rs:931`), the release profile sets `panic = "abort"`, and the
+  result is an unauthenticated remote denial of service on a released binary.
+  Fixed with the fallible `try_*` constructors. Grepping for the same pattern
+  found **three** more copies in the index-name date-math resolvers —
+  `xerj-engine/src/index.rs`, and *both* branches of
+  `xerj-api/src/es_compat.rs`: the `now` form (`<logs-{now+9999999999999d}>`)
+  and the anchored form (`<logs-{2026-01-01||+9999999999999d}>`), which are
+  handled by two different functions sixty lines apart. All three are fixed,
+  their `n * 30` / `n * 365` multiplications are `checked_mul`, the unit is read
+  as one character rather than one byte, and the addition goes through
+  `checked_add_signed`. `es_compat`'s resolver is the one that runs on the wire
+  — the index path parameter of every create/index call and the `_search` index
+  list — so `crates/xerj-api/tests/index_name_date_math_is_total.rs` now drives
+  it at the crate boundary; the same-file fix that missed the anchored branch
+  passed because nothing exercised the public entry point.
+
+- **A `_search` aggregation script containing one non-ASCII character aborted
+  the process.** `painless::tokenize` was not the only Painless-subset scanner
+  in the tree: `aggs.rs` holds two more with the identical byte-walk /
+  `&str`-slice shape — `lex_script` (`scripted_metric`) and `tokenize_script`
+  (`bucket_script` / `bucket_selector`) — and both took `&src[i..i + 2]` to test
+  for a two-character operator at a byte index that can sit inside a multi-byte
+  character, because every arm above it is ASCII-only.
+  `{"m":{"scripted_metric":{"map_script":"中"}}}` was `end byte index 2 is not a
+  char boundary`. Both also skipped whitespace with `is_whitespace()` on
+  `bytes[i] as char`, which is true for Latin-1 NEL and NBSP — bytes that in
+  valid UTF-8 are only ever *continuation* bytes. The two-character probe now
+  requires both bytes to be ASCII (every such operator is ASCII, so nothing is
+  lost) and whitespace is `is_ascii_whitespace`. A new `agg_script` fuzz target
+  covers all three entry points, which is how the next one gets found instead of
+  reported.
+
+- **An XML entity nobody declared no longer discards the text around it.**
+  Fallout from the `quick-xml` upgrade above, which is a breaking change to how
+  character data arrives: 0.38 stopped folding `&amp;` into the surrounding
+  `Event::Text` and began emitting each reference as its own
+  `Event::GeneralRef`. Entity handling is preserved across that change (a
+  reader that ignored the new event would have silently dropped every `&`, `<`,
+  `>` and `&#233;` while the words around them still arrived), and one case
+  gets better: 0.36's `BytesText::unescape()` failed the whole text node on an
+  entity no DTD declared for us, and `unwrap_or_default()` then discarded it —
+  now only the reference itself is dropped. Character data is also reassembled
+  from its fragments before being emitted, so an entity-bearing field stays one
+  value instead of becoming an array of pieces.
+
+### Added
+
+- **`GET /_ilm/status`, `POST /_ilm/start`, `POST /_ilm/stop`** (#282): the
+  operator can halt lifecycle execution without stopping the node; a stopped
+  engine's tick touches nothing. The flag is in-memory — a restart resumes
+  execution — while the per-index detach tombstone is the durable stop.
+- **`POST /{index}/_ilm/remove`** (#282): ES's own detach verb; goes through
+  the same tombstoned detach path as the settings-null route. A literal name
+  that is not an index answers 404 rather than writing a tombstone for a
+  ghost.
+
+- **A crafted filename can no longer forge records on the agent progress
+  stream** (the first rc.15 known issue below). Every externally-controlled
+  string — in-flight paths, the paths and error text interpolated into human
+  notes, the terminal line's reason — is stripped of control characters, bidi
+  overrides and zero-width characters and bounded in length before it reaches
+  any progress surface. Measured on a corpus holding crafted names: a run that
+  previously emitted a forged `xerj-done ok=true exit=0 reason=completed`
+  2.2 s ahead of its real terminal line now emits one terminal line and no
+  control characters at all. The same sanitisation covers the walker's
+  "skipping unreadable entry" warning, which renders a path to the same stderr.
+- **`--progress json` paces the bar like `--progress plain`.** The `bar` field
+  bypassed the spacing slot entirely: measured at `--progress-interval 1`, 178
+  of 178 ticks carried a bar against 18 bars on the plain surface. It is now a
+  string on exactly the ticks that owe a bar and `null` in between — 26 of 320
+  ticks on the same corpus, against 16 on plain.
+- **The bar spacing floor is the 15 s the documentation states.** A half-tick
+  tolerance made the enforced floor `interval/2` shorter — 12.5 s at the
+  shipped defaults. Measured at `--progress-interval 10`: 11 of 11 same-phase
+  gaps under 15 s (min 10.0 s) before, none after (min 19.3 s).
+
 ### Changed
 
 - **`merge.strategy = "log_structured"` is now refused at startup instead of
@@ -146,6 +278,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     specifying 7 routes out of the 200-plus the router registers. It is now
     titled and versioned as a partial spec, and says so.
 
+## [1.0.0-rc.15] - 2026-08-10
+
+### Known issues in this release
+
+Both were found by adversarial review *after* their pull requests merged, so
+they are present in these binaries. Fixes are in flight for rc.16.
+
+- **A crafted filename can forge records on the agent progress stream.** The
+  in-flight path is rendered onto the progress surface without control-character
+  sanitisation, so a filename containing a newline can inject something that
+  looks like a genuine `xerj-progress` or `xerj-done` record — including a false
+  `ok=true` completion — into the stream this release tells AI agents to parse.
+  Indexing a repository whose filenames you do not control is enough to trigger
+  it. Until the fix lands, do not treat that stream as trustworthy when the
+  corpus is untrusted.
+- **An outer repository's `.gitignore` judges files inside a nested checkout.**
+  The ignore lookup walks every layer with no repository-boundary stop, unlike
+  git itself, so a vendored or submoduled repository is filtered by rules that
+  have no authority over it. Files you expect to be indexed may be skipped.
+  `--no-ignore` bypasses it.
+
+Also unfixed and worth knowing: `--progress json` does not pace the bar (a JSON
+consumer sees roughly ten times as many bar lines as a plain consumer), and the
+documented "at most one bar per 15 s" floor is really 12.5 s.
+
+
+### Added
+
+- **Index lifecycle policies are executed, not just stored**
+  ([#199](https://github.com/xerj-org/xerj/issues/199), contributed by
+  @Vinz2168). A single internal engine modeled on OpenSearch's ISM state machine
+  — named states, ordered actions, ordered transitions — exposed through two
+  REST surfaces: native ISM at `_plugins/_ism/*` and the Elasticsearch-shaped
+  `_ilm/*`. `spawn_lifecycle_manager()` runs the tick on
+  `lifecycle.tick_interval_secs` (default 300s, matching OpenSearch ISM's own
+  job interval), and the managed-index cursor survives restart. Retention now
+  actually deletes and rolls over instead of being acknowledged and forgotten.
+  One documented divergence: `min_age` is measured from when an index entered
+  its current state rather than from rollover time, so a policy that rolls over
+  *and* has a downstream phase meant to be measured from the rollover will
+  advance on a different clock than Elasticsearch uses.
+
+- **`xerj autoindex` honours `.gitignore` and `.xerjignore`**
+  ([#276](https://github.com/xerj-org/xerj/issues/276)). Nested ignore files and
+  negation patterns follow git's own precedence, with build-output defaults
+  (`node_modules`, `vendor`, `target`, `dist`, `build`, `.venv`, `__pycache__`)
+  on top; `--no-ignore` and `--no-default-ignores` turn them off. Pointing xerj
+  directly at an ignored path still indexes it — an explicit instruction beats a
+  rule the user did not write for this purpose. `--dry-run` reports what was
+  skipped and by which rule, because a user whose files did not appear needs to
+  know why. Measured on this repository: 274,826 files walked in 1.18s becomes
+  1,385 in 0.25s.
+
+- **Progress is relayed to an AI agent as a drawn bar.** The stream surface
+  carries a rendered bar alongside its machine-readable `key=value` fields, so
+  an agent driving `xerj autoindex` on someone's machine can show a real
+  progress line rather than going silent for minutes. `--progress json` keeps a
+  single parseable stream; `--quiet` still writes nothing on either.
+
+### Fixed
+
+- **Tied scores have one total order — a bounded page is a prefix of the full
+  page** ([#191](https://github.com/xerj-org/xerj/issues/191)). A `size:5` page
+  and a `size:1000` page disagreed about which tied document came back. The
+  memtable's bounded candidates are now ranked by the same page key as the
+  segment path, so the two agree. The remaining `constant_score` and post-sort
+  re-sort cases are tracked separately in
+  [#270](https://github.com/xerj-org/xerj/issues/270).
+
+- **`date_histogram` no longer aborts the process on a multi-byte `time_zone`**
+  ([#272](https://github.com/xerj-org/xerj/issues/272), contributed by
+  @Vinz2168). `aggs::parse_time_zone_offset` sliced a `&str` on a byte index
+  that could land mid-character, and with `panic=abort` that took the whole node
+  down — an unauthenticated request was enough.
+
+- **The legacy path-parameter form of scroll continuation works again**
+  (contributed by @Vinz2168), and **`_cat/*?format=json` plus `_data_stream/**`
+  wildcards** are supported (also @Vinz2168) — both are shapes real
+  Elasticsearch clients send.
+
+### Changed
+
 - **`autoindex` parses each PDF once per fresh run instead of twice.** Phase A
   already paid a *complete* parse for every PDF — `extract::extract` routes
   `Family::Pdf` straight to the isolated worker and drops the sampling limit,
@@ -217,87 +431,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A `query_string` containing one non-ASCII character aborted the process.**
-  `{"query_string":{"query":"_\u0660"}}` — or the same text in `?q=` — took the
-  server down. The Lucene tokeniser walks bytes but slices `&q[start..i]` as a
-  `&str`, and it broke on `is_whitespace()`, which is true for Latin-1 NBSP
-  (0xA0). In valid UTF-8 that byte is only ever a *continuation* byte, so the
-  scan stopped between the two bytes of U+0660 and the slice panicked on a
-  character boundary. Every delimiter test in that scanner is now `is_ascii_*`,
-  which makes "the scan can only stop on a character boundary" true by
-  construction. Nothing is lost: the only non-ASCII bytes the old test accepted
-  were 0x85 and 0xA0, neither of which is a standalone character in UTF-8.
+- **An index whose metadata will not parse is refused instead of silently
+  reopened with an empty mapping**
+  ([#202](https://github.com/xerj-org/xerj/issues/202)). `Index::open` treated
+  "this file is not there" and "this file does not parse" as the same thing:
+  `load_schema`/`load_settings` mapped ENOENT, EACCES, EIO and malformed JSON
+  alike to one anonymous error, and the caller answered all of them with a
+  fresh dynamic mapping. Measured on a field deliberately mapped `keyword`:
+  after `schema.json` was truncated to half its bytes the index still opened
+  `Ok` with `field_count = 0`, the field came back `None`, and one further
+  document re-inferred it as `long` — a mapping silently replaced by a
+  different one, with nothing in any response saying so. Absent stays absent
+  (indices predating create-time schema persistence legitimately have no
+  `schema.json`); present-but-unparseable now fails the open with an error
+  naming the file. `es_mapping.json` — the full-fidelity mapping behind
+  `GET /_mapping` — was logged-and-ignored on a parse failure and now fails the
+  index too, on the boot scan, on snapshot restore and on a retry.
 
-- **An index name of `<{}{}>` aborted the process.** Index-name date math finds
-  the first `{` and the last `}` inside the braces; when the `}` comes first,
-  `date_part[2..0]` is a panic, not an empty slice. Reachable from any request
-  that names an index. The closing brace is now required to come after the
-  opening one.
+  **Visible on upgrade:** a node whose data dir already holds a corrupt sidecar
+  now boots **red** with that index unserved, where it previously came up green
+  with an empty mapping. It joins the failed set
+  [#206](https://github.com/xerj-org/xerj/issues/206) introduced, so every
+  surface that set feeds already reports it — measured on a node holding two
+  user indices, `victim` with a truncated `schema.json`:
 
-- **A Painless script containing one non-ASCII character aborted the process.**
-  The second thing the new fuzz harnesses found, inside a second. The tokeniser
-  walks *bytes* (`bytes[i] as char` reinterprets each byte as Latin-1) but
-  slices `&src[start..i]` as a `&str`. Every continuation byte of a multi-byte
-  character reads as an alphabetic Latin-1 char, so an identifier scan could
-  start or stop inside one and the slice panicked on a char boundary —
-  `end byte index 24 is not a char boundary; it is inside 'ʋ'`. Scripts arrive
-  in ordinary search and update bodies and the release profile sets
-  `panic = "abort"`, so this was not a 400, it was the whole server. The
-  identifier scan is now ASCII-only, which keeps both ends on a character
-  boundary by construction; a non-ASCII byte reaches the tokeniser's
-  `unexpected char` error instead. String literals still carry any Unicode.
+  ```
+  GET  /_cluster/health          -> red, unassigned_primary_shards: 1
+  GET  /_cluster/health?level=indices
+                                 -> victim red, unassigned_info.details = the
+                                    absolute path of schema.json and the parse error
+  GET  /_cat/indices             -> "red open victim <uuid> 1 0 0 0 0b 0b 0b"
+  GET  /_cluster/indices/failed  -> the reason, plus the retry and delete calls
+  PUT  /victim, POST /victim/_doc, POST /victim/_search
+                                 -> 503 no_shard_available_action_exception
+                                    carrying that same reason
+  GET  /health/ready             -> 200 "ready (degraded): 1 of 2 indices
+                                    serving, 1 failed to open; see GET
+                                    /_cluster/indices/failed"
+  POST /healthy/_search          -> 200
+  ```
 
-- **A search body could abort the whole process: `{"range":{"ts":{"gte":"now+33333333333333H"}}}`.**
-  The first thing the new `date_math` fuzz target found, 20 seconds into its
-  first run. `chrono`'s `Duration::hours` and its siblings **panic** when the
-  count does not fit a `TimeDelta`, and they run before the
-  `checked_add_signed` that was supposed to make
-  `xerj_query::dates::add_unit` total — so the careful checking around them
-  bought nothing. A range bound goes straight from the request body into this
-  code (`parser.rs:931`), the release profile sets `panic = "abort"`, and the
-  result is an unauthenticated remote denial of service on a released binary.
-  Fixed with the fallible `try_*` constructors. Grepping for the same pattern
-  found **three** more copies in the index-name date-math resolvers —
-  `xerj-engine/src/index.rs`, and *both* branches of
-  `xerj-api/src/es_compat.rs`: the `now` form (`<logs-{now+9999999999999d}>`)
-  and the anchored form (`<logs-{2026-01-01||+9999999999999d}>`), which are
-  handled by two different functions sixty lines apart. All three are fixed,
-  their `n * 30` / `n * 365` multiplications are `checked_mul`, the unit is read
-  as one character rather than one byte, and the addition goes through
-  `checked_add_signed`. `es_compat`'s resolver is the one that runs on the wire
-  — the index path parameter of every create/index call and the `_search` index
-  list — so `crates/xerj-api/tests/index_name_date_math_is_total.rs` now drives
-  it at the crate boundary; the same-file fix that missed the anchored branch
-  passed because nothing exercised the public entry point.
+  The readiness counts above are the two-index test router's. A running node
+  also holds its internal `.xerj_*` indices, so the same condition on the shipped
+  binary reads `ready (degraded): 15 of 16 indices serving, 1 failed to open` —
+  the 200 and its meaning are unchanged, only the totals move with what else the
+  node holds.
 
-- **A `_search` aggregation script containing one non-ASCII character aborted
-  the process.** `painless::tokenize` was not the only Painless-subset scanner
-  in the tree: `aggs.rs` holds two more with the identical byte-walk /
-  `&str`-slice shape — `lex_script` (`scripted_metric`) and `tokenize_script`
-  (`bucket_script` / `bucket_selector`) — and both took `&src[i..i + 2]` to test
-  for a two-character operator at a byte index that can sit inside a multi-byte
-  character, because every arm above it is ASCII-only.
-  `{"m":{"scripted_metric":{"map_script":"中"}}}` was `end byte index 2 is not a
-  char boundary`. Both also skipped whitespace with `is_whitespace()` on
-  `bytes[i] as char`, which is true for Latin-1 NEL and NBSP — bytes that in
-  valid UTF-8 are only ever *continuation* bytes. The two-character probe now
-  requires both bytes to be ASCII (every such operator is ASCII, so nothing is
-  lost) and whitespace is `is_ascii_whitespace`. A new `agg_script` fuzz target
-  covers all three entry points, which is how the next one gets found instead of
-  reported.
+  Recovery is the three doors #206 added. Two were measured end to end on the
+  shipped binary: repair the file and
+  `POST /_cluster/indices/failed/{index}/_retry` (503 while it is still torn,
+  `200 {"reopened": true}` once it is not, health back to green), and
+  `DELETE /{index}` (200, directory removed, health back to green). The third —
+  restore the index from a snapshot — is the path this change touches (a
+  successful restore now clears the recorded failure, which it has to or health
+  would stay red after the repair worked); it is covered by an engine-level
+  test rather than measured over HTTP. The node stays in kubelet rotation as
+  long as any index is still serving.
 
-- **An XML entity nobody declared no longer discards the text around it.**
-  Fallout from the `quick-xml` upgrade above, which is a breaking change to how
-  character data arrives: 0.38 stopped folding `&amp;` into the surrounding
-  `Event::Text` and began emitting each reference as its own
-  `Event::GeneralRef`. Entity handling is preserved across that change (a
-  reader that ignored the new event would have silently dropped every `&`, `<`,
-  `>` and `&#233;` while the words around them still arrived), and one case
-  gets better: 0.36's `BytesText::unescape()` failed the whole text node on an
-  entity no DTD declared for us, and `unwrap_or_default()` then discarded it —
-  now only the reference itself is dropped. Character data is also reassembled
-  from its fragments before being emitted, so an entity-bearing field stays one
-  value instead of becoming an array of pieces.
+- **Concurrent sidecar writes can no longer manufacture the torn file the reader
+  now refuses.** `write_file_atomic` staged every write in
+  `path.with_extension("tmp")` — one shared name for all writers of that file —
+  so two concurrent writers of one sidecar (`PUT /{index}/_settings` racing
+  another settings update, two API-key mints for `api_keys.json`) both opened it
+  `O_TRUNC`, interleaved their bytes, and each renamed it into place. The rename
+  is atomic; the content being renamed was not one writer's. Measured with the
+  old shared name, 4 threads × two different-length settings bodies × 200
+  rounds, over four runs: **86–294 of 800 writes failed with ENOENT** (the loser
+  renaming a file the winner had already moved) and, with those errors swallowed
+  as the callers did, **1–16 of 200 rounds left an unparseable `settings.json`**.
+  The counts are race-dependent and vary with machine load; what does not vary is
+  that both are non-zero on every run with the shared name and **0 and 0** on
+  every run with a unique staging name. Each write now stages
+  in its own sibling file (`<file>.tmp.<pid>.<seq>`) in the target's directory
+  and removes its own debris on failure — which for `api_keys.json` is key
+  material. `update_settings` also writes `settings.json` through
+  `write_file_atomic` rather than a plain `fs::write`; it was the last
+  non-atomic sidecar writer left.
 
 - **`index` on the mapping is now honoured instead of silently ignored**
   ([#204](https://github.com/xerj-org/xerj/issues/204)). `"index": false` was
@@ -674,6 +883,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the other side. The handle is now restored on failure, so the index stays in
   service and addressable and the operator can retry the delete once the cause
   is fixed.
+
+- **Index templates, ingest pipelines, data streams and ILM policies survive a
+  restart** ([#203](https://github.com/xerj-org/xerj/issues/203)). Index
+  templates, legacy (v1) templates, component templates, ingest pipelines, data
+  streams and ILM policies lived only in memory: `PUT /_index_template/logs`
+  answered `{"acknowledged": true}` and `GET` answered 404 after the next
+  restart, and the next index that should have matched the template was created
+  without it — with no error anywhere. All six are now persisted together in
+  `<data_dir>/cluster_state.json`, written atomically (tmp → fsync → rename →
+  fsync the parent directory) so the write is committed at the request, not in
+  a shutdown hook, and restored in `Engine::new` before the listeners come up.
+  A write that fails is rolled back in memory and answered with a 500 instead
+  of `acknowledged`. Restored pipelines are recompiled, not just re-read —
+  storing the definition alone would have left `?pipeline=x` accepted and
+  silently inert after a restart.
+
+  Four defects found while verifying it, each reproduced first:
+
+  - Concurrent management writes corrupted each other (all flushes staged
+    through one fixed `.tmp` path — 32 parallel template PUTs returned
+    `store_exception`). Snapshot-and-write is now serialized.
+  - A rollover interrupted between "backing index created" and "generation
+    persisted" wedged the data stream forever: every later rollover recomputed
+    the same name and got `409 resource_already_exists_exception`. Boot now
+    adopts the highest generation actually present on disk, warns, and persists
+    the repair once.
+  - A `cluster_state.json` that could not be **read** (EACCES after a uid
+    change on a container volume, a backup tool's chmod, EIO) came up as empty
+    maps, and the next management write renamed a snapshot of those empty maps
+    over a file whose bytes were perfectly good. The load failure now latches:
+    every management mutation is refused with a 500 naming the file, and the
+    file is not touched, until a boot loads it cleanly. The corrupt-parse arm
+    refuses too, and still keeps a `cluster_state.corrupt.json` copy.
+  - `DELETE /_data_stream/<name>` recorded the removal before destroying the
+    backing indices, so a crash in that window stranded `.ds-<name>-00000N`
+    directories that no data-stream API could reach — GET and DELETE answered
+    404 while `PUT /_data_stream/<name>` answered
+    `409 resource_already_exists_exception` permanently. The order is reversed:
+    the removal is recorded only once every backing index is gone, and a
+    backing index that cannot be deleted now aborts the DELETE with a 500
+    (it was previously swallowed and answered `acknowledged`) so the operator
+    can retry. Read that 500 as "did not finish", not as "nothing happened":
+    a multi-generation stream still loses every backing index that *could* be
+    destroyed, the stream itself stays addressable, and the retry after the
+    cause is fixed completes the delete.
+
+  **Known gaps, deliberately not closed here.** `.ds-*` indices that no data
+  stream claims — left by a data dir written before this change, or by a
+  DELETE interrupted by an older build — are **not** cleaned up or adopted
+  automatically; boot now names them in a warning and the recovery is
+  `DELETE /<backing-index>` per index, because an orphan may hold the only copy
+  of real data. And `aliases.json` still has both swallow shapes that were
+  fixed here for `cluster_state.json`: an unreadable aliases file is swallowed
+  at boot and overwritten by the next alias write, and a *failed* alias write
+  is only logged, so an alias can survive on disk after the stream it named was
+  deleted with a 200. Both are pre-existing behaviour, not introduced here or
+  made worse here, and are tracked separately.
 
 - **`autoindex` no longer leaves immortal catalog entries for skipped files**
   ([#238](https://github.com/xerj-org/xerj/issues/238)). A file added after the
