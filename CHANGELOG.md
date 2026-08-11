@@ -5,16 +5,10 @@ All notable changes to XERJ are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0-rc.16] - 2026-08-11
 
-### Changed
-
-- **Default `_search` source payloads omit engine-generated embedding companions.** A
-  search with no `_source` now returns ordinary source fields without
-  `<field>_vector` and `<field>_vector_chunks`; measured payload size fell from
-  211,432 to 21,069 bytes for 5 hits (about 90%). Explicit `"_source": true`,
-  `"_source": ["field"]`, and include/exclude forms are unchanged. Add
-  `"_source": true` to restore the previous complete payload, including vectors.
+Both rc.15 known issues (the progress-stream forgery and the outer-`.gitignore`
+reach into nested checkouts) are fixed in this release — see Fixed below.
 
 ### Security
 
@@ -60,7 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`PUT /{index}/_settings {"index.lifecycle.name": null}` actually detaches
-  the index, and the detach survives a restart** (#282, ported from #262). The
+  the index, and the detach survives a restart** (#282, ported from #262;
+  regression-tested in [#290](https://github.com/xerj-org/xerj/pull/290)). The
   null previously fell through a string-only settings reader, so the operator
   got `200 acknowledged` while the index stayed attached — to a policy whose
   delete phase then destroyed it. A detach now removes the execution cursor,
@@ -163,6 +158,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from its fragments before being emitted, so an entity-bearing field stays one
   value instead of becoming an array of pieces.
 
+- **`constant_score` on a mixed flushed/unflushed corpus returned the wrong
+  page, and any tied hit set could be re-sorted into `_id` order**
+  ([#270](https://github.com/xerj-org/xerj/issues/270),
+  [#300](https://github.com/xerj-org/xerj/pull/300)). Two defects. A
+  top-level `constant_score` (or `boost`) wrapper defeated the match-all
+  shortcut, so the stored scan ran in exact-counting mode and a bounded page
+  came back all-memtable — `size:1` on 40 flushed + 300 unflushed identical
+  docs returned the memtable doc where the oldest flushed doc was correct;
+  the wrapper is now peeled for the count/bounds decisions only, with scoring
+  unchanged. Separately, five post-sort re-sorts — the bool-text IDF rescore,
+  the near-zero-BM25 TF-IDF fallback, and the three `rescore` sorts — tied by
+  `_id` alone, so any of them firing on tied scores reordered the page; the
+  main sort and all five now route through the one page-order key
+  (`score DESC, seq_no ASC, _id ASC`). Known residual, documented rather
+  than asserted around: bounded pages for multi-clause bools on a mixed
+  corpus are still admitted under first-pass scores (#188's remit).
+
+- **A shrinking file set on a junk-bearing `autoindex` generation aborted the
+  cutover with `desired manifest digest does not match sync_begin payload`**
+  ([#283](https://github.com/xerj-org/xerj/issues/283),
+  [#296](https://github.com/xerj-org/xerj/pull/296)). A fresh plan kept
+  duplicate-file aliases whose content was junk or skipped while the
+  incremental projection dropped them, so the two disagreed on byte-identical
+  junk duplicates — two empty files suffice. The fresh plan now projects
+  exactly like the incremental path, so the shrink reconciles cleanly. Where
+  a journal is *genuinely* inconsistent, the replay and validation paths now
+  say what to do — no remote data changed, re-running will not repair it,
+  rebuild with a new `--state-dir` and `--prefix` — with the invariant kept
+  as the error cause.
+
+- **An outer repository's `.gitignore` no longer judges files inside a nested
+  checkout** (the second rc.15 known issue below;
+  [#287](https://github.com/xerj-org/xerj/pull/287), repairing
+  [#279](https://github.com/xerj-org/xerj/pull/279)). The rule walk had no
+  repository-boundary stop, so a root `*.md` hid the README of every
+  vendored dependency beneath it. The git-sourced rule kinds now stop at a
+  `.git` boundary — the set kept under a nested checkout is byte-for-byte
+  what `git status --untracked-files=all` reports there — while
+  `.xerjignore` and the built-in defaults deliberately still govern the
+  whole folder you named. Three more defects from the same merge: hidden
+  directories pruned by the dotfile rule were deep-counted into
+  `ignored_files_in_pruned_dirs` (97,731 phantom files on this repository's
+  own walk); that number reached the `xerj-done` line and `--progress json`
+  as a bare total when it is budget-capped — a new
+  `ignored_files_in_pruned_dirs_exact` flag now says whether it is a total
+  or a floor; and `--no-ignore`/`--no-default-ignores` were accepted and
+  ignored (#204) on `autoindex map` and `status`, which never walk a
+  filesystem — both are now refused there with the reason. The shipped docs
+  that contradicted the code are corrected.
+
+- **A finished `autoindex` run could leave its state-directory lock held, so
+  the immediately following run on the same state dir was refused as
+  already in use** ([#305](https://github.com/xerj-org/xerj/pull/305)).
+  `flock` ownership follows the open file description, so a helper
+  subprocess forked while the journal was live (the PDF extraction helper,
+  git invocations) could inherit the descriptor and keep the lock held past
+  the owner's close. The lock guard now records the acquiring PID and
+  unlocks on drop only in that process — a fork-inherited copy closes its
+  descriptor without releasing the live owner's lock. No retry, wait or
+  takeover behaviour was added; crash recovery is unchanged. Covered by a
+  same-OFD unit oracle and a real-fork integration regression on
+  Linux/macOS.
+
+- **`autoindex` indexed a `.mts` or `.cts` file as prose**
+  ([#284](https://github.com/xerj-org/xerj/pull/284)). The extension
+  registry claimed `.mjs`/`.cjs` but not TypeScript's own ESM/CJS
+  counterparts, and an unclaimed extension does not degrade to "code without
+  symbols" — it fell through to the prose extractor, so the file carried no
+  `language`, no `defs`, no `symbols`, was split into several body-only
+  records, and was invisible to symbol search.
+
+- **An exported module `const` reached `defs` in neither TypeScript nor
+  JavaScript** ([#285](https://github.com/xerj-org/xerj/pull/285),
+  [#304](https://github.com/xerj-org/xerj/pull/304), closes
+  [#293](https://github.com/xerj-org/xerj/issues/293)). Capture only fired
+  when the value was a function, so a module whose whole public surface is
+  built by factory calls — `export const users = pgTable(...)`, a router, a
+  config object — extracted zero symbols and could not be found by symbol
+  search at all. The new pattern is exported-only, anchored to module scope,
+  and matches the `const` token, so function-local bindings and mutable
+  exported `let` stay out; module-private `const` was measured and excluded
+  because it added weight without retrieval gain.
+
+- **A PHP 8.1 enum extracted zero symbols, and class constants were never
+  captured** ([#286](https://github.com/xerj-org/xerj/pull/286)). An enum
+  declares no class, interface or trait, so a file holding one could not be
+  found by its own name through symbol search. Enums, enum cases and `const`
+  declarations — class-level and file-scope — now land in `defs`, with
+  cases treated as named constants the way Go's `const_spec` members are;
+  `define()` calls stay uncaptured.
+
 ### Added
 
 - **`GET /_ilm/status`, `POST /_ilm/start`, `POST /_ilm/stop`** (#282): the
@@ -175,7 +261,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ghost.
 
 - **A dynamically-discovered nested object field is no longer permanently
-  opaque to `GET _mapping`/`_field_caps`.** A subfield like `metadata.kind`
+  opaque to `GET _mapping`/`_field_caps`**
+  ([#292](https://github.com/xerj-org/xerj/pull/292),
+  [#307](https://github.com/xerj-org/xerj/pull/307)). A subfield like `metadata.kind`
   was already queryable (dotted-path resolution against `_source` doesn't
   care about the mapping) but had no way to be *discovered* by a client that
   reads the mapping instead of already knowing the field name — indistinguishable
@@ -192,7 +280,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"fields": {}}` before, the real entry after. The cluster-wide
   `GET /_field_caps` (as opposed to the per-index `GET /{index}/_field_caps`)
   had the same gaps independently and is fixed the same way — the two no
-  longer disagree about which fields exist.
+  longer disagree about which fields exist. Dynamic mapping also now
+  re-inspects nested fields on *every* document — a later document adding a
+  new nested key merges it into the existing mapping instead of leaving it
+  permanently invisible — and `Schema::field_count()` counts nested children
+  and multi-fields recursively, closing a `max_fields_per_index` bypass
+  where one top-level object could carry unbounded uncounted children. Note
+  the tightening this implies: a dynamic text field with its `.keyword`
+  multi-field now costs 2 against the default limit of 500, which matches
+  how ES counts `index.mapping.total_fields.limit`. Two bounded residuals
+  from review (a one-shot budget overshoot on a single deeply-keyed insert;
+  array-nested keys deferred to the 100-doc recheck) are filed as
+  [#312](https://github.com/xerj-org/xerj/issues/312).
   **Known limitation**: this only benefits indices created after this
   ships. An index (a `/_memory` namespace or otherwise) created before it
   already has its stored mapping written, and that isn't retroactively
@@ -242,7 +341,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirms the parent-directory fsync; Windows uses a same-directory Win32
   write-through replacement rather than claiming its directory-sync no-op is
   durable. Safe-only indices remain format 1.
+
 ### Changed
+
+- **Default `_search` source payloads omit engine-generated embedding
+  companions** ([#309](https://github.com/xerj-org/xerj/pull/309)). A search
+  with no `_source` now returns ordinary source fields without
+  `<field>_vector` and `<field>_vector_chunks` — identified from the
+  mapping's embedding config, not by name; measured payload size fell from
+  211,432 to 21,069 bytes for 5 hits (about 90%). Explicit `"_source": true`,
+  `"_source": ["field"]`, and include/exclude forms are unchanged, vectors
+  remain stored and used for kNN/semantic/hybrid scoring, and the
+  document-copying paths (`_reindex`, index clone, enrich execution) request
+  the full source explicitly so copies keep embeddings byte-for-byte. Add
+  `"_source": true` to restore the previous complete payload, including
+  vectors. Two residuals disclosed from review: a `fields` request naming a
+  companion resolves against the already-filtered source and comes back
+  empty under the new default — name it in `_source` instead
+  ([#310](https://github.com/xerj-org/xerj/issues/310)) — and the new
+  default arm copies each hit's source even on indices with no embedding
+  fields, a constant-factor read-path cost filed as
+  [#311](https://github.com/xerj-org/xerj/issues/311).
 
 - **`merge.strategy = "log_structured"` is now refused at startup instead of
   silently running the size-tiered policy**
@@ -383,8 +502,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one) processes only what changed and publishes from a sealed snapshot, so
   `--max-minutes` does not apply there — and that route now *says so* on
   stderr rather than accepting the flag and quietly not honouring it.
-
-### Changed
 
 - **`autoindex` indexes what matters first.** Phase B's queue was sorted by
   size alone — right about scheduling, silent about value, so a user who
@@ -1380,6 +1497,7 @@ documented "at most one bar per 15 s" floor is really 12.5 s.
   `embedding.default_endpoint` falls back to lexical at startup and
   `/v1/embedding/identity` reports `lexical` — the backend the server will
   really use — rather than `proxy`.
+
 ## [1.0.0-rc.10] - 2026-08-03
 
 ### Security
