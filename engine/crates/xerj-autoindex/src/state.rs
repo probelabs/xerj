@@ -50,7 +50,57 @@ pub struct PlanDataset {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_id_in_second, Journal};
+    use super::{run_id_in_second, Journal, StateLock};
+
+    /// `flock` ownership follows the open file description, so an inherited
+    /// descriptor can unlock the acquiring parent's lock. Model that post-fork
+    /// relationship deterministically with `try_clone`: a guard whose recorded
+    /// owner is a different PID must close only, while the acquiring owner's
+    /// guard must still release the lock.
+    #[cfg(unix)]
+    #[test]
+    fn foreign_pid_drop_preserves_lock_until_owner_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.lock");
+        let owner_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&owner_file).unwrap();
+        let inherited_file = owner_file.try_clone().unwrap();
+        let owner_pid = std::process::id();
+        let foreign_pid = if owner_pid == u32::MAX {
+            owner_pid - 1
+        } else {
+            owner_pid + 1
+        };
+        let owner = StateLock {
+            file: owner_file,
+            owner_pid,
+        };
+        let inherited = StateLock {
+            file: inherited_file,
+            owner_pid: foreign_pid,
+        };
+
+        drop(inherited);
+
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&contender)
+            .expect_err("a foreign-PID drop must not unlock the live owner's flock");
+
+        drop(owner);
+        fs2::FileExt::try_lock_exclusive(&contender)
+            .expect("the acquiring owner's drop must release its flock");
+        fs2::FileExt::unlock(&contender).unwrap();
+    }
 
     #[test]
     fn legacy_journal_can_resume_with_a_custom_operational_timeout() {
@@ -392,13 +442,20 @@ pub struct Journal {
 ///
 /// Closing the file normally releases an `flock`, but a concurrently forked
 /// child can temporarily retain the same open-file description until it
-/// execs. Explicitly unlocking before close keeps a completed Journal from
-/// spuriously blocking its immediate successor during that window.
-struct StateLock(std::fs::File);
+/// execs. The acquiring process explicitly unlocks before close so its
+/// completed Journal cannot be retained by that child. An inherited copy must
+/// only close: `LOCK_UN` on the shared open-file description would also release
+/// the still-live parent's lock.
+struct StateLock {
+    file: std::fs::File,
+    owner_pid: u32,
+}
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
+        if std::process::id() == self.owner_pid {
+            let _ = fs2::FileExt::unlock(&self.file);
+        }
     }
 }
 
@@ -647,9 +704,13 @@ impl Journal {
                 state_dir.display()
             )
         })?;
-        // Wrap immediately after acquisition so every later preflight exit
-        // explicitly unlocks before closing the file descriptor.
-        let state_lock = StateLock(state_lock_file);
+        // Capture the acquiring process before any later fallible work. A
+        // forked child inherits this value and therefore closes without
+        // unlocking the parent's shared open-file description.
+        let state_lock = StateLock {
+            file: state_lock_file,
+            owner_pid: std::process::id(),
+        };
         let journal_path = state_dir.join("journal.ndjson");
         let journal_exists = journal_path.exists();
         let (plan, committed_manifest, pending_sync, legacy_migration_reasons, unreadable_plan) =
