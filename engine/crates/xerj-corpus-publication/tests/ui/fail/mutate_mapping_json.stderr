@@ -1,0 +1,5 @@
+error[E0594]: cannot assign to data in a `&` reference
+ --> tests/ui/fail/mutate_mapping_json.rs:4:5
+  |
+4 |     bytes.canonical_json()[0] = b'!';
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot assign

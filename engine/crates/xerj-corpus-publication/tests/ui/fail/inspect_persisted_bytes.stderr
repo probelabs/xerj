@@ -1,0 +1,5 @@
+error[E0616]: field `0` of struct `PersistedPreparedInputBytesV1` is private
+ --> tests/ui/fail/inspect_persisted_bytes.rs:5:23
+  |
+5 |     let _ = persisted.0;
+  |                       ^ private field

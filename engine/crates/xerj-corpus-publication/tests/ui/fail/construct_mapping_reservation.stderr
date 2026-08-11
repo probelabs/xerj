@@ -1,0 +1,15 @@
+error[E0624]: associated function `from_canonical_mapping` is private
+  --> tests/ui/fail/construct_mapping_reservation.rs:13:35
+   |
+13 |       let _ = MappingReservationV1::from_canonical_mapping(
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^ private associated function
+   |
+  ::: src/plan.rs
+   |
+   | /     pub(crate) fn from_canonical_mapping(
+   | |         projection_kind: ProjectionKind,
+   | |         resource_key: ResourceKey,
+   | |         mapping_digest: MappingDigest,
+   | |         canonical_mapping_json: Box<[u8]>,
+   | |     ) -> Result<Self> {
+   | |_____________________- private associated function defined here

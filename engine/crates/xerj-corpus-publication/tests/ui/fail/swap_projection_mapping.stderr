@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/swap_projection_mapping.rs:2:24
+  |
+2 | fn main() { needs_data(xerj_corpus_publication::CatalogMappingV1::parse_json(b"{}").unwrap()); }
+  |             ---------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `DataMappingV1`, found `CatalogMappingV1`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/swap_projection_mapping.rs:1:4
+  |
+1 | fn needs_data(_: xerj_corpus_publication::DataMappingV1) {}
+  |    ^^^^^^^^^^ -----------------------------------------

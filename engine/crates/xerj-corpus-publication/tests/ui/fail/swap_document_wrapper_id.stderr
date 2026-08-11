@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/swap_document_wrapper_id.rs:3:28
+  |
+3 | fn main() { needs_document(xerj_corpus_publication::WrapperId::from_str("id").unwrap()); }
+  |             -------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `DocumentId`, found `WrapperId`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/swap_document_wrapper_id.rs:2:4
+  |
+2 | fn needs_document(_: xerj_corpus_publication::DocumentId) {}
+  |    ^^^^^^^^^^^^^^ --------------------------------------

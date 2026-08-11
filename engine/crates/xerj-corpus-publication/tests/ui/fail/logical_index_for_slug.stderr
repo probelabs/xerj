@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/logical_index_for_slug.rs:6:25
+  |
+6 |     needs_logical_index(xerj_corpus_publication::DataSlug::from_str("docs").unwrap());
+  |     ------------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `LogicalIndexName`, found `DataSlug`
+  |     |
+  |     arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/fail/logical_index_for_slug.rs:3:4
+  |
+3 | fn needs_logical_index(_: xerj_corpus_publication::LogicalIndexName) {}
+  |    ^^^^^^^^^^^^^^^^^^^ --------------------------------------------

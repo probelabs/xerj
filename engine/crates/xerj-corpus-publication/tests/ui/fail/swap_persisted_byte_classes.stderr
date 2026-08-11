@@ -1,0 +1,18 @@
+error[E0308]: arguments to this function are incorrect
+  --> tests/ui/fail/swap_persisted_byte_classes.rs:10:13
+   |
+10 |     let _ = DurableBeginBundleV1::rehydrate(plan, Vec::new(), prepared, begin);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ----              -------- expected `PersistedDesiredPlanBytesV1`, found `PersistedPreparedInputBytesV1`
+   |                                             |
+   |                                             expected `PersistedPreparedInputBytesV1`, found `PersistedDesiredPlanBytesV1`
+   |
+note: associated function defined here
+  --> src/begin.rs
+   |
+   |     pub fn rehydrate(
+   |            ^^^^^^^^^
+help: swap these arguments
+   |
+10 -     let _ = DurableBeginBundleV1::rehydrate(plan, Vec::new(), prepared, begin);
+10 +     let _ = DurableBeginBundleV1::rehydrate(prepared, Vec::new(), plan, begin);
+   |
