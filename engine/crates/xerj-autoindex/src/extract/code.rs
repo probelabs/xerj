@@ -234,6 +234,25 @@ const PYTHON_Q: &str = r#"
 (class_definition name: (identifier) @class)
 "#;
 
+// The last pattern is the JavaScript half of #170, and it is the same hole
+// #285 closed for TypeScript: an ESM module whose public surface is
+// `export const x = someBuilder(...)` — a schema, a route table, a config
+// object — is not a function value, so the two function-valued patterns above
+// miss it and the module extracts ZERO symbols.
+//
+// Deliberately identical in shape to the TS_Q pattern, and for the same three
+// reasons: exported-only because `defs` is the cross-file retrieval surface
+// (the broader scope was measured in #285 as weight without retrieval gain);
+// anchored to `program` because `lexical_declaration` is the same node inside a
+// function body, so an unanchored form would fill `defs` with function-local
+// `const` (the 90%-locals trap measured for C in #170); and the `"const"` token
+// matched so `export let` — mutable module state — stays out.
+//
+// The kind overlap is WIDER here than in TypeScript and is asserted, not
+// assumed: JS_Q's function-valued pattern admits `function_expression` as well
+// as `arrow_function`, so `export const f = function () {}` carries both
+// `@function` and `@const`, where the TS equivalent only does so for arrows.
+// `defs` dedups on (kind, name), so each spelling still answers its own search.
 const JS_Q: &str = r#"
 (function_declaration name: (identifier) @function)
 (generator_function_declaration name: (identifier) @function)
@@ -241,6 +260,7 @@ const JS_Q: &str = r#"
 (method_definition name: (property_identifier) @method)
 (variable_declarator name: (identifier) @function value: [(arrow_function) (function_expression)])
 (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @function value: (arrow_function))))
+(program (export_statement declaration: (lexical_declaration "const" (variable_declarator name: (identifier) @const))))
 "#;
 
 // The last pattern is #170's failure mode in the language where it is most
@@ -533,6 +553,55 @@ mod tests {
         assert!(has(&s, "m", "method"));
         assert!(has(&s, "g", "function"));
     }
+
+    /// The JavaScript half of #293. `TS_Q` gained exported-module-`const`
+    /// capture in #285; `JS_Q` did not, so an ESM JavaScript module whose whole
+    /// public surface is `export const x = someBuilder(...)` still extracted
+    /// ZERO symbols — #170's failure mode, unchanged, in `.js`/`.jsx`/`.mjs`/
+    /// `.cjs`. The scope boundaries are the ones #285 established and are
+    /// re-asserted here rather than assumed to carry over: the grammar differs.
+    #[test]
+    fn javascript_exported_module_const() {
+        let s = syms(
+            "javascript",
+            "export const users = pgTable(\"users\", {});\n\
+             export const ROUTES = [\"a\", \"b\"];\n\
+             const MAX_BODY_CHARS = 30000;\n\
+             export let mutableState = 2;\n\
+             function f(){ const local = 1; return local; }\n",
+        );
+        assert!(has(&s, "users", "const"), "got {s:?}");
+        assert!(has(&s, "ROUTES", "const"), "got {s:?}");
+        // Module-private const stays out: `defs` is the cross-file retrieval
+        // surface, and #285 measured the broader scope as weight without gain.
+        assert!(
+            !has(&s, "MAX_BODY_CHARS", "const"),
+            "captured a module-private const: {s:?}"
+        );
+        // Function-local `const` must NOT be captured — the 90%-locals trap.
+        assert!(!has(&s, "local", "const"), "captured a local: {s:?}");
+        // `let` is mutable module state, not a constant, even when exported.
+        assert!(!has(&s, "mutableState", "const"), "captured a let: {s:?}");
+    }
+
+    /// The overlap is wider in JavaScript than in TypeScript, and that is worth
+    /// pinning rather than discovering later: `JS_Q`'s function-valued pattern
+    /// admits `function_expression` as well as `arrow_function`, so BOTH forms
+    /// of an exported function-valued const carry two kinds. `defs` dedups on
+    /// (kind, name), so each answers searches for either spelling.
+    #[test]
+    fn javascript_exported_function_valued_const_is_both_kinds() {
+        let s = syms(
+            "javascript",
+            "export const arrowFn = () => 1;\n\
+             export const exprFn = function () { return 1; };\n",
+        );
+        assert!(has(&s, "arrowFn", "function"), "got {s:?}");
+        assert!(has(&s, "arrowFn", "const"), "got {s:?}");
+        assert!(has(&s, "exprFn", "function"), "got {s:?}");
+        assert!(has(&s, "exprFn", "const"), "got {s:?}");
+    }
+
     #[test]
     fn typescript() {
         let s = syms(
