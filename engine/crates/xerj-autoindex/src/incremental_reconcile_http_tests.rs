@@ -1138,6 +1138,73 @@ fn a_junk_file_is_recorded_and_never_fatal() {
     assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
 }
 
+#[test]
+fn issue_283_inferred_float_manifest_digest_replays_on_unchanged_rerun() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // 2,209 bytes / 9 records produces the exact inferred f64 which used to
+    // change from 245.44444444444446 to 245.44444444444449 on journal replay.
+    let mut csv = String::from("body\n");
+    for len in [245, 245, 245, 245, 245, 245, 245, 245, 249] {
+        csv.push_str(&"x".repeat(len));
+        csv.push('\n');
+    }
+    fs::write(corpus.path().join("data.csv"), csv).unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (first_code, first_summary) = run_index_report(config.clone()).unwrap();
+    assert_eq!(first_code, 0);
+    assert_eq!(first_summary.unwrap()["generation"], 1);
+
+    let (second_code, second_summary) = run_index_report(config).unwrap();
+    assert_eq!(second_code, 0);
+    assert_eq!(second_summary.unwrap()["generation"], 1);
+}
+
+#[test]
+fn issue_283_junk_bearing_generation_reconciles_a_shrinking_file_set() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // Preserve the inferred f64 from the original failure while exercising the
+    // user's actual second-run shape: generation one contains junk, then a
+    // tracked file disappears without any ignore-policy change.
+    let mut csv = String::from("body\n");
+    for len in [245, 245, 245, 245, 245, 245, 245, 245, 249] {
+        csv.push_str(&"x".repeat(len));
+        csv.push('\n');
+    }
+    fs::write(corpus.path().join("data.csv"), csv).unwrap();
+    fs::write(
+        corpus.path().join("remove.md"),
+        "# Temporary report\n\nThis file is removed before generation two.\n",
+    )
+    .unwrap();
+    fs::write(corpus.path().join("empty.csv"), "").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (first_code, first_summary) = run_index_report(config.clone()).unwrap();
+    assert_eq!(first_code, 3, "generation one completes with recorded junk");
+    let first_summary = first_summary.unwrap();
+    assert_eq!(first_summary["generation"], 1);
+    assert_eq!(first_summary["files_junk"], 1);
+    assert_eq!(paths(&endpoint.data_docs()), ["data.csv", "remove.md"]);
+
+    fs::remove_file(corpus.path().join("remove.md")).unwrap();
+    let (second_code, second_summary) = run_index_report(config).unwrap();
+    assert_eq!(second_code, 3, "the smaller tree still records empty.csv");
+    let second_summary = second_summary.unwrap();
+    assert_eq!(second_summary["generation"], 2);
+    assert_eq!(second_summary["files_junk"], 1);
+    assert_eq!(paths(&endpoint.data_docs()), ["data.csv"]);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
+}
+
 /// Junk *records* were fatal on the generated path
 /// (`durable preparation of X produced N junk records`) while the legacy path
 /// merely accumulated them — directly contradicting the documented contract

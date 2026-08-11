@@ -6488,6 +6488,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "simd-json",
  "streaming-iterator",
  "tempfile",
  "tree-sitter",
