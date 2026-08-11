@@ -1346,3 +1346,129 @@ fn a_generated_run_narrates_its_scan_and_closes_its_own_stream() {
         String::from_utf8_lossy(&buffer.lock().unwrap())
     );
 }
+
+/// Two byte-identical junk files — two empty files are the everyday case —
+/// made the fresh plan carry a duplicate alias for content that has no
+/// `plan.files` entry, so the generation cutover failed its own
+/// alias-projection invariant and the whole run aborted with exit 1 (#283's
+/// reproducible sibling: junk plus duplicates diverging between the fresh plan
+/// and the incremental projection). The fresh plan now projects aliases the
+/// same way `reconcile_plan` does, so the folder indexes, a no-op re-run
+/// confirms instead of committing a spurious generation, and a shrinking file
+/// set on the junk-bearing generation reconciles.
+#[test]
+fn two_byte_identical_junk_files_commit_reconcile_and_survive_a_shrink() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n2,beta\n").unwrap();
+    fs::write(corpus.path().join("e1.dat"), "").unwrap();
+    fs::write(corpus.path().join("e2.dat"), "").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (code, summary) = run_index_report(config.clone())
+        .expect("a folder with two byte-identical junk files must index, not abort");
+    let summary = summary.expect("the junk-bearing generation still commits");
+    assert_eq!(code, 3, "junk is recorded, never fatal (cli.rs EXIT CODES)");
+    assert_eq!(summary["generation"], 1);
+    assert_eq!(summary["records_total"], 2);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    // The fresh plan and the incremental projection must agree byte-for-byte
+    // on how junk-content aliases project, or this no-op re-run would see a
+    // "changed" plan and commit generation 2 over nothing.
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    assert_eq!(
+        journal_events(state_dir.path(), "sync_commit"),
+        1,
+        "a no-op re-run over the junk-bearing generation confirms; it must not re-commit"
+    );
+
+    // The issue's headline shape: the file set shrinks on a generation that
+    // carries junk records.
+    fs::remove_file(corpus.path().join("a.csv")).unwrap();
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
+    assert!(
+        paths(&endpoint.data_docs()).is_empty(),
+        "the deleted dataset's records must not survive the reconcile"
+    );
+
+    // And the junk files themselves disappearing reconciles back to clean.
+    fs::remove_file(corpus.path().join("e1.dat")).unwrap();
+    fs::remove_file(corpus.path().join("e2.dat")).unwrap();
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 3);
+}
+
+/// The #283 abort itself: a durable generation record that fails its own
+/// re-validation used to surface as a bare internal invariant ("desired
+/// manifest digest does not match sync_begin payload", exit 1) — text the user
+/// can do nothing with. However the journal got that way, the refusal must
+/// name the recovery route the way the exec-config guard already does, and
+/// keep the invariant attached as the cause.
+#[test]
+fn a_journal_that_fails_its_own_revalidation_names_the_rebuild_route() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let source = corpus.path().join("rows.csv");
+    fs::write(&source, "id,value\n1,first\n").unwrap();
+    fs::write(corpus.path().join("empty.csv"), "").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+
+    // Leave a durable pending generation behind: begin succeeds, the bulk is
+    // partially applied, the run fails before commit.
+    fs::write(&source, "id,value\n1,replaced\n2,second\n").unwrap();
+    endpoint
+        .state
+        .lock()
+        .unwrap()
+        .partially_apply_next_data_bulk = true;
+    assert!(run_index(config.clone()).is_err());
+    assert_eq!(journal_events(state_dir.path(), "sync_begin"), 2);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    // Corrupt the pending sync_begin payload in a spot only the manifest
+    // digest covers: the junk record's byte count. This makes the next run
+    // hit exactly the #283 invariant.
+    let journal_path = state_dir.path().join("journal.ndjson");
+    let tampered: String = fs::read_to_string(&journal_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).unwrap();
+            if record.get("kind").and_then(Value::as_str) == Some("sync_begin")
+                && record
+                    .pointer("/desired/generation")
+                    .and_then(Value::as_u64)
+                    == Some(2)
+            {
+                let bytes = record
+                    .pointer_mut("/desired/plan/junk_files/0/bytes")
+                    .expect("the junk-bearing desired manifest records its junk file");
+                *bytes = Value::from(bytes.as_u64().unwrap() + 1);
+            }
+            let mut line = serde_json::to_string(&record).unwrap();
+            line.push('\n');
+            line
+        })
+        .collect();
+    fs::write(&journal_path, tampered).unwrap();
+
+    let error = run_index(config).expect_err("a tampered generation journal must refuse to run");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("desired manifest digest does not match sync_begin payload"),
+        "the internal invariant must stay attached as the cause: {rendered}"
+    );
+    assert!(
+        rendered.contains("Rebuild with a new --state-dir and a new --prefix"),
+        "the refusal must name the recovery route, not just the invariant: {rendered}"
+    );
+}

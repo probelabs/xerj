@@ -677,7 +677,18 @@ pub fn replay_pending_operations(
         .committed_manifest
         .clone()
         .context("pending corpus generation has no committed base")?;
-    pending.validate_against(&base)?;
+    // Same contract as the journal-replay wrap in `state.rs` (#283): a pending
+    // generation that fails its own re-validation is unrepairable by
+    // re-running, and the internal invariant alone is not actionable.
+    pending.validate_against(&base).with_context(|| {
+        format!(
+            "the pending corpus generation {} no longer re-validates against committed \
+             generation {}; the generation journal is not internally consistent, and re-running \
+             will not repair it. No remote data was changed. Rebuild with a new --state-dir and \
+             a new --prefix",
+            pending.desired.generation, base.generation
+        )
+    })?;
     let snapshot = open_snapshot(state_dir, &pending.tx_id)?;
     verify_snapshot_binding(&pending, &snapshot)?;
     backend.provision_generation(&pending.desired)?;
