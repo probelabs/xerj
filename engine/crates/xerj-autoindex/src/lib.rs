@@ -4697,6 +4697,26 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             "\nnext: `xerj autoindex map --url {}` for the data map; search via GET /{}-*/_search",
             cfg.url, cfg.prefix
         );
+        // This line is where an agent learns how to search, so it is where the
+        // code-aware form belongs. A blind usability run showed the cost of
+        // omitting it: the agent followed exactly this guidance, got whole
+        // files back, and reinvented client-side slicing rather than
+        // discovering `_passage` — which it never saw mentioned anywhere.
+        // Only printed when source code was actually indexed; for a PDF or log
+        // corpus it would be noise.
+        let indexed_code = plan.files.values().any(|fa| fa.family == "code");
+        if indexed_code {
+            println!(
+                "      code was indexed — for a function/class instead of a whole file:\n\
+                 \x20       curl -s $URL/{}-*/_search -H 'Content-Type: application/json' \\\n\
+                 \x20         -d '{{\"query\":{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\
+                 \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},\
+                 \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
+                 \x20       (`defs` matches the file that DEFINES a symbol; `_passage` returns \
+                 the enclosing block, not the file)",
+                cfg.prefix
+            );
+        }
     }
     // Exit 3 means "completed, some input was unusable". Backend rejections
     // are not consulted and must not be: a rejected item aborts the run with

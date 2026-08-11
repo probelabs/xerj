@@ -245,6 +245,18 @@ fn print_help() {
              xerj brain      <folder>        one command: index a folder into a running, browsable\n\
                                              second brain in your browser (see xerj brain --help)\n\
          \n\
+         SEARCHING A CODEBASE:\n\
+             A search hit returns the whole indexed document, which for source code is the\n\
+             whole file. To get only the matching function or class, ask for the passage:\n\
+         \n\
+                 curl -s $URL/<index>/_search -H 'Content-Type: application/json' \\\n\
+                   -d '{{\"query\":{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\n\
+                        \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},\n\
+                        \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
+         \n\
+             `defs` matches the file that DEFINES a symbol rather than one that mentions it;\n\
+             `_passage` returns the enclosing block. Without them you get whole files.\n\
+         \n\
          ENVIRONMENT:\n\
              XERJ_LOG         Log level filter (default: info)\n\
              XERJ_CONFIG      Config file path\n\

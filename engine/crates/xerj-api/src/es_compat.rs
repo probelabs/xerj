@@ -3114,7 +3114,28 @@ pub async fn get_doc(
             let version = idx.lookup_version(&id).unwrap_or(1);
             let seq_no = idx.lookup_seq_no(&id).unwrap_or(0);
             let resp = EsGetResponse::found(&index, &id, version, seq_no, filtered);
-            Json(resp).into_response()
+            // A blind usability run fetched a whole source file this way and
+            // paid 3.17 MB for one function: `GET /_doc/{id}` is where an agent
+            // lands once search has told it *which* document it wants, and it
+            // had no way to learn a cheaper route existed. Same size-triggered
+            // hint as `_search`, emitted before the payload so it survives
+            // output truncation.
+            match serde_json::to_value(&resp) {
+                Ok(Value::Object(map)) => {
+                    let doc_bytes = map
+                        .get("_source")
+                        .map(|s| serde_json::to_string(s).map(|s| s.len()).unwrap_or(0))
+                        .unwrap_or(0);
+                    if doc_bytes > LARGE_RESPONSE_HINT_THRESHOLD_BYTES {
+                        let mut out = serde_json::Map::new();
+                        out.insert("_xerj".into(), get_doc_response_hint(&index, doc_bytes));
+                        out.extend(map);
+                        return Json(Value::Object(out)).into_response();
+                    }
+                    Json(Value::Object(map)).into_response()
+                }
+                _ => Json(resp).into_response(),
+            }
         }
         Ok(None) => {
             let resp = EsGetResponse::not_found(&index, &id);
@@ -6952,16 +6973,52 @@ fn fields_request_includes_passage(fields: &Value) -> bool {
 /// every response the caller already handled correctly is exactly the kind
 /// of noise this project's review guidance rules out. Returns `None`
 /// whenever the hint would not be actionable.
+/// Hint attached to an oversized `GET /{index}/_doc/{id}` response.
+///
+/// A document fetch cannot be narrowed the way a search can, so the recovery is
+/// to go back through `_search` and ask for the passage instead of the document.
+fn get_doc_response_hint(index: &str, doc_bytes: usize) -> Value {
+    json!({
+        "hints": [{
+            "reason": format!(
+                "this document's `_source` is {doc_bytes} bytes — for code, that is \
+                 the whole file. To retrieve only the function or class you are after, \
+                 search for it and request the passage instead of fetching the document."
+            ),
+            "try": {
+                "request": format!("POST /{index}/_search"),
+                "body": {
+                    "query": {"match": {"body": "<the symbol or phrase you want>"}},
+                    // Project the path rather than dropping `_source`: a blind
+                    // run got the passage, could not tell which file it came
+                    // from, and spent 6 MB on follow-ups recovering it. Costs
+                    // ~69 bytes and makes the reply a complete answer.
+                    "_source": ["ax_path", "title"],
+                    "fields": ["_passage"],
+                },
+            },
+        }],
+    })
+}
+
 fn search_response_hint(index: &str, body: &EsSearchBody, hits: &[EsHit]) -> Option<Value> {
-    // `_source` defaulted or explicitly `true` still returns the whole
-    // document; anything else (`false`, an include/exclude list, an
-    // object) means the caller already made a deliberate choice.
-    let source_is_unprojected = matches!(body.source, None | Some(Value::Bool(true)));
+    // Trigger on the SIZE of what we are about to return, not on whether the
+    // caller projected `_source`.
+    //
+    // An earlier version gated on "the caller did not project", which sounded
+    // reasonable and was wrong: a blind usability run had an agent project
+    // `_source` almost immediately — a good instinct — which silenced the hint
+    // permanently. It then pulled 372 KB with `_source:["body"]` and never
+    // learned `_passage` existed. Projecting to a whole-file field is exactly
+    // the case that needs the hint most, so size is the only honest signal.
+    //
+    // `_passage` already requested is still a valid reason to stay quiet: that
+    // caller has found the mechanism and is choosing its payload deliberately.
     let passage_already_requested = body
         .fields
         .as_ref()
         .is_some_and(fields_request_includes_passage);
-    if !source_is_unprojected || passage_already_requested {
+    if passage_already_requested {
         return None;
     }
 
@@ -6977,16 +7034,21 @@ fn search_response_hint(index: &str, body: &EsSearchBody, hits: &[EsHit]) -> Opt
     Some(json!({
         "hints": [{
             "reason": format!(
-                "this response returned complete document bodies via `_source` \
-                 ({source_bytes} bytes across {hit_count} hit(s)). For the matching \
-                 snippet only, project `_source` and add `\"fields\":[\"_passage\"]`.",
+                "this response carried {source_bytes} bytes of `_source` across \
+                 {hit_count} hit(s) — for code, that is usually whole files. To get \
+                 only the matching function or class, add `\"fields\":[\"_passage\"]` \
+                 and drop `_source`.",
                 hit_count = hits.len(),
             ),
             "try": {
                 "request": format!("POST /{index}/_search"),
                 "body": {
                     "query": body.query.clone().unwrap_or_else(|| json!({"match_all": {}})),
-                    "_source": false,
+                    // Project the path rather than dropping `_source`: a blind
+                    // run got the passage, could not tell which file it came
+                    // from, and spent 6 MB on follow-ups recovering it. Costs
+                    // ~69 bytes and makes the reply a complete answer.
+                    "_source": ["ax_path", "title"],
                     "fields": ["_passage"],
                 },
             },
@@ -7146,7 +7208,7 @@ mod search_response_hint_tests {
     }
 
     #[tokio::test]
-    async fn hint_is_absent_when_source_is_already_projected() {
+    async fn hint_is_absent_when_source_is_disabled() {
         let state = test_state();
         index_one_big_doc(&state, "hint-projected").await;
         let router = crate::router::build_es_compat_router(state);
@@ -7158,6 +7220,30 @@ mod search_response_hint_tests {
         )
         .await;
         assert!(json.get("_xerj").is_none(), "unexpected hint: {json}");
+    }
+
+    /// Regression for a defect a blind usability run exposed: the hint used to
+    /// be suppressed whenever the caller projected `_source` at all. A fresh
+    /// user projected early — a good instinct — and thereby silenced the hint
+    /// for the rest of the session, then pulled 372 KB with `_source:["body"]`
+    /// and never discovered `_passage`. Projecting to a whole-file field is the
+    /// case that needs the hint most, so the trigger is size, not projection.
+    #[tokio::test]
+    async fn hint_still_appears_when_source_is_projected_to_a_large_field() {
+        let state = test_state();
+        index_one_big_doc(&state, "hint-projected-big").await;
+        let router = crate::router::build_es_compat_router(state);
+
+        let (json, _) = run_search(
+            &router,
+            "hint-projected-big",
+            json!({"query": {"match_all": {}}, "_source": ["content"]}),
+        )
+        .await;
+        assert!(
+            json.get("_xerj").is_some(),
+            "a large projected response must still hint: {json}"
+        );
     }
 
     #[tokio::test]
