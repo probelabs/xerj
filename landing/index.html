@@ -13,7 +13,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
-<link rel="stylesheet" href="/style.css?v=if9">
+<link rel="stylesheet" href="/style.css?v=if10">
 </head>
 <body>
 
@@ -276,64 +276,48 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
 </section>
 
 <!-- BENCHMARKS — SUPPORTING EVIDENCE -------------------------->
-<section class="scene-section">
-  <div class="kicker"><span class="accent">05</span><span class="dash">·</span><span>SUPPORTING EVIDENCE · XERJ vs ELASTICSEARCH 8.13.4</span></div>
-  <div class="ticker">
-    <div class="tk">
-      <div class="eyebrow">FULL QUERY MATRIX · CLOSED-LOOP · CACHE OFF</div>
-      <div class="value"><span class="accent">55W</span> · 26T · 4L</div>
-      <div class="hint">vs live ES 8.13.4 · 3 N/A · the 4 losses are all read-under-write p99 (published too) · demo/playbooks/SCORECARD.md</div>
-    </div>
-    <div class="tk">
-      <div class="eyebrow">XERJ vs ES · BULK INGEST</div>
-      <div class="value"><span class="accent">1.72×</span> FASTER</div>
-      <div class="hint">191k vs 111k docs/s, same corpus, closed-loop · acked deletes survive SIGTERM/SIGKILL restarts (11/11 crash cells)</div>
-    </div>
-    <div class="tk">
-      <div class="eyebrow">XERJ vs ES · INDEX ON DISK</div>
-      <div class="value"><span class="accent">1.61×</span> SMALLER</div>
-      <div class="hint">index on-disk 176 MB vs ES 283 MB, same corpus · demo/playbooks/SCORECARD.md</div>
-    </div>
-  </div>
-  <p class="viz-caption" style="margin-top:var(--sp-4);">The engine numbers back the use cases up — they are not the product. kNN recall@10 measured 1.00 (unfiltered kNN is now HNSW-served with exact rescoring — re-measured 1.00 vs ES 8.13.4's 0.80 on the official bench cell). <a class="mono" href="/benchmarks/" style="color:var(--z-mute);">FULL BENCHMARK METHODOLOGY + REPRODUCTION →</a></p>
-</section>
-
-<!-- ENGINE --------------------------------------------------->
 <section class="scene-section" id="engine" style="border-top:0;">
-  <div class="kicker"><span class="accent">06</span><span class="dash">·</span><span>INSIDE XERJ</span></div>
-  <h2 class="scene">ONE BINARY.<br>NO JVM.<br><span class="accent">NO COMPROMISES.</span></h2>
+  <div class="kicker"><span class="accent">05</span><span class="dash">·</span><span>WHY XERJ · THE COMPETITIVE ADVANTAGE</span></div>
+  <h2 class="scene">THE ADVANTAGE,<br><span class="accent">FEATURE BY FEATURE.</span></h2>
 
   <p class="wide">
-    XERJ is written in Rust and ships as a single static binary.
-    No JVM to tune, no sidecars to deploy, no cluster coordinator to
-    install. The query planner, the vector index, the ingestion
-    pipeline, the embedded Raft consensus, and the HTTP server all
-    live in the same process.
+    Every feature exists to cut the thing agents actually spend: context.
+    Reading a file costs a context window; asking an index costs kilobytes.
+    XERJ puts everything an agent needs to <em>ask</em> — code, documents,
+    vectors, memory — behind one query surface.
   </p>
 
   <div class="row">
-    <div class="k">Query types</div>
-    <div class="v">50 query types, machine-checked against the parser dispatch table including native hybrid BM25 + kNN fusion — more than most dedicated vector databases</div>
+    <div class="k">AST code search</div>
+    <div class="v">Source is parsed with tree-sitter (13 languages) into symbols with kind and line number plus a searchable definitions field — the agent retrieves a <em>function with its contract</em>, not a grep line that needs the whole file opened to judge</div>
   </div>
   <div class="row">
-    <div class="k">Aggregations</div>
-    <div class="v">Metric + bucket + pipeline agg families · terms are <strong>~1.15×</strong> faster than ES because histograms are pre-computed at ingest</div>
+    <div class="k">Token economics</div>
+    <div class="v">In the <a href="/use-cases/code-security-audit.html">WordPress security audit</a>, an agent worked across 1,492 PHP files on roughly <strong>26,000 tokens</strong> — about half a percent of the tree read into context. That is the product; the speed is a side effect</div>
   </div>
   <div class="row">
-    <div class="k">Vector index</div>
-    <div class="v">HNSW-served kNN with exact rescoring on unfiltered queries (measured recall@10 1.00 on the official bench query) · exact brute-force scan for filtered / quantized / small-index shapes · cosine / L2 / dot · SQ8 / SQ4 / binary quantization · max 16,384 dims (ES caps at 4,096)</div>
+    <div class="k">Hybrid in one pass</div>
+    <div class="v">50 query types, machine-checked against the parser dispatch table, including native BM25 + kNN fusion (RRF) in a single query tree — no bolt-on vector database, no fusion glue between two systems</div>
   </div>
   <div class="row">
-    <div class="k">AI-native</div>
-    <div class="v">Auto-embed on ingest with a built-in lexical embedder (optional external proxy) · agent-memory store · anomaly detection · semantic search at query time</div>
+    <div class="k">Semantic without setup</div>
+    <div class="v">Auto-embed on ingest, fully offline. Honest by default: the built-in embedder is lexical feature-hashing (vocabulary overlap, not neural understanding); the in-binary neural encoder and the external-proxy mode are drop-in upgrades when you want them</div>
   </div>
   <div class="row">
-    <div class="k">Storage</div>
-    <div class="v">Columnar · 9 domain-aware encodings · ZSTD · <strong>1.20×</strong> smaller than ES on the benchmark corpus · mmap'd segments</div>
+    <div class="k">Agent memory + graph</div>
+    <div class="v">A namespaced <code class="inline">/_memory</code> REST API — store, recall by meaning / keyword / vector, filter, forget, physically isolated per agent — and a <code class="inline">/_graph</code> knowledge layer with evidence on every link</div>
   </div>
   <div class="row">
-    <div class="k">Cluster</div>
-    <div class="v">Embedded Raft consensus · metadata replication · region-based partitioning · no ZooKeeper / etcd</div>
+    <div class="k">Zero-config ingest</div>
+    <div class="v">One command sniffs 13 format families by content — code, CSV, JSON, PDF, DOCX, SQLite, logs — honours <code class="inline">.gitignore</code>, records junk instead of crashing on it, and resumes incrementally</div>
+  </div>
+  <div class="row">
+    <div class="k">Speaks Elasticsearch</div>
+    <div class="v">1,365 / 1,368 wire-conformance cases green on every commit — existing clients, dashboards and tooling connect unchanged. A migration bridge, not a clone: the engine underneath is designed for agents</div>
+  </div>
+  <div class="row">
+    <div class="k">One static binary</div>
+    <div class="v">Rust, no JVM, sub-second start, Apache-2.0 — laptop to server with the same artifact. Benchmarks with wins <em>and</em> losses published at <a href="/benchmarks">xerj.org/benchmarks</a></div>
   </div>
 </section>
 
