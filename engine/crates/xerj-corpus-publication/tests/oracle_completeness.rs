@@ -127,7 +127,7 @@ fn every_checked_in_binary_or_json_oracle_is_complete_and_self_consistent() {
     assert!(incomplete_scope.is_empty());
     assert_eq!(
         provenance["candidate_source"]["status"],
-        "attested_preceding_source_commit"
+        "final_attested_repaired_source_commit"
     );
     assert_eq!(
         provenance["candidate_source"]["base_commit"],
@@ -139,21 +139,37 @@ fn every_checked_in_binary_or_json_oracle_is_complete_and_self_consistent() {
     );
     assert_eq!(
         provenance["candidate_source"]["candidate_commit"],
-        "a214f1587df2d39f38e1017b4ebe4766715e3716"
+        "fc04d9aba39ced1dfcff78bce67ba3b39a660a4e"
     );
     assert_eq!(
         provenance["candidate_source"]["candidate_tree"],
-        "3eae5b0efbac8598d9939c76272e585874124a4a"
+        "13c75a660b63629e53860d5d8792266862f7f835"
     );
     assert_eq!(
         provenance["candidate_source"]["claim"],
-        "This attestation pins the exact preceding source commit and tree. The final provenance-attestation commit changes evidence metadata and oracle assertions only; it intentionally does not and cannot self-pin its own commit or tree."
+        "This final attestation supersedes the earlier attestation and pins the exact repaired source commit and tree. The final provenance-attestation commit changes evidence metadata and oracle assertions only; it intentionally does not and cannot self-pin its own commit or tree."
     );
     assert_eq!(
         provenance["attestation_commit"]["changes_evidence_metadata_only"],
         true
     );
     assert_eq!(provenance["attestation_commit"]["self_pins"], false);
+    assert_eq!(
+        provenance["attestation_commit"]["supersedes_attestation_commit"],
+        "5eaecbcecbfebaece8c03a83bab4250a5a95ea9d"
+    );
+    assert_eq!(
+        provenance["attestation_commit"]["superseded_candidate_commit"],
+        "a214f1587df2d39f38e1017b4ebe4766715e3716"
+    );
+    assert_eq!(
+        provenance["attestation_commit"]["superseded_candidate_tree"],
+        "3eae5b0efbac8598d9939c76272e585874124a4a"
+    );
+    assert_eq!(
+        provenance["attestation_commit"]["statement"],
+        "The final attestation commit is deliberately outside the pinned repaired source identity. It supersedes the earlier attestation, records the already-committed repair identity, and updates only the generated evidence metadata and assertions that verify it."
+    );
     assert_eq!(
         provenance["attestation_commit"]["pinned_preceding_commit"],
         provenance["candidate_source"]["candidate_commit"]
@@ -204,7 +220,7 @@ fn every_checked_in_binary_or_json_oracle_is_complete_and_self_consistent() {
     let reference_encoder = include_bytes!("support/reference_codec.rs");
     assert_eq!(
         provenance["reference_encoder"]["status"],
-        "pinned_in_preceding_source_commit; unchanged_by_attestation"
+        "pinned_in_repaired_source_commit; unchanged_by_final_attestation"
     );
     assert_eq!(
         provenance["reference_encoder"]["sha256"].as_str().unwrap(),

@@ -1,10 +1,13 @@
 {
   "attestation_commit": {
     "changes_evidence_metadata_only": true,
-    "pinned_preceding_commit": "a214f1587df2d39f38e1017b4ebe4766715e3716",
-    "pinned_preceding_tree": "3eae5b0efbac8598d9939c76272e585874124a4a",
+    "pinned_preceding_commit": "fc04d9aba39ced1dfcff78bce67ba3b39a660a4e",
+    "pinned_preceding_tree": "13c75a660b63629e53860d5d8792266862f7f835",
     "self_pins": false,
-    "statement": "The attestation commit is deliberately outside the pinned source identity. Its only purpose is to record that already-committed source identity and update the assertions that verify this evidence."
+    "statement": "The final attestation commit is deliberately outside the pinned repaired source identity. It supersedes the earlier attestation, records the already-committed repair identity, and updates only the generated evidence metadata and assertions that verify it.",
+    "superseded_candidate_commit": "a214f1587df2d39f38e1017b4ebe4766715e3716",
+    "superseded_candidate_tree": "3eae5b0efbac8598d9939c76272e585874124a4a",
+    "supersedes_attestation_commit": "5eaecbcecbfebaece8c03a83bab4250a5a95ea9d"
   },
   "authority_plan": {
     "bytes": 220497,
@@ -14,10 +17,10 @@
   "candidate_source": {
     "base_commit": "aa142d6772a046baa9d5728328737020d3d05818",
     "base_tree": "2f9e469b1f1e12ab9005e0f666ddb1ff2cd680b9",
-    "candidate_commit": "a214f1587df2d39f38e1017b4ebe4766715e3716",
-    "candidate_tree": "3eae5b0efbac8598d9939c76272e585874124a4a",
-    "claim": "This attestation pins the exact preceding source commit and tree. The final provenance-attestation commit changes evidence metadata and oracle assertions only; it intentionally does not and cannot self-pin its own commit or tree.",
-    "status": "attested_preceding_source_commit"
+    "candidate_commit": "fc04d9aba39ced1dfcff78bce67ba3b39a660a4e",
+    "candidate_tree": "13c75a660b63629e53860d5d8792266862f7f835",
+    "claim": "This final attestation supersedes the earlier attestation and pins the exact repaired source commit and tree. The final provenance-attestation commit changes evidence metadata and oracle assertions only; it intentionally does not and cannot self-pin its own commit or tree.",
+    "status": "final_attested_repaired_source_commit"
   },
   "fence_prerequisite": "d8b243023f3c325c3c433cd384ad74ca4e12af51",
   "first_slice_plan": {
@@ -70,11 +73,11 @@
   },
   "incomplete_scope": [],
   "independent_generator": {
-    "bytes": 150028,
+    "bytes": 150536,
     "hash_methodology": "SHA-256 over the exact checked-in generate.py bytes read before output serialization; generator output files are not inputs to this hash.",
     "id": "independent-python-review11-v2",
     "path": "generate.py",
-    "sha256": "115e3a3d2a78d7e3607d32d703a28732251d6714c59629b9a24172c462182383"
+    "sha256": "e8f4c901b4dbe9eee60f4d5c2cdb60f126c961b4c9e02ddc59baee4f5ad4656e"
   },
   "mutation_execution": {
     "derivation": "Completion is true only when each recorded observation exactly matches the row/case expectations derived from this ledger and every row's classified execution gate passes.",
@@ -167,7 +170,7 @@
     "bytes": 1119,
     "path": "../../tests/support/reference_codec.rs",
     "sha256": "cccc1085a9b40c5b8231a0cfb66f873a893406f3e051153285da340519f56ba8",
-    "status": "pinned_in_preceding_source_commit; unchanged_by_attestation"
+    "status": "pinned_in_repaired_source_commit; unchanged_by_final_attestation"
   },
   "review_11": {
     "bytes": 16338,

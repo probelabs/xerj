@@ -3351,26 +3351,37 @@ def provenance(
             "tree": "20a6a8c450ba7aa86979d78bb3a90c0fdef783df",
         },
         "candidate_source": {
-            "status": "attested_preceding_source_commit",
+            "status": "final_attested_repaired_source_commit",
             "base_commit": "aa142d6772a046baa9d5728328737020d3d05818",
             "base_tree": "2f9e469b1f1e12ab9005e0f666ddb1ff2cd680b9",
-            "candidate_commit": "a214f1587df2d39f38e1017b4ebe4766715e3716",
-            "candidate_tree": "3eae5b0efbac8598d9939c76272e585874124a4a",
+            "candidate_commit": "fc04d9aba39ced1dfcff78bce67ba3b39a660a4e",
+            "candidate_tree": "13c75a660b63629e53860d5d8792266862f7f835",
             "claim": (
-                "This attestation pins the exact preceding source commit and tree. The final "
-                "provenance-attestation commit changes evidence metadata and oracle assertions "
-                "only; it intentionally does not and cannot self-pin its own commit or tree."
+                "This final attestation supersedes the earlier attestation and pins the exact "
+                "repaired source commit and tree. The final provenance-attestation commit "
+                "changes evidence metadata and oracle assertions only; it intentionally does "
+                "not and cannot self-pin its own commit or tree."
             ),
         },
         "attestation_commit": {
             "changes_evidence_metadata_only": True,
             "self_pins": False,
-            "pinned_preceding_commit": "a214f1587df2d39f38e1017b4ebe4766715e3716",
-            "pinned_preceding_tree": "3eae5b0efbac8598d9939c76272e585874124a4a",
+            "pinned_preceding_commit": "fc04d9aba39ced1dfcff78bce67ba3b39a660a4e",
+            "pinned_preceding_tree": "13c75a660b63629e53860d5d8792266862f7f835",
+            "supersedes_attestation_commit": (
+                "5eaecbcecbfebaece8c03a83bab4250a5a95ea9d"
+            ),
+            "superseded_candidate_commit": (
+                "a214f1587df2d39f38e1017b4ebe4766715e3716"
+            ),
+            "superseded_candidate_tree": (
+                "3eae5b0efbac8598d9939c76272e585874124a4a"
+            ),
             "statement": (
-                "The attestation commit is deliberately outside the pinned source identity. "
-                "Its only purpose is to record that already-committed source identity and "
-                "update the assertions that verify this evidence."
+                "The final attestation commit is deliberately outside the pinned repaired "
+                "source identity. It supersedes the earlier attestation, records the already-"
+                "committed repair identity, and updates only the generated evidence metadata "
+                "and assertions that verify it."
             ),
         },
         "fence_prerequisite": "d8b243023f3c325c3c433cd384ad74ca4e12af51",
@@ -3436,7 +3447,7 @@ def provenance(
             "path": "../../tests/support/reference_codec.rs",
             "bytes": len(reference_bytes),
             "sha256": raw_sha256(reference_bytes),
-            "status": "pinned_in_preceding_source_commit; unchanged_by_attestation",
+            "status": "pinned_in_repaired_source_commit; unchanged_by_final_attestation",
         },
         "generated_at": "2026-08-12T00:10:39+02:00",
         "toolchain": (
