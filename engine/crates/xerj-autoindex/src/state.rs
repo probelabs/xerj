@@ -370,7 +370,7 @@ pub struct FileDone {
 pub struct Journal {
     path: PathBuf,
     file: std::fs::File,
-    _state_lock: std::fs::File,
+    _state_lock: StateLock,
     pub run_id: String,
     pub resumed: bool,
     pub done: HashMap<String, FileDone>,
@@ -386,6 +386,20 @@ pub struct Journal {
     pub committed_manifest: Option<crate::sync::CommittedManifest>,
     pub pending_sync: Option<crate::sync::PendingSync>,
     pub legacy_migration_reasons: Vec<String>,
+}
+
+/// Owns the process-wide state-directory exclusion lock.
+///
+/// Closing the file normally releases an `flock`, but a concurrently forked
+/// child can temporarily retain the same open-file description until it
+/// execs. Explicitly unlocking before close keeps a completed Journal from
+/// spuriously blocking its immediate successor during that window.
+struct StateLock(std::fs::File);
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
 }
 
 /// Per-process monotonic suffix for [`new_run_id`].
@@ -591,7 +605,7 @@ fn read_plan_for_preflight(
 
 pub struct JournalPreflight {
     state_dir: PathBuf,
-    state_lock: std::fs::File,
+    state_lock: StateLock,
     pub plan: Option<Plan>,
     pub committed_manifest: Option<crate::sync::CommittedManifest>,
     pub pending_sync: Option<crate::sync::PendingSync>,
@@ -620,19 +634,22 @@ impl Journal {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
         let lock_path = state_dir.join(".autoindex.lock");
-        let state_lock = std::fs::OpenOptions::new()
+        let state_lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
-        state_lock.try_lock_exclusive().with_context(|| {
+        state_lock_file.try_lock_exclusive().with_context(|| {
             format!(
                 "autoindex state {} is already in use by another process; wait for it to \
                  finish or choose a different --state-dir",
                 state_dir.display()
             )
         })?;
+        // Wrap immediately after acquisition so every later preflight exit
+        // explicitly unlocks before closing the file descriptor.
+        let state_lock = StateLock(state_lock_file);
         let journal_path = state_dir.join("journal.ndjson");
         let journal_exists = journal_path.exists();
         let (plan, committed_manifest, pending_sync, legacy_migration_reasons, unreadable_plan) =
