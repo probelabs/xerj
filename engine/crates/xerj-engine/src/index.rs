@@ -24564,16 +24564,41 @@ fn apply_source_filter(
             hit
         })
         .collect();
-    let generated_companion_fields: Vec<String> =
-        generated_companion_fields.iter().cloned().collect();
     match filter {
-        SourceFilter::Default => hits
-            .into_iter()
-            .map(|mut h| {
-                h.source = filter_object(&h.source, &[], &generated_companion_fields);
-                h
-            })
-            .collect(),
+        // The default is a passthrough: only engine-generated embedding
+        // companions are stripped, so an index without embedding mappings
+        // must not pay a per-hit deep copy of its source (issue #311).
+        SourceFilter::Default => {
+            if generated_companion_fields.is_empty() {
+                return hits;
+            }
+            // A dotted companion (embedding target under a nested mapping)
+            // strips a *nested* key; a `*` would be a glob to
+            // `filter_object`'s matcher. Both need the general filter —
+            // plain names, the only shape the engine generates today, are
+            // removed in place without copying the kept values.
+            if generated_companion_fields
+                .iter()
+                .any(|f| f.contains('.') || f.contains('*'))
+            {
+                let excludes: Vec<String> = generated_companion_fields.iter().cloned().collect();
+                return hits
+                    .into_iter()
+                    .map(|mut h| {
+                        h.source = filter_object(&h.source, &[], &excludes);
+                        h
+                    })
+                    .collect();
+            }
+            hits.into_iter()
+                .map(|mut h| {
+                    if let Some(map) = h.source.as_object_mut() {
+                        map.retain(|k, _| !generated_companion_fields.contains(k));
+                    }
+                    h
+                })
+                .collect()
+        }
         SourceFilter::Enabled(true) => hits,
         // `_source: false`: keep the raw source so the response layer can
         // still resolve `fields` / `_ignored` / `highlight` against it —
@@ -24879,6 +24904,57 @@ mod source_filter_tests {
         );
 
         assert_eq!(filtered[0].source, original);
+    }
+
+    /// Heap-buffer pointer of a field's string value. Stable across map
+    /// mutation and moves; changes only if the value itself is deep-copied.
+    fn str_buf_ptr(source: &Value, field: &str) -> *const u8 {
+        source[field].as_str().unwrap().as_ptr()
+    }
+
+    // Issue #311: with no embedding mappings there is nothing to strip, so
+    // the default `_source` arm must hand every hit back untouched instead
+    // of deep-copying O(source bytes) per hit on the hottest read path.
+    #[test]
+    fn default_source_without_companions_is_a_zero_copy_passthrough() {
+        let companions = generated_embedding_companion_fields(&Schema::empty());
+        assert!(companions.is_empty());
+
+        let hits = vec![hit(
+            "doc",
+            0.9,
+            json!({"body": "the source text", "title": "a user field"}),
+        )];
+        let body_ptr = str_buf_ptr(&hits[0].source, "body");
+        let title_ptr = str_buf_ptr(&hits[0].source, "title");
+
+        let filtered = apply_source_filter(hits, &SourceFilter::Default, &companions);
+
+        assert_eq!(
+            filtered[0].source,
+            json!({"body": "the source text", "title": "a user field"})
+        );
+        assert_eq!(str_buf_ptr(&filtered[0].source, "body"), body_ptr);
+        assert_eq!(str_buf_ptr(&filtered[0].source, "title"), title_ptr);
+    }
+
+    // Issue #311, companion-bearing indexes: strip the companions in place
+    // rather than rebuilding the map with a deep clone of every kept value.
+    #[test]
+    fn default_source_with_companions_strips_in_place_without_deep_copy() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let hits = vec![hit("doc", 0.9, generated_source())];
+        let body_ptr = str_buf_ptr(&hits[0].source, "body");
+        let title_ptr = str_buf_ptr(&hits[0].source, "title");
+
+        let filtered = apply_source_filter(hits, &SourceFilter::Default, &companions);
+
+        assert_eq!(
+            filtered[0].source,
+            json!({"body": "the source text", "title": "a user field"})
+        );
+        assert_eq!(str_buf_ptr(&filtered[0].source, "body"), body_ptr);
+        assert_eq!(str_buf_ptr(&filtered[0].source, "title"), title_ptr);
     }
 }
 
