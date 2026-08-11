@@ -55,6 +55,7 @@ onnx-experimental = ["xerj-ai/onnx-experimental"]
 stackprobe = []
 
 [dev-dependencies]
+xerj-storage = { path = "../xerj-storage", features = ["test-hooks"] }
 tempfile  = { workspace = true }
 tokio     = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true }
