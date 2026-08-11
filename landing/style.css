@@ -453,6 +453,31 @@ section.hero-split .lead { margin-bottom: 0; }
   border-color: var(--z-accent);
 }
 .hero-install-agent { margin-top: var(--sp-4); }
+/* The agent paste-prompt is the page's primary CTA — boxed and accent-lit,
+   unlike every other command on the page. */
+.hero-install-cmd.agent-prompt {
+  border: 1px solid var(--z-accent);
+  background: color-mix(in srgb, var(--z-accent) 9%, transparent);
+  padding: var(--sp-3) var(--sp-4);
+}
+.hero-install-cmd.agent-prompt code {
+  color: var(--z-accent);
+  font-size: clamp(var(--fs-13), 1.15vw, 17px);
+  line-height: 1.55;
+}
+.hero-install-cmd.agent-prompt .hero-install-copy {
+  background: var(--z-accent);
+  border-color: var(--z-accent);
+  color: var(--z-bg);
+  font-weight: 700;
+  align-self: center;
+}
+.hero-install-cmd.agent-prompt .hero-install-copy:hover,
+.hero-install-cmd.agent-prompt .hero-install-copy:focus-visible {
+  background: var(--z-ink);
+  border-color: var(--z-ink);
+  color: var(--z-bg);
+}
 .hero-install-agent-line {
   font-family: var(--font-prose);
   font-size: var(--fs-13);
