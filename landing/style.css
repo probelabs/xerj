@@ -2575,10 +2575,32 @@ svg.chart.is-interactive .ser:focus-visible {
   .hero-center .hero { font-size: clamp(36px, 12vw, 64px); }
   .hero-report-tag { font-size: 13px; }
   .hero-sub { font-size: var(--fs-16); }
-  .hero-proof { font-size: 14px; }
+  .hero-marks { font-size: 12px; }
   .prompt-label { font-size: 12px; }
   .prompt-card code { font-size: 15px; }
-  .hero-alt-install { font-size: 12px; }
+  .hero-marks {
+  font-family: var(--font-data);
+  font-size: var(--fs-11);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--z-mute);
+  margin: var(--sp-4) auto 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--sp-2) var(--sp-3);
+}
+.hero-marks a {
+  color: var(--z-mute);
+  text-decoration: none;
+  border-bottom: 1px solid var(--z-line);
+  padding-bottom: 1px;
+}
+.hero-marks a:hover, .hero-marks a:focus-visible {
+  color: var(--z-accent);
+  border-color: var(--z-accent);
+}
+.hero-alt-install { font-size: 12px; }
 }
 @media (max-width: 330px) {
   .hero-center .hero { font-size: 36px; }
