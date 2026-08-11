@@ -25252,17 +25252,33 @@ fn build_highlight_fragments(
     // window math below operates on `text` (the original), so mixing in
     // lowercased offsets would slice through multibyte codepoints and panic.
     let mut match_positions: Vec<(usize, usize)> = Vec::new();
+    // Parallel record of each candidate in LOWERCASED space, so scoring can
+    // look at surrounding text without needing an orig->lower reverse map.
+    let mut lower_positions: Vec<(usize, usize)> = Vec::new();
     for term in terms {
         let mut start = 0;
+        // Budget the scan PER TERM, not across all terms. A shared budget is
+        // spent entirely by whichever term happens to be scanned first, and
+        // `terms` arrives sorted alphabetically — so for `function
+        // human_time_diff`, the hundreds of early occurrences of "function"
+        // filled the quota and "human_time_diff" was never searched for at
+        // all. Two independent usability runs hit this: both asked for a
+        // phrase deep in a large file, both got fragments from the top of the
+        // file highlighting only the common word, and both abandoned
+        // highlighting and downloaded whole documents instead.
+        let mut per_term = 0usize;
+        let per_term_cap = (num_frags * 4).max(4);
         while let Some(pos) = text_lower[start..].find(term.as_str()) {
             let abs = start + pos;
             let (oa, ob) = lower_span_to_orig(lower_map, orig_len, abs, abs + term.len());
             if ob > oa {
                 match_positions.push((oa, ob));
+                lower_positions.push((abs, abs + term.len()));
             }
             start = abs + term.len();
-            if match_positions.len() > num_frags * 4 {
-                break; // enough candidates — stop scanning early
+            per_term += 1;
+            if per_term >= per_term_cap {
+                break; // enough candidates FOR THIS TERM; keep scanning others
             }
         }
     }
@@ -25271,8 +25287,36 @@ fn build_highlight_fragments(
         return Vec::new();
     }
 
-    // Sort by position so we pick the earliest matches first.
-    match_positions.sort_by_key(|&(s, _)| s);
+    // Rank candidates by how many DISTINCT query terms fall inside the window
+    // a fragment would cover, richest first, and only then by position.
+    //
+    // Sorting purely by position returns whatever appears earliest, which for
+    // a multi-term query is almost always the commonest word — the top of the
+    // file rather than the place the query is actually about. Counting
+    // distinct terms makes the spot where the terms co-occur win, which is the
+    // phrase the caller searched for.
+    let half_window = (frag_size / 2).max(1);
+    let lower_len = text_lower.len();
+    let mut scored: Vec<(usize, (usize, usize))> = match_positions
+        .iter()
+        .zip(lower_positions.iter())
+        .map(|(&orig, &(ls, le))| {
+            let lo = ls.saturating_sub(half_window).min(lower_len);
+            let hi = (le + half_window).min(lower_len);
+            // Snap to char boundaries: text_lower is UTF-8 and a naive slice
+            // could land mid-codepoint.
+            let lo = (0..=lo).rev().find(|&i| text_lower.is_char_boundary(i)).unwrap_or(0);
+            let hi = (hi..=lower_len).find(|&i| text_lower.is_char_boundary(i)).unwrap_or(lower_len);
+            let window = &text_lower[lo..hi];
+            let distinct = terms.iter().filter(|t| window.contains(t.as_str())).count();
+            (distinct, orig)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1 .0.cmp(&b.1 .0)));
+    let match_positions: Vec<(usize, usize)> = scored.into_iter().map(|(_, p)| p).collect();
+
+    // (Ordering is decided by the distinct-term ranking above; the old
+    // earliest-first sort would undo it.)
 
     let text_bytes = text.as_bytes();
     let total_bytes = text_bytes.len();
@@ -38860,6 +38904,42 @@ mod highlight_multibyte_tests {
         let terms = vec!["a".to_string()];
         let out = highlight_full_text(text, &lower, &map, &terms, "<em>", "</em>");
         assert_eq!(out, "İ<em>a</em>");
+    }
+
+    #[test]
+    fn fragment_highlight_finds_a_rare_term_buried_after_many_common_ones() {
+        // The defect this guards: the candidate scan used to share one budget
+        // across all terms and `terms` arrives sorted, so a common word
+        // exhausted the quota and the distinctive word was never searched for.
+        // Candidates were then ordered earliest-first, so even when both were
+        // found the top-of-document match won. Two blind usability runs asked
+        // for a phrase deep in a large file, both got fragments from the head
+        // of the file, and both abandoned highlighting entirely.
+        // Each filler block is far wider than `fragment_size`, so every common
+        // match claims its own fragment window instead of collapsing into a
+        // shared one — the shape of a real source file, where the rare term
+        // sits thousands of bytes past hundreds of common ones.
+        let pad = "x".repeat(600);
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!("function helper_{i}() {{ /* {pad} */ }}\n"));
+        }
+        text.push_str("function human_time_diff( $from, $to = 0 ) { return 1; }\n");
+        for i in 0..300 {
+            text.push_str(&format!("function tail_{i}() {{ /* {pad} */ }}\n"));
+        }
+
+        let (lower, map) = build_lower_offset_map(&text);
+        // Sorted, as `extract_highlight_terms` produces: the common term first.
+        let terms = vec!["function".to_string(), "human_time_diff".to_string()];
+        let frags = build_highlight_fragments(&text, &lower, &map, &terms, "<em>", "</em>", 200, 2);
+
+        assert!(!frags.is_empty(), "expected fragments");
+        assert!(
+            frags.iter().any(|f| f.contains("human_time_diff")),
+            "the rare term is what the caller searched for; fragments must reach \
+             it rather than returning the head of the document: {frags:?}"
+        );
     }
 
     #[test]
