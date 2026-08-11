@@ -278,12 +278,42 @@ pub fn build_sample_queries(pd: &PlanDataset, correlations: &[KeyCorr]) -> Vec<V
             .max_by_key(|w| w.len())
             .unwrap_or("data")
             .to_string();
-        out.push(json!({
-            "class": "full_text",
-            "title": format!("Full-text (BM25) match on {}", f.name),
-            "request": format!("POST /{}/_search", pd.index),
-            "body": {"query": {"match": {(f.name.clone()): word.clone()}}, "size": 3}
-        }));
+        // Code datasets additionally carry `defs` (newline-joined "kind
+        // name" per symbol, identifying the file that DEFINES a symbol —
+        // see `dataset.rs`). Searching `[body, defs]` together with
+        // `most_fields` measurably improves identifier retrieval over body
+        // alone (mean rank 2.17 -> 1.83, no conceptual-query regression)
+        // with no boost needed. Only emit this shape when `defs` actually
+        // exists on the dataset — never assume it. `_source` is projected
+        // to the two fields an agent needs to act on a hit (`ax_path`,
+        // `title` — present on every ingested document, not just code) and
+        // `fields: ["_passage"]` asks for the matching snippet instead of
+        // the whole file body.
+        let has_defs = specs.iter().any(|s| s.name == "defs");
+        if has_defs {
+            out.push(json!({
+                "class": "full_text",
+                "title": format!("Code-aware full-text (BM25) match on {} + defs", f.name),
+                "request": format!("POST /{}/_search", pd.index),
+                "body": {
+                    "query": {"multi_match": {
+                        "query": word.clone(),
+                        "fields": [f.name.clone(), "defs"],
+                        "type": "most_fields",
+                    }},
+                    "_source": ["ax_path", "title"],
+                    "fields": ["_passage"],
+                    "size": 3,
+                }
+            }));
+        } else {
+            out.push(json!({
+                "class": "full_text",
+                "title": format!("Full-text (BM25) match on {}", f.name),
+                "request": format!("POST /{}/_search", pd.index),
+                "body": {"query": {"match": {(f.name.clone()): word.clone()}}, "size": 3}
+            }));
+        }
         // 3. hybrid — only when a semantic_text field exists
         if let Some(sf) = &pd.semantic_field {
             out.push(json!({
@@ -633,5 +663,100 @@ mod duplicate_tests {
         assert_eq!(rendered.matches("## Duplicate aliases").count(), 1);
         assert!(rendered.contains("`copy.pdf` → `report.pdf`"));
         assert!(!rendered.contains("## Junk / skipped"));
+    }
+}
+
+#[cfg(test)]
+mod sample_query_tests {
+    use super::*;
+    use crate::infer::FieldSpec;
+
+    fn spec(name: &str, es_type: &str, avg_len: f64, examples: &[&str]) -> FieldSpec {
+        FieldSpec {
+            name: name.into(),
+            es_type: es_type.into(),
+            date_enc: None,
+            semantic: None,
+            cardinality_est: 0,
+            cardinality_overflow: false,
+            null_ratio: 0.0,
+            avg_len,
+            coverage: 1.0,
+            examples: examples.iter().map(|s| s.to_string()).collect(),
+            notes: vec![],
+            date_min: None,
+            date_max: None,
+            date_evidence: vec![],
+        }
+    }
+
+    fn dataset(slug: &str, specs: Vec<FieldSpec>) -> PlanDataset {
+        PlanDataset {
+            slug: slug.into(),
+            index: format!("ax-{slug}"),
+            family: "document".into(),
+            group: None,
+            specs,
+            time_field: None,
+            semantic_field: None,
+            sampled_records: 1,
+            file_count: 1,
+        }
+    }
+
+    /// A dataset carrying `defs` (the code extractor's per-symbol index —
+    /// see `dataset.rs`) must get the code-aware `multi_match` shape:
+    /// `[body, defs]` with `most_fields`, `_source` projected to just the
+    /// fields an agent needs to act on a hit, and `_passage` requested
+    /// instead of the whole file body.
+    #[test]
+    fn code_dataset_with_defs_gets_a_code_aware_projected_passage_query() {
+        let pd = dataset(
+            "repo",
+            vec![
+                spec("title", "keyword", 8.0, &["main.rs"]),
+                spec("body", "text", 400.0, &["fn main implementation body"]),
+                spec("defs", "text", 20.0, &["function main"]),
+            ],
+        );
+        let queries = build_sample_queries(&pd, &[]);
+        let full_text = queries
+            .iter()
+            .find(|q| q["class"] == "full_text")
+            .expect("a full_text sample query");
+        assert_eq!(
+            full_text["body"]["query"]["multi_match"]["fields"],
+            json!(["body", "defs"])
+        );
+        assert_eq!(
+            full_text["body"]["query"]["multi_match"]["type"],
+            "most_fields"
+        );
+        assert_eq!(full_text["body"]["_source"], json!(["ax_path", "title"]));
+        assert_eq!(full_text["body"]["fields"], json!(["_passage"]));
+    }
+
+    /// A dataset with no `defs` field (the overwhelming majority — plain
+    /// data/text datasets) must keep the original single-field `match`
+    /// shape unchanged: no `defs` reference, no forced projection.
+    #[test]
+    fn non_code_dataset_keeps_the_plain_single_field_match() {
+        let pd = dataset(
+            "logs",
+            vec![spec(
+                "message",
+                "text",
+                200.0,
+                &["connection reset by peer"],
+            )],
+        );
+        let queries = build_sample_queries(&pd, &[]);
+        let full_text = queries
+            .iter()
+            .find(|q| q["class"] == "full_text")
+            .expect("a full_text sample query");
+        assert!(full_text["body"]["query"]["match"]["message"].is_string());
+        assert!(full_text["body"].get("_source").is_none());
+        assert!(full_text["body"].get("fields").is_none());
     }
 }

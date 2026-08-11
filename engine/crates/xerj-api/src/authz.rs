@@ -284,6 +284,7 @@ fn es_error(status: StatusCode, reason: String) -> Response {
             request_id: None,
         },
         status: status.as_u16(),
+        xerj_hint: None,
     };
     (status, Json(body)).into_response()
 }

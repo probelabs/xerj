@@ -181,9 +181,17 @@ fn print_help() {
         "xerj v{} — the unified search engine for AI (Elasticsearch wire-compatible)\n\
          \n\
          USAGE:\n\
-             xerj [OPTIONS]\n\
+             xerj [OPTIONS]                      start the server (options below)\n\
+             xerj autoindex <folder> [OPTIONS]   zero-config discovery + indexing — the\n\
+                                                  flagship path for most agents (see xerj\n\
+                                                  autoindex --help)\n\
+             xerj autoindex map                  print the discovered data map\n\
+             xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
+                                                  index --help)\n\
+             xerj brain <folder>                 index + browse in one command (see xerj\n\
+                                                  brain --help)\n\
          \n\
-         OPTIONS:\n\
+         OPTIONS (for `xerj [OPTIONS]`, the bare server start):\n\
              --config,   -c <PATH>  Path to TOML config file\n\
              --data-dir, -d <PATH>  Override data directory\n\
              --bind,     -b <ADDR>  Interface to bind every listener to. Default 127.0.0.1 —\n\

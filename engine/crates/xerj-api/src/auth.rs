@@ -420,6 +420,7 @@ fn unauthorized_response() -> Response {
             request_id: None,
         },
         status: 401,
+        xerj_hint: None,
     };
 
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
