@@ -93,7 +93,11 @@ const PHP_KINDS: &[&str] = &[
     "trait_declaration",
 ];
 
-const PYTHON_KINDS: &[&str] = &["function_definition", "class_definition", "decorated_definition"];
+const PYTHON_KINDS: &[&str] = &[
+    "function_definition",
+    "class_definition",
+    "decorated_definition",
+];
 
 const JS_KINDS: &[&str] = &[
     "function_declaration",
@@ -277,6 +281,21 @@ fn cache_key(language: &str, body: &str) -> u64 {
     xxhash_rust::xxh3::xxh3_64_with_seed(body.as_bytes(), seed)
 }
 
+/// Syntactic wrappers that carry a declaration's modifiers rather than being
+/// blocks in their own right. A resolved block is widened through these so the
+/// passage shows the declaration as it is actually written — `export function
+/// f()`, not a bare `function f()` that reads as un-exported.
+///
+/// Language-agnostic by construction: a kind absent from a grammar simply never
+/// matches, so one table is safe for every language in the registry.
+const WRAPPER_KINDS: &[&str] = &[
+    // JavaScript / TypeScript
+    "export_statement",
+    "export_default_declaration",
+    // Python
+    "decorated_definition",
+];
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 /// Find the smallest node enclosing byte range `[start, end)` in `body`
@@ -295,22 +314,12 @@ fn cache_key(language: &str, body: &str) -> u64 {
 /// - the smallest acceptable block exceeds [`max_block_bytes`] — since any
 ///   larger enclosing block is only bigger, this stops at the first
 ///   candidate rather than searching further up.
-/// Syntactic wrappers that carry a declaration's modifiers rather than being
-/// blocks in their own right. A resolved block is widened through these so the
-/// passage shows the declaration as it is actually written — `export function
-/// f()`, not a bare `function f()` that reads as un-exported.
-///
-/// Language-agnostic by construction: a kind absent from a grammar simply never
-/// matches, so one table is safe for every language in the registry.
-const WRAPPER_KINDS: &[&str] = &[
-    // JavaScript / TypeScript
-    "export_statement",
-    "export_default_declaration",
-    // Python
-    "decorated_definition",
-];
-
-pub fn enclosing_block(language: &str, body: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+pub fn enclosing_block(
+    language: &str,
+    body: &str,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
     if start > end || end > body.len() {
         return None;
     }
@@ -366,7 +375,8 @@ mod tests {
         let needle = "y * 2";
         let start = body.find(needle).unwrap();
         let end = start + needle.len();
-        let (s, e) = enclosing_block("rust", body, start, end).expect("expected an enclosing block");
+        let (s, e) =
+            enclosing_block("rust", body, start, end).expect("expected an enclosing block");
         let block = &body[s..e];
         assert!(
             block.starts_with("fn target"),
@@ -397,7 +407,8 @@ mod tests {
         let needle = "return y";
         let start = body.find(needle).unwrap();
         let end = start + needle.len();
-        let (s, e) = enclosing_block("python", body, start, end).expect("expected an enclosing block");
+        let (s, e) =
+            enclosing_block("python", body, start, end).expect("expected an enclosing block");
         let block = &body[s..e];
         assert!(
             block.starts_with("def target"),
@@ -440,7 +451,8 @@ mod tests {
 
     #[test]
     fn go_package_level_const_resolves_to_its_declaration() {
-        let body = "package p\n\nconst (\n\tDefaultTimeout = 30\n\tMaxRetries     = 5\n)\n\nfunc f() {}\n";
+        let body =
+            "package p\n\nconst (\n\tDefaultTimeout = 30\n\tMaxRetries     = 5\n)\n\nfunc f() {}\n";
         let needle = "MaxRetries";
         let start = body.find(needle).unwrap();
         let (s, e) = enclosing_block("go", body, start, start + needle.len())
@@ -503,7 +515,10 @@ mod tests {
 
     #[test]
     fn unsupported_language_falls_back() {
-        assert_eq!(enclosing_block("cobol", "IDENTIFICATION DIVISION.", 0, 5), None);
+        assert_eq!(
+            enclosing_block("cobol", "IDENTIFICATION DIVISION.", 0, 5),
+            None
+        );
     }
 
     #[test]

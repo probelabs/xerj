@@ -7033,7 +7033,11 @@ fn referenced_query_fields(q: &Value, out: &mut Vec<String>) {
 /// spent their largest payloads — 182 KB and 65 KB in one run — trial-and-
 /// erroring field names before thinking to fetch `_mapping`. The engine knows
 /// the schema; staying silent is a choice, and the wrong one.
-fn unknown_field_hint(index: &str, body: &EsSearchBody, schema: &xerj_common::types::Schema) -> Option<Value> {
+fn unknown_field_hint(
+    index: &str,
+    body: &EsSearchBody,
+    schema: &xerj_common::types::Schema,
+) -> Option<Value> {
     let query = body.query.as_ref()?;
     let mut referenced = Vec::new();
     referenced_query_fields(query, &mut referenced);
@@ -7118,11 +7122,8 @@ fn exact_term_clauses(q: &Value, out: &mut Vec<(String, String)>) {
                     "term" => {
                         if let Value::Object(inner) = v {
                             for (f, val) in inner {
-                                let s = val
-                                    .get("value")
-                                    .unwrap_or(val)
-                                    .as_str()
-                                    .map(str::to_string);
+                                let s =
+                                    val.get("value").unwrap_or(val).as_str().map(str::to_string);
                                 if let Some(s) = s {
                                     out.push((f.clone(), s));
                                 }
@@ -12840,15 +12841,15 @@ async fn search_impl(
                 }
                 for (field, value) in clauses.into_iter().take(2) {
                     let base = field.split('.').next().unwrap_or(&field).to_string();
-                    let is_keyword = schema
-                        .field(&base)
-                        .is_some_and(|f| matches!(f.field_type, xerj_common::types::FieldType::Keyword));
+                    let is_keyword = schema.field(&base).is_some_and(|f| {
+                        matches!(f.field_type, xerj_common::types::FieldType::Keyword)
+                    });
                     if !is_keyword {
                         continue;
                     }
-                    let Ok(sample_req) =
-                        xerj_query::parse_request(&json!({"query": {"match_all": {}}, "size": 256}))
-                    else {
+                    let Ok(sample_req) = xerj_query::parse_request(
+                        &json!({"query": {"match_all": {}}, "size": 256}),
+                    ) else {
                         continue;
                     };
                     let Ok(sample) = idx.search(&sample_req).await else {

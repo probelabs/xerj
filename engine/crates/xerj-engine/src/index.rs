@@ -25305,8 +25305,13 @@ fn build_highlight_fragments(
             let hi = (le + half_window).min(lower_len);
             // Snap to char boundaries: text_lower is UTF-8 and a naive slice
             // could land mid-codepoint.
-            let lo = (0..=lo).rev().find(|&i| text_lower.is_char_boundary(i)).unwrap_or(0);
-            let hi = (hi..=lower_len).find(|&i| text_lower.is_char_boundary(i)).unwrap_or(lower_len);
+            let lo = (0..=lo)
+                .rev()
+                .find(|&i| text_lower.is_char_boundary(i))
+                .unwrap_or(0);
+            let hi = (hi..=lower_len)
+                .find(|&i| text_lower.is_char_boundary(i))
+                .unwrap_or(lower_len);
             let window = &text_lower[lo..hi];
             let distinct = terms.iter().filter(|t| window.contains(t.as_str())).count();
             (distinct, orig)
@@ -27213,7 +27218,10 @@ fn refine_code_passage(
     if field != "body" {
         return None;
     }
-    if !matches!(get_field_value(source, "symbol_count"), Some(Value::Number(_))) {
+    if !matches!(
+        get_field_value(source, "symbol_count"),
+        Some(Value::Number(_))
+    ) {
         return None;
     }
     let language = get_field_value(source, "language")?;
@@ -27636,7 +27644,13 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                             })
                             .and_then(|anchor| {
                                 let anchor_end = (anchor + 1).min(text.len());
-                                refine_code_passage(&hit.source, field_name, text, anchor, anchor_end)
+                                refine_code_passage(
+                                    &hit.source,
+                                    field_name,
+                                    text,
+                                    anchor,
+                                    anchor_end,
+                                )
                             })
                             .unwrap_or((start, end));
                         best = Some((
