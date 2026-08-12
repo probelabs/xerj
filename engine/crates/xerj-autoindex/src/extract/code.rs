@@ -377,8 +377,8 @@ fn predicates_hold(query: &Query, m: &tree_sitter::QueryMatch, text: &str) -> bo
             })
             .collect();
         match &*p.operator {
-            "eq?" | "any-of?" => strings.iter().any(|s| *s == got),
-            "not-eq?" | "not-any-of?" => !strings.iter().any(|s| *s == got),
+            "eq?" | "any-of?" => strings.contains(&got),
+            "not-eq?" | "not-any-of?" => !strings.contains(&got),
             _ => false,
         }
     })
