@@ -141,7 +141,21 @@ strip = false
 
 # Fast iteration profile: symbolized with thin LTO and parallel codegen.
 # It is intentionally not production-codegen-equivalent.
-# Fast verification profile — for the implement -> build -> verify loop.
+# Fast verification profile — the BUILD half of the implement -> build -> verify
+# loop. Its sibling is [profile.ci-test] above, which serves the TEST half.
+#
+# The division is deliberate and the two are not redundant:
+#   quick    — `cargo build`. Inherits panic = "abort" from release, matching the
+#              shipped binary, so the artifact you smoke-test behaves like the real
+#              one (panic strategy is observable).
+#   ci-test  — `cargo test`. Uses panic = "unwind", because cargo rebuilds the whole
+#              dependency graph with unwind for test targets regardless; declaring it
+#              makes that split explicit instead of accidental, and lets test builds
+#              share artifacts with each other rather than fighting a build profile
+#              they can never reuse.
+#
+# Use ci-test for `cargo test`. Use quick for `cargo build`. Neither is ever valid
+# for a released artifact or a published number.
 #
 # WHY: [profile.release] below is a SHIPPING configuration — `lto = "fat"` plus
 # `codegen-units = 1` is the slowest build Rust can produce, deliberately, because

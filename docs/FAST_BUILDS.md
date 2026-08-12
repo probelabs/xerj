@@ -24,6 +24,8 @@ cargo build --profile quick -j 12 -p xerj-server
 cargo test  --profile quick -j 12 -p xerj-autoindex
 ```
 
+Its sibling `[profile.ci-test]` serves `cargo test`; use `quick` for `cargo build`.
+
 It keeps everything affecting **correctness** identical to release —
 `panic = "abort"` (inherited; it changes observable behaviour so it must match),
 same features, same `target-cpu` — and relaxes only optimisation.
