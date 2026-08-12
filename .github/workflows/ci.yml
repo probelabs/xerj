@@ -269,14 +269,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+          # api-checks / conformance / usecase-smoke / autoindex-fd-smoke all
+          # build xerj-server under [profile.ci-test], so they share one cache
+          # entry instead of each storing a near-identical copy. rust-cache
+          # scopes keys by os/arch, so the macOS and Windows legs stay separate.
+          shared-key: xerj-server-ci-test
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Build xerj (release)
+      # ci-test, not release: this job boots the binary and checks liveness,
+      # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
+      # checks. Same opt-level and features, only LTO scope differs.
+      - name: Build xerj (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server
+        run: cargo build --profile ci-test -p xerj-server
 
       # Boots the binary, seeds a real corpus, then gates on:
       #   smoke suite (61/61), API liveness (no 5xx across the read surface),
@@ -297,10 +305,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+          # api-checks / conformance / usecase-smoke / autoindex-fd-smoke all
+          # build xerj-server under [profile.ci-test], so they share one cache
+          # entry instead of each storing a near-identical copy. rust-cache
+          # scopes keys by os/arch, so the macOS and Windows legs stay separate.
+          shared-key: xerj-server-ci-test
 
-      - name: Build server + conformance runner (release)
+      # ci-test: conformance asserts wire behaviour, not throughput.
+      - name: Build server + conformance runner (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server -p es-yaml-runner
+        run: cargo build --profile ci-test -p xerj-server -p es-yaml-runner
 
       # rc.3 regression: the shipped xerj.default.toml failed to parse
       # (`unknown field hnsw_offload_threshold`) so the documented
@@ -315,7 +329,7 @@ jobs:
           set -euo pipefail
           SMOKE="$(mktemp -d)"
           cd "$SMOKE"
-          "$GITHUB_WORKSPACE/engine/target/release/xerj" \
+          "$GITHUB_WORKSPACE/engine/target/ci-test/xerj" \
             --config "$GITHUB_WORKSPACE/engine/xerj.default.toml" > server.log 2>&1 &
           SMOKE_PID=$!
           up=""
@@ -340,7 +354,7 @@ jobs:
           set -euo pipefail
           DATA="$(mktemp -d)"
           echo "XERJ_DATA=$DATA" >> "$GITHUB_ENV"
-          ./target/release/xerj --insecure --data-dir "$DATA" > "$DATA/server.log" 2>&1 &
+          ./target/ci-test/xerj --insecure --data-dir "$DATA" > "$DATA/server.log" 2>&1 &
           echo "XERJ_PID=$!" >> "$GITHUB_ENV"
           for _ in $(seq 1 80); do
             if curl -fs -m1 localhost:9200/_cluster/health >/dev/null 2>&1; then
@@ -416,14 +430,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+          # api-checks / conformance / usecase-smoke / autoindex-fd-smoke all
+          # build xerj-server under [profile.ci-test], so they share one cache
+          # entry instead of each storing a near-identical copy. rust-cache
+          # scopes keys by os/arch, so the macOS and Windows legs stay separate.
+          shared-key: xerj-server-ci-test
 
       - name: Build xerj + xerj-mcp (release)
         working-directory: engine
-        run: cargo build --release -p xerj-server -p xerj-mcp
+        run: cargo build --profile ci-test -p xerj-server -p xerj-mcp
 
       # Drives the demo/usecases scripts themselves, so the thing CI gates is
       # the same thing a reader runs. No browser, no model, no network.
       - name: Use-case smoke (brain transcript, MCP tools, autoindex discovery)
+        env:
+          XERJ_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj
+          XERJ_MCP_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj-mcp
         run: bash .github/scripts/usecase-smoke.sh
 
   # Per-OS runtime gate. The earlier autoindex "Too many open files" crash was
@@ -449,11 +471,21 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+          # api-checks / conformance / usecase-smoke / autoindex-fd-smoke all
+          # build xerj-server under [profile.ci-test], so they share one cache
+          # entry instead of each storing a near-identical copy. rust-cache
+          # scopes keys by os/arch, so the macOS and Windows legs stay separate.
+          shared-key: xerj-server-ci-test
 
-      - name: Build xerj (release)
+      # ci-test, not release: this job boots the binary and checks liveness,
+      # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
+      # checks. Same opt-level and features, only LTO scope differs.
+      - name: Build xerj (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server
+        run: cargo build --profile ci-test -p xerj-server
 
       - name: Autoindex a many-dataset corpus (must not exhaust file descriptors)
         shell: bash
+        env:
+          XERJ_BIN: engine/target/ci-test/xerj
         run: bash .github/scripts/autoindex-fd-smoke.sh
