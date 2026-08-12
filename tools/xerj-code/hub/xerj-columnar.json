@@ -1,0 +1,5 @@
+{"corpus":"xerj-columnar","cloned_at":"2026-08-07T08:28:36Z","repos":[
+  {"repo":"ClickHouse","url":"https://github.com/ClickHouse/ClickHouse","licence":"Apache-2.0","sha":"31081d9f05014003321333553bb3e657eb3da168","files":72754,"bytes":1195576661,
+   "review":{"spdx":"Apache-2.0","use":"adapt-with-attribution","by":"xerj-org","at":"2026-08-12",
+             "note":"~1.2 GB checkout — by far the largest entry in the hub."}}
+]}

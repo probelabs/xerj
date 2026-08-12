@@ -1,0 +1,8 @@
+{"corpus":"xerj-storage","cloned_at":"2026-08-06T20:24:00Z","repos":[
+  {"repo":"sled","url":"https://github.com/spacejam/sled","licence":"Apache-2.0/MIT","sha":"e449d17111f4a097e1c66b6db241962ccb6a4136","files":70,"bytes":1322994,
+   "review":{"spdx":"Apache-2.0 OR MIT","use":"adapt-with-attribution","by":"xerj-org","at":"2026-08-12"}},
+  {"repo":"fjall","url":"https://github.com/fjall-rs/fjall","licence":"Apache-2.0/MIT","sha":"7870992c9b61e2110caf5483785a866edd05c921","files":274,"bytes":24173777,
+   "review":{"spdx":"Apache-2.0 OR MIT","use":"adapt-with-attribution","by":"xerj-org","at":"2026-08-12"}},
+  {"repo":"redb","url":"https://github.com/cberner/redb","licence":"Apache-2.0/MIT","sha":"f551b96f43d36314db076ad38a49c8eb6e8ee311","files":118,"bytes":2060729,
+   "review":{"spdx":"Apache-2.0 OR MIT","use":"adapt-with-attribution","by":"xerj-org","at":"2026-08-12"}}
+]}

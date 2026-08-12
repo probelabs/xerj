@@ -53,5 +53,7 @@ memorization, and the line is sharp.
   retrieval-vs-none, which both server versions deliver equally.
 
 Full write-up: `CASE_STUDY.md`. Raw per-run data: `data/`. Captured generated
-programs (the 503-line failure vs the 4-line success): `generated/`. Reproduce with
-the harness in the `xerj-code` skill (`MEASURE.md`).
+programs (the 503-line failure vs the 4-line success): `generated/`. The retrieval
+tooling — and pinned, licence-reviewed definitions of the corpora used here — ship
+in `tools/xerj-code/`; see "How you reproduce it" in `CASE_STUDY.md` for what is
+and is not included.

@@ -286,13 +286,14 @@ Do this proactively for the rest of the session without me asking again.</pre>
 <!-- Reproduce guide -->
 <section class="scene-section">
   <h2 class="scene" style="font-size:var(--fs-56);">DO IT <span class="accent">YOURSELF.</span></h2>
-  <p class="wide">The whole study reproduces from the repo. The method works on any repository — including your own private code, which is the real use case.</p>
+  <p class="wide">The tooling ships in the repo, at <a class="mono" href="https://github.com/xerj-org/xerj/tree/main/tools/xerj-code" rel="external" style="color:var(--accent);">tools/xerj-code/</a>. The method works on any repository — including your own private code, which is the real use case.</p>
   <ol class="steps" style="margin-top:var(--sp-6); max-width:820px;">
     <li><strong>Start XERJ.</strong> <code class="inline">xerj -d ./.xerj-data --insecure</code> — the ES-compatible API comes up on <code class="inline">:9200</code>.</li>
     <li><strong>Build a corpus.</strong> <code class="inline">xc-corpus.sh async-rust https://github.com/tokio-rs/tokio https://github.com/hyperium/hyper</code> — group by problem domain, not language.</li>
+    <li><strong>Or rebuild one someone already vetted.</strong> <code class="inline">xc-corpus.sh --from hub/xerj-search.json</code> — a corpus definition is URLs, pinned commit SHAs and licences; no source, so nothing to redistribute, and the same file gives two machines the same bytes.</li>
     <li><strong>Index it.</strong> <code class="inline">xc-index.sh async-rust</code> — runs <code class="inline">xerj autoindex</code>; a 100k-record tree indexes in ~10 s.</li>
     <li><strong>Retrieve before you write.</strong> <code class="inline">xc.py async-rust "graceful shutdown with a broadcast channel"</code> — returns the matching definition with <code class="inline">file:line</code>.</li>
-    <li><strong>Measure it honestly.</strong> The 3-arm harness (<code class="inline">csrun.py</code>, <code class="inline">csmulti.py</code>) runs bare / native / XERJ, one hidden-test verdict, real tokens from <code class="inline">claude -p --output-format json</code> — no API key. Full recipe in <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/CASE_STUDY.md" rel="external" style="color:var(--accent);">MEASURE / CASE_STUDY.md</a>.</li>
+    <li><strong>Measure it honestly.</strong> Three arms of the same agent — memory only, grep-driven, retrieval-injected — one hidden-test verdict, real tokens from <code class="inline">claude -p --output-format json</code>, no API key. The numbers and every per-run record are in <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/CASE_STUDY.md" rel="external" style="color:var(--accent);">CASE_STUDY.md</a>; the harness itself is not shipped.</li>
   </ol>
 </section>
 
