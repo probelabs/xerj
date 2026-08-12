@@ -540,3 +540,47 @@ async fn recreating_an_index_under_the_same_name_does_not_stall_the_tap() {
         target.actions()
     );
 }
+
+/// `_stats` is the honesty surface, so `lag_seq` must not lie in the one case
+/// where the naive arithmetic does: a tap that positions at the END of an
+/// established index is caught up by definition — it deliberately skipped the
+/// history it cannot backfill. Reporting that history as a backlog would send
+/// an operator hunting a problem the tap does not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tap_that_started_at_the_end_does_not_report_history_as_lag() {
+    let target = StubTarget::start().await;
+    let dir = TempDir::new().unwrap();
+    // Enabled but allowlisting nothing, so the index accumulates history the
+    // tap never saw.
+    let engine = engine_with_tap(&dir, tap_config(&target.url, &["nothing-*"]));
+    write_docs(&engine, "edge-logs", &["1", "2", "3"]).await;
+
+    // `flush()` force-rotates every WAL shard and prunes the generations whose
+    // entries are now durable in a segment, which is exactly the state of an
+    // established index: generation 0 is gone, so the "never pruned, read it
+    // all" path does not apply and the tap must position at the end.
+    let index = engine.get_index("edge-logs").unwrap();
+    index.flush().await.unwrap();
+
+    let mut config = engine.wal_tap.config();
+    config.indices = vec!["edge-logs".into()];
+    engine.wal_tap.set_config(config);
+    engine.wal_tap.tick(&engine).await;
+
+    let head = index.current_seq_no().saturating_sub(1);
+    assert!(
+        head > 0,
+        "the index must actually have history for this to mean anything"
+    );
+    let shipped = engine
+        .wal_tap
+        .stats()
+        .get("edge-logs")
+        .map(|s| s.last_shipped_seq)
+        .unwrap_or(0);
+    assert!(
+        shipped >= head,
+        "a tap positioned at the end must report zero lag, not the whole \
+         history it never intended to ship (head {head}, watermark {shipped})"
+    );
+}

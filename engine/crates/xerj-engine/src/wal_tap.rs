@@ -169,8 +169,12 @@ pub struct IndexTapStats {
     /// are how external versioning absorbs a redelivery. Counted separately so
     /// they never look like data loss.
     pub version_conflicts: u64,
-    /// Times a WAL generation was pruned before the tap read it. Each one is
-    /// unrecoverable data loss for the target.
+    /// Times a poll found a WAL generation pruned before it could be shipped.
+    /// Any value above zero means entries the target will never receive.
+    ///
+    /// Counted per observation, not per lost generation: while a tap is stuck
+    /// behind a live gap, each poll re-observes it and this keeps climbing.
+    /// That is the useful reading — "still losing data", not "lost data once".
     pub gaps: u64,
     /// `UpdateMapping` WAL entries seen. No current xerj code path writes one
     /// (only read sites exist), so this is expected to stay 0; if it ever
@@ -578,10 +582,19 @@ impl WalTap {
 
     /// Poll one index once: read its WAL tail, ship it, advance its cursors.
     ///
+    /// `head_seq` is the index's highest reserved sequence number, used only to
+    /// seed the lag watermark on a first look — see below.
+    ///
     /// Returns `true` when there is more to read immediately (the batch was
     /// truncated), so the caller can keep going without waiting a full poll
     /// interval.
-    async fn poll_index(&self, config: &WalTapConfig, name: &str, wal_root: PathBuf) -> bool {
+    async fn poll_index(
+        &self,
+        config: &WalTapConfig,
+        name: &str,
+        wal_root: PathBuf,
+        head_seq: u64,
+    ) -> bool {
         let known: BTreeMap<String, WalTailCursor> = self
             .state
             .read()
@@ -589,6 +602,7 @@ impl WalTap {
             .get(name)
             .map(|c| c.shards.clone())
             .unwrap_or_default();
+        let first_look = known.is_empty();
 
         let budget = config.max_batch_docs.max(1);
         let read = {
@@ -656,7 +670,7 @@ impl WalTap {
 
         if batch.is_empty() {
             // Nothing to send, but the cursors may still have moved (a fresh
-            // "start from now" position, or frames that decoded to nothing).
+            // start-at-the-end position, or frames that decoded to nothing).
             if new_cursors != known {
                 self.state
                     .write()
@@ -665,6 +679,16 @@ impl WalTap {
                     .or_default()
                     .shards = new_cursors;
                 self.persist();
+                if first_look {
+                    // The tap just positioned at the end of an established
+                    // index: it is caught up by definition, having deliberately
+                    // skipped the history it cannot backfill. Seeding the
+                    // watermark keeps `lag_seq` from reporting the whole of
+                    // that history as a backlog the tap intends to ship.
+                    self.stat(name, |s| {
+                        s.last_shipped_seq = s.last_shipped_seq.max(head_seq);
+                    });
+                }
             }
             return more;
         }
@@ -800,10 +824,16 @@ impl WalTap {
                 continue;
             };
             let wal_root = index.wal_dir();
+            // `current_seq_no` is the NEXT seq to be handed out, so the highest
+            // reserved one is that minus 1.
+            let head_seq = index.current_seq_no().saturating_sub(1);
             // Keep draining an index that is behind, but bounded: at most a
             // few batches per tick so one busy index cannot starve the others.
             for _ in 0..4 {
-                if !self.poll_index(&config, &name, wal_root.clone()).await {
+                if !self
+                    .poll_index(&config, &name, wal_root.clone(), head_seq)
+                    .await
+                {
                     break;
                 }
             }
