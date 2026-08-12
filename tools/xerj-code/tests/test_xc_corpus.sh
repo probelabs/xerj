@@ -219,6 +219,122 @@ else
   ok "validate_manifest.py rejects a short sha"
 fi
 
+# ---------------------------------------------------------------------------
+# 8. A manifest is UNTRUSTED INPUT — `--from` exists to run files other people
+#    wrote. `repo` becomes a path that is force-checked-out and `clean -fd`ed,
+#    so a traversing name must be refused before any of that happens.
+#
+# Verified reachable before the guard: a manifest with
+# repo="../../../victim" moved an unrelated git checkout to the manifest's
+# commit, deleted its uncommitted changes and its untracked files, and
+# rewrote its `origin` remote.
+# ---------------------------------------------------------------------------
+VICTIM="$TMP/victim"
+mkdir -p "$VICTIM"
+git -C "$VICTIM" init -q -b main
+git -C "$VICTIM" config user.email t@example.invalid
+git -C "$VICTIM" config user.name test
+git -C "$VICTIM" remote add origin https://example.invalid/untouched
+printf 'committed\n' > "$VICTIM/tracked.txt"
+git -C "$VICTIM" add -A && git -C "$VICTIM" commit -qm base
+printf 'uncommitted work\n' >> "$VICTIM/tracked.txt"
+printf 'untracked\n' > "$VICTIM/untracked.txt"
+
+# home6/corpora/<name> is three levels below $TMP, so ../../../victim lands on it.
+cat > "$TMP/traversal.json" <<EOF
+{"corpus":"trav","cloned_at":"2026-08-12T00:00:00Z","repos":[
+  {"repo":"../../../victim","url":"$ALPHA_URL","licence":"MIT","sha":"$ALPHA_PIN","files":2,"bytes":0}
+]}
+EOF
+H6="$TMP/home6"
+if xc "$H6" --from "$TMP/traversal.json"; then
+  bad "a traversing repo name was accepted"
+else
+  ok "a traversing repo name is rejected"
+fi
+check "traversal did not touch the victim's working tree" \
+      "$(cat "$VICTIM/tracked.txt" 2>/dev/null)" "$(printf 'committed\nuncommitted work')"
+check "traversal did not delete the victim's untracked files" \
+      "$([ -f "$VICTIM/untracked.txt" ] && echo present || echo GONE)" "present"
+check "traversal did not rewrite the victim's origin remote" \
+      "$(git -C "$VICTIM" remote get-url origin)" "https://example.invalid/untouched"
+
+cat > "$TMP/trav-hub.json" <<'EOF'
+{"corpus":"trav-hub","repos":[{"repo":"../evil","url":"https://example.invalid/x","licence":"MIT",
+ "sha":"0000000000000000000000000000000000000000",
+ "review":{"spdx":"MIT","use":"approach-only","by":"t","at":"2026-08-12"}}]}
+EOF
+if python3 "$HERE/validate_manifest.py" "$TMP/trav-hub.json" 2>/dev/null; then
+  bad "validate_manifest.py accepted a traversing repo name"
+else
+  ok "validate_manifest.py rejects a traversing repo name"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. xc-index.sh must not accept an instruction and drop it. `--frsh` used to
+#    set no flag and exit 0, running an INCREMENTAL index — and autoindex's
+#    incremental state makes that skip every file, leaving a corpus that
+#    retrieves nothing with no error anywhere.
+# ---------------------------------------------------------------------------
+XC_INDEX="$HERE/../scripts/xc-index.sh"
+mkdir -p "$TMP/home7/corpora/demo"
+if XERJ_CODE_HOME="$TMP/home7" "$XC_INDEX" demo --frsh >"$TMP/idx.log" 2>&1; then
+  bad "xc-index.sh accepted an unknown argument"
+elif grep -q "unknown argument '--frsh'" "$TMP/idx.log"; then
+  ok "xc-index.sh rejects an unknown argument by name"
+else
+  bad "xc-index.sh rejected '--frsh' but never named it: $(tr '\n' ';' < "$TMP/idx.log")"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. xc.py warns on every licence xc-corpus.sh warns about. The retrieval tool
+#     is where an agent is actually looking at the code, so a gap here is the
+#     one that matters. An exact-match ("GPL","LGPL") test was silent on the
+#     AGPL, BUSL and (after the detector fix) MPL-2.0 repos the hub ships.
+# ---------------------------------------------------------------------------
+lic_warn="$(python3 - "$HERE/../scripts/xc.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("xc", sys.argv[1])
+xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
+warn = lambda l: bool(l) and any(r in l for r in xc.RESTRICTED)
+must   = ["AGPL", "SSPL", "Elastic", "BUSL", "GPL", "LGPL", "MPL-2.0",
+          "BUSL/MIT", "UNKNOWN", "NONE-FOUND", "Apache-2.0/UNKNOWN"]
+mustnt = ["MIT", "Apache-2.0", "BSD", "Apache-2.0/MIT", ""]
+bad = [l for l in must if not warn(l)] + [l for l in mustnt if warn(l)]
+print("clean" if not bad else "wrong on " + ",".join(repr(b) for b in bad))
+PY
+)"
+check "xc.py warns on every restricted licence and no permissive one" "$lic_warn" "clean"
+
+# ---------------------------------------------------------------------------
+# 11. A rebuild that dropped a repository must not exit 0. The documented idiom
+#     is `xc-corpus.sh --from hub/<name>.json && xc-index.sh <name>`, so exit 0
+#     on a partial corpus indexes something that is not what the manifest
+#     describes while the "same manifest in, same bytes out" claim still reads
+#     as having held.
+# ---------------------------------------------------------------------------
+cat > "$TMP/partial.json" <<EOF
+{"corpus":"partial","cloned_at":"2026-08-12T00:00:00Z","repos":[
+  {"repo":"alpha","url":"$ALPHA_URL","licence":"MIT","sha":"$ALPHA_PIN","files":2,"bytes":0},
+  {"repo":"gone","url":"file://$TMP/remote/does-not-exist","licence":"MIT","sha":"$ALPHA_PIN","files":2,"bytes":0}
+]}
+EOF
+H8="$TMP/home8"
+if xc "$H8" --from "$TMP/partial.json"; then
+  bad "a partial rebuild exited 0"
+else
+  ok "a partial rebuild exits non-zero"
+fi
+# The repo that DID land is still checked out, and the manifest still describes
+# the real state — only the exit code says the corpus is not complete.
+check "the repos that did land are still checked out" \
+      "$(git -C "$H8/corpora/partial/alpha" rev-parse HEAD 2>/dev/null || echo MISSING)" "$ALPHA_PIN"
+if grep -q 'INCOMPLETE' "$TMP/out.log"; then
+  ok "a partial rebuild says which repos are missing"
+else
+  bad "a partial rebuild failed without naming the gap"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

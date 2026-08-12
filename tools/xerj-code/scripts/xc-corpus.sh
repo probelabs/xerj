@@ -135,6 +135,16 @@ read_manifest() {
   python3 - "$1" <<'PY'
 import json, re, sys
 path = sys.argv[1]
+
+# A manifest is UNTRUSTED INPUT. `--from` is documented as "rebuild a corpus
+# someone else defined", so the file arrives from a hub, a chat message or a
+# pull request, and every field in it is attacker-controlled. `repo` becomes a
+# filesystem path (`$dest/$repo_name`) that the caller then runs `checkout
+# --force` and `clean -fd` inside, so a name like "../../../work/repo" walks
+# out of ~/.xerj-code and destroys uncommitted work in an unrelated checkout.
+# The corpus name has been screened since the first version of this script;
+# the per-repo name comes from the same untrusted file and needs the same gate.
+REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*\Z")
 try:
     with open(path) as fh:
         m = json.load(fh)
@@ -152,6 +162,14 @@ for r in repos:
     url, sha = r.get("url") or "", r.get("sha") or ""
     if not name or not url:
         sys.exit(f"xc-corpus: {path}: an entry is missing 'repo' or 'url'")
+    if not REPO_NAME.match(name):
+        sys.exit(
+            f"xc-corpus: {path}: repo name {name!r} is not a plain directory "
+            "name. It is used as a path under the corpus directory and is then "
+            "force-checked-out and cleaned, so a name containing '/' or '..' "
+            "would overwrite files outside the corpus. Allowed: letters, "
+            "digits, '.', '_' and '-', not starting with '.' or '-'."
+        )
     # A short sha cannot be fetched from a remote — `git fetch --depth 1 origin
     # e449d17` fails with "couldn't find remote ref". Manifests written before
     # full SHAs were recorded would otherwise rebuild silently at the tip,
@@ -227,6 +245,12 @@ else
 fi
 
 entries=()
+# Repos that were asked for and did not land. A partial corpus is not the
+# corpus the caller asked for, and the documented idiom is
+# `xc-corpus.sh --from hub/<name>.json && xc-index.sh <name>` — so a rebuild
+# that dropped a repository must not exit 0 and let the chain continue as if
+# "same manifest in, same bytes out" had held.
+skipped=()
 
 if [ -n "$manifest_in" ]; then
   # stderr of read_manifest carries the manifest's own corpus name; on failure
@@ -272,12 +296,20 @@ if [ -n "$manifest_in" ]; then
   echo "rebuilding corpus '$name' from $manifest_in"
   while IFS=$'\t' read -r repo_name url sha declared; do
     [ -n "$repo_name" ] || continue
+    # read_manifest already rejects these, loudly and with a better message.
+    # Repeated here because the next few lines force-checkout and `clean -fd`
+    # whatever path this builds: the one destructive step in the toolkit should
+    # not depend on a validator two functions away staying correct.
+    case "$repo_name" in
+      */*|.*|-*) echo "  [FAIL] refusing unsafe repo name '$repo_name'" >&2
+                 skipped+=("$repo_name"); continue ;;
+    esac
     target="$dest/$repo_name"
     if [ -d "$target/.git" ] && [ "$(git -C "$target" rev-parse HEAD 2>/dev/null)" = "$sha" ]; then
       echo "  [ok] $repo_name already at ${sha:0:12}"
     else
       echo "  [pin] $repo_name -> ${sha:0:12}"
-      checkout_at_sha "$target" "$url" "$sha" || continue
+      checkout_at_sha "$target" "$url" "$sha" || { skipped+=("$repo_name"); continue; }
     fi
     record "$repo_name" "$url" "$target" "$declared"
   done <<< "$rows"
@@ -292,6 +324,7 @@ else
       echo "  [clone] $repo_name"
       if ! git clone --depth 1 --quiet "$url" "$target"; then
         echo "  [FAIL] $repo_name — could not clone; continuing" >&2
+        skipped+=("$repo_name")
         continue
       fi
     fi
@@ -317,4 +350,16 @@ fi
 echo
 echo "corpus '$name': ${#entries[@]} repos at $dest"
 echo "share it: $manifest  (rebuild with xc-corpus.sh --from <that file>)"
+
+# The manifest above is still written — it honestly describes what is on disk,
+# which is what you want when diagnosing a partial run. The exit code is what
+# stops `&& xc-index.sh` from indexing a corpus that is missing repositories
+# and calling it the shared one.
+if [ ${#skipped[@]} -gt 0 ]; then
+  echo >&2
+  echo "xc-corpus: ${#skipped[@]} of $(( ${#entries[@]} + ${#skipped[@]} )) repos did not land: ${skipped[*]}" >&2
+  echo "xc-corpus: this corpus is INCOMPLETE — it is not the one the manifest describes." >&2
+  exit 1
+fi
+
 echo "next: xc-index.sh $name"

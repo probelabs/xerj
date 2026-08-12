@@ -22,6 +22,19 @@ STALE_DAYS = 30
 # k=60 is the paper's value and the universal default. It is NOT tuned here.
 RRF_K = 60
 
+# Licences you must not copy from, as substrings of what the manifest records.
+# This MUST stay in step with `warn_licence()` in xc-corpus.sh: that one fires
+# once at clone time, this one fires at the moment an agent is actually looking
+# at the code and deciding whether to lift it, which is the one that counts.
+#
+# Warning on only ("GPL", "LGPL") — an exact match, as this did — was silent on
+# every restricted repo the hub deliberately ships: elasticsearch (AGPL/SSPL/
+# Elastic), meilisearch's Enterprise Edition parts (BUSL), and, once the
+# detector was corrected to read MPL-2.0 rather than GPL, sonic as well. Fixing
+# the detector must not quietly cost a repo its warning.
+RESTRICTED = ("AGPL", "SSPL", "Elastic", "BUSL", "GPL", "LGPL", "MPL",
+              "UNKNOWN", "NONE-FOUND")
+
 
 def die(msg, code=2):
     print(f"xc: {msg}", file=sys.stderr)
@@ -555,8 +568,8 @@ def main():
             else:
                 body = src.get("body") or ""
                 print("    " + str(body)[:400].replace("\n", "\n    "))
-        if lic in ("GPL", "LGPL"):
-            print(f"    !! {lic}: adapt the approach, do not copy the code")
+        if lic and any(r in lic for r in RESTRICTED):
+            print(f"    !! {lic}: adapt the APPROACH, do not copy the code")
 
     if not args.meatl:
         print(f"\n{len(hits)} passages from '{args.corpus}'"

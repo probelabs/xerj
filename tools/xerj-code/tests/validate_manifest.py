@@ -14,6 +14,11 @@ import re
 import sys
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
+# `repo` is used as a directory name under the corpus root, which xc-corpus.sh
+# then force-checks-out and cleans. A name containing '/' or '..' escapes the
+# corpus and destroys whatever it lands on, so a manifest carrying one must
+# never pass review — least of all one published under the project's name.
+REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*\Z")
 USES = {"adapt-with-attribution", "approach-only", "mixed"}
 
 
@@ -46,6 +51,11 @@ def check(path: str, hub: bool) -> list[str]:
         for k in ("repo", "url", "licence", "sha"):
             if not r.get(k):
                 errs.append(f"{name}: missing '{k}'")
+        if not REPO_NAME.match(str(r.get("repo") or "")):
+            errs.append(
+                f"{name}: repo name is not a plain directory name "
+                "(letters, digits, '.', '_', '-'; not starting with '.' or '-')"
+            )
         sha = r.get("sha") or ""
         # A short sha is not fetchable from a remote, so it cannot pin a
         # rebuild — the whole point of sharing the definition.

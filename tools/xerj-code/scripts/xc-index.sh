@@ -7,10 +7,25 @@ CORPORA="$ROOT/corpora"
 URL="${XERJ_URL:-http://localhost:9200}"
 XERJ_BIN="${XERJ_BIN:-xerj}"
 
-[ $# -ge 1 ] || { echo "usage: xc-index.sh <corpus-name> [--fresh]" >&2; exit 2; }
+usage() { echo "usage: xc-index.sh <corpus-name> [--fresh]" >&2; exit 2; }
+
+[ $# -ge 1 ] || usage
 name="$1"; shift
+
+# Reject what we do not understand rather than dropping it. The previous form
+# was `[ "${1:-}" = "--fresh" ] && fresh="--fresh"`, which silently ignored a
+# mistyped or extra flag: `xc-index.sh <corpus> --frsh` ran an INCREMENTAL
+# index and exited 0. That is the worst possible shape for this particular
+# flag — autoindex keeps incremental state in ~/.xerj/autoindex/, so a run that
+# should have been fresh skips every file as "already indexed" and leaves a
+# corpus with 0 documents that retrieves nothing, with no error anywhere.
 fresh=""
-[ "${1:-}" = "--fresh" ] && fresh="--fresh"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fresh) fresh="--fresh"; shift ;;
+    *) echo "xc-index: unknown argument '$1'" >&2; usage ;;
+  esac
+done
 
 dir="$CORPORA/$name"
 [ -d "$dir" ] || { echo "xc-index: no corpus '$name' — run xc-corpus.sh first" >&2; exit 2; }
