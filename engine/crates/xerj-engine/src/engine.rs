@@ -527,6 +527,12 @@ pub struct Engine {
     pub rollup_jobs: Arc<DashMap<String, Value>>,
     /// CCR auto-follow pattern name → pattern JSON
     pub ccr_auto_follow: Arc<DashMap<String, Value>>,
+    /// Single-node WAL tap (issue #320): live config, durable cursors and
+    /// counters for the one-directional push of allowlisted indices to an
+    /// external ES-compatible target. Always present; inert until
+    /// `wal_tap.enabled` and a target URL are set. Not CCR — see
+    /// [`crate::wal_tap`] for why the two are different features.
+    pub wal_tap: Arc<crate::wal_tap::WalTap>,
     /// API key id → record. Populated by `POST /_security/api_key` so the
     /// auth middleware can re-authenticate `Authorization: ApiKey <encoded>`.
     /// In-memory only (lost on restart).
@@ -688,6 +694,11 @@ impl Engine {
         } = crate::cluster_state::preflight(&data_dir);
         let storage_available = cluster_state_status.is_writable();
 
+        // Cloned before `config` is moved into the Arc below — the WAL tap
+        // owns a live, runtime-editable copy (PUT /_xerj/wal_tap) rather than
+        // reading the frozen boot config.
+        let wal_tap_config = config.wal_tap.clone();
+
         // Apply operator-tunable aggregation bucket cap. Stored in a static
         // AtomicUsize inside aggs.rs so all per-bucket-allocator hot loops
         // can read it with no plumbing through every agg signature.
@@ -741,6 +752,7 @@ impl Engine {
             frozen_indices: Arc::new(DashMap::new()),
             rollup_jobs: Arc::new(DashMap::new()),
             ccr_auto_follow: Arc::new(DashMap::new()),
+            wal_tap: Arc::new(crate::wal_tap::WalTap::new(&data_dir, wal_tap_config)),
             api_keys: Arc::new(DashMap::new()),
             application_privileges: Arc::new(DashMap::new()),
             legacy_templates: Arc::new(DashMap::new()),
@@ -3762,7 +3774,7 @@ fn copy_dir_recursive(
 }
 
 /// Simple glob pattern matching (supports `*` and `?`).
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = text.chars().collect();
     let (m, n) = (pat.len(), txt.len());

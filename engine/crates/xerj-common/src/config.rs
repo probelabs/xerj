@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **105 settings** versus
+//! Configuration is intentionally minimal: **114 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -92,9 +92,12 @@ pub struct Config {
     pub compat: CompatConfig,
     /// ISM/ILM index-lifecycle-management background execution — 1 setting.
     pub lifecycle: LifecycleConfig,
+    /// Single-node WAL tap: push a filtered index subset to an external
+    /// ES-compatible target — 9 settings. Off by default.
+    pub wal_tap: WalTapConfig,
 }
 
-// 20 sub-configs, 105 leaf settings in total. Do not maintain that sum by hand
+// 21 sub-configs, 114 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -1737,6 +1740,80 @@ impl Default for LifecycleConfig {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Single-node WAL tap — push a filtered subset of indices to an external
+/// ES-compatible target (issue #320). **9 settings.**
+///
+/// This is deliberately *not* cross-cluster replication. It is one
+/// directional, single node, and target-agnostic because the wire format is
+/// just `_bulk`: an Elasticsearch cluster, an OpenSearch cluster, or another
+/// xerj node all work.
+///
+/// Semantics that matter before you turn it on:
+///
+/// - **No backfill.** An index whose WAL has never been pruned (a new one) is
+///   shipped whole. An index that has been running long enough to prune
+///   starts from the moment it is allowlisted: it ships what happens next,
+///   not what is already in segments. Use snapshot/restore to seed the target
+///   first if you need the existing data.
+/// - **At-least-once.** A batch is re-sent if the cursor could not be
+///   advanced, so the target may see a document twice. `doc_id` is the
+///   `_bulk` `_id` and each action carries `version_type: external` with the
+///   entry's `seq_no`, so a redelivery (and an out-of-order one) is a no-op
+///   on any target that honours external versioning.
+/// - **Retention never waits for the target.** WAL generations are pruned as
+///   soon as their entries are durable in a segment, whether or not the tap
+///   has shipped them — coupling the two would let a slow remote fill the
+///   local disk. A tap that falls that far behind loses entries and *says
+///   so*: `gaps` in `GET /_xerj/wal_tap/_stats`, plus a warning per gap.
+/// - **System indices are never shipped**, whatever the allowlist says.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WalTapConfig {
+    /// Master switch (default: `false` — off).
+    pub enabled: bool,
+    /// Base URL of the target cluster, e.g. `"https://central:9200"`. The
+    /// tap POSTs to `{target_url}/_bulk`. Empty disables the tap even when
+    /// `enabled = true`.
+    pub target_url: String,
+    /// Verbatim `Authorization` header value for the target, e.g.
+    /// `"ApiKey abc123"` or `"Basic dXNlcjpwdw=="`. Empty sends none.
+    /// Never echoed back by the REST surface.
+    pub target_auth: String,
+    /// Index allowlist. Glob patterns (`*` only, as in `_cat` expressions);
+    /// empty ships nothing. `["*"]` ships every non-system index.
+    pub indices: Vec<String>,
+    /// How often each index's WAL is polled, in milliseconds (default:
+    /// `500`). This is the floor on end-to-end latency.
+    pub poll_interval_ms: u64,
+    /// Maximum WAL entries in one `_bulk` request (default: `1000`).
+    pub max_batch_docs: usize,
+    /// Maximum `_bulk` body size in bytes (default: 5 MiB). A single
+    /// document larger than this is still sent, alone.
+    pub max_batch_bytes: usize,
+    /// Per-request timeout against the target, in seconds (default: `30`).
+    pub request_timeout_secs: u64,
+    /// Ceiling on the exponential retry backoff, in seconds (default: `60`).
+    pub max_retry_backoff_secs: u64,
+}
+
+impl Default for WalTapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_url: String::new(),
+            target_auth: String::new(),
+            indices: Vec::new(),
+            poll_interval_ms: 500,
+            max_batch_docs: 1000,
+            max_batch_bytes: 5 * 1024 * 1024,
+            request_timeout_secs: 30,
+            max_retry_backoff_secs: 60,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Scroll + async-search context lifecycle settings (RC4 blocker 11).
 ///
 /// **7 settings.**
@@ -2445,6 +2522,7 @@ mod tests {
         ("logging", 2),
         ("compat", 2),
         ("lifecycle", 1),
+        ("wal_tap", 9),
     ];
 
     /// Count the settings by *counting them*.
@@ -2487,7 +2565,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 105,
+            total, 114,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

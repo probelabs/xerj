@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Push a filtered subset of indices to an external ES-compatible target —
+  the single-node WAL tap** ([#320](https://github.com/xerj-org/xerj/issues/320)).
+  Nothing pushed data out of the engine before this: `_ccr/*` answered `501`,
+  reindex-from-remote was refused up front, and snapshot/restore — scheduled and
+  whole-index — was the only export path. A XERJ node used as a lightweight edge
+  collector had no way to stream a curated slice of its data up to a central
+  cluster.
+  - New `[wal_tap]` config section (9 settings, off by default) and a runtime
+    REST surface: `GET`/`PUT /_xerj/wal_tap` and `GET /_xerj/wal_tap/_stats`.
+    The allowlist is glob-based and adjustable without a restart.
+  - The wire format is `_bulk` and nothing else, so the target can be
+    Elasticsearch, OpenSearch, or another XERJ node with nothing installed.
+  - **This is not CCR.** It is one-directional, single-node, and independent of
+    the post-GA sharding/replication track. `_ccr/*` still answers `501`.
+  - The tap adds nothing to the write path: it tails WAL files from disk on a
+    timer and takes no lock the writer wants.
+  - Delivery is at-least-once, with `version_type: external` carrying the WAL
+    `seq_no` on every action so a redelivery converges on the same document the
+    source holds.
+  - WAL retention is deliberately *not* coupled to the tap — a slow remote must
+    not be able to fill the local disk. A tap that falls far enough behind loses
+    entries and says so: `gaps` in `_stats`, plus a warning per occurrence.
+  - XERJ's own `.xerj*` system indices are never shipped, whatever the allowlist
+    says, and a wildcard never expands to a hidden index.
+  - There is no backfill. A new index is shipped whole; an established one ships
+    from the moment it is allowlisted. Seed the target with snapshot/restore
+    first if it needs the existing documents.
 
 ## [1.0.0-rc.16] - 2026-08-13
 

@@ -2231,6 +2231,27 @@ async fn async_main() -> Result<()> {
         tokio::spawn(xerj_api::es_compat::run_metrics_gauge_loop(state.clone()));
     }
 
+    // 9b-2. WAL tap (issue #320) — one-directional push of an allowlisted
+    //       index subset to an external ES-compatible target. The loop always
+    //       runs; it is inert (one sleep per poll interval, no I/O) until
+    //       `wal_tap.enabled` and a `target_url` are set, either in the config
+    //       file or at runtime via `PUT /_xerj/wal_tap`.
+    {
+        let tap = state.engine.wal_tap.clone();
+        let engine = state.engine.clone();
+        if tap.config().enabled {
+            let cfg = tap.config();
+            info!(
+                target = %cfg.target_url,
+                indices = ?cfg.indices,
+                poll_interval_ms = cfg.poll_interval_ms,
+                "WAL tap enabled — pushing to an external ES-compatible target \
+                 (one-directional, no backfill; see GET /_xerj/wal_tap/_stats)"
+            );
+        }
+        tokio::spawn(xerj_engine::wal_tap::run(tap, engine));
+    }
+
     // 9c. Routers — engine and Xerj Console are *peer* surfaces.  Each crate
     //     builds a complete Router (routes + its own auth + its own
     //     middleware) and `xerj-server` merges them onto the same TCP

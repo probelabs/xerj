@@ -18479,6 +18479,17 @@ impl Index {
         &self.data_dir
     }
 
+    /// Root of this index's write-ahead log — the directory holding either
+    /// `*.wal` files (legacy single-WAL layout) or `s0`, `s1`, … shard
+    /// subdirectories.
+    ///
+    /// Read-only consumers live here: the WAL tap (`crate::wal_tap`) tails
+    /// these files on a timer so it never has to take a lock the write path
+    /// wants.
+    pub fn wal_dir(&self) -> PathBuf {
+        self.store.wal_dir()
+    }
+
     // ── Delete index ──────────────────────────────────────────────────────────
 
     /// Remove all data files for this index.

@@ -1527,71 +1527,18 @@ fn read_wal_file(path: PathBuf) -> Vec<Result<ReplayEntry>> {
                 let this_offset = off as u64;
                 off = end;
 
-                // Check and strip the compression flag from op_code.
-                let is_compressed = (op_code & OP_COMPRESSED_FLAG) != 0;
-                let raw_op_code = op_code & !OP_COMPRESSED_FLAG;
-
-                let op = match WalOpCode::from_u8(raw_op_code) {
-                    Some(o) => o,
-                    None => {
-                        warn!(
-                            op_code = raw_op_code,
-                            "unknown WAL op code — skipping entry"
-                        );
+                match decode_frame_payload(op_code, payload, generation, this_offset) {
+                    FrameDecode::Entry(entry) => results.push(Ok(ReplayEntry {
+                        seq_no,
+                        entry,
+                        file_offset: this_offset,
+                    })),
+                    FrameDecode::UnknownOp => continue,
+                    FrameDecode::Bad(e) => {
+                        results.push(Err(e));
                         continue;
                     }
-                };
-
-                // Decompress payload if compressed.
-                let payload_owned: Vec<u8>;
-                let payload_bytes: &[u8] = if is_compressed {
-                    match decompress_size_prepended(payload) {
-                        Ok(dec) => {
-                            payload_owned = dec;
-                            &payload_owned
-                        }
-                        Err(e) => {
-                            results.push(Err(StorageError::WalCorrupt(
-                                this_offset,
-                                format!("gen={generation} lz4 decompression failed: {e}"),
-                            )));
-                            continue;
-                        }
-                    }
-                } else {
-                    payload
-                };
-
-                let entry: WalEntry = match serde_json::from_slice(payload_bytes) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        results.push(Err(StorageError::WalCorrupt(
-                            this_offset,
-                            format!("gen={generation} json error op={op:?}: {e}"),
-                        )));
-                        continue;
-                    }
-                };
-
-                // Sanity-check op code matches enum variant
-                let expected_op = match &entry {
-                    WalEntry::Index { .. } => WalOpCode::Index,
-                    WalEntry::Delete { .. } => WalOpCode::Delete,
-                    WalEntry::UpdateMapping { .. } => WalOpCode::UpdateMapping,
-                };
-                if op != expected_op {
-                    results.push(Err(StorageError::WalCorrupt(
-                        this_offset,
-                        format!("op code mismatch: header={op:?}, payload={expected_op:?}"),
-                    )));
-                    continue;
                 }
-
-                results.push(Ok(ReplayEntry {
-                    seq_no,
-                    entry,
-                    file_offset: this_offset,
-                }));
             }
         }
     }
@@ -1606,6 +1553,445 @@ fn read_wal_file(path: PathBuf) -> Vec<Result<ReplayEntry>> {
     });
 
     results
+}
+
+/// What one CRC-valid frame's payload turned out to hold.
+enum FrameDecode {
+    /// A decoded entry.
+    Entry(WalEntry),
+    /// The op byte is not one this build knows — warn and skip WITHOUT
+    /// recording an error, so a file written by a future version stays
+    /// prunable rather than being retained forever.
+    UnknownOp,
+    /// Framing was intact but the payload did not decode (lz4, JSON, or an
+    /// op-code/variant mismatch).
+    Bad(StorageError),
+}
+
+/// Decode one CRC-valid frame's payload: strip the compression flag,
+/// decompress, parse the JSON, and check the op byte against the decoded
+/// variant.
+///
+/// Shared by [`read_wal_file`] (full replay) and [`tail_wal_file`] (the
+/// WAL-tap reader) so the two can never drift on what a frame means.
+fn decode_frame_payload(
+    op_code: u8,
+    payload: &[u8],
+    generation: u64,
+    this_offset: u64,
+) -> FrameDecode {
+    let is_compressed = (op_code & OP_COMPRESSED_FLAG) != 0;
+    let raw_op_code = op_code & !OP_COMPRESSED_FLAG;
+
+    let op = match WalOpCode::from_u8(raw_op_code) {
+        Some(o) => o,
+        None => {
+            warn!(
+                op_code = raw_op_code,
+                "unknown WAL op code — skipping entry"
+            );
+            return FrameDecode::UnknownOp;
+        }
+    };
+
+    let payload_owned: Vec<u8>;
+    let payload_bytes: &[u8] = if is_compressed {
+        match decompress_size_prepended(payload) {
+            Ok(dec) => {
+                payload_owned = dec;
+                &payload_owned
+            }
+            Err(e) => {
+                return FrameDecode::Bad(StorageError::WalCorrupt(
+                    this_offset,
+                    format!("gen={generation} lz4 decompression failed: {e}"),
+                ))
+            }
+        }
+    } else {
+        payload
+    };
+
+    let entry: WalEntry = match serde_json::from_slice(payload_bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            return FrameDecode::Bad(StorageError::WalCorrupt(
+                this_offset,
+                format!("gen={generation} json error op={op:?}: {e}"),
+            ))
+        }
+    };
+
+    let expected_op = match &entry {
+        WalEntry::Index { .. } => WalOpCode::Index,
+        WalEntry::Delete { .. } => WalOpCode::Delete,
+        WalEntry::UpdateMapping { .. } => WalOpCode::UpdateMapping,
+    };
+    if op != expected_op {
+        return FrameDecode::Bad(StorageError::WalCorrupt(
+            this_offset,
+            format!("op code mismatch: header={op:?}, payload={expected_op:?}"),
+        ));
+    }
+
+    FrameDecode::Entry(entry)
+}
+
+// ── WAL tail reader (issue #320) ─────────────────────────────────────────────
+
+/// A consumer's durable position inside ONE WAL shard stream.
+///
+/// The position is a **byte offset**, not a sequence number, and that is not
+/// an accident: the M5.8 lock-free writer reserves its seq_nos with a
+/// `fetch_add` *outside* the shard mutex and only then appends under it, so
+/// frames can land in a file out of seq order (see the sort in
+/// [`read_wal_file`]). Append order is the only order a file position can be
+/// resumed from without risking a skipped frame, so that is what a cursor is.
+///
+/// `generation` and `drained` exist to answer one question the offset alone
+/// cannot: *was anything pruned out from under us?* Rotated generations are
+/// deleted once every entry in them is durable in a segment
+/// ([`WalWriter::prune_verified`]) — retention never waits for a consumer, by
+/// design, because a slow remote target must not be able to fill the disk. A
+/// consumer that falls far enough behind therefore loses source data, and the
+/// contract here is that it always **finds out** ([`WalShardTail::gap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalTailCursor {
+    /// Generation the cursor sits in.
+    pub generation: u64,
+    /// Byte offset just past the last consumed frame.
+    pub offset: u64,
+    /// The last read reached a clean end-of-file for `generation`. Lets the
+    /// gap check tell "we finished this generation and it was then pruned"
+    /// (fine) from "this generation was pruned before we read it" (a gap).
+    pub drained: bool,
+}
+
+impl WalTailCursor {
+    /// A cursor positioned at the very start of `generation`.
+    pub fn start_of(generation: u64) -> Self {
+        Self {
+            generation,
+            offset: WAL_HEADER_LEN,
+            drained: false,
+        }
+    }
+}
+
+/// The result of one tail poll over a single shard stream.
+#[derive(Debug)]
+pub struct WalShardTail {
+    /// Entries read, in **append order** — the order the source engine
+    /// applied them under the shard mutex.
+    pub entries: Vec<ReplayEntry>,
+    /// Where to resume. Persist this only after the entries have been
+    /// consumed successfully; re-reading from an un-advanced cursor is how
+    /// at-least-once delivery is achieved.
+    pub cursor: WalTailCursor,
+    /// Whole generations were pruned before this consumer read them: entries
+    /// are missing and are not recoverable from the WAL. Never silent.
+    pub gap: bool,
+    /// `max_entries` cut the batch short — poll again immediately.
+    pub truncated: bool,
+    /// Frames skipped because their payload did not decode.
+    pub corrupt_skipped: usize,
+}
+
+/// Every WAL shard stream under `wal_root`, as `(shard_name, dir)`.
+///
+/// Mirrors what [`IndexStore`](crate::index_store::IndexStore) writes: the
+/// legacy single-WAL layout puts `*.wal` straight in the root (shard name
+/// `""`), the sharded layout uses `s0`, `s1`, … subdirectories.
+pub fn wal_shard_dirs(wal_root: &Path) -> Vec<(String, PathBuf)> {
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    let Ok(rd) = fs::read_dir(wal_root) else {
+        return dirs;
+    };
+    let mut has_root_wal = false;
+    for entry in rd.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.extension().map(|x| x == "wal").unwrap_or(false) {
+            has_root_wal = true;
+        } else if path.is_dir() && name.starts_with('s') && name[1..].parse::<usize>().is_ok() {
+            dirs.push((name, path));
+        }
+    }
+    if has_root_wal {
+        dirs.push((String::new(), wal_root.to_path_buf()));
+    }
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    dirs
+}
+
+/// Sorted list of the generations present in one shard directory.
+fn generations_in(dir: &Path) -> Vec<u64> {
+    let mut gens: Vec<u64> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| parse_wal_generation(&e.file_name().to_string_lossy()))
+        .collect();
+    gens.sort_unstable();
+    gens
+}
+
+/// Read the tail of one WAL shard stream.
+///
+/// `cursor == None` is a first look at this stream, and where it starts
+/// depends on one question: has anything ever been pruned here?
+///
+/// - **Generation 0 is still on disk** — nothing has been reclaimed, so the
+///   file set *is* the whole history. Start at the beginning and read it. This
+///   is what makes an index created after the consumer starts get all of its
+///   documents, including the ones written in the first poll interval.
+/// - **Generation 0 is gone** — the stream has been pruned before, so its
+///   surviving files are an arbitrary recent slice. Start at the end instead
+///   and ship only what happens next. Shipping the slice would look like a
+///   backfill while being nothing of the sort; snapshot/restore is the tool
+///   for a real copy.
+///
+/// `max_entries == 0` reads nothing and leaves the cursor where it was.
+pub fn tail_shard(dir: &Path, cursor: Option<WalTailCursor>, max_entries: usize) -> WalShardTail {
+    let gens = generations_in(dir);
+    let Some(&newest) = gens.last() else {
+        // No generations at all (fresh index): stay where we are.
+        return WalShardTail {
+            entries: Vec::new(),
+            cursor: cursor.unwrap_or(WalTailCursor::start_of(0)),
+            gap: false,
+            truncated: false,
+            corrupt_skipped: 0,
+        };
+    };
+    let first = gens[0];
+
+    let cursor = match cursor {
+        Some(c) => c,
+        // Never pruned: the files on disk are the entire history, so read it.
+        None if first == 0 => WalTailCursor::start_of(0),
+        // Pruned before: start at the end rather than ship an arbitrary slice.
+        // Walk the newest generation to find its last frame boundary and throw
+        // the entries away — paid once, when a tap first sees the stream.
+        None => {
+            let scan = tail_wal_file(&wal_path(dir, newest), WAL_HEADER_LEN, false, usize::MAX);
+            return WalShardTail {
+                entries: Vec::new(),
+                cursor: WalTailCursor {
+                    generation: newest,
+                    offset: scan.end_offset,
+                    drained: scan.drained,
+                },
+                gap: false,
+                truncated: false,
+                corrupt_skipped: 0,
+            };
+        }
+    };
+
+    // Did the pruner delete generations we had not finished reading?
+    // `drained` on generation g means g is done, so g+1 appearing as the
+    // oldest file on disk is normal progress, not a gap.
+    let (start_gen, start_off, gap) = if cursor.generation > newest {
+        // The cursor points past every generation that exists. A stream only
+        // goes backwards when it is not the same stream: the index was deleted
+        // and recreated under the same name, or the data directory was rolled
+        // back. Restart from the beginning and flag it — holding position here
+        // would stall this shard silently and forever, which is precisely the
+        // failure a WAL consumer must never have.
+        (first, WAL_HEADER_LEN, true)
+    } else if cursor.generation < first {
+        let expected_next = cursor.generation + if cursor.drained { 1 } else { 0 };
+        (first, WAL_HEADER_LEN, first > expected_next)
+    } else {
+        (cursor.generation, cursor.offset, false)
+    };
+
+    let mut entries: Vec<ReplayEntry> = Vec::new();
+    let mut corrupt_skipped = 0usize;
+    let mut truncated = false;
+    let mut out_cursor = WalTailCursor {
+        generation: start_gen,
+        offset: start_off,
+        drained: false,
+    };
+
+    for &gen in gens.iter().filter(|&&g| g >= start_gen) {
+        let from = if gen == start_gen {
+            start_off
+        } else {
+            WAL_HEADER_LEN
+        };
+        // A rotated generation will never grow again, so a corrupt region in
+        // it is permanent: resync past it exactly like replay does. The
+        // newest generation is still being appended to, so a bad frame at its
+        // tail is almost certainly a half-written one — stop and re-read it
+        // on the next poll instead of resyncing over a frame that is about to
+        // become valid.
+        let allow_resync = gen != newest;
+        let budget = max_entries.saturating_sub(entries.len());
+        let scan = tail_wal_file(&wal_path(dir, gen), from, allow_resync, budget);
+
+        corrupt_skipped += scan.corrupt;
+        entries.extend(scan.entries);
+        out_cursor = WalTailCursor {
+            generation: gen,
+            offset: scan.end_offset,
+            drained: scan.drained,
+        };
+        if scan.truncated {
+            truncated = true;
+            break;
+        }
+    }
+
+    WalShardTail {
+        entries,
+        cursor: out_cursor,
+        gap,
+        truncated,
+        corrupt_skipped,
+    }
+}
+
+/// One file's contribution to a tail poll.
+struct FileTail {
+    entries: Vec<ReplayEntry>,
+    /// Offset to resume from: the start of the first frame NOT consumed.
+    end_offset: u64,
+    /// Reached a clean end-of-file.
+    drained: bool,
+    /// Stopped because the entry budget ran out.
+    truncated: bool,
+    corrupt: usize,
+}
+
+/// Read frames from `path` starting at `from_offset`, at most `budget` of them.
+///
+/// Frames are returned in append order. `end_offset` always lands on a frame
+/// boundary, so the caller can persist it and resume from exactly there.
+fn tail_wal_file(path: &Path, from_offset: u64, allow_resync: bool, budget: usize) -> FileTail {
+    let buf = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Pruned between listing and reading. Treat as finished so the
+            // caller moves on to the next generation.
+            return FileTail {
+                entries: Vec::new(),
+                end_offset: from_offset,
+                drained: true,
+                truncated: false,
+                corrupt: 0,
+            };
+        }
+        Err(e) => {
+            warn!(?path, error = %e, "WAL tap: cannot read generation");
+            return FileTail {
+                entries: Vec::new(),
+                end_offset: from_offset,
+                drained: false,
+                truncated: false,
+                corrupt: 0,
+            };
+        }
+    };
+
+    if buf.len() < WAL_HEADER_LEN as usize || &buf[..4] != WAL_MAGIC {
+        return FileTail {
+            entries: Vec::new(),
+            end_offset: from_offset.max(WAL_HEADER_LEN),
+            drained: false,
+            truncated: false,
+            corrupt: 0,
+        };
+    }
+    let generation = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+
+    let mut off = (from_offset.max(WAL_HEADER_LEN) as usize).min(buf.len());
+    let mut entries = Vec::new();
+    let mut corrupt = 0usize;
+
+    loop {
+        if entries.len() >= budget {
+            return FileTail {
+                entries,
+                end_offset: off as u64,
+                drained: false,
+                truncated: true,
+                corrupt,
+            };
+        }
+        match parse_raw_frame(&buf, off) {
+            RawFrame::End => {
+                return FileTail {
+                    entries,
+                    end_offset: off as u64,
+                    drained: true,
+                    truncated: false,
+                    corrupt,
+                }
+            }
+            RawFrame::Corrupt => {
+                if !allow_resync {
+                    // Active generation: a half-written frame completes on
+                    // the writer's next flush. Hold the boundary.
+                    return FileTail {
+                        entries,
+                        end_offset: off as u64,
+                        drained: false,
+                        truncated: false,
+                        corrupt,
+                    };
+                }
+                match scan_next_valid_frame(&buf, off + 1) {
+                    Some(next) => {
+                        warn!(
+                            generation,
+                            offset = off,
+                            resync_at = next,
+                            "WAL tap: corrupt region in a rotated generation — entries in \
+                             the gap cannot be shipped"
+                        );
+                        corrupt += 1;
+                        off = next;
+                    }
+                    None => {
+                        // Torn tail on a file that will never grow again.
+                        corrupt += 1;
+                        return FileTail {
+                            entries,
+                            end_offset: off as u64,
+                            drained: true,
+                            truncated: false,
+                            corrupt,
+                        };
+                    }
+                }
+            }
+            RawFrame::Frame {
+                seq_no,
+                op_code,
+                payload,
+                end,
+            } => {
+                let this_offset = off as u64;
+                off = end;
+                match decode_frame_payload(op_code, payload, generation, this_offset) {
+                    FrameDecode::Entry(entry) => entries.push(ReplayEntry {
+                        seq_no,
+                        entry,
+                        file_offset: this_offset,
+                    }),
+                    FrameDecode::UnknownOp => {}
+                    FrameDecode::Bad(e) => {
+                        warn!(generation, offset = this_offset, error = %e,
+                              "WAL tap: undecodable frame — skipped");
+                        corrupt += 1;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2347,5 +2733,267 @@ mod tests {
             assert_eq!(reopened.buffer_capacity(), WAL_BUF_CAP);
         }
         assert_eq!(total, 200);
+    }
+
+    // ── WAL tail reader (issue #320) ─────────────────────────────────────────
+
+    fn doc(id: &str) -> WalEntry {
+        WalEntry::Index {
+            doc_id: id.to_string(),
+            source: serde_json::json!({"v": id}),
+        }
+    }
+
+    fn doc_ids(tail: &WalShardTail) -> Vec<String> {
+        tail.entries
+            .iter()
+            .map(|e| match &e.entry {
+                WalEntry::Index { doc_id, .. } => format!("+{doc_id}"),
+                WalEntry::Delete { doc_id } => format!("-{doc_id}"),
+                WalEntry::UpdateMapping { .. } => "~".to_string(),
+            })
+            .collect()
+    }
+
+    /// A never-pruned stream is read from the beginning, so an index created
+    /// while a tap is running is shipped whole — including the documents
+    /// written before its first poll.
+    #[test]
+    fn a_fresh_stream_is_tailed_from_the_beginning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        w.append(&doc("a")).unwrap();
+        w.append(&doc("b")).unwrap();
+        drop(w);
+
+        let tail = tail_shard(dir.path(), None, 100);
+        assert_eq!(doc_ids(&tail), vec!["+a", "+b"]);
+        assert!(!tail.gap);
+        assert!(tail.cursor.drained);
+    }
+
+    /// The resume contract: a cursor read back returns only what arrived
+    /// after it, exactly once.
+    #[test]
+    fn a_cursor_resumes_without_re_reading_or_skipping() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        w.append(&doc("a")).unwrap();
+
+        let first = tail_shard(dir.path(), None, 100);
+        assert_eq!(doc_ids(&first), vec!["+a"]);
+
+        // Nothing new yet.
+        let idle = tail_shard(dir.path(), Some(first.cursor), 100);
+        assert!(idle.entries.is_empty());
+        assert!(!idle.gap);
+
+        w.append(&doc("b")).unwrap();
+        w.append(&WalEntry::Delete {
+            doc_id: "a".to_string(),
+        })
+        .unwrap();
+        let next = tail_shard(dir.path(), Some(idle.cursor), 100);
+        assert_eq!(doc_ids(&next), vec!["+b", "-a"]);
+    }
+
+    /// `max_entries` bounds one read; the cursor lands on a frame boundary so
+    /// the next read continues from exactly there.
+    #[test]
+    fn a_truncated_read_resumes_at_the_frame_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        for id in ["a", "b", "c", "d"] {
+            w.append(&doc(id)).unwrap();
+        }
+        drop(w);
+
+        let first = tail_shard(dir.path(), None, 2);
+        assert_eq!(doc_ids(&first), vec!["+a", "+b"]);
+        assert!(first.truncated);
+        assert!(!first.cursor.drained);
+
+        let second = tail_shard(dir.path(), Some(first.cursor), 100);
+        assert_eq!(doc_ids(&second), vec!["+c", "+d"]);
+        assert!(!second.truncated);
+    }
+
+    /// Rotation is not a gap: a consumer that keeps up walks from one
+    /// generation into the next without noticing.
+    #[test]
+    fn rotation_is_not_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        w.append(&doc("a")).unwrap();
+        let caught_up = tail_shard(dir.path(), None, 100);
+        assert_eq!(doc_ids(&caught_up), vec!["+a"]);
+
+        w.force_rotate().unwrap();
+        w.append(&doc("b")).unwrap();
+        drop(w);
+
+        let after = tail_shard(dir.path(), Some(caught_up.cursor), 100);
+        assert_eq!(doc_ids(&after), vec!["+b"]);
+        assert!(
+            !after.gap,
+            "rotating past a drained generation is not a gap"
+        );
+    }
+
+    /// Draining a generation that is THEN pruned is still not a gap — the
+    /// consumer had already read every entry in it.
+    #[test]
+    fn pruning_a_generation_we_already_drained_is_not_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        w.append(&doc("a")).unwrap();
+        let caught_up = tail_shard(dir.path(), None, 100);
+        assert_eq!(doc_ids(&caught_up), vec!["+a"]);
+        assert_eq!(caught_up.cursor.generation, 0);
+        assert!(caught_up.cursor.drained);
+
+        w.force_rotate().unwrap();
+        w.append(&doc("b")).unwrap();
+        drop(w);
+        // The flush path reclaims generation 0 once its entries are durable.
+        std::fs::remove_file(wal_path(dir.path(), 0)).unwrap();
+
+        let after = tail_shard(dir.path(), Some(caught_up.cursor), 100);
+        assert_eq!(doc_ids(&after), vec!["+b"]);
+        assert!(!after.gap);
+    }
+
+    /// The honesty contract. Retention never waits for a consumer, so a
+    /// consumer that falls far enough behind loses entries — and MUST be told.
+    /// This is the case the whole cursor design exists to detect.
+    #[test]
+    fn a_generation_pruned_before_it_was_read_is_reported_as_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        w.append(&doc("a")).unwrap();
+        let behind = tail_shard(dir.path(), None, 100);
+        assert_eq!(behind.cursor.generation, 0);
+
+        // Two more generations come and go while the consumer is stalled.
+        w.force_rotate().unwrap();
+        w.append(&doc("b")).unwrap();
+        w.force_rotate().unwrap();
+        w.append(&doc("c")).unwrap();
+        drop(w);
+        std::fs::remove_file(wal_path(dir.path(), 0)).unwrap();
+        std::fs::remove_file(wal_path(dir.path(), 1)).unwrap();
+
+        let after = tail_shard(dir.path(), Some(behind.cursor), 100);
+        assert!(
+            after.gap,
+            "generation 1 was pruned unread — that is data the target will \
+             never receive and it must not be silent"
+        );
+        assert_eq!(doc_ids(&after), vec!["+c"]);
+    }
+
+    /// A stream that has been pruned before starts at the END: its surviving
+    /// files are an arbitrary recent slice, and shipping them would look like
+    /// a backfill without being one.
+    #[test]
+    fn a_previously_pruned_stream_starts_at_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        w.append(&doc("old")).unwrap();
+        w.force_rotate().unwrap();
+        w.append(&doc("recent")).unwrap();
+        drop(w);
+        std::fs::remove_file(wal_path(dir.path(), 0)).unwrap();
+
+        let first = tail_shard(dir.path(), None, 100);
+        assert!(
+            first.entries.is_empty(),
+            "an established index must not half-backfill; got {:?}",
+            doc_ids(&first)
+        );
+        assert!(!first.gap);
+
+        // …and it picks up everything from there on.
+        let mut w = make_writer(dir.path());
+        w.append(&doc("new")).unwrap();
+        drop(w);
+        let next = tail_shard(dir.path(), Some(first.cursor), 100);
+        assert_eq!(doc_ids(&next), vec!["+new"]);
+    }
+
+    /// A half-written frame at the tail of the ACTIVE generation is not
+    /// corruption — the writer is mid-append. Hold the boundary and pick the
+    /// frame up once it is complete, rather than resyncing over it.
+    #[test]
+    fn a_half_written_tail_frame_is_waited_for_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        w.append(&doc("a")).unwrap();
+        drop(w);
+
+        let path = wal_path(dir.path(), 0);
+        let good = std::fs::read(&path).unwrap();
+        // Append a plausible but incomplete frame header.
+        let mut torn = good.clone();
+        torn.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, &torn).unwrap();
+
+        let tail = tail_shard(dir.path(), None, 100);
+        assert_eq!(doc_ids(&tail), vec!["+a"]);
+        assert!(!tail.cursor.drained);
+        assert_eq!(tail.corrupt_skipped, 0, "a torn tail is not corruption");
+        assert_eq!(tail.cursor.offset as usize, good.len());
+    }
+
+    /// A cursor from a stream that no longer exists — an index deleted and
+    /// recreated under the same name — must not stall the consumer forever.
+    /// Restart from the beginning and flag it.
+    #[test]
+    fn a_cursor_past_every_generation_restarts_instead_of_stalling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        w.append(&doc("fresh")).unwrap();
+        drop(w);
+
+        let stale = WalTailCursor {
+            generation: 42,
+            offset: 9_000,
+            drained: false,
+        };
+        let tail = tail_shard(dir.path(), Some(stale), 100);
+        assert_eq!(doc_ids(&tail), vec!["+fresh"]);
+        assert!(
+            tail.gap,
+            "a rolled-back stream is a reportable discontinuity"
+        );
+        assert_eq!(tail.cursor.generation, 0);
+    }
+
+    /// Both WAL layouts are discovered: legacy `*.wal` in the root, and the
+    /// sharded `s0`/`s1`/… subdirectories.
+    #[test]
+    fn shard_dirs_cover_both_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        make_writer(&legacy).append(&doc("a")).unwrap();
+        assert_eq!(
+            wal_shard_dirs(&legacy)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            vec![""]
+        );
+
+        let sharded = root.path().join("sharded");
+        for shard in ["s0", "s1"] {
+            make_writer(&sharded.join(shard)).append(&doc("a")).unwrap();
+        }
+        assert_eq!(
+            wal_shard_dirs(&sharded)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            vec!["s0", "s1"]
+        );
     }
 }
