@@ -269,11 +269,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-          # api-checks / conformance / usecase-smoke / autoindex-fd-smoke all
-          # build xerj-server under [profile.ci-test], so they share one cache
-          # entry instead of each storing a near-identical copy. rust-cache
-          # scopes keys by os/arch, so the macOS and Windows legs stay separate.
-          shared-key: xerj-server-ci-test
 
       - uses: actions/setup-node@v4
         with:
@@ -305,11 +300,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-          # api-checks / conformance / usecase-smoke / autoindex-fd-smoke all
-          # build xerj-server under [profile.ci-test], so they share one cache
-          # entry instead of each storing a near-identical copy. rust-cache
-          # scopes keys by os/arch, so the macOS and Windows legs stay separate.
-          shared-key: xerj-server-ci-test
 
       # ci-test: conformance asserts wire behaviour, not throughput.
       - name: Build server + conformance runner (ci-test profile)
@@ -430,11 +420,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-          # api-checks / conformance / usecase-smoke / autoindex-fd-smoke all
-          # build xerj-server under [profile.ci-test], so they share one cache
-          # entry instead of each storing a near-identical copy. rust-cache
-          # scopes keys by os/arch, so the macOS and Windows legs stay separate.
-          shared-key: xerj-server-ci-test
 
       - name: Build xerj + xerj-mcp (release)
         working-directory: engine
@@ -471,11 +456,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-          # api-checks / conformance / usecase-smoke / autoindex-fd-smoke all
-          # build xerj-server under [profile.ci-test], so they share one cache
-          # entry instead of each storing a near-identical copy. rust-cache
-          # scopes keys by os/arch, so the macOS and Windows legs stay separate.
-          shared-key: xerj-server-ci-test
 
       # ci-test, not release: this job boots the binary and checks liveness,
       # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
