@@ -2052,6 +2052,60 @@ mod tests {
         );
     }
 
+    /// #294: snapshot blobs are content-addressed and extensionless
+    /// (`blobs/00000000`), and the code extractor keyed its grammar lookup on
+    /// the CONTENT path instead of the logical one carried by `Sniffed`. Every
+    /// source file on the durable path therefore prepared as junk — zero
+    /// documents — while the generation still committed and reported success.
+    #[test]
+    fn preparation_extracts_code_from_extensionless_snapshot_blobs() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            corpus.path().join("app.py"),
+            "def alpha_helper():\n    return 1\n",
+        )
+        .unwrap();
+        let inventory = inventory(corpus.path());
+        let plan = plan_for(&inventory);
+        let snapshot = create_prepared_snapshot(
+            state.path(),
+            "tx-code",
+            &inventory,
+            &plan,
+            "test-preparation-v1",
+            u64::MAX,
+        )
+        .unwrap();
+        let prepared = snapshot.files[0].prepared.as_ref().unwrap();
+        assert_eq!(
+            (prepared.records, prepared.junk),
+            (1, 0),
+            "a code file must prepare one document, not silent junk"
+        );
+        let ndjson = std::fs::read_to_string(
+            state
+                .path()
+                .join("sync-snapshots/tx-code")
+                .join(&prepared.relative_ndjson),
+        )
+        .unwrap();
+        let document: Value = serde_json::from_str(ndjson.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(document["language"], "python", "{document}");
+        // The title must be the logical file name, not the blob ordinal.
+        assert_eq!(document["title"], "app.py", "{document}");
+        assert!(
+            document["defs"]
+                .as_str()
+                .unwrap_or("")
+                .contains("function alpha_helper"),
+            "{document}"
+        );
+    }
+
     #[test]
     fn prepared_snapshot_budget_aborts_and_removes_staging() {
         let corpus = tempfile::tempdir().unwrap();

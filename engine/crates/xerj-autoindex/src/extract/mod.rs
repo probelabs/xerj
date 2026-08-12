@@ -163,7 +163,7 @@ pub fn extract(
         Family::Docx => docx::extract(path, sink),
         Family::Sqlite => sqlite_x::extract(path, limit_bytes.map(|_| 500), sink),
         Family::SqlDump => sqldump::extract(path, sn.gzip, limit_bytes, sink),
-        Family::Code => code::extract(path, sink),
+        Family::Code => code::extract(path, sn, sink),
         Family::Binary => Ok(ExtractStats::default()),
     }
 }
