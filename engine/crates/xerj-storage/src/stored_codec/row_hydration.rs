@@ -1226,7 +1226,11 @@ mod tests {
                 (
                     "__id",
                     ColCodec::DictBitpack,
-                    encode_dict_bitpack(&[json!("a"), json!("b")], &[0, 1, 0, 1], STORED_ZSTD_LEVEL),
+                    encode_dict_bitpack(
+                        &[json!("a"), json!("b")],
+                        &[0, 1, 0, 1],
+                        STORED_ZSTD_LEVEL,
+                    ),
                 ),
                 ("__seq_no", ColCodec::CrossDep, dependent),
             ],

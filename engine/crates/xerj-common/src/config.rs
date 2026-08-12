@@ -2298,7 +2298,7 @@ mod tests {
             // validates, so #318's `block_size_docs = 999999` node would not
             // have started.
             let err = Config::from_toml_str(&format!("[compression]\nblock_size_docs = {bad}\n"))
-                .expect_err("{bad} is outside the documented 16..=4096 range");
+                .unwrap_err();
             assert!(
                 err.to_string().contains("compression.block_size_docs"),
                 "the error must name the setting, got: {err}"
