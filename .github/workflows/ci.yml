@@ -86,15 +86,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-lint-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-lint-cargo-
+          workspaces: engine
 
       - name: rustfmt (check)
         working-directory: engine
@@ -208,23 +202,57 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+          # Single writer for the Linux [profile.ci-test] dependency cache.
+          # This job compiles the whole workspace, so its dependency set is a
+          # superset of what api-checks / conformance / usecase-smoke need;
+          # they restore this same key read-only. rust-cache's default key is
+          # per-job, which meant five near-identical ~700 MB copies competing
+          # for a 10 GB repo budget and evicting each other.
+          shared-key: ci-test-linux
+
+      # One cargo invocation, not two. `cargo build --release --workspace` used
+      # to run first, but `panic = "abort"` in [profile.release] makes cargo
+      # rebuild the whole dependency graph with `panic = "unwind"` for the test
+      # targets, so that step handed the tests almost nothing: on run
+      # 31571998506 it compiled 39 crates in 9m17s and the test step then
+      # compiled 453. The fat-LTO link of every workspace member is still
+      # gated -- it moved to the `release-build` job, which runs concurrently
+      # instead of in front of this one.
+      #
+      # [profile.ci-test] keeps opt-level 3 and release's assertion settings and
+      # only drops whole-program LTO / codegen-unit merging. Fat-LTO linking of
+      # ~99 separate test binaries was 76m05s of this job's 78-minute test step;
+      # the tests themselves ran in 1m52s.
+      - name: Unit + integration tests
+        working-directory: engine
+        run: cargo test --profile ci-test --workspace -- --test-threads=2
+
+  # Fat LTO + codegen-units=1 + panic=abort over every workspace member is a
+  # failure mode of its own (LTO ICEs, symbol collisions, panic-strategy
+  # mismatches) and is not covered by `cargo clippy --all-targets` in `lint`
+  # nor by the `-p xerj-server` builds elsewhere -- xerj-wasm, for one, is in
+  # no other job's dependency closure. So it stays gated, just not in series
+  # with the tests.
+  release-build:
+    name: Release build (fat LTO, all members link)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
 
       - name: Build (release)
         working-directory: engine
         run: cargo build --release --workspace
-
-      - name: Unit + integration tests
-        working-directory: engine
-        run: cargo test --release --workspace -- --test-threads=2
 
   onnx-feature:
     name: ONNX feature compile + tests
@@ -238,15 +266,9 @@ jobs:
           components: clippy
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-onnx-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-onnx-cargo-
+          workspaces: engine
 
       - name: Compile the server ONNX feature path
         working-directory: engine
@@ -274,28 +296,34 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Build xerj (release)
+      # ci-test, not release: this job boots the binary and checks liveness,
+      # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
+      # checks. Same opt-level and features, only LTO scope differs.
+      - name: Build xerj (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server
+        run: cargo build --profile ci-test -p xerj-server
 
       # Boots the binary, seeds a real corpus, then gates on:
       #   smoke suite (61/61), API liveness (no 5xx across the read surface),
       #   and prints the hot-path benchmark. Deterministic — no model needed.
       - name: API smoke + liveness + benchmark
+        env:
+          XERJ_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj
         run: bash demo/playbooks/ci-check.sh
 
   conformance:
@@ -308,19 +336,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
-      - name: Build server + conformance runner (release)
+      # ci-test: conformance asserts wire behaviour, not throughput.
+      - name: Build server + conformance runner (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server -p es-yaml-runner
+        run: cargo build --profile ci-test -p xerj-server -p es-yaml-runner
 
       # rc.3 regression: the shipped xerj.default.toml failed to parse
       # (`unknown field hnsw_offload_threshold`) so the documented
@@ -335,7 +365,7 @@ jobs:
           set -euo pipefail
           SMOKE="$(mktemp -d)"
           cd "$SMOKE"
-          "$GITHUB_WORKSPACE/engine/target/release/xerj" \
+          "$GITHUB_WORKSPACE/engine/target/ci-test/xerj" \
             --config "$GITHUB_WORKSPACE/engine/xerj.default.toml" > server.log 2>&1 &
           SMOKE_PID=$!
           up=""
@@ -360,7 +390,7 @@ jobs:
           set -euo pipefail
           DATA="$(mktemp -d)"
           echo "XERJ_DATA=$DATA" >> "$GITHUB_ENV"
-          ./target/release/xerj --insecure --data-dir "$DATA" > "$DATA/server.log" 2>&1 &
+          ./target/ci-test/xerj --insecure --data-dir "$DATA" > "$DATA/server.log" 2>&1 &
           echo "XERJ_PID=$!" >> "$GITHUB_ENV"
           for _ in $(seq 1 80); do
             if curl -fs -m1 localhost:9200/_cluster/health >/dev/null 2>&1; then
@@ -433,23 +463,27 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
       - name: Build xerj + xerj-mcp (release)
         working-directory: engine
-        run: cargo build --release -p xerj-server -p xerj-mcp
+        run: cargo build --profile ci-test -p xerj-server -p xerj-mcp
 
       # Drives the demo/usecases scripts themselves, so the thing CI gates is
       # the same thing a reader runs. No browser, no model, no network.
       - name: Use-case smoke (brain transcript, MCP tools, autoindex discovery)
+        env:
+          XERJ_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj
+          XERJ_MCP_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj-mcp
         run: bash .github/scripts/usecase-smoke.sh
 
   # Per-OS runtime gate. The earlier autoindex "Too many open files" crash was
@@ -472,20 +506,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-smoke-${{ matrix.os }}-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-smoke-${{ matrix.os }}-
+          workspaces: engine
 
-      - name: Build xerj (release)
+      # ci-test, not release: this job boots the binary and checks liveness,
+      # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
+      # checks. Same opt-level and features, only LTO scope differs.
+      - name: Build xerj (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server
+        run: cargo build --profile ci-test -p xerj-server
 
       - name: Autoindex a many-dataset corpus (must not exhaust file descriptors)
         shell: bash
+        env:
+          XERJ_BIN: engine/target/ci-test/xerj
         run: bash .github/scripts/autoindex-fd-smoke.sh

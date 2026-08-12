@@ -117,6 +117,28 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# CI test profile. Identical *code semantics* to [profile.release] --
+# opt-level 3, debug-assertions off, overflow-checks off -- so tests still
+# exercise optimized codegen. Only the optimization *scope* changes: no
+# whole-program LTO and 16 codegen units instead of 1.
+#
+# Why it exists: `cargo test --release` links every one of the ~99 test
+# binaries with fat LTO + codegen-units=1. On CI run 31571998506 that was
+# 76m05s of compilation for 1m52s of actual test execution. `panic = "abort"`
+# additionally forces cargo to rebuild the entire dependency graph with
+# `panic = "unwind"` for test targets, so a preceding `cargo build --release`
+# shares almost nothing with it; `panic = "unwind"` here makes that split
+# explicit rather than accidental.
+#
+# [profile.release] above is deliberately untouched: release.yml builds the
+# shipped binary with `cargo build --release`, and it must stay fat-LTO.
+[profile.ci-test]
+inherits = "release"
+lto = false
+codegen-units = 16
+panic = "unwind"
+strip = false
+
 # Fast iteration profile: symbolized with thin LTO and parallel codegen.
 # It is intentionally not production-codegen-equivalent.
 [profile.profiling]
