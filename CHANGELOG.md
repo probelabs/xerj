@@ -5,6 +5,78 @@ All notable changes to XERJ are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **The reference-coding toolkit ships in the repo, and a corpus definition can
+  now rebuild a corpus** ([#319](https://github.com/xerj-org/xerj/issues/319)).
+  `xc-corpus.sh`, `xc-index.sh`, `xc.py` and `SKILL.md` lived only in a
+  gitignored working copy, so `git ls-files | grep xc-` returned nothing while
+  the case study, `CONTRIBUTING.md` and the landing page all told a reader to
+  run them. They are now in [`tools/xerj-code/`](tools/xerj-code/), with a
+  `!tools/**/*.md` re-include in `.gitignore` — the blanket `*.md` rule was what
+  swallowed `SKILL.md`, the same failure mode that hid this repo's pull-request
+  template for its entire history.
+  - `corpus.json` records the **full 40-character SHA**. The old
+    `rev-parse --short` value cannot be fetched from a remote
+    (`git fetch --depth 1 origin e449d17` → "couldn't find remote ref"), so a
+    manifest could not pin anything. A manifest carrying a short SHA is now
+    rejected with a SHA-specific error rather than silently rebuilt at the tip.
+  - `xc-corpus.sh --from <manifest>` rebuilds a corpus at its pinned commits —
+    fetch-by-SHA at depth 1 with progressively deeper fallbacks — and an
+    existing clone is *moved* to the recorded SHA instead of skipped.
+  - [`tools/xerj-code/hub/`](tools/xerj-code/hub/) carries vetted definitions
+    for the four corpora this repo uses. Each entry has a `review` block a
+    human filled in: SPDX expression, `adapt-with-attribution` /
+    `approach-only` / `mixed`, reviewer and date.
+  - Hosting pre-built *indexes* remains out of scope (on-disk format version,
+    embedder identity, redistribution of the indexed source), as does the
+    measurement harness — `CASE_STUDY.md` and `SKILL.md` previously pointed at
+    a `MEASURE.md` that is not in the repo, and now say plainly what ships.
+
+### Fixed
+
+- **The licence detector was wrong on 2 of the 13 repositories it had
+  classified.** `sonic` was recorded as `GPL` when it is **MPL-2.0** — MPL-2.0
+  defines "Secondary License" in terms of the GNU GPL inside its own text, and
+  restrictive-first *body* matching hit that first. `quickwit` was recorded as
+  `Apache-2.0/UNKNOWN` when it is plain **Apache-2.0** — `LICENSE-3rdparty.csv`
+  is a dependency inventory, not the project's licence. The classifier now
+  reads the title line before the body and skips third-party inventories.
+  Elasticsearch's triple licence still resolves to `AGPL` from its title, so
+  the safe direction is preserved where it matters most; that is a test.
+
+- **A corpus manifest could write outside the corpus directory and destroy an
+  unrelated checkout.** `--from` is documented as "rebuild a corpus someone
+  else defined", so a manifest is untrusted input — but only the *corpus* name
+  was screened, while the per-repo `repo` field, from the same file, was used
+  directly as a path. A manifest with `"repo": "../../../work/repo"` moved that
+  checkout to the manifest's commit, discarded its uncommitted changes and
+  untracked files (`checkout --force`, `clean -fd`), and rewrote its `origin`
+  remote. `repo` must now be a plain directory name, enforced in `xc-corpus.sh`
+  and in `validate_manifest.py`, with the destructive path double-guarded.
+
+- **`xc-index.sh` silently ignored an unrecognised argument.**
+  `xc-index.sh <corpus> --frsh` set no flag, ran an *incremental* index and
+  exited 0. Because `autoindex` keeps incremental state in `~/.xerj/autoindex/`,
+  a run that should have been fresh skips every file as "already indexed" and
+  leaves a corpus with 0 documents that retrieves nothing, reporting no error
+  anywhere. Unknown arguments are now rejected by name.
+
+- **`xc.py` warned about only `GPL` and `LGPL`, by exact match**, so it was
+  silent on every restricted repository the hub deliberately ships:
+  elasticsearch (AGPL/SSPL/Elastic), meilisearch's BUSL Enterprise Edition
+  parts, and — once the detector above was corrected from `GPL` to `MPL-2.0` —
+  sonic, which had been warning before. The warning at retrieval time is the
+  one that counts, because that is when an agent is looking at the code and
+  deciding whether to lift it; it now covers the same set as `xc-corpus.sh`.
+
+- New CI job `reference-coding`: shell and Python syntax, the offline
+  round-trip suite (`tools/xerj-code/tests/test_xc_corpus.sh`, 28 checks, local
+  git repositories over `file://`, never touching the real `~/.xerj-code`), and
+  `validate_manifest.py --hub` over every shipped manifest.
+
 ## [1.0.0-rc.16] - 2026-08-11
 
 Both rc.15 known issues (the progress-stream forgery and the outer-`.gitignore`

@@ -51,6 +51,29 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: python3 scripts/check_cla_coauthors.py --pr "$PR_NUMBER"
 
+  reference-coding:
+    name: Reference-coding toolkit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          for f in tools/xerj-code/scripts/*.sh tools/xerj-code/tests/*.sh; do
+            bash -n "$f"
+          done
+          python3 -m py_compile tools/xerj-code/scripts/xc.py \
+                                tools/xerj-code/tests/validate_manifest.py
+
+      # The corpus manifests are the shareable artifact (issue #319): if they
+      # cannot rebuild a corpus, publishing them is worse than not shipping
+      # them. Offline — the fixtures are local git repos served over file://.
+      - name: Corpus manifest round-trip
+        run: tools/xerj-code/tests/test_xc_corpus.sh
+
+      - name: Vetted hub manifests validate
+        run: python3 tools/xerj-code/tests/validate_manifest.py --hub tools/xerj-code/hub/*.json
+
   lint:
     name: Format + Clippy
     runs-on: ubuntu-latest

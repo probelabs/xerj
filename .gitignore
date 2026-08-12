@@ -118,6 +118,13 @@ landing/resources/xerj-sales-kit.zip
 !ROADMAP.md
 !docs/**/*.md
 
+# Re-include the shipped tooling's own docs. `tools/xerj-code/SKILL.md` is part
+# of the tool, not a design note, and the blanket *.md rule above silently
+# swallowed it — the same failure mode as the pull-request template below, and
+# the reason issue #319 existed at all (the reference-coding tooling was
+# documented everywhere and shipped nowhere).
+!tools/**/*.md
+
 # Re-include the public .github community files. The blanket *.md rule above
 # silently swallowed these: no pull-request template has ever existed in this
 # repo's history because `git add` refused it without anyone noticing, while

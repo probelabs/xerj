@@ -1,0 +1,16 @@
+{"corpus":"xerj-search","cloned_at":"2026-08-07T08:24:23Z","repos":[
+  {"repo":"tantivy","url":"https://github.com/quickwit-oss/tantivy","licence":"MIT","sha":"3a55bc986d1062fce618943c4dbd43d55ca87828","files":527,"bytes":36482562,
+   "review":{"spdx":"MIT","use":"adapt-with-attribution","by":"xerj-org","at":"2026-08-12"}},
+  {"repo":"quickwit","url":"https://github.com/quickwit-oss/quickwit","licence":"Apache-2.0","sha":"fb99535bccc4a9745840378f6cf77ff839a21fa6","files":1555,"bytes":31824429,
+   "review":{"spdx":"Apache-2.0","use":"adapt-with-attribution","by":"xerj-org","at":"2026-08-12",
+             "note":"LICENSE is plain Apache-2.0; LICENSE-3rdparty.csv is a dependency inventory, not this project's licence."}},
+  {"repo":"meilisearch","url":"https://github.com/meilisearch/meilisearch","licence":"BUSL/MIT","sha":"be181e115792eae868b1b7c0934a2a29b9d2fde7","files":1734,"bytes":54038985,
+   "review":{"spdx":"MIT AND BUSL-1.1","use":"mixed","by":"xerj-org","at":"2026-08-12",
+             "note":"MIT core, but Enterprise Edition parts are BUSL-1.1 (LICENSE-EE). Check the file's header and path before copying anything."}},
+  {"repo":"sonic","url":"https://github.com/valeriansaliou/sonic","licence":"MPL-2.0","sha":"484339e891a5c9f62840990391f0b3251618de22","files":244,"bytes":1680442,
+   "review":{"spdx":"MPL-2.0","use":"approach-only","by":"xerj-org","at":"2026-08-12",
+             "note":"File-level copyleft. XERJ is Apache-2.0, so read the design and write your own code; do not lift MPL files in."}},
+  {"repo":"elasticsearch","url":"https://github.com/elastic/elasticsearch","licence":"AGPL","sha":"ac375eb50ac52fb9438b26bca7cfe9ecd93e60ad","files":46387,"bytes":586728834,
+   "review":{"spdx":"AGPL-3.0-only OR SSPL-1.0 OR Elastic-2.0","use":"approach-only","by":"xerj-org","at":"2026-08-12",
+             "note":"Triple-licensed; the detector reports only the first (most restrictive) match. Never copy ES code into XERJ — beyond the licence, XERJ's public position is that it shares no code and no architecture with Elasticsearch."}}
+]}
