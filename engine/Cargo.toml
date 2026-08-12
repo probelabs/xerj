@@ -141,6 +141,41 @@ strip = false
 
 # Fast iteration profile: symbolized with thin LTO and parallel codegen.
 # It is intentionally not production-codegen-equivalent.
+# Fast verification profile — for the implement -> build -> verify loop.
+#
+# WHY: [profile.release] below is a SHIPPING configuration — `lto = "fat"` plus
+# `codegen-units = 1` is the slowest build Rust can produce, deliberately, because
+# it yields the fastest binary. Fat LTO is a whole-program optimisation that runs
+# largely single-threaded at link time, and codegen-units = 1 removes intra-crate
+# parallelism, so a 32-core machine ends up watching one core. That is the right
+# trade for an artifact users download and run for months. It is the wrong trade
+# for an agent rebuilding to check whether a one-line fix compiles: the same cost
+# is paid on every iteration, and the resulting binary's runtime speed is
+# irrelevant to the question being asked.
+#
+# `quick` keeps everything that affects CORRECTNESS identical to release —
+# panic = "abort" (inherited, and it changes observable behaviour, so it must
+# match), the same feature set, the same target-cpu from .cargo/config.toml — and
+# relaxes only what affects optimisation. A binary built with `quick` is a valid
+# functional test of a release binary; it is NOT valid for measuring performance.
+#
+# USE IT FOR: does it compile, do the tests pass, does the ES-YAML suite stay at
+#             0 failed, does this fix actually fix the bug.
+# NEVER USE IT FOR: benchmarks, latency numbers, published measurements, or any
+#             artifact that leaves this machine. Those must be --release.
+#
+#   cargo build --profile quick -p xerj-server
+#   cargo test  --profile quick -p xerj-autoindex
+#
+[profile.quick]
+inherits = "release"
+lto = false          # the single biggest lever: no whole-program link-time pass
+codegen-units = 16   # let 32 cores actually participate
+opt-level = 2        # enough that tests are not pathologically slow
+debug = false        # debuginfo is a large share of both build time and disk
+strip = true
+incremental = true   # meaningful for the edit-rebuild-edit loop this profile serves
+
 [profile.profiling]
 inherits = "release"
 debug = 1
