@@ -243,6 +243,11 @@ pub fn help_text() -> String {
              terminal line, in every progress mode EXCEPT `none` (which --quiet\n\
              selects), so an outcome never has to be guessed from silence:\n\
                xerj-done ok=true exit=3 reason=completed-with-junk wall=57.6s …\n\
+             The terminal line also carries code coverage — code_files=N\n\
+             code_files_indexed=M code_files_junked=K — so a corpus whose\n\
+             source files were ALL dropped cannot print the same line as a\n\
+             healthy one. code_files>0 with code_files_indexed=0 is always a\n\
+             defect, and the run says so in words as well.\n\
              --quiet/--progress none prints no progress and NO terminal line\n\
              (only a fatal `error:` line, if any) — poll `autoindex status\n\
              --state-dir <dir>` or read the exit code instead of waiting for\n\
