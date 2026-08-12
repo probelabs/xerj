@@ -871,7 +871,7 @@ mod tests {
                 (
                     "__id",
                     ColCodec::DictBitpack,
-                    encode_dict_bitpack(&values, &ids),
+                    encode_dict_bitpack(&values, &ids, STORED_ZSTD_LEVEL),
                 ),
                 (
                     "__seq_no",
@@ -902,7 +902,7 @@ mod tests {
             assert_eq!(unpack_id(&packed[..packed.len() - 1], width, 2), None);
         }
 
-        let mut corrupt = encode_dict_bitpack(&[json!("only")], &[0, 0, 0]);
+        let mut corrupt = encode_dict_bitpack(&[json!("only")], &[0, 0, 0], STORED_ZSTD_LEVEL);
         // Rebuild the packed stream with id=3, which is outside {entry,null}.
         let dict_len = u32::from_le_bytes(corrupt[5..9].try_into().unwrap()) as usize;
         let packed_offset = 9 + dict_len + 8;
@@ -926,7 +926,7 @@ mod tests {
         );
         assert!(decode_stored_v2_rows(&bad, &[0]).is_err());
 
-        let mut padding = encode_dict_bitpack(&[json!("only")], &[0, 0, 0]);
+        let mut padding = encode_dict_bitpack(&[json!("only")], &[0, 0, 0], STORED_ZSTD_LEVEL);
         let dict_len = u32::from_le_bytes(padding[5..9].try_into().unwrap()) as usize;
         let packed_length_offset = 9 + dict_len + 4;
         let packed_offset = packed_length_offset + 4;
@@ -1226,7 +1226,7 @@ mod tests {
                 (
                     "__id",
                     ColCodec::DictBitpack,
-                    encode_dict_bitpack(&[json!("a"), json!("b")], &[0, 1, 0, 1]),
+                    encode_dict_bitpack(&[json!("a"), json!("b")], &[0, 1, 0, 1], STORED_ZSTD_LEVEL),
                 ),
                 ("__seq_no", ColCodec::CrossDep, dependent),
             ],
