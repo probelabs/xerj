@@ -14255,6 +14255,7 @@ impl Index {
                         query,
                         &text_fields,
                         &exact_fields,
+                        &kw_fields,
                         mem_doc_count,
                     )
                     .map(Arc::new)
@@ -14878,7 +14879,9 @@ impl Index {
         // and materialises only the top prefix, so the F1 bounded-scan / count
         // overwrite must NOT touch FTS queries — it only applies to the
         // non-FTS stored-doc scan (match_all / term-on-keyword / range).
-        let query_needs_fts: bool = query_node_to_fts(query, &text_fields, &exact_fields).is_some();
+        let query_needs_fts: bool =
+            query_node_to_fts_with_keyword_fields(query, &text_fields, &exact_fields, &kw_fields)
+                .is_some();
 
         // ── Precomputed segment agg fast path (M2 G2) ─────────────────────
         //
@@ -15122,7 +15125,12 @@ impl Index {
             // entirely — that call eagerly reads .fst/.meta/.post/.norms
             // for every text field, which costs ~50 MB per segment and is
             // wasted work when the query is a stored-doc scan.
-            let fts_query_probe = query_node_to_fts(query, &text_fields, &exact_fields);
+            let fts_query_probe = query_node_to_fts_with_keyword_fields(
+                query,
+                &text_fields,
+                &exact_fields,
+                &kw_fields,
+            );
             let needs_fts = fts_query_probe.is_some();
             // A `query_string` whose projection DECLINED still has to be
             // answered by the stored-doc scan — an over-cap `tokens × fields`
@@ -15335,7 +15343,12 @@ impl Index {
                             // document happens to sit in.  `None` keeps this
                             // segment's own stats (single-arm gate).
                             .with_collection_stats(collection_stats());
-                    let fts_query = query_node_to_fts(query, &text_fields, &exact_fields);
+                    let fts_query = query_node_to_fts_with_keyword_fields(
+                        query,
+                        &text_fields,
+                        &exact_fields,
+                        &kw_fields,
+                    );
 
                     // Count-only fast path for single-term FTS queries:
                     // call `term_doc_freq` directly on the segment reader
@@ -20287,6 +20300,7 @@ impl Index {
         query: &QueryNode,
         text_fields: &[String],
         exact_fields: &HashSet<String>,
+        keyword_fields: &HashSet<String>,
         mem_doc_count: usize,
     ) -> Option<xerj_fts::CollectionStats> {
         // Widest (field × term) pre-pass we will pay for.  A field-less
@@ -20297,7 +20311,12 @@ impl Index {
         // convention as `MAX_QS_CROSS_PRODUCT`).
         const MAX_STATS_PROBES: usize = 4096;
 
-        let fq = query_node_to_fts(query, text_fields, exact_fields)?;
+        let fq = query_node_to_fts_with_keyword_fields(
+            query,
+            text_fields,
+            exact_fields,
+            keyword_fields,
+        )?;
         let mut fields: Vec<String> = Vec::new();
         collect_fts_query_fields(&fq, &mut fields);
         if fields.is_empty() {
@@ -29490,8 +29509,10 @@ async fn try_aggs_fast_with_segments(
 
 /// Extract a plain-text query string from a QueryNode (for memtable BM25 search).
 ///
-/// Only full-text query types are handled here. Term-level queries (Term, Terms,
-/// Range, Exists, Prefix, Wildcard) are handled by doc scanning instead.
+/// Only full-text query types are handled here. Term-level queries are handled
+/// by the memtable's structured paths or doc scanning; scalar keyword terms
+/// are kept in the segment FTS bool projection so mixed clauses retain exact
+/// membership and scoring there.
 fn extract_query_text(q: &QueryNode) -> Option<String> {
     match q {
         // Wildcard field match must use doc scanning, not BM25.
@@ -34594,11 +34615,14 @@ fn query_string_has_no_tokens(
 /// Convert a QueryNode to an FTS Query for segment search.
 ///
 /// `exact_fields` are the non-Text schema fields (keyword / numeric / date /
-/// bool / ip).  `build_fts_field_configs` indexes those with the `keyword`
+/// bool / ip). `build_fts_field_configs` indexes those with the `keyword`
 /// analyzer — the whole value becomes ONE case-preserved term — so the query
 /// side must look them up by whole value too (ES semantics: `match` /
 /// `multi_match` / query-string clauses on a keyword field are exact
 /// whole-value comparisons, because the keyword analyzer is a no-op).
+/// `keyword_fields` is the narrower schema-typed subset that is safe for a
+/// scalar `term` projection. Numeric/date/bool/IP terms remain on their
+/// source/doc-values path, where typed equality and formatting are preserved.
 /// Tokenizing the query with the `standard` analyzer here would produce
 /// terms (e.g. "claude" from "claude-haiku-4-5") that can never exist in a
 /// keyword field's FST — the cause of the multi_match / query_string /
@@ -34644,10 +34668,23 @@ fn collect_field_boosts(q: &QueryNode, out: &mut HashMap<String, f32>) {
     }
 }
 
+#[cfg(test)]
 fn query_node_to_fts(
     q: &QueryNode,
     text_fields: &[String],
     exact_fields: &std::collections::HashSet<String>,
+) -> Option<FtsQuery> {
+    // The projection tests below pass the exact-field set as their keyword
+    // subset. The search path uses the schema-aware helper so IP/date/numeric
+    // terms retain their source/DV semantics.
+    query_node_to_fts_with_keyword_fields(q, text_fields, exact_fields, exact_fields)
+}
+
+fn query_node_to_fts_with_keyword_fields(
+    q: &QueryNode,
+    text_fields: &[String],
+    exact_fields: &std::collections::HashSet<String>,
+    keyword_fields: &std::collections::HashSet<String>,
 ) -> Option<FtsQuery> {
     match q {
         QueryNode::MatchAll => {
@@ -34660,7 +34697,9 @@ fn query_node_to_fts(
         // applied post-hoc by the top-level override in `search` (the
         // keyword-schema shape is served bit-exactly by `scored_columnar`
         // before this projection is ever consulted).
-        QueryNode::Constant { query, .. } => query_node_to_fts(query, text_fields, exact_fields),
+        QueryNode::Constant { query, .. } => {
+            query_node_to_fts_with_keyword_fields(query, text_fields, exact_fields, keyword_fields)
+        }
         QueryNode::Match {
             field,
             query,
@@ -34969,17 +35008,36 @@ fn query_node_to_fts(
                 Some(combined)
             }
         }
-        QueryNode::Term { .. } => {
-            // Term queries are routed through stored-doc scanning
-            // (json_values_equal) because the FTS index applies the text
-            // analyzer at index time — so `term {method: "GET"}` against a
-            // keyword/int/date field would miss (stopword for "GET", wrong
-            // type for integer).  Doc scanning handles all field types
-            // correctly.  Trade-off: slower on huge segments, but segments
-            // are merged aggressively and most term queries are highly
-            // selective.
-            None
+        QueryNode::Term {
+            field,
+            value,
+            boost,
+        } if keyword_fields.contains(field) && exact_fields.contains(field) => {
+            // Declared keyword fields use the keyword analyzer, so a scalar
+            // term is already the exact FTS term. Keeping it in the FTS tree
+            // is essential for a mixed bool: the FTS bool executor can then
+            // union/intersect it with text clauses and add its BM25 score
+            // instead of routing the whole tree through the schema-blind
+            // stored-source fallback.
+            //
+            // This does not change the repository's existing post-flush
+            // multi-valued-keyword limitation: the segment sidecar flattens
+            // source arrays into one keyword token. Array/object query values
+            // therefore decline here, and scalar keyword coverage is the
+            // deliberately safe projection fixed by this change.
+            let term = match value {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null | Value::Array(_) | Value::Object(_) => return None,
+            };
+            Some(FtsQuery::Term(FtsTerm::boosted(
+                field.as_str(),
+                &term,
+                boost.unwrap_or(1.0),
+            )))
         }
+        QueryNode::Term { .. } => None,
         QueryNode::Bool {
             must,
             should,
@@ -35016,10 +35074,15 @@ fn query_node_to_fts(
             // with keyword-field projections now producing real matches, a
             // dropped filter would silently overcount. Project them as
             // `must`, or fall back to the stored scan when one can't
-            // project (Term/Range/etc. all project to None, so classic
-            // filters keep taking the doc-scan path as before).
+            // project (unsupported Term/Range/etc. still project to None, so
+            // classic filters keep taking the doc-scan path as before).
             for sub in must.iter().chain(filter.iter()) {
-                let fq = query_node_to_fts(sub, text_fields, exact_fields)?;
+                let fq = query_node_to_fts_with_keyword_fields(
+                    sub,
+                    text_fields,
+                    exact_fields,
+                    keyword_fields,
+                )?;
                 bool_q = bool_q.must(fq);
                 projected_any = true;
             }
@@ -35029,14 +35092,24 @@ fn query_node_to_fts(
                 // dropped — dropping it makes the bool LESS permissive and
                 // loses docs that match only via that clause. Fall back to
                 // the stored-doc scan, which handles every child shape.
-                let fq = query_node_to_fts(sub, text_fields, exact_fields)?;
+                let fq = query_node_to_fts_with_keyword_fields(
+                    sub,
+                    text_fields,
+                    exact_fields,
+                    keyword_fields,
+                )?;
                 bool_q = bool_q.should(fq);
                 projected_any = true;
             }
             // `must_not` children that don't project are similar: dropping
             // a must_not relaxes the filter, which is wrong.
             for sub in must_not {
-                let fq = query_node_to_fts(sub, text_fields, exact_fields)?;
+                let fq = query_node_to_fts_with_keyword_fields(
+                    sub,
+                    text_fields,
+                    exact_fields,
+                    keyword_fields,
+                )?;
                 bool_q = bool_q.must_not(fq);
                 projected_any = true;
             }
@@ -37739,6 +37812,23 @@ mod fts_projection_tests {
                 assert_eq!(t.term, "claude-haiku-4-5", "whole value, not tokens");
             }
             other => panic!("expected single term, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn scalar_term_on_keyword_field_projects_whole_value() {
+        let q = QueryNode::Term {
+            field: "ax_path".into(),
+            value: Value::String("no/such/file.php".into()),
+            boost: None,
+        };
+        let fq = query_node_to_fts(&q, &[], &kw(&["ax_path"])).expect("projects");
+        match fq {
+            FtsQuery::Term(term) => {
+                assert_eq!(term.field, "ax_path");
+                assert_eq!(term.term, "no/such/file.php");
+            }
+            other => panic!("expected keyword term, got {other:?}"),
         }
     }
 
