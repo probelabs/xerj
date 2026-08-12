@@ -260,11 +260,11 @@ fn print_help() {
              whole file. To get only the matching function or class, ask for the passage:\n\
          \n\
                  curl -s $URL/<index>/_search -H 'Content-Type: application/json' \\\n\
-                   -d '{{\"query\":{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\n\
-                        \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},\n\
+                   -d '{{\"query\":{{\"bool\":{{\"should\":[{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\n\
+                        \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":8}}}}}}]}}}},\n\
                         \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
          \n\
-             `defs` matches the file that DEFINES a symbol rather than one that mentions it;\n\
+             the `match_phrase` clause ranks the file that DEFINES a symbol above files that merely call it;\n\
              `_passage` returns the enclosing block. Without them you get whole files.\n\
          \n\
          ENVIRONMENT:\n\

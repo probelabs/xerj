@@ -7202,7 +7202,17 @@ fn get_doc_response_hint(index: &str, doc_bytes: usize) -> Value {
             "try": {
                 "request": format!("POST /{index}/_search"),
                 "body": {
-                    "query": {"match": {"body": "<the symbol or phrase you want>"}},
+                    "query": {"bool": {"should": [
+                        {"multi_match": {
+                            "query": "<the symbol or phrase you want>",
+                            "fields": ["body", "defs"],
+                            "type": "most_fields",
+                        }},
+                        {"match_phrase": {"defs": {
+                            "query": "<the symbol or phrase you want>",
+                            "boost": 8,
+                        }}},
+                    ]}},
                     // Project the path rather than dropping `_source`: a blind
                     // run got the passage, could not tell which file it came
                     // from, and spent 6 MB on follow-ups recovering it. Costs

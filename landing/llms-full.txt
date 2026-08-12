@@ -269,10 +269,11 @@ Large documents — ask for the snippet, not the whole file (see §2):
   from the original field. Works with a lexical query naming one field or
   `multi_match`, and with a single semantic/kNN clause; combine with a projected
   `_source` for the largest size reduction. For code specifically,
-  `multi_match` over `["body","defs"]` (`defs` is autoindex's per-file symbol
-  index — one "kind name" line per definition) with `"type":"most_fields"` weights a
-  file that DEFINES a symbol over one that merely mentions it — `xerj autoindex map`
-  prints this exact query pre-built for every code dataset it finds.
+  `bool.should` with `multi_match` over `["body","defs"]` and a
+  `match_phrase` on `defs` with "boost":8 (`defs` is autoindex's per-file symbol
+  index — one "kind name" line per definition) ranks a file that DEFINES a symbol
+  over one that merely mentions it — `xerj autoindex map` prints this exact query
+  pre-built for every code dataset it finds.
 
 --- 3.2 xerj_semantic_search — meaning over a semantic_text field ----
 Prereq: the field must be mapped as `semantic_text` (auto-embedded at ingest).

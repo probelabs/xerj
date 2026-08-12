@@ -280,15 +280,16 @@ pub fn build_sample_queries(pd: &PlanDataset, correlations: &[KeyCorr]) -> Vec<V
             .to_string();
         // Code datasets additionally carry `defs` (newline-joined "kind
         // name" per symbol, identifying the file that DEFINES a symbol —
-        // see `dataset.rs`). Searching `[body, defs]` together with
-        // `most_fields` measurably improves identifier retrieval over body
-        // alone (mean rank 2.17 -> 1.83, no conceptual-query regression)
-        // with no boost needed. Only emit this shape when `defs` actually
-        // exists on the dataset — never assume it. `_source` is projected
-        // to the two fields an agent needs to act on a hit (`ax_path`,
-        // `title` — present on every ingested document, not just code) and
-        // `fields: ["_passage"]` asks for the matching snippet instead of
-        // the whole file body.
+        // see `dataset.rs`). `defs` is analyzed text, so `strip_shortcodes`
+        // tokenizes to `strip` + `shortcodes`; boosting it alone amplifies
+        // conceptual noise. The phrase clause requires the token sequence,
+        // so it contributes for a symbol definition but essentially never
+        // for a multi-word conceptual query. Only emit this shape when `defs`
+        // actually exists on the dataset — never assume it. `_source` is
+        // projected to the two fields an agent needs to act on a hit
+        // (`ax_path`, `title` — present on every ingested document, not just
+        // code) and `fields: ["_passage"]` asks for the matching snippet
+        // instead of the whole file body.
         let has_defs = specs.iter().any(|s| s.name == "defs");
         if has_defs {
             out.push(json!({
@@ -296,11 +297,17 @@ pub fn build_sample_queries(pd: &PlanDataset, correlations: &[KeyCorr]) -> Vec<V
                 "title": format!("Code-aware full-text (BM25) match on {} + defs", f.name),
                 "request": format!("POST /{}/_search", pd.index),
                 "body": {
-                    "query": {"multi_match": {
-                        "query": word.clone(),
-                        "fields": [f.name.clone(), "defs"],
-                        "type": "most_fields",
-                    }},
+                    "query": {"bool": {"should": [
+                        {"multi_match": {
+                            "query": word.clone(),
+                            "fields": [f.name.clone(), "defs"],
+                            "type": "most_fields",
+                        }},
+                        {"match_phrase": {"defs": {
+                            "query": word.clone(),
+                            "boost": 8,
+                        }}},
+                    ]}},
                     "_source": ["ax_path", "title"],
                     "fields": ["_passage"],
                     "size": 3,
@@ -705,10 +712,9 @@ mod sample_query_tests {
     }
 
     /// A dataset carrying `defs` (the code extractor's per-symbol index —
-    /// see `dataset.rs`) must get the code-aware `multi_match` shape:
-    /// `[body, defs]` with `most_fields`, `_source` projected to just the
-    /// fields an agent needs to act on a hit, and `_passage` requested
-    /// instead of the whole file body.
+    /// see `dataset.rs`) must get the code-aware bool shape: a `[body, defs]`
+    /// `most_fields` query plus a self-gating `match_phrase` on `defs`, with
+    /// `_source` projected and `_passage` requested instead of the whole file.
     #[test]
     fn code_dataset_with_defs_gets_a_code_aware_projected_passage_query() {
         let pd = dataset(
@@ -724,14 +730,17 @@ mod sample_query_tests {
             .iter()
             .find(|q| q["class"] == "full_text")
             .expect("a full_text sample query");
+        let should = full_text["body"]["query"]["bool"]["should"]
+            .as_array()
+            .expect("code-aware query should have bool.should");
+        assert_eq!(should.len(), 2);
+        assert_eq!(should[0]["multi_match"]["fields"], json!(["body", "defs"]));
+        assert_eq!(should[0]["multi_match"]["type"], "most_fields");
         assert_eq!(
-            full_text["body"]["query"]["multi_match"]["fields"],
-            json!(["body", "defs"])
+            should[1]["match_phrase"]["defs"]["query"],
+            should[0]["multi_match"]["query"]
         );
-        assert_eq!(
-            full_text["body"]["query"]["multi_match"]["type"],
-            "most_fields"
-        );
+        assert_eq!(should[1]["match_phrase"]["defs"]["boost"], json!(8));
         assert_eq!(full_text["body"]["_source"], json!(["ax_path", "title"]));
         assert_eq!(full_text["body"]["fields"], json!(["_passage"]));
     }
@@ -756,6 +765,8 @@ mod sample_query_tests {
             .find(|q| q["class"] == "full_text")
             .expect("a full_text sample query");
         assert!(full_text["body"]["query"]["match"]["message"].is_string());
+        assert!(full_text["body"]["query"].get("bool").is_none());
+        assert!(full_text["body"]["query"].get("match_phrase").is_none());
         assert!(full_text["body"].get("_source").is_none());
         assert!(full_text["body"].get("fields").is_none());
     }
