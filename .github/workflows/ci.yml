@@ -63,15 +63,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-lint-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-lint-cargo-
+          workspaces: engine
 
       - name: rustfmt (check)
         working-directory: engine
@@ -185,23 +179,50 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+
+      # One cargo invocation, not two. `cargo build --release --workspace` used
+      # to run first, but `panic = "abort"` in [profile.release] makes cargo
+      # rebuild the whole dependency graph with `panic = "unwind"` for the test
+      # targets, so that step handed the tests almost nothing: on run
+      # 31571998506 it compiled 39 crates in 9m17s and the test step then
+      # compiled 453. The fat-LTO link of every workspace member is still
+      # gated -- it moved to the `release-build` job, which runs concurrently
+      # instead of in front of this one.
+      #
+      # [profile.ci-test] keeps opt-level 3 and release's assertion settings and
+      # only drops whole-program LTO / codegen-unit merging. Fat-LTO linking of
+      # ~99 separate test binaries was 76m05s of this job's 78-minute test step;
+      # the tests themselves ran in 1m52s.
+      - name: Unit + integration tests
+        working-directory: engine
+        run: cargo test --profile ci-test --workspace -- --test-threads=2
+
+  # Fat LTO + codegen-units=1 + panic=abort over every workspace member is a
+  # failure mode of its own (LTO ICEs, symbol collisions, panic-strategy
+  # mismatches) and is not covered by `cargo clippy --all-targets` in `lint`
+  # nor by the `-p xerj-server` builds elsewhere -- xerj-wasm, for one, is in
+  # no other job's dependency closure. So it stays gated, just not in series
+  # with the tests.
+  release-build:
+    name: Release build (fat LTO, all members link)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
 
       - name: Build (release)
         working-directory: engine
         run: cargo build --release --workspace
-
-      - name: Unit + integration tests
-        working-directory: engine
-        run: cargo test --release --workspace -- --test-threads=2
 
   onnx-feature:
     name: ONNX feature compile + tests
@@ -215,15 +236,9 @@ jobs:
           components: clippy
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-onnx-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-onnx-cargo-
+          workspaces: engine
 
       - name: Compile the server ONNX feature path
         working-directory: engine
@@ -251,15 +266,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
 
       - uses: actions/setup-node@v4
         with:
@@ -285,15 +294,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
 
       - name: Build server + conformance runner (release)
         working-directory: engine
@@ -410,15 +413,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
 
       - name: Build xerj + xerj-mcp (release)
         working-directory: engine
@@ -449,15 +446,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-smoke-${{ matrix.os }}-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-smoke-${{ matrix.os }}-
+          workspaces: engine
 
       - name: Build xerj (release)
         working-directory: engine
