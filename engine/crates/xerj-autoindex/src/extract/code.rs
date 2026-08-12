@@ -32,6 +32,12 @@ struct LangDef {
     exts: &'static [&'static str],
     language: Language,
     query: Query,
+    /// Content probe for extensions claimed by more than one language (#295).
+    /// `.m` is both Objective-C and MATLAB: when several registry rows claim
+    /// an extension, the first row whose probe returns true wins; a row with
+    /// no probe is the fallback owner. Rows with a unique extension leave this
+    /// `None` and are never probed.
+    probe: Option<fn(&str) -> bool>,
 }
 
 /// Is this extension a language we AST-parse? Cheap check used by the sniffer.
@@ -42,12 +48,56 @@ pub fn is_code_ext(ext: &str) -> bool {
 
 fn def(name: &'static str, exts: &'static [&'static str], lang: Language, q: &str) -> LangDef {
     let query = Query::new(&lang, q).unwrap_or_else(|e| panic!("bad {name} query: {e}"));
+    // Text predicates (#eq?/#any-of?/#match?) are NOT applied by the core
+    // library — parse_symbols() evaluates them itself. Reject operators it
+    // does not implement here, at registry build time, so a typo'd or
+    // unsupported predicate fails `all_queries_compile` instead of silently
+    // matching everything at extraction time.
+    for i in 0..query.pattern_count() {
+        for p in query.general_predicates(i) {
+            assert!(
+                matches!(&*p.operator, "eq?" | "not-eq?" | "any-of?" | "not-any-of?"),
+                "{name} query uses unsupported predicate #{}",
+                p.operator
+            );
+        }
+    }
     LangDef {
         name,
         exts,
         language: lang,
         query,
+        probe: None,
     }
+}
+
+/// A `def(...)` whose extension is shared with another language — see
+/// `LangDef::probe`.
+fn def_probed(
+    name: &'static str,
+    exts: &'static [&'static str],
+    lang: Language,
+    q: &str,
+    probe: fn(&str) -> bool,
+) -> LangDef {
+    let mut d = def(name, exts, lang, q);
+    d.probe = Some(probe);
+    d
+}
+
+/// `.m` probe: Objective-C vs MATLAB. Real Objective-C files near-universally
+/// carry an `#import`/`@interface`/`@implementation`/`@protocol`/`@end`
+/// marker; a `.m` with none of them is treated as MATLAB (the fallback row).
+fn looks_like_objc(text: &str) -> bool {
+    [
+        "#import",
+        "@interface",
+        "@implementation",
+        "@protocol",
+        "@end",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
 }
 
 fn registry() -> &'static [LangDef] {
@@ -108,6 +158,139 @@ fn registry() -> &'static [LangDef] {
                 tree_sitter_bash::LANGUAGE.into(),
                 BASH_Q,
             ),
+            // ── #295 Tier 1 ─────────────────────────────────────────────
+            def(
+                "kotlin",
+                &["kt", "kts"],
+                tree_sitter_kotlin_ng::LANGUAGE.into(),
+                KOTLIN_Q,
+            ),
+            def(
+                "swift",
+                &["swift"],
+                tree_sitter_swift::LANGUAGE.into(),
+                SWIFT_Q,
+            ),
+            // `.sc` is also SuperCollider; Scala is the statistically dominant
+            // owner in the repos agents index, and no SuperCollider grammar is
+            // registered, so no probe is needed (same policy as `.h` → C).
+            def(
+                "scala",
+                &["scala", "sc"],
+                tree_sitter_scala::LANGUAGE.into(),
+                SCALA_Q,
+            ),
+            def("dart", &["dart"], tree_sitter_dart::LANGUAGE.into(), DART_Q),
+            def("lua", &["lua"], tree_sitter_lua::LANGUAGE.into(), LUA_Q),
+            // `.pl` is also Prolog. Perl owns it: overwhelmingly dominant in
+            // real repos, and no Prolog grammar is registered to probe for.
+            def(
+                "perl",
+                &["pl", "pm"],
+                tree_sitter_perl::LANGUAGE.into(),
+                PERL_Q,
+            ),
+            // `.r` is also Rebol; R owns it, same policy as `.pl`.
+            def("r", &["r"], tree_sitter_r::LANGUAGE.into(), R_Q),
+            def(
+                "julia",
+                &["jl"],
+                tree_sitter_julia::LANGUAGE.into(),
+                JULIA_Q,
+            ),
+            def(
+                "haskell",
+                &["hs"],
+                tree_sitter_haskell::LANGUAGE.into(),
+                HASKELL_Q,
+            ),
+            def(
+                "elixir",
+                &["ex", "exs"],
+                tree_sitter_elixir::LANGUAGE.into(),
+                ELIXIR_Q,
+            ),
+            // ── #295 Tier 2 ─────────────────────────────────────────────
+            def(
+                "erlang",
+                &["erl", "hrl"],
+                tree_sitter_erlang::LANGUAGE.into(),
+                ERLANG_Q,
+            ),
+            // OCaml ships separate grammars for implementations and
+            // interfaces; `.mli` needs its own row (and query) or interface
+            // files would fail to parse and fall back to plain text.
+            def(
+                "ocaml",
+                &["ml"],
+                tree_sitter_ocaml::LANGUAGE_OCAML.into(),
+                OCAML_Q,
+            ),
+            def(
+                "ocaml_interface",
+                &["mli"],
+                tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into(),
+                OCAML_MLI_Q,
+            ),
+            def("zig", &["zig"], tree_sitter_zig::LANGUAGE.into(), ZIG_Q),
+            // `.m` collision (issue #295 decision): Objective-C vs MATLAB is
+            // the one collision where both owners are registered, so it is
+            // resolved by content probe — objc markers win, MATLAB is the
+            // fallback row below. `.mm` (Objective-C++) is claimed too: the
+            // objc grammar parses the Objective-C subset and a file it cannot
+            // parse still indexes as plain text.
+            def_probed(
+                "objc",
+                &["m", "mm"],
+                tree_sitter_objc::LANGUAGE.into(),
+                OBJC_Q,
+                looks_like_objc,
+            ),
+            def(
+                "groovy",
+                &["groovy", "gradle"],
+                tree_sitter_groovy::LANGUAGE.into(),
+                GROOVY_Q,
+            ),
+            def(
+                "powershell",
+                &["ps1", "psm1", "psd1"],
+                tree_sitter_powershell::LANGUAGE.into(),
+                POWERSHELL_Q,
+            ),
+            def(
+                "fsharp",
+                &["fs", "fsx"],
+                tree_sitter_fsharp::LANGUAGE_FSHARP.into(),
+                FSHARP_Q,
+            ),
+            def("nix", &["nix"], tree_sitter_nix::LANGUAGE.into(), NIX_Q),
+            // ── #295 Tier 3 ─────────────────────────────────────────────
+            // Free-form Fortran only: `.f` (fixed-form) is deliberately NOT
+            // claimed — the grammar is free-form, a fixed-form file would
+            // parse to garbage, and an unclaimed extension still indexes as
+            // text, which is strictly better than a wrong AST.
+            def(
+                "fortran",
+                &["f90", "f95", "f03"],
+                tree_sitter_fortran::LANGUAGE.into(),
+                FORTRAN_Q,
+            ),
+            // MATLAB is the probe-less fallback for `.m` — must sort after
+            // the objc row (first passing probe wins, probe-less row catches
+            // the rest).
+            def(
+                "matlab",
+                &["m"],
+                tree_sitter_matlab::LANGUAGE.into(),
+                MATLAB_Q,
+            ),
+            def(
+                "solidity",
+                &["sol"],
+                tree_sitter_solidity::LANGUAGE.into(),
+                SOLIDITY_Q,
+            ),
         ]
     })
 }
@@ -124,15 +307,30 @@ pub fn extract(path: &Path, sn: &crate::sniff::Sniffed, sink: Sink) -> Result<Ex
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let Some(def) = registry().iter().find(|d| d.exts.contains(&ext.as_str())) else {
+    let claimants: Vec<&LangDef> = registry()
+        .iter()
+        .filter(|d| d.exts.contains(&ext.as_str()))
+        .collect();
+    if claimants.is_empty() {
         stats.junk += 1;
         return Ok(stats);
-    };
+    }
     let Some(bytes) = super::read_whole(path, false, CODE_CAP)? else {
         stats.junk += 1;
         return Ok(stats);
     };
     let (text, _) = crate::sniff::decode_text(&bytes);
+    // Shared extensions (`.m`): first claimant whose content probe passes wins;
+    // the probe-less row is the fallback. Single-claimant extensions skip the
+    // probe entirely.
+    let def = if claimants.len() == 1 {
+        claimants[0]
+    } else {
+        claimants
+            .iter()
+            .find(|d| d.probe.map(|p| p(&text)).unwrap_or(true))
+            .unwrap_or(&claimants[0])
+    };
 
     // Parse + capture definitions. A parse failure (or an over-deep tree) is not
     // fatal — index the file as plain text so its content is still searchable.
@@ -144,6 +342,48 @@ pub fn extract(path: &Path, sn: &crate::sniff::Sniffed, sink: Sink) -> Result<Ex
 /// (name, kind, 1-based line)
 type Symbol = (String, String, usize);
 
+/// Evaluate a pattern's text predicates against one match. The core library
+/// exposes `#eq?`/`#any-of?` (and their `not-` forms) as *general* predicates
+/// and applies NONE of them itself — without this, the Elixir query would tag
+/// every function call in the file as a definition. Operators are validated
+/// in `def()`; an unknown one landing here rejects the match (fail closed).
+fn predicates_hold(query: &Query, m: &tree_sitter::QueryMatch, text: &str) -> bool {
+    use tree_sitter::QueryPredicateArg as Arg;
+    let cap_text = |ix: u32| -> &str {
+        m.captures
+            .iter()
+            .find(|c| c.index == ix)
+            .and_then(|c| text.get(c.node.byte_range()))
+            .unwrap_or("")
+    };
+    query.general_predicates(m.pattern_index).iter().all(|p| {
+        let mut args = p.args.iter();
+        let Some(Arg::Capture(first)) = args.next() else {
+            return false;
+        };
+        let got = cap_text(*first);
+        let strings: Vec<&str> = p
+            .args
+            .iter()
+            .skip(1)
+            .filter_map(|a| match a {
+                Arg::String(s) => Some(&**s),
+                Arg::Capture(c) => text.get(
+                    m.captures
+                        .iter()
+                        .find(|x| x.index == *c)
+                        .map(|x| x.node.byte_range())?,
+                ),
+            })
+            .collect();
+        match &*p.operator {
+            "eq?" | "any-of?" => strings.iter().any(|s| *s == got),
+            "not-eq?" | "not-any-of?" => !strings.iter().any(|s| *s == got),
+            _ => false,
+        }
+    })
+}
+
 fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
     let mut parser = Parser::new();
     parser.set_language(&def.language).ok()?;
@@ -153,8 +393,14 @@ fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(&def.query, tree.root_node(), text.as_bytes());
     while let Some(m) = it.next() {
+        if !predicates_hold(&def.query, m, text) {
+            continue;
+        }
         for cap in m.captures {
             let kind = names[cap.index as usize]; // capture name == symbol kind
+            if kind.starts_with('_') {
+                continue; // predicate-only capture (`@_kw`), not a symbol
+            }
             let node = cap.node;
             let name = text.get(node.byte_range()).unwrap_or("").trim();
             if name.is_empty() || name.len() > 200 {
@@ -519,6 +765,326 @@ const BASH_Q: &str = r#"
 (function_definition name: (word) @function)
 "#;
 
+// ── #295 queries. Prior art: where the grammar crate ships an author-written
+// `queries/tags.scm`, the definition patterns below are adapted from it and
+// the source is cited; reference-capture patterns and doc-comment plumbing
+// are dropped (this extractor only wants definitions), and `@definition.*`
+// capture names are replaced by this file's capture-name==kind convention.
+// Where no tags.scm ships, patterns are derived from the grammar's
+// `src/node-types.json` and pinned by the fixture tests below. ────────────
+
+// Kotlin has no tags.scm in tree-sitter-kotlin-ng 1.1.0; node-types.json:
+// class/object/function declarations carry `name: (identifier)`. The grammar
+// has no separate interface node — `interface Foo` is a class_declaration
+// whose keyword token distinguishes it, so the "interface" pattern matches
+// the anonymous token to keep `interface Foo` searchable as such. Kotlin has
+// no `.h`-style split, and function-local `fun` is rare enough that the
+// unanchored function pattern is signal (local helpers are still named
+// definitions, as in Rust).
+const KOTLIN_Q: &str = r#"
+(class_declaration "interface" name: (identifier) @interface)
+(class_declaration name: (identifier) @class)
+(object_declaration name: (identifier) @object)
+(function_declaration name: (identifier) @function)
+(type_alias type: (identifier) @type)
+"#;
+
+// Adapted from tree-sitter-swift 0.7.3 queries/tags.scm (class_declaration /
+// protocol_declaration / function_declaration name captures). The grammar
+// folds class/struct/enum/actor/extension into one class_declaration node
+// with a `declaration_kind` token field — matched here so a Swift `struct`
+// is searchable as `struct Point`, not mislabelled a class. tags.scm's
+// method/property captures are dropped: methods are the same
+// function_declaration node captured below, and properties are the
+// locals-trap shape (#170).
+const SWIFT_Q: &str = r#"
+(class_declaration declaration_kind: "class" name: (type_identifier) @class)
+(class_declaration declaration_kind: "struct" name: (type_identifier) @struct)
+(class_declaration declaration_kind: "enum" name: (type_identifier) @enum)
+(class_declaration declaration_kind: "actor" name: (type_identifier) @class)
+(class_declaration declaration_kind: "extension" name: (user_type) @class)
+(protocol_declaration name: (type_identifier) @protocol)
+(function_declaration name: (simple_identifier) @function)
+"#;
+
+// Adapted from tree-sitter-scala 0.26.2 queries/tags.scm. `val`/`var`
+// captures are dropped: the same node appears inside method bodies, which is
+// the 90%-locals trap measured for C in #170; tags.scm tags them because
+// editors want local navigation — `defs` does not.
+const SCALA_Q: &str = r#"
+(class_definition name: (identifier) @class)
+(object_definition name: (identifier) @object)
+(trait_definition name: (identifier) @trait)
+(enum_definition name: (identifier) @enum)
+(full_enum_case name: (identifier) @const)
+(simple_enum_case name: (identifier) @const)
+(function_definition name: (identifier) @function)
+(type_definition name: (type_identifier) @type)
+"#;
+
+// Adapted from tree-sitter-dart 0.2.0 queries/tags.scm (class / mixin / enum
+// / function / method / typedef / enum-constant captures; getter/setter and
+// constructor variants dropped as weight without retrieval surface).
+const DART_Q: &str = r#"
+(class_declaration name: (identifier) @class)
+(mixin_declaration (identifier) @mixin)
+(enum_declaration name: (identifier) @enum)
+(enum_constant name: (identifier) @const)
+(function_signature name: (identifier) @function)
+(type_alias (type_identifier) @type)
+"#;
+
+// Adapted from tree-sitter-lua 0.5.0 queries/tags.scm: the three spellings a
+// Lua module actually uses — `function M.add()`, `function M:method()`, and
+// `local add = function()` / `M.add = function()` assignments, plus
+// function-valued table fields.
+const LUA_Q: &str = r#"
+(function_declaration name: (identifier) @function)
+(function_declaration name: (dot_index_expression field: (identifier) @function))
+(function_declaration name: (method_index_expression method: (identifier) @method))
+(assignment_statement (variable_list name: (identifier) @function) (expression_list value: (function_definition)))
+(assignment_statement (variable_list name: (dot_index_expression field: (identifier) @function)) (expression_list value: (function_definition)))
+(table_constructor (field name: (identifier) @function value: (function_definition)))
+"#;
+
+// No tags.scm in tree-sitter-perl 1.1.2; node-types.json: function_definition
+// carries `name: (identifier)`, packages are a bare `package_name` child.
+const PERL_Q: &str = r#"
+(package_statement (package_name) @module)
+(function_definition name: (identifier) @function)
+"#;
+
+// Adapted from tree-sitter-r 1.3.0 queries/tags.scm: R has no declaration
+// keyword — a "definition" is `name <- function(...)` (or `=`), which is
+// exactly what tags.scm matches. The string-lhs variants are dropped
+// (assigning a function to a string name is vanishingly rare outside
+// metaprogramming).
+const R_Q: &str = r#"
+(binary_operator lhs: (identifier) @function operator: "<-" rhs: (function_definition))
+(binary_operator lhs: (identifier) @function operator: "=" rhs: (function_definition))
+"#;
+
+// No tags.scm in tree-sitter-julia 0.23.1; node-types.json: definitions wrap
+// a `signature` (whose call_expression holds the name) or a `type_head`.
+// The bare-identifier signature is the zero-arg `function f end` form; the
+// binary_expression type_head is `struct Foo <: Bar`.
+const JULIA_Q: &str = r#"
+(function_definition (signature (call_expression (identifier) @function)))
+(function_definition (signature (identifier) @function))
+(macro_definition (signature (call_expression (identifier) @macro)))
+(struct_definition (type_head (identifier) @struct))
+(struct_definition (type_head (binary_expression (identifier) @struct)))
+(abstract_definition (type_head (identifier) @type))
+(abstract_definition (type_head (binary_expression (identifier) @type)))
+(module_definition name: (identifier) @module)
+"#;
+
+// No tags.scm in tree-sitter-haskell 0.23.1; node-types.json: top level is
+// `haskell > declarations > (function|signature|data_type|…)`. The function
+// and signature patterns are anchored to `declarations` because the same
+// `function` node appears in `where` blocks (via `local_binds`, which holds
+// `decl` directly — so the anchor excludes exactly the locals, #170's trap).
+// `signature` is captured too: every exported Haskell function has a type
+// signature, and a file of signatures-only (class heads, foreign imports)
+// must not extract zero symbols. Kinds follow the language's own keywords
+// (`data`, `class`) so `data Maybe` matches what a Haskeller searches.
+const HASKELL_Q: &str = r#"
+(declarations (function name: (variable) @function))
+(declarations (signature name: (variable) @function))
+(data_type name: (name) @data)
+(newtype name: (name) @data)
+(class name: (name) @class)
+(type_synomym name: (name) @type)
+"#;
+
+// Adapted from tree-sitter-elixir 0.3.5 queries/tags.scm — the module and
+// function/macro definition patterns, including the guard-clause form. In
+// Elixir `def` is itself a macro, so a definition is a `call` whose target
+// spells a def-keyword: the `#any-of?` predicates (evaluated by
+// predicates_hold — the core library applies none of them) are what keeps
+// every other function call in the file out of `defs`. tags.scm's reference
+// patterns and @ignore plumbing are dropped.
+const ELIXIR_Q: &str = r#"
+(call target: (identifier) @_kw (arguments (alias) @module) (#any-of? @_kw "defmodule" "defprotocol"))
+(call target: (identifier) @_kw
+  (arguments [
+    (identifier) @function
+    (call target: (identifier) @function)
+    (binary_operator left: (call target: (identifier) @function) operator: "when")
+  ])
+  (#any-of? @_kw "def" "defp" "defdelegate" "defguard" "defguardp" "defmacro" "defmacrop" "defn" "defnp"))
+"#;
+
+// No tags.scm in tree-sitter-erlang 0.20.0 (the WhatsApp ELP grammar);
+// node-types.json: fun_decl wraps function_clause (name: atom),
+// module/record/define/type attributes carry their own name fields. `.hrl`
+// headers are records + macros — without those two patterns a header
+// extracts zero symbols, the same failure C had before #170. `-define`
+// names are `var` (uppercase) or `atom` (lowercase); both are captured.
+const ERLANG_Q: &str = r#"
+(fun_decl (function_clause name: (atom) @function))
+(module_attribute name: (atom) @module)
+(record_decl name: (atom) @record)
+(pp_define lhs: (macro_lhs name: (var) @const))
+(pp_define lhs: (macro_lhs name: (atom) @const))
+(type_alias name: (type_name name: (atom) @type))
+"#;
+
+// Adapted from tree-sitter-ocaml 0.25.0 queries/tags.scm: let-bindings with
+// parameters (or a fun/function body) are functions — a bare `let x = 5` is
+// deliberately not one; modules, module types, classes, methods, types and
+// externals as tagged upstream. Doc-comment (#strip!) plumbing dropped.
+const OCAML_Q: &str = r#"
+(module_definition (module_binding (module_name) @module))
+(module_type_definition (module_type_name) @interface)
+(type_definition (type_binding name: (type_constructor) @type))
+(value_definition (let_binding pattern: (value_name) @function (parameter)))
+(value_definition (let_binding pattern: (value_name) @function body: (fun_expression)))
+(value_definition (let_binding pattern: (value_name) @function body: (function_expression)))
+(external (value_name) @function)
+(method_definition (method_name) @method)
+(class_definition (class_binding (class_name) @class))
+"#;
+
+// The interface grammar is separate (see the registry row). A `.mli` is a
+// module's public surface: every `val` line IS the API, so
+// value_specification is the load-bearing capture — the tags.scm above
+// only covers `.ml` nodes and would extract zero symbols here.
+const OCAML_MLI_Q: &str = r#"
+(value_specification (value_name) @function)
+(type_definition (type_binding name: (type_constructor) @type))
+(module_definition (module_binding (module_name) @module))
+(module_type_definition (module_type_name) @interface)
+(external (value_name) @function)
+"#;
+
+// No tags.scm in tree-sitter-zig 1.1.2; node-types.json: functions carry
+// `name: (identifier)`; types have NO name of their own — `const Point =
+// struct {...}` is a variable_declaration whose value is the container
+// declaration, so the type patterns match that shape. The bare top-level
+// const pattern is anchored to source_file (function-local `const` in Zig is
+// ordinary control flow, the locals trap); the container patterns need no
+// anchor because the shape itself (a container child) cannot be a local.
+const ZIG_Q: &str = r#"
+(function_declaration name: (identifier) @function)
+(variable_declaration (identifier) @struct (struct_declaration))
+(variable_declaration (identifier) @enum (enum_declaration))
+(variable_declaration (identifier) @union (union_declaration))
+(source_file (variable_declaration (identifier) @const))
+"#;
+
+// No tags.scm in tree-sitter-objc 3.0.2. The C-family half (functions,
+// structs, enums, typedefs, #defines) reuses C_Q's measured shapes — same
+// nodes, same locals-trap reasoning (see C_Q). The Objective-C half from
+// node-types.json: @interface/@implementation/@protocol carry their name as
+// the FIRST identifier child (`superclass`/`category` are later fields, and
+// a bare `(identifier)` pattern would capture those too — the `.` anchor is
+// what keeps them out). Method selectors: unary selectors are a bare
+// identifier child; each keyword segment is a keyword_declarator whose
+// first child is the segment name (multi-segment selectors yield one symbol
+// per segment; `defs` dedups).
+const OBJC_Q: &str = r#"
+(class_interface . (identifier) @class)
+(class_implementation . (identifier) @class)
+(protocol_declaration . (identifier) @protocol)
+(method_definition (identifier) @method)
+(method_definition (keyword_declarator . (identifier) @method))
+(method_declaration (identifier) @method)
+(method_declaration (keyword_declarator . (identifier) @method))
+(function_definition declarator: (function_declarator declarator: (identifier) @function))
+(function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @function)))
+(struct_specifier name: (type_identifier) @struct)
+(enum_specifier name: (type_identifier) @enum)
+(type_definition declarator: (type_identifier) @type)
+(preproc_def name: (identifier) @const value: (preproc_arg))
+"#;
+
+// No tags.scm in tree-sitter-groovy 0.1.2; node-types.json mirrors the Java
+// grammar's shapes (name: (identifier) throughout) plus a Groovy-specific
+// function_definition for script-level `def foo() {}` — the form Gradle
+// build scripts and Jenkinsfiles are made of.
+const GROOVY_Q: &str = r#"
+(class_declaration name: (identifier) @class)
+(interface_declaration name: (identifier) @interface)
+(enum_declaration name: (identifier) @enum)
+(method_declaration name: (identifier) @method)
+(constructor_declaration name: (identifier) @method)
+(function_definition name: (identifier) @function)
+"#;
+
+// No tags.scm in tree-sitter-powershell 0.26.4; node-types.json: none of the
+// definition nodes use fields — the name is the first named child
+// (function_name for functions, simple_name for class/enum/method), so the
+// class/enum patterns anchor to keep member names from matching.
+const POWERSHELL_Q: &str = r#"
+(function_statement (function_name) @function)
+(class_statement . (simple_name) @class)
+(class_method_definition (simple_name) @method)
+(enum_statement . (simple_name) @enum)
+"#;
+
+// Adapted from tree-sitter-fsharp 0.3.11 queries/tags.scm. The function
+// patterns keep upstream's anchoring to the four top-level contexts
+// (file/named_module/module_defn/namespace via declaration_expression) —
+// F# nests `let` inside functions constantly, and the same
+// function_or_value_defn node models both, so the unanchored form is the
+// locals trap (#170). The type pattern collapses upstream's nine-variant
+// enumeration into a wildcard: every variant wraps the same type_name node.
+const FSHARP_Q: &str = r#"
+(named_module name: (long_identifier) @module)
+(module_defn . (_) @module)
+(type_definition (_ (type_name type_name: (_) @type)))
+(file (declaration_expression (function_or_value_defn (function_declaration_left . (_) @function))))
+(named_module (declaration_expression (function_or_value_defn (function_declaration_left . (_) @function))))
+(module_defn (declaration_expression (function_or_value_defn (function_declaration_left . (_) @function))))
+(namespace (declaration_expression (function_or_value_defn (function_declaration_left . (_) @function))))
+(member_defn (method_or_prop_defn name: (property_or_ident) @method))
+"#;
+
+// Adapted from tree-sitter-nix 0.3.0 queries/tags.scm — its one definition
+// pattern: a binding whose value is a function expression. The attrpath
+// capture is narrowed to the attr identifier so `defs` carries `foo`, not
+// `foo.bar.baz` punctuation.
+const NIX_Q: &str = r#"
+(binding attrpath: (attrpath attr: (identifier) @function) expression: (function_expression))
+"#;
+
+// Adapted from tree-sitter-fortran 0.6.0 queries/tags.scm: functions,
+// subroutines, modules/programs/submodules, derived types. tags.scm maps
+// program/submodule to module and derived types to class; derived types are
+// @type here (`type :: point_t` is what a Fortran user searches).
+const FORTRAN_Q: &str = r#"
+(function_statement (name) @function)
+(subroutine_statement (name) @function)
+(module_statement (name) @module)
+(submodule_statement (name) @module)
+(program_statement (name) @module)
+(derived_type_statement (type_name) @type)
+"#;
+
+// Adapted from tree-sitter-matlab 1.3.0 queries/neovim/tags.scm — the two
+// definition patterns (function/class), name-fielded.
+const MATLAB_Q: &str = r#"
+(function_definition name: (identifier) @function)
+(class_definition name: (identifier) @class)
+"#;
+
+// Adapted from tree-sitter-solidity 1.2.13 queries/tags.scm. Kinds keep the
+// language's own keywords (contract/library/event) rather than tags.scm's
+// class/interface mapping — `contract Token` is the search a Solidity user
+// types. Functions inside contracts are the same function_definition node,
+// captured once, unanchored (Solidity has no nested functions to trap on).
+const SOLIDITY_Q: &str = r#"
+(contract_declaration name: (identifier) @contract)
+(interface_declaration name: (identifier) @interface)
+(library_declaration name: (identifier) @library)
+(function_definition name: (identifier) @function)
+(struct_declaration name: (identifier) @struct)
+(enum_declaration name: (identifier) @enum)
+(event_definition name: (identifier) @event)
+(modifier_definition name: (identifier) @function)
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +1122,134 @@ mod tests {
         assert_eq!(records[0].fields["language"], "python");
         // Title comes from the logical name, not the blob ordinal.
         assert_eq!(records[0].fields["title"], "app.py");
+    }
+
+    /// #295 acceptance criterion: every registered grammar must instantiate
+    /// on the linked core. Core 0.26 accepts ABI 13–15; a grammar crate
+    /// generated against a newer ABI would refuse to load — this makes that
+    /// an immediate CI failure on every OS in the matrix rather than a
+    /// runtime parse failure at a user's machine (the c-sharp crate already
+    /// forced one core bump this way).
+    #[test]
+    fn all_languages_load() {
+        for d in registry() {
+            let mut p = Parser::new();
+            assert!(
+                p.set_language(&d.language).is_ok(),
+                "{}: grammar ABI {} incompatible with linked tree-sitter core",
+                d.name,
+                d.language.abi_version()
+            );
+        }
+    }
+
+    /// The public docs (`ROADMAP.md`, `landing/index.html`) state a language
+    /// count. Honest-claims rule: pin it to the registry so the number cannot
+    /// drift. Registry ROWS exceed languages by one — OCaml needs two rows
+    /// because `.ml` and `.mli` are separate grammars — while `tsx` has always
+    /// been counted as its own language by these docs.
+    #[test]
+    fn documented_language_count() {
+        assert_eq!(registry().len(), 35, "registry row count changed");
+        let langs: std::collections::HashSet<&str> = registry()
+            .iter()
+            .map(|d| d.name.trim_end_matches("_interface"))
+            .collect();
+        assert_eq!(
+            langs.len(),
+            34,
+            "docs say 34 languages; update ROADMAP.md and landing/index.html"
+        );
+    }
+
+    /// The #295 regression test: these languages fell through to the prose
+    /// extractor at HEAD (verified live — `language`/`symbols`/`defs` all
+    /// null after an `xerj autoindex` run over Kotlin/Swift/Lua/Elixir
+    /// fixtures). An unclaimed extension is not code to the sniffer AT ALL,
+    /// so those files were chunked into body-only records. This fails on the
+    /// pre-#295 registry and pins every newly claimed extension to its
+    /// language.
+    #[test]
+    fn issue_295_extensions_route() {
+        for (ext, lang) in [
+            ("kt", "kotlin"),
+            ("kts", "kotlin"),
+            ("swift", "swift"),
+            ("scala", "scala"),
+            ("sc", "scala"),
+            ("dart", "dart"),
+            ("lua", "lua"),
+            ("pl", "perl"),
+            ("pm", "perl"),
+            ("r", "r"),
+            ("jl", "julia"),
+            ("hs", "haskell"),
+            ("ex", "elixir"),
+            ("exs", "elixir"),
+            ("erl", "erlang"),
+            ("hrl", "erlang"),
+            ("ml", "ocaml"),
+            ("mli", "ocaml_interface"),
+            ("zig", "zig"),
+            ("m", "objc"),
+            ("mm", "objc"),
+            ("groovy", "groovy"),
+            ("gradle", "groovy"),
+            ("ps1", "powershell"),
+            ("psm1", "powershell"),
+            ("psd1", "powershell"),
+            ("fs", "fsharp"),
+            ("fsx", "fsharp"),
+            ("nix", "nix"),
+            ("f90", "fortran"),
+            ("f95", "fortran"),
+            ("f03", "fortran"),
+            ("sol", "solidity"),
+        ] {
+            assert!(is_code_ext(ext), "{ext} must be recognised as code");
+            let d = registry().iter().find(|d| d.exts.contains(&ext));
+            assert_eq!(
+                d.map(|d| d.name),
+                Some(lang),
+                "{ext} must route to the {lang} grammar"
+            );
+        }
+        // Deliberately NOT claimed, each for a stated reason: fixed-form
+        // Fortran would mis-parse under the free-form grammar; nim/crystal
+        // have no usable published grammar; sql routing is deferred; clojure
+        // waits on a crate release against core 0.26.
+        for ext in ["f", "nim", "cr", "sql", "clj"] {
+            assert!(!is_code_ext(ext), "{ext} must stay unclaimed (see #295)");
+        }
+    }
+
+    /// The `.m` collision decision from #295: content probe. Objective-C
+    /// markers route to objc; a markerless `.m` is MATLAB. The probe only
+    /// runs for extensions with more than one claimant.
+    #[test]
+    fn m_extension_content_probe() {
+        assert!(looks_like_objc("#import <Foundation/Foundation.h>\n"));
+        assert!(looks_like_objc("@interface Foo : NSObject\n@end\n"));
+        assert!(!looks_like_objc(
+            "function y = square(x)\n  y = x^2;\nend\n"
+        ));
+        // Registry order is load-bearing: objc (probed) must sort before
+        // matlab (fallback) among the `.m` claimants.
+        let claimants: Vec<&str> = registry()
+            .iter()
+            .filter(|d| d.exts.contains(&"m"))
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(claimants, ["objc", "matlab"], "probe order broken");
+        assert!(
+            registry()
+                .iter()
+                .find(|d| d.name == "objc")
+                .unwrap()
+                .probe
+                .is_some(),
+            "objc row must carry the content probe"
+        );
     }
 
     #[test]
@@ -980,5 +1674,412 @@ mod tests {
     fn bash() {
         let s = syms("bash", "foo() { echo hi; }\nfunction bar { echo yo; }\n");
         assert!(has(&s, "foo", "function"));
+    }
+
+    // ── #295 fixtures: one real-world-shaped snippet per added language,
+    // asserting at least one symbol of each kind its query captures. ─────
+
+    #[test]
+    fn kotlin() {
+        let s = syms(
+            "kotlin",
+            "package demo\n\
+             interface Greets { fun greet(): String }\n\
+             class Greeter(val name: String) : Greets {\n\
+                 override fun greet(): String = \"hi $name\"\n\
+             }\n\
+             object Registry { fun lookup(id: Int) = id }\n\
+             typealias Handler = (Int) -> Unit\n\
+             fun topLevel(): Int = 42\n",
+        );
+        assert!(has(&s, "Greeter", "class"), "got {s:?}");
+        assert!(has(&s, "Greets", "interface"), "got {s:?}");
+        assert!(has(&s, "Registry", "object"), "got {s:?}");
+        assert!(has(&s, "greet", "function"), "got {s:?}");
+        assert!(has(&s, "topLevel", "function"), "got {s:?}");
+        assert!(has(&s, "Handler", "type"), "got {s:?}");
+    }
+
+    #[test]
+    fn swift() {
+        let s = syms(
+            "swift",
+            "protocol Shape { func area() -> Double }\n\
+             struct Point { var x: Double }\n\
+             enum Direction { case north, south }\n\
+             class Canvas {\n\
+                 func draw(_ p: Point) {}\n\
+             }\n\
+             func launch() {}\n",
+        );
+        assert!(has(&s, "Shape", "protocol"), "got {s:?}");
+        assert!(has(&s, "Point", "struct"), "got {s:?}");
+        assert!(has(&s, "Direction", "enum"), "got {s:?}");
+        assert!(has(&s, "Canvas", "class"), "got {s:?}");
+        assert!(has(&s, "draw", "function"), "got {s:?}");
+        assert!(has(&s, "launch", "function"), "got {s:?}");
+    }
+
+    #[test]
+    fn scala() {
+        let s = syms(
+            "scala",
+            "trait Greeter { def greet(name: String): String }\n\
+             class Impl extends Greeter { def greet(name: String) = s\"hi $name\" }\n\
+             object Main { def run(): Unit = () }\n\
+             enum Color { case Red, Green }\n\
+             type Handler = String => Unit\n",
+        );
+        assert!(has(&s, "Greeter", "trait"), "got {s:?}");
+        assert!(has(&s, "Impl", "class"), "got {s:?}");
+        assert!(has(&s, "Main", "object"), "got {s:?}");
+        assert!(has(&s, "greet", "function"), "got {s:?}");
+        assert!(has(&s, "Color", "enum"), "got {s:?}");
+        assert!(has(&s, "Red", "const"), "got {s:?}");
+        assert!(has(&s, "Handler", "type"), "got {s:?}");
+    }
+
+    #[test]
+    fn dart() {
+        let s = syms(
+            "dart",
+            "class Greeter { String greet(String name) => 'hi'; }\n\
+             mixin Musical { void play() {} }\n\
+             enum Suit { hearts, spades }\n\
+             typedef Handler = void Function(int);\n\
+             int topLevel(int x) { return x; }\n",
+        );
+        assert!(has(&s, "Greeter", "class"), "got {s:?}");
+        assert!(has(&s, "Musical", "mixin"), "got {s:?}");
+        assert!(has(&s, "Suit", "enum"), "got {s:?}");
+        assert!(has(&s, "hearts", "const"), "got {s:?}");
+        assert!(has(&s, "Handler", "type"), "got {s:?}");
+        assert!(has(&s, "topLevel", "function"), "got {s:?}");
+        assert!(has(&s, "greet", "function"), "got {s:?}");
+    }
+
+    #[test]
+    fn lua() {
+        let s = syms(
+            "lua",
+            "local M = {}\n\
+             function M.add(a, b) return a + b end\n\
+             function M:reset() end\n\
+             local helper = function(x) return x end\n\
+             function standalone() end\n\
+             local T = { handler = function() end }\n\
+             return M\n",
+        );
+        assert!(has(&s, "add", "function"), "got {s:?}");
+        assert!(has(&s, "reset", "method"), "got {s:?}");
+        assert!(has(&s, "helper", "function"), "got {s:?}");
+        assert!(has(&s, "standalone", "function"), "got {s:?}");
+        assert!(has(&s, "handler", "function"), "got {s:?}");
+    }
+
+    #[test]
+    fn perl() {
+        let s = syms(
+            "perl",
+            "package My::Module;\n\
+             sub new {\n    my ($class) = @_;\n    return bless {}, $class;\n}\n\
+             sub greet { return 'hi'; }\n\
+             1;\n",
+        );
+        assert!(has(&s, "My::Module", "module"), "got {s:?}");
+        assert!(has(&s, "new", "function"), "got {s:?}");
+        assert!(has(&s, "greet", "function"), "got {s:?}");
+    }
+
+    #[test]
+    fn r() {
+        let s = syms(
+            "r",
+            "square <- function(x) {\n  x^2\n}\ncube = function(x) x^3\nvalue <- 42\n",
+        );
+        assert!(has(&s, "square", "function"), "got {s:?}");
+        assert!(has(&s, "cube", "function"), "got {s:?}");
+        // Plain value assignment is not a definition.
+        assert!(!has(&s, "value", "function"), "captured a value: {s:?}");
+    }
+
+    #[test]
+    fn julia() {
+        let s = syms(
+            "julia",
+            "module Geometry\n\
+             struct Point\n    x::Float64\nend\n\
+             abstract type Shape end\n\
+             struct Circle <: Shape\n    r::Float64\nend\n\
+             function area(c::Circle)\n    3.14 * c.r^2\nend\n\
+             macro trace(ex)\n    ex\nend\n\
+             end\n",
+        );
+        assert!(has(&s, "Geometry", "module"), "got {s:?}");
+        assert!(has(&s, "Point", "struct"), "got {s:?}");
+        assert!(has(&s, "Circle", "struct"), "got {s:?}");
+        assert!(has(&s, "Shape", "type"), "got {s:?}");
+        assert!(has(&s, "area", "function"), "got {s:?}");
+        assert!(has(&s, "trace", "macro"), "got {s:?}");
+    }
+
+    #[test]
+    fn haskell() {
+        // NOTE: single literal with explicit indentation — Haskell layout is
+        // significant, and the `\`-continuation form strips leading spaces,
+        // which silently promotes where-locals to top level.
+        let s = syms(
+            "haskell",
+            "module Demo where\n\ndata Tree = Leaf | Node Tree Tree\nnewtype Wrapper = Wrapper Int\ntype Alias = Int\nclass Pretty a where\n  pretty :: a -> String\ndepth :: Tree -> Int\ndepth t = go t\n  where\n    go Leaf = 0\n    go (Node l r) = 1 + max (go l) (go r)\n",
+        );
+        assert!(has(&s, "Tree", "data"), "got {s:?}");
+        assert!(has(&s, "Wrapper", "data"), "got {s:?}");
+        assert!(has(&s, "Alias", "type"), "got {s:?}");
+        assert!(has(&s, "Pretty", "class"), "got {s:?}");
+        assert!(has(&s, "depth", "function"), "got {s:?}");
+        // The where-bound helper is a local — the `declarations` anchor is
+        // what keeps it out of `defs` (#170's trap, Haskell edition).
+        assert!(!has(&s, "go", "function"), "captured a where-local: {s:?}");
+    }
+
+    #[test]
+    fn elixir() {
+        let s = syms(
+            "elixir",
+            "defmodule Server do\n\
+               def start(port) do\n    {:ok, port}\n  end\n\
+               def stop, do: :ok\n\
+               defp validate(port) when is_integer(port), do: port\n\
+               defmacro trace(ast), do: ast\n\
+               def handle(:ping), do: :pong\n\
+               IO.puts(\"not a definition\")\n\
+             end\n",
+        );
+        assert!(has(&s, "Server", "module"), "got {s:?}");
+        assert!(has(&s, "start", "function"), "got {s:?}");
+        assert!(has(&s, "stop", "function"), "got {s:?}");
+        assert!(has(&s, "validate", "function"), "got {s:?}");
+        assert!(has(&s, "trace", "function"), "got {s:?}");
+        assert!(has(&s, "handle", "function"), "got {s:?}");
+        // The #any-of? predicate is what rejects ordinary calls — without
+        // predicate evaluation every call in the file would be a "def".
+        assert!(!has(&s, "puts", "function"), "captured a call: {s:?}");
+    }
+
+    #[test]
+    fn erlang() {
+        let s = syms(
+            "erlang",
+            "-module(server).\n\
+             -record(state, {port, owner}).\n\
+             -define(MAX_CONN, 100).\n\
+             -define(default_port, 8080).\n\
+             -type conn() :: pid().\n\
+             start(Port) -> {ok, Port}.\n\
+             stop() -> ok.\n",
+        );
+        assert!(has(&s, "server", "module"), "got {s:?}");
+        assert!(has(&s, "state", "record"), "got {s:?}");
+        assert!(has(&s, "MAX_CONN", "const"), "got {s:?}");
+        assert!(has(&s, "default_port", "const"), "got {s:?}");
+        assert!(has(&s, "conn", "type"), "got {s:?}");
+        assert!(has(&s, "start", "function"), "got {s:?}");
+        assert!(has(&s, "stop", "function"), "got {s:?}");
+    }
+
+    #[test]
+    fn ocaml() {
+        let s = syms(
+            "ocaml",
+            "module Geometry = struct\n  let pi = 3.14\nend\n\
+             type shape = Circle of float | Square of float\n\
+             let area s = match s with Circle r -> r | Square w -> w\n\
+             let double = fun x -> x * 2\n\
+             let tau = 6.28\n\
+             external now : unit -> float = \"caml_now\"\n",
+        );
+        assert!(has(&s, "Geometry", "module"), "got {s:?}");
+        assert!(has(&s, "shape", "type"), "got {s:?}");
+        assert!(has(&s, "area", "function"), "got {s:?}");
+        assert!(has(&s, "double", "function"), "got {s:?}");
+        assert!(has(&s, "now", "function"), "got {s:?}");
+        // A bare value binding is not a function definition.
+        assert!(!has(&s, "tau", "function"), "captured a value: {s:?}");
+    }
+
+    /// `.mli` parses under a DIFFERENT grammar; without its own registry row
+    /// an interface file — the file that IS a module's public API — would
+    /// fall back to plain text.
+    #[test]
+    fn ocaml_interface() {
+        let s = syms(
+            "ocaml_interface",
+            "type shape = Circle of float\n\
+             val area : shape -> float\n\
+             val name : string\n\
+             module type S = sig\n  val id : int\nend\n",
+        );
+        assert!(has(&s, "shape", "type"), "got {s:?}");
+        assert!(has(&s, "area", "function"), "got {s:?}");
+        assert!(has(&s, "S", "interface"), "got {s:?}");
+    }
+
+    #[test]
+    fn zig() {
+        let s = syms(
+            "zig",
+            "const std = @import(\"std\");\n\
+             const Point = struct {\n    x: f32,\n    pub fn norm(self: Point) f32 { return self.x; }\n};\n\
+             const Direction = enum { north, south };\n\
+             const Value = union { int: i32, float: f32 };\n\
+             pub fn main() void {\n    const local = 1;\n    _ = local;\n}\n",
+        );
+        assert!(has(&s, "Point", "struct"), "got {s:?}");
+        assert!(has(&s, "Direction", "enum"), "got {s:?}");
+        assert!(has(&s, "Value", "union"), "got {s:?}");
+        assert!(has(&s, "main", "function"), "got {s:?}");
+        assert!(has(&s, "norm", "function"), "got {s:?}");
+        assert!(has(&s, "std", "const"), "got {s:?}");
+        // Function-local const must stay out (source_file anchor).
+        assert!(!has(&s, "local", "const"), "captured a local: {s:?}");
+    }
+
+    #[test]
+    fn objc() {
+        let s = syms(
+            "objc",
+            "#import <Foundation/Foundation.h>\n\
+             #define MAX_RETRIES 3\n\
+             @protocol Drawable\n- (void)draw;\n@end\n\
+             @interface Shape : NSObject\n- (double)area;\n@end\n\
+             @implementation Shape\n\
+             - (double)area { return 0; }\n\
+             - (void)moveToX:(double)x y:(double)y { }\n\
+             @end\n\
+             static int helper(int v) { return v; }\n",
+        );
+        assert!(has(&s, "Shape", "class"), "got {s:?}");
+        assert!(has(&s, "Drawable", "protocol"), "got {s:?}");
+        assert!(has(&s, "area", "method"), "got {s:?}");
+        assert!(has(&s, "moveToX", "method"), "got {s:?}");
+        assert!(has(&s, "helper", "function"), "got {s:?}");
+        assert!(has(&s, "MAX_RETRIES", "const"), "got {s:?}");
+    }
+
+    /// The other half of the `.m` probe: a markerless `.m` routes to MATLAB
+    /// and extracts MATLAB symbols.
+    #[test]
+    fn matlab() {
+        let s = syms("matlab", "function y = square(x)\n  y = x^2;\nend\n");
+        assert!(has(&s, "square", "function"), "got {s:?}");
+        let c = syms(
+            "matlab",
+            "classdef Point\n  methods\n    function obj = Point()\n    end\n  end\nend\n",
+        );
+        assert!(has(&c, "Point", "class"), "got {c:?}");
+    }
+
+    #[test]
+    fn groovy() {
+        let s = syms(
+            "groovy",
+            "class Pipeline {\n\
+                 Pipeline() {}\n\
+                 def run(stage) { stage() }\n\
+             }\n\
+             interface Task { void execute() }\n\
+             enum Phase { BUILD, TEST }\n\
+             def deploy(env) { println env }\n",
+        );
+        assert!(has(&s, "Pipeline", "class"), "got {s:?}");
+        assert!(has(&s, "Task", "interface"), "got {s:?}");
+        assert!(has(&s, "Phase", "enum"), "got {s:?}");
+        assert!(has(&s, "deploy", "function"), "got {s:?}");
+        assert!(has(&s, "run", "method"), "got {s:?}");
+    }
+
+    #[test]
+    fn powershell() {
+        let s = syms(
+            "powershell",
+            "function Get-Widget {\n    param($Name)\n    $Name\n}\n\
+             class Inventory {\n    [int] $Count\n    [void] Add([int] $n) { }\n}\n\
+             enum Color { Red; Green }\n",
+        );
+        assert!(has(&s, "Get-Widget", "function"), "got {s:?}");
+        assert!(has(&s, "Inventory", "class"), "got {s:?}");
+        assert!(has(&s, "Add", "method"), "got {s:?}");
+        assert!(has(&s, "Color", "enum"), "got {s:?}");
+    }
+
+    #[test]
+    fn fsharp() {
+        // NOTE: single literal with explicit indentation — F# layout is
+        // significant (see the haskell fixture note).
+        let s = syms(
+            "fsharp",
+            "module Demo\ntype Shape =\n    | Circle of float\n    | Square of float\ntype Point = { X: float; Y: float }\nlet area shape =\n    let helper r = r * r\n    helper 2.0\n",
+        );
+        assert!(has(&s, "Demo", "module"), "got {s:?}");
+        assert!(has(&s, "Shape", "type"), "got {s:?}");
+        assert!(has(&s, "Point", "type"), "got {s:?}");
+        assert!(has(&s, "area", "function"), "got {s:?}");
+        // Nested let is a local — the context anchoring keeps it out.
+        assert!(!has(&s, "helper", "function"), "captured a local: {s:?}");
+    }
+
+    #[test]
+    fn nix() {
+        let s = syms(
+            "nix",
+            "{\n  mkShell = pkgs: pkgs.mkShell {};\n  version = \"1.0\";\n}\n",
+        );
+        assert!(has(&s, "mkShell", "function"), "got {s:?}");
+        // A non-function binding is data, not a definition.
+        assert!(!has(&s, "version", "function"), "captured data: {s:?}");
+    }
+
+    #[test]
+    fn fortran() {
+        let s = syms(
+            "fortran",
+            "module geometry\n\
+               type :: point_t\n    real :: x\n  end type\n\
+             contains\n\
+               function area(r) result(a)\n    real :: r, a\n    a = r * r\n  end function\n\
+               subroutine reset(p)\n    type(point_t) :: p\n  end subroutine\n\
+             end module\n\
+             program main\n  use geometry\nend program\n",
+        );
+        assert!(has(&s, "geometry", "module"), "got {s:?}");
+        assert!(has(&s, "point_t", "type"), "got {s:?}");
+        assert!(has(&s, "area", "function"), "got {s:?}");
+        assert!(has(&s, "reset", "function"), "got {s:?}");
+        assert!(has(&s, "main", "module"), "got {s:?}");
+    }
+
+    #[test]
+    fn solidity() {
+        let s = syms(
+            "solidity",
+            "contract Token {\n\
+                 struct Account { uint balance; }\n\
+                 enum Phase { Open, Closed }\n\
+                 event Transfer(address from, address to);\n\
+                 modifier onlyOwner() { _; }\n\
+                 function mint(uint amount) public { }\n\
+             }\n\
+             interface IToken { function total() external; }\n\
+             library MathLib { function min(uint a, uint b) internal pure returns (uint) { return a; } }\n",
+        );
+        assert!(has(&s, "Token", "contract"), "got {s:?}");
+        assert!(has(&s, "IToken", "interface"), "got {s:?}");
+        assert!(has(&s, "MathLib", "library"), "got {s:?}");
+        assert!(has(&s, "Account", "struct"), "got {s:?}");
+        assert!(has(&s, "Phase", "enum"), "got {s:?}");
+        assert!(has(&s, "Transfer", "event"), "got {s:?}");
+        assert!(has(&s, "mint", "function"), "got {s:?}");
+        assert!(has(&s, "onlyOwner", "function"), "got {s:?}");
+        assert!(has(&s, "min", "function"), "got {s:?}");
     }
 }
