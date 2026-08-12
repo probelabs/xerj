@@ -285,6 +285,8 @@ jobs:
       #   smoke suite (61/61), API liveness (no 5xx across the read surface),
       #   and prints the hot-path benchmark. Deterministic — no model needed.
       - name: API smoke + liveness + benchmark
+        env:
+          XERJ_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj
         run: bash demo/playbooks/ci-check.sh
 
   conformance:
