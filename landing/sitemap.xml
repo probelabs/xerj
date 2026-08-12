@@ -100,4 +100,24 @@
     <lastmod>2026-07-08</lastmod>
     <priority>0.6</priority>
   </url>
+  <url>
+    <loc>https://xerj.org/use-cases/second-brain.html</loc>
+    <lastmod>2026-08-12</lastmod>
+    <priority>0.7</priority>
+  </url>
+  <url>
+    <loc>https://xerj.org/docs/agents/schemas/anthropic-tools.json</loc>
+    <lastmod>2026-08-12</lastmod>
+    <priority>0.6</priority>
+  </url>
+  <url>
+    <loc>https://xerj.org/docs/agents/schemas/openai-tools.json</loc>
+    <lastmod>2026-08-12</lastmod>
+    <priority>0.6</priority>
+  </url>
+  <url>
+    <loc>https://xerj.org/docs/agents/schemas/mcp-tools.json</loc>
+    <lastmod>2026-08-12</lastmod>
+    <priority>0.6</priority>
+  </url>
 </urlset>

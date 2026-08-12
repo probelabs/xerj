@@ -144,7 +144,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
     <a class="recipe" href="/docs/agents/endpoints.html#search">
       <span class="num">01 · SEARCH</span>
       <span class="title">Find anything, four ways</span>
-      <p class="lead">Keyword &amp; structured (<code class="inline">match</code>, <code class="inline">term</code>, <code class="inline">bool</code>), <code class="inline">semantic</code> retrieval by meaning, exact <code class="inline">knn</code> vector search, and <code class="inline">hybrid</code> fusion — all on the same ES-compatible <code class="inline">_search</code> endpoint.</p>
+      <p class="lead">Keyword &amp; structured (<code class="inline">match</code>, <code class="inline">term</code>, <code class="inline">bool</code>), <code class="inline">semantic</code> retrieval by meaning, <code class="inline">knn</code> vector search (HNSW-served when unfiltered, exact when filtered), and <code class="inline">hybrid</code> fusion — all on the same ES-compatible <code class="inline">_search</code> endpoint.</p>
       <span class="meta">POST /:index/_search</span>
     </a>
     <a class="recipe" href="/docs/agents/endpoints.html#data">
@@ -171,7 +171,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
     <div class="head">DOES</div>
 
     <div class="cell m">xerj_autoindex</div>
-    <div class="cell p">xerj autoindex &lt;folder&gt;</div>
+    <div class="cell p">xerj autoindex &lt;folder&gt;<br><span class="mono">CLI ONLY · NO HTTP ROUTE</span></div>
     <div class="cell dsc">Make a folder searchable, zero config — sniffed formats, inferred mappings, self-describing catalog.</div>
 
     <div class="cell m">xerj_search</div>
@@ -184,7 +184,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
 
     <div class="cell m">xerj_vector_search</div>
     <div class="cell p">knn</div>
-    <div class="cell dsc">Exact nearest-neighbor over <code class="inline">dense_vector</code>.</div>
+    <div class="cell dsc">Nearest-neighbor over <code class="inline">dense_vector</code> — HNSW-served with exact rescoring when unfiltered, exact brute-force scan when filtered.</div>
 
     <div class="cell m">xerj_hybrid_search</div>
     <div class="cell p">hybrid query</div>
@@ -287,7 +287,7 @@ $ curl -sXPOST localhost:9200/docfolder/_search \
     <a class="recipe" href="/docs/agents/endpoints.html">
       <span class="num">CONTRACT</span>
       <span class="title">Endpoint reference</span>
-      <p class="lead">Method, path, request body and response shape for all six operations.</p>
+      <p class="lead">Method, path, request body and response shape for the six HTTP operations. The seventh, <code class="inline">xerj_autoindex</code>, is a CLI subcommand with no endpoint — its contract is in the <a href="/docs/recipes/zero-config-autoindex.html">flagship recipe</a>.</p>
     </a>
     <a class="recipe" href="/docs/agents/index.html">
       <span class="num">OVERVIEW</span>
@@ -326,12 +326,20 @@ $ curl -sXPOST localhost:9200/docfolder/_search \
 <section class="scene-section" style="border-top:0;">
   <div class="kicker"><span>FOR MACHINES · DISCOVER XERJ</span></div>
   <p class="lead" style="max-width:760px;">
-    Point a crawler or an agent's tool-discovery step at these. Both are served
-    from the site root and describe the same operations documented above.
+    Point a crawler or an agent's tool-discovery step at these. Every one is a
+    static file on this site, fetchable without a key, describing the same
+    operations documented above.
   </p>
   <ul class="pitch" style="max-width:760px;">
     <li><a href="/llms.txt"><code class="inline">/llms.txt</code></a> — a plain-text manifest of the base URL, the seven agent operations (autoindex included), and the honesty caveats, written for an LLM to read directly.</li>
-    <li><a href="/openapi.json"><code class="inline">/openapi.json</code></a> — an OpenAPI description of the six canonical agent operations (7 routes), for tool/codegen pipelines. It is a deliberately partial spec, not the whole ~210-route REST surface: an endpoint missing from it is "not written up yet", never "not supported".</li>
+    <li><a href="/llms-full.txt"><code class="inline">/llms-full.txt</code></a> — the expanded reference: the <code class="inline">autoindex</code> CLI contract, field types, request and response shapes, and the full endpoint catalogue.</li>
+    <li><a href="/openapi.json"><code class="inline">/openapi.json</code></a> — an OpenAPI description of the six <em>HTTP</em> agent operations (7 routes), for tool/codegen pipelines — <code class="inline">xerj_autoindex</code>, the seventh, is CLI-only and has no route to describe. It is a deliberately partial spec, not the whole ~210-route REST surface: an endpoint missing from it is "not written up yet", never "not supported".</li>
+    <li><strong>Tool schemas — paste straight into a tool definition.</strong> The same six HTTP operations, one file per calling convention:
+      <a href="/docs/agents/schemas/anthropic-tools.json"><code class="inline">/docs/agents/schemas/anthropic-tools.json</code></a> (Anthropic <code class="inline">tools</code> array),
+      <a href="/docs/agents/schemas/openai-tools.json"><code class="inline">/docs/agents/schemas/openai-tools.json</code></a> (OpenAI function-calling),
+      <a href="/docs/agents/schemas/mcp-tools.json"><code class="inline">/docs/agents/schemas/mcp-tools.json</code></a> (MCP <code class="inline">tools</code> list).
+      Each carries the full JSON-Schema input shape plus the same caveats as this page. They describe the HTTP surface only — <code class="inline">xerj_autoindex</code> is not in them, and you still need a running node to call.</li>
+    <li><a href="/use-cases/second-brain.html">Second brain — the runnable MCP server</a> — <code class="inline">xerj brain</code> over a folder of notes, exposing four verbs (<code class="inline">xerj_brain_ego</code>, <code class="inline">xerj_brain_link</code>, <code class="inline">xerj_brain_unlink</code>, <code class="inline">xerj_brain_overview</code>) under <code class="inline">contract: xerj-second-brain/1</code>, with the verification run that exercised them.</li>
   </ul>
 </section>
 
@@ -342,7 +350,7 @@ $ curl -sXPOST localhost:9200/docfolder/_search \
 </a>
 
 <footer class="footer">
-  <span>XERJ.AI · FOR AI · V1.0.0-RC.1</span>
+  <span>XERJ.AI · FOR AI · V1.0.0-RC.15</span>
   <span>ONE BINARY. THREE STORES.</span>
   <span><a href="/index.html">HOME</a> · <a href="/docs/index.html">DOCS</a> · <a href="/docs/recipes/index.html">RECIPES</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>

@@ -55,6 +55,15 @@
     the open-source repos worth learning from, and looks implementations up
     instead of re-deriving them.</p>
 
+  <p class="hero-sub" style="font-size:var(--fs-16); max-width:760px;">
+    Two things the agent has to get right, both stated in
+    <a href="/llms.txt">llms.txt</a>: <strong>indexing needs a running node</strong>
+    — <code class="inline">xerj --insecure --data-dir ./.xerj-data &amp;</code> comes
+    first, or <code class="inline">xerj autoindex</code> exits 1 — and
+    <strong>cloning reference repos downloads real data onto your machine</strong>,
+    so have it name the repos and estimate the job before it starts. XERJ's own
+    doctrine is estimate first, ask before long jobs.</p>
+
 
 </section>
 
@@ -79,20 +88,30 @@
     solve rate, <strong>26× fewer</strong> than working from memory
     (260,916 → 9,982), <strong>2.1× cheaper</strong> ($1.58 vs $3.27). In a
     companion run on a Rust library the model had never seen:
-    <strong>9/9 with retrieval vs 0/9 from memory</strong>. The three helper
-    scripts below ship in the repo, under
-    <a class="mono" href="https://github.com/xerj-org/xerj/tree/main/tools/xerj-code" rel="external" style="color:var(--z-mute);">tools/xerj-code/</a>.
+    <strong>9/9 with retrieval vs 0/9 from memory</strong>. The loop is four
+    commands and no extra tooling — it is exactly what
+    <a href="/llms.txt">llms.txt</a> walks your agent through when you paste the
+    prompt above.
   </p>
 
-<pre class="code">$ xc-corpus.sh --from hub/xerj-storage.json      # or: xc-corpus.sh xerj-storage &lt;git-url&gt;…
-$ xc-index.sh  xerj-storage                      # xerj autoindex, once per corpus
-$ xc.py xerj-storage "how does sled fsync its WAL segment on rotation?"
+<pre class="code">$ xerj --insecure --data-dir ./.xerj-data &amp;      <span class="comment"># 1. a node must be running first</span>
+$ git clone --depth 1 https://github.com/spacejam/sled ref/sled
+$ xerj autoindex ref/sled                        <span class="comment"># 2. tree-sitter AST fields, once per clone</span>
+$ curl -sXPOST 'localhost:9200/ax-*/_search' -H 'content-type: application/json' \
+    -d '{"query":{"multi_match":{"query":"fsync the WAL segment on rotation",
+                                 "fields":["defs^3","body","title"]}}}'
 → the exact function, file:line, contract included — a passage to read, not a tree to grep</pre>
 
   <p class="wide" style="margin-top:var(--sp-3);">
-    A corpus definition is a few hundred bytes of URLs, pinned commit SHAs and
-    licences — no source, so nothing to redistribute. Share the file, and
-    <code class="inline">--from</code> rebuilds the same commits on the other machine.
+    Optional convenience layer: the same four steps are wrapped by
+    <code class="inline">xc-corpus.sh</code> / <code class="inline">xc-index.sh</code> /
+    <code class="inline">xc.py</code>, which ship in the repo under
+    <a class="mono" href="https://github.com/xerj-org/xerj/tree/main/tools/xerj-code" rel="external" style="color:var(--z-mute);">tools/xerj-code/</a>.
+    They add one thing the plain commands don't have — a corpus definition, a
+    few hundred bytes of URLs, pinned commit SHAs and licences, no source, so
+    nothing to redistribute. Share that file, and
+    <code class="inline">xc-corpus.sh --from</code> rebuilds the same commits on
+    the other machine.
   </p>
 
   <p class="viz-caption"><a class="mono" href="/case-studies/reference-coding.html" style="color:var(--z-mute);">THE FULL CASE STUDY — EVERY NUMBER, EVERY TASK, THE EXACT PROMPT →</a></p>
@@ -129,6 +148,8 @@ done in 0.2s — 3 datasets, 5801 records live, 0 junk records, 1 junk/skipped f
   ax-docs                                           1 docs
 
 next: `xerj autoindex map --url http://localhost:9280` for the data map; search via GET /ax-*/_search</pre>
+
+  <p class="viz-caption">CAPTURE NOTE · THAT RUN'S NODE WAS STARTED ON A NON-DEFAULT PORT, SO THE OUTPUT ECHOES <span class="mono">:9280</span>. THE DEFAULT ES-COMPAT PORT IS <span class="mono">:9200</span> — USE <span class="mono">http://localhost:9200</span> UNLESS YOU CHANGED IT. THE TRANSCRIPT ABOVE IS REPRODUCED UNEDITED.</p>
 
   <div class="ticker" style="margin-top:var(--sp-6);">
     <div class="tk">
@@ -221,7 +242,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
     <strong>15 release candidates in 34 days</strong> — v1.0.0-rc.1 shipped
     2026-07-07, <strong>v1.0.0-rc.15</strong> on 2026-08-10, and the installers
     above always resolve the latest. Every commit re-runs the
-    <strong>1,365 / 1,368</strong> ES-YAML conformance suite; the changelog
+    <strong>1,366 / 1,369</strong> ES-YAML conformance suite; the changelog
     states known defects instead of implying their absence. In the current
     build: code arrives <strong>AST-parsed for 34 languages</strong> (symbols,
     definitions, line numbers), index lifecycle policies <strong>execute</strong>
@@ -320,7 +341,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   </div>
   <div class="row">
     <div class="k">Speaks Elasticsearch</div>
-    <div class="v">1,365 / 1,368 wire-conformance cases green on every commit — existing clients, dashboards and tooling connect unchanged. A migration bridge, not a clone: the engine underneath is designed for agents</div>
+    <div class="v">1,366 / 1,369 wire-conformance cases green on every commit — existing clients, dashboards and tooling connect unchanged. A migration bridge, not a clone: the engine underneath is designed for agents</div>
   </div>
   <div class="row">
     <div class="k">One static binary</div>
@@ -334,7 +355,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
 </a>
 
 <footer class="footer">
-  <span>XERJ.AI · V1.0.0-RC · 2026</span>
+  <span>XERJ.AI · V1.0.0-RC.15 · 2026</span>
   <span>STORAGE FOR THE AGENT ERA</span>
   <span><a href="/product.html">PRODUCT</a> · <a href="/docs/index.html">DOCS</a> · <a href="/brand.html">BRAND</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>

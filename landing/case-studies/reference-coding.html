@@ -74,8 +74,8 @@
         <button type="button" class="prompt-copy" data-copy="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">COPY THE PROMPT</button>
       </div>
     </div>
-    <div class="hint">That is the current one-line setup — <a href="https://xerj.org/llms.txt" rel="external" style="color:var(--accent);">llms.txt</a> walks the agent through the full loop. The measurement below ran the study's original long-form prompt.</div>
-    <div class="lbl" style="margin-top:18px;">◆ The exact prompt the study measured</div>
+    <div class="hint">That is the current one-line setup, and the only one to paste — <a href="https://xerj.org/llms.txt" rel="external" style="color:var(--accent);">llms.txt</a> walks the agent through the whole loop with nothing else to install: start a node, <code class="inline">git clone --depth 1</code> each reference repo, <code class="inline">xerj autoindex</code> it, then query the <code class="inline">ax-*</code> indices before writing code.</div>
+    <div class="lbl" style="margin-top:18px;">◆ HISTORICAL · the long-form prompt this study measured — kept verbatim for reproducibility, not current instructions</div>
     <pre>Set me up for reference-coding with XERJ and then use it automatically for the
 rest of our work, so I stop burning output tokens re-deriving APIs I could just
 look up.
@@ -96,7 +96,7 @@ look up.
 5. Re-index whenever the references change.
 
 Do this proactively for the rest of the session without me asking again.</pre>
-    <div class="hint">We tested this exact prompt end-to-end — see <a href="#verified" style="color:var(--accent);">Verified: the prompt works</a> below. Full text: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/OPENER_PROMPT.md" rel="external" style="color:var(--accent);">OPENER_PROMPT.md &rarr;</a></div>
+    <div class="hint">We tested this exact prompt end-to-end — see <a href="#verified" style="color:var(--accent);">Verified: the prompt works</a> below. Full text: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/OPENER_PROMPT.md" rel="external" style="color:var(--accent);">OPENER_PROMPT.md &rarr;</a>. It drove the loop through <code class="inline">xc-corpus.sh</code> / <code class="inline">xc-index.sh</code> / <code class="inline">xc.py</code> — at the time, internal wrappers from the maintainers' own agent skill. They now ship at <a class="mono" href="https://github.com/xerj-org/xerj/tree/main/tools/xerj-code" rel="external" style="color:var(--accent);">tools/xerj-code/</a>, but nothing requires them: they are thin shells around <code class="inline">git clone --depth 1</code>, <code class="inline">xerj autoindex</code>, and one <code class="inline">multi_match</code> query, and <a href="#reproduce" style="color:var(--accent);">Do it yourself</a> below runs the same method with plain commands.</div>
   </div>
 </section>
 
@@ -131,9 +131,9 @@ Do this proactively for the rest of the session without me asking again.</pre>
   <div class="solve">
     <h3>THE THREE-STEP LOOP</h3>
     <ul>
-      <li><strong>Clone</strong> — <code class="inline">xc-corpus.sh</code> shallow-clones the reference repos, grouped by problem domain.</li>
-      <li><strong>Index</strong> — <code class="inline">xc-index.sh</code> runs <code class="inline">xerj autoindex</code>; retrieval is O(1) regardless of tree size.</li>
-      <li><strong>Retrieve</strong> — <code class="inline">xc.py &lt;corpus&gt; "…"</code> returns the exact definition with its contract; the model reads a passage instead of re-deriving.</li>
+      <li><strong>Clone</strong> — <code class="inline">git clone --depth 1</code> the reference repos into one folder per problem domain.</li>
+      <li><strong>Index</strong> — <code class="inline">xerj autoindex &lt;clone&gt;</code> against a running node; retrieval is O(1) regardless of tree size.</li>
+      <li><strong>Retrieve</strong> — one <code class="inline">multi_match</code> over <code class="inline">defs</code> / <code class="inline">body</code> / <code class="inline">title</code> returns the exact definition with its contract; the model reads a passage instead of re-deriving.</li>
     </ul>
   </div>
 </div>
@@ -148,16 +148,16 @@ Do this proactively for the rest of the session without me asking again.</pre>
       reference-coding rules (retrieve before writing, cite what you use, respect licences).</li>
     <li><strong>2 · The corpus is chosen by problem domain, not language.</strong> The agent reads the project's
       dependencies and domains, picks the open-source repos that already solve those problems, and
-      <code class="inline">xc-corpus.sh</code> shallow-clones them into a named corpus. Each repository's licence
-      is recorded in <code class="inline">corpus.json</code>; GPL/AGPL entries are approach-only — read the design,
+      <code class="inline">git clone --depth 1</code>s them into one folder per domain. Record each repository's
+      licence alongside the clone; GPL/AGPL entries are approach-only — read the design,
       never copy the code.</li>
-    <li><strong>3 · Indexing is AST-aware.</strong> <code class="inline">xc-index.sh</code> runs
-      <code class="inline">xerj autoindex</code>: every file is sniffed by content, and source files go through
+    <li><strong>3 · Indexing is AST-aware.</strong> <code class="inline">xerj autoindex &lt;clone&gt;</code>:
+      every file is sniffed by content, and source files go through
       tree-sitter grammars (13 languages) that emit the language, every symbol with its kind and line number, a
       searchable <code class="inline">defs</code> field, and the full body. One index per dataset, incremental on
       re-runs — re-index when the references change.</li>
-    <li><strong>4 · Retrieval is hybrid, with a stated fallback.</strong> <code class="inline">xc.py</code> runs
-      BM25 <code class="inline">multi_match</code> over <code class="inline">body</code>,
+    <li><strong>4 · Retrieval is hybrid, with a stated fallback.</strong> The retrieval step is a BM25
+      <code class="inline">multi_match</code> over <code class="inline">body</code>,
       <code class="inline">defs</code> and <code class="inline">title</code> — with a measured (not hand-picked)
       boost on <code class="inline">defs</code> so exact symbol names outrank prose — RRF-fused with a vector arm
       where an index supports it. When no index does, it degrades to BM25-only and says so; a silently
@@ -284,15 +284,20 @@ Do this proactively for the rest of the session without me asking again.</pre>
 </section>
 
 <!-- Reproduce guide -->
-<section class="scene-section">
+<section class="scene-section" id="reproduce">
   <h2 class="scene" style="font-size:var(--fs-56);">DO IT <span class="accent">YOURSELF.</span></h2>
-  <p class="wide">The tooling ships in the repo, at <a class="mono" href="https://github.com/xerj-org/xerj/tree/main/tools/xerj-code" rel="external" style="color:var(--accent);">tools/xerj-code/</a>. The method works on any repository — including your own private code, which is the real use case.</p>
+  <p class="wide">Four commands, no tooling beyond the <code class="inline">xerj</code> binary and <code class="inline">git</code>. The method works on any repository — including your own private code, which is the real use case.</p>
   <ol class="steps" style="margin-top:var(--sp-6); max-width:820px;">
-    <li><strong>Start XERJ.</strong> <code class="inline">xerj -d ./.xerj-data --insecure</code> — the ES-compatible API comes up on <code class="inline">:9200</code>.</li>
-    <li><strong>Build a corpus.</strong> <code class="inline">xc-corpus.sh async-rust https://github.com/tokio-rs/tokio https://github.com/hyperium/hyper</code> — group by problem domain, not language.</li>
-    <li><strong>Or rebuild one someone already vetted.</strong> <code class="inline">xc-corpus.sh --from hub/xerj-search.json</code> — a corpus definition is URLs, pinned commit SHAs and licences; no source, so nothing to redistribute, and the same file gives two machines the same bytes.</li>
-    <li><strong>Index it.</strong> <code class="inline">xc-index.sh async-rust</code> — runs <code class="inline">xerj autoindex</code>; a 100k-record tree indexes in ~10 s.</li>
-    <li><strong>Retrieve before you write.</strong> <code class="inline">xc.py async-rust "graceful shutdown with a broadcast channel"</code> — returns the matching definition with <code class="inline">file:line</code>.</li>
+    <li><strong>Start XERJ.</strong> <code class="inline">xerj -d ./.xerj-data --insecure &amp;</code> — the ES-compatible API comes up on <code class="inline">:9200</code>. <code class="inline">autoindex</code> is a client of a running node; without one it exits 1.</li>
+    <li><strong>Build a corpus.</strong> <code class="inline">git clone --depth 1 https://github.com/tokio-rs/tokio ref/tokio</code> (and the same for each peer) — group by problem domain, not language.</li>
+    <li><strong>Index it.</strong> <code class="inline">xerj autoindex ref/tokio</code> — a 100k-record tree indexes in ~10 s; re-run when the references change and the journal makes it incremental.</li>
+    <li><strong>Retrieve before you write.</strong> One query against the new indices returns the matching definition with <code class="inline">file:line</code>:
+<pre style="margin-top:10px;">curl -sXPOST 'localhost:9200/ax-*/_search' -H 'content-type: application/json' \
+  -d '{"size":3,"query":{"multi_match":{
+        "query":"graceful shutdown with a broadcast channel",
+        "fields":["defs^3","body","title"]}}}'</pre>
+      <code class="inline">defs</code>, <code class="inline">symbols</code>, <code class="inline">body</code>, <code class="inline">title</code> and <code class="inline">language</code> are the fields <code class="inline">autoindex</code> writes for source files. <code class="inline">ax-*</code> matches every dataset on the node, your own project included — check <code class="inline">GET /_cat/indices</code> after each index run and narrow the pattern to the reference datasets when you want your own code kept out of the results.</li>
+    <li><strong>Or let the wrappers do it.</strong> <code class="inline">xc-corpus.sh</code> / <code class="inline">xc-index.sh</code> / <code class="inline">xc.py</code> ship in the repo at <a class="mono" href="https://github.com/xerj-org/xerj/tree/main/tools/xerj-code" rel="external" style="color:var(--accent);">tools/xerj-code/</a> and wrap exactly the four steps above. They add a corpus definition: <code class="inline">xc-corpus.sh --from hub/xerj-search.json</code> rebuilds a corpus someone already vetted — URLs, pinned commit SHAs and licences; no source, so nothing to redistribute, and the same file gives two machines the same bytes.</li>
     <li><strong>Measure it honestly.</strong> Three arms of the same agent — memory only, grep-driven, retrieval-injected — one hidden-test verdict, real tokens from <code class="inline">claude -p --output-format json</code>, no API key. The numbers and every per-run record are in <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/CASE_STUDY.md" rel="external" style="color:var(--accent);">CASE_STUDY.md</a>; the harness itself is not shipped.</li>
   </ol>
 </section>
