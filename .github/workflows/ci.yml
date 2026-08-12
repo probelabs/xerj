@@ -486,6 +486,17 @@ jobs:
           XERJ_MCP_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj-mcp
         run: bash .github/scripts/usecase-smoke.sh
 
+      # The published agent-facing schema vs what the server actually serves.
+      # It drifted once already — six tools published against ten served, every
+      # xerj_brain_* tool missing — and nothing failed, because nothing
+      # compared them. This drives `xerj mcp` (the subcommand a user who ran
+      # the installer has, not a dev-only binary), issues a real tools/list
+      # over stdio, and diffs the response against
+      # landing/docs/agents/schemas/mcp-tools.json. Needs no running node:
+      # tools/list is answered before any proxying.
+      - name: MCP published-schema drift gate (xerj mcp ↔ mcp-tools.json)
+        run: bash scripts/mcp-schema-check.sh
+
   # Per-OS runtime gate. The earlier autoindex "Too many open files" crash was
   # macOS-only and slipped through because nothing in CI actually RAN the binary
   # on macOS/Windows. This job boots xerj and autoindexes a many-dataset corpus

@@ -137,6 +137,58 @@ Vector and hybrid search use the same `knn` and `semantic` syntax you would send
 to Elasticsearch. Any Elasticsearch client library works if you point it at
 `localhost:9200`.
 
+## Connect an agent over MCP
+
+Not every agent can run a shell command. Desktop assistants and function-calling
+hosts reach tools through the **Model Context Protocol**, and the binary you just
+installed *is* the MCP server — there is nothing else to download and nothing to
+compile:
+
+```sh
+xerj --insecure --data-dir ./data &     # 1. the node the tools query
+xerj mcp                                # 2. MCP stdio server (your client runs this)
+```
+
+`xerj mcp` speaks MCP over stdio and proxies to the node named by `XERJ_URL`
+(default `http://localhost:9200`). It does **not** start a node — step 1 is the
+prerequisite. Drop this into your MCP client's config:
+
+```json
+{
+  "mcpServers": {
+    "xerj": {
+      "command": "/home/you/.local/bin/xerj",
+      "args": ["mcp"],
+      "env": { "XERJ_URL": "http://localhost:9200" }
+    }
+  }
+}
+```
+
+Use an **absolute** path — the installer puts `xerj` in `~/.local/bin` by default
+(`command -v xerj` confirms), and MCP hosts launched from a desktop icon do not
+inherit your shell's `PATH`. If the node is running with auth (anything but
+`--insecure`), add `"XERJ_AUTH": "ApiKey <key>"` alongside `XERJ_URL`; the key is
+in `<data-dir>/admin.key`.
+
+Ten tools are exposed, each a thin proxy over an endpoint XERJ already serves:
+
+| Tool | What it does |
+|---|---|
+| `xerj_search` | ES query-DSL search over an index |
+| `xerj_semantic_search` | recall by meaning over a `semantic_text` field — the query is embedded server-side (default embedder is lexical feature-hashing, not neural, unless the node runs `--embed-mode neural`) |
+| `xerj_vector_search` | kNN over a `dense_vector` field |
+| `xerj_hybrid_search` | RRF or linear fusion of sub-queries |
+| `xerj_memory_store` / `xerj_memory_recall` | durable agent memory in a namespace, recalled by text, meaning or vector |
+| `xerj_brain_overview` / `xerj_brain_ego` / `xerj_brain_link` / `xerj_brain_unlink` | the second-brain link index — orient, expand one node's evidence-backed neighborhood, assert and retire links |
+
+`xerj mcp --help` prints the same config block and the full option list. The
+machine-readable tool schemas are published at
+[xerj.org/docs/agents/schemas/mcp-tools.json](https://xerj.org/docs/agents/schemas/mcp-tools.json)
+— generated from a live `tools/list`, never hand-written, and gated in CI
+(`scripts/mcp-schema-check.sh`) plus a unit test, so the published list cannot
+drift from the served one.
+
 ## Why it exists
 
 Agents burn their context window reading files. The PHP in WordPress core is

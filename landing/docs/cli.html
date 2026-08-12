@@ -119,10 +119,11 @@
   <h1>CLI reference</h1>
 
 
-  <p>Bare <code class="inline">xerj</code> starts the server, and everything the engine itself does is controlled by the TOML config and driven through the HTTP API. The subcommands — <a href="#autoindex"><code class="inline">autoindex</code></a>, <code class="inline">index</code>, <code class="inline">brain</code> — are <em>clients</em> of a running node, not other ways to run one.</p>
+  <p>Bare <code class="inline">xerj</code> starts the server, and everything the engine itself does is controlled by the TOML config and driven through the HTTP API. The subcommands — <a href="#autoindex"><code class="inline">autoindex</code></a>, <code class="inline">index</code>, <code class="inline">brain</code>, <a href="#mcp"><code class="inline">mcp</code></a> — are <em>clients</em> of a running node, not other ways to run one.</p>
 
 <pre class="code">USAGE:
   xerj [OPTIONS]
+  xerj &lt;SUBCOMMAND&gt; [ARGS]
 
 OPTIONS:
   -c, --config &lt;PATH&gt;     Path to the TOML config file
@@ -132,7 +133,13 @@ OPTIONS:
                           [default: 127.0.0.1 — loopback only]
   -k, --insecure          Disable TLS and API-key auth (dev only)
   -h, --help              Print help
-  -V, --version           Print version and build commit</pre>
+  -V, --version           Print version and build commit
+
+SUBCOMMANDS:
+  index      &lt;opts&gt;            direct NDJSON → engine ingest
+  autoindex  &lt;folder&gt; [opts]   zero-config folder discovery + indexing
+  brain      &lt;folder&gt;          index a folder into a browsable second brain
+  mcp        [opts]            Model Context Protocol stdio server</pre>
 
   <h2 id="config-flag">--config / -c</h2>
   <p>Path to the TOML config. Defaults to <code class="inline">./xerj.toml</code>. The <code class="inline">XERJ_CONFIG</code> environment variable is consulted only if this flag is absent.</p>
@@ -180,6 +187,41 @@ $ xerj autoindex ~/my-project --api-key "$(cat ./data/admin.key)"</pre>
   <p>Against a node started with <code class="inline">--insecure</code> no key is needed, because that flag clears <code class="inline">auth.enabled</code> too.</p>
 
   <p class="source-note">Source · engine/crates/xerj-server/src/main.rs · engine/crates/xerj-autoindex/src/cli.rs</p>
+  <h2 id="mcp">xerj mcp</h2>
+  <p>Starts a <strong>Model Context Protocol</strong> server on stdio — newline-delimited JSON-RPC 2.0 on stdin/stdout — so any MCP client (desktop assistants, IDE agents, function-calling hosts) can query XERJ without a shell. It is part of the single installed binary: if you ran the installer, you already have it.</p>
+
+  <p>It does <strong>not</strong> start a node. Start one first; <code class="inline">xerj mcp</code> proxies every tool call to the URL in <code class="inline">XERJ_URL</code>.</p>
+
+<pre class="code">xerj --insecure --data-dir ./data &amp;    # 1. the node
+xerj mcp                               # 2. the MCP server (your client runs this)
+
+OPTIONS:
+  --url &lt;URL&gt;      Base URL of the ES-compatible listener. Overrides XERJ_URL.
+                   [default: http://localhost:9200]
+  --auth &lt;VALUE&gt;   Authorization header sent verbatim on every proxied request,
+                   e.g. 'ApiKey &lt;token&gt;'. Overrides XERJ_AUTH.
+  -h, --help       Print help (includes the client config block below)
+  -V, --version    Print version and exit</pre>
+
+  <p>Client configuration — the standard <code class="inline">mcpServers</code> shape:</p>
+
+<pre class="code">{
+  "mcpServers": {
+    "xerj": {
+      "command": "/home/you/.local/bin/xerj",
+      "args": ["mcp"],
+      "env": { "XERJ_URL": "http://localhost:9200" }
+    }
+  }
+}</pre>
+
+  <p>Use an <em>absolute</em> path — the installer puts <code class="inline">xerj</code> in <code class="inline">~/.local/bin</code> by default (<code class="inline">command -v xerj</code> confirms), and an MCP host launched from a desktop icon does not inherit your shell's <code class="inline">PATH</code>. When the node is not running <code class="inline">--insecure</code>, add <code class="inline">"XERJ_AUTH": "ApiKey &lt;key&gt;"</code> next to <code class="inline">XERJ_URL</code>; the key lives in <code class="inline">&lt;data-dir&gt;/admin.key</code>.</p>
+
+  <p>Ten tools are served, each a thin proxy over an endpoint the engine already exposes — nothing is added, and engine errors come back verbatim: <code class="inline">xerj_search</code>, <code class="inline">xerj_semantic_search</code>, <code class="inline">xerj_vector_search</code>, <code class="inline">xerj_hybrid_search</code>, <code class="inline">xerj_memory_store</code>, <code class="inline">xerj_memory_recall</code>, <code class="inline">xerj_brain_overview</code>, <code class="inline">xerj_brain_ego</code>, <code class="inline">xerj_brain_link</code>, <code class="inline">xerj_brain_unlink</code>. Two caveats the tool descriptions carry themselves: <code class="inline">xerj_semantic_search</code> embeds server-side with the <em>lexical</em> feature-hashing embedder unless the node runs <code class="inline">--embed-mode neural</code>, and the <code class="inline">xerj_brain_*</code> tools work a deterministic link index, not a graph database.</p>
+
+  <p>Machine-readable schemas for all ten: <a href="/docs/agents/schemas/mcp-tools.json">/docs/agents/schemas/mcp-tools.json</a>, generated from a live <code class="inline">tools/list</code> and gated against the binary in CI.</p>
+
+  <p class="source-note">Source · engine/crates/xerj-server/src/main.rs · engine/crates/xerj-mcp/src/lib.rs</p>
   
 
 <div class="next">
