@@ -7210,7 +7210,7 @@ fn get_doc_response_hint(index: &str, doc_bytes: usize) -> Value {
                         }},
                         {"match_phrase": {"defs": {
                             "query": "<the symbol or phrase you want>",
-                            "boost": 8,
+                            "boost": 4,
                         }}},
                     ]}},
                     // Project the path rather than dropping `_source`: a blind

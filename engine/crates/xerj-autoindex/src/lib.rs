@@ -4710,7 +4710,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 "      code was indexed — for a function/class instead of a whole file:\n\
                  \x20       curl -s $URL/{}-*/_search -H 'Content-Type: application/json' \\\n\
                  \x20         -d '{{\"query\":{{\"bool\":{{\"should\":[{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\
-                 \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":8}}}}}}]}}}},\
+                 \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":4}}}}}}]}}}},\
                  \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
                  \x20       (the `match_phrase` clause ranks the file that DEFINES a symbol above files that merely call it; `_passage` returns \
                  the enclosing block, not the file)",

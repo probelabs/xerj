@@ -261,7 +261,7 @@ fn print_help() {
          \n\
                  curl -s $URL/<index>/_search -H 'Content-Type: application/json' \\\n\
                    -d '{{\"query\":{{\"bool\":{{\"should\":[{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\n\
-                        \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":8}}}}}}]}}}},\n\
+                        \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":4}}}}}}]}}}},\n\
                         \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
          \n\
              the `match_phrase` clause ranks the file that DEFINES a symbol above files that merely call it;\n\

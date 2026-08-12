@@ -270,7 +270,7 @@ Large documents — ask for the snippet, not the whole file (see §2):
   `multi_match`, and with a single semantic/kNN clause; combine with a projected
   `_source` for the largest size reduction. For code specifically,
   `bool.should` with `multi_match` over `["body","defs"]` and a
-  `match_phrase` on `defs` with "boost":8 (`defs` is autoindex's per-file symbol
+  `match_phrase` on `defs` with "boost":4 (`defs` is autoindex's per-file symbol
   index — one "kind name" line per definition) ranks a file that DEFINES a symbol
   over one that merely mentions it — `xerj autoindex map` prints this exact query
   pre-built for every code dataset it finds.

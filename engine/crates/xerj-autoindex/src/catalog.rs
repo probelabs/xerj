@@ -280,12 +280,19 @@ pub fn build_sample_queries(pd: &PlanDataset, correlations: &[KeyCorr]) -> Vec<V
             .to_string();
         // Code datasets additionally carry `defs` (newline-joined "kind
         // name" per symbol, identifying the file that DEFINES a symbol —
-        // see `dataset.rs`). `defs` is analyzed text, so `strip_shortcodes`
-        // tokenizes to `strip` + `shortcodes`; boosting it alone amplifies
-        // conceptual noise. The phrase clause requires the token sequence,
-        // so it contributes for a symbol definition but essentially never
-        // for a multi-word conceptual query. Only emit this shape when `defs`
-        // actually exists on the dataset — never assume it. `_source` is
+        // see `dataset.rs`). `defs` indexes identifiers as WHOLE tokens:
+        // `strip_shortcodes` is one term, and neither `strip` nor
+        // `shortcodes` matches it. A plain `match` on `defs` is an OR over
+        // the query's tokens, so a conceptual query still hits many
+        // documents through incidental overlap with symbol and kind words —
+        // which is what a `defs` boost amplifies. The phrase clause instead
+        // requires the whole token sequence, so a symbol lookup resolves to
+        // its definition while a multi-word conceptual query matches nothing
+        // at all and contributes no score. Note this is gated on word count,
+        // not on intent: a single-word query is one token and can still
+        // match a symbol of that name, which is why the boost stays modest.
+        // Only emit this shape when `defs` actually exists on the dataset —
+        // never assume it. `_source` is
         // projected to the two fields an agent needs to act on a hit
         // (`ax_path`, `title` — present on every ingested document, not just
         // code) and `fields: ["_passage"]` asks for the matching snippet
@@ -305,7 +312,7 @@ pub fn build_sample_queries(pd: &PlanDataset, correlations: &[KeyCorr]) -> Vec<V
                         }},
                         {"match_phrase": {"defs": {
                             "query": word.clone(),
-                            "boost": 8,
+                            "boost": 4,
                         }}},
                     ]}},
                     "_source": ["ax_path", "title"],
