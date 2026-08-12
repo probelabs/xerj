@@ -90,6 +90,17 @@ xerj --insecure --data-dir ./data &     # local dev: no TLS, no auth
 xerj autoindex ~/my-project
 ```
 
+If your server has auth on — which is the default for every start *without*
+`--insecure`, including any start from a config file — hand `autoindex` the same
+key. It never picks the key up from `xerj.toml`; pass `--api-key` or set
+`XERJ_API_KEY`, or every request comes back `401 Unauthorized`:
+
+```sh
+xerj --data-dir ./data &                          # auth on: key minted on first boot
+export XERJ_API_KEY="$(cat ./data/admin.key)"     # <data_dir>/admin.key
+xerj autoindex ~/my-project
+```
+
 That is the whole setup. There is no schema to write and no pipeline to
 configure. XERJ sniffs each file, works out what it is, and creates one index per
 dataset it finds:

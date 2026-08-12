@@ -19,6 +19,10 @@ pub struct IndexCfg {
     pub root: PathBuf,
     pub url: String,
     pub api_key: Option<String>,
+    /// Set only when `api_key` was discovered on disk rather than supplied by
+    /// the user, so completion hints can reference the file instead of
+    /// printing the secret into output people paste into bug reports.
+    pub api_key_file: Option<PathBuf>,
     /// Phase-B index workers (concurrent bulk senders).
     pub workers: usize,
     /// Phase-A scan pool width (content hashing, sniffing, sampling). Both come
@@ -338,6 +342,9 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
 
     let mut url = "http://localhost:9200".to_string();
     let mut api_key = std::env::var("XERJ_API_KEY").ok().filter(|s| !s.is_empty());
+    // Set only when the key was discovered on disk, so output can reference the
+    // file instead of echoing the secret.
+    let mut api_key_file: Option<PathBuf> = None;
     // Worker counts are decided by `crate::resources::plan` once every flag is
     // known, because the answer depends on --bulk-mb and on the machine. `None`
     // here means "the user did not ask for a number".
@@ -629,6 +636,33 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     .filter_map(|(name, used)| used.then_some(name))
     .collect();
 
+    // Last resort for credentials: the key the server wrote for itself.
+    //
+    // The shipped default config has `[auth] enabled = true`, and the server
+    // mints `<data_dir>/admin.key` on first start. `xerj brain` already reads
+    // that file, which is why it works with no flags; `autoindex` did not, so
+    // the documented "copy the default config, then autoindex" path ended in a
+    // 401 and users turned auth off to escape it.
+    //
+    // Only for a loopback `--url`: reading a local key file is meaningful when
+    // we are talking to a server on this machine, and sending it anywhere else
+    // would leak a credential to a host it does not belong to.
+    if api_key.is_none() && url_is_loopback(&url) {
+        if let Some((key, path)) = discover_local_admin_key() {
+            // Announced, never silent: a blind onboarding run found this
+            // fallback made success depend on the working directory, because
+            // `./data/admin.key` is resolved relative to cwd. Saying which
+            // file was used turns "it worked here and not there" into
+            // something the reader can see and reason about.
+            eprintln!(
+                "autoindex: no --api-key/XERJ_API_KEY given; using the admin key at {}",
+                path.display()
+            );
+            api_key = Some(key);
+            api_key_file = Some(path);
+        }
+    }
+
     match (sub.as_deref(), folder) {
         (Some("map"), _) | (Some("status"), _) if max_minutes_explicit || approve_explicit => {
             Err(format!(
@@ -678,6 +712,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 root,
                 url,
                 api_key,
+                api_key_file,
                 workers: plan.index_workers,
                 scan_workers: plan.scan_threads,
                 pdf_workers: plan.pdf_workers,
@@ -715,9 +750,72 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     }
 }
 
+/// True when `url`'s host is this machine, so a locally readable admin key is
+/// the right credential to send. Anything else — a LAN address, a hostname, a
+/// remote deployment — must be given a key explicitly.
+///
+/// Parsed with a real URL parser rather than string surgery, because the
+/// hand-rolled version of this was wrong in a way that leaked credentials:
+/// splitting on the last `:` treats the userinfo in
+/// `http://localhost:9200@evil.com/` as a host:port pair, judges it loopback,
+/// and sends the admin key to `evil.com`. `Url::host_str` resolves that to
+/// `evil.com`, which is the whole point of using it.
+fn url_is_loopback(url: &str) -> bool {
+    // A schemeless `localhost:9200` parses as scheme `localhost`, path `9200`,
+    // with no host at all, so retry those through `http://`. The retry still
+    // goes through the parser: `localhost:9200@evil.com` becomes
+    // `http://localhost:9200@evil.com`, whose host is `evil.com`, not loopback.
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") => u,
+        _ => match reqwest::Url::parse(&format!("http://{url}")) {
+            Ok(u) => u,
+            // Unparseable is not loopback. Failing closed here costs a user
+            // with an exotic URL one explicit --api-key; failing open costs
+            // them the key itself.
+            Err(_) => return false,
+        },
+    };
+    match parsed.host_str() {
+        // `host_str` strips the brackets from `[::1]` and does not lowercase
+        // an IPv6 literal, so compare case-insensitively and cover both forms.
+        Some(h) => {
+            let h = h.trim_start_matches('[').trim_end_matches(']');
+            h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0"
+        }
+        None => false,
+    }
+}
+
+/// The admin key a local server wrote for itself, if we can find it.
+///
+/// Checked in the order a user is most likely to have created them: the
+/// working directory's data dir (what the quickstart tells you to use), then
+/// the documented package install location. Absent or unreadable is not an
+/// error — the caller falls back to the actionable 401 message.
+fn discover_local_admin_key() -> Option<(String, PathBuf)> {
+    const CANDIDATES: &[&str] = &[
+        "./data/admin.key",
+        "./xerj-data/admin.key",
+        "/var/lib/xerj/admin.key",
+    ];
+    let mut paths: Vec<PathBuf> = CANDIDATES.iter().map(PathBuf::from).collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(&home).join(".xerj/brain/admin.key"));
+        paths.push(PathBuf::from(&home).join(".xerj/admin.key"));
+    }
+    paths.into_iter().find_map(|p| {
+        std::fs::read_to_string(&p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|k| (k, p))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse, Approval, Cmd, Duration, ProgressMode, DEFAULT_MAX_MINUTES};
+    use std::path::PathBuf;
 
     fn index(args: &[&str]) -> super::IndexCfg {
         match parse(args.iter().map(|s| s.to_string()).collect()).unwrap() {
@@ -1137,5 +1235,263 @@ mod tests {
     fn ignore_flags_still_apply_to_an_index_run() {
         assert!(!index(&["data", "--no-ignore"]).ignore.enabled);
         assert!(!index(&["data", "--no-default-ignores"]).ignore.defaults);
+    }
+
+    // ─── local admin-key discovery ──────────────────────────────────────
+
+    /// `url_is_loopback` decides whether a credential read off this machine's
+    /// disk is put on the wire, so a false positive is a credential leak, not
+    /// a cosmetic bug. The negatives below are the shapes an attacker would
+    /// reach for: a subdomain that starts with the magic word, a hostname that
+    /// merely contains it, a private address, and the loopback name appearing
+    /// somewhere in the URL that is not the host.
+    #[test]
+    fn url_is_loopback_is_true_only_for_this_machine() {
+        for url in [
+            "http://localhost:9200",
+            "https://127.0.0.1",
+            "http://[::1]:9200/path",
+            "http://localhost",
+            "http://127.0.0.1:9200/",
+            "http://127.0.0.1/_cluster/health",
+            "http://0.0.0.0:9200",
+            "https://localhost:9200/?pretty",
+            // No scheme at all: `--url localhost:9200` still names this box.
+            "localhost:9200",
+        ] {
+            assert!(super::url_is_loopback(url), "{url} is this machine");
+        }
+        for url in [
+            "http://localhost.evil.com",
+            "http://localhost.evil.com:9200",
+            "http://notlocalhost",
+            "http://notlocalhost:9200",
+            "http://xerj-localhost.example.com:9200",
+            "http://192.168.1.5:9200",
+            "http://10.0.0.7",
+            "http://169.254.169.254/latest/meta-data",
+            "http://example.com",
+            "https://search.example.com:9200/path",
+            "http://127.0.0.1.evil.com:9200",
+            "http://1270.0.0.1:9200",
+            "http://[fe80::1]:9200",
+            // The word appears, but never as the host.
+            "http://evil.com/localhost",
+            "http://evil.com:9200/localhost",
+            "http://evil.com/?next=http://localhost:9200",
+            "http://evil.com#localhost",
+        ] {
+            assert!(!super::url_is_loopback(url), "{url} is NOT this machine");
+        }
+    }
+
+    /// The bug this function was rewritten to fix: `rsplit_once(':')` read the
+    /// userinfo in `http://localhost:9200@evil.com/` as a host:port pair, called
+    /// it loopback, and would have sent the local admin key to `evil.com` as
+    /// `Authorization: ApiKey <key>`. Found by an adversarial review of the
+    /// original hand-rolled parser, not by the happy-path cases above.
+    #[test]
+    fn userinfo_cannot_disguise_a_remote_host_as_loopback() {
+        for url in [
+            "http://localhost:9200@evil.com/",
+            "http://127.0.0.1:80@evil.com/",
+            "http://localhost@evil.com/",
+            "https://[::1]:443@evil.com/",
+            "localhost:9200@evil.com",
+            "http://user:pass@evil.com/",
+        ] {
+            assert!(
+                !super::url_is_loopback(url),
+                "{url} is NOT this machine - treating it as loopback leaks the admin key"
+            );
+        }
+    }
+
+    /// Forms that are genuinely this machine and must keep working, including
+    /// the ones the hand-rolled version got wrong in the safe direction.
+    #[test]
+    fn loopback_spellings_all_resolve_to_this_machine() {
+        for url in [
+            "http://localhost:9200",
+            "http://LOCALHOST:9200",
+            "https://127.0.0.1",
+            "http://[::1]",
+            "http://[::1]:9200/path",
+            "localhost:9200",
+            "http://0.0.0.0:9200",
+        ] {
+            assert!(super::url_is_loopback(url), "{url} is this machine");
+        }
+    }
+
+    /// Serialises the tests that move process-global state. Both inputs to
+    /// `discover_local_admin_key` — the working directory and `HOME` — are
+    /// per-process, so these tests cannot be isolated any other way.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A temporary working directory and `HOME`, restored on drop (including
+    /// on panic) so no other test in this binary observes the mutation for
+    /// longer than the lock is held.
+    struct Sandbox {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        dir: tempfile::TempDir,
+        previous_dir: PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+        previous_env_key: Option<std::ffi::OsString>,
+    }
+
+    impl Sandbox {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let previous_dir = std::env::current_dir().unwrap();
+            let previous_home = std::env::var_os("HOME");
+            let previous_env_key = std::env::var_os("XERJ_API_KEY");
+            std::env::set_current_dir(dir.path()).unwrap();
+            std::env::set_var("HOME", dir.path().join("home"));
+            std::env::remove_var("XERJ_API_KEY");
+            Self {
+                _lock: lock,
+                dir,
+                previous_dir,
+                previous_home,
+                previous_env_key,
+            }
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_dir).unwrap();
+            match &self.previous_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_env_key {
+                Some(key) => std::env::set_var("XERJ_API_KEY", key),
+                None => std::env::remove_var("XERJ_API_KEY"),
+            }
+        }
+    }
+
+    /// The order matters: a user who is running a server out of this very
+    /// directory means that key, not one left in `$HOME` by an older run
+    /// against a different data dir.
+    #[test]
+    fn discovery_walks_the_candidates_in_order_and_trims_the_key() {
+        let sandbox = Sandbox::new();
+        assert_eq!(super::discover_local_admin_key(), None, "nothing to find");
+
+        // Weakest candidate first, then override it one rung at a time.
+        sandbox.write("home/.xerj/admin.key", "home-key\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("home-key")
+        );
+
+        sandbox.write("home/.xerj/brain/admin.key", "  brain-key \t\r\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("brain-key"),
+            "the brain data dir outranks the bare ~/.xerj key, and is trimmed"
+        );
+
+        sandbox.write("xerj-data/admin.key", "xerj-data-key\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("xerj-data-key"),
+            "a data dir in the working directory outranks anything in $HOME"
+        );
+
+        sandbox.write("data/admin.key", "\ndata-key\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("data-key"),
+            "./data is the quickstart's own path and wins outright"
+        );
+    }
+
+    /// A server that has not finished writing its key, or a file truncated by
+    /// hand, must not turn into `Authorization: ApiKey ` — that produces the
+    /// same 401 with none of the diagnosis.
+    #[test]
+    fn an_empty_key_file_is_skipped_not_returned_as_an_empty_key() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "   \n\t\n");
+        sandbox.write("xerj-data/admin.key", "");
+        assert_eq!(
+            super::discover_local_admin_key(),
+            None,
+            "whitespace-only and zero-byte files are not credentials"
+        );
+
+        sandbox.write("home/.xerj/admin.key", "real-key\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("real-key"),
+            "an empty candidate must be skipped over, not stop the search"
+        );
+    }
+
+    /// The wiring: discovery only ever fires when the run has no credential of
+    /// its own AND the target is this machine. Sending a locally readable
+    /// admin key to a host that did not write it is the failure mode this
+    /// whole feature has to avoid.
+    #[test]
+    fn a_discovered_key_is_used_for_a_local_url_and_never_for_a_remote_one() {
+        let sandbox = Sandbox::new();
+        assert_eq!(
+            index(&["notes"]).api_key,
+            None,
+            "no key file, no invented credential"
+        );
+
+        sandbox.write("data/admin.key", "local-admin-key\n");
+        assert_eq!(
+            index(&["notes"]).api_key.as_deref(),
+            Some("local-admin-key"),
+            "the default --url is loopback, so the run picks the key up"
+        );
+        assert_eq!(
+            index(&["notes", "--url", "http://localhost:9201"])
+                .api_key
+                .as_deref(),
+            Some("local-admin-key")
+        );
+
+        for remote in [
+            "http://search.example.com:9200",
+            "http://192.168.1.5:9200",
+            "https://localhost.evil.com:9200",
+        ] {
+            assert_eq!(
+                index(&["notes", "--url", remote]).api_key,
+                None,
+                "{remote} must never be sent a key found on this disk"
+            );
+        }
+
+        assert_eq!(
+            index(&["notes", "--api-key", "explicit"])
+                .api_key
+                .as_deref(),
+            Some("explicit"),
+            "an explicit flag is never overwritten by discovery"
+        );
+
+        std::env::set_var("XERJ_API_KEY", "from-env");
+        let from_env = index(&["notes"]).api_key;
+        std::env::remove_var("XERJ_API_KEY");
+        assert_eq!(
+            from_env.as_deref(),
+            Some("from-env"),
+            "the environment is also never overwritten by discovery"
+        );
     }
 }

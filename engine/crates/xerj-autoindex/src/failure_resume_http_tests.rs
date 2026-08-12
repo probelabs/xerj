@@ -503,6 +503,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         root: root.to_owned(),
         url: url.to_owned(),
         api_key: None,
+        api_key_file: None,
         workers: 1,
         scan_workers: 1,
         pdf_workers: 1,

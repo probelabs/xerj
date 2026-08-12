@@ -150,6 +150,8 @@ $ sha256sum -c xerj-${ver}-x86_64-unknown-linux-musl.tar.gz.sha256
 $ tar xzf xerj-${ver}-x86_64-unknown-linux-musl.tar.gz
 $ sudo install -m 0755 xerj-${ver}-x86_64-unknown-linux-musl/xerj /usr/local/bin/xerj
 $ xerj --version</pre>
+  <p><strong>macOS Gatekeeper:</strong> the release binaries are not code-signed or notarized. A tarball fetched with <code class="inline">curl</code> (both the one-liner and the commands above) is not quarantined and runs as-is. A tarball downloaded through a <em>browser</em> is: macOS attaches <code class="inline">com.apple.quarantine</code> and the first launch is blocked with <em>"cannot be opened because the developer cannot be verified"</em>. Clear it once, then run normally:</p>
+<pre class="code">$ xattr -d com.apple.quarantine ./xerj</pre>
 
   <h2>Write the config</h2>
   <p>The minimal config is three sections. Everything else uses defaults — see the <a href="/docs/config.html">config reference</a> for the full key list.</p>
@@ -164,7 +166,7 @@ data_dir     = "/var/lib/xerj"
 
 [auth]
 enabled = true</pre>
-  <p>With <code class="inline">auth.enabled = true</code>, the first start prints an auto-generated admin API key and writes it to <code class="inline">&lt;data_dir&gt;/admin.key</code> — every native-API request (including health) must send it. In-process TLS is not wired yet (rustls integration is on the roadmap) — terminate TLS at a reverse proxy (nginx/caddy) in front of ports 8080/9200 for now.</p>
+  <p>With <code class="inline">auth.enabled = true</code>, the first start prints an auto-generated admin API key and writes it to <code class="inline">&lt;data_dir&gt;/admin.key</code> — every native-API request (including health) must send it, and so must the CLI clients that talk to this node (see <a href="#first-index">Index your first folder</a> below). In-process TLS is not wired yet (rustls integration is on the roadmap) — terminate TLS at a reverse proxy (nginx/caddy) in front of ports 8080/9200 for now.</p>
 
   <h2>Run as a systemd unit</h2>
   <p>Create the service user first — <code class="inline">StateDirectory</code> then gives it <code class="inline">/var/lib/xerj</code> automatically:</p>
@@ -193,6 +195,12 @@ $ sudo systemctl enable --now xerj
 $ sudo systemctl status xerj
 $ curl -s -H "Authorization: ApiKey $(sudo cat /var/lib/xerj/admin.key)" \
     http://localhost:8080/v1/health</pre>
+
+  <h2 id="first-index">Index your first folder</h2>
+  <p>The node above has auth on, so <code class="inline">xerj autoindex</code> needs the same key. It does <strong>not</strong> read <code class="inline">/etc/xerj/xerj.toml</code> — the config file belongs to the server, not to its clients — so hand the key over explicitly, with <code class="inline">--api-key</code> or the <code class="inline">XERJ_API_KEY</code> environment variable. Under the unit above the key file is owned by the <code class="inline">xerj</code> user and mode <code class="inline">0600</code>, hence the <code class="inline">sudo</code>:</p>
+<pre class="code">$ export XERJ_API_KEY="$(sudo cat /var/lib/xerj/admin.key)"
+$ xerj autoindex ~/my-project</pre>
+  <p>Run it without a key and every request is refused: the run ends in <code class="inline">HTTP 401 Unauthorized</code>. <code class="inline">autoindex</code> is a client of the ES-compatible port — <code class="inline">http://localhost:9200</code> by default; pass <code class="inline">--url</code> for anything else. Full flag list on the <a href="/docs/cli.html#autoindex">CLI reference</a>.</p>
 
   <h2>Docker</h2>
   <p>No published image yet — build it locally from <code class="inline">engine/Dockerfile</code> (the image defaults to <code class="inline">--insecure --data-dir /data</code>, right for CI and local dev):</p>
