@@ -87,10 +87,12 @@ Exit codes: `0` complete · `3` completed-with-junk — **this is success** · `
 usage · `1` any error at all (read the `error:` line before acting) · `4`
 needs a decision (gate above; answer with `--approve`, never a retry). Percent,
 ETA and the drawn bar are honest or absent: `unknown` / `[????…]` when there is
-no denominator, and a full bar only at a real 100%. The full contract, with
-verbatim samples and the failure modes, is under "Running an index for a human"
-in [landing/llms.txt](./landing/llms.txt) (published at
-https://xerj.org/llms.txt).
+no denominator, and a full bar only at a real 100%. The short version is under
+"Running an index on someone's machine" in
+[landing/llms.txt](./landing/llms.txt) (https://xerj.org/llms.txt); the full
+contract, with verbatim samples and the failure modes, is §10 of
+[landing/llms-full.txt](./landing/llms-full.txt)
+(https://xerj.org/llms-full.txt).
 
 ## Talking to XERJ over MCP
 
