@@ -54,6 +54,57 @@ const PREPARED_RECORDS_IDENTITY: &str = "prepared-records-v1";
 const DOCUMENT_IDS_IDENTITY: &str = "document-ids-v1";
 const DETECTOR_DISABLED_IDENTITY: &str = "disabled";
 
+/// Render the `next:` guidance printed after a successful index run.
+///
+/// The run's own credential and URL are carried into the printed commands.
+/// They used to be printed bare, so against an auth-enabled server — which is
+/// the default, and what `xerj brain` boots — a *successful* run signed off by
+/// handing the user two commands that both answer 401
+/// (`ONBOARDING-401-REPRO.md` §3). Guidance that cannot be pasted is worse
+/// than no guidance: it reads as a broken server.
+///
+/// `api_key` is the credential this run used (`None` means the server needs
+/// none — `--insecure` or auth off — and the bare commands really do work).
+/// `env_key` is the ambient `XERJ_API_KEY`; when it already holds the run's
+/// key the hints reference `$XERJ_API_KEY` rather than the literal secret, so
+/// the command still pastes into the same shell while the admin key stays out
+/// of a banner users routinely paste into bug reports.
+///
+/// When the key came from neither the environment nor the user's own command
+/// line — i.e. it was discovered on disk — the hint must still not echo it.
+/// A blind onboarding run caught exactly that: `autoindex` found
+/// `./data/admin.key` by itself and then printed the admin key verbatim in a
+/// banner. The reader never typed that secret, so seeing it in copyable output
+/// is a disclosure, not a convenience.
+pub fn next_hint(
+    url: &str,
+    prefix: &str,
+    api_key: Option<&str>,
+    env_key: Option<&str>,
+    key_file: Option<&std::path::Path>,
+) -> String {
+    let Some(key) = api_key else {
+        return format!(
+            "\nnext: `xerj autoindex map --url {url}` for the data map; \
+             search via `curl '{url}/{prefix}-*/_search'`"
+        );
+    };
+    // A shell *expression* in every arm, so all renderings quote identically.
+    let key_expr = if env_key == Some(key) {
+        "$XERJ_API_KEY".to_string()
+    } else if let Some(path) = key_file {
+        // Reads the same secret at paste time without printing it here.
+        format!("$(cat {})", path.display())
+    } else {
+        key.to_string()
+    };
+    format!(
+        "\nnext: `xerj autoindex map --url {url} --api-key \"{key_expr}\"` for the data map;\n\
+         \x20     search via `curl -H \"Authorization: ApiKey {key_expr}\" \
+         '{url}/{prefix}-*/_search'`"
+    )
+}
+
 fn prepared_records_identity(cfg: &IndexCfg) -> Result<String> {
     let value = json!({
         "contract": PREPARED_RECORDS_IDENTITY,
@@ -981,6 +1032,7 @@ mod phase_a_grouping_tests {
             root: root.to_path_buf(),
             url: "http://unused.invalid".into(),
             api_key: None,
+            api_key_file: None,
             workers: 1,
             scan_workers: 1,
             pdf_workers: 1,
@@ -4694,8 +4746,14 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             );
         }
         println!(
-            "\nnext: `xerj autoindex map --url {}` for the data map; search via GET /{}-*/_search",
-            cfg.url, cfg.prefix
+            "{}",
+            next_hint(
+                &cfg.url,
+                &cfg.prefix,
+                cfg.api_key.as_deref(),
+                std::env::var("XERJ_API_KEY").ok().as_deref(),
+                cfg.api_key_file.as_deref(),
+            )
         );
     }
     // Exit 3 means "completed, some input was unusable". Backend rejections
@@ -5698,6 +5756,100 @@ mod generation_contract_identity_tests {
         let index_changed = generation_contract_identities(&first).unwrap();
         assert_eq!(index_changed.0, expected.0);
         assert_ne!(index_changed.1, expected.1);
+    }
+
+    /// ONBOARDING-401-REPRO.md §3: a *successful* run signed off by printing
+    /// `next:` commands that carried no credential, so against an auth-enabled
+    /// server (the default) every one of them answered 401 — including the
+    /// `xerj autoindex map` line `xerj brain` prints after "your second brain
+    /// is ready". The run's own key and url must ride into the hints.
+    #[test]
+    fn next_hint_carries_the_runs_credential() {
+        // Key came from `--api-key` (or a file), not the environment: print it
+        // literally, because nothing else in the user's shell holds it.
+        let hint = next_hint("http://localhost:9510", "ax", Some("s3cret"), None, None);
+        assert!(
+            hint.contains("--api-key \"s3cret\""),
+            "map hint must carry the key, got: {hint}"
+        );
+        assert!(
+            hint.contains("Authorization: ApiKey s3cret"),
+            "search hint must carry the key, got: {hint}"
+        );
+        assert!(
+            hint.contains("http://localhost:9510/ax-*/_search"),
+            "search hint must target the run's url and prefix, got: {hint}"
+        );
+        // Nothing is left as an un-runnable `GET /…` sketch.
+        assert!(
+            !hint.contains("search via GET"),
+            "hints must be runnable commands, got: {hint}"
+        );
+
+        // The key is already exported: reference the variable instead of
+        // echoing the admin secret into a banner people paste into issues.
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            Some("s3cret"),
+            None,
+        );
+        assert!(
+            !hint.contains("s3cret"),
+            "must not echo a secret already in the environment, got: {hint}"
+        );
+        assert!(
+            hint.contains("--api-key \"$XERJ_API_KEY\"")
+                && hint.contains("Authorization: ApiKey $XERJ_API_KEY"),
+            "must reference the exported variable, got: {hint}"
+        );
+
+        // A different value in the environment is not the run's credential.
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            Some("other"),
+            None,
+        );
+        assert!(
+            hint.contains("--api-key \"s3cret\""),
+            "a stale env var must not shadow the run's key, got: {hint}"
+        );
+
+        // Open server: no credential to carry, and none invented.
+        let hint = next_hint("http://localhost:9200", "ax", None, Some("ignored"), None);
+        assert!(
+            !hint.contains("api-key") && !hint.contains("Authorization"),
+            "an auth-free server must get auth-free hints, got: {hint}"
+        );
+        assert!(hint.contains("xerj autoindex map --url http://localhost:9200"));
+    }
+
+    /// A blind onboarding run found `autoindex` discovering `./data/admin.key`
+    /// on its own and then printing that admin key verbatim in its completion
+    /// banner. The reader never typed the secret, so echoing it into copyable
+    /// output is a disclosure — and this banner is exactly what people paste
+    /// into bug reports. Reference the file instead; `$(cat …)` still pastes.
+    #[test]
+    fn a_discovered_key_is_referenced_by_path_never_echoed() {
+        let path = std::path::Path::new("./data/admin.key");
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            None,
+            Some(path),
+        );
+        assert!(
+            !hint.contains("s3cret"),
+            "a key discovered on disk must never be echoed, got: {hint}"
+        );
+        assert!(
+            hint.contains("$(cat ./data/admin.key)"),
+            "the hint must read the key back from its file, got: {hint}"
+        );
     }
 
     #[test]

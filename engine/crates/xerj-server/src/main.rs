@@ -177,7 +177,14 @@ fn parse_args() -> CliArgs {
 }
 
 fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+/// The help text as a value, so tests can assert that a documented behaviour is
+/// still documented instead of trusting a `println!`. Same house style as
+/// `xerj_autoindex::cli::help_text`.
+fn help_text() -> String {
+    format!(
         "xerj v{} — the unified search engine for AI (Elasticsearch wire-compatible)\n\
          \n\
          USAGE:\n\
@@ -194,7 +201,11 @@ fn print_help() {
                                       XERJ_ALLOW_INSECURE_NETWORK_BIND=true), because every\n\
                                       request — API key included — would cross the network in\n\
                                       cleartext. Env: XERJ_BIND_ADDRESS\n\
-             --insecure, -k         Disable TLS\n\
+             --insecure, -k         Disable TLS *and* API-key authentication — local dev only.\n\
+                                      Auth is ON by default, so without this flag every client\n\
+                                      (`xerj autoindex` and `xerj brain` included) must send the\n\
+                                      key this server writes to <data_dir>/admin.key on first\n\
+                                      start — export XERJ_API_KEY=$(cat ./data/admin.key)\n\
              --embed-mode <MODE>    Embedding backend: lexical | neural | proxy | auto |\n\
                                       onnx-experimental\n\
                                       lexical  built-in feature-hash (default; offline, not neural)\n\
@@ -272,7 +283,7 @@ fn print_help() {
                 (or set only XERJ_COMPAT_VERSION and leave distribution to auto-detect — the two\n\
                 settings are resolved independently, mix and match as needed.)\n",
         env!("CARGO_PKG_VERSION")
-    );
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1630,6 +1641,56 @@ fn build_runtime(worker_threads: usize) -> Result<tokio::runtime::Runtime> {
         .thread_name("xerj-rt")
         .build()
         .context("build tokio runtime")
+}
+
+#[cfg(test)]
+mod help_text_tests {
+    use super::help_text;
+
+    /// `--insecure` disables TLS **and** auth (see `apply_overrides`, which
+    /// sets `cfg.tls.enabled = false; cfg.auth.enabled = false;`), but the
+    /// help said only "Disable TLS". Auth is on by default, so that flag is
+    /// precisely what makes `xerj autoindex` work against a fresh server — and
+    /// a user reading only `--help` could not learn that. The help must
+    /// describe both halves of what the flag does.
+    #[test]
+    fn insecure_help_documents_auth_not_just_tls() {
+        let help = help_text();
+        let line = help
+            .lines()
+            .position(|l| l.contains("--insecure"))
+            .expect("--insecure must be documented");
+        // The flag's own paragraph: its line plus the indented continuation
+        // lines under it, stopping at the next flag.
+        let para: String = help
+            .lines()
+            .skip(line)
+            .take(1)
+            .chain(
+                help.lines()
+                    .skip(line + 1)
+                    .take_while(|l| !l.trim_start().starts_with("--")),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            para.contains("TLS"),
+            "--insecure must still say it disables TLS, got:\n{para}"
+        );
+        assert!(
+            para.contains("auth"),
+            "--insecure disables authentication too and the help must say so, got:\n{para}"
+        );
+        assert!(
+            para.contains("admin.key"),
+            "the help must point at the key a non-insecure server demands, got:\n{para}"
+        );
+        assert!(
+            para.contains("XERJ_API_KEY"),
+            "the help must name the env var that carries the key, got:\n{para}"
+        );
+    }
 }
 
 #[cfg(test)]

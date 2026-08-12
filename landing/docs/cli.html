@@ -119,7 +119,7 @@
   <h1>CLI reference</h1>
 
 
-  <p>There are no subcommands. Everything the engine does is controlled by the TOML config and driven through the HTTP API. The binary just starts the server.</p>
+  <p>Bare <code class="inline">xerj</code> starts the server, and everything the engine itself does is controlled by the TOML config and driven through the HTTP API. The subcommands — <a href="#autoindex"><code class="inline">autoindex</code></a>, <code class="inline">index</code>, <code class="inline">brain</code> — are <em>clients</em> of a running node, not other ways to run one.</p>
 
 <pre class="code">USAGE:
   xerj [OPTIONS]
@@ -152,7 +152,34 @@ OPTIONS:
   <h2>--version / -V</h2>
   <p>Prints the version, git SHA, and build date. Useful in oncall pages: <code class="inline">xerj -V | head -1</code>.</p>
 
-  <p class="source-note">Source · engine/crates/xerj-server/src/main.rs</p>
+  <h2 id="autoindex">xerj autoindex &lt;folder&gt;</h2>
+  <p>Point it at a folder and it discovers, infers and indexes the contents — no mapping to write, no pipeline to configure. It is a client of a node that is <em>already running</em>, and it never reads the TOML config, so the endpoint and the credential are its own flags.</p>
+<pre class="code">USAGE:
+  xerj autoindex &lt;folder&gt; [OPTIONS]   discover + index a folder
+  xerj autoindex map [OPTIONS]        print the discovered data map
+  xerj autoindex status [OPTIONS]     resume-journal + index progress view
+
+OPTIONS (abridged — `xerj autoindex --help` prints all of them):
+  --url &lt;U&gt;           ES-compat endpoint
+                      [default: http://localhost:9200]
+  --api-key &lt;K&gt;       API key for that endpoint (or env XERJ_API_KEY)
+  --workers &lt;N&gt;       workers for both phases [default: every core]
+  --prefix &lt;P&gt;        index prefix [default: ax]
+  --no-semantic       skip semantic_text on body fields (pure BM25+keyword)
+  --dry-run           walk+sniff+infer, print the plan, index nothing
+  --json              machine-readable RESULT on stdout
+  --progress &lt;MODE&gt;   liveness on stderr: auto|plain|json|none</pre>
+
+  <h2 id="autoindex-api-key">autoindex --api-key</h2>
+  <p>The key the target node expects, or env <code class="inline">XERJ_API_KEY</code> (the flag wins). <code class="inline">autoindex</code> never takes it from <code class="inline">xerj.toml</code> — the config file belongs to the server, not to its clients. A node running with <code class="inline">[auth] enabled = true</code> (the default, and what happens on any start without <code class="inline">--insecure</code>) refuses an unauthenticated run with <code class="inline">HTTP 401 Unauthorized</code>. That node wrote its key to <code class="inline">&lt;data_dir&gt;/admin.key</code> on first boot:</p>
+<pre class="code">$ export XERJ_API_KEY="$(cat ./data/admin.key)"
+$ xerj autoindex ~/my-project
+
+# or per-run:
+$ xerj autoindex ~/my-project --api-key "$(cat ./data/admin.key)"</pre>
+  <p>Against a node started with <code class="inline">--insecure</code> no key is needed, because that flag clears <code class="inline">auth.enabled</code> too.</p>
+
+  <p class="source-note">Source · engine/crates/xerj-server/src/main.rs · engine/crates/xerj-autoindex/src/cli.rs</p>
   
 
 <div class="next">
