@@ -1272,6 +1272,105 @@ fn a_junk_record_is_counted_into_the_generation_and_never_fatal() {
 /// narrated (it is a per-file, minutes-long phase here exactly as on the legacy
 /// path), the stream closes with a truthful terminal line, and `--progress
 /// none` on the same path stays completely silent.
+/// #294, at the level where the loss actually happened: a mixed corpus of
+/// source code and prose, over the generated (`--no-graph`) path, through the
+/// real HTTP client.
+///
+/// Every code file was walked, sniffed as family `code`, counted — and then
+/// prepared as ZERO documents, so the generation committed and the run
+/// reported success while the entire code half of the corpus was missing.
+/// `sync_executor` pins the extraction half of that regression; this pins what
+/// a caller can actually observe: the documents that reach the endpoint carry
+/// their AST fields, and the run document and terminal line carry coverage
+/// counters that a wholly-junked corpus could not fake.
+#[test]
+fn code_files_index_with_ast_fields_and_the_run_reports_code_coverage() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("alpha.rs"),
+        "pub struct AlphaConfig {\n    pub retries: u32,\n}\n\n\
+         pub fn alpha_connect(cfg: &AlphaConfig) -> bool {\n    cfg.retries > 0\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus.path().join("gamma.py"),
+        "def gamma_load(path):\n    return open(path).read()\n\n\n\
+         class GammaStore:\n    def __init__(self, root):\n        self.root = root\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus.path().join("notes.md"),
+        "# Fixture notes\n\nTwo source files and this prose file, so the corpus is mixed.\n",
+    )
+    .unwrap();
+    let endpoint = HttpEndpoint::start();
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, summary) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0, "nothing in this corpus is unparseable");
+    let summary = summary.expect("a generated run returns its committed run projection");
+    assert_eq!(summary["code_files"], 2, "{summary}");
+    assert_eq!(
+        summary["code_files_indexed"], 2,
+        "both source files must reach the index: {summary}"
+    );
+    assert_eq!(summary["code_files_junked"], 0, "{summary}");
+
+    let docs = endpoint.data_docs();
+    let mut code_docs: Vec<&Value> = docs
+        .iter()
+        .filter(|doc| doc.get("language").is_some())
+        .collect();
+    code_docs.sort_by_key(|doc| doc["language"].as_str().unwrap_or("").to_owned());
+    assert_eq!(
+        code_docs.len(),
+        2,
+        "one AST document per source file: {docs:?}"
+    );
+    assert_eq!(code_docs[0]["language"], "python");
+    assert_eq!(code_docs[1]["language"], "rust");
+    for doc in &code_docs {
+        assert!(
+            doc["defs"].as_str().is_some_and(|defs| !defs.is_empty()),
+            "{doc}"
+        );
+        assert!(
+            doc["symbols"]
+                .as_array()
+                .is_some_and(|symbols| !symbols.is_empty()),
+            "{doc}"
+        );
+    }
+    // The title comes from the logical file name, never the content-addressed
+    // snapshot blob's ordinal — the other half of #294.
+    assert_eq!(code_docs[0]["title"], "gamma.py");
+    assert_eq!(code_docs[1]["title"], "alpha.rs");
+    let rendered = serde_json::to_string(&code_docs).unwrap();
+    assert!(rendered.contains("struct AlphaConfig"), "{rendered}");
+    assert!(rendered.contains("class GammaStore"), "{rendered}");
+
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let done = stream
+        .lines()
+        .find(|line| line.starts_with("xerj-done "))
+        .unwrap_or_else(|| panic!("{stream}"));
+    assert!(
+        done.contains("code_files=2 code_files_indexed=2 code_files_junked=0"),
+        "the terminal line carries the coverage that made #294 invisible: {done}"
+    );
+    assert!(!stream.contains("warning:"), "{stream}");
+}
+
 #[test]
 fn a_generated_run_narrates_its_scan_and_closes_its_own_stream() {
     let _guard = HTTP_E2E_LOCK.lock().unwrap();
