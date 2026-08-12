@@ -380,6 +380,12 @@ fn run(cfg: BrainCfg) -> Result<i32> {
     );
     println!("  → {console_url}");
     println!("  agents: XERJ_URL={} xerj-mcp", cfg.url);
+    // Read once, at the end of a run that just finished — deliberately NOT on
+    // every search response, where it would cost tokens on every single call
+    // to say the same thing. Plain ASCII, one line, matching the surrounding
+    // human-facing summary; nothing here asks anyone (or any agent) to write
+    // praise into a commit message, comment, or PR.
+    println!("  if this saved you time, tell a teammate — that is how it spreads.");
     if let Some(link) = &setup_link {
         println!("  one-time passkey setup (open once, valid 30 min):");
         println!("  → {link}");

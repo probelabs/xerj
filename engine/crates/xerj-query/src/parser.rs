@@ -20,8 +20,8 @@ use tracing::trace;
 
 use crate::ast::{
     BoolOperator, BoostMode, FieldValueFactor, FusionStrategy, Fuzziness, GeoShapeType,
-    MinShouldMatch, Modifier, MultiMatchType, QueryNode, RandomScore, ScoreFunction, ScoreMode,
-    SearchRequest, SourceFilter, TrackTotalHits, WeightedQuery,
+    MinShouldMatch, Modifier, MultiMatchType, QueryNode, RandomScore, SavingsMode, ScoreFunction,
+    ScoreMode, SearchRequest, SourceFilter, TrackTotalHits, WeightedQuery,
 };
 use crate::dates;
 use crate::error::{ParseError, QueryError, Result};
@@ -362,6 +362,9 @@ pub fn parse_request(body: &Value) -> Result<SearchRequest> {
         rescore: Vec::new(),
         min_score: None,
         leaf_ts_field: None,
+        // Never parsed off the wire body: the ES-compat `_search` handler
+        // sets this from `?savings=`.
+        savings: SavingsMode::Off,
     })
 }
 
