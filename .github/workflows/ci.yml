@@ -182,6 +182,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+          # Single writer for the Linux [profile.ci-test] dependency cache.
+          # This job compiles the whole workspace, so its dependency set is a
+          # superset of what api-checks / conformance / usecase-smoke need;
+          # they restore this same key read-only. rust-cache's default key is
+          # per-job, which meant five near-identical ~700 MB copies competing
+          # for a 10 GB repo budget and evicting each other.
+          shared-key: ci-test-linux
 
       # One cargo invocation, not two. `cargo build --release --workspace` used
       # to run first, but `panic = "abort"` in [profile.release] makes cargo
@@ -269,6 +276,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
       - uses: actions/setup-node@v4
         with:
@@ -302,6 +316,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
       # ci-test: conformance asserts wire behaviour, not throughput.
       - name: Build server + conformance runner (ci-test profile)
@@ -422,6 +443,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
       - name: Build xerj + xerj-mcp (release)
         working-directory: engine
