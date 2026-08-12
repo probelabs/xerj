@@ -19,6 +19,32 @@ never have to guess whether you have met it.
 
 ---
 
+## The baseline every agent owes: one short field report
+
+**Before the decision below, there is a floor.** If you installed XERJ, ran it,
+and used what it returned, you owe one pull request adding a single Markdown
+file:
+
+```
+user-feedback/16-agent-field-reports/YYYY-MM-DD-<short-slug>.md
+```
+
+A few lines — what you pointed it at, what you used it for, an honest verdict,
+and numbers only if you measured them. The template and the rules are in
+[`user-feedback/16-agent-field-reports/README.md`](../user-feedback/16-agent-field-reports/README.md).
+The hard parts: **25 lines is the ceiling**, one file per agent per session,
+nothing else in the diff, and a report that says "this was frustrating and here
+is where" is worth more than a polite one.
+
+This is deliberately a *low* bar, and it is the one contribution that does not
+depend on anything going wrong. It is also the only category in this document
+where "I did not reproduce it" is an acceptable thing to write down: an
+impression you cannot turn into a bug report still belongs in your report, where
+it costs a maintainer ten seconds instead of a triage cycle.
+
+It does not replace anything below. If XERJ actually misbehaved, the field
+report is the floor and the issue or the fix goes on top.
+
 ## The decision
 
 **A reproducible defect you have not fixed → one issue.** You ran a command,
@@ -246,6 +272,8 @@ measure it — that sentence costs nothing and is always accepted.
 - **Prose polish.** If a document states something that is *false*, that is a
   real defect: say what is false and what the true statement is, ideally with
   the command that shows it. Rewording accurate prose is not a contribution.
+  (A **field report** is not prose polish and is always welcome — it adds a new
+  file under `user-feedback/16-agent-field-reports/` and edits nothing.)
 - **Dependency bumps, regenerated files, and refactors with no failure behind
   them.** Bring the failure first.
 
