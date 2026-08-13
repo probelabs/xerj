@@ -7,80 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+_Nothing yet._
 
-- **The reference-coding toolkit ships in the repo, and a corpus definition can
-  now rebuild a corpus** ([#319](https://github.com/xerj-org/xerj/issues/319)).
-  `xc-corpus.sh`, `xc-index.sh`, `xc.py` and `SKILL.md` lived only in a
-  gitignored working copy, so `git ls-files | grep xc-` returned nothing while
-  the case study, `CONTRIBUTING.md` and the landing page all told a reader to
-  run them. They are now in [`tools/xerj-code/`](tools/xerj-code/), with a
-  `!tools/**/*.md` re-include in `.gitignore` — the blanket `*.md` rule was what
-  swallowed `SKILL.md`, the same failure mode that hid this repo's pull-request
-  template for its entire history.
-  - `corpus.json` records the **full 40-character SHA**. The old
-    `rev-parse --short` value cannot be fetched from a remote
-    (`git fetch --depth 1 origin e449d17` → "couldn't find remote ref"), so a
-    manifest could not pin anything. A manifest carrying a short SHA is now
-    rejected with a SHA-specific error rather than silently rebuilt at the tip.
-  - `xc-corpus.sh --from <manifest>` rebuilds a corpus at its pinned commits —
-    fetch-by-SHA at depth 1 with progressively deeper fallbacks — and an
-    existing clone is *moved* to the recorded SHA instead of skipped.
-  - [`tools/xerj-code/hub/`](tools/xerj-code/hub/) carries vetted definitions
-    for the four corpora this repo uses. Each entry has a `review` block a
-    human filled in: SPDX expression, `adapt-with-attribution` /
-    `approach-only` / `mixed`, reviewer and date.
-  - Hosting pre-built *indexes* remains out of scope (on-disk format version,
-    embedder identity, redistribution of the indexed source), as does the
-    measurement harness — `CASE_STUDY.md` and `SKILL.md` previously pointed at
-    a `MEASURE.md` that is not in the repo, and now say plainly what ships.
-
-### Fixed
-
-- **The licence detector was wrong on 2 of the 13 repositories it had
-  classified.** `sonic` was recorded as `GPL` when it is **MPL-2.0** — MPL-2.0
-  defines "Secondary License" in terms of the GNU GPL inside its own text, and
-  restrictive-first *body* matching hit that first. `quickwit` was recorded as
-  `Apache-2.0/UNKNOWN` when it is plain **Apache-2.0** — `LICENSE-3rdparty.csv`
-  is a dependency inventory, not the project's licence. The classifier now
-  reads the title line before the body and skips third-party inventories.
-  Elasticsearch's triple licence still resolves to `AGPL` from its title, so
-  the safe direction is preserved where it matters most; that is a test.
-
-- **A corpus manifest could write outside the corpus directory and destroy an
-  unrelated checkout.** `--from` is documented as "rebuild a corpus someone
-  else defined", so a manifest is untrusted input — but only the *corpus* name
-  was screened, while the per-repo `repo` field, from the same file, was used
-  directly as a path. A manifest with `"repo": "../../../work/repo"` moved that
-  checkout to the manifest's commit, discarded its uncommitted changes and
-  untracked files (`checkout --force`, `clean -fd`), and rewrote its `origin`
-  remote. `repo` must now be a plain directory name, enforced in `xc-corpus.sh`
-  and in `validate_manifest.py`, with the destructive path double-guarded.
-
-- **`xc-index.sh` silently ignored an unrecognised argument.**
-  `xc-index.sh <corpus> --frsh` set no flag, ran an *incremental* index and
-  exited 0. Because `autoindex` keeps incremental state in `~/.xerj/autoindex/`,
-  a run that should have been fresh skips every file as "already indexed" and
-  leaves a corpus with 0 documents that retrieves nothing, reporting no error
-  anywhere. Unknown arguments are now rejected by name.
-
-- **`xc.py` warned about only `GPL` and `LGPL`, by exact match**, so it was
-  silent on every restricted repository the hub deliberately ships:
-  elasticsearch (AGPL/SSPL/Elastic), meilisearch's BUSL Enterprise Edition
-  parts, and — once the detector above was corrected from `GPL` to `MPL-2.0` —
-  sonic, which had been warning before. The warning at retrieval time is the
-  one that counts, because that is when an agent is looking at the code and
-  deciding whether to lift it; it now covers the same set as `xc-corpus.sh`.
-
-- New CI job `reference-coding`: shell and Python syntax, the offline
-  round-trip suite (`tools/xerj-code/tests/test_xc_corpus.sh`, 28 checks, local
-  git repositories over `file://`, never touching the real `~/.xerj-code`), and
-  `validate_manifest.py --hub` over every shipped manifest.
-
-## [1.0.0-rc.16] - 2026-08-11
+## [1.0.0-rc.16] - 2026-08-13
 
 Both rc.15 known issues (the progress-stream forgery and the outer-`.gitignore`
 reach into nested checkouts) are fixed in this release — see Fixed below.
+
+### Performance
+
+- **An idle node with many indices burned ~4 CPU cores and made the host
+  machine unusable.** `IndexStore` spawned one OS thread per index that woke
+  every `wal_batch_ms` (default 100 ms) and locked *every* WAL shard of that
+  store to ask whether it was dirty. With the default 16 ingest shards that is
+  ~1.5M lock operations per second on a 9,382-index node, for an answer that is
+  always "no" on an idle index. WAL fsync is now scheduled by one process-wide,
+  event-driven pool (`(cores/2).clamp(2,8)` threads, spawned lazily): a shard
+  arms itself when a write arrives, and **an index with no pending writes costs
+  nothing — no thread, no wakeup**.
+
+  Measured on a real 9,382-index corpus, idle, with zero clients (10 samples ×
+  15s): threads **9,709 → 339**; CPU **718-760% → 59.7-68.3%**; context
+  switches **~197,000/s → ~4,000/s**; interrupts **~142,000/s → ~7,600/s**.
+  Thread count no longer scales with index count — 20 indices versus 200 is 335
+  threads versus 335, where it was 365 versus 541.
+
+  Durability is unchanged and was verified with `strace -f -y -tt` so WAL
+  fsyncs are distinguishable from snapshot fsyncs: `sync` fsyncs before ack,
+  `batched` issues exactly one fsync inside the `wal_batch_ms` window, `async`
+  issues none, and `kill -9` plus restart recovered every acked document in all
+  three modes. RSS is a smaller win and reported as such: marginal 0.699 → 0.682
+  MB per index (~12 KB/index of thread stack), since per-index RSS is dominated
+  by index state rather than the thread. (#334)
+
+  Not fixed here: ~0.65 core remains on that node from node-global sampling and
+  O(indices)-per-tick work on shared timers — a different mechanism, tracked
+  separately.
 
 ### Security
 
@@ -124,6 +86,74 @@ reach into nested checkouts) are fixed in this release — see Fixed below.
   `crossbeam-epoch` moved 0.9.18 → 0.9.20 for RUSTSEC-2026-0204.
 
 ### Fixed
+
+
+- **Following the documented setup and running `xerj autoindex` failed with a
+  401.** `AuthConfig::default()` is `enabled: true`, so copying the shipped
+  config as the docs instruct produced an auth-enabled server, while the pages
+  that show `autoindex` all pass `--insecure` and the pages that tell you to
+  write a config never mention a key. `ping()` also discarded the HTTP status,
+  so the 401 on the first round trip was swallowed and the run printed ~15 lines
+  of healthy-looking progress before dying at the embedding-identity probe with
+  a message about the server's *capabilities* — leading the reporter to conclude
+  their server lacked a feature rather than a credential. `ping()` and
+  `embedding_execution_identity()` now fail fast and actionably on 401/403,
+  `autoindex` gained the `admin.key` fallback `brain` already had (loopback
+  only), the server sends `WWW-Authenticate: ApiKey realm="xerj"`, and the 401
+  body names the real data dir plus `XERJ_API_KEY`, `--api-key` and
+  `--insecure`. Reported by a user on macOS. (#333)
+
+- **`xerj-done` reported an identical success line whether or not any source
+  code was indexed.** A corpus in which every code file was junked printed the
+  same terminal record as a healthy one, which is how a silently degraded
+  index went unnoticed. The terminal line and run document now carry
+  `code_files`, `code_files_indexed` and `code_files_junked` on both the
+  generated and legacy paths, and a warning is emitted before the terminal line
+  when code files were detected and none produced an indexed record. Named
+  `code_files_indexed` rather than `ast` deliberately: a code file with no
+  captured symbols still indexes correctly, so `ast` would overstate. (#294,
+  #316)
+
+
+- **The licence detector was wrong on 2 of the 13 repositories it had
+  classified.** `sonic` was recorded as `GPL` when it is **MPL-2.0** — MPL-2.0
+  defines "Secondary License" in terms of the GNU GPL inside its own text, and
+  restrictive-first *body* matching hit that first. `quickwit` was recorded as
+  `Apache-2.0/UNKNOWN` when it is plain **Apache-2.0** — `LICENSE-3rdparty.csv`
+  is a dependency inventory, not the project's licence. The classifier now
+  reads the title line before the body and skips third-party inventories.
+  Elasticsearch's triple licence still resolves to `AGPL` from its title, so
+  the safe direction is preserved where it matters most; that is a test.
+
+- **A corpus manifest could write outside the corpus directory and destroy an
+  unrelated checkout.** `--from` is documented as "rebuild a corpus someone
+  else defined", so a manifest is untrusted input — but only the *corpus* name
+  was screened, while the per-repo `repo` field, from the same file, was used
+  directly as a path. A manifest with `"repo": "../../../work/repo"` moved that
+  checkout to the manifest's commit, discarded its uncommitted changes and
+  untracked files (`checkout --force`, `clean -fd`), and rewrote its `origin`
+  remote. `repo` must now be a plain directory name, enforced in `xc-corpus.sh`
+  and in `validate_manifest.py`, with the destructive path double-guarded.
+
+- **`xc-index.sh` silently ignored an unrecognised argument.**
+  `xc-index.sh <corpus> --frsh` set no flag, ran an *incremental* index and
+  exited 0. Because `autoindex` keeps incremental state in `~/.xerj/autoindex/`,
+  a run that should have been fresh skips every file as "already indexed" and
+  leaves a corpus with 0 documents that retrieves nothing, reporting no error
+  anywhere. Unknown arguments are now rejected by name.
+
+- **`xc.py` warned about only `GPL` and `LGPL`, by exact match**, so it was
+  silent on every restricted repository the hub deliberately ships:
+  elasticsearch (AGPL/SSPL/Elastic), meilisearch's BUSL Enterprise Edition
+  parts, and — once the detector above was corrected from `GPL` to `MPL-2.0` —
+  sonic, which had been warning before. The warning at retrieval time is the
+  one that counts, because that is when an agent is looking at the code and
+  deciding whether to lift it; it now covers the same set as `xc-corpus.sh`.
+
+- New CI job `reference-coding`: shell and Python syntax, the offline
+  round-trip suite (`tools/xerj-code/tests/test_xc_corpus.sh`, 28 checks, local
+  git repositories over `file://`, never touching the real `~/.xerj-code`), and
+  `validate_manifest.py --hub` over every shipped manifest.
 
 - **A binary that does not understand `cluster_state.json` now fails closed
   before activating storage.** The previous loader accepted future and
@@ -347,6 +377,57 @@ reach into nested checkouts) are fixed in this release — see Fixed below.
   `define()` calls stay uncaptured.
 
 ### Added
+
+
+- **`xerj mcp` — the MCP server now ships in the installed binary.** XERJ had a
+  complete, tested 10-tool MCP server that no user could obtain: releases built
+  only `xerj-server`, the installer shipped only `xerj`, and MCP appeared in no
+  agent-facing doc. It is now a subcommand, so anyone who ran
+  `curl -fsSL https://xerj.org/get | sh` gets it on their next upgrade, with no
+  installer or release-matrix change and no new third-party dependencies. Tools:
+  `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`,
+  `xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall`,
+  `xerj_brain_ego`, `xerj_brain_link`, `xerj_brain_unlink`,
+  `xerj_brain_overview`. A XERJ node must already be running; `xerj mcp` does
+  not start one. The published tool schema at
+  `/docs/agents/schemas/mcp-tools.json` had drifted to six tools against ten
+  served — it is now generated from a real `tools/list` and gated in CI against
+  drifting again.
+
+- **`[profile.quick]` and `[profile.ci-test]`** for the build and test halves of
+  the verify loop. `[profile.release]` is `lto = "fat"` + `codegen-units = 1`,
+  deliberately the slowest build Rust can produce because it yields the fastest
+  binary — correct for a shipped artifact, wrong for "does this compile?". CI's
+  test job spent 76m05s compiling for 1m52s of tests. Neither profile is ever
+  valid for a released artifact or a published performance number.
+  `docs/FAST_BUILDS.md` documents the remaining levers.
+
+
+- **The reference-coding toolkit ships in the repo, and a corpus definition can
+  now rebuild a corpus** ([#319](https://github.com/xerj-org/xerj/issues/319)).
+  `xc-corpus.sh`, `xc-index.sh`, `xc.py` and `SKILL.md` lived only in a
+  gitignored working copy, so `git ls-files | grep xc-` returned nothing while
+  the case study, `CONTRIBUTING.md` and the landing page all told a reader to
+  run them. They are now in [`tools/xerj-code/`](tools/xerj-code/), with a
+  `!tools/**/*.md` re-include in `.gitignore` — the blanket `*.md` rule was what
+  swallowed `SKILL.md`, the same failure mode that hid this repo's pull-request
+  template for its entire history.
+  - `corpus.json` records the **full 40-character SHA**. The old
+    `rev-parse --short` value cannot be fetched from a remote
+    (`git fetch --depth 1 origin e449d17` → "couldn't find remote ref"), so a
+    manifest could not pin anything. A manifest carrying a short SHA is now
+    rejected with a SHA-specific error rather than silently rebuilt at the tip.
+  - `xc-corpus.sh --from <manifest>` rebuilds a corpus at its pinned commits —
+    fetch-by-SHA at depth 1 with progressively deeper fallbacks — and an
+    existing clone is *moved* to the recorded SHA instead of skipped.
+  - [`tools/xerj-code/hub/`](tools/xerj-code/hub/) carries vetted definitions
+    for the four corpora this repo uses. Each entry has a `review` block a
+    human filled in: SPDX expression, `adapt-with-attribution` /
+    `approach-only` / `mixed`, reviewer and date.
+  - Hosting pre-built *indexes* remains out of scope (on-disk format version,
+    embedder identity, redistribution of the indexed source), as does the
+    measurement harness — `CASE_STUDY.md` and `SKILL.md` previously pointed at
+    a `MEASURE.md` that is not in the repo, and now say plainly what ships.
 
 - **`GET /_ilm/status`, `POST /_ilm/start`, `POST /_ilm/stop`** (#282): the
   operator can halt lifecycle execution without stopping the node; a stopped
