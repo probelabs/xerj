@@ -10,6 +10,15 @@
 # To use: copy this file to xerj.toml and start the server:
 #   xerj --config /path/to/xerj.toml
 #
+# Doing that gives you an AUTHENTICATED server: [auth] enabled = true
+# below is the default. The admin key is auto-generated on first start,
+# printed in a banner, and written to <data_dir>/admin.key — and every
+# client has to send it, `xerj autoindex` included:
+#   export XERJ_API_KEY="$(cat <data_dir>/admin.key)"
+#   xerj autoindex <folder>
+# For a local dev node with no key at all, skip the config file and run
+# `xerj --insecure --data-dir ./data` (that disables TLS *and* auth).
+#
 # All settings are optional — an empty file is valid and uses
 # every default below.
 # ============================================================
@@ -88,6 +97,14 @@ trusted_proxies = []
 # When true, every request must carry:
 #   Authorization: ApiKey <key>
 # On first startup, the admin key is written to <data_dir>/admin.key.
+# This is the DEFAULT, so copying this file as-is enables auth. That
+# includes the CLI clients: `xerj autoindex` never takes the key from
+# this file, so pass `--api-key <key>` or set
+# XERJ_API_KEY=$(cat <data_dir>/admin.key), or it fails with 401.
+# One exception: against a loopback --url, `xerj autoindex` falls back to
+# reading <data_dir>/admin.key itself and prints which file it used. That
+# path is relative to the working directory, so a run started from anywhere
+# else still needs the key passed explicitly.
 # Set to false only in trusted private networks or development environments.
 enabled = true
 

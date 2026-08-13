@@ -43,7 +43,7 @@ cannot push at all: [.github/AI_CONTRIBUTIONS.md](./.github/AI_CONTRIBUTIONS.md)
 ## Ground rules for working in this repo
 
 - **Honest claims only.** Every public number traces to a verified run. The **default** embedding mode is *lexical* feature-hashing — never claim the default mode does neural/semantic understanding. A built-in **neural** BERT embedder ships in the binary but is **off unless activated** (`--embed-mode neural`, model auto-downloads on first use); only describe output as neural when that mode is actually running. kNN: unfiltered queries are HNSW-served with exact rescoring — recall is *measured* (recall@10 1.00 on the official bench query, 100-probe mean 0.976), never claim "recall 1.00 by construction" for the ANN path; filtered/nested/SQ8/small-index shapes run the exact brute-force scan; benchmark headline is the audited scorecard in `demo/playbooks/SCORECARD.md` (currently 55W / 26T / 4L, 3 N/A vs live ES 8.13.4 — the 4 losses are all read-under-write p99 cells); do not claim TB-scale end-to-end (server heap ticket: `demo/usecases/autoindex/scale/TICKET_server-unbounded-ingest-heap.md`).
-- **Reference-code before you write.** For non-trivial engine work, retrieve how peer projects already solved the problem before writing your own version, and cite `file:line` for what you relied on. This repo dogfoods XERJ for it: reference projects (tantivy, meilisearch, quickwit, qdrant, usearch, hnswlib, sled, fjall, redb, ClickHouse) are indexed locally and queried with `xc.py <corpus> "<what you need>"`. Two rules bind regardless of tooling: **retrieved code is evidence, not authority** — adapt and attribute rather than paste; and **check the licence** — XERJ is Apache-2.0, so GPL-family sources (and Elasticsearch, which is AGPL/SSPL/Elastic-licensed) are approach-only, never copied. That second rule is also why XERJ can state it shares no code with Elasticsearch: ES is read for wire-protocol *semantics*, never for implementation. Honest scope: retrieval pays off on code a model has not memorised (internal, niche, post-cutoff) and is pure overhead on popular public libraries it already knows.
+- **Reference-code before you write.** For non-trivial engine work, retrieve how peer projects already solved the problem before writing your own version, and cite `file:line` for what you relied on. This repo dogfoods XERJ for it: reference projects (tantivy, meilisearch, quickwit, qdrant, usearch, hnswlib, sled, fjall, redb, ClickHouse) are indexed locally and queried with `xc.py <corpus> "<what you need>"`; the tooling and the pinned corpus definitions are in [`tools/xerj-code/`](tools/xerj-code/). Two rules bind regardless of tooling: **retrieved code is evidence, not authority** — adapt and attribute rather than paste; and **check the licence** — XERJ is Apache-2.0, so GPL-family sources (and Elasticsearch, which is AGPL/SSPL/Elastic-licensed) are approach-only, never copied. That second rule is also why XERJ can state it shares no code with Elasticsearch: ES is read for wire-protocol *semantics*, never for implementation. Honest scope: retrieval pays off on code a model has not memorised (internal, niche, post-cutoff) and is pure overhead on popular public libraries it already knows.
 - **Builds are scoped:** `cd engine && cargo build --release -j 32 -p <crate>` — never workspace-wide, never `cargo clean`.
 - **The hard gate:** the ES-YAML conformance suite must stay at **0 failed** (currently 1365 passed / 0 failed / 3 skipped — the pass count grows as cases are added, so gate on failures, not on an exact total) before any engine change lands (see "Running the conformance tests" in the README).
 - **Git discipline:** non-trivial changes land with full commit bodies (motivation, before/after numbers, root cause, file pointers) — the git history is the project's engineering log; read it before re-deriving decisions.
@@ -92,12 +92,60 @@ verbatim samples and the failure modes, is under "Running an index for a human"
 in [landing/llms.txt](./landing/llms.txt) (published at
 https://xerj.org/llms.txt).
 
+## Talking to XERJ over MCP
+
+If you cannot run shell commands, you do not need to. XERJ ships a Model
+Context Protocol server **inside the one binary the installer puts on disk** —
+`xerj mcp` — so the whole install is still `curl -fsSL https://xerj.org/get | sh`.
+It speaks MCP over stdio (newline-delimited JSON-RPC 2.0) and proxies to a node
+that is already running; it does not start one.
+
+```json
+{
+  "mcpServers": {
+    "xerj": {
+      "command": "/home/you/.local/bin/xerj",
+      "args": ["mcp"],
+      "env": { "XERJ_URL": "http://localhost:9200" }
+    }
+  }
+}
+```
+
+Use an absolute path (`command -v xerj`): MCP hosts started from a desktop icon
+do not inherit a shell `PATH`. Add `"XERJ_AUTH": "ApiKey <key>"` when the node
+is not running `--insecure` — the key is `<data-dir>/admin.key`. `--url` and
+`--auth` flags override the two environment variables.
+
+Ten tools: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`,
+`xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall`,
+`xerj_brain_overview`, `xerj_brain_ego`, `xerj_brain_link`, `xerj_brain_unlink`.
+Each is a *thin proxy*: it builds exactly the request the ES-compatible surface
+already accepts and hands back whatever the engine returned, errors and refusals
+verbatim. It adds no capability of its own — so anything you can do over MCP you
+can also do with `curl`, and vice versa.
+
+Two honesty notes that bind how you describe results: `xerj_semantic_search`
+embeds server-side with the **lexical feature-hashing** embedder unless the node
+was started with `--embed-mode neural`, and the `xerj_brain_*` tools work a
+deterministic link index, not a graph database. Both are stated in the tool
+descriptions themselves; do not restate them more strongly than they are.
+
+The published schemas are `landing/docs/agents/schemas/mcp-tools.json`
+(https://xerj.org/docs/agents/schemas/mcp-tools.json). They are **generated**
+from a live `tools/list`, never hand-written — `scripts/mcp-schema-check.sh`
+regenerates (`--write`) and gates (default) them, and
+`engine/crates/xerj-mcp/tests/published_schema_drift.rs` fails the build if they
+diverge from what the server serves. That guard exists because the file once
+advertised six tools while the binary served ten.
+
 ## Where to look
 
 | You want | Go to |
 |---|---|
 | The product story & design rationale | [README.md](./README.md), [docs/WHY_XERJ.md](./docs/WHY_XERJ.md) |
 | Machine-readable capability reference + honest caveats | https://xerj.org/llms.txt · https://xerj.org/llms-full.txt |
+| MCP tool schemas (generated from the server, drift-gated) | [landing/docs/agents/schemas/mcp-tools.json](./landing/docs/agents/schemas/mcp-tools.json) · source: [engine/crates/xerj-mcp/](./engine/crates/xerj-mcp/) |
 | Verified how-to guides | [docs/recipes/](./docs/recipes/) (each live-validated before publication) |
 | The flagship feature's evaluation | [demo/usecases/autoindex/](./demo/usecases/autoindex/) (80/81 adversarial ground-truth exam, agent-vs-grep scorecard, scale report) |
 | Benchmark methodology & per-cell results | [demo/playbooks/](./demo/playbooks/) |

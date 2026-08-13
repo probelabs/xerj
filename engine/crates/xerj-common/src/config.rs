@@ -707,8 +707,16 @@ pub struct StorageConfig {
     ///   this is one fsync per bulk request (group commit), matching ES's
     ///   per-request translog fsync granularity. Safest, slowest.
     /// - `"batched"` — writes reach the kernel immediately (process-crash
-    ///   durable); a background loop fsyncs every `wal_batch_ms`, bounding
-    ///   the power-loss window. Good balance.
+    ///   durable) and are fsynced within `wal_batch_ms` of arriving, which
+    ///   bounds the power-loss window. Good balance.
+    ///
+    ///   Issue #334: the fsync is scheduled per WAL shard by a shared,
+    ///   bounded worker pool (`xerj_storage::wal_fsync`) that is woken by
+    ///   the write itself.  It used to be a dedicated OS thread per index
+    ///   polling on a timer, which cost a thread and `1000 / wal_batch_ms`
+    ///   wakeups per second per index even when nothing was ever written.
+    ///   The guarantee is unchanged (arguably tighter: the deadline is now
+    ///   anchored to the write instead of to a free-running tick).
     /// - `"async"` — never fsync; the OS decides when to write back.
     ///   Fastest, least durable.
     ///

@@ -5,8 +5,8 @@
 > unfamiliar-code libraries plus two memorised controls (tantivy, valkey+memcached).
 > Every number produced by `csrun.py` / `csmulti.py` + `summarize.py` on this
 > machine. Full method (what/which repos indexed, how indexed, how searched, how to
-> reproduce) below and in `MEASURE.md`. Raw data in `results-*.json`; captured
-> generated programs in `generated/`.
+> reproduce) below. Raw data in `data/results-*.json`; captured generated
+> programs in `generated/`.
 >
 > **One-line answer:** on the seven domains carrying a contract the model cannot
 > recall (a seal, a generational handle, a lazy refill, a specific hash scheme, an
@@ -123,12 +123,19 @@ Two kinds of reference deliberately:
 
 ## How they were indexed
 
-Two commands, both shipped with the skill:
+Two commands, both shipped in [`tools/xerj-code/`](../../../tools/xerj-code/):
 
 ```sh
 xc-corpus.sh <name> <git-url>…   # shallow clone (--depth 1) + record each repo's licence
 xc-index.sh  <name>              # xerj autoindex <dir> --url <XERJ> --prefix xc-<name> --no-graph
 ```
+
+`xc-corpus.sh` writes a `corpus.json` next to the clones — URLs, full commit
+SHAs and licences, a few hundred bytes, no source. That file is the shareable
+definition of a corpus: `xc-corpus.sh --from <manifest>` rebuilds it at the same
+commits somewhere else, which is what makes two people's retrieval results
+comparable. Pinned, licence-reviewed definitions for the corpora used here are
+in [`tools/xerj-code/hub/`](../../../tools/xerj-code/hub/).
 
 `xc-index.sh` runs **`xerj autoindex`** — XERJ's zero-config folder ingester: it
 sniffs file types, extracts per-file records (for source it pulls symbol/definition
@@ -157,16 +164,25 @@ returns ranked passages with `file:line` provenance:
 The `xerj` arm gets that passage injected into its prompt. The `native` arm is
 handed the same corpus tree on disk and must `grep`/read to find the API itself —
 that search cost is what the two arms differ by. See a worked query and its output
-in `SKILL.md`.
+in [`tools/xerj-code/SKILL.md`](../../../tools/xerj-code/SKILL.md).
 
 ## How you reproduce it
 
-End-to-end recipe in **`MEASURE.md`**: start XERJ → `xc-corpus.sh`/`xc-index.sh` a
-corpus → `validate_*` the tasks → `csrun.py`/`csmulti.py` across the three arms →
-`summarize.py`. It needs the `xerj` binary, the `claude` CLI (no API key — token
-counts and cost come from `claude -p --output-format json`), and the language
-toolchains. To measure retrieval on **your own** code, point `xc-index.sh` at your
-repo and write a task with a hidden test — that is the real use case.
+The **retrieval half** is shipped and runs as printed: start XERJ, then
+`xc-corpus.sh` (or `xc-corpus.sh --from tools/xerj-code/hub/<corpus>.json`, which
+pins the exact commits these runs used) → `xc-index.sh` → `xc.py`. It needs the
+`xerj` binary, `git` and `python3`. To point it at **your own** code, index your
+repo instead of a corpus — that is the real use case.
+
+The **measurement harness** — the three-arm runner, the purpose-built reference
+libraries, the hidden-test task specs — is **not** in this repository; only its
+outputs are (`data/results-*.json`, `generated/`). What it does, if you want to
+build the equivalent: run three arms of the same agent (memory only / grep-driven
+/ retrieval-injected) over tasks whose verdict is objective — the code compiles
+and passes a hidden test the model never sees — using the `claude` CLI's own
+token and cost accounting (`claude -p --output-format json`, no API key), and
+report medians. Validate each task first by injecting a known-correct and a
+known-wrong solution; a benchmark whose tests pass wrong code measures nothing.
 
 ---
 

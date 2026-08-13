@@ -21,7 +21,9 @@ ulimit -Hn 4096 2>/dev/null || true
 ulimit -Sn 256  2>/dev/null || true
 echo "platform: $(uname -s)   ulimit -Sn: $(ulimit -Sn 2>/dev/null || echo n/a)   -Hn: $(ulimit -Hn 2>/dev/null || echo n/a)"
 
-BIN="engine/target/release/xerj"
+# Overridable so CI can point at a cheaper profile than fat-LTO release;
+# defaults to the release path for local use.
+BIN="${XERJ_BIN:-engine/target/release/xerj}"
 [ -f "$BIN.exe" ] && BIN="$BIN.exe" # windows
 
 # ── generate 400 distinct-schema datasets (one index each) ─────────────────

@@ -6,6 +6,14 @@ license.workspace = true
 authors.workspace = true
 description = "Model Context Protocol (MCP) stdio server exposing the 10 canonical XERJ agent operations (search, memory, second-brain graph) as thin proxies to an ES-compatible XERJ endpoint"
 
+# Library first: the `xerj mcp` subcommand on the main binary calls
+# `xerj_mcp::run`, so a user with the installed `xerj` binary already has the
+# MCP server. The standalone binary below is a thin wrapper over the same entry
+# point (CI builds and smoke-tests it).
+[lib]
+name = "xerj_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "xerj-mcp"
 path = "src/main.rs"
