@@ -4866,6 +4866,53 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 cfg.api_key_file.as_deref(),
             )
         );
+        // This line is where an agent learns how to search, so it is where the
+        // code-aware form belongs. A blind usability run showed the cost of
+        // omitting it: the agent followed exactly this guidance, got whole
+        // files back, and reinvented client-side slicing rather than
+        // discovering `_passage` — which it never saw mentioned anywhere.
+        // Only printed when source code was actually indexed; for a PDF or log
+        // corpus it would be noise.
+        let indexed_code = plan.files.values().any(|fa| fa.family == "code");
+        if indexed_code {
+            println!(
+                "      code was indexed — for a function/class instead of a whole file:\n\
+                 \x20       curl -s $URL/{}-*/_search -H 'Content-Type: application/json' \\\n\
+                 \x20         -d '{{\"query\":{{\"bool\":{{\"should\":[{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\
+                 \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":4}}}}}}]}}}},\
+                 \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
+                 \x20       (the `match_phrase` clause ranks the file that DEFINES a symbol above files that merely call it; `_passage` returns \
+                 the enclosing block, not the file)",
+                cfg.prefix
+            );
+        }
+        // A mixed corpus needs one more thing said out loud. Code volume
+        // swamps prose on shared vocabulary: in a blind run, a question about
+        // documentation ("exit code 3") matched WordPress PHP on `exit` and
+        // `code` and returned nothing but source, costing a wasted round trip.
+        // The agent worked out the fix itself afterwards — scope the query —
+        // which is exactly the sort of thing that should not have to be
+        // rediscovered.
+        let indexed_prose = plan
+            .files
+            .values()
+            .any(|fa| fa.family.starts_with("txt") || fa.family == "html");
+        if indexed_code && indexed_prose {
+            println!(
+                "      this corpus mixes code and prose — code volume can swamp prose on\n\
+                 \x20     shared words. Scope the side you want:\n\
+                 \x20       …,\"query\":{{\"bool\":{{\"must\":[{{\"match\":{{\"body\":\"<text>\"}}}}],\
+                 \"filter\":[{{\"term\":{{\"ax_format\":\"code\"}}}}]}}}}\n\
+                 \x20       (values for `ax_format` in this run: {})",
+                {
+                    let mut fams: Vec<&str> =
+                        plan.files.values().map(|fa| fa.family.as_str()).collect();
+                    fams.sort_unstable();
+                    fams.dedup();
+                    fams.join(", ")
+                }
+            );
+        }
     }
     // Exit 3 means "completed, some input was unusable". Backend rejections
     // are not consulted and must not be: a rejected item aborts the run with

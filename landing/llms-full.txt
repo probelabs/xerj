@@ -112,6 +112,22 @@ Content types:
   exact ceiling depends on the box and document shape, so no single figure is quoted).
   Do not plan corpora beyond a few million documents until that fix lands.
 
+- Default `_search` returns whole documents; project `_source` and use `_passage`
+  to shrink it. With no `_source`/`fields` in the request, every hit's `_source` is
+  the complete stored document — for a corpus of source files or long documents that
+  is megabyte-scale for a handful of hits (measured: 5 hits over indexed source files
+  = 416,630 bytes). Add `"fields":["_passage"]` to any query (lexical, or a single
+  semantic/kNN clause — ambiguous multi-clause kNN/hybrid + `_passage` is rejected
+  with a 400 naming the fix) to get just the matching snippet —
+  `{field,ordinal,start_offset,end_offset,text,page?}` sliced from the original
+  field — instead of the whole body, and project `_source` (e.g. `["title","ax_path"]`,
+  or `false`) to drop the rest: the same query measured 12,122 bytes that way, a 34x
+  reduction. `_passage` is opt-in and does not appear in `_mapping` or any default
+  response, so a response that would benefit says so itself: when `_source` is
+  unprojected and `_passage` wasn't requested, XERJ splices an additive `_xerj.hints`
+  entry — a ready-to-send corrected request — ahead of `hits` (never inside
+  `hits`/`total`/`_score`, so existing ES clients are unaffected). See §3.1.
+
 - The fully-exercised, AI-core surface is: index & mapping management, `_doc` CRUD,
   `_bulk`, `_search` (full DSL + `semantic`/`knn`/`hybrid`), `_count`, `_mget`,
   `_msearch`, the `/_memory` API, and the `autoindex` CLI. Many cluster / _cat /
@@ -242,6 +258,22 @@ POST /{index}/_search
     "_source": ["title","url"],
     "aggs": { "by_tag": { "terms": { "field": "tag" } } } }
 Response: standard ES { "took", "hits": { "total": {"value":N}, "hits": [ {"_id","_score","_source"} ] }, "aggregations"? }
+
+Large documents — ask for the snippet, not the whole file (see §2):
+  { "query": { "match": { "body": "connection reset by peer" } },
+    "_source": ["title","ax_path"],
+    "fields": ["_passage"] }
+  `_passage` is a pseudo-field — opt-in only, absent from `_mapping` and from every
+  default response. Each hit's `fields._passage` carries
+  `{field,ordinal,start_offset,end_offset,text,page?}`, the matching snippet sliced
+  from the original field. Works with a lexical query naming one field or
+  `multi_match`, and with a single semantic/kNN clause; combine with a projected
+  `_source` for the largest size reduction. For code specifically,
+  `bool.should` with `multi_match` over `["body","defs"]` and a
+  `match_phrase` on `defs` with "boost":4 (`defs` is autoindex's per-file symbol
+  index — one "kind name" line per definition) ranks a file that DEFINES a symbol
+  over one that merely mentions it — `xerj autoindex map` prints this exact query
+  pre-built for every code dataset it finds.
 
 --- 3.2 xerj_semantic_search — meaning over a semantic_text field ----
 Prereq: the field must be mapped as `semantic_text` (auto-embedded at ingest).

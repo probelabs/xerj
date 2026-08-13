@@ -460,6 +460,7 @@ fn unauthorized_response(data_dir: &str) -> Response {
             request_id: None,
         },
         status: 401,
+        xerj_hint: None,
     };
 
     (

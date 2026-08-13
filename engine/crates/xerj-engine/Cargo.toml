@@ -40,10 +40,30 @@ regex      = "1"
 
 # Fast non-cryptographic hash — used to shard the engine FTS memtable
 # by doc_id so concurrent bulk ingest batches target different shards.
+# Also seeds the `code_blocks` parsed-tree cache key (#174 follow-up).
 xxhash-rust = { workspace = true }
 # FxHash for the memtable hot maps (postings, field_lengths, doc-values)
 # — SipHash was >21% of on-CPU time under the shard write locks at c8.
 rustc-hash = { workspace = true }
+
+# --- AST-aligned `_passage` for code hits (#174 follow-up, `code_blocks`).
+# Same grammar versions as `xerj-autoindex`'s ingest-time extractor
+# (`xerj-autoindex/src/extract/code.rs`) — this module re-parses at RESPONSE
+# time rather than depending on that crate (autoindex depends on the engine,
+# not the other way around; a reverse dependency would be circular). ---
+tree-sitter = "0.25"
+tree-sitter-python = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-bash = "0.23"
 
 [features]
 default = []

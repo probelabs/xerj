@@ -3114,7 +3114,28 @@ pub async fn get_doc(
             let version = idx.lookup_version(&id).unwrap_or(1);
             let seq_no = idx.lookup_seq_no(&id).unwrap_or(0);
             let resp = EsGetResponse::found(&index, &id, version, seq_no, filtered);
-            Json(resp).into_response()
+            // A blind usability run fetched a whole source file this way and
+            // paid 3.17 MB for one function: `GET /_doc/{id}` is where an agent
+            // lands once search has told it *which* document it wants, and it
+            // had no way to learn a cheaper route existed. Same size-triggered
+            // hint as `_search`, emitted before the payload so it survives
+            // output truncation.
+            match serde_json::to_value(&resp) {
+                Ok(Value::Object(map)) => {
+                    let doc_bytes = map
+                        .get("_source")
+                        .map(|s| serde_json::to_string(s).map(|s| s.len()).unwrap_or(0))
+                        .unwrap_or(0);
+                    if doc_bytes > LARGE_RESPONSE_HINT_THRESHOLD_BYTES {
+                        let mut out = serde_json::Map::new();
+                        out.insert("_xerj".into(), get_doc_response_hint(&index, doc_bytes));
+                        out.extend(map);
+                        return Json(Value::Object(out)).into_response();
+                    }
+                    Json(Value::Object(map)).into_response()
+                }
+                _ => Json(resp).into_response(),
+            }
         }
         Ok(None) => {
             let resp = EsGetResponse::not_found(&index, &id);
@@ -6911,6 +6932,678 @@ fn profile_shard_count(n: i64) -> u64 {
     n.clamp(1, 1024) as u64
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Actionable response hint (`_xerj`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Byte threshold above which an unprojected `_search` response is "large"
+/// enough to earn the `_xerj` hint (see [`search_response_hint`]). Picked
+/// well above realistic small-document test fixtures — most are a few
+/// hundred bytes at most — and well below the response a handful of whole
+/// source files produce (measured: 5 hits returning full file bodies via
+/// default `_source` = 416,630 bytes; the same query with `_source`
+/// projected and `fields: ["_passage"]` = 12,122 bytes).
+const LARGE_RESPONSE_HINT_THRESHOLD_BYTES: usize = 4096;
+
+/// Whether a `fields` request — in any of the shapes ES accepts (bare
+/// string, array of strings, array of `{"field": ...}` objects) — includes
+/// the `_passage` pseudo-field.
+fn fields_request_includes_passage(fields: &Value) -> bool {
+    fn is_passage(v: &Value) -> bool {
+        v.as_str() == Some("_passage")
+            || v.as_object()
+                .and_then(|o| o.get("field"))
+                .and_then(Value::as_str)
+                == Some("_passage")
+    }
+    match fields {
+        Value::Array(arr) => arr.iter().any(is_passage),
+        other => is_passage(other),
+    }
+}
+
+/// Build the additive `_xerj.hints` hint for a `_search` response.
+///
+/// `_passage` — the field that returns just the matching snippet instead of
+/// the whole document body — has no default trigger and is absent from
+/// `_mapping`, so a caller has no way to discover it short of reading the
+/// docs. This nudges them toward it, but only when it would actually help:
+/// the caller already gets a small response as soon as they project
+/// `_source` or ask for `_passage` themselves, and repeating a notice on
+/// every response the caller already handled correctly is exactly the kind
+/// of noise this project's review guidance rules out. Returns `None`
+/// whenever the hint would not be actionable.
+/// Field names a query refers to, gathered from the ordinary ES leaf shapes.
+///
+/// Subfield suffixes are kept (`symbols.name.keyword`) but the parent is also
+/// recorded, so a query against a real field's subfield is not reported as
+/// unknown.
+fn referenced_query_fields(q: &Value, out: &mut Vec<String>) {
+    const FIELD_KEYED: &[&str] = &[
+        "match",
+        "match_phrase",
+        "match_phrase_prefix",
+        "term",
+        "terms",
+        "prefix",
+        "wildcard",
+        "regexp",
+        "fuzzy",
+        "range",
+    ];
+    match q {
+        Value::Object(o) => {
+            for (k, v) in o {
+                if FIELD_KEYED.contains(&k.as_str()) {
+                    if let Value::Object(inner) = v {
+                        for f in inner.keys() {
+                            out.push(f.clone());
+                        }
+                    }
+                } else if k == "exists" {
+                    if let Some(f) = v.get("field").and_then(Value::as_str) {
+                        out.push(f.to_string());
+                    }
+                } else if k == "multi_match" {
+                    if let Some(Value::Array(fs)) = v.get("fields") {
+                        for f in fs.iter().filter_map(Value::as_str) {
+                            // `body^3` — the boost is not part of the name.
+                            out.push(f.split('^').next().unwrap_or(f).to_string());
+                        }
+                    }
+                } else {
+                    referenced_query_fields(v, out);
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|v| referenced_query_fields(v, out)),
+        _ => {}
+    }
+}
+
+/// Hint for a query that names a field the index does not have.
+///
+/// Fires regardless of hit count: a bogus field inside a `multi_match` that
+/// also names a real one still returns results, so a zero-hit-only check would
+/// never see the worst case.
+///
+/// This is the most expensive silent failure a newcomer hits. In blind
+/// usability runs, two independent agents both guessed `content` (a reasonable
+/// name that does not exist here), got `0 hits` with no explanation, and then
+/// spent their largest payloads — 182 KB and 65 KB in one run — trial-and-
+/// erroring field names before thinking to fetch `_mapping`. The engine knows
+/// the schema; staying silent is a choice, and the wrong one.
+fn unknown_field_hint(
+    index: &str,
+    body: &EsSearchBody,
+    schema: &xerj_common::types::Schema,
+) -> Option<Value> {
+    let query = body.query.as_ref()?;
+    let mut referenced = Vec::new();
+    referenced_query_fields(query, &mut referenced);
+    if referenced.is_empty() {
+        return None;
+    }
+
+    let known = |name: &str| -> bool {
+        // Accept the field itself, a subfield of a real field, and the ES
+        // metadata fields a query may legitimately target.
+        schema.field(name).is_some()
+            || name.starts_with('_')
+            || name
+                .split_once('.')
+                .is_some_and(|(parent, _)| schema.field(parent).is_some())
+    };
+
+    let unknown: Vec<String> = referenced
+        .iter()
+        .filter(|f| !known(f))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+
+    // Text-ish fields are what a full-text query actually wants; listing every
+    // keyword and numeric column would bury the answer.
+    let searchable: Vec<String> = schema
+        .fields
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.field_type,
+                xerj_common::types::FieldType::Text | xerj_common::types::FieldType::Keyword
+            ) && !f.name.starts_with("ax_")
+        })
+        .map(|f| f.name.clone())
+        .collect();
+
+    let primary = searchable
+        .iter()
+        .find(|n| n.as_str() == "body")
+        .or_else(|| searchable.first())
+        .cloned()
+        .unwrap_or_else(|| "body".to_string());
+
+    Some(json!({
+        "hints": [{
+            "code": "unknown_field",
+            "reason": format!(
+                "no results, and this query names {} that {} not exist in `{index}`: {}. \
+                 Searchable text fields here are: {}.",
+                if unknown.len() == 1 { "a field" } else { "fields" },
+                if unknown.len() == 1 { "does" } else { "do" },
+                unknown.join(", "),
+                if searchable.is_empty() { "(none)".to_string() } else { searchable.join(", ") },
+            ),
+            "try": {
+                "request": format!("POST /{index}/_search"),
+                "body": {
+                    "query": {"match": {primary.clone(): "<your text>"}},
+                    "_source": ["ax_path", "title"],
+                    "fields": ["_passage"],
+                },
+            },
+        }],
+    }))
+}
+
+/// `term`/`terms` clauses in a query, as (field, value) pairs.
+///
+/// Only exact-match clauses: a `match` against text is analysed and a zero
+/// result there is ordinary, not a taxonomy mistake.
+fn exact_term_clauses(q: &Value, out: &mut Vec<(String, String)>) {
+    match q {
+        Value::Object(o) => {
+            for (k, v) in o {
+                match k.as_str() {
+                    "term" => {
+                        if let Value::Object(inner) = v {
+                            for (f, val) in inner {
+                                let s =
+                                    val.get("value").unwrap_or(val).as_str().map(str::to_string);
+                                if let Some(s) = s {
+                                    out.push((f.clone(), s));
+                                }
+                            }
+                        }
+                    }
+                    "terms" => {
+                        if let Value::Object(inner) = v {
+                            for (f, val) in inner {
+                                if let Value::Array(a) = val {
+                                    for s in a.iter().filter_map(Value::as_str) {
+                                        out.push((f.clone(), s.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => referenced_or_recurse(v, out),
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|v| exact_term_clauses(v, out)),
+        _ => {}
+    }
+}
+
+fn referenced_or_recurse(v: &Value, out: &mut Vec<(String, String)>) {
+    exact_term_clauses(v, out);
+}
+
+/// Build the "you filtered on a value that does not exist" hint.
+///
+/// `present` is a bounded sample of the values actually stored in the field.
+/// A blind usability run filtered `ax_format: "markdown"` — an entirely
+/// reasonable guess — and got a silent zero, because this corpus classifies
+/// Markdown as `txt-prose`/`txt-lines`. Discovering that cost the agent two
+/// round trips and a terms aggregation it had to think to write.
+fn unknown_value_hint(index: &str, field: &str, value: &str, present: &[String]) -> Value {
+    json!({
+        "hints": [{
+            "code": "unknown_value",
+            // "include", not "are": this comes from a bounded sample, so a rare
+            // value may be missing from the list. Presenting a sample as the
+            // complete set would let a caller conclude a value does not exist
+            // when it simply was not sampled — a worse error than the one this
+            // hint is fixing.
+            "reason": format!(
+                "no results: `{field}` has no value `{value}` in `{index}`. \
+                 Values seen in a sample of this index include: {}. \
+                 For the complete set, aggregate on the field.",
+                present.join(", ")
+            ),
+            "try": {
+                "request": format!("POST /{index}/_search"),
+                "body": {
+                    "query": {"term": {field: present.first().cloned().unwrap_or_default()}},
+                    "_source": ["ax_path", "title"],
+                },
+            },
+        }],
+    })
+}
+
+/// Hint attached to an oversized `GET /{index}/_doc/{id}` response.
+///
+/// A document fetch cannot be narrowed the way a search can, so the recovery is
+/// to go back through `_search` and ask for the passage instead of the document.
+fn get_doc_response_hint(index: &str, doc_bytes: usize) -> Value {
+    json!({
+        "hints": [{
+            "reason": format!(
+                "this document's `_source` is {doc_bytes} bytes — for code, that is \
+                 the whole file. To retrieve only the function or class you are after, \
+                 search for it and request the passage instead of fetching the document."
+            ),
+            "try": {
+                "request": format!("POST /{index}/_search"),
+                "body": {
+                    "query": {"bool": {"should": [
+                        {"multi_match": {
+                            "query": "<the symbol or phrase you want>",
+                            "fields": ["body", "defs"],
+                            "type": "most_fields",
+                        }},
+                        {"match_phrase": {"defs": {
+                            "query": "<the symbol or phrase you want>",
+                            "boost": 4,
+                        }}},
+                    ]}},
+                    // Project the path rather than dropping `_source`: a blind
+                    // run got the passage, could not tell which file it came
+                    // from, and spent 6 MB on follow-ups recovering it. Costs
+                    // ~69 bytes and makes the reply a complete answer.
+                    "_source": ["ax_path", "title"],
+                    "fields": ["_passage"],
+                },
+            },
+        }],
+    })
+}
+
+fn search_response_hint(index: &str, body: &EsSearchBody, hits: &[EsHit]) -> Option<Value> {
+    // Trigger on the SIZE of what we are about to return, not on whether the
+    // caller projected `_source`.
+    //
+    // An earlier version gated on "the caller did not project", which sounded
+    // reasonable and was wrong: a blind usability run had an agent project
+    // `_source` almost immediately — a good instinct — which silenced the hint
+    // permanently. It then pulled 372 KB with `_source:["body"]` and never
+    // learned `_passage` existed. Projecting to a whole-file field is exactly
+    // the case that needs the hint most, so size is the only honest signal.
+    //
+    // `_passage` already requested is still a valid reason to stay quiet: that
+    // caller has found the mechanism and is choosing its payload deliberately.
+    let passage_already_requested = body
+        .fields
+        .as_ref()
+        .is_some_and(fields_request_includes_passage);
+    if passage_already_requested {
+        return None;
+    }
+
+    let source_bytes: usize = hits
+        .iter()
+        .filter_map(|h| h.source.as_ref())
+        .map(|s| serde_json::to_string(s).map(|s| s.len()).unwrap_or(0))
+        .sum();
+    if source_bytes <= LARGE_RESPONSE_HINT_THRESHOLD_BYTES {
+        return None;
+    }
+
+    Some(json!({
+        "hints": [{
+            "reason": format!(
+                "this response carried {source_bytes} bytes of `_source` across \
+                 {hit_count} hit(s) — for code, that is usually whole files. To get \
+                 only the matching function or class, add `\"fields\":[\"_passage\"]` \
+                 and drop `_source`.",
+                hit_count = hits.len(),
+            ),
+            "try": {
+                "request": format!("POST /{index}/_search"),
+                "body": {
+                    "query": body.query.clone().unwrap_or_else(|| json!({"match_all": {}})),
+                    // Project the path rather than dropping `_source`: a blind
+                    // run got the passage, could not tell which file it came
+                    // from, and spent 6 MB on follow-ups recovering it. Costs
+                    // ~69 bytes and makes the reply a complete answer.
+                    "_source": ["ax_path", "title"],
+                    "fields": ["_passage"],
+                },
+            },
+        }],
+    }))
+}
+
+/// A short list of existing index names to suggest when `_search` named an
+/// index that doesn't exist — the same spirit as the mapping-error path
+/// that already enumerates valid field names for an unknown one. Prefers
+/// names that share a prefix with, or contain/are contained by, what the
+/// caller typed (the common case: a half-remembered or typo'd dataset
+/// slug); falls back to whatever indices exist at all so the hint is never
+/// empty just because nothing looked textually similar.
+fn nearby_index_names(missing: &str, available: &[String], limit: usize) -> Vec<String> {
+    let missing_lower = missing.to_ascii_lowercase();
+    let mut scored: Vec<(usize, &String)> = available
+        .iter()
+        .map(|name| {
+            let name_lower = name.to_ascii_lowercase();
+            let common_prefix = missing_lower
+                .chars()
+                .zip(name_lower.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let substring_bonus =
+                if name_lower.contains(&missing_lower) || missing_lower.contains(&name_lower) {
+                    100
+                } else {
+                    0
+                };
+            (common_prefix + substring_bonus, name)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    if scored.first().is_none_or(|(score, _)| *score == 0) {
+        let mut all: Vec<String> = available.to_vec();
+        all.sort();
+        all.truncate(limit);
+        return all;
+    }
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, n)| n.clone())
+        .collect()
+}
+
+/// Build the additive `_xerj.hints` hint for a `404 index_not_found_exception`
+/// on `_search`. The ES-parity `reason` ("no such index [name]") is fixed
+/// byte-for-byte by conformance tests and untouched here — this only rides
+/// alongside it with something an agent can actually act on: nearby index
+/// names, and the `ax-*` wildcard `xerj autoindex` manages its data under.
+fn index_not_found_hint(missing: &str, available: &[String]) -> Value {
+    let candidates = nearby_index_names(missing, available, 5);
+    let candidates_line = if candidates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Existing index name(s) close to that: {}. ",
+            candidates.join(", ")
+        )
+    };
+    json!({
+        "hints": [{
+            "reason": format!(
+                "no index matches [{missing}]. {candidates_line}Data indexed by `xerj \
+                 autoindex` lives under indices named `ax-*` — `GET /ax-*/_search` (or any \
+                 `ax-*` pattern) searches all of it without needing the exact name, and \
+                 `GET /_cat/indices?v` lists every index that actually exists.",
+            ),
+            "candidates": candidates,
+        }],
+    })
+}
+
+#[cfg(test)]
+mod search_response_hint_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    /// Index one document whose `content` field alone is comfortably over
+    /// `LARGE_RESPONSE_HINT_THRESHOLD_BYTES`, so an unprojected `_search`
+    /// against it is the exact shape the hint exists for.
+    async fn index_one_big_doc(state: &AppState, index: &str) {
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("content", FieldType::Text));
+        state.engine.create_index(index, schema).unwrap();
+        let idx = state.engine.get_index(index).unwrap();
+        idx.index_document(
+            Some("1".into()),
+            json!({"content": "the quick brown fox jumps over the lazy dog. ".repeat(200)}),
+        )
+        .await
+        .unwrap();
+        idx.refresh().await.unwrap();
+    }
+
+    async fn run_search(router: &axum::Router, index: &str, body: Value) -> (Value, String) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/{index}/_search"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 response body");
+        let json: Value = serde_json::from_str(&text).expect("valid JSON response body");
+        (json, text)
+    }
+
+    #[tokio::test]
+    async fn hint_appears_for_a_large_unprojected_response() {
+        let state = test_state();
+        index_one_big_doc(&state, "hint-large").await;
+        let router = crate::router::build_es_compat_router(state);
+
+        let (json, _) =
+            run_search(&router, "hint-large", json!({"query": {"match_all": {}}})).await;
+        let hints = json["_xerj"]["hints"]
+            .as_array()
+            .expect("hints array present");
+        assert!(!hints.is_empty());
+        assert!(
+            hints[0]["reason"].as_str().unwrap().contains("_passage"),
+            "hint should point at `_passage`: {json}"
+        );
+        assert_eq!(hints[0]["try"]["body"]["fields"], json!(["_passage"]));
+        // Additive only — must not disturb the real ES-compat fields.
+        assert_eq!(json["hits"]["total"]["value"], 1);
+    }
+
+    #[tokio::test]
+    async fn hint_is_absent_when_source_is_disabled() {
+        let state = test_state();
+        index_one_big_doc(&state, "hint-projected").await;
+        let router = crate::router::build_es_compat_router(state);
+
+        let (json, _) = run_search(
+            &router,
+            "hint-projected",
+            json!({"query": {"match_all": {}}, "_source": false}),
+        )
+        .await;
+        assert!(json.get("_xerj").is_none(), "unexpected hint: {json}");
+    }
+
+    /// Regression for a defect a blind usability run exposed: the hint used to
+    /// be suppressed whenever the caller projected `_source` at all. A fresh
+    /// user projected early — a good instinct — and thereby silenced the hint
+    /// for the rest of the session, then pulled 372 KB with `_source:["body"]`
+    /// and never discovered `_passage`. Projecting to a whole-file field is the
+    /// case that needs the hint most, so the trigger is size, not projection.
+    #[tokio::test]
+    async fn hint_still_appears_when_source_is_projected_to_a_large_field() {
+        let state = test_state();
+        index_one_big_doc(&state, "hint-projected-big").await;
+        let router = crate::router::build_es_compat_router(state);
+
+        let (json, _) = run_search(
+            &router,
+            "hint-projected-big",
+            json!({"query": {"match_all": {}}, "_source": ["content"]}),
+        )
+        .await;
+        assert!(
+            json.get("_xerj").is_some(),
+            "a large projected response must still hint: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hint_is_absent_when_passage_already_requested() {
+        let state = test_state();
+        index_one_big_doc(&state, "hint-passage").await;
+        let router = crate::router::build_es_compat_router(state);
+
+        let (json, _) = run_search(
+            &router,
+            "hint-passage",
+            json!({
+                "query": {"match": {"content": "fox"}},
+                "fields": ["_passage"]
+            }),
+        )
+        .await;
+        assert!(json.get("_xerj").is_none(), "unexpected hint: {json}");
+    }
+
+    #[tokio::test]
+    async fn hint_is_absent_for_a_small_response() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("content", FieldType::Text));
+        state.engine.create_index("hint-small", schema).unwrap();
+        let idx = state.engine.get_index("hint-small").unwrap();
+        idx.index_document(Some("1".into()), json!({"content": "tiny"}))
+            .await
+            .unwrap();
+        idx.refresh().await.unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        let (json, _) =
+            run_search(&router, "hint-small", json!({"query": {"match_all": {}}})).await;
+        assert!(json.get("_xerj").is_none(), "unexpected hint: {json}");
+    }
+
+    /// PLACEMENT MATTERS: an agent that truncates long output from the
+    /// bottom never sees a hint trailing a multi-hundred-KB `hits` array.
+    /// Assert on the raw wire bytes, not the parsed `Value` — a
+    /// `serde_json::Value` only preserves the order it was built in
+    /// (workspace-wide `preserve_order`, see xerj-common/Cargo.toml); this
+    /// test is what actually proves that order survives serialisation onto
+    /// the wire.
+    #[tokio::test]
+    async fn hint_key_precedes_hits_in_the_serialised_bytes() {
+        let state = test_state();
+        index_one_big_doc(&state, "hint-order").await;
+        let router = crate::router::build_es_compat_router(state);
+
+        let (json, text) =
+            run_search(&router, "hint-order", json!({"query": {"match_all": {}}})).await;
+        assert!(json.get("_xerj").is_some(), "expected a hint: {json}");
+
+        let hint_pos = text.find("\"_xerj\"").expect("_xerj key in wire bytes");
+        let hits_pos = text.find("\"hits\"").expect("hits key in wire bytes");
+        assert!(
+            hint_pos < hits_pos,
+            "_xerj (byte {hint_pos}) must precede hits (byte {hits_pos}): {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_not_found_hint_suggests_nearby_index_names_and_wildcard() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("content", FieldType::Text));
+        // Shares a long prefix with the typo'd name searched below.
+        state.engine.create_index("ax-reports", schema).unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        let response = router
+            .oneshot(
+                Request::post("/ax-report/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"query": {"match_all": {}}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+        // ES-compat contract (conformance-tested elsewhere) stays byte-exact.
+        assert_eq!(json["error"]["type"], "index_not_found_exception");
+        assert_eq!(json["error"]["reason"], "no such index [ax-report]");
+
+        // The additive hint rides alongside it, unrecognized by ES clients.
+        let hints = json["_xerj"]["hints"]
+            .as_array()
+            .expect("hints array present");
+        assert!(
+            hints[0]["candidates"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("ax-reports")),
+            "expected ax-reports among candidates: {json}"
+        );
+        assert!(hints[0]["reason"].as_str().unwrap().contains("ax-*"));
+    }
+
+    /// A missing index with no live indices at all (an empty/fresh cluster)
+    /// still gets the `ax-*` wildcard guidance — the hint must not assume a
+    /// nonempty candidate list.
+    #[tokio::test]
+    async fn index_not_found_hint_on_an_empty_cluster_still_mentions_the_wildcard() {
+        let state = test_state();
+        let router = crate::router::build_es_compat_router(state);
+
+        let response = router
+            .oneshot(
+                Request::post("/anything/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"query": {"match_all": {}}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["reason"], "no such index [anything]");
+        let hints = json["_xerj"]["hints"]
+            .as_array()
+            .expect("hints array present");
+        assert_eq!(hints[0]["candidates"], json!([]));
+        assert!(hints[0]["reason"].as_str().unwrap().contains("ax-*"));
+    }
+}
+
 /// `POST /{index}/_search`.
 ///
 /// Thin wrapper over [`search_impl`] that installs the Painless fault sink for
@@ -9022,7 +9715,21 @@ async fn search_impl(
                     // Silently skip; behaves like an empty index.
                     continue;
                 }
-                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+                let mut api_err = ApiError::new(xerj_common::XerjError::from(e));
+                // Byte-parity `reason` ("no such index [name]") is fixed by
+                // ES-compat tests and set unconditionally in `error.rs` — this
+                // only adds the additive `_xerj` hint alongside it.
+                if matches!(api_err.inner, xerj_common::XerjError::IndexNotFound { .. }) {
+                    let available: Vec<String> = state
+                        .engine
+                        .list_indices()
+                        .await
+                        .into_iter()
+                        .map(|i| i.name)
+                        .collect();
+                    api_err = api_err.with_hint(index_not_found_hint(idx_name, &available));
+                }
+                return api_err.into_response();
             }
         };
 
@@ -12113,6 +12820,80 @@ async fn search_impl(
         shards_block.failed = shards_failed_count;
     }
 
+    // Computed before `hits` is moved into `response_body` below.
+    // Two independent diagnostics, merged into one `hints` array rather than
+    // one winning: a query can both name a nonexistent field AND return an
+    // oversized payload, and reporting only the first would hide the other.
+    //
+    // The unknown-field check runs whether or not there were hits. A bogus
+    // field inside a `multi_match` that also names a real one is the worst
+    // shape of all — it returns plenty of results, silently searching fewer
+    // fields than asked, so the caller has no signal at all.
+    let mut all_hints: Vec<Value> = Vec::new();
+    if let Some(first) = index_names.first() {
+        if let Ok(idx) = state.engine.get_index(first) {
+            let schema = idx.schema().await;
+            if let Some(h) = unknown_field_hint(&index, &body, &schema) {
+                if let Some(Value::Array(items)) = h.get("hints") {
+                    all_hints.extend(items.iter().cloned());
+                }
+            }
+            // A zero-hit exact filter on a real keyword field is nearly always
+            // a wrong-value guess rather than a genuine absence, and the reply
+            // gives no way to tell which. Sample a bounded slice of documents
+            // and name the values that do exist. Only on zero hits, only for
+            // exact clauses, and capped — this must never cost anything on a
+            // query that worked.
+            if all_hints.is_empty() && hits.is_empty() {
+                let mut clauses = Vec::new();
+                if let Some(q) = body.query.as_ref() {
+                    exact_term_clauses(q, &mut clauses);
+                }
+                for (field, value) in clauses.into_iter().take(2) {
+                    let base = field.split('.').next().unwrap_or(&field).to_string();
+                    let is_keyword = schema.field(&base).is_some_and(|f| {
+                        matches!(f.field_type, xerj_common::types::FieldType::Keyword)
+                    });
+                    if !is_keyword {
+                        continue;
+                    }
+                    let Ok(sample_req) = xerj_query::parse_request(
+                        &json!({"query": {"match_all": {}}, "size": 256}),
+                    ) else {
+                        continue;
+                    };
+                    let Ok(sample) = idx.search(&sample_req).await else {
+                        continue;
+                    };
+                    let mut seen = std::collections::BTreeSet::new();
+                    for hit in &sample.hits {
+                        if let Some(v) = hit.source.get(&base).and_then(Value::as_str) {
+                            seen.insert(v.to_string());
+                        }
+                    }
+                    // High-cardinality fields (ids, paths) would produce a
+                    // useless wall of values; only enumerate a real taxonomy.
+                    if seen.is_empty() || seen.len() > 25 || seen.contains(&value) {
+                        continue;
+                    }
+                    let present: Vec<String> = seen.into_iter().collect();
+                    if let Some(Value::Array(items)) =
+                        unknown_value_hint(&index, &base, &value, &present).get("hints")
+                    {
+                        all_hints.extend(items.iter().cloned());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(h) = search_response_hint(&index, &body, &hits) {
+        if let Some(Value::Array(items)) = h.get("hints") {
+            all_hints.extend(items.iter().cloned());
+        }
+    }
+    let response_hint = (!all_hints.is_empty()).then(|| json!({ "hints": all_hints }));
+
     let mut response_body = if track_total_disabled {
         if want_int_total {
             json!({
@@ -12173,6 +12954,26 @@ async fn search_impl(
                 }
                 *obj = rebuilt;
             }
+        }
+    }
+
+    // Additive, ES-unrecognized field carrying an actionable hint (see
+    // `search_response_hint`). MUST land before `hits` — and as early as
+    // possible overall — because an agent reading this response truncates
+    // long output from the bottom, so a hint trailing a multi-hundred-KB
+    // `hits` array is never seen. `pit_id` (above) is the one key ES itself
+    // places before `took`, so this splices in right after it, ahead of
+    // everything else including `hits`. `serde_json` runs with
+    // `preserve_order` workspace-wide (see xerj-common/Cargo.toml), so the
+    // rebuilt map's insertion order is exactly the wire order.
+    if let Some(hint) = response_hint {
+        if let Some(obj) = response_body.as_object_mut() {
+            let mut rebuilt = serde_json::Map::with_capacity(obj.len() + 1);
+            rebuilt.insert("_xerj".to_string(), hint);
+            for (k, v) in obj.iter() {
+                rebuilt.insert(k.clone(), v.clone());
+            }
+            *obj = rebuilt;
         }
     }
 
