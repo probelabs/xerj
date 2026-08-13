@@ -5762,7 +5762,9 @@ mod map_metadata_tests {
 
     #[test]
     fn unchanged_resume_keeps_durable_assignment_aware_dataset_bytes() {
-        let _guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let state_dir = tempfile::tempdir().unwrap();
         let plan = Plan {
             files: HashMap::from([

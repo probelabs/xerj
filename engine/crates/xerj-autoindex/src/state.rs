@@ -1644,7 +1644,9 @@ mod sync_journal_tests {
 
     #[test]
     fn sync_begin_is_pending_and_never_promotes_the_committed_manifest() {
-        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal = journal_with_plan(dir.path());
         let desired = pending(&journal);
@@ -1690,7 +1692,9 @@ mod sync_journal_tests {
 
     #[test]
     fn replay_rejects_sync_begin_followed_by_legacy_plan_without_changing_authority() {
-        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal = journal_with_plan(dir.path());
         journal.sync_begin(&pending(&journal)).unwrap();
@@ -1730,7 +1734,9 @@ mod sync_journal_tests {
 
     #[test]
     fn only_validated_all_committed_sync_advances_authority_after_restart() {
-        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal = journal_with_plan(dir.path());
         journal.sync_begin(&pending(&journal)).unwrap();
@@ -1775,7 +1781,9 @@ mod sync_journal_tests {
 
     #[test]
     fn digest_bound_abort_discards_pending_without_advancing_authority() {
-        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal = journal_with_plan(dir.path());
         journal.sync_begin(&pending(&journal)).unwrap();
@@ -1790,7 +1798,9 @@ mod sync_journal_tests {
 
     #[test]
     fn unknown_sync_namespace_record_fails_closed_but_preflight_exposes_pending() {
-        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal = journal_with_plan(dir.path());
         journal.sync_begin(&pending(&journal)).unwrap();
@@ -1907,7 +1917,9 @@ mod sync_journal_tests {
 
     #[test]
     fn sync_append_and_fsync_failures_roll_back_without_phantom_pending_state() {
-        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         for boundary in [1, 2, 3] {
             let dir = tempfile::tempdir().unwrap();
             let mut journal = journal_with_plan(dir.path());
@@ -1929,7 +1941,9 @@ mod sync_journal_tests {
 
     #[test]
     fn every_later_sync_record_rolls_back_append_partial_and_fsync_failures() {
-        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = SYNC_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         for stage in ["operation", "validated", "commit", "abort"] {
             for boundary in [1, 2, 3] {
                 let dir = tempfile::tempdir().unwrap();
@@ -2005,7 +2019,9 @@ mod compatibility_tests {
         // injection meant for the armer (observed live 2026-07-30 as a
         // parallel-run flake + poison cascade). Every file_done-reaching
         // test holds this lock, armer or not.
-        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
             Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
@@ -2059,7 +2075,9 @@ mod compatibility_tests {
     #[test]
     fn torn_file_done_tail_is_truncated_before_repair_commit_is_appended() {
         // Reaches file_done → must hold the failpoint lock (see above).
-        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
             Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
@@ -2158,7 +2176,9 @@ mod compatibility_tests {
     #[test]
     fn stale_generation_completion_cannot_clear_newer_pending_replacement() {
         // Reaches file_done → must hold the failpoint lock (see above).
-        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
             Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();
@@ -2181,7 +2201,9 @@ mod compatibility_tests {
 
     #[test]
     fn append_and_fsync_commit_failures_leave_pending_and_replayable() {
-        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         for boundary in [1, 2, 3] {
             let dir = tempfile::tempdir().unwrap();
             let mut journal =
@@ -2218,7 +2240,9 @@ mod compatibility_tests {
 
     #[test]
     fn partial_commit_is_rolled_back_before_another_worker_appends() {
-        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let _guard = FILE_DONE_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
             Journal::open(dir.path(), "root", "http://engine", "ax", 300, false).unwrap();

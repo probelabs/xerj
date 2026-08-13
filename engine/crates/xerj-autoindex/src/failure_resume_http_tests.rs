@@ -658,9 +658,15 @@ fn assert_unsupported_delta_without_remote_mutation(
 /// between them is visible in the output rather than only in the index.
 #[test]
 fn the_legacy_terminal_line_and_run_document_report_code_coverage() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -714,8 +720,12 @@ fn the_legacy_terminal_line_and_run_document_report_code_coverage() {
 
 #[test]
 fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("first.csv"), "id,value\n1,first\n").unwrap();
@@ -770,8 +780,12 @@ fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
 
 #[test]
 fn completed_plan_rejects_vanished_content_group_before_remote_mutation() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("first.csv"), "id,value\n1,first\n").unwrap();
@@ -786,8 +800,12 @@ fn completed_plan_rejects_vanished_content_group_before_remote_mutation() {
 
 #[test]
 fn completed_plan_rejects_mixed_membership_delta_in_stable_order() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("b-old.csv"), "id,value\n1,b\n").unwrap();
@@ -836,8 +854,12 @@ fn completed_plan_rejects_mixed_membership_delta_in_stable_order() {
 /// vanished group — the path is still there, and the pipeline republishes it.
 #[test]
 fn fresh_absorbs_an_edited_file_instead_of_calling_it_a_removal() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("notes.csv"), "id,value\n1,before\n").unwrap();
@@ -885,8 +907,12 @@ fn fresh_absorbs_an_edited_file_instead_of_calling_it_a_removal() {
 /// one.
 #[test]
 fn an_ordinary_rerun_replaces_an_edited_file_without_stranding_records() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("notes.csv"), "id,value\n1,before\n").unwrap();
@@ -910,8 +936,12 @@ fn an_ordinary_rerun_replaces_an_edited_file_without_stranding_records() {
 /// plan), then `--fresh` to absorb both.
 #[test]
 fn fresh_absorbs_an_addition_and_an_edit_after_a_reported_rerun() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("first.csv"), "id,value\n1,before\n").unwrap();
@@ -951,8 +981,12 @@ fn fresh_absorbs_an_addition_and_an_edit_after_a_reported_rerun() {
 
 #[test]
 fn fresh_cannot_erase_the_plan_and_bypass_the_removal_gate() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("old.csv"), "id,value\n1,old\n").unwrap();
@@ -968,8 +1002,12 @@ fn fresh_cannot_erase_the_plan_and_bypass_the_removal_gate() {
 
 #[test]
 fn deleting_one_path_of_a_duplicate_pair_is_not_a_removed_content_group() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let bytes = "id,value\n1,same\n";
@@ -999,8 +1037,12 @@ fn deleting_one_path_of_a_duplicate_pair_is_not_a_removed_content_group() {
 
 #[test]
 fn unchanged_planned_junk_is_not_reported_as_added_content() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("rows.csv"), "id,value\n1,kept\n").unwrap();
@@ -1021,8 +1063,12 @@ fn unchanged_planned_junk_is_not_reported_as_added_content() {
 
 #[test]
 fn deleted_planned_junk_is_swept_rather_than_refused() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("rows.csv"), "id,value\n1,kept\n").unwrap();
@@ -1066,8 +1112,12 @@ fn deleted_planned_junk_is_swept_rather_than_refused() {
 
 #[test]
 fn completed_plan_rejects_empty_current_folder_before_remote_mutation() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("only.csv"), "id,value\n1,only\n").unwrap();
@@ -1085,8 +1135,12 @@ fn completed_plan_rejects_empty_current_folder_before_remote_mutation() {
 
 #[test]
 fn semantic_resume_rejects_embedding_identity_drift_before_another_bulk() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -1123,8 +1177,12 @@ fn semantic_resume_rejects_embedding_identity_drift_before_another_bulk() {
 /// path — `brain` always runs graph-enabled, which never commits a generation.
 #[test]
 fn fresh_restarts_a_completed_graph_enabled_journal_the_way_brain_self_heal_needs() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -1155,12 +1213,16 @@ fn fresh_restarts_a_completed_graph_enabled_journal_the_way_brain_self_heal_need
 
 #[test]
 fn fresh_publication_skips_delete_and_noop_resume_does_not_append_plan() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // run_index reaches Journal::file_done; the file_done IO failpoint is
     // a global one-shot, so every file_done-reaching test must hold its
     // lock (armer or not) or it can steal an armed injection. Acquired
     // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -1241,8 +1303,12 @@ fn fresh_publication_skips_delete_and_noop_resume_does_not_append_plan() {
 
 #[test]
 fn changed_source_replaces_durable_dataset_bytes_across_reopen() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let path = corpus.path().join("records.csv");
@@ -1292,8 +1358,12 @@ fn changed_source_replaces_durable_dataset_bytes_across_reopen() {
 
 #[test]
 fn deleted_path_bytes_remain_while_its_documents_remain_live() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let removed = corpus.path().join("removed.csv");
@@ -1343,8 +1413,12 @@ fn deleted_path_bytes_remain_while_its_documents_remain_live() {
 
 #[test]
 fn product_path_counts_shared_source_once_per_distinct_dataset() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let path = corpus.path().join("finance.sqlite");
@@ -1395,8 +1469,12 @@ fn product_path_counts_shared_source_once_per_distinct_dataset() {
 
 #[test]
 fn existing_catalog_is_upgraded_before_new_run_metadata_is_written() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("records.csv"), "id,value\n0,one\n").unwrap();
@@ -1434,8 +1512,12 @@ fn existing_catalog_is_upgraded_before_new_run_metadata_is_written() {
 
 #[test]
 fn unchanged_resume_keeps_durable_dataset_junk_and_coercion_notes() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("records.csv"), "id,value\n0,one\n").unwrap();
@@ -1474,12 +1556,16 @@ fn unchanged_resume_keeps_durable_dataset_junk_and_coercion_notes() {
 
 #[test]
 fn legacy_plan_without_completion_cleans_possible_partial_visibility() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // run_index reaches Journal::file_done; the file_done IO failpoint is
     // a global one-shot, so every file_done-reaching test must hold its
     // lock (armer or not) or it can steal an armed injection. Acquired
     // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let first_state = tempfile::tempdir().unwrap();
     let legacy_state = tempfile::tempdir().unwrap();
@@ -1551,12 +1637,16 @@ fn legacy_plan_without_completion_cleans_possible_partial_visibility() {
 
 #[test]
 fn legacy_key_collision_fails_before_visibility_with_scoped_guidance() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // run_index reaches Journal::file_done; the file_done IO failpoint is
     // a global one-shot, so every file_done-reaching test must hold its
     // lock (armer or not) or it can steal an armed injection. Acquired
     // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let mut owner = vec![b'x'; 65_537];
@@ -1622,12 +1712,16 @@ fn legacy_key_collision_fails_before_visibility_with_scoped_guidance() {
 
 #[test]
 fn existing_completion_is_invalidated_and_partial_visibility_is_deleted_on_resume() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // run_index reaches Journal::file_done; the file_done IO failpoint is
     // a global one-shot, so every file_done-reaching test must hold its
     // lock (armer or not) or it can steal an armed injection. Acquired
     // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // 1: failure immediately after delete; 2: one complete 5,000-doc bulk
     // then a partial final bulk; 3: two complete bulks then a partial final
     // bulk immediately before the file_done journal append.
@@ -1743,12 +1837,16 @@ fn existing_completion_is_invalidated_and_partial_visibility_is_deleted_on_resum
 
 #[test]
 fn resume_repairs_kills_after_plan_delete_and_final_bulk_before_file_done() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // run_index reaches Journal::file_done; the file_done IO failpoint is
     // a global one-shot, so every file_done-reaching test must hold its
     // lock (armer or not) or it can steal an armed injection. Acquired
     // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     for boundary in [1u8, 2, 4] {
         let rows = 6_001usize;
         let corpus = tempfile::tempdir().unwrap();
@@ -1808,8 +1906,12 @@ fn resume_repairs_kills_after_plan_delete_and_final_bulk_before_file_done() {
 
 #[test]
 fn file_done_append_and_fsync_failures_are_fatal_and_resume_repairs() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     for io_boundary in [1u8, 2, 3] {
         let corpus = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
@@ -1870,12 +1972,16 @@ fn file_done_append_and_fsync_failures_are_fatal_and_resume_repairs() {
 
 #[test]
 fn pending_generation_b_is_superseded_when_source_changes_to_c() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // run_index reaches Journal::file_done; the file_done IO failpoint is
     // a global one-shot, so every file_done-reaching test must hold its
     // lock (armer or not) or it can steal an armed injection. Acquired
     // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let path = corpus.path().join("records.csv");
@@ -1948,12 +2054,16 @@ fn pending_generation_b_is_superseded_when_source_changes_to_c() {
 
 #[test]
 fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // run_index reaches Journal::file_done; the file_done IO failpoint is
     // a global one-shot, so every file_done-reaching test must hold its
     // lock (armer or not) or it can steal an armed injection. Acquired
     // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let original = "id,value\n0,original\n1,original\n";
@@ -2029,8 +2139,12 @@ fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
 
 #[test]
 fn an_added_then_deleted_file_leaves_no_immortal_catalog_entry() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -2115,12 +2229,16 @@ fn an_added_then_deleted_file_leaves_no_immortal_catalog_entry() {
 
 #[test]
 fn deleting_an_entire_duplicate_group_strands_no_pending_replacement() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // run_index reaches Journal::file_done; the file_done IO failpoint is
     // a global one-shot, so every file_done-reaching test must hold its
     // lock (armer or not) or it can steal an armed injection. Acquired
     // after FAILPOINT_TEST_LOCK everywhere — one consistent order.
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("dup-a.csv"), "id,value\n0,dup\n1,dup\n").unwrap();
@@ -2165,8 +2283,12 @@ fn deleting_an_entire_duplicate_group_strands_no_pending_replacement() {
 
 #[test]
 fn partial_file_done_is_rolled_back_before_another_worker_commits() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n0,a-old\n1,a-old\n").unwrap();
@@ -2228,8 +2350,12 @@ fn partial_file_done_is_rolled_back_before_another_worker_commits() {
 /// file left pending, and the rerun after the block lifts must really index.
 #[test]
 fn write_block_rejections_are_backend_fatal_and_the_file_stays_pending() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -2272,8 +2398,12 @@ fn write_block_rejections_are_backend_fatal_and_the_file_stays_pending() {
 /// `bulk_errors`' first-five sample cannot.
 #[test]
 fn backend_rejected_records_abort_the_run_before_any_map_is_written() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -2324,8 +2454,12 @@ fn backend_rejected_records_abort_the_run_before_any_map_is_written() {
 /// recover.
 #[test]
 fn zero_live_documents_after_journaled_records_fails_the_run() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -2361,8 +2495,12 @@ fn zero_live_documents_after_journaled_records_fails_the_run() {
 ///      asserted by `quiet_runs_emit_no_progress_stream_at_all` below.)
 #[test]
 fn a_run_reports_progress_through_every_phase_and_closes_the_stream() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     // Distinct bytes per file: byte-identical files collapse into one
@@ -2462,8 +2600,12 @@ fn a_run_reports_progress_through_every_phase_and_closes_the_stream() {
 /// here can spam a caller that asked for none.
 #[test]
 fn quiet_runs_emit_no_progress_stream_at_all() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("rows.csv"), "id,value\n0,alpha\n").unwrap();
@@ -2508,8 +2650,12 @@ fn quiet_runs_emit_no_progress_stream_at_all() {
 /// thread than it has is requested.
 #[test]
 fn the_resource_plan_is_announced_on_the_progress_surface_with_the_width_it_got() {
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -2571,7 +2717,9 @@ fn the_resource_plan_is_announced_on_the_progress_surface_with_the_width_it_got(
 fn fresh_pdf_is_parsed_once_and_failed_publication_retry_reparses_once() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     inject_pdf_spool_capacity(state_dir.path());
@@ -2627,7 +2775,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 fn refused_pdf_spool_reparses_and_reports_fallback_without_weakening_publication() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let tools = tempfile::tempdir().unwrap();
@@ -2698,7 +2848,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 fn refused_spool_does_not_pay_a_second_phase_a_source_hash() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let tools = tempfile::tempdir().unwrap();
@@ -2779,7 +2931,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 fn source_changed_during_phase_a_discards_the_artifact_and_names_the_reason() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     inject_pdf_spool_capacity(state_dir.path());
@@ -2863,7 +3017,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     inject_pdf_spool_capacity(state_dir.path());
@@ -2925,7 +3081,9 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
 fn multi_pdf_run_reuses_every_artifact_and_reports_exact_success_counters() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     inject_pdf_spool_capacity(state_dir.path());
@@ -2999,7 +3157,9 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
 fn corrupted_pdf_replay_reparses_without_blaming_the_source_or_backend() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     inject_pdf_spool_capacity(state_dir.path());
