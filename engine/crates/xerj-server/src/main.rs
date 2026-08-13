@@ -247,6 +247,10 @@ fn help_text() -> String {
              xerj autoindex  map             print the discovered data map\n\
              xerj brain      <folder>        one command: index a folder into a running, browsable\n\
                                              second brain in your browser (see xerj brain --help)\n\
+             xerj mcp        [opts]          Model Context Protocol stdio server: exposes 10 tools\n\
+                                             (search, semantic, vector, hybrid, memory, second-brain)\n\
+                                             to any MCP client. Proxies to a node you already started\n\
+                                             — set XERJ_URL or --url (see xerj mcp --help)\n\
          \n\
          ENVIRONMENT:\n\
              XERJ_LOG         Log level filter (default: info)\n\
@@ -1573,6 +1577,30 @@ fn main() -> Result<()> {
     // Dispatch before creating Tokio's pool so each PDF worker stays small.
     if matches!(std::env::args().nth(1).as_deref(), Some("__extract-pdf")) {
         std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
+    }
+
+    // `xerj mcp` — MCP stdio server (newline-delimited JSON-RPC on
+    // stdin/stdout), proxying to an already-running XERJ node.
+    //
+    // Dispatched HERE, ahead of the production runtime, for two reasons:
+    //
+    //  1. Size. A stdio proxy that awaits one line at a time does not need
+    //     8×cores worker threads at 4 MiB of stack each; two threads is the
+    //     whole shape of the work. Same reasoning as the PDF worker above.
+    //  2. stdout purity. MCP's stdio transport reserves stdout exclusively for
+    //     the JSON-RPC stream — one stray banner line and the host's parser
+    //     desynchronises. Everything below this point (`parse_args`'s
+    //     --help/--version fast paths, the startup banner, the console setup
+    //     link) writes to stdout; nothing above it does. `xerj-mcp` logs to
+    //     stderr only, by construction.
+    //
+    // This is what makes the MCP server obtainable: before it, `xerj-mcp` was
+    // a workspace crate that CI built and no release shipped, so the only way
+    // to get it was to clone the repo and compile. Now `curl … | sh` is enough.
+    if matches!(std::env::args().nth(1).as_deref(), Some("mcp")) {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let rt = build_runtime(2)?;
+        return rt.block_on(xerj_mcp::run(&args));
     }
     // Cores from the resource policy, so `XERJ_NUM_CPUS` and a container CPU
     // quota reach the async runtime the same way they reach every pool (#240).

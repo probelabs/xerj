@@ -92,12 +92,60 @@ verbatim samples and the failure modes, is under "Running an index for a human"
 in [landing/llms.txt](./landing/llms.txt) (published at
 https://xerj.org/llms.txt).
 
+## Talking to XERJ over MCP
+
+If you cannot run shell commands, you do not need to. XERJ ships a Model
+Context Protocol server **inside the one binary the installer puts on disk** —
+`xerj mcp` — so the whole install is still `curl -fsSL https://xerj.org/get | sh`.
+It speaks MCP over stdio (newline-delimited JSON-RPC 2.0) and proxies to a node
+that is already running; it does not start one.
+
+```json
+{
+  "mcpServers": {
+    "xerj": {
+      "command": "/home/you/.local/bin/xerj",
+      "args": ["mcp"],
+      "env": { "XERJ_URL": "http://localhost:9200" }
+    }
+  }
+}
+```
+
+Use an absolute path (`command -v xerj`): MCP hosts started from a desktop icon
+do not inherit a shell `PATH`. Add `"XERJ_AUTH": "ApiKey <key>"` when the node
+is not running `--insecure` — the key is `<data-dir>/admin.key`. `--url` and
+`--auth` flags override the two environment variables.
+
+Ten tools: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`,
+`xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall`,
+`xerj_brain_overview`, `xerj_brain_ego`, `xerj_brain_link`, `xerj_brain_unlink`.
+Each is a *thin proxy*: it builds exactly the request the ES-compatible surface
+already accepts and hands back whatever the engine returned, errors and refusals
+verbatim. It adds no capability of its own — so anything you can do over MCP you
+can also do with `curl`, and vice versa.
+
+Two honesty notes that bind how you describe results: `xerj_semantic_search`
+embeds server-side with the **lexical feature-hashing** embedder unless the node
+was started with `--embed-mode neural`, and the `xerj_brain_*` tools work a
+deterministic link index, not a graph database. Both are stated in the tool
+descriptions themselves; do not restate them more strongly than they are.
+
+The published schemas are `landing/docs/agents/schemas/mcp-tools.json`
+(https://xerj.org/docs/agents/schemas/mcp-tools.json). They are **generated**
+from a live `tools/list`, never hand-written — `scripts/mcp-schema-check.sh`
+regenerates (`--write`) and gates (default) them, and
+`engine/crates/xerj-mcp/tests/published_schema_drift.rs` fails the build if they
+diverge from what the server serves. That guard exists because the file once
+advertised six tools while the binary served ten.
+
 ## Where to look
 
 | You want | Go to |
 |---|---|
 | The product story & design rationale | [README.md](./README.md), [docs/WHY_XERJ.md](./docs/WHY_XERJ.md) |
 | Machine-readable capability reference + honest caveats | https://xerj.org/llms.txt · https://xerj.org/llms-full.txt |
+| MCP tool schemas (generated from the server, drift-gated) | [landing/docs/agents/schemas/mcp-tools.json](./landing/docs/agents/schemas/mcp-tools.json) · source: [engine/crates/xerj-mcp/](./engine/crates/xerj-mcp/) |
 | Verified how-to guides | [docs/recipes/](./docs/recipes/) (each live-validated before publication) |
 | The flagship feature's evaluation | [demo/usecases/autoindex/](./demo/usecases/autoindex/) (80/81 adversarial ground-truth exam, agent-vs-grep scorecard, scale report) |
 | Benchmark methodology & per-cell results | [demo/playbooks/](./demo/playbooks/) |
