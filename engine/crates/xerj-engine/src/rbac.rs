@@ -163,6 +163,28 @@ fn es_index_privilege(name: &str) -> &'static [Privilege] {
     }
 }
 
+/// Map one cluster-privilege name onto the cluster privileges this crate
+/// enforces — currently only [`Privilege::AuditRead`] (issue #329).
+///
+/// Everything else in a `cluster` array still grants nothing, for the reason
+/// [`roles_from_role_descriptors`] gives: honouring a privilege nothing checks
+/// would be theatre.
+///
+/// **`all` is deliberately not mapped here**, tempting as it is. `cluster:
+/// ["all"]` is the blanket grant operators already write next to their index
+/// grants, and honouring it would silently hand the audit log — every tenant's
+/// activity, every security event — to keys that were minted before the
+/// privilege was enforced and whose owners never asked for it. A fix for a
+/// privilege boundary must not widen a different one on upgrade. Reading the
+/// audit log is opt-in, by the name that never meant anything until now.
+fn es_cluster_privilege(name: &str) -> &'static [Privilege] {
+    use Privilege::*;
+    match name {
+        "read_audit" => &[AuditRead],
+        _ => &[],
+    }
+}
+
 /// Parse an Elasticsearch-shaped `role_descriptors` object — exactly what
 /// `POST /_security/api_key` already accepts on the wire — into the roles this
 /// crate enforces:
@@ -178,8 +200,10 @@ fn es_index_privilege(name: &str) -> &'static [Privilege] {
 /// list several entries with different privileges.
 ///
 /// Deliberate omissions, all of which fail closed (they grant nothing):
-/// - `cluster` privileges are ignored — xerj has no cluster-privilege
-///   enforcement, so honouring them would be theatre.
+/// - `cluster` privileges are ignored **except** `read_audit`, which grants
+///   [`Privilege::AuditRead`] and nothing else (issue #329). Every other cluster
+///   name — `all` included — is still dropped; see [`es_cluster_privilege`] for
+///   why the blanket grant is not honoured.
 /// - `field_security` / `query` (FLS/DLS) are ignored; a descriptor that only
 ///   makes sense with FLS/DLS therefore over-grants at the field level within
 ///   an index it was already granted. Callers that need FLS must not rely on
@@ -192,6 +216,29 @@ pub fn roles_from_role_descriptors(descriptors: &Value) -> Vec<Role> {
     };
     let mut roles = Vec::new();
     for (descriptor_name, descriptor) in map {
+        // Cluster privileges, of which exactly one name is honoured (#329).
+        // A `cluster` array is otherwise still ignored — see the doc comment —
+        // but `read_audit` has to be grantable or the gate on `/_audit/*` would
+        // mean "superuser only", and the enterprise ask is precisely to hand an
+        // auditor a credential that reads the audit log and nothing else.
+        // Emitted as a role over `*` because [`Privilege::AuditRead`] is not
+        // index-scoped: the pattern is irrelevant to the only check that reads
+        // it (`xerj_api::authz::holds_audit_read`), and the privilege set
+        // contains no index privilege, so this grants no access to any data.
+        if let Some(cluster) = descriptor.get("cluster").and_then(|v| v.as_array()) {
+            let privileges: HashSet<Privilege> = cluster
+                .iter()
+                .filter_map(|v| v.as_str())
+                .flat_map(|p| es_cluster_privilege(p).iter().copied())
+                .collect();
+            if !privileges.is_empty() {
+                roles.push(Role::new(
+                    format!("{descriptor_name}[cluster]"),
+                    privileges,
+                    vec!["*".to_string()],
+                ));
+            }
+        }
         let Some(entries) = descriptor.get("indices").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -445,6 +492,49 @@ mod tests {
                 "must grant nothing: {d}"
             );
         }
+    }
+
+    /// `cluster: ["read_audit"]` is the one cluster name that grants anything
+    /// (issue #329): it yields [`Privilege::AuditRead`] and **no** index
+    /// privilege, so an auditor credential reads the log and no data.
+    #[test]
+    fn read_audit_is_the_one_grantable_cluster_privilege() {
+        let roles = roles_from_role_descriptors(&serde_json::json!({
+            "a": { "cluster": ["read_audit"], "indices": [] }
+        }));
+        assert_eq!(roles.len(), 1, "one cluster role: {roles:?}");
+        assert_eq!(
+            roles[0].privileges,
+            [Privilege::AuditRead].into_iter().collect::<HashSet<_>>()
+        );
+        // The `*` pattern it carries is not an index grant — the privilege set
+        // holds nothing index-scoped, so every index check still fails.
+        for p in [
+            Privilege::ReadIndex,
+            Privilege::WriteIndex,
+            Privilege::AdminIndex,
+        ] {
+            assert!(!roles[0].allows("payroll", p), "{p:?} must not be granted");
+            assert!(!roles[0].allows(".xerj-memory-alice-edges", p));
+        }
+    }
+
+    /// It composes with index grants instead of replacing them.
+    #[test]
+    fn read_audit_alongside_index_grants_keeps_both() {
+        let roles = roles_from_role_descriptors(&serde_json::json!({
+            "a": {
+                "cluster": ["read_audit"],
+                "indices": [{ "names": ["logs-*"], "privileges": ["read"] }]
+            }
+        }));
+        assert_eq!(roles.len(), 2, "cluster role + index role: {roles:?}");
+        assert!(roles
+            .iter()
+            .any(|r| r.privileges.contains(&Privilege::AuditRead)));
+        assert!(roles
+            .iter()
+            .any(|r| r.allows("logs-prod", Privilege::ReadIndex)));
     }
 
     #[test]
