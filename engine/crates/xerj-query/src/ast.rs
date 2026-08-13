@@ -1011,6 +1011,36 @@ pub struct SearchRequest {
     /// indices (wrong page windows + `max_score: null`).
     #[serde(skip)]
     pub leaf_ts_field: Option<String>,
+
+    /// INTERNAL (never on the wire — `serde(skip)`): whether, and how, to
+    /// measure the `_source` payload this request did NOT have to send.
+    ///
+    /// The ES-compat `_search` handler sets [`SavingsMode::Sampled`] unless
+    /// `?savings=` says otherwise, so the statistic is on by default for
+    /// user-facing searches. The AST default is [`SavingsMode::Off`] so that
+    /// the many internal engine searches (reindex, update-by-query, terms
+    /// lookups, suggesters) never pay for a number nobody will read.
+    #[serde(skip)]
+    pub savings: SavingsMode,
+}
+
+/// Whether — and how precisely — to measure withheld `_source` bytes.
+///
+/// Measurement is not free: it has to look at the values being discarded.
+/// `Sampled` bounds that work by extrapolating long arrays from a sample,
+/// which is what makes the statistic affordable on every search; `Exact`
+/// serializes every omitted byte for callers who need the precise figure.
+/// The choice is reported on the wire as `_savings.measured`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SavingsMode {
+    /// Do not measure. The engine's internal searches, and any caller that
+    /// passes `?savings=false`.
+    #[default]
+    Off,
+    /// Bounded, stratified sampling of long arrays; everything else exact.
+    Sampled,
+    /// Serialize and count every omitted byte.
+    Exact,
 }
 
 fn default_query() -> QueryNode {
@@ -1042,6 +1072,7 @@ impl Default for SearchRequest {
             rescore: Vec::new(),
             min_score: None,
             leaf_ts_field: None,
+            savings: SavingsMode::Off,
         }
     }
 }

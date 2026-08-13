@@ -63,8 +63,8 @@ pub mod sort;
 
 // AST types
 pub use ast::{
-    BoolOperator, FusionStrategy, MinShouldMatch, MultiMatchType, QueryNode, SearchRequest,
-    SourceFilter, WeightedQuery,
+    BoolOperator, FusionStrategy, MinShouldMatch, MultiMatchType, QueryNode, SavingsMode,
+    SearchRequest, SourceFilter, WeightedQuery,
 };
 
 // Error types

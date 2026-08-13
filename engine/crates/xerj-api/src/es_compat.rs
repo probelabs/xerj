@@ -6678,6 +6678,28 @@ pub struct EsSearchQueryParams {
     /// URL parameter or a body field; whichever is set wins (body
     /// takes precedence when both are provided).
     pub explain: Option<String>,
+    /// xerj extension, `?savings=`: report the `_source` payload this
+    /// response did NOT have to send, relative to the response the caller
+    /// would have received with no `_source` clause at all.
+    ///
+    /// * absent / `true` / `sampled` — **the default**: long arrays are
+    ///   extrapolated from a bounded sample, everything else counted exactly,
+    ///   and the block says `"measured": "sampled"`.
+    /// * `exact` — serialize and count every omitted byte.
+    /// * `false` / `off` / `0` — do not measure, emit nothing.
+    pub savings: Option<String>,
+}
+
+/// Parse `?savings=` into a measurement mode. Anything unrecognised falls
+/// back to the default rather than 400-ing: this is a reporting extension,
+/// and a typo in it must never fail a search.
+fn parse_savings_mode(param: Option<&str>) -> xerj_query::ast::SavingsMode {
+    use xerj_query::ast::SavingsMode;
+    match param {
+        Some("false") | Some("off") | Some("0") | Some("none") => SavingsMode::Off,
+        Some("exact") => SavingsMode::Exact,
+        _ => SavingsMode::Sampled,
+    }
 }
 
 pub async fn search_all(
@@ -9678,6 +9700,9 @@ async fn search_impl(
             // (see the injection block above) — internal field, never on
             // the wire.
             r.leaf_ts_field = implicit_leaf_ts;
+            // xerj extension `?savings=` — `_source` savings measurement, on
+            // by default. Internal field, never echoed on the wire.
+            r.savings = parse_savings_mode(params.savings.as_deref());
             r
         }
         Err(e) => return ApiError::new(e).into_response(),
@@ -9685,6 +9710,14 @@ async fn search_impl(
 
     // Execute search on each index and merge results.
     let mut merged_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new(); // (index_name, hit)
+
+    // Per-(index, doc id) omitted bytes, re-summed after the merge below over
+    // the hits this response ACTUALLY emits. The engine measured a per-index
+    // page; multi-index merging, PIT filtering, kNN capping and collapse can
+    // all drop hits from it afterwards, and counting a dropped hit's bytes
+    // would inflate the number.
+    let mut savings_by_hit: HashMap<(String, String), u64> = HashMap::new();
+    let mut savings_record: Option<xerj_query::executor::PayloadSavings> = None;
     let mut total_count: u64 = 0;
     let mut total_relation = "eq".to_string();
     let mut merged_aggs: Option<Value> = None;
@@ -9889,6 +9922,12 @@ async fn search_impl(
                             }
                         }
                     }
+                }
+                if let Some(savings) = result.savings {
+                    for (id, bytes) in &savings.per_hit {
+                        savings_by_hit.insert((idx_name.to_string(), id.clone()), *bytes);
+                    }
+                    savings_record.get_or_insert(savings);
                 }
                 for hit in result.hits {
                     merged_hits.push((idx_name.to_string(), hit));
@@ -10405,6 +10444,33 @@ async fn search_impl(
             }
         }
     }
+
+    // ── `_savings` (xerj extension, `?savings=`) ──────────────────────────
+    // Summed over the hits that survived every post-merge filter, so the
+    // number describes THIS response and nothing else.
+    //
+    // Only this layer knows whether `_source` really was suppressed on the
+    // wire: suppression keys off the literal body value, so `_source: "false"`
+    // as a *string* still emits `_source` and the engine's claim would be
+    // wrong. Requests that re-materialise values through `fields` are not
+    // refused — they are netted at the emission site below, once the `fields`
+    // objects actually exist.
+    let source_withheld_claim_ok = !matches!(
+        search_req.source,
+        xerj_query::ast::SourceFilter::Enabled(false)
+    ) || matches!(body.source, Some(Value::Bool(false)));
+    let savings_page_bytes: u64 = merged_hits
+        .iter()
+        .filter_map(|(idx_name, h)| savings_by_hit.get(&(idx_name.clone(), h.id.clone())))
+        .sum();
+    let savings_claim = savings_record
+        .as_ref()
+        // Defense in depth against a stale cache entry: the engine's query
+        // cache keys on the mode, but a record must never reach a caller who
+        // asked for no measurement at all.
+        .filter(|_| !matches!(search_req.savings, xerj_query::ast::SavingsMode::Off))
+        .filter(|_| source_withheld_claim_ok)
+        .map(|record| (record, savings_page_bytes));
 
     let took_ms = started.elapsed().as_millis() as u64;
     // RC4 W4 item 2: record the index-agnostic side of the completed search —
@@ -13095,6 +13161,41 @@ async fn search_impl(
     }
     if let Some(suggest) = suggest_result {
         response_body["suggest"] = suggest;
+    }
+
+    // `_savings`. Emitted only when bytes were really withheld AND the saving
+    // is worth more than the block costs to print (the floor lives in
+    // `rescoped`).
+    if let Some((record, mut bytes)) = savings_claim {
+        if record.substitutable {
+            // `_source: false` combined with `fields` / `docvalue_fields` /
+            // `stored_fields` / `script_fields` hands some of those values
+            // straight back — they all land in each hit's `fields` object,
+            // which is now built, so subtract exactly what went out.
+            //
+            // The previous revision refused to claim anything at all here,
+            // which meant `_source: false` + `fields: [...]` — the strictly
+            // better-targeted query — silently lost its block while the
+            // sloppier `_source: false` alone kept one. Netting instruments
+            // the better habit instead of penalising it.
+            let substitutes: u64 = response_body["hits"]["hits"]
+                .as_array()
+                .map(|hits| {
+                    hits.iter()
+                        .filter_map(|hit| hit.get("fields"))
+                        .map(|fields| {
+                            serde_json::to_vec(fields)
+                                .map(|v| v.len() as u64)
+                                .unwrap_or(0)
+                        })
+                        .sum()
+                })
+                .unwrap_or(0);
+            bytes = bytes.saturating_sub(substitutes);
+        }
+        if let Some(savings) = record.rescoped(bytes) {
+            response_body["_savings"] = savings;
+        }
     }
 
     // Add profile data if requested.

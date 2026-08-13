@@ -143,6 +143,139 @@ impl Explanation {
     }
 }
 
+/// What this response did **not** have to send, because of a choice **the
+/// caller made** on **this** request.
+///
+/// The honesty invariants this type exists to enforce (see
+/// `SAVINGS-STATS-REPORT.md` for the full rationale):
+///
+/// * **The baseline is the response the caller would otherwise have
+///   received** — same query, same page, no `_source` clause. It is NOT a
+///   response containing raw embedding vectors: this engine has not returned
+///   those by default since #309, so measuring against them would credit the
+///   caller for the engine's own default and overstate the realised saving by
+///   ~9x. A blind UX dogfood caught exactly that; the counterfactual is now
+///   the only one a reader would recognise.
+/// * `bytes` counts only values that were materialised on this request and
+///   then left out of this response. Never a hypothetical, never a running
+///   total across requests.
+/// * The whole struct is `None` when nothing was saved, and the rendered
+///   block is `None` when the saving was too small to be worth the bytes
+///   spent reporting it — see [`PayloadSavings::rescoped`].
+/// * `bytes` is the measured quantity and the only number on the wire. There
+///   is deliberately no token conversion: dividing a byte count by a constant
+///   produces a bigger number, not more information, and printing
+///   "14,008,655 tokens" beside a 22 KB response is what cost an earlier
+///   revision its credibility with a real reader.
+/// * `measured: "sampled"` appears when long arrays were extrapolated rather
+///   than counted. Its **absence means the figure is exact** — an estimate is
+///   always labelled, a precise number never needs to be.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PayloadSavings {
+    /// Bytes of JSON omitted from this response, relative to the same
+    /// response with no `_source` clause.
+    pub bytes: u64,
+    /// How `bytes` was obtained. Serialized only when `Sampled`.
+    pub measured: SavingsMethod,
+    /// Short sentence naming the mechanism the caller used. Deliberately
+    /// factual rather than congratulatory: obeying a `_source` clause is not
+    /// a favour, and a reader told "you asked for 2 fields" learns nothing
+    /// they did not just type.
+    pub note: String,
+    /// Whether the response layer may still re-materialise some of these
+    /// bytes through `fields` / `docvalue_fields` / `script_fields`, in which
+    /// case it must subtract what it emitted before claiming anything.
+    #[serde(skip)]
+    pub substitutable: bool,
+    /// Per-hit attribution, `(hit id, omitted bytes)`.
+    ///
+    /// Never serialized: the ES-compat layer re-paginates, de-duplicates and
+    /// caps the merged hit set *after* the engine has run, so it re-sums this
+    /// over the hits it actually emits. Summing the engine-side total instead
+    /// would over-report on multi-index, PIT, kNN-capped and collapsed
+    /// searches — i.e. it would inflate.
+    #[serde(skip)]
+    pub per_hit: Vec<(String, u64)>,
+}
+
+/// Which method produced a [`PayloadSavings::bytes`] figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SavingsMethod {
+    /// Long arrays were extrapolated from a bounded, stratified sample.
+    /// Everything else — including every array short enough to be cheap —
+    /// was counted exactly. Observed error is reported in
+    /// `SAVINGS-STATS-REPORT.md`.
+    Sampled,
+    /// Every omitted byte was serialized and counted. Requested with
+    /// `?savings=exact`.
+    Exact,
+}
+
+/// How many times its own size a saving must be before it is worth printing.
+///
+/// A block that spends 135 bytes to announce a 19-byte saving is a net loss
+/// to the very budget it claims to protect, and the dogfood found that shape
+/// on ordinary single-document lookups. Silence is already correct when
+/// nothing was saved; this is the same principle applied to "saved so little
+/// that telling you costs more than it saved".
+pub const SAVINGS_REPORT_FLOOR_RATIO: u64 = 10;
+
+impl PayloadSavings {
+    /// Build a savings record, or `None` when nothing was actually saved.
+    ///
+    /// The `None`-on-zero rule lives here so no call site can accidentally
+    /// emit a `"bytes": 0` block.
+    pub fn new(
+        method: SavingsMethod,
+        note: impl Into<String>,
+        substitutable: bool,
+        per_hit: Vec<(String, u64)>,
+    ) -> Option<Self> {
+        let bytes: u64 = per_hit.iter().map(|(_, b)| *b).sum();
+        if bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            bytes,
+            measured: method,
+            note: note.into(),
+            substitutable,
+            per_hit,
+        })
+    }
+
+    /// Render the wire block for a byte total computed over a *different* hit
+    /// set (the ES-compat layer's post-merge page).
+    ///
+    /// Returns `None` when the total is zero, and also when the saving is
+    /// less than [`SAVINGS_REPORT_FLOOR_RATIO`] times what the block itself
+    /// would add to the response. The floor is measured against the rendered
+    /// block, not guessed, so it stays true if the wording changes.
+    pub fn rescoped(&self, bytes: u64) -> Option<serde_json::Value> {
+        if bytes == 0 {
+            return None;
+        }
+        let mut block = serde_json::Map::new();
+        block.insert("bytes".to_string(), bytes.into());
+        // Absence means exact; only the estimate carries a label.
+        if self.measured == SavingsMethod::Sampled {
+            block.insert(
+                "measured".to_string(),
+                serde_json::to_value(self.measured).ok()?,
+            );
+        }
+        block.insert("note".to_string(), self.note.clone().into());
+        let block = serde_json::Value::Object(block);
+        // `"_savings":` plus the block is what this costs the response.
+        let cost = serde_json::to_vec(&block).ok()?.len() as u64 + 11;
+        if bytes < cost.saturating_mul(SAVINGS_REPORT_FLOOR_RATIO) {
+            return None;
+        }
+        Some(block)
+    }
+}
+
 /// The complete search response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -176,6 +309,12 @@ pub struct SearchResult {
     /// into an error response rather than serving the degraded scores.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub script_failure: Option<String>,
+    /// Measured payload the response did not have to carry, populated only
+    /// when the caller opted in (`?savings=true`) **and** something was
+    /// genuinely omitted. `None` is the correct value for a query that saved
+    /// nothing — there is deliberately no zero-valued variant.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub savings: Option<PayloadSavings>,
 }
 
 impl SearchResult {
@@ -193,6 +332,7 @@ impl SearchResult {
             profile: None,
             max_score: None,
             script_failure: None,
+            savings: None,
         }
     }
 }

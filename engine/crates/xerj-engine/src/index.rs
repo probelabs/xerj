@@ -22,12 +22,12 @@ use xerj_fts::search::{
 };
 use xerj_query::ast::{
     BoostMode, FieldValueFactor, Fuzziness, HighlightRequest, MinShouldMatch, Modifier, QueryNode,
-    RandomScore, RescoreQuery, ScoreFunction, ScoreMode, SearchRequest, SourceFilter,
+    RandomScore, RescoreQuery, SavingsMode, ScoreFunction, ScoreMode, SearchRequest, SourceFilter,
     TrackTotalHits,
 };
 use xerj_query::executor::{
-    strip_internal_passage_metadata, Hit, PassageMatch, SearchResult, TotalHits, TotalHitsRelation,
-    PASSAGE_METADATA_PREFIX, PASSAGE_RESPONSE_FIELD,
+    strip_internal_passage_metadata, Hit, PassageMatch, PayloadSavings, SavingsMethod,
+    SearchResult, TotalHits, TotalHitsRelation, PASSAGE_METADATA_PREFIX, PASSAGE_RESPONSE_FIELD,
 };
 use xerj_storage::index_store::{IndexStore, IndexStoreConfig};
 use xerj_storage::segment::SectionType;
@@ -4308,6 +4308,11 @@ mod semantic_deadline_regression_tests {
         let request = match_all(1);
         let bytes = serde_json::to_vec(&request).unwrap();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // The savings-measurement mode is `serde(skip)`, so `search()` mixes
+        // it into the key by hand ahead of the serialized body; this
+        // hand-built key has to do the same or it addresses a different slot.
+        // `match_all` leaves the mode at its `Off` default.
+        std::hash::Hasher::write_u8(&mut hasher, 0);
         std::hash::Hasher::write(&mut hasher, &bytes);
         let key = QueryCacheKey {
             body_hash: std::hash::Hasher::finish(&hasher),
@@ -11807,6 +11812,7 @@ impl Index {
         // for v0.7-P1 — the per-query latency is dominated by the kNN
         // / FTS scan, not the await ordering.)
         let mut sub_results: Vec<(Vec<Hit>, f32)> = Vec::with_capacity(sub_queries.len());
+        let mut sub_savings: Vec<PayloadSavings> = Vec::new();
         let mut any_timed_out = false;
         for wq in sub_queries {
             if std::time::Instant::now() >= deadline {
@@ -11832,11 +11838,19 @@ impl Index {
                 fields: Vec::new(),
                 profile: false,
                 leaf_ts_field: None,
+                savings: request.savings,
             };
             // Box::pin to break the type-recursion (search_inner ↔
             // run_hybrid both async fn).
             let sub_result = Box::pin(self.search_inner(&sub_request, deadline)).await?;
             any_timed_out |= sub_result.timed_out;
+            // Fusion de-duplicates documents across sub-queries, so the
+            // per-hit records are merged by document id below — a document
+            // retrieved by both the lexical and the vector leg saved its
+            // bytes ONCE, and must be counted once.
+            if let Some(s) = sub_result.savings {
+                sub_savings.push(s);
+            }
             sub_results.push((sub_result.hits, wq.weight));
             if any_timed_out {
                 break;
@@ -11884,6 +11898,7 @@ impl Index {
             profile: None,
             max_score: None,
             script_failure: None,
+            savings: merge_sub_savings(sub_savings),
         })
     }
 
@@ -12131,6 +12146,7 @@ impl Index {
             profile: None,
             max_score: None,
             script_failure: None,
+            savings: None,
         })
     }
 
@@ -13100,6 +13116,7 @@ impl Index {
                 profile: None,
                 max_score: None,
                 script_failure: None,
+                savings: None,
             }
         };
         // M3 framework: response cache.  Hash the request shape and the
@@ -13149,6 +13166,20 @@ impl Index {
                 }
             }
             let mut h = DefaultHasher::new();
+            // `savings` is `serde(skip)`, so it does NOT reach the hasher via
+            // the request body — mix it in explicitly. Without this a cached
+            // result carries its predecessor's `_savings` record to a caller
+            // who asked for a different mode (or asked for none at all, and
+            // got a non-ES key on an otherwise stock response). Found on a
+            // live server, not in review.
+            Hasher::write_u8(
+                &mut h,
+                match request.savings {
+                    SavingsMode::Off => 0,
+                    SavingsMode::Sampled => 1,
+                    SavingsMode::Exact => 2,
+                },
+            );
             let body_hash: Option<u64> = serde_json::to_writer(HasherWriter(&mut h), request)
                 .ok()
                 .map(|_| h.finish());
@@ -13502,6 +13533,7 @@ impl Index {
                     profile: None,
                     max_score: None,
                     script_failure: None,
+                    savings: None,
                 };
                 // Hand the timed-out response to any coalesced followers so
                 // they return immediately rather than waiting for the closed
@@ -17635,7 +17667,12 @@ impl Index {
             let schema = self.schema.read().await;
             generated_embedding_companion_fields(&schema.schema)
         };
-        let page = apply_source_filter(page, &request.source, &generated_companion_fields);
+        let (page, savings) = apply_source_filter_measured(
+            page,
+            &request.source,
+            &generated_companion_fields,
+            Some(request),
+        );
 
         // --- Build profile data if requested ---
         let profile = if request.profile {
@@ -17719,6 +17756,7 @@ impl Index {
             profile,
             max_score: population_max_score,
             script_failure: None,
+            savings,
         })
     }
 
@@ -24780,11 +24818,309 @@ fn es_format_to_epoch_ms(s: &str, fmt: &str) -> Option<i64> {
     None
 }
 
+/// A `std::io::Write` sink that counts bytes and keeps none of them.
+///
+/// Serializing a value into this yields the byte count `serde_json` *would*
+/// have written, without allocating a buffer for a payload we are about to
+/// throw away. Using serde itself — rather than a hand-rolled length
+/// function — means the number cannot silently drift from what the wire
+/// format actually produces (float formatting above all).
+#[derive(Default)]
+struct ByteCounter(u64);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0 += buf.len() as u64;
+        Ok(())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Exact serialized JSON length of `value` — measured, not estimated.
+fn json_wire_len(value: &Value) -> u64 {
+    let mut counter = ByteCounter::default();
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        // `Value` → JSON cannot fail. If it somehow did we would not KNOW the
+        // size, and an unknown size must never be reported as a saving.
+        Err(_) => 0,
+    }
+}
+
+/// Exact serialized length of a JSON object key, quotes and escaping included.
+fn json_key_len(key: &str) -> u64 {
+    let mut counter = ByteCounter::default();
+    match serde_json::to_writer(&mut counter, key) {
+        Ok(()) => counter.0,
+        Err(_) => 0,
+    }
+}
+
+/// How many elements of a long array are actually rendered before the rest is
+/// extrapolated.
+///
+/// 64 was chosen by measurement, not taste. XERJ's built-in (non-ONNX)
+/// embedder emits *sparse* vectors — on a real 384-dim companion, 320 of the
+/// 384 elements are exactly `0.0` — and the resulting bimodal width
+/// distribution is what breaks naive sampling: plain 32-element sampling of
+/// that vector came out between -9.7% and +16.8% depending on which 32
+/// elements you take. Counting the fixed-width elements exactly (see
+/// [`cheap_element_len`]) and sampling only the rest at 64 brings the same
+/// vector to 0.00%. Observed error across real and adversarial shapes is
+/// tabulated in `SAVINGS-STATS-REPORT.md`.
+const SAVINGS_ARRAY_SAMPLE: usize = 64;
+
+/// Sample size at nesting depth `depth` (number of enclosing arrays).
+///
+/// Nested numeric arrays — a chunk matrix, `[[f32; dims]; chunks]` — multiply:
+/// sampling 64 rows of 64 columns is 4,096 float renders, which is most of
+/// what the measurement costs on a large document. The rows of an embedding
+/// matrix are homogeneous by construction (same dimensionality, same model,
+/// same magnitude range), so a smaller sample deeper down costs almost no
+/// accuracy and cuts the product hard. Measured effect is in the report.
+fn savings_sample_size(depth: u32) -> usize {
+    match depth {
+        0 => SAVINGS_ARRAY_SAMPLE,
+        1 => 16,
+        _ => 8,
+    }
+}
+
+/// Serialized length of an array element whose width is knowable without
+/// running the expensive formatter, or `None` if it has to be rendered.
+///
+/// The whole sampling scheme rests on this: the elements that make a vector's
+/// width distribution bimodal — the zeros — are also the ones we can size for
+/// free, so they are counted exactly and never sampled. Integers go through
+/// `itoa`, which is several times cheaper than the `ryu` float path and is
+/// therefore taken exactly too.
+fn cheap_element_len(value: &Value) -> Option<u64> {
+    match value {
+        Value::Null => Some(4),
+        Value::Bool(true) => Some(4),
+        Value::Bool(false) => Some(5),
+        Value::Number(number) => {
+            if let Some(float) = number.as_f64() {
+                if number.is_f64() {
+                    if float != 0.0 {
+                        return None;
+                    }
+                    // ryu renders signed zero as `-0.0`; `-0.0 == 0.0` in
+                    // Rust, so the sign has to be asked for explicitly.
+                    return Some(if float.is_sign_negative() { 4 } else { 3 });
+                }
+            }
+            Some(json_wire_len(value))
+        }
+        _ => None,
+    }
+}
+
+/// Serialized JSON length of `value`, with long arrays extrapolated from a
+/// bounded sample instead of rendered in full.
+///
+/// This is what makes the statistic affordable on every search. An embedding
+/// companion is ~250,000 float literals; rendering all of them with `ryu`
+/// purely to learn how many bytes they occupy costs ~10 ms per page of ten
+/// hits. Sampling 64 of them costs microseconds.
+///
+/// It is an estimate and is labelled as one on the wire
+/// (`_savings.measured: "sampled"`). Three properties keep it honest:
+///
+/// * Anything short enough to be cheap is measured **exactly** — arrays at or
+///   under [`SAVINGS_ARRAY_SAMPLE`] costly elements, every object, every
+///   scalar, every string outside a long array.
+/// * The elements with a free, exact width are counted exactly and excluded
+///   from the sample, so a bimodal (sparse-vector) distribution does not
+///   poison the mean.
+/// * The sample is strided across the whole array rather than taken from the
+///   head, and the extrapolation truncates rather than rounds, so what bias
+///   remains leans toward under-claiming.
+fn json_len_sampled(value: &Value) -> u64 {
+    json_len_sampled_at(value, 0)
+}
+
+fn json_len_sampled_at(value: &Value, depth: u32) -> u64 {
+    match value {
+        Value::Array(items) => {
+            if items.is_empty() {
+                return 2;
+            }
+            let sample = savings_sample_size(depth);
+            // Pass 1: size everything that is free to size, and count what is
+            // left. No allocation — this runs on the hot read path.
+            let mut exact = 0u64;
+            let mut costly = 0usize;
+            for item in items {
+                match cheap_element_len(item) {
+                    Some(len) => exact += len,
+                    None => costly += 1,
+                }
+            }
+            let sampled = if costly == 0 {
+                0
+            } else if costly <= sample {
+                // Few enough to be worth doing properly.
+                items
+                    .iter()
+                    .filter(|item| cheap_element_len(item).is_none())
+                    .map(|item| json_len_sampled_at(item, depth + 1))
+                    .sum()
+            } else {
+                // Pass 2: stride across the costly elements, rendering one
+                // every `costly / sample`, then extrapolate.
+                let mut seen = 0usize;
+                let mut taken = 0usize;
+                let mut total = 0u64;
+                for item in items {
+                    if cheap_element_len(item).is_some() {
+                        continue;
+                    }
+                    if taken < sample && seen >= taken * costly / sample {
+                        total += json_len_sampled_at(item, depth + 1);
+                        taken += 1;
+                    }
+                    seen += 1;
+                }
+                let taken = taken.max(1) as u128;
+                // Truncating division: the residue is dropped rather than
+                // rounded up, so the estimate never drifts high by rounding.
+                (total as u128 * costly as u128 / taken) as u64
+            };
+            // `[`, `]`, and one comma between each pair of elements.
+            2 + (items.len() as u64 - 1) + exact + sampled
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                return 2;
+            }
+            let inner: u64 = map
+                .iter()
+                .map(|(key, val)| json_key_len(key) + 1 + json_len_sampled_at(val, depth))
+                .sum();
+            2 + (map.len() as u64 - 1) + inner
+        }
+        _ => json_wire_len(value),
+    }
+}
+
+/// Serialized length of `value` under the caller's chosen measurement mode.
+fn json_len(value: &Value, mode: SavingsMode) -> u64 {
+    match mode {
+        SavingsMode::Exact => json_wire_len(value),
+        _ => json_len_sampled(value),
+    }
+}
+
+/// Per-hit omitted bytes.
+#[derive(Default)]
+struct SavingsAccumulator {
+    per_hit: Vec<(String, u64)>,
+}
+
+impl SavingsAccumulator {
+    fn record(&mut self, id: &str, bytes: u64) {
+        if bytes > 0 {
+            self.per_hit.push((id.to_string(), bytes));
+        }
+    }
+}
+
+/// Serialized length of the `_source` this hit would have carried had the
+/// caller written **no `_source` clause at all** — the engine's default
+/// projection, which strips generated embedding companions.
+///
+/// This is the baseline every saving below is measured against, and getting
+/// it right is the difference between a statistic and a slogan. Measuring
+/// against the raw stored document instead credits the caller's projection
+/// with the removal of embedding vectors that this engine has not returned by
+/// default since #309; a blind UX dogfood measured that overstatement at a
+/// consistent ~9.3x and it was the single thing that cost the feature its
+/// credibility.
+///
+/// Note what this does NOT do: it never serializes the companion values. The
+/// old baseline had to, because it was claiming them. Fixing the honesty
+/// problem removed the expensive half of the measurement with it.
+fn default_projection_len(
+    source: &Value,
+    generated_companion_fields: &HashSet<String>,
+    mode: SavingsMode,
+) -> u64 {
+    let Some(map) = source.as_object() else {
+        return json_len(source, mode);
+    };
+    if generated_companion_fields.is_empty() {
+        return json_len(source, mode);
+    }
+    // A dotted or globbed companion strips a nested key, which the key-wise
+    // walk below cannot express; fall back to building the projection.
+    if generated_companion_fields
+        .iter()
+        .any(|f| f.contains('.') || f.contains('*'))
+    {
+        let excludes: Vec<String> = generated_companion_fields.iter().cloned().collect();
+        return json_len(&filter_object(source, &[], &excludes), mode);
+    }
+    let mut inner = 0u64;
+    let mut kept = 0usize;
+    for (key, value) in map {
+        if generated_companion_fields.contains(key) {
+            continue;
+        }
+        inner += json_key_len(key) + 1 + json_len(value, mode);
+        kept += 1;
+    }
+    if kept == 0 {
+        return 2;
+    }
+    // `{`, `}`, and one comma between each pair of kept members.
+    2 + (kept as u64 - 1) + inner
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Unmeasured filtering — the shape every pre-existing test asserts on, and
+/// proof that the measurement is strictly additive rather than a rewrite of
+/// the `_source` projection semantics.
+#[cfg(test)]
 fn apply_source_filter(
     hits: Vec<Hit>,
     filter: &SourceFilter,
     generated_companion_fields: &HashSet<String>,
 ) -> Vec<Hit> {
+    apply_source_filter_measured(hits, filter, generated_companion_fields, None).0
+}
+
+/// `_source` filtering, measuring what it left out.
+///
+/// `measure: Some(request)` turns the savings measurement on; `None` skips it
+/// for one `Option` check per call and no per-hit work whatsoever — that is
+/// the path every internal engine search (reindex, update-by-query, terms
+/// lookup, suggesters) takes, because nobody will ever read their number.
+/// The user-facing `_search` handler measures by default; see
+/// [`SavingsMode`] and [`json_len_sampled`] for how that is made affordable.
+///
+/// Every number produced here is the difference between what this response
+/// carries and what the *same* response would have carried without the
+/// omission. Nothing hypothetical is counted, and nothing is counted twice.
+fn apply_source_filter_measured(
+    hits: Vec<Hit>,
+    filter: &SourceFilter,
+    generated_companion_fields: &HashSet<String>,
+    measure: Option<&SearchRequest>,
+) -> (Vec<Hit>, Option<PayloadSavings>) {
     let hits: Vec<Hit> = hits
         .into_iter()
         .map(|mut hit| {
@@ -24792,61 +25128,202 @@ fn apply_source_filter(
             hit
         })
         .collect();
-    match filter {
+    let mut acc = SavingsAccumulator::default();
+    // A request carrying `SavingsMode::Off` is indistinguishable from no
+    // request at all, so collapse the two here rather than guarding every
+    // measurement site below.
+    let mode = measure.map_or(SavingsMode::Off, |request| request.savings);
+    let measure = measure.filter(|_| !matches!(mode, SavingsMode::Off));
+    let measuring = measure.is_some();
+    let mut substitutable = false;
+    let filtered = match filter {
         // The default is a passthrough: only engine-generated embedding
         // companions are stripped, so an index without embedding mappings
         // must not pay a per-hit deep copy of its source (issue #311).
+        //
+        // NOTHING IS REPORTED HERE, deliberately. Stripping the companions is
+        // what this engine does on every default response; it is not a choice
+        // the caller made and it is not a saving relative to what they would
+        // otherwise have received. Claiming it meant a caller who wrote
+        // `{"query":…,"size":20}` and asked for everything was told they had
+        // saved 22 MB — the engine taking credit for its own default, which is
+        // precisely the vanity metric this feature was written to avoid.
         SourceFilter::Default => {
             if generated_companion_fields.is_empty() {
-                return hits;
+                return (hits, None);
             }
-            // A dotted companion (embedding target under a nested mapping)
-            // strips a *nested* key; a `*` would be a glob to
-            // `filter_object`'s matcher. Both need the general filter —
-            // plain names, the only shape the engine generates today, are
-            // removed in place without copying the kept values.
             if generated_companion_fields
                 .iter()
                 .any(|f| f.contains('.') || f.contains('*'))
             {
                 let excludes: Vec<String> = generated_companion_fields.iter().cloned().collect();
-                return hits
-                    .into_iter()
+                return (
+                    hits.into_iter()
+                        .map(|mut h| {
+                            h.source = filter_object(&h.source, &[], &excludes);
+                            h
+                        })
+                        .collect(),
+                    None,
+                );
+            }
+            return (
+                hits.into_iter()
                     .map(|mut h| {
-                        h.source = filter_object(&h.source, &[], &excludes);
+                        if let Some(map) = h.source.as_object_mut() {
+                            map.retain(|k, _| !generated_companion_fields.contains(k));
+                        }
                         h
                     })
-                    .collect();
-            }
-            hits.into_iter()
-                .map(|mut h| {
-                    if let Some(map) = h.source.as_object_mut() {
-                        map.retain(|k, _| !generated_companion_fields.contains(k));
-                    }
-                    h
-                })
-                .collect()
+                    .collect(),
+                None,
+            );
         }
-        SourceFilter::Enabled(true) => hits,
+        // The caller explicitly asked for the whole document — MORE than the
+        // default projection, not less. Nothing was withheld.
+        SourceFilter::Enabled(true) => return (hits, None),
         // `_source: false`: keep the raw source so the response layer can
         // still resolve `fields` / `_ignored` / `highlight` against it —
         // `_source` emission is suppressed in es_compat.rs.
-        SourceFilter::Enabled(false) => hits,
+        SourceFilter::Enabled(false) => {
+            if measuring {
+                // The response layer may hand some of these values back via
+                // `fields` / `docvalue_fields` / `script_fields`. It knows
+                // exactly how many bytes it emitted and subtracts them; this
+                // flag is what tells it to.
+                substitutable = true;
+                for h in &hits {
+                    let omitted =
+                        default_projection_len(&h.source, generated_companion_fields, mode);
+                    // Highlighting is the designated substitute when `_source`
+                    // is off: the fragments ARE on the wire, so the honest
+                    // saving is net of them.
+                    let substitute = h
+                        .highlight
+                        .as_ref()
+                        .map(|frags| {
+                            json_len(&serde_json::to_value(frags).unwrap_or(Value::Null), mode)
+                        })
+                        .unwrap_or(0);
+                    acc.record(&h.id, omitted.saturating_sub(substitute));
+                }
+            }
+            hits
+        }
         SourceFilter::Includes(fields) => hits
             .into_iter()
             .map(|mut h| {
+                let baseline = measuring
+                    .then(|| default_projection_len(&h.source, generated_companion_fields, mode));
                 h.source = filter_object(&h.source, fields, &[]);
+                if let Some(baseline) = baseline {
+                    // Saturating: a caller who explicitly projects a generated
+                    // companion gets MORE than the default, and more is not a
+                    // saving.
+                    acc.record(&h.id, baseline.saturating_sub(json_len(&h.source, mode)));
+                }
                 h
             })
             .collect(),
         SourceFilter::Fields { includes, excludes } => hits
             .into_iter()
             .map(|mut h| {
+                let baseline = measuring
+                    .then(|| default_projection_len(&h.source, generated_companion_fields, mode));
                 h.source = filter_object(&h.source, includes, excludes);
+                if let Some(baseline) = baseline {
+                    acc.record(&h.id, baseline.saturating_sub(json_len(&h.source, mode)));
+                }
                 h
             })
             .collect(),
+    };
+    let savings =
+        measure.and_then(|request| savings_note(filter, request, mode, substitutable, &acc));
+    (filtered, savings)
+}
+
+/// Merge the savings of a hybrid query's sub-searches.
+///
+/// Every leg strips the same companions from the same documents, so a
+/// document retrieved by two legs must contribute its bytes exactly once —
+/// summing the legs' totals would double-count, which is precisely the
+/// inflation this stat must not commit. De-duplicating by document id makes
+/// the double-count structurally impossible.
+fn merge_sub_savings(sub_savings: Vec<PayloadSavings>) -> Option<PayloadSavings> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut per_hit: Vec<(String, u64)> = Vec::new();
+    let mut note: Option<String> = None;
+    let mut method: Option<SavingsMethod> = None;
+    let mut substitutable = false;
+    for savings in sub_savings {
+        note.get_or_insert_with(|| savings.note.clone());
+        method.get_or_insert(savings.measured);
+        substitutable |= savings.substitutable;
+        for (id, bytes) in savings.per_hit {
+            if seen.insert(id.clone()) {
+                per_hit.push((id, bytes));
+            }
+        }
     }
+    PayloadSavings::new(method?, note?, substitutable, per_hit)
+}
+
+/// Phrase the mechanism that actually fired.
+///
+/// The point of the stat is not the counter, it is teaching the reader WHICH
+/// feature bought them the bytes, so each mechanism gets its own sentence.
+/// Kept to a few tens of bytes: a block that costs more tokens than it
+/// reports saving would be the worst possible advertisement for the idea.
+fn savings_note(
+    filter: &SourceFilter,
+    request: &SearchRequest,
+    mode: SavingsMode,
+    substitutable: bool,
+    acc: &SavingsAccumulator,
+) -> Option<PayloadSavings> {
+    // Counts come from the REQUEST, never from what came back. A caller who
+    // projects one field that a particular document happens to lack was told
+    // "Sent the 0 fields you asked for" — reporting their own request back to
+    // them, wrongly. What they asked for is a fact about the request.
+    //
+    // And no denominators. "not all 15" reads as a claim about the index
+    // schema, but it was really the widest document on the page: the same
+    // query at a different `size` reported 8, then 11, then 12, then 15, which
+    // reads as an unreliable statistic even though each number was true of the
+    // page it described.
+    let note = match filter {
+        // Neither of these reaches here — both return before the note is
+        // built — but the match must stay total.
+        SourceFilter::Default | SourceFilter::Enabled(true) => return None,
+        SourceFilter::Enabled(false) if request.highlight.is_some() => {
+            "highlight fragments returned in place of _source".to_string()
+        }
+        SourceFilter::Enabled(false) if !request.fields.is_empty() => {
+            "fields returned in place of _source".to_string()
+        }
+        SourceFilter::Enabled(false) => "_source withheld, as requested".to_string(),
+        SourceFilter::Includes(fields) => format!(
+            "_source narrowed to the {} field{} you listed",
+            fields.len(),
+            plural(fields.len())
+        ),
+        SourceFilter::Fields { includes, excludes } if includes.is_empty() => format!(
+            "_source excluded the {} field{} you listed",
+            excludes.len(),
+            plural(excludes.len())
+        ),
+        SourceFilter::Fields { includes, .. } => format!(
+            "_source narrowed to the {} field{} you listed",
+            includes.len(),
+            plural(includes.len())
+        ),
+    };
+    let method = match mode {
+        SavingsMode::Exact => SavingsMethod::Exact,
+        _ => SavingsMethod::Sampled,
+    };
+    PayloadSavings::new(method, note, substitutable, acc.per_hit.clone())
 }
 
 /// Return the engine-generated embedding companions for a schema.
@@ -25183,6 +25660,850 @@ mod source_filter_tests {
         );
         assert_eq!(str_buf_ptr(&filtered[0].source, "body"), body_ptr);
         assert_eq!(str_buf_ptr(&filtered[0].source, "title"), title_ptr);
+    }
+}
+
+/// The `_savings` statistic, at the point where the bytes are actually
+/// dropped.
+///
+/// Every byte count asserted here is recomputed from scratch with plain
+/// `serde_json` — never by re-running the implementation's own arithmetic —
+/// because a metric that only agrees with itself proves nothing.
+///
+/// The load-bearing property, after a blind UX dogfood caught the earlier
+/// revision overstating by ~9.3x: **the baseline is the default-projected
+/// response**, not the raw stored document. Several tests below exist purely
+/// to pin that down.
+#[cfg(test)]
+mod savings_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use xerj_common::types::{EmbeddingConfig, FieldConfig, FieldType};
+
+    fn embedded_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(
+                FieldConfig::new("body", FieldType::Text).with_embedding(EmbeddingConfig {
+                    endpoint: None,
+                    model: None,
+                    target_field: None,
+                }),
+            )
+            .unwrap();
+        schema
+    }
+
+    fn hit(id: &str, source: Value) -> Hit {
+        Hit {
+            id: id.to_string(),
+            score: 1.0,
+            source,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        }
+    }
+
+    /// Exact mode: the byte-for-byte assertions compare against an
+    /// independently serialized oracle, so they must not run against the
+    /// sampled estimator. Sampling accuracy has its own tests.
+    fn measuring(source: SourceFilter) -> SearchRequest {
+        SearchRequest {
+            source,
+            savings: SavingsMode::Exact,
+            ..SearchRequest::default()
+        }
+    }
+
+    fn measuring_sampled(source: SourceFilter) -> SearchRequest {
+        SearchRequest {
+            source,
+            savings: SavingsMode::Sampled,
+            ..SearchRequest::default()
+        }
+    }
+
+    /// A companion-bearing document: user fields plus the generated vector
+    /// and its per-chunk companions. The user fields are deliberately large
+    /// enough that a projection clears the reporting floor.
+    fn companion_source() -> Value {
+        let vector = Value::Array((0..384).map(|_| json!(0.123456)).collect());
+        json!({
+            "title": "quarterly report",
+            "author": "finance",
+            "body": "x".repeat(8_000),
+            "body_vector": vector,
+            "body_vector_chunks": [[0.5, 0.25], [0.125, 0.0625]],
+        })
+    }
+
+    /// The independent oracle for the baseline: what the caller would have
+    /// received had they written no `_source` clause at all. Built here by
+    /// hand from the same document, with nothing borrowed from the engine.
+    fn default_projected(source: &Value, companions: &HashSet<String>) -> Value {
+        let mut map = source.as_object().cloned().unwrap_or_default();
+        map.retain(|k, _| !companions.contains(k));
+        Value::Object(map)
+    }
+
+    fn wire_len(value: &Value) -> u64 {
+        serde_json::to_vec(value).unwrap().len() as u64
+    }
+
+    // ── the baseline: the whole point of this revision ─────────────────────
+
+    #[test]
+    fn a_projection_is_measured_against_the_response_you_would_have_got() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = measuring(filter.clone());
+
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", source.clone())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        let savings = savings.expect("dropping an 8 KB body is a real saving");
+
+        // The oracle: default projection minus what was actually returned.
+        // NOT the raw stored document — the embedding companions were never
+        // going to be sent, so crediting this projection with removing them
+        // would overstate the saving by the size of the vectors.
+        let expected =
+            wire_len(&default_projected(&source, &companions)) - wire_len(&filtered[0].source);
+        assert_eq!(
+            savings.bytes, expected,
+            "the baseline must be the default-projected response, not the stored document"
+        );
+
+        // And prove the two baselines really differ here, so the assertion
+        // above is not vacuous.
+        let against_stored = wire_len(&source) - wire_len(&filtered[0].source);
+        assert!(
+            against_stored > savings.bytes,
+            "this fixture must have companions worth counting, or the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_engines_own_default_is_never_claimed_as_a_saving() {
+        // The failure this exists to prevent: a caller who writes no `_source`
+        // clause at all, asks for everything, and is told they saved 22 MB.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let request = measuring(SourceFilter::Default);
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &SourceFilter::Default,
+            &companions,
+            Some(&request),
+        );
+        assert!(
+            savings.is_none(),
+            "stripping generated vectors is what this engine does on every default \
+             response; it is not a choice the caller made and not a saving relative \
+             to what they would otherwise have received"
+        );
+        assert!(
+            filtered[0].source.get("body_vector").is_none(),
+            "the stripping itself must still happen — only the claim is withdrawn"
+        );
+    }
+
+    #[test]
+    fn projecting_more_than_the_default_is_not_a_saving() {
+        // `_source: ["body_vector"]` on a document whose vector dwarfs its
+        // user fields returns MORE than the default projection would have.
+        // More is not less, and `saturating_sub` must not be allowed to
+        // report the shortfall as a win.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = json!({
+            "title": "t",
+            "body": "short",
+            "body_vector": Value::Array((0..384).map(|_| json!(0.123456)).collect()),
+        });
+        let filter = SourceFilter::Includes(vec!["body_vector".to_string()]);
+        let request = measuring(filter.clone());
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", source.clone())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        assert!(
+            filtered[0].source.get("body_vector").is_some(),
+            "the caller asked for the vector and must still receive it"
+        );
+        assert!(
+            wire_len(&filtered[0].source) > wire_len(&default_projected(&source, &companions)),
+            "this fixture must actually return more than the default, or it proves nothing"
+        );
+        assert!(
+            savings.is_none(),
+            "a response larger than the default withheld nothing"
+        );
+    }
+
+    #[test]
+    fn projecting_a_companion_alongside_a_large_body_still_measures_honestly() {
+        // The mirror case: the same projection on a document with an 8 KB
+        // body DOES withhold bytes, because the body did not go out. The
+        // saving is real and is still measured against the default
+        // projection, companion or not.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let filter = SourceFilter::Includes(vec!["body_vector".to_string()]);
+        let request = measuring(filter.clone());
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", source.clone())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        let expected =
+            wire_len(&default_projected(&source, &companions)) - wire_len(&filtered[0].source);
+        assert_eq!(
+            savings.expect("the 8 KB body did not go out").bytes,
+            expected
+        );
+    }
+
+    #[test]
+    fn suppressed_source_is_measured_against_the_default_projection_too() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let request = SearchRequest {
+            source: SourceFilter::Enabled(false),
+            savings: SavingsMode::Exact,
+            ..SearchRequest::default()
+        };
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", source.clone())],
+            &SourceFilter::Enabled(false),
+            &companions,
+            Some(&request),
+        );
+        let savings = savings.expect("withholding an 8 KB document is a real saving");
+        assert_eq!(
+            savings.bytes,
+            wire_len(&default_projected(&source, &companions)),
+            "`_source: false` withholds the default projection, not the raw document"
+        );
+        assert!(
+            savings.substitutable,
+            "the response layer may hand some of this back via `fields`, and must be told"
+        );
+    }
+
+    // ── the reporting floor ───────────────────────────────────────────────
+
+    #[test]
+    fn a_saving_too_small_to_be_worth_printing_is_not_printed() {
+        // Measured on a real corpus: 135 bytes of block to announce a 19-byte
+        // saving, net -116, on ordinary single-document lookups.
+        let savings = PayloadSavings::new(
+            SavingsMethod::Sampled,
+            "note",
+            false,
+            vec![("d".into(), 19)],
+        )
+        .expect("19 bytes is still a measurement");
+        assert_eq!(savings.bytes, 19);
+        assert!(
+            savings.rescoped(19).is_none(),
+            "a block that costs more than it reports is a net loss to the budget it \
+             claims to protect"
+        );
+    }
+
+    #[test]
+    fn the_floor_is_measured_against_the_block_that_would_be_printed() {
+        let savings = PayloadSavings::new(
+            SavingsMethod::Sampled,
+            "a note",
+            false,
+            vec![("d".into(), 1)],
+        )
+        .expect("non-zero");
+        // Walk up until it prints, then check the ratio actually held.
+        let mut emitted_at = None;
+        for bytes in 1..4000u64 {
+            if let Some(block) = savings.rescoped(bytes) {
+                emitted_at = Some((bytes, serde_json::to_vec(&block).unwrap().len() as u64 + 11));
+                break;
+            }
+        }
+        let (bytes, cost) = emitted_at.expect("it must print eventually");
+        assert!(
+            bytes >= cost * 10,
+            "first emission was {bytes} bytes against a {cost}-byte block — under 10x"
+        );
+        assert!(
+            savings.rescoped(bytes - 1).is_none(),
+            "the threshold must be sharp, not approximate"
+        );
+    }
+
+    // ── the wire block ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_block_carries_no_derivable_or_constant_fields() {
+        let savings = PayloadSavings::new(
+            SavingsMethod::Sampled,
+            "_source narrowed to the 2 fields you listed",
+            false,
+            vec![("d".into(), 100_000)],
+        )
+        .unwrap();
+        let block = savings.rescoped(100_000).expect("well over the floor");
+        let keys: Vec<&str> = block
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["bytes", "measured", "note"],
+            "44% of the old block was a constant divisor, a constant label, and a \
+             division the reader could do themselves"
+        );
+        assert!(block.get("tokens_approx").is_none());
+        assert!(block.get("bytes_per_token").is_none());
+    }
+
+    #[test]
+    fn only_an_estimate_is_labelled() {
+        let per_hit = vec![("d".to_string(), 100_000u64)];
+        let sampled =
+            PayloadSavings::new(SavingsMethod::Sampled, "n", false, per_hit.clone()).unwrap();
+        let exact = PayloadSavings::new(SavingsMethod::Exact, "n", false, per_hit).unwrap();
+        assert_eq!(
+            sampled.rescoped(100_000).unwrap()["measured"],
+            json!("sampled"),
+            "an extrapolated figure must always say so"
+        );
+        assert!(
+            exact.rescoped(100_000).unwrap().get("measured").is_none(),
+            "absence means exact — a precise number needs no hedge"
+        );
+    }
+
+    #[test]
+    fn the_wire_block_stays_small() {
+        let mut widest = 0usize;
+        for note in [
+            "_source narrowed to the 2 fields you listed",
+            "_source excluded the 3 fields you listed",
+            "highlight fragments returned in place of _source",
+            "fields returned in place of _source",
+            "_source withheld, as requested",
+        ] {
+            let savings = PayloadSavings::new(
+                SavingsMethod::Sampled,
+                note,
+                false,
+                vec![("d".into(), 9_999_999)],
+            )
+            .unwrap();
+            let block = savings.rescoped(9_999_999).unwrap();
+            let wire = serde_json::to_vec(&block).unwrap().len() + 11;
+            widest = widest.max(wire);
+        }
+        assert!(
+            widest <= 120,
+            "the block is {widest} bytes; it was 147 before the constants came out"
+        );
+    }
+
+    // ── the notes: counts from the request, and no schema claims ──────────
+
+    #[test]
+    fn the_note_counts_what_you_asked_for_not_what_came_back() {
+        // Reported bug: asking for one field that this document lacks was
+        // answered "Sent the 0 fields you asked for" — the caller's own
+        // request, reported back to them wrongly.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["absent_field".to_string()]);
+        let request = measuring(filter.clone());
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        assert_eq!(
+            filtered[0].source,
+            json!({}),
+            "the document genuinely has none of the requested fields"
+        );
+        let savings = savings.expect("the whole default projection was withheld");
+        assert_eq!(
+            savings.note, "_source narrowed to the 1 field you listed",
+            "the count is a fact about the request, not about what matched"
+        );
+    }
+
+    #[test]
+    fn the_note_makes_no_claim_about_the_schema() {
+        // Reported bug: the `not all M` denominator moved 8 -> 11 -> 12 -> 15
+        // on the same query at different page sizes, because it described the
+        // widest document on the page. Each number was true; together they
+        // read as an unreliable statistic. There is no denominator now, so
+        // documents of different widths cannot move it.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = measuring(filter.clone());
+
+        let narrow = json!({"title": "t", "body": "y".repeat(8_000)});
+        let wide = {
+            let mut m = companion_source().as_object().cloned().unwrap();
+            m.insert("extra_a".into(), json!(1));
+            m.insert("extra_b".into(), json!(2));
+            Value::Object(m)
+        };
+        let notes: Vec<String> = [vec![hit("a", narrow)], vec![hit("b", wide)]]
+            .into_iter()
+            .map(|page| {
+                apply_source_filter_measured(page, &filter, &companions, Some(&request))
+                    .1
+                    .expect("both pages saved bytes")
+                    .note
+            })
+            .collect();
+        assert_eq!(
+            notes[0], notes[1],
+            "documents of different widths must not change the sentence"
+        );
+    }
+
+    #[test]
+    fn distinct_mechanisms_produce_distinct_sentences() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let mut notes = Vec::new();
+        for (filter, request) in [
+            (
+                SourceFilter::Includes(vec!["title".to_string()]),
+                measuring(SourceFilter::Includes(vec!["title".to_string()])),
+            ),
+            (
+                SourceFilter::Fields {
+                    includes: Vec::new(),
+                    excludes: vec!["body".to_string()],
+                },
+                measuring(SourceFilter::Fields {
+                    includes: Vec::new(),
+                    excludes: vec!["body".to_string()],
+                }),
+            ),
+            (
+                SourceFilter::Enabled(false),
+                SearchRequest {
+                    source: SourceFilter::Enabled(false),
+                    savings: SavingsMode::Exact,
+                    ..SearchRequest::default()
+                },
+            ),
+            (
+                SourceFilter::Enabled(false),
+                SearchRequest {
+                    source: SourceFilter::Enabled(false),
+                    savings: SavingsMode::Exact,
+                    fields: vec!["title".to_string()],
+                    ..SearchRequest::default()
+                },
+            ),
+        ] {
+            let (_, savings) = apply_source_filter_measured(
+                vec![hit("doc", companion_source())],
+                &filter,
+                &companions,
+                Some(&request),
+            );
+            notes.push(savings.expect("each mechanism withheld bytes").note);
+        }
+        assert_eq!(
+            notes,
+            vec![
+                "_source narrowed to the 1 field you listed",
+                "_source excluded the 1 field you listed",
+                "_source withheld, as requested",
+                "fields returned in place of _source",
+            ],
+            "the note names the mechanism; it must not read alike across mechanisms"
+        );
+    }
+
+    #[test]
+    fn suppressed_source_with_highlight_is_reported_net_of_the_fragments() {
+        let source = json!({ "body": "x".repeat(8_000) });
+        let mut h = hit("doc", source.clone());
+        let fragments: HashMap<String, Vec<String>> = HashMap::from([(
+            "body".to_string(),
+            vec!["…the <em>relevant</em> sentence…".to_string()],
+        )]);
+        h.highlight = Some(fragments.clone());
+        let request = SearchRequest {
+            source: SourceFilter::Enabled(false),
+            savings: SavingsMode::Exact,
+            highlight: Some(HighlightRequest::default()),
+            ..SearchRequest::default()
+        };
+
+        let (_, savings) = apply_source_filter_measured(
+            vec![h],
+            &SourceFilter::Enabled(false),
+            &HashSet::new(),
+            Some(&request),
+        );
+        let savings = savings.expect("an 8 KB body replaced by one fragment is a real saving");
+        assert_eq!(
+            savings.bytes,
+            wire_len(&source) - wire_len(&json!(fragments))
+        );
+        assert_eq!(
+            savings.note,
+            "highlight fragments returned in place of _source"
+        );
+    }
+
+    // ── the anti-inflation half: silence when nothing was saved ────────────
+
+    #[test]
+    fn an_index_without_companions_and_no_projection_reports_nothing() {
+        let request = measuring(SourceFilter::Default);
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", json!({"body": "text", "title": "a user field"}))],
+            &SourceFilter::Default,
+            &HashSet::new(),
+            Some(&request),
+        );
+        assert!(savings.is_none(), "nothing was withheld");
+    }
+
+    #[test]
+    fn asking_for_the_whole_document_reports_nothing_at_all() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let request = measuring(SourceFilter::Enabled(true));
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &SourceFilter::Enabled(true),
+            &companions,
+            Some(&request),
+        );
+        assert!(
+            savings.is_none(),
+            "`_source: true` returns MORE than the default projection, not less"
+        );
+    }
+
+    #[test]
+    fn a_projection_that_drops_nothing_reports_nothing_at_all() {
+        let source = json!({"title": "t", "year": 2026});
+        let filter = SourceFilter::Includes(vec!["title".to_string(), "year".to_string()]);
+        let request = measuring(filter.clone());
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", source)],
+            &filter,
+            &HashSet::new(),
+            Some(&request),
+        );
+        assert!(
+            savings.is_none(),
+            "asking for all N of N fields saves nothing, however it is spelled"
+        );
+    }
+
+    #[test]
+    fn an_empty_page_reports_nothing_at_all() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = measuring(filter.clone());
+        let (_, savings) =
+            apply_source_filter_measured(Vec::new(), &filter, &companions, Some(&request));
+        assert!(
+            savings.is_none(),
+            "an aggregation-only page returned no documents, so it withheld no document bytes"
+        );
+    }
+
+    #[test]
+    fn fragments_larger_than_the_document_report_nothing_at_all() {
+        let mut h = hit("doc", json!({ "body": "short" }));
+        h.highlight = Some(HashMap::from([(
+            "body".to_string(),
+            vec!["<em>short</em>".to_string(); 8],
+        )]));
+        let request = SearchRequest {
+            source: SourceFilter::Enabled(false),
+            savings: SavingsMode::Exact,
+            highlight: Some(HighlightRequest::default()),
+            ..SearchRequest::default()
+        };
+        let (_, savings) = apply_source_filter_measured(
+            vec![h],
+            &SourceFilter::Enabled(false),
+            &HashSet::new(),
+            Some(&request),
+        );
+        assert!(
+            savings.is_none(),
+            "when the substitute costs more than the original there is no saving to report"
+        );
+    }
+
+    #[test]
+    fn measurement_is_off_unless_the_caller_asks() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &filter,
+            &companions,
+            None,
+        );
+        assert!(savings.is_none(), "no opt-in, no measurement, no block");
+        assert_eq!(
+            filtered[0].source,
+            json!({"title": "quarterly report"}),
+            "the filtering itself is unchanged by the measurement being off"
+        );
+    }
+
+    #[test]
+    fn a_request_that_declines_measurement_gets_nothing() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = SearchRequest {
+            source: filter.clone(),
+            savings: SavingsMode::Off,
+            ..SearchRequest::default()
+        };
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        assert!(savings.is_none(), "`?savings=false` means no block");
+    }
+
+    #[test]
+    fn a_zero_total_can_never_be_rendered() {
+        assert!(
+            PayloadSavings::new(
+                SavingsMethod::Exact,
+                "anything",
+                false,
+                vec![("d".into(), 0)]
+            )
+            .is_none(),
+            "the constructor is the single gate that makes a 0-byte block unrepresentable"
+        );
+        let savings = PayloadSavings::new(
+            SavingsMethod::Exact,
+            "note",
+            false,
+            vec![("d".into(), 100_000)],
+        )
+        .unwrap();
+        assert!(
+            savings.rescoped(0).is_none(),
+            "re-scoping to a page that saved nothing must also produce nothing"
+        );
+    }
+
+    #[test]
+    fn every_hit_on_the_page_is_attributed_and_summed() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = measuring(filter.clone());
+
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("a", source.clone()), hit("b", source.clone())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        let savings = savings.expect("two hits saved bytes");
+        let per_doc =
+            wire_len(&default_projected(&source, &companions)) - wire_len(&filtered[0].source);
+        assert_eq!(savings.bytes, per_doc * 2);
+        assert_eq!(
+            savings.per_hit,
+            vec![("a".to_string(), per_doc), ("b".to_string(), per_doc)],
+            "per-hit attribution is what lets the API layer re-sum over the page it really emits"
+        );
+    }
+
+    #[test]
+    fn hybrid_legs_that_return_the_same_document_count_it_once() {
+        let leg = |id: &str| {
+            PayloadSavings::new(
+                SavingsMethod::Exact,
+                "note",
+                false,
+                vec![(id.to_string(), 500)],
+            )
+            .unwrap()
+        };
+        let merged = merge_sub_savings(vec![leg("a"), leg("a")]).expect("one document saved bytes");
+        assert_eq!(
+            merged.bytes, 500,
+            "a document found by both legs saved its bytes once, not twice"
+        );
+    }
+
+    // ── the sampled estimator: on by default, so its error is a first-class
+    //    property, not an implementation detail ─────────────────────────────
+
+    /// Deterministic LCG — the shapes below must be identical on every run,
+    /// or a tolerance assertion is just a coin flip.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_unit(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+    }
+
+    /// The shape XERJ's own built-in embedder actually emits: mostly exact
+    /// zeros with a scattered minority of full-width floats. This bimodal
+    /// distribution is what breaks naive sampling.
+    fn sparse_companion_vector() -> Value {
+        let mut rng = Lcg(0x5eed);
+        Value::Array(
+            (0..384)
+                .map(|i| {
+                    if i % 6 == 0 {
+                        json!(rng.next_unit())
+                    } else {
+                        json!(0.0)
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn dense_vector(dims: usize, seed: u64) -> Value {
+        let mut rng = Lcg(seed);
+        Value::Array((0..dims).map(|_| json!(rng.next_unit())).collect())
+    }
+
+    #[test]
+    fn sampling_tracks_the_exact_count_on_the_shapes_that_matter() {
+        let mut rng = Lcg(99);
+        let chunk_matrix = Value::Array((0..64).map(|i| dense_vector(384, 1000 + i)).collect());
+        let mixed = Value::Array(
+            (0..1000)
+                .map(|i| match i % 4 {
+                    0 => json!(1.0e-9),
+                    1 => json!(1),
+                    2 => json!(123456.789),
+                    _ => json!(rng.next_unit()),
+                })
+                .collect(),
+        );
+        let cases: Vec<(&str, Value, f64)> = vec![
+            ("sparse companion (384)", sparse_companion_vector(), 0.5),
+            ("dense vector (384)", dense_vector(384, 7), 1.5),
+            ("dense vector (1536)", dense_vector(1536, 11), 1.5),
+            ("chunk matrix (64x384)", chunk_matrix, 1.5),
+            ("mixed magnitudes (1000)", mixed, 3.0),
+            (
+                "integers (1000)",
+                Value::Array((0..1000).map(|i| json!(i * 7919)).collect()),
+                0.0,
+            ),
+        ];
+        for (name, value, tolerance) in cases {
+            let exact = json_wire_len(&value);
+            let sampled = json_len_sampled(&value);
+            let err = (sampled as f64 - exact as f64) / exact as f64 * 100.0;
+            eprintln!("{name}: exact={exact} sampled={sampled} err={err:+.2}%");
+            assert!(
+                err.abs() <= tolerance,
+                "{name}: sampled estimate is {err:+.2}% off exact \
+                 (exact={exact}, sampled={sampled}), budget {tolerance}%"
+            );
+        }
+    }
+
+    #[test]
+    fn anything_cheap_enough_to_count_exactly_is_counted_exactly() {
+        for value in [
+            json!({"title": "quarterly report", "year": 2026}),
+            json!({"body": "x".repeat(20_000)}),
+            dense_vector(SAVINGS_ARRAY_SAMPLE, 3),
+            json!([1, 2, 3, 4, 5]),
+            json!([]),
+            json!({}),
+        ] {
+            assert_eq!(
+                json_len_sampled(&value),
+                json_wire_len(&value),
+                "no sampling should have happened for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn zeros_never_enter_the_sample() {
+        let all_zero = Value::Array((0..4096).map(|_| json!(0.0)).collect());
+        assert_eq!(json_len_sampled(&all_zero), json_wire_len(&all_zero));
+        let signed_zero = Value::Array(
+            (0..4096)
+                .map(|i| json!(if i % 2 == 0 { 0.0 } else { -0.0 }))
+                .collect(),
+        );
+        assert_eq!(json_len_sampled(&signed_zero), json_wire_len(&signed_zero));
+    }
+
+    #[test]
+    fn the_default_projection_baseline_is_itself_sampled_consistently() {
+        // The baseline never serializes the companions, so it must agree with
+        // an independently built default projection under both modes.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let oracle = wire_len(&default_projected(&source, &companions));
+        assert_eq!(
+            default_projection_len(&source, &companions, SavingsMode::Exact),
+            oracle
+        );
+        let sampled = default_projection_len(&source, &companions, SavingsMode::Sampled);
+        let err = (sampled as f64 - oracle as f64) / oracle as f64 * 100.0;
+        assert!(
+            err.abs() <= 1.5,
+            "baseline drifted {err:+.2}% under sampling"
+        );
+    }
+
+    #[test]
+    fn the_method_is_labelled_on_every_record() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        for (request, expected) in [
+            (measuring(filter.clone()), SavingsMethod::Exact),
+            (measuring_sampled(filter.clone()), SavingsMethod::Sampled),
+        ] {
+            let (_, savings) = apply_source_filter_measured(
+                vec![hit("doc", companion_source())],
+                &filter,
+                &companions,
+                Some(&request),
+            );
+            assert_eq!(
+                savings.expect("bytes were withheld").measured,
+                expected,
+                "a reader must be able to tell an estimate from an exact count"
+            );
+        }
     }
 }
 
@@ -27974,7 +29295,12 @@ fn knn_result_from_scored(
         }
     })
     .collect();
-    let hits = apply_source_filter(hits, &request.source, generated_companion_fields);
+    let (hits, savings) = apply_source_filter_measured(
+        hits,
+        &request.source,
+        generated_companion_fields,
+        Some(request),
+    );
 
     SearchResult {
         hits,
@@ -27988,6 +29314,7 @@ fn knn_result_from_scored(
         profile: None,
         max_score: None,
         script_failure: None,
+        savings,
     }
 }
 
