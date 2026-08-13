@@ -113,7 +113,7 @@ pub async fn put_wal_tap(
     }
     if let Some(v) = patch.indices {
         // A pattern that can only ever match system indices is a mistake worth
-        // reporting rather than silently dropping: the tap refuses `.xerj-*`
+        // reporting rather than silently dropping: the tap refuses `.xerj*`
         // unconditionally, so such a pattern would ship nothing forever and
         // look like a broken tap.
         if let Some(bad) = v.iter().find(|p| p.starts_with(".xerj")) {

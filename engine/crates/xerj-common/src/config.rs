@@ -411,7 +411,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (105 user-facing settings total; counted by
+// Sub-configs  (114 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -2069,7 +2069,7 @@ mod tests {
             drift.join("\n  ")
         );
 
-        // …and the file's own header quotes how many of the 105 it sets. That
+        // …and the file's own header quotes how many of the 114 it sets. That
         // number was 38, then 56, and never once the truth (#207), so count the
         // assignments instead of trusting the sentence.
         let set_here = toml_src

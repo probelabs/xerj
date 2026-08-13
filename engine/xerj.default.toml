@@ -523,7 +523,8 @@ access_log = false
 #    remote must not be able to fill this node's disk. A tap that falls that far
 #    behind loses entries and reports `gaps` in GET /_xerj/wal_tap/_stats.
 #
-# System indices (.xerj-*) are never shipped, whatever `indices` says.
+# System indices (every .xerj* name, not just .xerj-memory-*) are never
+# shipped, whatever `indices` says.
 # Everything here is also settable at runtime, without a restart, via
 # PUT /_xerj/wal_tap.
 #
