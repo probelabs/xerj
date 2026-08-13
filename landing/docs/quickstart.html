@@ -118,6 +118,11 @@
   <div class="kicker"><span>01 · START</span></div>
   <h1>Quickstart</h1>
 
+  <p><strong>Audience: operators driving XERJ's native REST API on port <code class="inline">8080</code>.</strong> This page creates indices with explicit field mappings and ingests through <code class="inline">turbo-ingest</code> — the low-level path. It is <em>not</em> the agent onramp, and it deliberately does not cover <code class="inline">xerj autoindex</code>.</p>
+  <ul>
+    <li><strong>AI agents start here instead:</strong> <a href="/llms.txt"><code class="inline">/llms.txt</code></a> (install → run → index → query, written for a machine) or the <a href="/docs/agents/quickstart.html">agent quickstart</a> — both use the Elasticsearch-compatible surface on <code class="inline">9200</code>.</li>
+    <li><strong>Just want a folder to become searchable?</strong> <code class="inline">xerj autoindex &lt;folder&gt;</code> writes the mappings for you — the <a href="/docs/recipes/zero-config-autoindex.html">zero-config indexing recipe</a>.</li>
+  </ul>
 
   <p>Start the server, create an index, ingest some data, run a query. Sixty seconds if you already have a binary.</p>
 
@@ -182,7 +187,7 @@ $ xerj autoindex ~/my-project        # picks up XERJ_API_KEY, or take --api-key<
 
   <!-- Print-only branded footer (hidden on screen, visible in PDF) -->
   <div class="print-footer" style="display:none;">
-    <span>XERJ.AI · V0.1 · 2026-04-16</span>
+    <span>XERJ.AI · DOCS · V1.0.0-RC.15</span>
     <a href="https://xerj.org/docs/">https://xerj.org/docs/</a>
     <span>Quickstart</span>
   </div>
@@ -190,7 +195,7 @@ $ xerj autoindex ~/my-project        # picks up XERJ_API_KEY, or take --api-key<
 </div>
 
 <footer class="footer">
-  <span>XERJ.AI · DOCS · V1.0.0-RC.1</span>
+  <span>XERJ.AI · DOCS · V1.0.0-RC.15</span>
   <span>READ THE SOURCE</span>
   <span><a href="/index.html">HOME</a> · <a href="/product.html">PRODUCT</a> · <a href="/brand.html">BRAND</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>
