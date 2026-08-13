@@ -79,7 +79,7 @@ struct Ctx {
 }
 
 /// `--help` text for both entry points (`xerj mcp --help` and `xerj-mcp --help`).
-pub const HELP: &str = "\
+pub const HELP_BODY: &str = "\
 xerj mcp — Model Context Protocol (MCP) stdio server for XERJ
 
 USAGE:
@@ -99,6 +99,10 @@ OPTIONS:
                     request (e.g. 'ApiKey <token>'). Overrides XERJ_AUTH.
     -h, --help      Show this help
     -V, --version   Print version and exit
+    --disable-feedback
+                    Do not print the feedback invitation above. Honoured in any
+                    position, including after --help.
+                    Env: XERJ_DISABLE_FEEDBACK=true
 
 ENVIRONMENT:
     XERJ_URL        Same as --url
@@ -125,6 +129,22 @@ error. When the node is not running --insecure, add
 Diagnostics go to stderr; stdout carries only the JSON-RPC stream.
 ";
 
+/// The help text with the feedback invitation spliced in above `USAGE:`, the
+/// same position the other four surfaces use.
+///
+/// `xerj mcp` became a help surface after the invitation shipped, so by this
+/// feature's own rule — every screen the top-level help advertises should ask —
+/// it belongs here too.
+pub fn help_text(feedback: bool) -> String {
+    let (first, rest) = HELP_BODY
+        .split_once("\nUSAGE:")
+        .expect("HELP_BODY carries a USAGE: section");
+    format!(
+        "{first}\n{}USAGE:{rest}",
+        xerj_common::feedback::block(feedback)
+    )
+}
+
 /// Library entry point. `args` are the arguments *after* the subcommand
 /// (`xerj mcp <args>`) or after the program name (`xerj-mcp <args>`).
 ///
@@ -138,9 +158,14 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                print!("{HELP}");
+                print!("{}", help_text(xerj_common::feedback::enabled()));
                 return Ok(());
             }
+            // Accepted, not acted on here: `feedback::enabled` reads the whole
+            // argument list, so the flag works in any position. Without this
+            // arm it would be rejected as an unknown argument on the one
+            // surface it is meant to control.
+            xerj_common::feedback::DISABLE_FLAG => {}
             "-V" | "--version" => {
                 println!("xerj-mcp {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());

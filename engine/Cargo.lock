@@ -6933,6 +6933,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+ "xerj-common",
 ]
 
 [[package]]
