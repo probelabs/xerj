@@ -7,7 +7,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- **BREAKING — `PUT /{index}` now refuses an `analysis` block XERJ cannot
+  honour, instead of accepting it and analysing differently**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)).
+  `AnalyzerRegistry::apply_settings` is total by design (it also runs when an
+  existing index is opened, where a hard failure would brick it), so an
+  unresolvable tokenizer silently became `standard` and an unresolvable token
+  filter was dropped — the index was created, `GET /_settings` echoed the block
+  back, and the field was analysed in a way nobody asked for. Index creation
+  now validates the block and answers `400` with the exact constructs it cannot
+  build. `PUT /{index}/_settings` with an `analysis` block is likewise refused
+  (it only ever changed what `GET /_settings` echoed; the registry is built
+  once, at create/open, and there is no rebuild path — Elasticsearch also
+  refuses analysis updates on an open index).
+
+  **This rejects settings blocks that XERJ used to accept with a `200`, and the
+  ES-YAML conformance suite does not cover them — CI being green is not
+  evidence that your index still creates.** What is honoured:
+
+  | | honoured (still `200`) |
+  |---|---|
+  | `analysis.filter.*.type` | `synonym`, `length`, `shingle`, `asciifolding` |
+  | `analysis.tokenizer.*.type` | `ngram`, `edge_ngram`, `pattern` |
+  | `analysis.analyzer.*.type` (non-custom) | any name the built-in registry resolves — measured: `standard`, `english`, `whitespace`, `keyword` |
+  | `analysis.char_filter` | nothing — the char-filter slot is hard-coded empty |
+  | `analysis.normalizer` | nothing — never built |
+
+  Anything else in those positions is now a `400`. There is one important
+  exception to read first: XERJ resolves a declared filter or tokenizer by
+  **name**, not by `type`, so a declaration whose *name* is a built-in is still
+  honoured whatever its type says. Measured, all still `200`:
+  `{"english_stop": {"type": "stop", "stopwords": "_english_"}}`,
+  `{"lowercase": {"type": "lowercase"}}`,
+  `{"stemmer"|"english_stemmer": {"type": "stemmer", "language": "english"}}`
+  — the canonical Elasticsearch-docs `rebuilt_english` block among them, which
+  has a regression test pinning it. Naming a built-in analyzer on a field
+  (`"analyzer": "english"`) needs no `analysis` block at all and is unaffected.
+
+  What now fails is a declaration under a name that does NOT resolve — which is
+  the usual ES habit of naming filters after what they do in *your* index.
+  Measured blocks that returned `200` in rc.14 and return `400` from this
+  release:
+
+  - a `keyword` field's `normalizer` (any);
+  - a `char_filter` (any, including `html_strip` and `mapping`), declared
+    either under `analysis.char_filter` or as an analyzer's `char_filter`;
+  - a custom-named token filter whose `type` is `lowercase`, `stop`, `stemmer`,
+    `snowball`, `kstem`, `porter_stem`, `ngram`, `edge_ngram`,
+    `word_delimiter_graph`, `trim`, `unique`, `elision`, `decimal_digit`,
+    `apostrophe`, `limit`, `truncate`, `pattern_replace`, `keyword_marker`,
+    `uppercase` or `reverse` — e.g. `{"my_lowercase": {"type": "lowercase"}}`,
+    which never lowercased anything, because the analyzer referencing
+    `my_lowercase` found no such filter and dropped it;
+  - a custom-named tokenizer whose `type` is `standard`, `whitespace`,
+    `keyword`, `classic`, `uax_url_email`, `path_hierarchy`, `char_group`,
+    `letter`, `lowercase` or `simple_pattern`;
+  - an analyzer whose non-custom `type` is `simple`, `stop`, `pattern`,
+    `fingerprint`, or a language other than `english`;
+  - a `synonym` filter whose `synonyms` is a bare string rather than an array
+    (it built a filter with zero rules).
+
+  **Upgrading:** there is no opt-out flag. Either remove the analysis block and
+  name a built-in analyzer on the field (`"analyzer": "english"`), or keep only
+  the constructs in the table. The `400` names every offending construct in one
+  response, so one round-trip is enough to see the whole list. **Two paths are
+  not covered and still accept these blocks silently: an index template's
+  `template.settings.analysis` is dropped wholesale before the gate ever sees
+  it, and option-level divergence inside a supported type (`synonyms_path`,
+  `length.min`, `asciifolding.preserve_original`) is not checked at all.**
+
+### Fixed
+
+- **`200 acknowledged` on an ingest pipeline now means "we will run this", and
+  every write path enforces it**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)).
+  `PUT /_ingest/pipeline/{id}` used to store the raw body first and only
+  warn-log a compile failure, so a pipeline that could never run was
+  acknowledged and echoed back by `GET`. It now compiles first, with three
+  outcomes: compiled → stored and acknowledged; a processor config we refuse →
+  `400`; a processor or option this build cannot honour → accepted (as
+  Elasticsearch does) but recorded as **unrunnable**, so the write refuses
+  rather than storing an untransformed document.
+
+  Defects this surfaced, each of which answered `200`/`201` and did something
+  smaller than asked: **every** ES `rename` processor failed to compile (the
+  handler emitted `{from, to}`, the plugin requires `{mappings: {…}}`) and
+  renamed nothing; ES `append` was executed as `set`, replacing the field
+  instead of extending it, and disagreeing with `_simulate`, which implemented
+  a real append; `set.override` defaulted to `false` where Elasticsearch
+  defaults it to `true`; an unknown `pii_redaction` type built an empty pattern
+  set and redacted nothing; an unknown `grok` pattern name silently became the
+  catch-all; an unknown `convert` target left the field unconverted per
+  document; array-typed keys given as a bare string were dropped and the stage
+  behaved as if unconfigured; and `DELETE /_ingest/pipeline/{id}` removed the
+  definition while leaving the compiled pipeline live under the same name.
+  ES `convert` `long`/`double` now map to XERJ's equivalent `integer`/`float`
+  rather than being refused.
+
+  Two more of the same, at the definition's own edges: a **pipeline-level**
+  `on_failure` block (the top-level body key, not the processor-level one) was
+  accepted, echoed by `GET`, and never run — the pipeline is now recorded
+  unrunnable, exactly as its processor-level twin already was; and `set` with
+  Elasticsearch's `copy_from` is reported as an unsupported *option* (accepted
+  at `PUT`, refused at the write) rather than as `mapper_parsing_exception:
+  missing value`, which told the caller their valid ES pipeline was malformed.
+
+  **The refusal now covers every ingest path, not only `PUT /{index}/_doc`.**
+  `POST /_bulk?pipeline=`, `index.default_pipeline` under `_bulk`,
+  `_reindex` `dest.pipeline` and `POST /{index}/_update_by_query?pipeline=`
+  previously read the instruction and dropped it — a redaction pipeline that
+  the single-document endpoint refused was ignored in bulk, and the document
+  was stored verbatim under `errors: false`. All four now run the pipeline, and
+  refuse when it cannot run. `_reindex` and `_update_by_query` validate the
+  name before touching a single document, so a bad pipeline fails the request
+  instead of half of it.
+
+  Two related honesty fixes on the same paths: `_clone` / `_shrink` / `_split`
+  copied at most 10,000 documents and swallowed every per-document write error
+  before answering `{"acknowledged": true}` (now full keyset paging, and any
+  failed write — or a failed source flush — fails the request); and a failed
+  `_bulk` item no longer reports `"result": "deleted"` alongside its own
+  `status: 400`, which claimed a deletion that never happened.
+
+  **Known gaps, stated rather than closed:** `_simulate` interprets the stored
+  ES body directly and covers processors the compiled path does not, so a
+  pipeline recorded as unrunnable can still show a transformation under
+  `_simulate` that ingest refuses to perform; `GET /_ingest/pipeline/{id}`
+  returns the stored definition (the ES body for an unrunnable pipeline, the
+  compiled shape otherwise) with no runnability signal, so an operator only
+  learns at write time; a write addressed to an **alias** does not pick up the
+  backing index's `default_pipeline`; and `_update_by_query` reports a `drop`
+  processor as a per-document failure, because it updates in place and has no
+  delete path.
 
 ## [1.0.0-rc.16] - 2026-08-13
 
@@ -783,75 +916,6 @@ documented "at most one bar per 15 s" floor is really 12.5 s.
 
 ### Changed
 
-- **BREAKING — `PUT /{index}` now refuses an `analysis` block XERJ cannot
-  honour, instead of accepting it and analysing differently**
-  ([#204](https://github.com/xerj-org/xerj/issues/204)).
-  `AnalyzerRegistry::apply_settings` is total by design (it also runs when an
-  existing index is opened, where a hard failure would brick it), so an
-  unresolvable tokenizer silently became `standard` and an unresolvable token
-  filter was dropped — the index was created, `GET /_settings` echoed the block
-  back, and the field was analysed in a way nobody asked for. Index creation
-  now validates the block and answers `400` with the exact constructs it cannot
-  build. `PUT /{index}/_settings` with an `analysis` block is likewise refused
-  (it only ever changed what `GET /_settings` echoed; the registry is built
-  once, at create/open, and there is no rebuild path — Elasticsearch also
-  refuses analysis updates on an open index).
-
-  **This rejects settings blocks that XERJ used to accept with a `200`, and the
-  ES-YAML conformance suite does not cover them — CI being green is not
-  evidence that your index still creates.** What is honoured:
-
-  | | honoured (still `200`) |
-  |---|---|
-  | `analysis.filter.*.type` | `synonym`, `length`, `shingle`, `asciifolding` |
-  | `analysis.tokenizer.*.type` | `ngram`, `edge_ngram`, `pattern` |
-  | `analysis.analyzer.*.type` (non-custom) | any name the built-in registry resolves — measured: `standard`, `english`, `whitespace`, `keyword` |
-  | `analysis.char_filter` | nothing — the char-filter slot is hard-coded empty |
-  | `analysis.normalizer` | nothing — never built |
-
-  Anything else in those positions is now a `400`. There is one important
-  exception to read first: XERJ resolves a declared filter or tokenizer by
-  **name**, not by `type`, so a declaration whose *name* is a built-in is still
-  honoured whatever its type says. Measured, all still `200`:
-  `{"english_stop": {"type": "stop", "stopwords": "_english_"}}`,
-  `{"lowercase": {"type": "lowercase"}}`,
-  `{"stemmer"|"english_stemmer": {"type": "stemmer", "language": "english"}}`
-  — the canonical Elasticsearch-docs `rebuilt_english` block among them, which
-  has a regression test pinning it. Naming a built-in analyzer on a field
-  (`"analyzer": "english"`) needs no `analysis` block at all and is unaffected.
-
-  What now fails is a declaration under a name that does NOT resolve — which is
-  the usual ES habit of naming filters after what they do in *your* index.
-  Measured blocks that returned `200` in rc.14 and return `400` from this
-  release:
-
-  - a `keyword` field's `normalizer` (any);
-  - a `char_filter` (any, including `html_strip` and `mapping`), declared
-    either under `analysis.char_filter` or as an analyzer's `char_filter`;
-  - a custom-named token filter whose `type` is `lowercase`, `stop`, `stemmer`,
-    `snowball`, `kstem`, `porter_stem`, `ngram`, `edge_ngram`,
-    `word_delimiter_graph`, `trim`, `unique`, `elision`, `decimal_digit`,
-    `apostrophe`, `limit`, `truncate`, `pattern_replace`, `keyword_marker`,
-    `uppercase` or `reverse` — e.g. `{"my_lowercase": {"type": "lowercase"}}`,
-    which never lowercased anything, because the analyzer referencing
-    `my_lowercase` found no such filter and dropped it;
-  - a custom-named tokenizer whose `type` is `standard`, `whitespace`,
-    `keyword`, `classic`, `uax_url_email`, `path_hierarchy`, `char_group`,
-    `letter`, `lowercase` or `simple_pattern`;
-  - an analyzer whose non-custom `type` is `simple`, `stop`, `pattern`,
-    `fingerprint`, or a language other than `english`;
-  - a `synonym` filter whose `synonyms` is a bare string rather than an array
-    (it built a filter with zero rules).
-
-  **Upgrading:** there is no opt-out flag. Either remove the analysis block and
-  name a built-in analyzer on the field (`"analyzer": "english"`), or keep only
-  the constructs in the table. The `400` names every offending construct in one
-  response, so one round-trip is enough to see the whole list. **Two paths are
-  not covered and still accept these blocks silently: an index template's
-  `template.settings.analysis` is dropped wholesale before the gate ever sees
-  it, and option-level divergence inside a supported type (`synonyms_path`,
-  `length.min`, `asciifolding.preserve_original`) is not checked at all.**
-
 - **`autoindex` parses each PDF once per fresh run instead of twice.** Phase A
   already paid a *complete* parse for every PDF — `extract::extract` routes
   `Family::Pdf` straight to the isolated worker and drops the sampling limit,
@@ -922,68 +986,6 @@ documented "at most one bar per 15 s" floor is really 12.5 s.
   file. `--json` still carries every entry.
 
 ### Fixed
-
-- **`200 acknowledged` on an ingest pipeline now means "we will run this", and
-  every write path enforces it**
-  ([#204](https://github.com/xerj-org/xerj/issues/204)).
-  `PUT /_ingest/pipeline/{id}` used to store the raw body first and only
-  warn-log a compile failure, so a pipeline that could never run was
-  acknowledged and echoed back by `GET`. It now compiles first, with three
-  outcomes: compiled → stored and acknowledged; a processor config we refuse →
-  `400`; a processor or option this build cannot honour → accepted (as
-  Elasticsearch does) but recorded as **unrunnable**, so the write refuses
-  rather than storing an untransformed document.
-
-  Defects this surfaced, each of which answered `200`/`201` and did something
-  smaller than asked: **every** ES `rename` processor failed to compile (the
-  handler emitted `{from, to}`, the plugin requires `{mappings: {…}}`) and
-  renamed nothing; ES `append` was executed as `set`, replacing the field
-  instead of extending it, and disagreeing with `_simulate`, which implemented
-  a real append; `set.override` defaulted to `false` where Elasticsearch
-  defaults it to `true`; an unknown `pii_redaction` type built an empty pattern
-  set and redacted nothing; an unknown `grok` pattern name silently became the
-  catch-all; an unknown `convert` target left the field unconverted per
-  document; array-typed keys given as a bare string were dropped and the stage
-  behaved as if unconfigured; and `DELETE /_ingest/pipeline/{id}` removed the
-  definition while leaving the compiled pipeline live under the same name.
-  ES `convert` `long`/`double` now map to XERJ's equivalent `integer`/`float`
-  rather than being refused.
-
-  Two more of the same, at the definition's own edges: a **pipeline-level**
-  `on_failure` block (the top-level body key, not the processor-level one) was
-  accepted, echoed by `GET`, and never run — the pipeline is now recorded
-  unrunnable, exactly as its processor-level twin already was; and `set` with
-  Elasticsearch's `copy_from` is reported as an unsupported *option* (accepted
-  at `PUT`, refused at the write) rather than as `mapper_parsing_exception:
-  missing value`, which told the caller their valid ES pipeline was malformed.
-
-  **The refusal now covers every ingest path, not only `PUT /{index}/_doc`.**
-  `POST /_bulk?pipeline=`, `index.default_pipeline` under `_bulk`,
-  `_reindex` `dest.pipeline` and `POST /{index}/_update_by_query?pipeline=`
-  previously read the instruction and dropped it — a redaction pipeline that
-  the single-document endpoint refused was ignored in bulk, and the document
-  was stored verbatim under `errors: false`. All four now run the pipeline, and
-  refuse when it cannot run. `_reindex` and `_update_by_query` validate the
-  name before touching a single document, so a bad pipeline fails the request
-  instead of half of it.
-
-  Two related honesty fixes on the same paths: `_clone` / `_shrink` / `_split`
-  copied at most 10,000 documents and swallowed every per-document write error
-  before answering `{"acknowledged": true}` (now full keyset paging, and any
-  failed write — or a failed source flush — fails the request); and a failed
-  `_bulk` item no longer reports `"result": "deleted"` alongside its own
-  `status: 400`, which claimed a deletion that never happened.
-
-  **Known gaps, stated rather than closed:** `_simulate` interprets the stored
-  ES body directly and covers processors the compiled path does not, so a
-  pipeline recorded as unrunnable can still show a transformation under
-  `_simulate` that ingest refuses to perform; `GET /_ingest/pipeline/{id}`
-  returns the stored definition (the ES body for an unrunnable pipeline, the
-  compiled shape otherwise) with no runnability signal, so an operator only
-  learns at write time; a write addressed to an **alias** does not pick up the
-  backing index's `default_pipeline`; and `_update_by_query` reports a `drop`
-  processor as a per-document failure, because it updates in place and has no
-  delete path.
 
 - **An index whose metadata will not parse is refused instead of silently
   reopened with an empty mapping**
