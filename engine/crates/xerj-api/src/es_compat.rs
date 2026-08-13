@@ -1013,7 +1013,16 @@ pub async fn create_index(
     }
 
     let schema = if let Some(props) = mappings_val.get("properties") {
-        es_properties_to_schema(props)
+        // #275: a field asked for something this build cannot deliver (an
+        // unimplemented or unknown `quantization`). Refuse the create rather
+        // than acknowledge it and echo the value back from `GET /_mapping`.
+        match es_properties_to_schema(props) {
+            Ok(schema) => schema,
+            Err(reason) => {
+                let e = xerj_common::XerjError::invalid_mapping(reason);
+                return ApiError::new(e).into_response();
+            }
+        }
     } else {
         Schema::empty()
     };
@@ -1170,6 +1179,16 @@ fn validate_properties(props: &serde_json::Map<String, Value>) -> Result<(), Str
                 return Err(format!(
                     "Failed to parse mapping: The mapper type [{t}] declared on field [{name}] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation."
                 ));
+            }
+            // #275: the same `quantization` guard `es_properties_to_fields`
+            // enforces, applied on the validation walk as well. Not
+            // belt-and-braces: this walk recurses into `fields` (multi-fields)
+            // where the schema builder does not, so a `dense_vector` declared
+            // as a multi-field would otherwise still be accepted, echoed back
+            // by `GET /_mapping`, and dropped on the floor. One shared
+            // resolver means one accepted set and one error message.
+            if t == "dense_vector" {
+                resolve_vector_quantization(name, spec)?;
             }
         }
         // Recurse into sub-properties and multi-fields.
@@ -2283,7 +2302,18 @@ pub async fn put_mapping(
         if let Some(properties) = body.get("properties") {
             let current = idx.schema().await;
             let mut candidate = current.clone();
-            for field in es_properties_to_fields(properties) {
+            // #275: refuse here too, and refuse in the plan phase — this loop
+            // runs per target index, so an unimplemented `quantization` in a
+            // multi-index `PUT _mapping` must abort before any of it is
+            // published rather than after half of it took effect.
+            let parsed = match es_properties_to_fields(properties) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    let e = xerj_common::XerjError::invalid_mapping(reason);
+                    return ApiError::new(e).into_response();
+                }
+            };
+            for field in parsed {
                 if let Some(existing_field) = current.field(&field.name) {
                     if existing_field.field_type != field.field_type {
                         let e = xerj_common::XerjError::invalid_mapping(format!(
@@ -14903,19 +14933,104 @@ mod script_query_end_to_end_tests {
 // Schema conversion helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn es_properties_to_schema(properties: &Value) -> Schema {
-    let mut schema = Schema::empty();
-    for field in es_properties_to_fields(properties) {
-        let _ = schema.add_field(field);
+/// Decide what a `dense_vector` field's `quantization` means — the single
+/// place that knows which schemes this build actually implements.
+///
+/// **`quantization` is strict; `index_options.type` is not, and the asymmetry
+/// is deliberate.** `index_options.type` is Elasticsearch's key: a real ES
+/// mapping carrying `hnsw`, `flat`, `bbq_hnsw` or `int4_hnsw` must still
+/// create an index here, because refusing it would break the wire
+/// compatibility this surface exists for. Those families are served by the
+/// exact f32 scan, which still answers the contract ES states for them (a
+/// nearest-neighbour result set) — a substitution that costs memory, not
+/// answers. `quantization` is XERJ's own key with no ES meaning, so nothing is
+/// owed to compatibility and everything is owed to the operator: the value is
+/// a request for a specific memory/recall trade, and the only honest answers
+/// are "done" and "no".
+///
+/// Issue #275: this match used to end in `_ => {}`. `"scalar4"`, `"binary"`,
+/// `"int4"` and typos such as `"sq8"` were accepted with a `200`, echoed back
+/// verbatim by `GET /_mapping`, and then ignored — the field stored
+/// full-precision f32 while the mapping the operator read back to confirm it
+/// said otherwise. Only `Some("scalar8")` is ever read by the serving path
+/// (`xerj-engine/src/index.rs:10440` and `:10847`), so every other value was
+/// inert. `Config::validate` has refused an unimplemented `[vector]
+/// default_quantization` since #207; this is the same guard at the other
+/// surface that sets the same field.
+fn resolve_vector_quantization(
+    field_name: &str,
+    field_def: &Value,
+) -> Result<Option<String>, String> {
+    // ES expresses 8-bit scalar quantization through `index_options.type`:
+    // the `int8_*` families map onto our serving-path SQ8 code store. Every
+    // other family keeps the exact f32 scan, so `quantization` stays unset for
+    // them and their behaviour is byte-identical to an unquantized field.
+    let mut quant: Option<String> = None;
+    if let Some(io_type) = field_def
+        .get("index_options")
+        .and_then(|io| io.get("type"))
+        .and_then(Value::as_str)
+    {
+        if matches!(io_type, "int8_hnsw" | "int8_flat") {
+            quant = Some("scalar8".to_string());
+        }
     }
-    schema
+
+    let Some(q) = field_def.get("quantization") else {
+        return Ok(quant);
+    };
+    let Some(q) = q.as_str() else {
+        return Err(format!(
+            "Failed to parse mapping: [quantization] on field [{field_name}] must be a string; \
+             this build implements [\"none\"] and [\"scalar8\"] (alias [\"int8\"])"
+        ));
+    };
+    match q {
+        // Honoured: a `scalar8` field keeps a per-field u8 code store and the
+        // kNN path scores candidates by decoding those codes.
+        "scalar8" | "int8" => Ok(Some("scalar8".to_string())),
+        // Explicit opt-out, and it overrides an `int8_*` index_options.type.
+        "none" => Ok(None),
+        // Named but unimplemented. `binary` is refused for exactly the reason
+        // `Config::validate` refuses `default_quantization = "binary"`: there
+        // is no BinaryQuantizer, so honouring it would store full precision
+        // while the operator sized a cluster on a 32× reduction. `scalar4` /
+        // `int4` do have a `Scalar4Quantizer` in xerj-vector, but nothing in
+        // the serving path reaches it — an unreachable quantizer is not an
+        // implemented one, and accepting the name is the same lie in a
+        // smaller font.
+        "binary" | "scalar4" | "int4" => Err(format!(
+            "Failed to parse mapping: quantization [{q}] on field [{field_name}] is not \
+             implemented in this build and would silently store full-precision vectors; \
+             this build implements [\"none\"] and [\"scalar8\"] (alias [\"int8\"])"
+        )),
+        other => Err(format!(
+            "Failed to parse mapping: unknown quantization [{other}] on field [{field_name}]; \
+             this build implements [\"none\"] and [\"scalar8\"] (alias [\"int8\"])"
+        )),
+    }
 }
 
-fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
+fn es_properties_to_schema(properties: &Value) -> Result<Schema, String> {
+    let mut schema = Schema::empty();
+    for field in es_properties_to_fields(properties)? {
+        let _ = schema.add_field(field);
+    }
+    Ok(schema)
+}
+
+/// Convert an ES `properties` object into engine [`FieldConfig`]s.
+///
+/// Returns `Err` with an ES-shaped `mapper_parsing_exception` reason when a
+/// field asks for something this build cannot deliver. The check lives *here*,
+/// at the site every engine schema is built from, and not only beside the
+/// handlers: #207's sibling defect survived a fix placed next to one handler
+/// because a second entry point kept building schemas the old way.
+fn es_properties_to_fields(properties: &Value) -> Result<Vec<FieldConfig>, String> {
     let mut fields = Vec::new();
     let obj = match properties.as_object() {
         Some(o) => o,
-        None => return fields,
+        None => return Ok(fields),
     };
     for (field_name, field_def) in obj {
         let es_type = field_def
@@ -14936,7 +15051,7 @@ fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
         let native_type = es_type_to_native(es_type);
         let mut fc = FieldConfig::new(field_name.clone(), native_type);
         if let Some(sub_props) = field_def.get("properties") {
-            fc.fields = es_properties_to_fields(sub_props);
+            fc.fields = es_properties_to_fields(sub_props)?;
         }
 
         // `doc_values` — carry the DECLARED mapping intent onto the field.
@@ -15064,32 +15179,7 @@ fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
                 fc.options.similarity = Some("cosine".to_string());
             }
 
-            // Opt-in scalar8 (SQ8) quantization. ES expresses this via
-            // `index_options.type`: the `int8_*` families are 8-bit scalar
-            // quantized, which we map to our serving-path SQ8 code store. A
-            // direct `quantization` string on the field def is also honoured
-            // (and overrides). Only `scalar8` changes the serving path — every
-            // other family (hnsw/flat/bbq*/int4*) keeps the exact f32 scan, so
-            // we leave `quantization` unset (None) for them and default
-            // behaviour stays byte-identical.
-            let mut quant: Option<String> = None;
-            if let Some(io_type) = field_def
-                .get("index_options")
-                .and_then(|io| io.get("type"))
-                .and_then(Value::as_str)
-            {
-                if matches!(io_type, "int8_hnsw" | "int8_flat") {
-                    quant = Some("scalar8".to_string());
-                }
-            }
-            if let Some(q) = field_def.get("quantization").and_then(Value::as_str) {
-                match q {
-                    "scalar8" | "int8" => quant = Some("scalar8".to_string()),
-                    "none" => quant = None,
-                    _ => {}
-                }
-            }
-            fc.options.quantization = quant;
+            fc.options.quantization = resolve_vector_quantization(field_name, field_def)?;
         }
 
         fields.push(fc);
@@ -15119,7 +15209,7 @@ fn es_properties_to_fields(properties: &Value) -> Vec<FieldConfig> {
         })
         .collect();
     fields.extend(semantic_companions);
-    fields
+    Ok(fields)
 }
 
 fn field_configs_contain_logical_path(fields: &[FieldConfig], target: &str) -> bool {
@@ -15175,7 +15265,8 @@ mod semantic_companion_schema_tests {
                 "similarity": "dot_product"
             },
             "ports": { "type": "object" }
-        }));
+        }))
+        .expect("valid mapping");
 
         let body = fields.iter().find(|field| field.name == "body").unwrap();
         assert_eq!(
@@ -15209,7 +15300,8 @@ mod semantic_companion_schema_tests {
                 "dims": 7,
                 "similarity": "l2_norm"
             }
-        }));
+        }))
+        .expect("valid mapping");
 
         assert_eq!(
             fields
@@ -15313,7 +15405,8 @@ mod semantic_companion_schema_tests {
                 "dimensions": 16
             },
             "measurements": { "type": "object" }
-        }));
+        }))
+        .expect("valid mapping");
 
         let vectors: Vec<_> = fields
             .iter()
