@@ -1770,7 +1770,10 @@ mod help_text_tests {
     /// describe both halves of what the flag does.
     #[test]
     fn insecure_help_documents_auth_not_just_tls() {
-        let help = help_text();
+        // `false` so this test reads the flag documentation alone: whether the
+        // feedback invitation is present is a separate concern with its own
+        // tests, and mixing them would make this one fail for the wrong reason.
+        let help = help_text(false);
         let line = help
             .lines()
             .position(|l| l.contains("--insecure"))
