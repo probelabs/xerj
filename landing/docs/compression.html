@@ -122,13 +122,15 @@
   <p>XERJ uses two layers of compression. <strong>Column encodings</strong> are chosen per-field at write time based on the column's shape. <strong>Block compression</strong> runs over the encoded column data. The two together give XERJ a smaller on-disk footprint than Elasticsearch — measured 1.61× smaller vs ES 8.13.4 on the reproducible telemetry-corpus scorecard (the exact ratio varies by data shape).</p>
 
   <h2>Block compression</h2>
-  <p>Three levels, controlled by <code class="inline">[compression] level</code>:</p>
+  <p>Three Zstandard effort levels, controlled by <code class="inline">[compression] level</code>:</p>
   <ul>
-    <li><strong>fast</strong> — LZ4. ~500 MB/s throughput. Use for write-heavy paths.</li>
-    <li><strong>balanced</strong> — Zstd L3. Default. ~3-4× ratio.</li>
-    <li><strong>best</strong> — Zstd L19. ~5-6× ratio. Use for cold indices you query rarely.</li>
+    <li><strong>fast</strong> — Zstd L1. Fastest encode, loosest ratio.</li>
+    <li><strong>balanced</strong> — Zstd L3. Default.</li>
+    <li><strong>best</strong> — Zstd L6. Tightest measured ratio per byte of decode window. Use for cold indices you query rarely.</li>
   </ul>
-  <p><code class="inline">block_size_docs</code> (16-4096, default 128) controls the compression block size.</p>
+  <p><strong>The level applies at merge, not at flush.</strong> Freshly flushed segments are always written at L3: flush is the back-pressure-critical bound on ingest, and raising its level once collapsed sustained throughput from 1.55M docs/s to 21k docs/s with 75% of documents rejected. Merges run off that path, and they are what produces the long-lived segments where footprint actually matters. So a level change takes effect as segments merge, not the instant you restart — and re-merging an existing index (<code class="inline">POST /{index}/_forcemerge</code>) applies it to data already on disk.</p>
+  <p>Levels are a write-side choice only. Zstd decoding does not depend on the level a payload was written at, so segments written at different levels coexist in one index with no migration and no reindex.</p>
+  <p><code class="inline">enabled</code> and <code class="inline">block_size_docs</code> are <strong>accepted but not wired</strong>. Every durable artifact XERJ writes is a compressed envelope with no uncompressed write path, so <code class="inline">enabled = false</code> does nothing; and the stored codec is columnar over the whole segment section rather than blocked by document count, so there is no doc-block for <code class="inline">block_size_docs</code> (16-4096, default 128) to size. Setting either off its default logs a warning at startup. Both were silently ignored before <a href="https://github.com/xerj-org/xerj/issues/318">#318</a>.</p>
 
   <h2>Column encodings</h2>
   <p>Picked automatically at ingest time from this set:</p>

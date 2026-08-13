@@ -182,6 +182,20 @@ impl Config {
             return Err(XerjError::config("merge.min_segments must be >= 2"));
         }
 
+        // Compression: block_size_docs is documented as 16–4096 and was
+        // accepted at any value (#318 got `999999` past startup in silence).
+        // Range-check it even though the knob is dormant: an out-of-range
+        // value is a typo the operator wants to hear about now, and the check
+        // must not start passing quietly if the knob is ever wired.
+        if !CompressionConfig::BLOCK_SIZE_DOCS_RANGE.contains(&self.compression.block_size_docs) {
+            return Err(XerjError::config(format!(
+                "compression.block_size_docs must be in {}..={}, got {}",
+                CompressionConfig::BLOCK_SIZE_DOCS_RANGE.start(),
+                CompressionConfig::BLOCK_SIZE_DOCS_RANGE.end(),
+                self.compression.block_size_docs
+            )));
+        }
+
         // Vector: hnsw_ef_construction >= hnsw_m
         if self.vector.hnsw_ef_construction < self.vector.hnsw_m {
             return Err(XerjError::config(
@@ -916,14 +930,28 @@ pub enum MergeStrategy {
 #[serde(default, deny_unknown_fields)]
 pub struct CompressionConfig {
     /// Enable block compression for stored fields (default: `true`).
+    ///
+    /// **Dormant.** Every durable artifact XERJ writes is a self-describing
+    /// compressed envelope (`ZBS2` stored, `ZFM4` `.meta`, `ZPS1` `.post`,
+    /// the zstd-flagged `.dv` columns); "off" would mean emitting the legacy
+    /// uncompressed layouts, which only exist as read-side compatibility
+    /// paths. Setting `false` warns at startup — see
+    /// [`CompressionConfig::dormant_overrides`].
     pub enabled: bool,
     /// Compression level: `"fast"`, `"balanced"`, or `"best"` (default: `"balanced"`).
     ///
-    /// Uses LZ4 for `"fast"` and Zstandard for `"balanced"` / `"best"`.
+    /// Selects the Zstandard effort level used to re-encode a segment's
+    /// durable artifacts **at merge time**. See [`CompressionLevel`] for the
+    /// level each name maps to, and why flush ignores this knob.
     pub level: CompressionLevel,
     /// Number of documents per compressed block (default: `128`).
     ///
-    /// Larger blocks compress better but increase random read amplification.
+    /// **Dormant.** Kept because it has shipped in `xerj.default.toml` since
+    /// v0.1, but XERJ's stored codec is columnar over the whole segment
+    /// section rather than blocked by document count, so there is no
+    /// doc-block for this to size. Validated against its documented 16–4096
+    /// range and warned about when moved off the default — see
+    /// [`CompressionConfig::dormant_overrides`].
     pub block_size_docs: u32,
 }
 
@@ -937,16 +965,111 @@ impl Default for CompressionConfig {
     }
 }
 
-/// Compression level.
+impl CompressionConfig {
+    /// The documented range for `block_size_docs`, quoted in
+    /// `xerj.default.toml` and on `landing/docs/config.html`.
+    pub const BLOCK_SIZE_DOCS_RANGE: std::ops::RangeInclusive<u32> = 16..=4096;
+
+    /// Compression settings this build accepts but does not act on, in the
+    /// same `("compression.key", "what actually happens")` shape as
+    /// [`MergeConfig::dormant_overrides`], and reported the same way — only
+    /// when the operator has moved one off its default.
+    ///
+    /// Issue #318 found the whole `[compression]` section inert: two servers
+    /// differing only in `enabled` / `level` / `block_size_docs` produced
+    /// byte-identical segments (`.seg` 261,481 / `.dv` 10,679 / `.post`
+    /// 192,287 on a 3,000-doc corpus), with no error and no warning, while
+    /// the docs described all three as live. `level` is now wired into the
+    /// merge re-encode; these two are not, and stay accepted-but-warned for
+    /// the reason `merge.io_rate_mb_per_sec` does — both ship non-default in
+    /// no config the project itself hands out, and the cost of ignoring them
+    /// is disk footprint, not data.
+    pub fn dormant_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        let d = CompressionConfig::default();
+        let mut out = Vec::new();
+        if self.enabled != d.enabled {
+            out.push((
+                "compression.enabled",
+                "durable artifacts are always compressed in this build — the \
+                 stored (ZBS2), .meta (ZFM4), .post (ZPS1) and .dv envelopes \
+                 have no uncompressed write path, only legacy read support",
+            ));
+        }
+        if self.block_size_docs != d.block_size_docs {
+            out.push((
+                "compression.block_size_docs",
+                "nothing reads it — the stored codec is columnar over the \
+                 whole segment section, not blocked by document count",
+            ));
+        }
+        out
+    }
+}
+
+/// Compression level — the Zstandard effort applied when a segment's durable
+/// artifacts are re-encoded at **merge**.
+///
+/// Three things about this enum are deliberate and were all decided against
+/// what the docs used to promise (issue #318):
+///
+/// 1. **Merge only.** Flush stays pinned at [`CompressionLevel::Balanced`]'s
+///    level 3 regardless of this setting. Raising the flush level to 19 is
+///    exactly the regression recorded in
+///    `engine/reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`
+///    — 1.55 M docs/s peak collapsed to 21 K docs/s with 75 % of documents
+///    rejected, because a ~50 ms segment flush became 5–10 s and tripped
+///    back-pressure. Merge is off the ingest critical path; flush is not.
+/// 2. **All three names are Zstandard**, not "LZ4 for fast". Every durable
+///    envelope XERJ writes (`ZBS2`, `ZFM4`, `ZPS1`, zstd-flagged `.dv`) is
+///    zstd-framed, and its magic is what the reader dispatches on; making
+///    one level switch algorithm would mean writing the legacy LZ4 layouts
+///    that survive only as read-compatibility paths. `"fast"` is therefore
+///    zstd's own fastest level, not a different codec.
+/// 3. **`"best"` is level 6, not 19.** The RFC #148 thread measured L6 at
+///    −14.4 % stored / −14.3 % `.dv` / −15.4 % `.meta`, while L9 doubles the
+///    decode window from 2.00 to 4.00 MiB and L19 takes it to 8.00 MiB — a
+///    cost every streaming point-get pays on read, forever, for a ratio gain
+///    that measurement did not show. Lucene and Elasticsearch land in the
+///    same place from the other direction: ES's `best_compression` stored
+///    fields format tops out at zstd **3** with a bigger block, not at a
+///    high effort level (`Zstd814StoredFieldsFormat.java:38-46`, read for
+///    approach only — that code is AGPL/SSPL/Elastic-2.0 and none of it is
+///    copied here).
+///
+/// Decoding never depends on the level a segment was written at, so mixed
+/// levels across segments — the normal state after changing this setting —
+/// need no format flag and no migration. That is why XERJ does not need
+/// Lucene's `Lucene90StoredFieldsFormat.MODE_KEY` segment attribute
+/// (`Lucene90StoredFieldsFormat.java:113-137`, Apache-2.0): Lucene must
+/// record the mode because BEST_SPEED and BEST_COMPRESSION are different
+/// algorithms (LZ4 vs Deflate), whereas here they differ only in effort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionLevel {
-    /// LZ4 — maximum throughput, moderate ratio.
+    /// Zstandard level 1 — maximum throughput, moderate ratio.
     Fast,
-    /// Zstandard level 3 — good ratio with low CPU overhead.
+    /// Zstandard level 3 — good ratio with low CPU overhead. Also the level
+    /// every flush uses, whatever this setting says.
     Balanced,
-    /// Zstandard level 19 — maximum ratio, higher CPU cost.
+    /// Zstandard level 6 — best measured ratio per byte of decode window.
     Best,
+}
+
+impl CompressionLevel {
+    /// The Zstandard level this name maps to.
+    ///
+    /// The single source of truth for the mapping: the encoder sites in
+    /// `xerj-storage` and `xerj-fts` take an `i32` level, and
+    /// `xerj-compress`'s codec factory routes through here too, so the
+    /// meaning of "best" cannot drift between the config surface and the
+    /// codecs.
+    pub const fn zstd_level(self) -> i32 {
+        match self {
+            Self::Fast => 1,
+            Self::Balanced => 3,
+            Self::Best => 6,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2131,6 +2254,94 @@ mod tests {
         assert!(
             cfg.merge.dormant_overrides().is_empty(),
             "max_segment_mb reaches the merge policy, so it is not dormant"
+        );
+    }
+
+    /// #318 — the `[compression]` section reached no encoder at all: two
+    /// nodes differing only in `enabled` / `level` / `block_size_docs` wrote
+    /// byte-identical segments, with no error and no warning, while the docs
+    /// called all three live. `level` is wired now (see the engine-side merge
+    /// test); the other two are dormant, and dormant must be *audible*.
+    #[test]
+    fn dormant_compression_settings_are_named_only_when_an_operator_sets_them() {
+        assert!(
+            CompressionConfig::default().dormant_overrides().is_empty(),
+            "an untouched default asks for nothing, so it must not warn"
+        );
+
+        for (toml, expected) in [
+            ("enabled = false", "compression.enabled"),
+            ("block_size_docs = 512", "compression.block_size_docs"),
+        ] {
+            let cfg = Config::from_toml_str(&format!("[compression]\n{toml}\n")).unwrap();
+            let named: Vec<&str> = cfg
+                .compression
+                .dormant_overrides()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            assert_eq!(
+                named,
+                vec![expected],
+                "setting {toml} must be reported, and nothing else"
+            );
+        }
+
+        // `level` now reaches the merge re-encode, so it must NOT be reported
+        // — a warning on a knob that works is the same lie in the other
+        // direction.
+        let cfg = Config::from_toml_str("[compression]\nlevel = \"best\"\n").unwrap();
+        assert!(
+            cfg.compression.dormant_overrides().is_empty(),
+            "compression.level reaches the merge encoder, so it is not dormant"
+        );
+    }
+
+    /// The documented 16–4096 range was never enforced: #318's repro node
+    /// booted happily on `block_size_docs = 999999`.
+    #[test]
+    fn out_of_range_block_size_docs_is_refused_at_startup() {
+        for bad in [15u32, 4097, 999_999, 0] {
+            // Rejected on the path a real boot takes — `from_toml_str`
+            // validates, so #318's `block_size_docs = 999999` node would not
+            // have started.
+            let err = Config::from_toml_str(&format!("[compression]\nblock_size_docs = {bad}\n"))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("compression.block_size_docs"),
+                "the error must name the setting, got: {err}"
+            );
+
+            // And directly, so the check cannot be lost by a refactor that
+            // moves parsing off `validate`.
+            let mut cfg = Config::default();
+            cfg.compression.block_size_docs = bad;
+            assert!(cfg.validate().is_err(), "{bad} must fail validate()");
+        }
+
+        for ok in [16u32, 128, 4096] {
+            Config::from_toml_str(&format!("[compression]\nblock_size_docs = {ok}\n"))
+                .unwrap_or_else(|e| panic!("block_size_docs = {ok} is in range, got: {e}"));
+        }
+    }
+
+    /// The zstd level behind each name. Pinned because these numbers are
+    /// quoted in `xerj.default.toml` and on `landing/docs/compression.html`,
+    /// and because `"best"` deliberately means 6 rather than the 19 the enum
+    /// used to document — see the doc comment for the measurements.
+    #[test]
+    fn compression_level_names_map_to_the_documented_zstd_levels() {
+        assert_eq!(CompressionLevel::Fast.zstd_level(), 1);
+        assert_eq!(CompressionLevel::Balanced.zstd_level(), 3);
+        assert_eq!(CompressionLevel::Best.zstd_level(), 6);
+
+        // The default must stay byte-for-byte what flush already writes, so
+        // that adopting this build changes nothing for an operator who never
+        // touched the section.
+        assert_eq!(
+            CompressionConfig::default().level.zstd_level(),
+            3,
+            "the default level must equal the pinned flush level"
         );
     }
 

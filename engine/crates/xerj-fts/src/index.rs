@@ -320,7 +320,12 @@ const POST_MAGIC_ZSTD: &[u8; 4] = b"ZPS1";
 /// (merge-dominated long-term storage barely changes; only the
 /// freshest tier-0 segments are larger before they merge).  See
 /// `engine/reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`.
-const ZSTD_DURABLE_LEVEL: i32 = 3;
+///
+/// This is the **flush** level and the writer default. A merge-time caller
+/// raises it via [`FtsIndexWriter::with_zstd_level`] to honour the operator's
+/// `compression.level` (#318) — merge is off the ingest critical path, which
+/// is exactly the distinction the paragraph above is about.
+pub const ZSTD_DURABLE_LEVEL: i32 = 3;
 const ZFM3_RECORD_LEN: usize = 4 + 8 + 8 + 4; // 24 bytes: df, ttf, off, len
 
 /// Header byte length for a ZFM3 file (magic + total_docs + total_field_length
@@ -357,6 +362,7 @@ fn encode_field_meta_v4(
     has_positions: bool,
     sorted_terms: &[String],
     term_postings: &HashMap<String, TermPostings>,
+    zstd_level: i32,
 ) -> Result<Vec<u8>> {
     let num_terms = sorted_terms.len();
     // Build the records section in the same byte layout that ZFM3
@@ -380,7 +386,7 @@ fn encode_field_meta_v4(
     }
     let uncompressed_len = records.len() as u32;
     let compressed =
-        zstd::bulk::compress(&records, ZSTD_DURABLE_LEVEL).with_context(|| "ZFM4 zstd compress")?;
+        zstd::bulk::compress(&records, zstd_level).with_context(|| "ZFM4 zstd compress")?;
     let mut out: Vec<u8> = Vec::with_capacity(ZFM3_HEADER_LEN + 4 + 4 + compressed.len());
     out.extend_from_slice(META_MAGIC_V4);
     out.write_u64::<LittleEndian>(stats.total_docs).unwrap();
@@ -555,6 +561,9 @@ pub struct FtsIndexWriter {
     /// Per-field: (config, postings_writer, field_stats, norms)
     fields: HashMap<String, FieldData>,
     encoded_filename_layout_published: bool,
+    /// Zstd effort for the `.meta` (ZFM4) and `.post` (ZPS1) envelopes.
+    /// [`ZSTD_DURABLE_LEVEL`] unless [`Self::with_zstd_level`] raised it.
+    zstd_level: i32,
 }
 
 struct FieldData {
@@ -578,7 +587,21 @@ impl FtsIndexWriter {
             registry,
             fields: HashMap::new(),
             encoded_filename_layout_published: false,
+            zstd_level: ZSTD_DURABLE_LEVEL,
         }
+    }
+
+    /// Re-encode this segment's `.meta` / `.post` at `level` instead of the
+    /// flush default [`ZSTD_DURABLE_LEVEL`].
+    ///
+    /// For merge callers only — flush must not raise the level, and
+    /// [`ZSTD_DURABLE_LEVEL`] records the measured reason. Both envelopes
+    /// stay byte-format-identical across levels (zstd decode does not consult
+    /// the level a payload was written at), so this changes only how hard the
+    /// encoder works and how large the result is.
+    pub fn with_zstd_level(mut self, level: i32) -> Self {
+        self.zstd_level = level;
+        self
     }
 
     /// Register a field with its indexing configuration.
@@ -847,6 +870,7 @@ impl FtsIndexWriter {
 
         let segment_dir = self.segment_dir.clone();
         let segment_id = self.segment_id.clone();
+        let zstd_level = self.zstd_level;
 
         // Drain fields into a Vec so we can parallelise the iterator.
         // Cloning `stats` before consuming `field_data` — `stats` goes into
@@ -866,8 +890,14 @@ impl FtsIndexWriter {
         let results: Vec<Result<(String, FieldStats)>> = fields
             .into_par_iter()
             .map(|(field_name, stats, field_data)| {
-                Self::write_field_static(&segment_dir, &segment_id, &field_name, field_data)
-                    .with_context(|| format!("writing field '{}'", field_name))?;
+                Self::write_field_static(
+                    &segment_dir,
+                    &segment_id,
+                    &field_name,
+                    field_data,
+                    zstd_level,
+                )
+                .with_context(|| format!("writing field '{}'", field_name))?;
                 Ok((field_name, stats))
             })
             .collect();
@@ -887,6 +917,7 @@ impl FtsIndexWriter {
         segment_id: &str,
         field_name: &str,
         field_data: FieldData,
+        zstd_level: i32,
     ) -> Result<()> {
         // NOTE: `PathBuf::with_extension` replaces the final `.ext` in the path,
         // so using `segment_dir.join("segment_id.field_name")` followed by
@@ -959,7 +990,7 @@ impl FtsIndexWriter {
             Vec::new()
         } else {
             let uncompressed_len = post_data.len() as u32;
-            let compressed = zstd::bulk::compress(&post_data, ZSTD_DURABLE_LEVEL)
+            let compressed = zstd::bulk::compress(&post_data, zstd_level)
                 .with_context(|| "ZPS1 zstd compress")?;
             let mut out = Vec::with_capacity(4 + 4 + compressed.len());
             out.extend_from_slice(POST_MAGIC_ZSTD);
@@ -1030,6 +1061,7 @@ impl FtsIndexWriter {
             has_positions,
             &sorted_terms,
             &term_postings,
+            zstd_level,
         )?;
         xerj_common::fsio::write_file_durable(&meta_path, &meta_bytes)
             .with_context(|| format!("writing meta to {:?}", meta_path))?;

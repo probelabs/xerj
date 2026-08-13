@@ -2106,6 +2106,176 @@ mod merge_publication_transaction_tests {
         (engine, index, component, segments_dir)
     }
 
+    /// Deterministic, compressible-but-not-trivial documents: a fixed word
+    /// list drawn by an LCG, so every run of this test encodes the same bytes
+    /// and any size difference is attributable to the codec alone.
+    fn compression_fixture_docs(count: usize) -> Vec<serde_json::Value> {
+        const WORDS: [&str; 16] = [
+            "segment",
+            "merge",
+            "posting",
+            "term",
+            "dictionary",
+            "zstandard",
+            "columnar",
+            "envelope",
+            "flush",
+            "durable",
+            "compression",
+            "level",
+            "operator",
+            "ratio",
+            "decode",
+            "window",
+        ];
+        let mut state: u64 = 0x2026_0318;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        (0..count)
+            .map(|i| {
+                let body: Vec<&str> = (0..40).map(|_| WORDS[next() % WORDS.len()]).collect();
+                serde_json::json!({ "body": format!("document {i} {}", body.join(" ")) })
+            })
+            .collect()
+    }
+
+    /// Ingest the same corpus into a fresh index at `level`, flush two
+    /// segments, merge them, and return `extension → total bytes` for the
+    /// pre-merge (flushed) and post-merge segment families.
+    async fn artifact_bytes_at_level(
+        dir: &TempDir,
+        level: xerj_common::config::CompressionLevel,
+    ) -> (
+        std::collections::BTreeMap<String, u64>,
+        std::collections::BTreeMap<String, u64>,
+    ) {
+        let mut cfg = config(dir);
+        cfg.compression.level = level;
+        // One ingest shard, so each flush publishes exactly one segment and
+        // the merge below is a deterministic 2 → 1. With the default 16
+        // shards a flush yields 16 tiny segments, most below `V2_MIN_DOCS`,
+        // which is the wrong shape for measuring a codec.
+        cfg.engine.ingest_shards = 1;
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        let engine = Engine::new(cfg).unwrap();
+        engine.create_index("compression", schema).unwrap();
+        let index = engine.get_index("compression").unwrap();
+        index.abort_background_tasks();
+
+        // Two flushes → two segments to merge. Each is comfortably over
+        // `V2_MIN_DOCS` (128), so the stored section takes the columnar v2
+        // path rather than the tiny-segment v1 fallback.
+        let docs = compression_fixture_docs(600);
+        for (half, chunk) in docs.chunks(300).enumerate() {
+            for (i, doc) in chunk.iter().enumerate() {
+                index
+                    .index_document(Some(format!("{half}-{i}")), doc.clone())
+                    .await
+                    .unwrap();
+            }
+            index.flush().await.unwrap();
+        }
+        let segments_dir = index.data_dir.join("segments");
+        let flushed = artifact_bytes_by_extension(&segments_dir);
+
+        assert_eq!(index.store.snapshot().segments.len(), 2);
+        assert_eq!(index.run_merge_once().await.unwrap(), 1);
+        let snapshot = index.store.snapshot();
+        assert_eq!(snapshot.segments.len(), 1);
+        let merged_id = snapshot.segments[0].id.to_string();
+
+        let merged = artifact_bytes_by_extension_for(&segments_dir, &merged_id);
+        (flushed, merged)
+    }
+
+    fn artifact_bytes_by_extension(
+        segments_dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, u64> {
+        artifact_bytes_by_extension_for(segments_dir, "")
+    }
+
+    /// Sum on-disk bytes per file extension, restricted to files whose name
+    /// starts with `id_prefix` (pass `""` for every segment in the dir).
+    /// Keyed by extension because merged segment IDs are fresh UUIDs, so the
+    /// two runs being compared never share a filename.
+    fn artifact_bytes_by_extension_for(
+        segments_dir: &std::path::Path,
+        id_prefix: &str,
+    ) -> std::collections::BTreeMap<String, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(segments_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(id_prefix) {
+                continue;
+            }
+            let Some(ext) = name.rsplit('.').next() else {
+                continue;
+            };
+            // Only the compressed durable artifacts. `.fst` and `.norms` are
+            // not zstd envelopes, and the marker files are fixed-size.
+            if !matches!(ext, "seg" | "dv" | "post" | "meta") {
+                continue;
+            }
+            *out.entry(ext.to_string()).or_insert(0) += entry.metadata().unwrap().len();
+        }
+        out
+    }
+
+    /// #318 — `[compression]` was accepted and ignored. Two servers on the
+    /// same build with the same corpus, differing only in this section,
+    /// produced byte-identical indices: `.seg` 261,481 / `.dv` 10,679 /
+    /// `.post` 192,287 in both, no error, no warning, while the docs called
+    /// the settings live.
+    ///
+    /// The knob is honoured at MERGE, so this asserts both halves of that
+    /// contract: the merged artifacts must respond to `compression.level`,
+    /// and the flushed ones must not — raising the flush level is the ingest
+    /// collapse recorded in
+    /// `reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`, and a
+    /// well-meaning "make it consistent" change would reintroduce it.
+    #[tokio::test]
+    async fn compression_level_reaches_the_merge_encoder_but_never_the_flush_path() {
+        use xerj_common::config::CompressionLevel;
+
+        let fast_dir = TempDir::new().unwrap();
+        let best_dir = TempDir::new().unwrap();
+        let (fast_flushed, fast_merged) =
+            artifact_bytes_at_level(&fast_dir, CompressionLevel::Fast).await;
+        let (best_flushed, best_merged) =
+            artifact_bytes_at_level(&best_dir, CompressionLevel::Best).await;
+
+        assert_eq!(
+            fast_flushed, best_flushed,
+            "flush must ignore compression.level entirely — it is the \
+             back-pressure-critical path (zstd19 ingest regression)"
+        );
+
+        // Every compressed artifact family the merge re-encodes must respond.
+        // Before the fix each of these was equal, which is the bug.
+        for ext in ["seg", "dv", "post", "meta"] {
+            let fast = fast_merged.get(ext).copied().unwrap_or_default();
+            let best = best_merged.get(ext).copied().unwrap_or_default();
+            assert!(
+                fast > 0 && best > 0,
+                ".{ext} artifacts must exist to compare"
+            );
+            assert!(
+                best < fast,
+                ".{ext}: compression.level = \"best\" must produce a smaller \
+                 merged artifact than \"fast\" (got best={best}, fast={fast}); \
+                 equal bytes mean the setting reached no encoder"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn merging_v1_raw_unsafe_fields_advances_marker_before_encoded_output() {
         let dir = TempDir::new().unwrap();
@@ -5290,6 +5460,15 @@ pub struct Index {
     /// `Config.merge` at index construction; reads are cheap and merge
     /// runs hold the snapshot for the duration of one batch.
     merge_config: xerj_common::config::MergeConfig,
+    /// Snapshot of `Config.compression`, read by `merge_pass_locked` to pick
+    /// the zstd effort for the merged segment's durable artifacts. Only the
+    /// merge path consults it: flush stays pinned at the level its own
+    /// constants document, because raising it there is the ingest collapse in
+    /// `reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`.
+    ///
+    /// Before #318 this section reached no encoder at all — two nodes
+    /// differing only in `[compression]` wrote byte-identical segments.
+    compression_config: xerj_common::config::CompressionConfig,
     /// Retained so a semantic field added after index creation can pin the
     /// same embedding identity before its first document is accepted.
     embedding_config: xerj_common::config::EmbeddingConfig,
@@ -5851,6 +6030,7 @@ impl Index {
             )),
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
+            compression_config: config.compression.clone(),
             embedding_config: config.embedding.clone(),
             max_fields_per_index: config.limits.max_fields_per_index,
             embedder: Arc::new(RwLock::new(effective_embedder)),
@@ -6204,6 +6384,7 @@ impl Index {
             )),
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
+            compression_config: config.compression.clone(),
             embedding_config: config.embedding.clone(),
             max_fields_per_index: config.limits.max_fields_per_index,
             embedder: Arc::new(RwLock::new(effective_embedder)),
@@ -8479,6 +8660,12 @@ impl Index {
             let excluded_fts_fields_for_task = excluded_fts_fields.clone();
             let segments_dir_for_task = segments_dir.clone();
             let dv_skip_for_merge = dv_skip.clone();
+            // #318 — the operator's `compression.level`, resolved once per
+            // merge task. Merge is the only writer that honours it: it runs
+            // on the nice-+15 SMALL pool, off the ingest critical path, which
+            // is precisely why raising the effort here is safe and raising it
+            // on flush was not.
+            let merge_zstd_level = self.compression_config.level.zstd_level();
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
@@ -8813,7 +9000,10 @@ impl Index {
                             return None;
                         }
                     };
-                    let encoded = xerj_storage::stored_codec::encode_stored_v2(&merged_json_buf);
+                    let encoded = xerj_storage::stored_codec::encode_stored_v2_at_level(
+                        &merged_json_buf,
+                        merge_zstd_level,
+                    );
                     drop(merged_json_buf);
                     if let Err(e) = writer.add_section(SectionType::Stored, &encoded) {
                         tracing::error!("merge ABORTED: failed to add section: {e}");
@@ -8874,7 +9064,8 @@ impl Index {
                             &segments_dir_for_task,
                             merged_meta.id.as_str(),
                             Arc::clone(&registry_for_task),
-                        );
+                        )
+                        .with_zstd_level(merge_zstd_level);
                         for (field_name, cfg) in &field_configs_for_task {
                             fts_writer.configure_field(field_name.clone(), cfg.clone());
                         }
@@ -8952,10 +9143,11 @@ impl Index {
                             &dv_skip_for_merge,
                         );
                         if !columns.is_empty() {
-                            if let Err(e) = write_doc_values_sidecar(
+                            if let Err(e) = write_doc_values_sidecar_at_level(
                                 &segments_dir_for_task,
                                 merged_meta.id.as_str(),
                                 &columns,
+                                merge_zstd_level,
                             ) {
                                 tracing::warn!("merge: doc-values write failed: {e}");
                             }
@@ -18792,8 +18984,25 @@ fn write_doc_values_sidecar(
     segment_id: &str,
     columns: &std::collections::BTreeMap<String, xerj_storage::doc_values::Column>,
 ) -> std::io::Result<()> {
+    write_doc_values_sidecar_at_level(
+        segments_dir,
+        segment_id,
+        columns,
+        xerj_storage::doc_values::DV_ZSTD_LEVEL,
+    )
+}
+
+/// [`write_doc_values_sidecar`] at a caller-chosen zstd level — the merge
+/// path's entry point for the operator's `compression.level` (#318). The
+/// flush path keeps the pinned level; see `DV_ZSTD_LEVEL`.
+fn write_doc_values_sidecar_at_level(
+    segments_dir: &std::path::Path,
+    segment_id: &str,
+    columns: &std::collections::BTreeMap<String, xerj_storage::doc_values::Column>,
+    level: i32,
+) -> std::io::Result<()> {
     let path = segments_dir.join(format!("{segment_id}.dv"));
-    let bytes = xerj_storage::doc_values::encode_columns(columns);
+    let bytes = xerj_storage::doc_values::encode_columns_at_level(columns, level);
     xerj_common::fsio::write_file_durable(&path, &bytes)
 }
 

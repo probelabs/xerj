@@ -456,6 +456,14 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         warn!("{key} is set but has no effect in this build: {effect}");
     }
 
+    // Same treatment for `[compression]` (#318): `level` is wired into the
+    // merge re-encode, `enabled` and `block_size_docs` are not, and an
+    // operator who set all three to trade CPU for $/GB previously got three
+    // no-ops in silence.
+    for (key, effect) in cfg.compression.dormant_overrides() {
+        warn!("{key} is set but has no effect in this build: {effect}");
+    }
+
     // Bind address override: `--bind` flag or `XERJ_BIND_ADDRESS` env (flag
     // wins). Both exist because the default is loopback (#228): without a way
     // to say "expose me" that is not a TOML file, a container image or a
