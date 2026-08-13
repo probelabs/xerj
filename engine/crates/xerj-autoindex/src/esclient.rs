@@ -372,7 +372,50 @@ impl Es {
             .req(reqwest::Method::GET, "/")
             .send()
             .with_context(|| format!("endpoint unreachable: {}", self.base))?;
+        let status = resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            anyhow::bail!(self.auth_help(status.as_u16()));
+        }
         Ok(resp.json().unwrap_or(Value::Null))
+    }
+
+    /// The recovery message for a server that wants credentials we do not have.
+    ///
+    /// This exists because the failure it replaces was actively misleading. A
+    /// server with auth on (which is the shipped default) answered the very
+    /// first request with 401, `ping` threw the status away, and the run went
+    /// on to print ~15 lines of healthy-looking progress before dying at the
+    /// embedding-identity probe with "requires a XERJ server that exposes a
+    /// resumable embedding identity". A real user read that, concluded their
+    /// server lacked the feature, and disabled auth to get past it — when all
+    /// that was missing was a key the server had already written to disk.
+    ///
+    /// So: name every way out, and name them at the first round trip.
+    fn auth_help(&self, status: u16) -> String {
+        let what = if self.api_key.is_some() {
+            "rejected the API key we sent"
+        } else {
+            "requires authentication and no API key was supplied"
+        };
+        // Order and framing matter here. A blind onboarding run showed that
+        // listing `--insecure` as a co-equal third bullet makes it the
+        // cheapest thing to try — one flag, no path to look up — which is the
+        // straight line to "I turned auth off", the very outcome this message
+        // exists to prevent. So: the two fixes that keep auth on come first
+        // and concretely, and turning auth off is fenced as a last resort for
+        // a throwaway local server. The server's own 401 already words it
+        // this way; this makes the CLI say what the server says.
+        format!(
+            "the server at {} {what} (HTTP {status}).\n\
+             \x20 To fix, in order of preference:\n\
+             \x20 1. export XERJ_API_KEY=\"$(cat <data_dir>/admin.key)\" — the server \
+             generates this key on first startup and prints the path in its startup banner\n\
+             \x20 2. or pass it explicitly: --api-key <key>\n\
+             \x20 3. last resort, and only for a throwaway local server you can afford to \
+             leave unauthenticated: restart it with --insecure, which disables TLS and auth \
+             for every client, not just this command",
+            self.base
+        )
     }
 
     pub fn embedding_execution_identity(&self) -> Result<EmbeddingExecutionIdentity> {
@@ -381,6 +424,13 @@ impl Es {
             .send()
             .context("GET /v1/embedding/identity")?;
         let status = response.status();
+        // Defence in depth: `ping` already fails closed on 401/403, but a
+        // `--url` target can answer `GET /` anonymously and still guard this
+        // endpoint. Blaming the server's capabilities for a missing credential
+        // is what sent the original reporter down the wrong path.
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            anyhow::bail!(self.auth_help(status.as_u16()));
+        }
         if !status.is_success() {
             anyhow::bail!(
                 "GET /v1/embedding/identity failed: HTTP {status}; semantic autoindex requires \
@@ -1375,5 +1425,169 @@ mod tests {
         let _b = admission.acquire();
         admission.on_congestion();
         assert_eq!(admission.congestion_events(), 0);
+    }
+
+    // ─── authentication failures ────────────────────────────────────────
+    //
+    // A real user hit HTTP 401 on the very first request of an `autoindex`
+    // run, saw ~15 lines of healthy-looking progress, and was then told the
+    // server "requires a XERJ server that exposes a resumable embedding
+    // identity". They concluded the server lacked a feature and turned auth
+    // off. Every test below exists to keep that specific failure impossible:
+    // the run must stop at the first round trip, and the message must name
+    // the credential, not a capability.
+
+    /// Serve one request and answer with `status_line`, asserting the client
+    /// asked for `path`. Returns the bound address to point a client at.
+    fn one_shot(
+        path: &'static str,
+        status_line: &'static str,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with(&format!("GET {path} HTTP/1.1")),
+                "{request}"
+            );
+            respond_status(
+                &mut stream,
+                status_line,
+                br#"{"error":{"type":"security_exception","reason":"missing or invalid API key in Authorization header"},"status":401}"#,
+            );
+        });
+        (address, server)
+    }
+
+    /// Every escape route the user has must be in the text, or the message is
+    /// the same dead end with different words.
+    fn assert_names_every_way_out(error: &str, base: &str) {
+        for expected in [
+            "--api-key",
+            "XERJ_API_KEY",
+            "<data_dir>/admin.key",
+            "--insecure",
+            base,
+        ] {
+            assert!(
+                error.contains(expected),
+                "recovery message must name {expected}: {error}"
+            );
+        }
+    }
+
+    /// `ping` used to be `Ok(resp.json().unwrap_or(Value::Null))` — a 401 was
+    /// indistinguishable from a healthy server, which is what deferred the
+    /// failure by fifteen lines of output. It must now fail closed, at the
+    /// first round trip, on both refusal codes.
+    #[test]
+    fn ping_fails_closed_on_401_and_403_and_says_how_to_recover() {
+        for (status_line, code, api_key, subject) in [
+            (
+                "401 Unauthorized",
+                "401",
+                None,
+                "requires authentication and no API key was supplied",
+            ),
+            (
+                "403 Forbidden",
+                "403",
+                Some("a-rejected-key".to_string()),
+                "rejected the API key we sent",
+            ),
+        ] {
+            let (address, server) = one_shot("/", status_line);
+            let base = format!("http://{address}");
+            let es = Es::new(&base, api_key).unwrap();
+            let error = format!("{:#}", es.ping().unwrap_err());
+            assert!(
+                error.contains(subject),
+                "message must distinguish sent-and-rejected from never-sent: {error}"
+            );
+            assert!(
+                error.contains(code),
+                "the HTTP status belongs in it: {error}"
+            );
+            assert_names_every_way_out(&error, &base);
+            // The old capability sentence is what sent the reporter looking at
+            // the wrong thing; a credential failure must never mention it.
+            assert!(!error.contains("resumable embedding identity"), "{error}");
+            server.join().unwrap();
+        }
+    }
+
+    /// The fail-closed branch must be exactly two status codes wide: a healthy
+    /// server still gets its banner parsed and the run still starts.
+    #[test]
+    fn ping_still_returns_the_banner_from_a_server_that_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            respond_json(
+                &mut stream,
+                br#"{"tagline":"XERJ","version":{"number":"1.0"}}"#,
+            );
+        });
+        let es = Es::new(&format!("http://{address}"), Some("key".to_string())).unwrap();
+        let banner = es.ping().unwrap();
+        assert_eq!(banner.pointer("/tagline").unwrap(), "XERJ");
+        server.join().unwrap();
+    }
+
+    /// Defence in depth for a `--url` target that answers `GET /` anonymously
+    /// and guards the identity endpoint: the 401 must be reported as a missing
+    /// credential, never as the server lacking a resumable identity. This is
+    /// the exact sentence the original report pasted.
+    #[test]
+    fn the_identity_probe_reports_a_401_as_auth_not_as_a_missing_capability() {
+        for (status_line, code, api_key, subject) in [
+            (
+                "401 Unauthorized",
+                "401",
+                None,
+                "requires authentication and no API key was supplied",
+            ),
+            (
+                "403 Forbidden",
+                "403",
+                Some("a-rejected-key".to_string()),
+                "rejected the API key we sent",
+            ),
+        ] {
+            let (address, server) = one_shot("/v1/embedding/identity", status_line);
+            let base = format!("http://{address}");
+            let es = Es::new(&base, api_key).unwrap();
+            let error = format!("{:#}", es.embedding_execution_identity().unwrap_err());
+            assert!(
+                !error.contains("resumable embedding identity"),
+                "the reported misleading message must be gone: {error}"
+            );
+            assert!(error.contains(subject), "{error}");
+            assert!(error.contains(code), "{error}");
+            assert_names_every_way_out(&error, &base);
+            server.join().unwrap();
+        }
+    }
+
+    /// …and the capability wording is still the right answer for a failure
+    /// that really is about the server, so the auth branch has to be narrow.
+    #[test]
+    fn the_identity_probe_still_blames_the_capability_for_a_non_auth_failure() {
+        for status_line in ["404 Not Found", "500 Internal Server Error"] {
+            let (address, server) = one_shot("/v1/embedding/identity", status_line);
+            let es = Es::new(&format!("http://{address}"), None).unwrap();
+            let error = format!("{:#}", es.embedding_execution_identity().unwrap_err());
+            assert!(
+                error.contains("resumable embedding identity"),
+                "{status_line}: {error}"
+            );
+            assert!(!error.contains("--insecure"), "{status_line}: {error}");
+            server.join().unwrap();
+        }
     }
 }

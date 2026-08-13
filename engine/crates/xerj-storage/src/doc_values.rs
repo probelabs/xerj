@@ -626,7 +626,24 @@ fn roaring_retained_bytes(bitmap: &RoaringBitmap) -> u64 {
 const KIND_FLAG_ZSTD: u8 = 0x80;
 const KIND_MASK: u8 = 0x7F;
 
+/// Zstd level the flush path encodes `.dv` columns at. Pinned for the reason
+/// on `stored_codec::STORED_ZSTD_LEVEL`: flush is the back-pressure-critical
+/// bound on sustained ingest, and this used to be one of three stacked
+/// level-19 encoders in a single flush.
+pub const DV_ZSTD_LEVEL: i32 = 3;
+
+/// Encode at [`DV_ZSTD_LEVEL`]; merge calls [`encode_columns_at_level`] to
+/// honour `compression.level` (#318).
 pub fn encode_columns(columns: &BTreeMap<String, Column>) -> Vec<u8> {
+    encode_columns_at_level(columns, DV_ZSTD_LEVEL)
+}
+
+/// [`encode_columns`] at a caller-chosen zstd effort level.
+///
+/// Level is a write-side choice only: the reader dispatches on the
+/// `KIND_FLAG_ZSTD` bit and zstd decode is level-independent, so `.dv` files
+/// written at different levels coexist in one index with no format change.
+pub fn encode_columns_at_level(columns: &BTreeMap<String, Column>, level: i32) -> Vec<u8> {
     let mut out = Vec::new();
     out.write_u32::<LittleEndian>(MAGIC).unwrap();
     out.write_u32::<LittleEndian>(columns.len() as u32).unwrap();
@@ -639,16 +656,19 @@ pub fn encode_columns(columns: &BTreeMap<String, Column>) -> Vec<u8> {
             Column::Numeric(n) => n.encode(),
             Column::Keyword(k) => k.encode(),
         };
-        // Zstd level 3 — fast encode (~250 MB/s/core).  Reverted from
-        // level 19 because the flush path needs to keep up with sustained
-        // ingest (1 M+ docs/s) and the level-19 pass collapsed throughput
-        // by 70-100× under continuous load.  See
+        // `level` is DV_ZSTD_LEVEL (3) on flush — fast encode
+        // (~250 MB/s/core), reverted from level 19 because the flush path
+        // needs to keep up with sustained ingest (1 M+ docs/s) and the
+        // level-19 pass collapsed throughput by 70-100× under continuous
+        // load.  See
         // `engine/reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`.
+        // Merge passes the operator's `compression.level` instead, which is
+        // off the ingest critical path.
         // Legacy LZ4-framed column payloads are still auto-detected by
         // the reader via the high bit on the kind byte; level-19-encoded
         // segments from older builds remain readable (zstd decompress is
         // level-independent).
-        let zstd_payload = match zstd::encode_all(&payload[..], 3) {
+        let zstd_payload = match zstd::encode_all(&payload[..], level) {
             Ok(c) if c.len() < payload.len() => c,
             // If compression doesn't help (rare tiny columns), keep the
             // zstd path anyway — decompression still works and avoids a

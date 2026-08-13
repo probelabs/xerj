@@ -117,8 +117,79 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# CI test profile. Identical *code semantics* to [profile.release] --
+# opt-level 3, debug-assertions off, overflow-checks off -- so tests still
+# exercise optimized codegen. Only the optimization *scope* changes: no
+# whole-program LTO and 16 codegen units instead of 1.
+#
+# Why it exists: `cargo test --release` links every one of the ~99 test
+# binaries with fat LTO + codegen-units=1. On CI run 31571998506 that was
+# 76m05s of compilation for 1m52s of actual test execution. `panic = "abort"`
+# additionally forces cargo to rebuild the entire dependency graph with
+# `panic = "unwind"` for test targets, so a preceding `cargo build --release`
+# shares almost nothing with it; `panic = "unwind"` here makes that split
+# explicit rather than accidental.
+#
+# [profile.release] above is deliberately untouched: release.yml builds the
+# shipped binary with `cargo build --release`, and it must stay fat-LTO.
+[profile.ci-test]
+inherits = "release"
+lto = false
+codegen-units = 16
+panic = "unwind"
+strip = false
+
 # Fast iteration profile: symbolized with thin LTO and parallel codegen.
 # It is intentionally not production-codegen-equivalent.
+# Fast verification profile — the BUILD half of the implement -> build -> verify
+# loop. Its sibling is [profile.ci-test] above, which serves the TEST half.
+#
+# The division is deliberate and the two are not redundant:
+#   quick    — `cargo build`. Inherits panic = "abort" from release, matching the
+#              shipped binary, so the artifact you smoke-test behaves like the real
+#              one (panic strategy is observable).
+#   ci-test  — `cargo test`. Uses panic = "unwind", because cargo rebuilds the whole
+#              dependency graph with unwind for test targets regardless; declaring it
+#              makes that split explicit instead of accidental, and lets test builds
+#              share artifacts with each other rather than fighting a build profile
+#              they can never reuse.
+#
+# Use ci-test for `cargo test`. Use quick for `cargo build`. Neither is ever valid
+# for a released artifact or a published number.
+#
+# WHY: [profile.release] below is a SHIPPING configuration — `lto = "fat"` plus
+# `codegen-units = 1` is the slowest build Rust can produce, deliberately, because
+# it yields the fastest binary. Fat LTO is a whole-program optimisation that runs
+# largely single-threaded at link time, and codegen-units = 1 removes intra-crate
+# parallelism, so a 32-core machine ends up watching one core. That is the right
+# trade for an artifact users download and run for months. It is the wrong trade
+# for an agent rebuilding to check whether a one-line fix compiles: the same cost
+# is paid on every iteration, and the resulting binary's runtime speed is
+# irrelevant to the question being asked.
+#
+# `quick` keeps everything that affects CORRECTNESS identical to release —
+# panic = "abort" (inherited, and it changes observable behaviour, so it must
+# match), the same feature set, the same target-cpu from .cargo/config.toml — and
+# relaxes only what affects optimisation. A binary built with `quick` is a valid
+# functional test of a release binary; it is NOT valid for measuring performance.
+#
+# USE IT FOR: does it compile, do the tests pass, does the ES-YAML suite stay at
+#             0 failed, does this fix actually fix the bug.
+# NEVER USE IT FOR: benchmarks, latency numbers, published measurements, or any
+#             artifact that leaves this machine. Those must be --release.
+#
+#   cargo build --profile quick -p xerj-server
+#   cargo test  --profile quick -p xerj-autoindex
+#
+[profile.quick]
+inherits = "release"
+lto = false          # the single biggest lever: no whole-program link-time pass
+codegen-units = 16   # let 32 cores actually participate
+opt-level = 2        # enough that tests are not pathologically slow
+debug = false        # debuginfo is a large share of both build time and disk
+strip = true
+incremental = true   # meaningful for the edit-rebuild-edit loop this profile serves
+
 [profile.profiling]
 inherits = "release"
 debug = 1

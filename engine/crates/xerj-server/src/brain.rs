@@ -379,7 +379,15 @@ fn run(cfg: BrainCfg) -> Result<i32> {
         t0.elapsed().as_secs_f64()
     );
     println!("  → {console_url}");
-    println!("  agents: XERJ_URL={} xerj-mcp", cfg.url);
+    // The credential this run used, carried into the printed command. Without
+    // it the `xerj-mcp` line 401s against the server `brain` just booted —
+    // auth is on by default and `brain` read `<data-dir>/admin.key` itself to
+    // get past it (ONBOARDING-401-REPRO.md §3). `$XERJ_API_KEY` when the
+    // caller already exported it, so the secret is not echoed needlessly.
+    println!(
+        "  agents: {} xerj-mcp",
+        mcp_env(&cfg.url, api_key.as_deref())
+    );
     if let Some(link) = &setup_link {
         println!("  one-time passkey setup (open once, valid 30 min):");
         println!("  → {link}");
@@ -494,6 +502,32 @@ fn needs_live_node_probe(records_total: u64) -> bool {
     records_total == 0
 }
 
+/// The environment prefix for the `xerj-mcp` line in the success banner.
+///
+/// `xerj brain` resolves a credential (from `--api-key`, `XERJ_API_KEY`, or
+/// `<data-dir>/admin.key`) and uses it for the whole run, but used to print an
+/// `XERJ_URL=… xerj-mcp` hint with no credential in it at all — so the agent
+/// command the banner suggests 401s against the very server the banner is
+/// announcing. Carry the run's key into it.
+///
+/// `env_key` is the ambient `XERJ_API_KEY`: when it already holds this key the
+/// hint says `$XERJ_API_KEY` rather than echoing the admin secret into output
+/// that gets pasted into issues.
+fn mcp_env(url: &str, api_key: Option<&str>) -> String {
+    mcp_env_with(url, api_key, std::env::var("XERJ_API_KEY").ok().as_deref())
+}
+
+fn mcp_env_with(url: &str, api_key: Option<&str>, env_key: Option<&str>) -> String {
+    match api_key {
+        // Open server (`--insecure` / auth off): no credential to carry.
+        None => format!("XERJ_URL={url}"),
+        Some(key) if env_key == Some(key) => {
+            format!("XERJ_URL={url} XERJ_API_KEY=\"$XERJ_API_KEY\"")
+        }
+        Some(key) => format!("XERJ_URL={url} XERJ_API_KEY=\"{key}\""),
+    }
+}
+
 fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
     // Same resource policy as `xerj autoindex` itself — `xerj brain` composes
     // autoindex, so it must not invent its own worker counts (#240).
@@ -503,6 +537,10 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         root: cfg.root.clone(),
         url: cfg.url.clone(),
         api_key,
+        // `brain` resolves its own credential (its data dir's admin.key) and
+        // renders hints itself, so there is no discovered-file path to thread
+        // through the autoindex hint path here.
+        api_key_file: None,
         workers: plan.index_workers,
         scan_workers: plan.scan_threads,
         pdf_workers: plan.pdf_workers,
@@ -725,6 +763,38 @@ fn open_browser(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ONBOARDING-401-REPRO.md §3: `brain` resolves a credential itself (from
+    /// `<data-dir>/admin.key` when nothing else supplies one) and then printed
+    /// an `XERJ_URL=… xerj-mcp` hint with no credential in it — a command that
+    /// 401s against the very server the success banner is announcing.
+    #[test]
+    fn mcp_hint_carries_the_runs_credential() {
+        // Key from admin.key / --api-key: nothing else in the shell holds it.
+        let hint = mcp_env_with("http://localhost:9510", Some("s3cret"), None);
+        assert_eq!(
+            hint, "XERJ_URL=http://localhost:9510 XERJ_API_KEY=\"s3cret\"",
+            "the mcp hint must carry the run's key"
+        );
+
+        // Already exported: reference the variable, don't echo the secret.
+        let hint = mcp_env_with("http://localhost:9200", Some("s3cret"), Some("s3cret"));
+        assert!(!hint.contains("s3cret"), "must not echo the secret: {hint}");
+        assert!(
+            hint.contains("XERJ_API_KEY=\"$XERJ_API_KEY\""),
+            "must reference the exported variable: {hint}"
+        );
+
+        // A stale/different env value must not shadow the run's credential.
+        let hint = mcp_env_with("http://localhost:9200", Some("s3cret"), Some("other"));
+        assert!(hint.contains("XERJ_API_KEY=\"s3cret\""), "{hint}");
+
+        // Auth-free server: no credential to carry, and none invented.
+        assert_eq!(
+            mcp_env_with("http://localhost:9200", None, Some("ignored")),
+            "XERJ_URL=http://localhost:9200"
+        );
+    }
 
     #[test]
     fn url_parsing_defaults_port_and_rejects_https() {

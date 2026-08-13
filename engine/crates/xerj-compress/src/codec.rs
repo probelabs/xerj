@@ -1,5 +1,6 @@
 //! Compression codecs: LZ4, Zstd, and passthrough.
 
+use xerj_common::config::CompressionLevel as ConfigLevel;
 use xerj_common::XerjError;
 
 /// Result alias for codec operations.
@@ -27,7 +28,15 @@ pub trait Codec: Send + Sync {
 // Compression level
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Selects the compression algorithm and effort level.
+/// Selects the compression algorithm and effort level for the block codecs in
+/// this crate.
+///
+/// Not the operator-facing type: `compression.level` in the config file
+/// deserialises into [`xerj_common::config::CompressionLevel`], which has no
+/// `None` variant and lives in a crate below this one in the dependency graph.
+/// The two stay in step because the zstd effort each name means is defined
+/// once, in that enum's `zstd_level`, and [`ZstdCodec::balanced`] /
+/// [`ZstdCodec::best`] read it from there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionLevel {
     /// No compression — raw bytes pass through unchanged.
@@ -35,9 +44,9 @@ pub enum CompressionLevel {
     /// LZ4: very fast compression with moderate ratio.
     #[default]
     Fast,
-    /// Zstd level 3: balanced speed vs. ratio.
+    /// Zstd at the `"balanced"` effort level.
     Balanced,
-    /// Zstd level 19: maximum compression ratio.
+    /// Zstd at the `"best"` effort level.
     Best,
 }
 
@@ -118,7 +127,8 @@ impl Codec for Lz4Codec {
 /// Zstd-based codec wrapping the [`zstd`] crate.
 #[derive(Debug, Clone)]
 pub struct ZstdCodec {
-    /// Zstd compression level (1–22; defaults to 3 for balanced, 19 for best).
+    /// Zstd compression level, from
+    /// [`xerj_common::config::CompressionLevel::zstd_level`].
     level: i32,
 }
 
@@ -127,14 +137,20 @@ impl ZstdCodec {
         Self { level }
     }
 
-    /// Balanced Zstd (level 3).
+    /// Balanced Zstd — the level `compression.level = "balanced"` selects.
     pub fn balanced() -> Self {
-        Self::new(3)
+        Self::new(ConfigLevel::Balanced.zstd_level())
     }
 
-    /// Maximum Zstd compression (level 19).
+    /// Maximum-ratio Zstd — the level `compression.level = "best"` selects.
+    ///
+    /// This used to be a hardcoded 19 while the config surface's own enum
+    /// documented 19 too and neither reached an encoder (#318). Both now read
+    /// the same table, so "best" cannot mean one thing to an operator and
+    /// another to a codec; see [`ConfigLevel`] for why the measured answer is
+    /// 6 rather than 19.
     pub fn best() -> Self {
-        Self::new(19)
+        Self::new(ConfigLevel::Best.zstd_level())
     }
 }
 

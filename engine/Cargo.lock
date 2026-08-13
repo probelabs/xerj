@@ -6979,6 +6979,7 @@ dependencies = [
  "xerj-engine",
  "xerj-fts",
  "xerj-logs",
+ "xerj-mcp",
  "xerj-query",
  "xerj-storage",
  "xerj-vector",

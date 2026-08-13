@@ -97,7 +97,19 @@ data_dir = "/var/lib/xerj"
 es_compat_port = 9200
 
 [auth]
-enabled = false   # set true and provide admin_api_key in production
+enabled = false   # NOT the default — the default is true
+```
+
+`auth.enabled` defaults to **true**; `enabled = false` above is an explicit
+opt-out, appropriate only for a trusted private network or local development.
+Leave it out (or set it to `true`) and the server mints an admin key on first
+boot, prints it, and writes it to `<data_dir>/admin.key`. Every client then has
+to send it — including `xerj autoindex`, which never reads the key out of
+`xerj.toml`; give it `--api-key` or `XERJ_API_KEY`:
+
+```bash
+export XERJ_API_KEY="$(cat /var/lib/xerj/admin.key)"
+xerj autoindex ~/my-project
 ```
 
 Pass a config file with `--config`:

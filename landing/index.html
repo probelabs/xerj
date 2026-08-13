@@ -80,13 +80,20 @@
     (260,916 → 9,982), <strong>2.1× cheaper</strong> ($1.58 vs $3.27). In a
     companion run on a Rust library the model had never seen:
     <strong>9/9 with retrieval vs 0/9 from memory</strong>. The three helper
-    scripts below ship with the case study — the hero prompt sets them up.
+    scripts below ship in the repo, under
+    <a class="mono" href="https://github.com/xerj-org/xerj/tree/main/tools/xerj-code" rel="external" style="color:var(--z-mute);">tools/xerj-code/</a>.
   </p>
 
-<pre class="code">$ xc-corpus.sh xerj-storage https://github.com/spacejam/sled …   # clone the peers, once
-$ xc-index.sh  xerj-storage                                       # xerj autoindex, once per corpus
+<pre class="code">$ xc-corpus.sh --from hub/xerj-storage.json      # or: xc-corpus.sh xerj-storage &lt;git-url&gt;…
+$ xc-index.sh  xerj-storage                      # xerj autoindex, once per corpus
 $ xc.py xerj-storage "how does sled fsync its WAL segment on rotation?"
 → the exact function, file:line, contract included — a passage to read, not a tree to grep</pre>
+
+  <p class="wide" style="margin-top:var(--sp-3);">
+    A corpus definition is a few hundred bytes of URLs, pinned commit SHAs and
+    licences — no source, so nothing to redistribute. Share the file, and
+    <code class="inline">--from</code> rebuilds the same commits on the other machine.
+  </p>
 
   <p class="viz-caption"><a class="mono" href="/case-studies/reference-coding.html" style="color:var(--z-mute);">THE FULL CASE STUDY — EVERY NUMBER, EVERY TASK, THE EXACT PROMPT →</a></p>
 </section>
