@@ -388,6 +388,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         root: root.to_owned(),
         url: url.to_owned(),
         api_key: None,
+        api_key_file: None,
         workers: 1,
         scan_workers: 1,
         pdf_workers: 1,
@@ -406,6 +407,10 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         no_semantic: !semantic,
         brain: None,
         no_graph: true,
+        // Gate off: these fixtures assert reconcile behaviour, not a
+        // timing-derived stop. See `gate_tests` and `cli::tests`.
+        max_minutes: 0,
+        approve: None,
         dry_run: false,
         json: false,
         quiet: true,
@@ -1138,6 +1143,73 @@ fn a_junk_file_is_recorded_and_never_fatal() {
     assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
 }
 
+#[test]
+fn issue_283_inferred_float_manifest_digest_replays_on_unchanged_rerun() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // 2,209 bytes / 9 records produces the exact inferred f64 which used to
+    // change from 245.44444444444446 to 245.44444444444449 on journal replay.
+    let mut csv = String::from("body\n");
+    for len in [245, 245, 245, 245, 245, 245, 245, 245, 249] {
+        csv.push_str(&"x".repeat(len));
+        csv.push('\n');
+    }
+    fs::write(corpus.path().join("data.csv"), csv).unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (first_code, first_summary) = run_index_report(config.clone()).unwrap();
+    assert_eq!(first_code, 0);
+    assert_eq!(first_summary.unwrap()["generation"], 1);
+
+    let (second_code, second_summary) = run_index_report(config).unwrap();
+    assert_eq!(second_code, 0);
+    assert_eq!(second_summary.unwrap()["generation"], 1);
+}
+
+#[test]
+fn issue_283_junk_bearing_generation_reconciles_a_shrinking_file_set() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // Preserve the inferred f64 from the original failure while exercising the
+    // user's actual second-run shape: generation one contains junk, then a
+    // tracked file disappears without any ignore-policy change.
+    let mut csv = String::from("body\n");
+    for len in [245, 245, 245, 245, 245, 245, 245, 245, 249] {
+        csv.push_str(&"x".repeat(len));
+        csv.push('\n');
+    }
+    fs::write(corpus.path().join("data.csv"), csv).unwrap();
+    fs::write(
+        corpus.path().join("remove.md"),
+        "# Temporary report\n\nThis file is removed before generation two.\n",
+    )
+    .unwrap();
+    fs::write(corpus.path().join("empty.csv"), "").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (first_code, first_summary) = run_index_report(config.clone()).unwrap();
+    assert_eq!(first_code, 3, "generation one completes with recorded junk");
+    let first_summary = first_summary.unwrap();
+    assert_eq!(first_summary["generation"], 1);
+    assert_eq!(first_summary["files_junk"], 1);
+    assert_eq!(paths(&endpoint.data_docs()), ["data.csv", "remove.md"]);
+
+    fs::remove_file(corpus.path().join("remove.md")).unwrap();
+    let (second_code, second_summary) = run_index_report(config).unwrap();
+    assert_eq!(second_code, 3, "the smaller tree still records empty.csv");
+    let second_summary = second_summary.unwrap();
+    assert_eq!(second_summary["generation"], 2);
+    assert_eq!(second_summary["files_junk"], 1);
+    assert_eq!(paths(&endpoint.data_docs()), ["data.csv"]);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
+}
+
 /// Junk *records* were fatal on the generated path
 /// (`durable preparation of X produced N junk records`) while the legacy path
 /// merely accumulated them — directly contradicting the documented contract
@@ -1201,6 +1273,105 @@ fn a_junk_record_is_counted_into_the_generation_and_never_fatal() {
 /// narrated (it is a per-file, minutes-long phase here exactly as on the legacy
 /// path), the stream closes with a truthful terminal line, and `--progress
 /// none` on the same path stays completely silent.
+/// #294, at the level where the loss actually happened: a mixed corpus of
+/// source code and prose, over the generated (`--no-graph`) path, through the
+/// real HTTP client.
+///
+/// Every code file was walked, sniffed as family `code`, counted — and then
+/// prepared as ZERO documents, so the generation committed and the run
+/// reported success while the entire code half of the corpus was missing.
+/// `sync_executor` pins the extraction half of that regression; this pins what
+/// a caller can actually observe: the documents that reach the endpoint carry
+/// their AST fields, and the run document and terminal line carry coverage
+/// counters that a wholly-junked corpus could not fake.
+#[test]
+fn code_files_index_with_ast_fields_and_the_run_reports_code_coverage() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("alpha.rs"),
+        "pub struct AlphaConfig {\n    pub retries: u32,\n}\n\n\
+         pub fn alpha_connect(cfg: &AlphaConfig) -> bool {\n    cfg.retries > 0\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus.path().join("gamma.py"),
+        "def gamma_load(path):\n    return open(path).read()\n\n\n\
+         class GammaStore:\n    def __init__(self, root):\n        self.root = root\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus.path().join("notes.md"),
+        "# Fixture notes\n\nTwo source files and this prose file, so the corpus is mixed.\n",
+    )
+    .unwrap();
+    let endpoint = HttpEndpoint::start();
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, summary) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0, "nothing in this corpus is unparseable");
+    let summary = summary.expect("a generated run returns its committed run projection");
+    assert_eq!(summary["code_files"], 2, "{summary}");
+    assert_eq!(
+        summary["code_files_indexed"], 2,
+        "both source files must reach the index: {summary}"
+    );
+    assert_eq!(summary["code_files_junked"], 0, "{summary}");
+
+    let docs = endpoint.data_docs();
+    let mut code_docs: Vec<&Value> = docs
+        .iter()
+        .filter(|doc| doc.get("language").is_some())
+        .collect();
+    code_docs.sort_by_key(|doc| doc["language"].as_str().unwrap_or("").to_owned());
+    assert_eq!(
+        code_docs.len(),
+        2,
+        "one AST document per source file: {docs:?}"
+    );
+    assert_eq!(code_docs[0]["language"], "python");
+    assert_eq!(code_docs[1]["language"], "rust");
+    for doc in &code_docs {
+        assert!(
+            doc["defs"].as_str().is_some_and(|defs| !defs.is_empty()),
+            "{doc}"
+        );
+        assert!(
+            doc["symbols"]
+                .as_array()
+                .is_some_and(|symbols| !symbols.is_empty()),
+            "{doc}"
+        );
+    }
+    // The title comes from the logical file name, never the content-addressed
+    // snapshot blob's ordinal — the other half of #294.
+    assert_eq!(code_docs[0]["title"], "gamma.py");
+    assert_eq!(code_docs[1]["title"], "alpha.rs");
+    let rendered = serde_json::to_string(&code_docs).unwrap();
+    assert!(rendered.contains("struct AlphaConfig"), "{rendered}");
+    assert!(rendered.contains("class GammaStore"), "{rendered}");
+
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let done = stream
+        .lines()
+        .find(|line| line.starts_with("xerj-done "))
+        .unwrap_or_else(|| panic!("{stream}"));
+    assert!(
+        done.contains("code_files=2 code_files_indexed=2 code_files_junked=0"),
+        "the terminal line carries the coverage that made #294 invisible: {done}"
+    );
+    assert!(!stream.contains("warning:"), "{stream}");
+}
+
 #[test]
 fn a_generated_run_narrates_its_scan_and_closes_its_own_stream() {
     let _guard = HTTP_E2E_LOCK.lock().unwrap();
@@ -1273,5 +1444,131 @@ fn a_generated_run_narrates_its_scan_and_closes_its_own_stream() {
         buffer.lock().unwrap().is_empty(),
         "--progress none asked for nothing: {}",
         String::from_utf8_lossy(&buffer.lock().unwrap())
+    );
+}
+
+/// Two byte-identical junk files — two empty files are the everyday case —
+/// made the fresh plan carry a duplicate alias for content that has no
+/// `plan.files` entry, so the generation cutover failed its own
+/// alias-projection invariant and the whole run aborted with exit 1 (#283's
+/// reproducible sibling: junk plus duplicates diverging between the fresh plan
+/// and the incremental projection). The fresh plan now projects aliases the
+/// same way `reconcile_plan` does, so the folder indexes, a no-op re-run
+/// confirms instead of committing a spurious generation, and a shrinking file
+/// set on the junk-bearing generation reconciles.
+#[test]
+fn two_byte_identical_junk_files_commit_reconcile_and_survive_a_shrink() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n2,beta\n").unwrap();
+    fs::write(corpus.path().join("e1.dat"), "").unwrap();
+    fs::write(corpus.path().join("e2.dat"), "").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (code, summary) = run_index_report(config.clone())
+        .expect("a folder with two byte-identical junk files must index, not abort");
+    let summary = summary.expect("the junk-bearing generation still commits");
+    assert_eq!(code, 3, "junk is recorded, never fatal (cli.rs EXIT CODES)");
+    assert_eq!(summary["generation"], 1);
+    assert_eq!(summary["records_total"], 2);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    // The fresh plan and the incremental projection must agree byte-for-byte
+    // on how junk-content aliases project, or this no-op re-run would see a
+    // "changed" plan and commit generation 2 over nothing.
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    assert_eq!(
+        journal_events(state_dir.path(), "sync_commit"),
+        1,
+        "a no-op re-run over the junk-bearing generation confirms; it must not re-commit"
+    );
+
+    // The issue's headline shape: the file set shrinks on a generation that
+    // carries junk records.
+    fs::remove_file(corpus.path().join("a.csv")).unwrap();
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 2);
+    assert!(
+        paths(&endpoint.data_docs()).is_empty(),
+        "the deleted dataset's records must not survive the reconcile"
+    );
+
+    // And the junk files themselves disappearing reconciles back to clean.
+    fs::remove_file(corpus.path().join("e1.dat")).unwrap();
+    fs::remove_file(corpus.path().join("e2.dat")).unwrap();
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 3);
+}
+
+/// The #283 abort itself: a durable generation record that fails its own
+/// re-validation used to surface as a bare internal invariant ("desired
+/// manifest digest does not match sync_begin payload", exit 1) — text the user
+/// can do nothing with. However the journal got that way, the refusal must
+/// name the recovery route the way the exec-config guard already does, and
+/// keep the invariant attached as the cause.
+#[test]
+fn a_journal_that_fails_its_own_revalidation_names_the_rebuild_route() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap();
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let source = corpus.path().join("rows.csv");
+    fs::write(&source, "id,value\n1,first\n").unwrap();
+    fs::write(corpus.path().join("empty.csv"), "").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+
+    // Leave a durable pending generation behind: begin succeeds, the bulk is
+    // partially applied, the run fails before commit.
+    fs::write(&source, "id,value\n1,replaced\n2,second\n").unwrap();
+    endpoint
+        .state
+        .lock()
+        .unwrap()
+        .partially_apply_next_data_bulk = true;
+    assert!(run_index(config.clone()).is_err());
+    assert_eq!(journal_events(state_dir.path(), "sync_begin"), 2);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    // Corrupt the pending sync_begin payload in a spot only the manifest
+    // digest covers: the junk record's byte count. This makes the next run
+    // hit exactly the #283 invariant.
+    let journal_path = state_dir.path().join("journal.ndjson");
+    let tampered: String = fs::read_to_string(&journal_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).unwrap();
+            if record.get("kind").and_then(Value::as_str) == Some("sync_begin")
+                && record
+                    .pointer("/desired/generation")
+                    .and_then(Value::as_u64)
+                    == Some(2)
+            {
+                let bytes = record
+                    .pointer_mut("/desired/plan/junk_files/0/bytes")
+                    .expect("the junk-bearing desired manifest records its junk file");
+                *bytes = Value::from(bytes.as_u64().unwrap() + 1);
+            }
+            let mut line = serde_json::to_string(&record).unwrap();
+            line.push('\n');
+            line
+        })
+        .collect();
+    fs::write(&journal_path, tampered).unwrap();
+
+    let error = run_index(config).expect_err("a tampered generation journal must refuse to run");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("desired manifest digest does not match sync_begin payload"),
+        "the internal invariant must stay attached as the cause: {rendered}"
+    );
+    assert!(
+        rendered.contains("Rebuild with a new --state-dir and a new --prefix"),
+        "the refusal must name the recovery route, not just the invariant: {rendered}"
     );
 }

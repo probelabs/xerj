@@ -554,8 +554,17 @@ impl AppState {
             "issuer": "xerj"
         })));
         let watcher_active = Arc::new(AtomicBool::new(true));
-        let ml_detectors = Arc::new(MlDetector::load_all(&config.server.data_dir));
-        let ml_datafeeds = Arc::new(MlDatafeed::load_all(&config.server.data_dir));
+        // A blocked cluster-state boot is a diagnostic shell. Do not even
+        // read auxiliary persisted registries: they are storage state whose
+        // ownership may be described by the unsupported cluster metadata.
+        let (ml_detectors, ml_datafeeds) = if engine.cluster_state_boot_status().is_writable() {
+            (
+                Arc::new(MlDetector::load_all(&config.server.data_dir)),
+                Arc::new(MlDatafeed::load_all(&config.server.data_dir)),
+            )
+        } else {
+            (Arc::new(DashMap::new()), Arc::new(DashMap::new()))
+        };
         Self {
             config: Arc::new(config),
             engine: Arc::new(engine),

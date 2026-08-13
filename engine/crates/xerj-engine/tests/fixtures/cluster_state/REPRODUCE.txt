@@ -1,0 +1,41 @@
+Reproduce the format-1 all-fields fixture
+=========================================
+
+`v1-ee29361-all-fields.json` is output captured from the released format-1
+writer. It is not a hand-authored approximation and does not depend on a
+private benchmark directory.
+
+1. Put writer commit `ee29361bccce77de527baac3fe6ed387cd1f6dff` in
+   a disposable worktree (do not rewrite the tree being reviewed) and build
+   only the server:
+
+       git worktree add ../xerj-format1-writer ee29361bccce77de527baac3fe6ed387cd1f6dff
+       cd ../xerj-format1-writer/engine
+       CARGO_PROFILE_PROFILING_LTO=thin cargo build --locked --profile profiling -j 32 -p xerj-server
+
+2. Start that binary with an empty data directory, authentication disabled,
+   and an unused loopback ES-compatible port. In the commands below,
+   `XERJ_URL` is that listener, for example `http://127.0.0.1:19200`.
+
+3. Drive every format-1 map through its public write endpoint:
+
+       curl -fsS -XPUT "$XERJ_URL/_index_template/logs" -H 'content-type: application/json' --data-binary '{"index_patterns":["logs-*"],"template":{"settings":{"number_of_replicas":0},"mappings":{"properties":{"host":{"type":"keyword"}}}},"priority":200}'
+       curl -fsS -XPUT "$XERJ_URL/_template/legacy-logs" -H 'content-type: application/json' --data-binary '{"index_patterns":["legacy-*"],"settings":{"index.number_of_shards":"1"}}'
+       curl -fsS -XPUT "$XERJ_URL/_component_template/base-settings" -H 'content-type: application/json' --data-binary '{"template":{"settings":{"number_of_replicas":1}}}'
+       curl -fsS -XPUT "$XERJ_URL/_ingest/pipeline/tagger" -H 'content-type: application/json' --data-binary '{"description":"tag every doc","stages":[{"type":"set","config":{"field":"tagged","value":"yes"}}]}'
+       curl -fsS -XPUT "$XERJ_URL/_data_stream/metrics-app"
+       curl -fsS -XPUT "$XERJ_URL/_ilm/policy/hot-warm" -H 'content-type: application/json' --data-binary '{"policy":{"phases":{"hot":{"actions":{}}}}}'
+
+4. Read the same six resources before accepting the capture:
+
+       curl -fsS "$XERJ_URL/_index_template/logs"
+       curl -fsS "$XERJ_URL/_template/legacy-logs"
+       curl -fsS "$XERJ_URL/_component_template/base-settings"
+       curl -fsS "$XERJ_URL/_ingest/pipeline/tagger"
+       curl -fsS "$XERJ_URL/_data_stream/metrics-app"
+       curl -fsS "$XERJ_URL/_ilm/policy/hot-warm"
+
+5. Stop the server with `SIGTERM`, require exit status 0, and copy
+   `<data_dir>/cluster_state.json`. The result is 1,275 bytes with SHA-256
+   `ae9f96a1dbf70cc711eadfdf8cd2e6701004b66f39c197f1e74cde556d64bb7b`.
+   `MANIFEST.json` pins that digest and the digests of every negative fixture.

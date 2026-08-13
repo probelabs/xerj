@@ -8,7 +8,7 @@ look up.
    --insecure`).
 2. Look at this project — its dependencies, the domains its code touches — and
    decide which well-known open-source libraries already solve those problems.
-   Clone them into a reference corpus with the skill's `xc-corpus.sh`, grouped by
+   Clone them into a reference corpus with `tools/xerj-code/scripts/xc-corpus.sh`, grouped by
    problem domain (async, parsers, storage, …), not by language.
 3. Index that corpus with `xc-index.sh` (it runs `xerj autoindex`).
 4. From now on, for **every** coding task this session: before you write

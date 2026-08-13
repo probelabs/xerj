@@ -69,6 +69,13 @@ pub struct Sniffed {
     pub csv: Option<CsvDialect>,
     /// "utf-8" or "windows-1252 (lossy)"
     pub encoding: &'static str,
+    /// File name of the LOGICAL source (`app.py`), even when the sniffed
+    /// content lives elsewhere. Durable preparation reads content-addressed
+    /// snapshot blobs (`blobs/00000000`), so an extractor that recovers a
+    /// parameter from its content path silently loses the name — that is how
+    /// #294 turned every code file into junk. Name-derived decisions after
+    /// sniffing must use this, never the content path.
+    pub logical_name: Option<std::path::PathBuf>,
 }
 
 fn read_prefix(path: &Path, gzip: bool, n: usize) -> Result<Vec<u8>> {
@@ -100,6 +107,7 @@ pub fn sniff_with_name(content_path: &Path, logical_path: &Path) -> Result<Sniff
     let prefix = read_prefix(content_path, gzip, 8192)?;
     let mut s = sniff_bytes(&prefix, content_path, logical_path, gzip)?;
     s.gzip = gzip;
+    s.logical_name = logical_path.file_name().map(std::path::PathBuf::from);
     Ok(s)
 }
 
@@ -115,6 +123,7 @@ fn sniff_bytes(
         binary_kind: None,
         csv: None,
         encoding: "utf-8",
+        logical_name: None,
     };
     if prefix.is_empty() {
         let mut s = mk(Family::Binary);

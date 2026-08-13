@@ -677,7 +677,18 @@ pub fn replay_pending_operations(
         .committed_manifest
         .clone()
         .context("pending corpus generation has no committed base")?;
-    pending.validate_against(&base)?;
+    // Same contract as the journal-replay wrap in `state.rs` (#283): a pending
+    // generation that fails its own re-validation is unrepairable by
+    // re-running, and the internal invariant alone is not actionable.
+    pending.validate_against(&base).with_context(|| {
+        format!(
+            "the pending corpus generation {} no longer re-validates against committed \
+             generation {}; the generation journal is not internally consistent, and re-running \
+             will not repair it. No remote data was changed. Rebuild with a new --state-dir and \
+             a new --prefix",
+            pending.desired.generation, base.generation
+        )
+    })?;
     let snapshot = open_snapshot(state_dir, &pending.tx_id)?;
     verify_snapshot_binding(&pending, &snapshot)?;
     backend.provision_generation(&pending.desired)?;
@@ -2038,6 +2049,60 @@ mod tests {
         assert_eq!(
             std::fs::read(root.join(&snapshot.files[0].relative_blob)).unwrap(),
             sealed
+        );
+    }
+
+    /// #294: snapshot blobs are content-addressed and extensionless
+    /// (`blobs/00000000`), and the code extractor keyed its grammar lookup on
+    /// the CONTENT path instead of the logical one carried by `Sniffed`. Every
+    /// source file on the durable path therefore prepared as junk — zero
+    /// documents — while the generation still committed and reported success.
+    #[test]
+    fn preparation_extracts_code_from_extensionless_snapshot_blobs() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            corpus.path().join("app.py"),
+            "def alpha_helper():\n    return 1\n",
+        )
+        .unwrap();
+        let inventory = inventory(corpus.path());
+        let plan = plan_for(&inventory);
+        let snapshot = create_prepared_snapshot(
+            state.path(),
+            "tx-code",
+            &inventory,
+            &plan,
+            "test-preparation-v1",
+            u64::MAX,
+        )
+        .unwrap();
+        let prepared = snapshot.files[0].prepared.as_ref().unwrap();
+        assert_eq!(
+            (prepared.records, prepared.junk),
+            (1, 0),
+            "a code file must prepare one document, not silent junk"
+        );
+        let ndjson = std::fs::read_to_string(
+            state
+                .path()
+                .join("sync-snapshots/tx-code")
+                .join(&prepared.relative_ndjson),
+        )
+        .unwrap();
+        let document: Value = serde_json::from_str(ndjson.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(document["language"], "python", "{document}");
+        // The title must be the logical file name, not the blob ordinal.
+        assert_eq!(document["title"], "app.py", "{document}");
+        assert!(
+            document["defs"]
+                .as_str()
+                .unwrap_or("")
+                .contains("function alpha_helper"),
+            "{document}"
         );
     }
 

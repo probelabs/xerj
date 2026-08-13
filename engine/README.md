@@ -53,7 +53,7 @@ HTTP wire payloads, single-node, tmpfs data dir, both freshly started
 | Per-batch (5K) bulk p99 | **34.8 ms** | 80.3 ms | ES 2.3× |
 | Data loss on restart | 0% | 0% | tied |
 | GC pauses | 20–40 ms (JVM) | **0** (no GC) | **xerj** |
-| Config surface | 3,000+ knobs | **38** | **xerj** |
+| Config surface | 3,000+ knobs | **105**, all optional | **xerj** |
 
 xerj wins on every operational and read-path metric. ES still wins
 bulk-ingest throughput on warm Lucene `IndexWriter` (perf-backlog item
@@ -85,7 +85,9 @@ The resulting binary is at `target/release/xerj`.
 
 ## Configuration
 
-See [`xerj.default.toml`](xerj.default.toml) for all 38 settings with documentation.
+See [`xerj.default.toml`](xerj.default.toml) for the commonly-tuned settings, and
+[`crates/xerj-common/src/config.rs`](crates/xerj-common/src/config.rs) for all 105
+— every one of them optional.
 
 The minimal config to get started:
 
@@ -95,7 +97,19 @@ data_dir = "/var/lib/xerj"
 es_compat_port = 9200
 
 [auth]
-enabled = false   # set true and provide admin_api_key in production
+enabled = false   # NOT the default — the default is true
+```
+
+`auth.enabled` defaults to **true**; `enabled = false` above is an explicit
+opt-out, appropriate only for a trusted private network or local development.
+Leave it out (or set it to `true`) and the server mints an admin key on first
+boot, prints it, and writes it to `<data_dir>/admin.key`. Every client then has
+to send it — including `xerj autoindex`, which never reads the key out of
+`xerj.toml`; give it `--api-key` or `XERJ_API_KEY`:
+
+```bash
+export XERJ_API_KEY="$(cat /var/lib/xerj/admin.key)"
+xerj autoindex ~/my-project
 ```
 
 Pass a config file with `--config`:
@@ -302,7 +316,7 @@ data/
     schema.json   Field mapping definition
 ```
 
-Documents are written to the WAL and an in-memory memtable first. The memtable is flushed to a durable segment when it exceeds `flush_size_mb` (default 256 MiB) or `flush_interval_secs` (default 30 s). Segments are periodically merged in the background.
+Documents are written to the WAL and an in-memory memtable first. The memtable is flushed to a durable segment when it exceeds `flush_size_mb` (default 512 MiB) or `flush_interval_secs` (default 30 s). Segments are periodically merged in the background.
 
 ## Security
 

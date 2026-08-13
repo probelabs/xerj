@@ -1,0 +1,1 @@
+{"query":{"query_string":{"query":"title:(quick OR brown) AND price:>10"}},"highlight":{"fields":{"title":{}}},"explain":true,"profile":true}

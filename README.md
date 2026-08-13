@@ -4,7 +4,62 @@ XERJ is a search engine for AI agents. Point it at a folder and one command make
 your code, docs, logs and PDFs queryable, so an agent asks questions instead of
 reading files into its context window.
 
-## Install
+[![CI](https://github.com/xerj-org/xerj/actions/workflows/ci.yml/badge.svg)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+[![Release](https://img.shields.io/github/v/release/xerj-org/xerj?include_prereleases&sort=semver)](https://github.com/xerj-org/xerj/releases)
+[![ES conformance](https://img.shields.io/badge/ES%20conformance-1366%2F1369-brightgreen.svg)](https://xerj.org/benchmarks)
+
+## Paste this to your AI agent
+
+The whole setup is one prompt:
+
+```text
+Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
+reference coding: clone and index the open-source repos closest to what we're building,
+and search how they solved a problem before writing code.
+```
+
+[llms.txt](https://xerj.org/llms.txt) gives your agent the ordered steps: install,
+start the server, `xerj autoindex .`, query with any Elasticsearch client, and the
+reference-coding loop (clone similar OSS, index it, retrieve the mechanism before
+writing, cite what you use, respect licenses).
+
+Why you would: an agent working from memory retry-loops on any API it hasn't
+memorised, and grep only tells it where to look — the recovery is still reading
+source into context, up to 1.06M input tokens on one corpus in our measurements.
+An agent that queries XERJ reads the exact passage instead.
+
+The numbers, measured end-to-end on code the model had not memorised
+([the case study](https://xerj.org/case-studies/reference-coding.html), 8 tasks
+across 4 languages, 16 runs per arm, real `claude -p` token counts): **2.7× fewer
+output tokens** than grep-driven Claude Code (9,982 vs 26,477) at the same 16/16
+solve rate, **26× fewer** than working from memory alone (260,916 → 9,982), and
+**2.1× cheaper** ($1.58 vs $3.27). In a companion run on a Rust library the model
+had never seen: **9/9 correct with retrieval versus 0/9 from memory**. Beyond the
+lab, users report roughly **5× fewer tokens** across real product development —
+fewer retry loops, sharper requests
+([field reports](./user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md)).
+
+More prompts that work on a fresh install:
+
+- *"Read https://xerj.org/llms.txt, set XERJ up as your search backend, index `./docs`,
+  and show me one example query per index it created."*
+- *"Run `xerj autoindex map` and tell me what is in this data — types, counts and the
+  gotchas it recorded — then answer my questions with search instead of reading files."*
+- *"Use XERJ's `/_memory/notes` API as your long-term memory for this project: store what
+  you learn as you work, and recall it by meaning next session."*
+
+Worked, validated examples for each capability: [xerj.org/docs/recipes](https://xerj.org/docs/recipes/).
+
+<video src="https://xerj.org/xerj-biz-demo.mp4" poster="docs/media/demo-poster.png" controls muted playsinline width="840">
+  <a href="https://xerj.org/aise-demo.html"><img src="docs/media/demo-poster.png" width="840" alt="Watch the XERJ demo: boot, ingest, search, vectors, dashboards"></a>
+</video>
+
+<sub>Boot, bulk ingest, search, vector kNN, live dashboards, no cuts.
+<a href="https://xerj.org/aise-demo.html">Watch it on xerj.org</a> or
+<a href="https://xerj.org/playground/">try the live playground</a>.</sub>
+
+## Install by hand
 
 ```sh
 curl -fsSL https://xerj.org/get | sh
@@ -26,49 +81,23 @@ your PATH if needed): `xerj --insecure --data-dir ./data &`, wait until
 `http://localhost:9200` responds, then `xerj autoindex ~/my-project` — see
 [Index a folder](#index-a-folder).
 
-### Or paste this to your AI agent
-
-```text
-Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
-reference coding: clone and index the open-source repos closest to what we're building,
-and search how they solved a problem before writing code.
-```
-
-One prompt is enough — [llms.txt](https://xerj.org/llms.txt) gives your agent the
-ordered steps: install, start the server, `xerj autoindex .`, query with any
-Elasticsearch client, and the reference-coding loop (clone similar OSS, index it,
-retrieve the mechanism before writing, cite what you use, respect licenses).
-
-More prompts that work on a fresh install:
-
-- *"Read https://xerj.org/llms.txt, set XERJ up as your search backend, index `./docs`,
-  and show me one example query per index it created."*
-- *"Run `xerj autoindex map` and tell me what is in this data — types, counts and the
-  gotchas it recorded — then answer my questions with search instead of reading files."*
-- *"Use XERJ's `/_memory/notes` API as your long-term memory for this project: store what
-  you learn as you work, and recall it by meaning next session."*
-
-Worked, validated examples for each capability: [xerj.org/recipes](https://xerj.org/recipes).
-
-[![CI](https://github.com/xerj-org/xerj/actions/workflows/ci.yml/badge.svg)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
-[![Release](https://img.shields.io/github/v/release/xerj-org/xerj?include_prereleases&sort=semver)](https://github.com/xerj-org/xerj/releases)
-[![ES conformance](https://img.shields.io/badge/ES%20conformance-1365%2F1368-brightgreen.svg)](https://xerj.org/benchmarks)
-
-<video src="https://xerj.org/xerj-biz-demo.mp4" poster="docs/media/demo-poster.png" controls muted playsinline width="840">
-  <a href="https://xerj.org/aise-demo.html"><img src="docs/media/demo-poster.png" width="840" alt="Watch the XERJ demo: boot, ingest, search, vectors, dashboards"></a>
-</video>
-
-<sub>Boot, bulk ingest, search, vector kNN, live dashboards, no cuts.
-<a href="https://xerj.org/aise-demo.html">Watch it on xerj.org</a> or
-<a href="https://xerj.org/playground/">try the live playground</a>.</sub>
-
 ## Index a folder
 
 Start the server, then point `autoindex` at anything:
 
 ```sh
 xerj --insecure --data-dir ./data &     # local dev: no TLS, no auth
+xerj autoindex ~/my-project
+```
+
+If your server has auth on — which is the default for every start *without*
+`--insecure`, including any start from a config file — hand `autoindex` the same
+key. It never picks the key up from `xerj.toml`; pass `--api-key` or set
+`XERJ_API_KEY`, or every request comes back `401 Unauthorized`:
+
+```sh
+xerj --data-dir ./data &                          # auth on: key minted on first boot
+export XERJ_API_KEY="$(cat ./data/admin.key)"     # <data_dir>/admin.key
 xerj autoindex ~/my-project
 ```
 
@@ -108,6 +137,58 @@ Vector and hybrid search use the same `knn` and `semantic` syntax you would send
 to Elasticsearch. Any Elasticsearch client library works if you point it at
 `localhost:9200`.
 
+## Connect an agent over MCP
+
+Not every agent can run a shell command. Desktop assistants and function-calling
+hosts reach tools through the **Model Context Protocol**, and the binary you just
+installed *is* the MCP server — there is nothing else to download and nothing to
+compile:
+
+```sh
+xerj --insecure --data-dir ./data &     # 1. the node the tools query
+xerj mcp                                # 2. MCP stdio server (your client runs this)
+```
+
+`xerj mcp` speaks MCP over stdio and proxies to the node named by `XERJ_URL`
+(default `http://localhost:9200`). It does **not** start a node — step 1 is the
+prerequisite. Drop this into your MCP client's config:
+
+```json
+{
+  "mcpServers": {
+    "xerj": {
+      "command": "/home/you/.local/bin/xerj",
+      "args": ["mcp"],
+      "env": { "XERJ_URL": "http://localhost:9200" }
+    }
+  }
+}
+```
+
+Use an **absolute** path — the installer puts `xerj` in `~/.local/bin` by default
+(`command -v xerj` confirms), and MCP hosts launched from a desktop icon do not
+inherit your shell's `PATH`. If the node is running with auth (anything but
+`--insecure`), add `"XERJ_AUTH": "ApiKey <key>"` alongside `XERJ_URL`; the key is
+in `<data-dir>/admin.key`.
+
+Ten tools are exposed, each a thin proxy over an endpoint XERJ already serves:
+
+| Tool | What it does |
+|---|---|
+| `xerj_search` | ES query-DSL search over an index |
+| `xerj_semantic_search` | recall by meaning over a `semantic_text` field — the query is embedded server-side (default embedder is lexical feature-hashing, not neural, unless the node runs `--embed-mode neural`) |
+| `xerj_vector_search` | kNN over a `dense_vector` field |
+| `xerj_hybrid_search` | RRF or linear fusion of sub-queries |
+| `xerj_memory_store` / `xerj_memory_recall` | durable agent memory in a namespace, recalled by text, meaning or vector |
+| `xerj_brain_overview` / `xerj_brain_ego` / `xerj_brain_link` / `xerj_brain_unlink` | the second-brain link index — orient, expand one node's evidence-backed neighborhood, assert and retire links |
+
+`xerj mcp --help` prints the same config block and the full option list. The
+machine-readable tool schemas are published at
+[xerj.org/docs/agents/schemas/mcp-tools.json](https://xerj.org/docs/agents/schemas/mcp-tools.json)
+— generated from a live `tools/list`, never hand-written, and gated in CI
+(`scripts/mcp-schema-check.sh`) plus a unit test, so the published list cannot
+drift from the served one.
+
 ## Why it exists
 
 Agents burn their context window reading files. The PHP in WordPress core is
@@ -122,6 +203,7 @@ load about half a percent of the tree.
 
 ## Use cases
 
+- **[Reference coding](https://xerj.org/case-studies/reference-coding.html)**: your coding agent retrieves how peer projects already solved it instead of re-deriving — measured 2.7× fewer output tokens than grep-driven coding (26× vs memory alone); users report ~5× in real development
 - **[Code search and security audits](https://xerj.org/use-cases/code-security-audit.html)**: AST-aware indexing, so an agent finds a function instead of a line
 - **[AI search and RAG](https://xerj.org/use-cases/ai-search-retrieval.html)**: full-text, vector and hybrid retrieval in one query, with no separate vector database
 - **[Agent memory](https://xerj.org/use-cases/second-brain.html)**: durable recall with a knowledge graph over your own documents
@@ -137,7 +219,7 @@ XERJ implements the Elasticsearch REST API: indices, documents, bulk, search,
 aggregations, mappings, kNN, scroll, reindex and the `_cat` endpoints. Kibana and
 the official client libraries connect to it directly.
 
-The conformance suite runs on every commit and currently passes **1365 of 1368**
+The conformance suite runs on every commit and currently passes **1366 of 1369**
 cases. It lives in [`engine/tests/es-compat-yaml`](./engine/tests/es-compat-yaml),
 and the remaining gaps are listed there rather than hidden. XERJ is compatible
 with the API. It is not a reimplementation of Elasticsearch internals, and it is
@@ -179,7 +261,11 @@ cargo run --release -p es-yaml-runner -- --dir tests/es-compat-yaml/yaml
 
 - [Guides and API reference](https://xerj.org/docs/)
 - [Recipes](https://xerj.org/recipes) for common tasks
-- [Roadmap and project layout](./ROADMAP.md)
+- [Roadmap](./ROADMAP.md) — what ships today versus what is coming, verified
+  against the release binary. Release-by-release view:
+  [milestones](https://github.com/xerj-org/xerj/milestones) · live status:
+  [project board](https://github.com/users/xerj-org/projects/1) · standing
+  pointer: [pinned roadmap issue](https://github.com/xerj-org/xerj/issues/298)
 - [Changelog](./CHANGELOG.md)
 
 Reference pages for individual subsystems, written against the source and

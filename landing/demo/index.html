@@ -265,7 +265,7 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
     <div class="stat"><div class="v">47 ms</div><div class="l">cold start (median, 5 runs)</div></div>
     <div class="stat"><div class="v">519 MB</div><div class="l">RSS · 655 K-doc index</div></div>
     <div class="stat"><div class="v">3.3×</div><div class="l">disk smaller than raw</div></div>
-    <div class="stat"><div class="v">1305 / 1329</div><div class="l">ES YAML conformance</div></div>
+    <div class="stat"><div class="v"><!-- snapshot:2026-04-27 -->1305 / 1329</div><div class="l">ES YAML conformance · 2026-04-27 snapshot (current: 1,366 / 1,369)</div></div>
   </div>
   <p style="font-size: 12px; color: var(--dim); letter-spacing: 0.1em; text-transform: uppercase; margin-top: 18px;">
     Every number above + every CLI block on this page was captured live on this
@@ -1193,8 +1193,10 @@ node demo/scripts/full-demo-flow.js
   <h2><span class="num">08</span>Drop-in for ES tooling</h2>
   <p class="why">
     The migration story.  Xerj implements the Elasticsearch wire protocol —
-    1305 of 1329 official ES YAML conformance tests pass on
-    <a href="https://github.com/xerj-org/xerj/tree/main/engine/tests/es-compat-yaml">the ES 8.13 test suite</a>.
+    <!-- snapshot:2026-04-27 -->1305 of 1329 official ES YAML conformance tests passed on
+    <a href="https://github.com/xerj-org/xerj/tree/main/engine/tests/es-compat-yaml">the ES 8.13 test suite</a>
+    when this page was captured on 2026-04-27; the suite now stands at
+    <strong>1,366 / 1,369 (0 failed, 3 skipped)</strong>.
     That means existing curl, official ES SDKs (Python, Go, Java, JS), and
     even Kibana itself can point at port 9200 unchanged.
   </p>
@@ -1210,9 +1212,10 @@ node demo/scripts/full-demo-flow.js
   <div class="compare">
     <div class="xerj-side">
       <div class="label">Xerj · ES wire-protocol</div>
-      <div class="num">1305 / 1329</div>
-      <div class="small">98.2 % of ES 8.13 official YAML conformance tests pass.
-        The remaining 24 are documented in
+      <div class="num"><!-- snapshot:2026-04-27 -->1305 / 1329</div>
+      <div class="small">98.2 % of ES 8.13 official YAML conformance tests passed at this
+        page's 2026-04-27 capture; the current figure is <strong>1,366 / 1,369</strong>
+        (0 failed, 3 skipped). The 24 outstanding at capture time were documented in
         <a href="https://github.com/xerj-org/xerj/blob/main/engine/reports/PATH_TO_100_PCT_v0.6.0_to_v1.0.md"><code>PATH_TO_100_PCT</code></a>.
         This includes search DSL, all <!-- generated:query-type-count -->50<!-- /generated:query-type-count --> query types, all aggs, bulk, scroll,
         index templates, aliases, knn, hybrid, semantic.</div>

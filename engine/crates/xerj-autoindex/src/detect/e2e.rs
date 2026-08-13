@@ -256,6 +256,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         root: root.to_owned(),
         url: url.to_owned(),
         api_key: None,
+        api_key_file: None,
         workers: 1,
         scan_workers: 1,
         pdf_workers: 1,
@@ -274,6 +275,12 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         no_semantic: true,
         brain: Some("notes".into()),
         no_graph: false,
+        // The gate is switched off in these fixtures on purpose: they assert
+        // indexing, resume and edge behaviour, and a timing-derived stop would
+        // make them depend on how loaded the runner was. The gate's own
+        // behaviour is covered in `gate_tests` and `cli::tests`.
+        max_minutes: 0,
+        approve: None,
         dry_run: false,
         json: false,
         quiet: true,

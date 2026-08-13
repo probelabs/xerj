@@ -22,12 +22,12 @@ use xerj_fts::search::{
 };
 use xerj_query::ast::{
     BoostMode, FieldValueFactor, Fuzziness, HighlightRequest, MinShouldMatch, Modifier, QueryNode,
-    RandomScore, RescoreQuery, ScoreFunction, ScoreMode, SearchRequest, SourceFilter,
+    RandomScore, RescoreQuery, SavingsMode, ScoreFunction, ScoreMode, SearchRequest, SourceFilter,
     TrackTotalHits,
 };
 use xerj_query::executor::{
-    strip_internal_passage_metadata, Hit, PassageMatch, SearchResult, TotalHits, TotalHitsRelation,
-    PASSAGE_METADATA_PREFIX, PASSAGE_RESPONSE_FIELD,
+    strip_internal_passage_metadata, Hit, PassageMatch, PayloadSavings, SavingsMethod,
+    SearchResult, TotalHits, TotalHitsRelation, PASSAGE_METADATA_PREFIX, PASSAGE_RESPONSE_FIELD,
 };
 use xerj_storage::index_store::{IndexStore, IndexStoreConfig};
 use xerj_storage::segment::SectionType;
@@ -829,10 +829,25 @@ mod flush_publication_recovery_tests {
 
     static FLUSH_FAULT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    fn data_dir_format_version(index: &Index) -> u64 {
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(index.data_dir.join("xerj_meta.json")).unwrap())
+                .unwrap();
+        marker["format_version"].as_u64().unwrap()
+    }
+
     fn text_schema() -> Schema {
         let mut schema = Schema::empty();
         schema
             .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    fn slash_field_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("bad/field", FieldType::Text))
             .unwrap();
         schema
     }
@@ -1142,6 +1157,203 @@ mod flush_publication_recovery_tests {
         let idx = restarted.get_index("bm25-failed-publication").unwrap();
         idx.abort_background_tasks();
         assert_eq!(idx.search(&request).await.unwrap().hits[0].id, "survivor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slash_field_flush_publishes_and_restarts_searchable() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("slash-field-publish", slash_field_schema())
+            .unwrap();
+        let idx = engine.get_index("slash-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 1);
+        idx.index_document(Some("survivor".into()), json!({"bad/field": "slashneedle"}))
+            .await
+            .unwrap();
+
+        idx.flush().await.unwrap();
+        assert_eq!(data_dir_format_version(&idx), 2);
+        assert_eq!(idx.memtable.doc_count(), 0);
+        assert_eq!(idx.store.snapshot().segments.len(), 1);
+        assert!(idx.data_dir.join("snapshot.json").is_file());
+        let segment_entries: Vec<_> = std::fs::read_dir(idx.data_dir.join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert!(segment_entries
+            .iter()
+            .all(|entry| entry.file_type().unwrap().is_file()));
+        assert!(segment_entries.iter().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".fts-layout-v2")));
+
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"bad/field": "slashneedle"}},
+            "size": 10,
+            "track_total_hits": true
+        }))
+        .unwrap();
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "survivor");
+        drop(idx);
+        drop(engine);
+
+        let restarted = crate::Engine::new(config).unwrap();
+        let idx = restarted.get_index("slash-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 2);
+        assert_eq!(idx.store.snapshot().segments.len(), 1);
+        assert_eq!(idx.memtable.doc_count(), 0);
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "survivor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn portable_field_flush_keeps_baseline_data_dir_format() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        engine
+            .create_index("portable-field-publish", text_schema())
+            .unwrap();
+        let idx = engine.get_index("portable-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 1);
+        idx.index_document(Some("safe".into()), json!({"body": "portable"}))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        assert_eq!(data_dir_format_version(&idx), 1);
+        drop(idx);
+        drop(engine);
+
+        let restarted = crate::Engine::new(config).unwrap();
+        let idx = restarted.get_index("portable-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn marker_preflight_failure_writes_no_encoded_sidecars_and_retry_recovers() {
+        use xerj_storage::index_store::DataDirFormatWriteFailpoint;
+
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        for (position, failpoint, expected_version) in [
+            (
+                "temp write",
+                DataDirFormatWriteFailpoint::BeforeTempWrite,
+                1,
+            ),
+            ("rename", DataDirFormatWriteFailpoint::BeforeRename, 1),
+            (
+                "parent fsync",
+                DataDirFormatWriteFailpoint::BeforeParentFsync,
+                2,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(config).unwrap();
+            let index_name = format!("slash-field-marker-{}", position.replace(' ', "-"));
+            engine
+                .create_index(&index_name, slash_field_schema())
+                .unwrap();
+            let idx = engine.get_index(&index_name).unwrap();
+            idx.abort_background_tasks();
+            idx.index_document(Some("survivor".into()), json!({"bad/field": "slashneedle"}))
+                .await
+                .unwrap();
+            idx.store
+                .set_data_dir_format_write_failpoint_for_test(failpoint);
+
+            let error = idx.flush().await.unwrap_err().to_string();
+            assert!(
+                error.contains("marker persistence failure"),
+                "unexpected {position} error: {error}"
+            );
+            assert_eq!(
+                data_dir_format_version(&idx),
+                expected_version,
+                "{position}"
+            );
+            let entries: Vec<String> = std::fs::read_dir(idx.data_dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                entries
+                    .iter()
+                    .all(|name| !name.contains("__xerj_fts_field_sha256_")),
+                "{position} failure wrote an encoded side-car: {entries:?}"
+            );
+            assert!(
+                entries.iter().all(|name| !name.ends_with(".fts-layout-v2")),
+                "{position} failure published a layout discriminator: {entries:?}"
+            );
+            assert_eq!(
+                idx.store.fts_v2_marker_durability_confirmations_for_test(),
+                0,
+                "{position} must not claim marker durability after failure"
+            );
+            assert_eq!(idx.memtable.doc_count(), 1);
+
+            // Split the retry at its preflight boundary: confirmation must
+            // cross one platform-appropriate durable-publication boundary
+            // (Unix parent fsync or Windows write-through replacement) while
+            // no discriminator, encoded temporary path, or encoded final path
+            // exists yet.
+            idx.store
+                .ensure_fts_encoded_field_component_format()
+                .unwrap();
+            assert_eq!(
+                idx.store.fts_v2_marker_durability_confirmations_for_test(),
+                1,
+                "{position} retry must establish durability exactly once"
+            );
+            let after_confirmation: Vec<String> = std::fs::read_dir(idx.data_dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(after_confirmation.iter().all(|name| {
+                !name.contains("__xerj_fts_field_sha256_") && !name.ends_with(".fts-layout-v2")
+            }));
+
+            idx.flush().await.unwrap();
+            assert_eq!(
+                idx.store.fts_v2_marker_durability_confirmations_for_test(),
+                1,
+                "{position} publication must reuse the confirmed preflight"
+            );
+            assert_eq!(data_dir_format_version(&idx), 2);
+            assert_eq!(idx.memtable.doc_count(), 0);
+            assert!(std::fs::read_dir(idx.data_dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("__xerj_fts_field_sha256_")));
+            assert!(std::fs::read_dir(idx.data_dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".fts-layout-v2")));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1828,6 +2040,301 @@ mod merge_publication_transaction_tests {
         config.merge.min_merge_count = 2;
         config.merge.max_merge_count = 2;
         config
+    }
+
+    fn dot_field_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new(".", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    fn marker_version(index: &Index) -> u64 {
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(index.data_dir.join("xerj_meta.json")).unwrap())
+                .unwrap();
+        marker["format_version"].as_u64().unwrap()
+    }
+
+    async fn v1_raw_dot_field_merge_fixture(
+        dir: &TempDir,
+        index_name: &str,
+    ) -> (Engine, Arc<Index>, String, PathBuf) {
+        use sha2::{Digest, Sha256};
+
+        let engine = Engine::new(config(dir)).unwrap();
+        engine.create_index(index_name, dot_field_schema()).unwrap();
+        let index = engine.get_index(index_name).unwrap();
+        index.abort_background_tasks();
+        for (id, value) in [("one", "alpha"), ("two", "beta")] {
+            index
+                .index_document(Some(id.into()), serde_json::json!({".": value}))
+                .await
+                .unwrap();
+            index.flush().await.unwrap();
+        }
+        assert_eq!(index.store.snapshot().segments.len(), 2);
+        assert_eq!(marker_version(&index), 2);
+
+        // Rewrite the two input families into the exact v1 raw layout and
+        // restore a v1 marker. This models segments published by the old
+        // writer without needing an old binary inside this unit test.
+        let component = format!("__xerj_fts_field_sha256_{:x}", Sha256::digest(b"."));
+        let segments_dir = index.data_dir.join("segments");
+        for meta in index.store.snapshot().segments.iter() {
+            for extension in ["fst", "post", "meta", "norms"] {
+                let current = segments_dir.join(format!("{}.{}.{}", meta.id, component, extension));
+                let legacy = segments_dir.join(format!("{}...{}", meta.id, extension));
+                std::fs::rename(current, legacy).unwrap();
+            }
+            std::fs::remove_file(segments_dir.join(format!("{}.fts-layout-v2", meta.id))).unwrap();
+        }
+        std::fs::write(
+            index.data_dir.join("xerj_meta.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "format_version": 1,
+                "xerj_version": "v1-test-fixture"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        index
+            .store
+            .clear_fts_v2_marker_durability_confirmation_for_test();
+        assert_eq!(marker_version(&index), 1);
+        (engine, index, component, segments_dir)
+    }
+
+    /// Deterministic, compressible-but-not-trivial documents: a fixed word
+    /// list drawn by an LCG, so every run of this test encodes the same bytes
+    /// and any size difference is attributable to the codec alone.
+    fn compression_fixture_docs(count: usize) -> Vec<serde_json::Value> {
+        const WORDS: [&str; 16] = [
+            "segment",
+            "merge",
+            "posting",
+            "term",
+            "dictionary",
+            "zstandard",
+            "columnar",
+            "envelope",
+            "flush",
+            "durable",
+            "compression",
+            "level",
+            "operator",
+            "ratio",
+            "decode",
+            "window",
+        ];
+        let mut state: u64 = 0x2026_0318;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        (0..count)
+            .map(|i| {
+                let body: Vec<&str> = (0..40).map(|_| WORDS[next() % WORDS.len()]).collect();
+                serde_json::json!({ "body": format!("document {i} {}", body.join(" ")) })
+            })
+            .collect()
+    }
+
+    /// Ingest the same corpus into a fresh index at `level`, flush two
+    /// segments, merge them, and return `extension → total bytes` for the
+    /// pre-merge (flushed) and post-merge segment families.
+    async fn artifact_bytes_at_level(
+        dir: &TempDir,
+        level: xerj_common::config::CompressionLevel,
+    ) -> (
+        std::collections::BTreeMap<String, u64>,
+        std::collections::BTreeMap<String, u64>,
+    ) {
+        let mut cfg = config(dir);
+        cfg.compression.level = level;
+        // One ingest shard, so each flush publishes exactly one segment and
+        // the merge below is a deterministic 2 → 1. With the default 16
+        // shards a flush yields 16 tiny segments, most below `V2_MIN_DOCS`,
+        // which is the wrong shape for measuring a codec.
+        cfg.engine.ingest_shards = 1;
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        let engine = Engine::new(cfg).unwrap();
+        engine.create_index("compression", schema).unwrap();
+        let index = engine.get_index("compression").unwrap();
+        index.abort_background_tasks();
+
+        // Two flushes → two segments to merge. Each is comfortably over
+        // `V2_MIN_DOCS` (128), so the stored section takes the columnar v2
+        // path rather than the tiny-segment v1 fallback.
+        let docs = compression_fixture_docs(600);
+        for (half, chunk) in docs.chunks(300).enumerate() {
+            for (i, doc) in chunk.iter().enumerate() {
+                index
+                    .index_document(Some(format!("{half}-{i}")), doc.clone())
+                    .await
+                    .unwrap();
+            }
+            index.flush().await.unwrap();
+        }
+        let segments_dir = index.data_dir.join("segments");
+        let flushed = artifact_bytes_by_extension(&segments_dir);
+
+        assert_eq!(index.store.snapshot().segments.len(), 2);
+        assert_eq!(index.run_merge_once().await.unwrap(), 1);
+        let snapshot = index.store.snapshot();
+        assert_eq!(snapshot.segments.len(), 1);
+        let merged_id = snapshot.segments[0].id.to_string();
+
+        let merged = artifact_bytes_by_extension_for(&segments_dir, &merged_id);
+        (flushed, merged)
+    }
+
+    fn artifact_bytes_by_extension(
+        segments_dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, u64> {
+        artifact_bytes_by_extension_for(segments_dir, "")
+    }
+
+    /// Sum on-disk bytes per file extension, restricted to files whose name
+    /// starts with `id_prefix` (pass `""` for every segment in the dir).
+    /// Keyed by extension because merged segment IDs are fresh UUIDs, so the
+    /// two runs being compared never share a filename.
+    fn artifact_bytes_by_extension_for(
+        segments_dir: &std::path::Path,
+        id_prefix: &str,
+    ) -> std::collections::BTreeMap<String, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(segments_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(id_prefix) {
+                continue;
+            }
+            let Some(ext) = name.rsplit('.').next() else {
+                continue;
+            };
+            // Only the compressed durable artifacts. `.fst` and `.norms` are
+            // not zstd envelopes, and the marker files are fixed-size.
+            if !matches!(ext, "seg" | "dv" | "post" | "meta") {
+                continue;
+            }
+            *out.entry(ext.to_string()).or_insert(0) += entry.metadata().unwrap().len();
+        }
+        out
+    }
+
+    /// #318 — `[compression]` was accepted and ignored. Two servers on the
+    /// same build with the same corpus, differing only in this section,
+    /// produced byte-identical indices: `.seg` 261,481 / `.dv` 10,679 /
+    /// `.post` 192,287 in both, no error, no warning, while the docs called
+    /// the settings live.
+    ///
+    /// The knob is honoured at MERGE, so this asserts both halves of that
+    /// contract: the merged artifacts must respond to `compression.level`,
+    /// and the flushed ones must not — raising the flush level is the ingest
+    /// collapse recorded in
+    /// `reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`, and a
+    /// well-meaning "make it consistent" change would reintroduce it.
+    #[tokio::test]
+    async fn compression_level_reaches_the_merge_encoder_but_never_the_flush_path() {
+        use xerj_common::config::CompressionLevel;
+
+        let fast_dir = TempDir::new().unwrap();
+        let best_dir = TempDir::new().unwrap();
+        let (fast_flushed, fast_merged) =
+            artifact_bytes_at_level(&fast_dir, CompressionLevel::Fast).await;
+        let (best_flushed, best_merged) =
+            artifact_bytes_at_level(&best_dir, CompressionLevel::Best).await;
+
+        assert_eq!(
+            fast_flushed, best_flushed,
+            "flush must ignore compression.level entirely — it is the \
+             back-pressure-critical path (zstd19 ingest regression)"
+        );
+
+        // Every compressed artifact family the merge re-encodes must respond.
+        // Before the fix each of these was equal, which is the bug.
+        for ext in ["seg", "dv", "post", "meta"] {
+            let fast = fast_merged.get(ext).copied().unwrap_or_default();
+            let best = best_merged.get(ext).copied().unwrap_or_default();
+            assert!(
+                fast > 0 && best > 0,
+                ".{ext} artifacts must exist to compare"
+            );
+            assert!(
+                best < fast,
+                ".{ext}: compression.level = \"best\" must produce a smaller \
+                 merged artifact than \"fast\" (got best={best}, fast={fast}); \
+                 equal bytes mean the setting reached no encoder"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn merging_v1_raw_unsafe_fields_advances_marker_before_encoded_output() {
+        let dir = TempDir::new().unwrap();
+        let (_engine, index, component, segments_dir) =
+            v1_raw_dot_field_merge_fixture(&dir, "v1-raw-fts-merge").await;
+
+        assert_eq!(index.run_merge_once().await.unwrap(), 1);
+        assert_eq!(marker_version(&index), 2);
+        let snapshot = index.store.snapshot();
+        assert_eq!(snapshot.segments.len(), 1);
+        let output = &snapshot.segments[0];
+        assert!(segments_dir
+            .join(format!("{}.fts-layout-v2", output.id))
+            .is_file());
+        for extension in ["fst", "post", "meta", "norms"] {
+            assert!(segments_dir
+                .join(format!("{}.{}.{}", output.id, component, extension))
+                .is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_marker_failure_publishes_only_v1_compatible_no_fts_output() {
+        use xerj_storage::index_store::DataDirFormatWriteFailpoint;
+
+        let dir = TempDir::new().unwrap();
+        let (_engine, index, component, segments_dir) =
+            v1_raw_dot_field_merge_fixture(&dir, "v1-raw-fts-merge-failure").await;
+        index.store.set_data_dir_format_write_failpoint_for_test(
+            DataDirFormatWriteFailpoint::BeforeRename,
+        );
+
+        // Merge has historically allowed a correct stored-scan output when
+        // optional FTS side-car construction fails. Preserve that policy:
+        // marker failure skips finish(), so no v2 filename exists and the v1
+        // marker remains truthful.
+        assert_eq!(index.run_merge_once().await.unwrap(), 1);
+        assert_eq!(marker_version(&index), 1);
+        let snapshot = index.store.snapshot();
+        assert_eq!(snapshot.segments.len(), 1);
+        let output = &snapshot.segments[0];
+        assert!(["fst", "post", "meta", "norms"].iter().all(|extension| {
+            !segments_dir
+                .join(format!("{}.{}.{}", output.id, component, extension))
+                .exists()
+        }));
+        assert!(!segments_dir
+            .join(format!("{}.fts-layout-v2", output.id))
+            .exists());
+
+        let request = xerj_query::parse_request(&serde_json::json!({
+            "query": {"match": {".": "alpha"}},
+            "size": 10,
+            "track_total_hits": true
+        }))
+        .unwrap();
+        let result = index.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "one");
     }
 
     async fn fixture(dir: &TempDir) -> (Engine, Arc<Index>) {
@@ -3801,6 +4308,11 @@ mod semantic_deadline_regression_tests {
         let request = match_all(1);
         let bytes = serde_json::to_vec(&request).unwrap();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // The savings-measurement mode is `serde(skip)`, so `search()` mixes
+        // it into the key by hand ahead of the serialized body; this
+        // hand-built key has to do the same or it addresses a different slot.
+        // `match_all` leaves the mode at its `Off` default.
+        std::hash::Hasher::write_u8(&mut hasher, 0);
         std::hash::Hasher::write(&mut hasher, &bytes);
         let key = QueryCacheKey {
             body_hash: std::hash::Hasher::finish(&hasher),
@@ -4953,6 +5465,15 @@ pub struct Index {
     /// `Config.merge` at index construction; reads are cheap and merge
     /// runs hold the snapshot for the duration of one batch.
     merge_config: xerj_common::config::MergeConfig,
+    /// Snapshot of `Config.compression`, read by `merge_pass_locked` to pick
+    /// the zstd effort for the merged segment's durable artifacts. Only the
+    /// merge path consults it: flush stays pinned at the level its own
+    /// constants document, because raising it there is the ingest collapse in
+    /// `reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`.
+    ///
+    /// Before #318 this section reached no encoder at all — two nodes
+    /// differing only in `[compression]` wrote byte-identical segments.
+    compression_config: xerj_common::config::CompressionConfig,
     /// Retained so a semantic field added after index creation can pin the
     /// same embedding identity before its first document is accepted.
     embedding_config: xerj_common::config::EmbeddingConfig,
@@ -5536,6 +6057,7 @@ impl Index {
             )),
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
+            compression_config: config.compression.clone(),
             embedding_config: config.embedding.clone(),
             max_fields_per_index: config.limits.max_fields_per_index,
             embedder: Arc::new(RwLock::new(effective_embedder)),
@@ -5890,6 +6412,7 @@ impl Index {
             )),
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
+            compression_config: config.compression.clone(),
             embedding_config: config.embedding.clone(),
             max_fields_per_index: config.limits.max_fields_per_index,
             embedder: Arc::new(RwLock::new(effective_embedder)),
@@ -6243,20 +6766,21 @@ impl Index {
         // Auto-evolve schema for new fields.
         // Fast path: skip the schema read lock every doc when schema is stable.
         // We cache a hash of the document field keys and only re-check schema
-        // evolution every 100 docs (or when field keys change).
+        // evolution every 100 docs (or when field keys change). The hash
+        // walks NESTED field names too, not just the top-level ones (see
+        // `hash_all_field_names`) -- a document whose top-level key set is
+        // unchanged but whose nested shape changed (e.g. metadata.kind on
+        // one document, metadata.project on the next) must still produce a
+        // different hash, or this throttle would silently suppress the
+        // evolve call that the newly-nested key needs, for up to 100
+        // documents -- exactly the failure mode the recursive dynamic-
+        // mapping fix (`merge_dynamic_children_into`) exists to close, one
+        // layer further up the call chain.
         let should_evolve = {
             let current_count = self.doc_count.load(Ordering::Relaxed);
             let last_epoch = self.schema_hash_epoch.load(Ordering::Relaxed);
-            // Compute a quick hash of the doc's field names.
             let mut h: u64 = 0xcbf29ce484222325;
-            if let Some(obj) = source.as_object() {
-                for k in obj.keys() {
-                    for b in k.bytes() {
-                        h ^= b as u64;
-                        h = h.wrapping_mul(0x00000100000001b3);
-                    }
-                }
-            }
+            hash_all_field_names(&source, &mut h);
             let cached = self.schema_hash_cache.load(Ordering::Relaxed);
             if cached != h {
                 // Field set changed — must evolve and update cache.
@@ -6634,22 +7158,35 @@ impl Index {
             );
             // Fast-path: for a stable, non-dynamic schema we can skip
             // the entire per-doc evolve pass.  Under dynamic mapping we
-            // cheaply collect the union of unknown field names seen in
-            // this batch under the read lock, then only upgrade to a
-            // write lock if we actually found any.
-            let mut unknown_field_sources: Vec<&Value> = Vec::new();
+            // cheaply collect the sources that might actually change the
+            // schema under the read lock, then only upgrade to a write
+            // lock (inside `evolve_schema_from_doc`, called per source
+            // below) for the ones that do. "Might change the schema" is
+            // two things, not one: a brand-new top-level field (as
+            // before), OR a new nested child under a top-level field the
+            // schema already has (`field_config_needs_merge`) -- without
+            // the second check, a document whose only new content is
+            // nested (e.g. `metadata.project` after `metadata.kind` was
+            // already known) would never reach `evolve_schema_from_doc` at
+            // all here, no matter how many times it fixed this same gap
+            // internally.
+            let mut sources_needing_evolve: Vec<&Value> = Vec::new();
             if is_dynamic {
                 for ingest in &processed {
                     if let Some(obj) = ingest.source.as_object() {
-                        let has_unknown = obj.keys().any(|k| !schema_guard.schema.has_field(k));
-                        if has_unknown {
-                            unknown_field_sources.push(ingest.source.as_ref());
+                        let needs_evolve =
+                            obj.iter().any(|(k, v)| match schema_guard.schema.field(k) {
+                                None => true,
+                                Some(existing) => field_config_needs_merge(existing, v),
+                            });
+                        if needs_evolve {
+                            sources_needing_evolve.push(ingest.source.as_ref());
                         }
                     }
                 }
             }
             drop(schema_guard);
-            for src in unknown_field_sources {
+            for src in sources_needing_evolve {
                 self.evolve_schema_from_doc(src).await;
             }
         }
@@ -8152,6 +8689,12 @@ impl Index {
             let excluded_fts_fields_for_task = excluded_fts_fields.clone();
             let segments_dir_for_task = segments_dir.clone();
             let dv_skip_for_merge = dv_skip.clone();
+            // #318 — the operator's `compression.level`, resolved once per
+            // merge task. Merge is the only writer that honours it: it runs
+            // on the nice-+15 SMALL pool, off the ingest critical path, which
+            // is precisely why raising the effort here is safe and raising it
+            // on flush was not.
+            let merge_zstd_level = self.compression_config.level.zstd_level();
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
@@ -8486,7 +9029,10 @@ impl Index {
                             return None;
                         }
                     };
-                    let encoded = xerj_storage::stored_codec::encode_stored_v2(&merged_json_buf);
+                    let encoded = xerj_storage::stored_codec::encode_stored_v2_at_level(
+                        &merged_json_buf,
+                        merge_zstd_level,
+                    );
                     drop(merged_json_buf);
                     if let Err(e) = writer.add_section(SectionType::Stored, &encoded) {
                         tracing::error!("merge ABORTED: failed to add section: {e}");
@@ -8547,7 +9093,8 @@ impl Index {
                             &segments_dir_for_task,
                             merged_meta.id.as_str(),
                             Arc::clone(&registry_for_task),
-                        );
+                        )
+                        .with_zstd_level(merge_zstd_level);
                         for (field_name, cfg) in &field_configs_for_task {
                             fts_writer.configure_field(field_name.clone(), cfg.clone());
                         }
@@ -8562,6 +9109,24 @@ impl Index {
                             // the whole batch already runs inside merge_pool.
                             crate::merge_pool().install(|| {
                                 fts_writer.add_documents_parallel(&fts_input);
+                                if fts_writer.uses_encoded_field_filename_components() {
+                                    if let Err(e) = store_for_task
+                                        .ensure_fts_encoded_field_component_format()
+                                    {
+                                        tracing::warn!(
+                                            "merge: encoded FTS filename format preflight failed: {e}"
+                                        );
+                                        return;
+                                    }
+                                    if let Err(e) =
+                                        fts_writer.publish_encoded_filename_layout()
+                                    {
+                                        tracing::warn!(
+                                            "merge: FTS filename-layout publication failed: {e}"
+                                        );
+                                        return;
+                                    }
+                                }
                                 if let Err(e) = fts_writer.finish() {
                                     tracing::warn!("merge: FTS build failed: {e}");
                                 }
@@ -8607,10 +9172,11 @@ impl Index {
                             &dv_skip_for_merge,
                         );
                         if !columns.is_empty() {
-                            if let Err(e) = write_doc_values_sidecar(
+                            if let Err(e) = write_doc_values_sidecar_at_level(
                                 &segments_dir_for_task,
                                 merged_meta.id.as_str(),
                                 &columns,
+                                merge_zstd_level,
                             ) {
                                 tracing::warn!("merge: doc-values write failed: {e}");
                             }
@@ -10030,7 +10596,18 @@ impl Index {
             candidates = scored.len(),
             "knn served via HNSW (coverage gate passed)"
         );
-        Some(knn_result_from_scored(request, field, scored, k, started))
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        Some(knn_result_from_scored(
+            request,
+            field,
+            scored,
+            k,
+            started,
+            &generated_companion_fields,
+        ))
     }
 
     /// Brute-force exact KNN against every doc's stored source.
@@ -10501,7 +11078,18 @@ impl Index {
         // ── Rank, cap the candidate pool at k, then paginate ──────────
         // (shared with the HNSW path so hits format / total semantics
         // cannot drift between the exact and approximate executors)
-        let mut result = knn_result_from_scored(request, field, scored, k, started);
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        let mut result = knn_result_from_scored(
+            request,
+            field,
+            scored,
+            k,
+            started,
+            &generated_companion_fields,
+        );
         result.timed_out = timed_out;
         if timed_out {
             result.total.relation = TotalHitsRelation::Gte;
@@ -10584,7 +11172,18 @@ impl Index {
         // passage metadata. Child clauses retain ordinary ranking semantics;
         // provenance is intentionally omitted until per-clause ownership is
         // represented in the merged winner.
-        let mut result = knn_result_from_scored(request, "", merged, k_sum, started);
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        let mut result = knn_result_from_scored(
+            request,
+            "",
+            merged,
+            k_sum,
+            started,
+            &generated_companion_fields,
+        );
         result.timed_out = any_timed_out;
         if any_timed_out {
             result.total.relation = TotalHitsRelation::Gte;
@@ -11237,6 +11836,7 @@ impl Index {
         // for v0.7-P1 — the per-query latency is dominated by the kNN
         // / FTS scan, not the await ordering.)
         let mut sub_results: Vec<(Vec<Hit>, f32)> = Vec::with_capacity(sub_queries.len());
+        let mut sub_savings: Vec<PayloadSavings> = Vec::new();
         let mut any_timed_out = false;
         for wq in sub_queries {
             if std::time::Instant::now() >= deadline {
@@ -11262,11 +11862,19 @@ impl Index {
                 fields: Vec::new(),
                 profile: false,
                 leaf_ts_field: None,
+                savings: request.savings,
             };
             // Box::pin to break the type-recursion (search_inner ↔
             // run_hybrid both async fn).
             let sub_result = Box::pin(self.search_inner(&sub_request, deadline)).await?;
             any_timed_out |= sub_result.timed_out;
+            // Fusion de-duplicates documents across sub-queries, so the
+            // per-hit records are merged by document id below — a document
+            // retrieved by both the lexical and the vector leg saved its
+            // bytes ONCE, and must be counted once.
+            if let Some(s) = sub_result.savings {
+                sub_savings.push(s);
+            }
             sub_results.push((sub_result.hits, wq.weight));
             if any_timed_out {
                 break;
@@ -11314,6 +11922,7 @@ impl Index {
             profile: None,
             max_score: None,
             script_failure: None,
+            savings: merge_sub_savings(sub_savings),
         })
     }
 
@@ -11561,6 +12170,7 @@ impl Index {
             profile: None,
             max_score: None,
             script_failure: None,
+            savings: None,
         })
     }
 
@@ -11895,6 +12505,38 @@ impl Index {
             .map(|(seq, h)| (h.score, *seq, h.id.clone()));
         let kept = decorated.into_iter().map(|(_, h)| h).collect();
         (kept, worst)
+    }
+
+    /// Sort `hits` into the ONE total order every score-ranked page uses:
+    /// `score DESC, seq_no ASC (arrival — ES `_doc`), _id ASC`.  Decorates
+    /// with the resolved `seq_no` once, sorts, undecorates — same shape as
+    /// the main page sort (a per-comparison `VersionMap` lookup was ~6% of a
+    /// `term` page in the P1 profile).
+    ///
+    /// #270 — five post-sort re-sorts (the bool-text IDF rescore, the TF-IDF
+    /// fallback, and the three `request.rescore` sorts) used to tie by `_id`
+    /// ALONE, so any of them firing on a tied hit set silently reordered the
+    /// page into `_id` ASC — for UUID-shaped ids exactly the "essentially
+    /// random" ordering the main sort's `seq_no` tie-break replaced.  The
+    /// peer engines keep ONE comparator through collection, merge and final
+    /// sort (Lucene `HitQueue.java:76-82`; tantivy
+    /// `collector/sort_key/sort_by_score.rs:105-109` heap entry vs `:187`
+    /// final sort, same key; quickwit `quickwit-search/src/collector.rs:
+    /// 1131-1156` ties by `GlobalDocAddress` in both comparators) — every
+    /// score re-sort routes through here so they cannot drift again.
+    fn sort_hits_page_order(&self, hits: &mut Vec<Hit>) {
+        let mut decorated: Vec<(u64, Hit)> = std::mem::take(hits)
+            .into_iter()
+            .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
+            .collect();
+        decorated.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        *hits = decorated.into_iter().map(|(_, h)| h).collect();
     }
 
     /// Look up the latest `seq_no` for a document by id via the version
@@ -12498,6 +13140,7 @@ impl Index {
                 profile: None,
                 max_score: None,
                 script_failure: None,
+                savings: None,
             }
         };
         // M3 framework: response cache.  Hash the request shape and the
@@ -12547,6 +13190,20 @@ impl Index {
                 }
             }
             let mut h = DefaultHasher::new();
+            // `savings` is `serde(skip)`, so it does NOT reach the hasher via
+            // the request body — mix it in explicitly. Without this a cached
+            // result carries its predecessor's `_savings` record to a caller
+            // who asked for a different mode (or asked for none at all, and
+            // got a non-ES key on an otherwise stock response). Found on a
+            // live server, not in review.
+            Hasher::write_u8(
+                &mut h,
+                match request.savings {
+                    SavingsMode::Off => 0,
+                    SavingsMode::Sampled => 1,
+                    SavingsMode::Exact => 2,
+                },
+            );
             let body_hash: Option<u64> = serde_json::to_writer(HasherWriter(&mut h), request)
                 .ok()
                 .map(|_| h.finish());
@@ -12900,6 +13557,7 @@ impl Index {
                     profile: None,
                     max_score: None,
                     script_failure: None,
+                    savings: None,
                 };
                 // Hand the timed-out response to any coalesced followers so
                 // they return immediately rather than waiting for the closed
@@ -13845,6 +14503,7 @@ impl Index {
                         query,
                         &text_fields,
                         &exact_fields,
+                        &kw_fields,
                         mem_doc_count,
                     )
                     .map(Arc::new)
@@ -14383,6 +15042,34 @@ impl Index {
         // Anything more complex (Bool, Range, Match) currently returns
         // `None` — `Range` will be shortcut-able once G3 (BKD) lands.
         let is_match_all = matches!(query, QueryNode::MatchAll);
+        // #270 — a top-level `constant_score`/`boosted` chain over
+        // `match_all` matches exactly the documents `match_all` matches, but
+        // the raw flag above left it with `count_authoritative == false` (no
+        // `try_shortcut_count` arm resolves a bare MatchAll — MatchAll totals
+        // are handled by the flag, which the wrapper defeated).  The scan
+        // then ran in exact-counting mode: it TALLIES past a full collector
+        // but never materialises into it, so with the memtable walked first
+        // the bounded page was all memtable documents (`size:1` →
+        // `mem0000` where the full page starts `seg0000`) even though the
+        // segment documents hold the lowest `seq_no`s and own the head of
+        // the page.  This flag widens ONLY the count/bounds decisions
+        // (`count_authoritative`, the final `live_doc_count()` total
+        // overwrite) so wrapped match_all takes the same bounded-scan +
+        // cross-segment re-merge path as bare match_all.  SCORING keeps the
+        // raw flag: wrapper hits still go through `score_doc`, and a
+        // top-level `Constant`'s scores are overwritten with the wrapper
+        // boost before the page sort regardless.
+        let is_match_all_effective = is_match_all || {
+            let mut q = query;
+            loop {
+                match q {
+                    QueryNode::Constant { query, .. } | QueryNode::Boosted { query, .. } => {
+                        q = query
+                    }
+                    other => break matches!(other, QueryNode::MatchAll),
+                }
+            }
+        };
 
         // For MatchAll we now skip the memtable iteration entirely at
         // `MemSnapshot` time (it was cloning 200 k doc_ids just to tick a
@@ -14440,7 +15127,9 @@ impl Index {
         // and materialises only the top prefix, so the F1 bounded-scan / count
         // overwrite must NOT touch FTS queries — it only applies to the
         // non-FTS stored-doc scan (match_all / term-on-keyword / range).
-        let query_needs_fts: bool = query_node_to_fts(query, &text_fields, &exact_fields).is_some();
+        let query_needs_fts: bool =
+            query_node_to_fts_with_keyword_fields(query, &text_fields, &exact_fields, &kw_fields)
+                .is_some();
 
         // ── Precomputed segment agg fast path (M2 G2) ─────────────────────
         //
@@ -14684,7 +15373,12 @@ impl Index {
             // entirely — that call eagerly reads .fst/.meta/.post/.norms
             // for every text field, which costs ~50 MB per segment and is
             // wasted work when the query is a stored-doc scan.
-            let fts_query_probe = query_node_to_fts(query, &text_fields, &exact_fields);
+            let fts_query_probe = query_node_to_fts_with_keyword_fields(
+                query,
+                &text_fields,
+                &exact_fields,
+                &kw_fields,
+            );
             let needs_fts = fts_query_probe.is_some();
             // A `query_string` whose projection DECLINED still has to be
             // answered by the stored-doc scan — an over-cap `tokens × fields`
@@ -14742,7 +15436,7 @@ impl Index {
             // pre-F1 scan time — correctness over speed until the shortcut
             // itself is made delete-aware. (`deletes_present` hoisted above.)
             let count_authoritative: bool = !query_needs_fts
-                && (is_match_all || (shortcut_count.is_some() && !deletes_present));
+                && (is_match_all_effective || (shortcut_count.is_some() && !deletes_present));
 
             // Whether a Regexp query's field is keyword-typed — gates the
             // FST term-dictionary route of the regexp pre-filter (computed
@@ -14897,7 +15591,12 @@ impl Index {
                             // document happens to sit in.  `None` keeps this
                             // segment's own stats (single-arm gate).
                             .with_collection_stats(collection_stats());
-                    let fts_query = query_node_to_fts(query, &text_fields, &exact_fields);
+                    let fts_query = query_node_to_fts_with_keyword_fields(
+                        query,
+                        &text_fields,
+                        &exact_fields,
+                        &kw_fields,
+                    );
 
                     // Count-only fast path for single-term FTS queries:
                     // call `term_doc_freq` directly on the segment reader
@@ -16275,23 +16974,7 @@ impl Index {
                     hit.score = *score;
                 }
             }
-            // Precompute seq_no ONCE per hit, not once per comparison. The
-            // former `seq(&a.id)`/`seq(&b.id)` closure did a `VersionMap`
-            // dashmap string-hash get inside the comparator — O(n log n) gets
-            // per page sort (~6% of a `term` page in the P1 profile). Decorate
-            // with the resolved seq_no, then sort on the plain u64.
-            let mut decorated: Vec<(u64, Hit)> = std::mem::take(&mut final_hits)
-                .into_iter()
-                .map(|h| (self.lookup_seq_no(&h.id).unwrap_or(u64::MAX), h))
-                .collect();
-            decorated.sort_by(|a, b| {
-                b.1.score
-                    .partial_cmp(&a.1.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-                    .then_with(|| a.1.id.cmp(&b.1.id))
-            });
-            final_hits = decorated.into_iter().map(|(_, h)| h).collect();
+            self.sort_hits_page_order(&mut final_hits);
         }
 
         // --- IDF-weighted rescore for Bool queries with multiple terms ---
@@ -16346,13 +17029,9 @@ impl Index {
                         hit.score = score;
                     }
                 }
-                // Re-sort by the new scores.
-                final_hits.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.id.cmp(&b.id))
-                });
+                // Re-sort by the new scores (#270 — full page-order key, so
+                // hits the rescore left tied keep arrival order).
+                self.sort_hits_page_order(&mut final_hits);
             }
         }
 
@@ -16411,13 +17090,10 @@ impl Index {
                     for (hit, score) in final_hits.iter_mut().zip(new_scores) {
                         hit.score = score;
                     }
-                    // Re-sort with new TF-IDF scores.
-                    final_hits.sort_by(|a, b| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.id.cmp(&b.id))
-                    });
+                    // Re-sort with new TF-IDF scores (#270 — full page-order
+                    // key; on ~640 identical docs every fallback score is
+                    // exactly 1.0, and an `_id` tie-break inverted the page).
+                    self.sort_hits_page_order(&mut final_hits);
                 }
             }
         }
@@ -16443,13 +17119,11 @@ impl Index {
         // For each rescore stage, re-score the top window_size hits using the secondary query.
         // Final score = original_score * query_weight + rescore_score * rescore_query_weight
         if !request.rescore.is_empty() {
-            // Sort by score before applying rescore so we work on the correct top-N.
-            final_hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            // Sort by score before applying rescore so we work on the correct
+            // top-N (#270 — full page-order key at every stage, so the
+            // window selection and any hits a stage leaves tied both follow
+            // arrival order rather than `_id`).
+            self.sort_hits_page_order(&mut final_hits);
 
             for rescore_stage in &request.rescore {
                 apply_rescore(&mut final_hits, rescore_stage);
@@ -16457,21 +17131,11 @@ impl Index {
                 // next stage's `window_size` applies to the top-N
                 // of the just-rescored order, not the pre-rescore
                 // BM25 order.
-                final_hits.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.id.cmp(&b.id))
-                });
+                self.sort_hits_page_order(&mut final_hits);
             }
 
             // Re-sort after rescoring.
-            final_hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            self.sort_hits_page_order(&mut final_hits);
         }
 
         // --- match_all total = authoritative live doc count ---
@@ -16480,7 +17144,10 @@ impl Index {
         // an UPDATE would inflate hits.total. For an unfiltered match_all the
         // true total is the live doc count (one entry per `_id`). min_score
         // below still adjusts from this corrected base if present.
-        if is_match_all {
+        // `_effective` (#270): a wrapped match_all now scans in bounded
+        // `count_authoritative` mode, so its tally is partial and needs this
+        // same overwrite.
+        if is_match_all_effective {
             total_count = self.live_doc_count();
         } else if !count_only
             && !query_needs_fts
@@ -17020,7 +17687,16 @@ impl Index {
         };
 
         // --- Apply _source filtering ---
-        let page = apply_source_filter(page, &request.source);
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        let (page, savings) = apply_source_filter_measured(
+            page,
+            &request.source,
+            &generated_companion_fields,
+            Some(request),
+        );
 
         // --- Build profile data if requested ---
         let profile = if request.profile {
@@ -17104,6 +17780,7 @@ impl Index {
             profile,
             max_score: population_max_score,
             script_failure: None,
+            savings,
         })
     }
 
@@ -17919,13 +18596,26 @@ impl Index {
     /// added under a single write lock, which re-checks `has_field` exactly
     /// like the per-doc slow path does.
     async fn evolve_schema_from_docs(&self, sources: &[Arc<Value>]) {
-        let new_fields: Vec<(String, FieldConfig)> = {
+        // Fast path: read-lock scan for TWO kinds of change, not just one --
+        // a brand-new top-level field (as before), or a NEW NESTED CHILD
+        // under a top-level field the schema already knows about (the fix
+        // for a real gap found in review: gating purely on "does the
+        // top-level key already exist" meant a later document introducing
+        // e.g. `metadata.project` after an earlier one already registered
+        // `metadata` from its own `{"kind": ...}` was never inspected again,
+        // no matter how many more documents arrived -- see
+        // `field_config_needs_merge`'s doc comment for the full story).
+        // Stores the raw value (not a precomputed FieldConfig) for both
+        // kinds, so the write-lock section below can re-derive against the
+        // live schema rather than trusting a possibly-stale read-lock
+        // snapshot.
+        let (new_top_level, needs_merge): (Vec<(String, Value)>, Vec<(String, Value)>) = {
             let schema = self.schema.read().await;
             if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
                 return;
             }
-            let date_detection = self.date_detection_enabled();
-            let mut out: Vec<(String, FieldConfig)> = Vec::new();
+            let mut new_top_level = Vec::new();
+            let mut needs_merge = Vec::new();
             for source in sources {
                 let Some(obj) = source.as_object() else {
                     continue;
@@ -17934,16 +18624,20 @@ impl Index {
                     if key.starts_with(PASSAGE_METADATA_PREFIX) {
                         continue;
                     }
-                    if !schema.schema.has_field(key) && !out.iter().any(|(k, _)| k == key) {
-                        let fc = dynamic_field_config(key, val, date_detection);
-                        out.push((key.clone(), fc));
+                    match schema.schema.field(key) {
+                        None => new_top_level.push((key.clone(), val.clone())),
+                        Some(existing) => {
+                            if field_config_needs_merge(existing, val) {
+                                needs_merge.push((key.clone(), val.clone()));
+                            }
+                        }
                     }
                 }
             }
-            out
+            (new_top_level, needs_merge)
         };
 
-        if new_fields.is_empty() {
+        if new_top_level.is_empty() && needs_merge.is_empty() {
             return;
         }
 
@@ -17952,15 +18646,20 @@ impl Index {
         // same limit, but the engine's dynamic-mapping path calls
         // `Schema::add_field` directly, which previously bypassed the cap.
         // An authenticated client could ingest documents with arbitrarily many
-        // distinct field names, bloating the schema unbounded.
+        // distinct field names, bloating the schema unbounded. This is an
+        // approximate early exit on `new_top_level` alone (a `needs_merge`
+        // entry might add zero fields or several, not knowable without
+        // walking it against the live schema, which the write-lock section
+        // below does anyway) -- the write lock's own per-field checks are
+        // the real, exact enforcement.
         {
             let schema = self.schema.read().await;
             let current = schema.schema.field_count() as u32;
-            let projected = current.saturating_add(new_fields.len() as u32);
+            let projected = current.saturating_add(new_top_level.len() as u32);
             if projected > self.max_fields_per_index {
                 tracing::warn!(
                     current_fields = current,
-                    new_fields = new_fields.len(),
+                    new_fields = new_top_level.len(),
                     limit = self.max_fields_per_index,
                     "rejecting schema evolution: field limit exceeded"
                 );
@@ -17968,29 +18667,63 @@ impl Index {
             }
         }
 
+        let date_detection = self.date_detection_enabled();
         let mut schema = self.schema.write().await;
         if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
             return;
         }
-        // Re-check under the write lock: another concurrent ingest may have
-        // already added fields up to the limit between the read-lock check
-        // above and this write lock.
+        // Re-derive against the live schema under the write lock rather than
+        // trusting the read-lock snapshot: another concurrent ingest may
+        // have already added fields (up to the limit, or the exact ones
+        // this batch also wants) between the read-lock check above and this
+        // write lock.
         let mut schema_changed = false;
-        for (_, fc) in new_fields {
-            if !schema.schema.has_field(&fc.name) {
-                if schema.schema.field_count() as u32 >= self.max_fields_per_index {
-                    tracing::warn!(
-                        field = %fc.name,
-                        limit = self.max_fields_per_index,
-                        "rejecting new field: field limit reached"
-                    );
-                    break;
+        let mut field_count = schema.schema.field_count() as u32;
+        for (key, val) in new_top_level {
+            if let Some(existing) = schema.schema.field_mut(&key) {
+                // Raced in since the read-lock scan -- merge into it
+                // instead of skipping outright, so a key another doc in
+                // this same batch also introduces isn't lost.
+                if merge_dynamic_children_into(
+                    existing,
+                    &val,
+                    date_detection,
+                    1,
+                    &mut field_count,
+                    self.max_fields_per_index,
+                ) {
+                    schema_changed = true;
                 }
-                if matches!(fc.field_type, FieldType::Date) {
-                    self.has_date_fields.store(true, Ordering::Relaxed);
+                continue;
+            }
+            if field_count >= self.max_fields_per_index {
+                tracing::warn!(
+                    field = %key,
+                    limit = self.max_fields_per_index,
+                    "rejecting new field: field limit reached"
+                );
+                break;
+            }
+            let fc = dynamic_field_config(&key, &val, date_detection);
+            if matches!(fc.field_type, FieldType::Date) {
+                self.has_date_fields.store(true, Ordering::Relaxed);
+            }
+            field_count += 1;
+            let _ = schema.schema.add_field(fc);
+            schema_changed = true;
+        }
+        for (key, val) in needs_merge {
+            if let Some(existing) = schema.schema.field_mut(&key) {
+                if merge_dynamic_children_into(
+                    existing,
+                    &val,
+                    date_detection,
+                    1,
+                    &mut field_count,
+                    self.max_fields_per_index,
+                ) {
+                    schema_changed = true;
                 }
-                let _ = schema.schema.add_field(fc);
-                schema_changed = true;
             }
         }
         if schema_changed {
@@ -18007,35 +18740,46 @@ impl Index {
         // Fast path: check with a read lock first to avoid taking a write lock
         // on every document when all fields are already known.  This is the
         // common case after the first few documents and avoids the write lock
-        // bottleneck that otherwise limits indexing throughput.
-        let new_fields: Vec<(String, FieldConfig)> = {
+        // bottleneck that otherwise limits indexing throughput. `needs_write`
+        // covers both a brand-new top-level field and a new nested child
+        // under an already-known one -- see `evolve_schema_from_docs` for
+        // the full rationale (same fix, single-document form).
+        let needs_write = {
             let schema = self.schema.read().await;
             if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
                 return;
             }
-            let date_detection = self.date_detection_enabled();
-            obj.iter()
-                .filter(|(key, _)| {
-                    !key.starts_with(PASSAGE_METADATA_PREFIX) && !schema.schema.has_field(key)
-                })
-                .map(|(key, val)| (key.clone(), dynamic_field_config(key, val, date_detection)))
-                .collect()
+            obj.iter().any(|(key, val)| {
+                if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                    return false;
+                }
+                match schema.schema.field(key) {
+                    None => true,
+                    Some(existing) => field_config_needs_merge(existing, val),
+                }
+            })
         };
 
-        if new_fields.is_empty() {
-            // No new fields — skip the write lock entirely (hot path).
+        if !needs_write {
+            // Nothing new — skip the write lock entirely (hot path).
             return;
         }
 
-        // Mapping-explosion guard (see evolve_schema_from_docs for rationale).
+        // Mapping-explosion guard (see evolve_schema_from_docs for rationale
+        // -- this single-document form only ever contributes at most
+        // `obj.len()` brand-new top-level fields, so that bound is used for
+        // the same approximate early exit; a merge's real growth is
+        // enforced exactly under the write lock below).
         {
             let schema = self.schema.read().await;
             let current = schema.schema.field_count() as u32;
-            let projected = current.saturating_add(new_fields.len() as u32);
+            let new_top_level_upper_bound =
+                obj.keys().filter(|k| !schema.schema.has_field(k)).count() as u32;
+            let projected = current.saturating_add(new_top_level_upper_bound);
             if projected > self.max_fields_per_index {
                 tracing::warn!(
                     current_fields = current,
-                    new_fields = new_fields.len(),
+                    new_fields = new_top_level_upper_bound,
                     limit = self.max_fields_per_index,
                     "rejecting schema evolution: field limit exceeded"
                 );
@@ -18043,29 +18787,47 @@ impl Index {
             }
         }
 
-        // Slow path: at least one new field found.  Upgrade to write lock and
-        // persist the updated schema.
+        // Slow path: at least one new field or new nested child found.
+        // Upgrade to write lock and persist the updated schema.
+        let date_detection = self.date_detection_enabled();
         let mut schema = self.schema.write().await;
         if !matches!(schema.dynamic, xerj_common::schema::DynamicMapping::Dynamic) {
             return;
         }
         let mut schema_changed = false;
-        for (_, fc) in new_fields {
-            if !schema.schema.has_field(&fc.name) {
-                if schema.schema.field_count() as u32 >= self.max_fields_per_index {
-                    tracing::warn!(
-                        field = %fc.name,
-                        limit = self.max_fields_per_index,
-                        "rejecting new field: field limit reached"
-                    );
-                    break;
-                }
-                if matches!(fc.field_type, FieldType::Date) {
-                    self.has_date_fields.store(true, Ordering::Relaxed);
-                }
-                let _ = schema.schema.add_field(fc);
-                schema_changed = true;
+        let mut field_count = schema.schema.field_count() as u32;
+        for (key, val) in obj {
+            if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                continue;
             }
+            if let Some(existing) = schema.schema.field_mut(key) {
+                if merge_dynamic_children_into(
+                    existing,
+                    val,
+                    date_detection,
+                    1,
+                    &mut field_count,
+                    self.max_fields_per_index,
+                ) {
+                    schema_changed = true;
+                }
+                continue;
+            }
+            if field_count >= self.max_fields_per_index {
+                tracing::warn!(
+                    field = %key,
+                    limit = self.max_fields_per_index,
+                    "rejecting new field: field limit reached"
+                );
+                break;
+            }
+            let fc = dynamic_field_config(key, val, date_detection);
+            if matches!(fc.field_type, FieldType::Date) {
+                self.has_date_fields.store(true, Ordering::Relaxed);
+            }
+            field_count += 1;
+            let _ = schema.schema.add_field(fc);
+            schema_changed = true;
         }
         if schema_changed {
             self.persist_evolved_schema(&schema).await;
@@ -18325,8 +19087,25 @@ fn write_doc_values_sidecar(
     segment_id: &str,
     columns: &std::collections::BTreeMap<String, xerj_storage::doc_values::Column>,
 ) -> std::io::Result<()> {
+    write_doc_values_sidecar_at_level(
+        segments_dir,
+        segment_id,
+        columns,
+        xerj_storage::doc_values::DV_ZSTD_LEVEL,
+    )
+}
+
+/// [`write_doc_values_sidecar`] at a caller-chosen zstd level — the merge
+/// path's entry point for the operator's `compression.level` (#318). The
+/// flush path keeps the pinned level; see `DV_ZSTD_LEVEL`.
+fn write_doc_values_sidecar_at_level(
+    segments_dir: &std::path::Path,
+    segment_id: &str,
+    columns: &std::collections::BTreeMap<String, xerj_storage::doc_values::Column>,
+    level: i32,
+) -> std::io::Result<()> {
     let path = segments_dir.join(format!("{segment_id}.dv"));
-    let bytes = xerj_storage::doc_values::encode_columns(columns);
+    let bytes = xerj_storage::doc_values::encode_columns_at_level(columns, level);
     xerj_common::fsio::write_file_durable(&path, &bytes)
 }
 
@@ -19833,6 +20612,7 @@ impl Index {
         query: &QueryNode,
         text_fields: &[String],
         exact_fields: &HashSet<String>,
+        keyword_fields: &HashSet<String>,
         mem_doc_count: usize,
     ) -> Option<xerj_fts::CollectionStats> {
         // Widest (field × term) pre-pass we will pay for.  A field-less
@@ -19843,7 +20623,12 @@ impl Index {
         // convention as `MAX_QS_CROSS_PRODUCT`).
         const MAX_STATS_PROBES: usize = 4096;
 
-        let fq = query_node_to_fts(query, text_fields, exact_fields)?;
+        let fq = query_node_to_fts_with_keyword_fields(
+            query,
+            text_fields,
+            exact_fields,
+            keyword_fields,
+        )?;
         let mut fields: Vec<String> = Vec::new();
         collect_fts_query_fields(&fq, &mut fields);
         if fields.is_empty() {
@@ -23638,6 +24423,16 @@ async fn do_flush_shard(
                 fts_writer.add_documents_parallel(&drained_fts_for_build);
                 fts_add_us = t_add.elapsed().as_micros();
                 let t_fin = std::time::Instant::now();
+                if fts_writer.uses_encoded_field_filename_components() {
+                    store_for_warm.ensure_fts_encoded_field_component_format()?;
+                    fts_writer
+                        .publish_encoded_filename_layout()
+                        .map_err(|error| {
+                            xerj_storage::StorageError::Io(std::io::Error::other(format!(
+                                "FTS filename-layout publication failed: {error}"
+                            )))
+                        })?;
+                }
                 fts_writer.finish().map_err(|error| {
                     xerj_storage::StorageError::Io(std::io::Error::other(format!(
                         "FTS side-car build failed: {error}"
@@ -24088,7 +24883,309 @@ fn es_format_to_epoch_ms(s: &str, fmt: &str) -> Option<i64> {
     None
 }
 
-fn apply_source_filter(hits: Vec<Hit>, filter: &SourceFilter) -> Vec<Hit> {
+/// A `std::io::Write` sink that counts bytes and keeps none of them.
+///
+/// Serializing a value into this yields the byte count `serde_json` *would*
+/// have written, without allocating a buffer for a payload we are about to
+/// throw away. Using serde itself — rather than a hand-rolled length
+/// function — means the number cannot silently drift from what the wire
+/// format actually produces (float formatting above all).
+#[derive(Default)]
+struct ByteCounter(u64);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0 += buf.len() as u64;
+        Ok(())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Exact serialized JSON length of `value` — measured, not estimated.
+fn json_wire_len(value: &Value) -> u64 {
+    let mut counter = ByteCounter::default();
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        // `Value` → JSON cannot fail. If it somehow did we would not KNOW the
+        // size, and an unknown size must never be reported as a saving.
+        Err(_) => 0,
+    }
+}
+
+/// Exact serialized length of a JSON object key, quotes and escaping included.
+fn json_key_len(key: &str) -> u64 {
+    let mut counter = ByteCounter::default();
+    match serde_json::to_writer(&mut counter, key) {
+        Ok(()) => counter.0,
+        Err(_) => 0,
+    }
+}
+
+/// How many elements of a long array are actually rendered before the rest is
+/// extrapolated.
+///
+/// 64 was chosen by measurement, not taste. XERJ's built-in (non-ONNX)
+/// embedder emits *sparse* vectors — on a real 384-dim companion, 320 of the
+/// 384 elements are exactly `0.0` — and the resulting bimodal width
+/// distribution is what breaks naive sampling: plain 32-element sampling of
+/// that vector came out between -9.7% and +16.8% depending on which 32
+/// elements you take. Counting the fixed-width elements exactly (see
+/// [`cheap_element_len`]) and sampling only the rest at 64 brings the same
+/// vector to 0.00%. Observed error across real and adversarial shapes is
+/// tabulated in `SAVINGS-STATS-REPORT.md`.
+const SAVINGS_ARRAY_SAMPLE: usize = 64;
+
+/// Sample size at nesting depth `depth` (number of enclosing arrays).
+///
+/// Nested numeric arrays — a chunk matrix, `[[f32; dims]; chunks]` — multiply:
+/// sampling 64 rows of 64 columns is 4,096 float renders, which is most of
+/// what the measurement costs on a large document. The rows of an embedding
+/// matrix are homogeneous by construction (same dimensionality, same model,
+/// same magnitude range), so a smaller sample deeper down costs almost no
+/// accuracy and cuts the product hard. Measured effect is in the report.
+fn savings_sample_size(depth: u32) -> usize {
+    match depth {
+        0 => SAVINGS_ARRAY_SAMPLE,
+        1 => 16,
+        _ => 8,
+    }
+}
+
+/// Serialized length of an array element whose width is knowable without
+/// running the expensive formatter, or `None` if it has to be rendered.
+///
+/// The whole sampling scheme rests on this: the elements that make a vector's
+/// width distribution bimodal — the zeros — are also the ones we can size for
+/// free, so they are counted exactly and never sampled. Integers go through
+/// `itoa`, which is several times cheaper than the `ryu` float path and is
+/// therefore taken exactly too.
+fn cheap_element_len(value: &Value) -> Option<u64> {
+    match value {
+        Value::Null => Some(4),
+        Value::Bool(true) => Some(4),
+        Value::Bool(false) => Some(5),
+        Value::Number(number) => {
+            if let Some(float) = number.as_f64() {
+                if number.is_f64() {
+                    if float != 0.0 {
+                        return None;
+                    }
+                    // ryu renders signed zero as `-0.0`; `-0.0 == 0.0` in
+                    // Rust, so the sign has to be asked for explicitly.
+                    return Some(if float.is_sign_negative() { 4 } else { 3 });
+                }
+            }
+            Some(json_wire_len(value))
+        }
+        _ => None,
+    }
+}
+
+/// Serialized JSON length of `value`, with long arrays extrapolated from a
+/// bounded sample instead of rendered in full.
+///
+/// This is what makes the statistic affordable on every search. An embedding
+/// companion is ~250,000 float literals; rendering all of them with `ryu`
+/// purely to learn how many bytes they occupy costs ~10 ms per page of ten
+/// hits. Sampling 64 of them costs microseconds.
+///
+/// It is an estimate and is labelled as one on the wire
+/// (`_savings.measured: "sampled"`). Three properties keep it honest:
+///
+/// * Anything short enough to be cheap is measured **exactly** — arrays at or
+///   under [`SAVINGS_ARRAY_SAMPLE`] costly elements, every object, every
+///   scalar, every string outside a long array.
+/// * The elements with a free, exact width are counted exactly and excluded
+///   from the sample, so a bimodal (sparse-vector) distribution does not
+///   poison the mean.
+/// * The sample is strided across the whole array rather than taken from the
+///   head, and the extrapolation truncates rather than rounds, so what bias
+///   remains leans toward under-claiming.
+fn json_len_sampled(value: &Value) -> u64 {
+    json_len_sampled_at(value, 0)
+}
+
+fn json_len_sampled_at(value: &Value, depth: u32) -> u64 {
+    match value {
+        Value::Array(items) => {
+            if items.is_empty() {
+                return 2;
+            }
+            let sample = savings_sample_size(depth);
+            // Pass 1: size everything that is free to size, and count what is
+            // left. No allocation — this runs on the hot read path.
+            let mut exact = 0u64;
+            let mut costly = 0usize;
+            for item in items {
+                match cheap_element_len(item) {
+                    Some(len) => exact += len,
+                    None => costly += 1,
+                }
+            }
+            let sampled = if costly == 0 {
+                0
+            } else if costly <= sample {
+                // Few enough to be worth doing properly.
+                items
+                    .iter()
+                    .filter(|item| cheap_element_len(item).is_none())
+                    .map(|item| json_len_sampled_at(item, depth + 1))
+                    .sum()
+            } else {
+                // Pass 2: stride across the costly elements, rendering one
+                // every `costly / sample`, then extrapolate.
+                let mut seen = 0usize;
+                let mut taken = 0usize;
+                let mut total = 0u64;
+                for item in items {
+                    if cheap_element_len(item).is_some() {
+                        continue;
+                    }
+                    if taken < sample && seen >= taken * costly / sample {
+                        total += json_len_sampled_at(item, depth + 1);
+                        taken += 1;
+                    }
+                    seen += 1;
+                }
+                let taken = taken.max(1) as u128;
+                // Truncating division: the residue is dropped rather than
+                // rounded up, so the estimate never drifts high by rounding.
+                (total as u128 * costly as u128 / taken) as u64
+            };
+            // `[`, `]`, and one comma between each pair of elements.
+            2 + (items.len() as u64 - 1) + exact + sampled
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                return 2;
+            }
+            let inner: u64 = map
+                .iter()
+                .map(|(key, val)| json_key_len(key) + 1 + json_len_sampled_at(val, depth))
+                .sum();
+            2 + (map.len() as u64 - 1) + inner
+        }
+        _ => json_wire_len(value),
+    }
+}
+
+/// Serialized length of `value` under the caller's chosen measurement mode.
+fn json_len(value: &Value, mode: SavingsMode) -> u64 {
+    match mode {
+        SavingsMode::Exact => json_wire_len(value),
+        _ => json_len_sampled(value),
+    }
+}
+
+/// Per-hit omitted bytes.
+#[derive(Default)]
+struct SavingsAccumulator {
+    per_hit: Vec<(String, u64)>,
+}
+
+impl SavingsAccumulator {
+    fn record(&mut self, id: &str, bytes: u64) {
+        if bytes > 0 {
+            self.per_hit.push((id.to_string(), bytes));
+        }
+    }
+}
+
+/// Serialized length of the `_source` this hit would have carried had the
+/// caller written **no `_source` clause at all** — the engine's default
+/// projection, which strips generated embedding companions.
+///
+/// This is the baseline every saving below is measured against, and getting
+/// it right is the difference between a statistic and a slogan. Measuring
+/// against the raw stored document instead credits the caller's projection
+/// with the removal of embedding vectors that this engine has not returned by
+/// default since #309; a blind UX dogfood measured that overstatement at a
+/// consistent ~9.3x and it was the single thing that cost the feature its
+/// credibility.
+///
+/// Note what this does NOT do: it never serializes the companion values. The
+/// old baseline had to, because it was claiming them. Fixing the honesty
+/// problem removed the expensive half of the measurement with it.
+fn default_projection_len(
+    source: &Value,
+    generated_companion_fields: &HashSet<String>,
+    mode: SavingsMode,
+) -> u64 {
+    let Some(map) = source.as_object() else {
+        return json_len(source, mode);
+    };
+    if generated_companion_fields.is_empty() {
+        return json_len(source, mode);
+    }
+    // A dotted or globbed companion strips a nested key, which the key-wise
+    // walk below cannot express; fall back to building the projection.
+    if generated_companion_fields
+        .iter()
+        .any(|f| f.contains('.') || f.contains('*'))
+    {
+        let excludes: Vec<String> = generated_companion_fields.iter().cloned().collect();
+        return json_len(&filter_object(source, &[], &excludes), mode);
+    }
+    let mut inner = 0u64;
+    let mut kept = 0usize;
+    for (key, value) in map {
+        if generated_companion_fields.contains(key) {
+            continue;
+        }
+        inner += json_key_len(key) + 1 + json_len(value, mode);
+        kept += 1;
+    }
+    if kept == 0 {
+        return 2;
+    }
+    // `{`, `}`, and one comma between each pair of kept members.
+    2 + (kept as u64 - 1) + inner
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Unmeasured filtering — the shape every pre-existing test asserts on, and
+/// proof that the measurement is strictly additive rather than a rewrite of
+/// the `_source` projection semantics.
+#[cfg(test)]
+fn apply_source_filter(
+    hits: Vec<Hit>,
+    filter: &SourceFilter,
+    generated_companion_fields: &HashSet<String>,
+) -> Vec<Hit> {
+    apply_source_filter_measured(hits, filter, generated_companion_fields, None).0
+}
+
+/// `_source` filtering, measuring what it left out.
+///
+/// `measure: Some(request)` turns the savings measurement on; `None` skips it
+/// for one `Option` check per call and no per-hit work whatsoever — that is
+/// the path every internal engine search (reindex, update-by-query, terms
+/// lookup, suggesters) takes, because nobody will ever read their number.
+/// The user-facing `_search` handler measures by default; see
+/// [`SavingsMode`] and [`json_len_sampled`] for how that is made affordable.
+///
+/// Every number produced here is the difference between what this response
+/// carries and what the *same* response would have carried without the
+/// omission. Nothing hypothetical is counted, and nothing is counted twice.
+fn apply_source_filter_measured(
+    hits: Vec<Hit>,
+    filter: &SourceFilter,
+    generated_companion_fields: &HashSet<String>,
+    measure: Option<&SearchRequest>,
+) -> (Vec<Hit>, Option<PayloadSavings>) {
     let hits: Vec<Hit> = hits
         .into_iter()
         .map(|mut hit| {
@@ -24096,27 +25193,223 @@ fn apply_source_filter(hits: Vec<Hit>, filter: &SourceFilter) -> Vec<Hit> {
             hit
         })
         .collect();
-    match filter {
-        SourceFilter::Enabled(true) => hits,
+    let mut acc = SavingsAccumulator::default();
+    // A request carrying `SavingsMode::Off` is indistinguishable from no
+    // request at all, so collapse the two here rather than guarding every
+    // measurement site below.
+    let mode = measure.map_or(SavingsMode::Off, |request| request.savings);
+    let measure = measure.filter(|_| !matches!(mode, SavingsMode::Off));
+    let measuring = measure.is_some();
+    let mut substitutable = false;
+    let filtered = match filter {
+        // The default is a passthrough: only engine-generated embedding
+        // companions are stripped, so an index without embedding mappings
+        // must not pay a per-hit deep copy of its source (issue #311).
+        //
+        // NOTHING IS REPORTED HERE, deliberately. Stripping the companions is
+        // what this engine does on every default response; it is not a choice
+        // the caller made and it is not a saving relative to what they would
+        // otherwise have received. Claiming it meant a caller who wrote
+        // `{"query":…,"size":20}` and asked for everything was told they had
+        // saved 22 MB — the engine taking credit for its own default, which is
+        // precisely the vanity metric this feature was written to avoid.
+        SourceFilter::Default => {
+            if generated_companion_fields.is_empty() {
+                return (hits, None);
+            }
+            if generated_companion_fields
+                .iter()
+                .any(|f| f.contains('.') || f.contains('*'))
+            {
+                let excludes: Vec<String> = generated_companion_fields.iter().cloned().collect();
+                return (
+                    hits.into_iter()
+                        .map(|mut h| {
+                            h.source = filter_object(&h.source, &[], &excludes);
+                            h
+                        })
+                        .collect(),
+                    None,
+                );
+            }
+            return (
+                hits.into_iter()
+                    .map(|mut h| {
+                        if let Some(map) = h.source.as_object_mut() {
+                            map.retain(|k, _| !generated_companion_fields.contains(k));
+                        }
+                        h
+                    })
+                    .collect(),
+                None,
+            );
+        }
+        // The caller explicitly asked for the whole document — MORE than the
+        // default projection, not less. Nothing was withheld.
+        SourceFilter::Enabled(true) => return (hits, None),
         // `_source: false`: keep the raw source so the response layer can
         // still resolve `fields` / `_ignored` / `highlight` against it —
         // `_source` emission is suppressed in es_compat.rs.
-        SourceFilter::Enabled(false) => hits,
+        SourceFilter::Enabled(false) => {
+            if measuring {
+                // The response layer may hand some of these values back via
+                // `fields` / `docvalue_fields` / `script_fields`. It knows
+                // exactly how many bytes it emitted and subtracts them; this
+                // flag is what tells it to.
+                substitutable = true;
+                for h in &hits {
+                    let omitted =
+                        default_projection_len(&h.source, generated_companion_fields, mode);
+                    // Highlighting is the designated substitute when `_source`
+                    // is off: the fragments ARE on the wire, so the honest
+                    // saving is net of them.
+                    let substitute = h
+                        .highlight
+                        .as_ref()
+                        .map(|frags| {
+                            json_len(&serde_json::to_value(frags).unwrap_or(Value::Null), mode)
+                        })
+                        .unwrap_or(0);
+                    acc.record(&h.id, omitted.saturating_sub(substitute));
+                }
+            }
+            hits
+        }
         SourceFilter::Includes(fields) => hits
             .into_iter()
             .map(|mut h| {
+                let baseline = measuring
+                    .then(|| default_projection_len(&h.source, generated_companion_fields, mode));
                 h.source = filter_object(&h.source, fields, &[]);
+                if let Some(baseline) = baseline {
+                    // Saturating: a caller who explicitly projects a generated
+                    // companion gets MORE than the default, and more is not a
+                    // saving.
+                    acc.record(&h.id, baseline.saturating_sub(json_len(&h.source, mode)));
+                }
                 h
             })
             .collect(),
         SourceFilter::Fields { includes, excludes } => hits
             .into_iter()
             .map(|mut h| {
+                let baseline = measuring
+                    .then(|| default_projection_len(&h.source, generated_companion_fields, mode));
                 h.source = filter_object(&h.source, includes, excludes);
+                if let Some(baseline) = baseline {
+                    acc.record(&h.id, baseline.saturating_sub(json_len(&h.source, mode)));
+                }
                 h
             })
             .collect(),
+    };
+    let savings =
+        measure.and_then(|request| savings_note(filter, request, mode, substitutable, &acc));
+    (filtered, savings)
+}
+
+/// Merge the savings of a hybrid query's sub-searches.
+///
+/// Every leg strips the same companions from the same documents, so a
+/// document retrieved by two legs must contribute its bytes exactly once —
+/// summing the legs' totals would double-count, which is precisely the
+/// inflation this stat must not commit. De-duplicating by document id makes
+/// the double-count structurally impossible.
+fn merge_sub_savings(sub_savings: Vec<PayloadSavings>) -> Option<PayloadSavings> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut per_hit: Vec<(String, u64)> = Vec::new();
+    let mut note: Option<String> = None;
+    let mut method: Option<SavingsMethod> = None;
+    let mut substitutable = false;
+    for savings in sub_savings {
+        note.get_or_insert_with(|| savings.note.clone());
+        method.get_or_insert(savings.measured);
+        substitutable |= savings.substitutable;
+        for (id, bytes) in savings.per_hit {
+            if seen.insert(id.clone()) {
+                per_hit.push((id, bytes));
+            }
+        }
     }
+    PayloadSavings::new(method?, note?, substitutable, per_hit)
+}
+
+/// Phrase the mechanism that actually fired.
+///
+/// The point of the stat is not the counter, it is teaching the reader WHICH
+/// feature bought them the bytes, so each mechanism gets its own sentence.
+/// Kept to a few tens of bytes: a block that costs more tokens than it
+/// reports saving would be the worst possible advertisement for the idea.
+fn savings_note(
+    filter: &SourceFilter,
+    request: &SearchRequest,
+    mode: SavingsMode,
+    substitutable: bool,
+    acc: &SavingsAccumulator,
+) -> Option<PayloadSavings> {
+    // Counts come from the REQUEST, never from what came back. A caller who
+    // projects one field that a particular document happens to lack was told
+    // "Sent the 0 fields you asked for" — reporting their own request back to
+    // them, wrongly. What they asked for is a fact about the request.
+    //
+    // And no denominators. "not all 15" reads as a claim about the index
+    // schema, but it was really the widest document on the page: the same
+    // query at a different `size` reported 8, then 11, then 12, then 15, which
+    // reads as an unreliable statistic even though each number was true of the
+    // page it described.
+    let note = match filter {
+        // Neither of these reaches here — both return before the note is
+        // built — but the match must stay total.
+        SourceFilter::Default | SourceFilter::Enabled(true) => return None,
+        SourceFilter::Enabled(false) if request.highlight.is_some() => {
+            "highlight fragments returned in place of _source".to_string()
+        }
+        SourceFilter::Enabled(false) if !request.fields.is_empty() => {
+            "fields returned in place of _source".to_string()
+        }
+        SourceFilter::Enabled(false) => "_source withheld, as requested".to_string(),
+        SourceFilter::Includes(fields) => format!(
+            "_source narrowed to the {} field{} you listed",
+            fields.len(),
+            plural(fields.len())
+        ),
+        SourceFilter::Fields { includes, excludes } if includes.is_empty() => format!(
+            "_source excluded the {} field{} you listed",
+            excludes.len(),
+            plural(excludes.len())
+        ),
+        SourceFilter::Fields { includes, .. } => format!(
+            "_source narrowed to the {} field{} you listed",
+            includes.len(),
+            plural(includes.len())
+        ),
+    };
+    let method = match mode {
+        SavingsMode::Exact => SavingsMethod::Exact,
+        _ => SavingsMethod::Sampled,
+    };
+    PayloadSavings::new(method, note, substitutable, acc.per_hit.clone())
+}
+
+/// Return the engine-generated embedding companions for a schema.
+///
+/// This is deliberately derived from `FieldConfig.embedding` rather than from
+/// field-name suffixes: a user-owned field called `body_vector` is ordinary
+/// source data unless an embedding mapping designates it as a target.
+fn generated_embedding_companion_fields(schema: &Schema) -> HashSet<String> {
+    let mut companions = HashSet::new();
+    for field in &schema.fields {
+        let Some(embedding) = &field.embedding else {
+            continue;
+        };
+        let target = embedding
+            .target_field
+            .clone()
+            .unwrap_or_else(|| format!("{}_vector", field.name));
+        companions.insert(target.clone());
+        companions.insert(format!("{target}_chunks"));
+    }
+    companions
 }
 
 /// Return a filtered copy of a JSON object keeping `includes` and removing `excludes`.
@@ -24246,6 +25539,1037 @@ fn filter_object(source: &Value, includes: &[String], excludes: &[String]) -> Va
     }
 
     collect_and_filter(source, "", includes, excludes)
+}
+
+#[cfg(test)]
+mod source_filter_tests {
+    use super::*;
+    use serde_json::json;
+    use xerj_common::types::{EmbeddingConfig, FieldConfig, FieldType};
+
+    fn embedded_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(
+                FieldConfig::new("body", FieldType::Text).with_embedding(EmbeddingConfig {
+                    endpoint: None,
+                    model: None,
+                    target_field: None,
+                }),
+            )
+            .unwrap();
+        schema
+    }
+
+    fn hit(id: &str, score: f32, source: Value) -> Hit {
+        Hit {
+            id: id.to_string(),
+            score,
+            source,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        }
+    }
+
+    fn generated_source() -> Value {
+        json!({
+            "body": "the source text",
+            "body_vector": [0.1, 0.2, 0.3],
+            "body_vector_chunks": [[0.1, 0.2], [0.2, 0.3]],
+            "title": "a user field"
+        })
+    }
+
+    #[test]
+    fn omitted_source_excludes_mapping_derived_companions_only() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let hits = vec![
+            hit("first", 0.9, generated_source()),
+            hit("second", 0.4, generated_source()),
+        ];
+
+        let filtered = apply_source_filter(hits, &SourceFilter::Default, &companions);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|hit| (hit.id.as_str(), hit.score))
+                .collect::<Vec<_>>(),
+            vec![("first", 0.9), ("second", 0.4)]
+        );
+        for hit in filtered {
+            assert_eq!(
+                hit.source,
+                json!({
+                    "body": "the source text",
+                    "title": "a user field"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_source_true_keeps_mapping_derived_companions() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let original = generated_source();
+        let filtered = apply_source_filter(
+            vec![hit("doc", 0.9, original.clone())],
+            &SourceFilter::Enabled(true),
+            &companions,
+        );
+
+        assert_eq!(filtered[0].source, original);
+    }
+
+    #[test]
+    fn explicit_source_include_still_returns_a_generated_companion() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filtered = apply_source_filter(
+            vec![hit("doc", 0.9, generated_source())],
+            &SourceFilter::Includes(vec!["body_vector".to_string()]),
+            &companions,
+        );
+
+        assert_eq!(filtered[0].source, json!({"body_vector": [0.1, 0.2, 0.3]}));
+    }
+
+    #[test]
+    fn omitted_source_measures_companion_payload_reduction() {
+        let vector = Value::Array((0..384).map(|_| json!(0.123456)).collect());
+        let chunks = Value::Array((0..660).map(|_| vector.clone()).collect());
+        let source = json!({
+            "body": "x".repeat(250_000),
+            "body_vector": vector,
+            "body_vector_chunks": chunks
+        });
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let before = hit("doc", 0.9, source);
+        let before_bytes = serde_json::to_vec(&before).unwrap().len();
+        let after = apply_source_filter(vec![before], &SourceFilter::Default, &companions);
+        let after_bytes = serde_json::to_vec(&after[0]).unwrap().len();
+
+        eprintln!("default _search hit payload bytes: before={before_bytes}, after={after_bytes}");
+        assert!(before_bytes > 2_000_000);
+        assert!(after_bytes < 300_000);
+        assert!(after_bytes * 8 < before_bytes);
+    }
+
+    #[test]
+    fn user_declared_vector_suffix_without_embedding_is_not_stripped() {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body_vector", FieldType::Keyword))
+            .unwrap();
+        let companions = generated_embedding_companion_fields(&schema);
+        assert!(companions.is_empty());
+
+        let original = json!({"body_vector": "user-owned value"});
+        let filtered = apply_source_filter(
+            vec![hit("doc", 0.9, original.clone())],
+            &SourceFilter::Default,
+            &companions,
+        );
+
+        assert_eq!(filtered[0].source, original);
+    }
+
+    /// Heap-buffer pointer of a field's string value. Stable across map
+    /// mutation and moves; changes only if the value itself is deep-copied.
+    fn str_buf_ptr(source: &Value, field: &str) -> *const u8 {
+        source[field].as_str().unwrap().as_ptr()
+    }
+
+    // Issue #311: with no embedding mappings there is nothing to strip, so
+    // the default `_source` arm must hand every hit back untouched instead
+    // of deep-copying O(source bytes) per hit on the hottest read path.
+    #[test]
+    fn default_source_without_companions_is_a_zero_copy_passthrough() {
+        let companions = generated_embedding_companion_fields(&Schema::empty());
+        assert!(companions.is_empty());
+
+        let hits = vec![hit(
+            "doc",
+            0.9,
+            json!({"body": "the source text", "title": "a user field"}),
+        )];
+        let body_ptr = str_buf_ptr(&hits[0].source, "body");
+        let title_ptr = str_buf_ptr(&hits[0].source, "title");
+
+        let filtered = apply_source_filter(hits, &SourceFilter::Default, &companions);
+
+        assert_eq!(
+            filtered[0].source,
+            json!({"body": "the source text", "title": "a user field"})
+        );
+        assert_eq!(str_buf_ptr(&filtered[0].source, "body"), body_ptr);
+        assert_eq!(str_buf_ptr(&filtered[0].source, "title"), title_ptr);
+    }
+
+    // Issue #311, companion-bearing indexes: strip the companions in place
+    // rather than rebuilding the map with a deep clone of every kept value.
+    #[test]
+    fn default_source_with_companions_strips_in_place_without_deep_copy() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let hits = vec![hit("doc", 0.9, generated_source())];
+        let body_ptr = str_buf_ptr(&hits[0].source, "body");
+        let title_ptr = str_buf_ptr(&hits[0].source, "title");
+
+        let filtered = apply_source_filter(hits, &SourceFilter::Default, &companions);
+
+        assert_eq!(
+            filtered[0].source,
+            json!({"body": "the source text", "title": "a user field"})
+        );
+        assert_eq!(str_buf_ptr(&filtered[0].source, "body"), body_ptr);
+        assert_eq!(str_buf_ptr(&filtered[0].source, "title"), title_ptr);
+    }
+}
+
+/// The `_savings` statistic, at the point where the bytes are actually
+/// dropped.
+///
+/// Every byte count asserted here is recomputed from scratch with plain
+/// `serde_json` — never by re-running the implementation's own arithmetic —
+/// because a metric that only agrees with itself proves nothing.
+///
+/// The load-bearing property, after a blind UX dogfood caught the earlier
+/// revision overstating by ~9.3x: **the baseline is the default-projected
+/// response**, not the raw stored document. Several tests below exist purely
+/// to pin that down.
+#[cfg(test)]
+mod savings_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use xerj_common::types::{EmbeddingConfig, FieldConfig, FieldType};
+
+    fn embedded_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(
+                FieldConfig::new("body", FieldType::Text).with_embedding(EmbeddingConfig {
+                    endpoint: None,
+                    model: None,
+                    target_field: None,
+                }),
+            )
+            .unwrap();
+        schema
+    }
+
+    fn hit(id: &str, source: Value) -> Hit {
+        Hit {
+            id: id.to_string(),
+            score: 1.0,
+            source,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        }
+    }
+
+    /// Exact mode: the byte-for-byte assertions compare against an
+    /// independently serialized oracle, so they must not run against the
+    /// sampled estimator. Sampling accuracy has its own tests.
+    fn measuring(source: SourceFilter) -> SearchRequest {
+        SearchRequest {
+            source,
+            savings: SavingsMode::Exact,
+            ..SearchRequest::default()
+        }
+    }
+
+    fn measuring_sampled(source: SourceFilter) -> SearchRequest {
+        SearchRequest {
+            source,
+            savings: SavingsMode::Sampled,
+            ..SearchRequest::default()
+        }
+    }
+
+    /// A companion-bearing document: user fields plus the generated vector
+    /// and its per-chunk companions. The user fields are deliberately large
+    /// enough that a projection clears the reporting floor.
+    fn companion_source() -> Value {
+        let vector = Value::Array((0..384).map(|_| json!(0.123456)).collect());
+        json!({
+            "title": "quarterly report",
+            "author": "finance",
+            "body": "x".repeat(8_000),
+            "body_vector": vector,
+            "body_vector_chunks": [[0.5, 0.25], [0.125, 0.0625]],
+        })
+    }
+
+    /// The independent oracle for the baseline: what the caller would have
+    /// received had they written no `_source` clause at all. Built here by
+    /// hand from the same document, with nothing borrowed from the engine.
+    fn default_projected(source: &Value, companions: &HashSet<String>) -> Value {
+        let mut map = source.as_object().cloned().unwrap_or_default();
+        map.retain(|k, _| !companions.contains(k));
+        Value::Object(map)
+    }
+
+    fn wire_len(value: &Value) -> u64 {
+        serde_json::to_vec(value).unwrap().len() as u64
+    }
+
+    // ── the baseline: the whole point of this revision ─────────────────────
+
+    #[test]
+    fn a_projection_is_measured_against_the_response_you_would_have_got() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = measuring(filter.clone());
+
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", source.clone())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        let savings = savings.expect("dropping an 8 KB body is a real saving");
+
+        // The oracle: default projection minus what was actually returned.
+        // NOT the raw stored document — the embedding companions were never
+        // going to be sent, so crediting this projection with removing them
+        // would overstate the saving by the size of the vectors.
+        let expected =
+            wire_len(&default_projected(&source, &companions)) - wire_len(&filtered[0].source);
+        assert_eq!(
+            savings.bytes, expected,
+            "the baseline must be the default-projected response, not the stored document"
+        );
+
+        // And prove the two baselines really differ here, so the assertion
+        // above is not vacuous.
+        let against_stored = wire_len(&source) - wire_len(&filtered[0].source);
+        assert!(
+            against_stored > savings.bytes,
+            "this fixture must have companions worth counting, or the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_engines_own_default_is_never_claimed_as_a_saving() {
+        // The failure this exists to prevent: a caller who writes no `_source`
+        // clause at all, asks for everything, and is told they saved 22 MB.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let request = measuring(SourceFilter::Default);
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &SourceFilter::Default,
+            &companions,
+            Some(&request),
+        );
+        assert!(
+            savings.is_none(),
+            "stripping generated vectors is what this engine does on every default \
+             response; it is not a choice the caller made and not a saving relative \
+             to what they would otherwise have received"
+        );
+        assert!(
+            filtered[0].source.get("body_vector").is_none(),
+            "the stripping itself must still happen — only the claim is withdrawn"
+        );
+    }
+
+    #[test]
+    fn projecting_more_than_the_default_is_not_a_saving() {
+        // `_source: ["body_vector"]` on a document whose vector dwarfs its
+        // user fields returns MORE than the default projection would have.
+        // More is not less, and `saturating_sub` must not be allowed to
+        // report the shortfall as a win.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = json!({
+            "title": "t",
+            "body": "short",
+            "body_vector": Value::Array((0..384).map(|_| json!(0.123456)).collect()),
+        });
+        let filter = SourceFilter::Includes(vec!["body_vector".to_string()]);
+        let request = measuring(filter.clone());
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", source.clone())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        assert!(
+            filtered[0].source.get("body_vector").is_some(),
+            "the caller asked for the vector and must still receive it"
+        );
+        assert!(
+            wire_len(&filtered[0].source) > wire_len(&default_projected(&source, &companions)),
+            "this fixture must actually return more than the default, or it proves nothing"
+        );
+        assert!(
+            savings.is_none(),
+            "a response larger than the default withheld nothing"
+        );
+    }
+
+    #[test]
+    fn projecting_a_companion_alongside_a_large_body_still_measures_honestly() {
+        // The mirror case: the same projection on a document with an 8 KB
+        // body DOES withhold bytes, because the body did not go out. The
+        // saving is real and is still measured against the default
+        // projection, companion or not.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let filter = SourceFilter::Includes(vec!["body_vector".to_string()]);
+        let request = measuring(filter.clone());
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", source.clone())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        let expected =
+            wire_len(&default_projected(&source, &companions)) - wire_len(&filtered[0].source);
+        assert_eq!(
+            savings.expect("the 8 KB body did not go out").bytes,
+            expected
+        );
+    }
+
+    #[test]
+    fn suppressed_source_is_measured_against_the_default_projection_too() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let request = SearchRequest {
+            source: SourceFilter::Enabled(false),
+            savings: SavingsMode::Exact,
+            ..SearchRequest::default()
+        };
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", source.clone())],
+            &SourceFilter::Enabled(false),
+            &companions,
+            Some(&request),
+        );
+        let savings = savings.expect("withholding an 8 KB document is a real saving");
+        assert_eq!(
+            savings.bytes,
+            wire_len(&default_projected(&source, &companions)),
+            "`_source: false` withholds the default projection, not the raw document"
+        );
+        assert!(
+            savings.substitutable,
+            "the response layer may hand some of this back via `fields`, and must be told"
+        );
+    }
+
+    // ── the reporting floor ───────────────────────────────────────────────
+
+    #[test]
+    fn a_saving_too_small_to_be_worth_printing_is_not_printed() {
+        // Measured on a real corpus: 135 bytes of block to announce a 19-byte
+        // saving, net -116, on ordinary single-document lookups.
+        let savings = PayloadSavings::new(
+            SavingsMethod::Sampled,
+            "note",
+            false,
+            vec![("d".into(), 19)],
+        )
+        .expect("19 bytes is still a measurement");
+        assert_eq!(savings.bytes, 19);
+        assert!(
+            savings.rescoped(19).is_none(),
+            "a block that costs more than it reports is a net loss to the budget it \
+             claims to protect"
+        );
+    }
+
+    #[test]
+    fn the_floor_is_measured_against_the_block_that_would_be_printed() {
+        let savings = PayloadSavings::new(
+            SavingsMethod::Sampled,
+            "a note",
+            false,
+            vec![("d".into(), 1)],
+        )
+        .expect("non-zero");
+        // Walk up until it prints, then check the ratio actually held.
+        let mut emitted_at = None;
+        for bytes in 1..4000u64 {
+            if let Some(block) = savings.rescoped(bytes) {
+                emitted_at = Some((bytes, serde_json::to_vec(&block).unwrap().len() as u64 + 11));
+                break;
+            }
+        }
+        let (bytes, cost) = emitted_at.expect("it must print eventually");
+        assert!(
+            bytes >= cost * 10,
+            "first emission was {bytes} bytes against a {cost}-byte block — under 10x"
+        );
+        assert!(
+            savings.rescoped(bytes - 1).is_none(),
+            "the threshold must be sharp, not approximate"
+        );
+    }
+
+    // ── the wire block ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_block_carries_no_derivable_or_constant_fields() {
+        let savings = PayloadSavings::new(
+            SavingsMethod::Sampled,
+            "_source narrowed to the 2 fields you listed",
+            false,
+            vec![("d".into(), 100_000)],
+        )
+        .unwrap();
+        let block = savings.rescoped(100_000).expect("well over the floor");
+        let keys: Vec<&str> = block
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["bytes", "measured", "note"],
+            "44% of the old block was a constant divisor, a constant label, and a \
+             division the reader could do themselves"
+        );
+        assert!(block.get("tokens_approx").is_none());
+        assert!(block.get("bytes_per_token").is_none());
+    }
+
+    #[test]
+    fn only_an_estimate_is_labelled() {
+        let per_hit = vec![("d".to_string(), 100_000u64)];
+        let sampled =
+            PayloadSavings::new(SavingsMethod::Sampled, "n", false, per_hit.clone()).unwrap();
+        let exact = PayloadSavings::new(SavingsMethod::Exact, "n", false, per_hit).unwrap();
+        assert_eq!(
+            sampled.rescoped(100_000).unwrap()["measured"],
+            json!("sampled"),
+            "an extrapolated figure must always say so"
+        );
+        assert!(
+            exact.rescoped(100_000).unwrap().get("measured").is_none(),
+            "absence means exact — a precise number needs no hedge"
+        );
+    }
+
+    #[test]
+    fn the_wire_block_stays_small() {
+        let mut widest = 0usize;
+        for note in [
+            "_source narrowed to the 2 fields you listed",
+            "_source excluded the 3 fields you listed",
+            "highlight fragments returned in place of _source",
+            "fields returned in place of _source",
+            "_source withheld, as requested",
+        ] {
+            let savings = PayloadSavings::new(
+                SavingsMethod::Sampled,
+                note,
+                false,
+                vec![("d".into(), 9_999_999)],
+            )
+            .unwrap();
+            let block = savings.rescoped(9_999_999).unwrap();
+            let wire = serde_json::to_vec(&block).unwrap().len() + 11;
+            widest = widest.max(wire);
+        }
+        assert!(
+            widest <= 120,
+            "the block is {widest} bytes; it was 147 before the constants came out"
+        );
+    }
+
+    // ── the notes: counts from the request, and no schema claims ──────────
+
+    #[test]
+    fn the_note_counts_what_you_asked_for_not_what_came_back() {
+        // Reported bug: asking for one field that this document lacks was
+        // answered "Sent the 0 fields you asked for" — the caller's own
+        // request, reported back to them wrongly.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["absent_field".to_string()]);
+        let request = measuring(filter.clone());
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        assert_eq!(
+            filtered[0].source,
+            json!({}),
+            "the document genuinely has none of the requested fields"
+        );
+        let savings = savings.expect("the whole default projection was withheld");
+        assert_eq!(
+            savings.note, "_source narrowed to the 1 field you listed",
+            "the count is a fact about the request, not about what matched"
+        );
+    }
+
+    #[test]
+    fn the_note_makes_no_claim_about_the_schema() {
+        // Reported bug: the `not all M` denominator moved 8 -> 11 -> 12 -> 15
+        // on the same query at different page sizes, because it described the
+        // widest document on the page. Each number was true; together they
+        // read as an unreliable statistic. There is no denominator now, so
+        // documents of different widths cannot move it.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = measuring(filter.clone());
+
+        let narrow = json!({"title": "t", "body": "y".repeat(8_000)});
+        let wide = {
+            let mut m = companion_source().as_object().cloned().unwrap();
+            m.insert("extra_a".into(), json!(1));
+            m.insert("extra_b".into(), json!(2));
+            Value::Object(m)
+        };
+        let notes: Vec<String> = [vec![hit("a", narrow)], vec![hit("b", wide)]]
+            .into_iter()
+            .map(|page| {
+                apply_source_filter_measured(page, &filter, &companions, Some(&request))
+                    .1
+                    .expect("both pages saved bytes")
+                    .note
+            })
+            .collect();
+        assert_eq!(
+            notes[0], notes[1],
+            "documents of different widths must not change the sentence"
+        );
+    }
+
+    #[test]
+    fn distinct_mechanisms_produce_distinct_sentences() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let mut notes = Vec::new();
+        for (filter, request) in [
+            (
+                SourceFilter::Includes(vec!["title".to_string()]),
+                measuring(SourceFilter::Includes(vec!["title".to_string()])),
+            ),
+            (
+                SourceFilter::Fields {
+                    includes: Vec::new(),
+                    excludes: vec!["body".to_string()],
+                },
+                measuring(SourceFilter::Fields {
+                    includes: Vec::new(),
+                    excludes: vec!["body".to_string()],
+                }),
+            ),
+            (
+                SourceFilter::Enabled(false),
+                SearchRequest {
+                    source: SourceFilter::Enabled(false),
+                    savings: SavingsMode::Exact,
+                    ..SearchRequest::default()
+                },
+            ),
+            (
+                SourceFilter::Enabled(false),
+                SearchRequest {
+                    source: SourceFilter::Enabled(false),
+                    savings: SavingsMode::Exact,
+                    fields: vec!["title".to_string()],
+                    ..SearchRequest::default()
+                },
+            ),
+        ] {
+            let (_, savings) = apply_source_filter_measured(
+                vec![hit("doc", companion_source())],
+                &filter,
+                &companions,
+                Some(&request),
+            );
+            notes.push(savings.expect("each mechanism withheld bytes").note);
+        }
+        assert_eq!(
+            notes,
+            vec![
+                "_source narrowed to the 1 field you listed",
+                "_source excluded the 1 field you listed",
+                "_source withheld, as requested",
+                "fields returned in place of _source",
+            ],
+            "the note names the mechanism; it must not read alike across mechanisms"
+        );
+    }
+
+    #[test]
+    fn suppressed_source_with_highlight_is_reported_net_of_the_fragments() {
+        let source = json!({ "body": "x".repeat(8_000) });
+        let mut h = hit("doc", source.clone());
+        let fragments: HashMap<String, Vec<String>> = HashMap::from([(
+            "body".to_string(),
+            vec!["…the <em>relevant</em> sentence…".to_string()],
+        )]);
+        h.highlight = Some(fragments.clone());
+        let request = SearchRequest {
+            source: SourceFilter::Enabled(false),
+            savings: SavingsMode::Exact,
+            highlight: Some(HighlightRequest::default()),
+            ..SearchRequest::default()
+        };
+
+        let (_, savings) = apply_source_filter_measured(
+            vec![h],
+            &SourceFilter::Enabled(false),
+            &HashSet::new(),
+            Some(&request),
+        );
+        let savings = savings.expect("an 8 KB body replaced by one fragment is a real saving");
+        assert_eq!(
+            savings.bytes,
+            wire_len(&source) - wire_len(&json!(fragments))
+        );
+        assert_eq!(
+            savings.note,
+            "highlight fragments returned in place of _source"
+        );
+    }
+
+    // ── the anti-inflation half: silence when nothing was saved ────────────
+
+    #[test]
+    fn an_index_without_companions_and_no_projection_reports_nothing() {
+        let request = measuring(SourceFilter::Default);
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", json!({"body": "text", "title": "a user field"}))],
+            &SourceFilter::Default,
+            &HashSet::new(),
+            Some(&request),
+        );
+        assert!(savings.is_none(), "nothing was withheld");
+    }
+
+    #[test]
+    fn asking_for_the_whole_document_reports_nothing_at_all() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let request = measuring(SourceFilter::Enabled(true));
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &SourceFilter::Enabled(true),
+            &companions,
+            Some(&request),
+        );
+        assert!(
+            savings.is_none(),
+            "`_source: true` returns MORE than the default projection, not less"
+        );
+    }
+
+    #[test]
+    fn a_projection_that_drops_nothing_reports_nothing_at_all() {
+        let source = json!({"title": "t", "year": 2026});
+        let filter = SourceFilter::Includes(vec!["title".to_string(), "year".to_string()]);
+        let request = measuring(filter.clone());
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", source)],
+            &filter,
+            &HashSet::new(),
+            Some(&request),
+        );
+        assert!(
+            savings.is_none(),
+            "asking for all N of N fields saves nothing, however it is spelled"
+        );
+    }
+
+    #[test]
+    fn an_empty_page_reports_nothing_at_all() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = measuring(filter.clone());
+        let (_, savings) =
+            apply_source_filter_measured(Vec::new(), &filter, &companions, Some(&request));
+        assert!(
+            savings.is_none(),
+            "an aggregation-only page returned no documents, so it withheld no document bytes"
+        );
+    }
+
+    #[test]
+    fn fragments_larger_than_the_document_report_nothing_at_all() {
+        let mut h = hit("doc", json!({ "body": "short" }));
+        h.highlight = Some(HashMap::from([(
+            "body".to_string(),
+            vec!["<em>short</em>".to_string(); 8],
+        )]));
+        let request = SearchRequest {
+            source: SourceFilter::Enabled(false),
+            savings: SavingsMode::Exact,
+            highlight: Some(HighlightRequest::default()),
+            ..SearchRequest::default()
+        };
+        let (_, savings) = apply_source_filter_measured(
+            vec![h],
+            &SourceFilter::Enabled(false),
+            &HashSet::new(),
+            Some(&request),
+        );
+        assert!(
+            savings.is_none(),
+            "when the substitute costs more than the original there is no saving to report"
+        );
+    }
+
+    #[test]
+    fn measurement_is_off_unless_the_caller_asks() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &filter,
+            &companions,
+            None,
+        );
+        assert!(savings.is_none(), "no opt-in, no measurement, no block");
+        assert_eq!(
+            filtered[0].source,
+            json!({"title": "quarterly report"}),
+            "the filtering itself is unchanged by the measurement being off"
+        );
+    }
+
+    #[test]
+    fn a_request_that_declines_measurement_gets_nothing() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = SearchRequest {
+            source: filter.clone(),
+            savings: SavingsMode::Off,
+            ..SearchRequest::default()
+        };
+        let (_, savings) = apply_source_filter_measured(
+            vec![hit("doc", companion_source())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        assert!(savings.is_none(), "`?savings=false` means no block");
+    }
+
+    #[test]
+    fn a_zero_total_can_never_be_rendered() {
+        assert!(
+            PayloadSavings::new(
+                SavingsMethod::Exact,
+                "anything",
+                false,
+                vec![("d".into(), 0)]
+            )
+            .is_none(),
+            "the constructor is the single gate that makes a 0-byte block unrepresentable"
+        );
+        let savings = PayloadSavings::new(
+            SavingsMethod::Exact,
+            "note",
+            false,
+            vec![("d".into(), 100_000)],
+        )
+        .unwrap();
+        assert!(
+            savings.rescoped(0).is_none(),
+            "re-scoping to a page that saved nothing must also produce nothing"
+        );
+    }
+
+    #[test]
+    fn every_hit_on_the_page_is_attributed_and_summed() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        let request = measuring(filter.clone());
+
+        let (filtered, savings) = apply_source_filter_measured(
+            vec![hit("a", source.clone()), hit("b", source.clone())],
+            &filter,
+            &companions,
+            Some(&request),
+        );
+        let savings = savings.expect("two hits saved bytes");
+        let per_doc =
+            wire_len(&default_projected(&source, &companions)) - wire_len(&filtered[0].source);
+        assert_eq!(savings.bytes, per_doc * 2);
+        assert_eq!(
+            savings.per_hit,
+            vec![("a".to_string(), per_doc), ("b".to_string(), per_doc)],
+            "per-hit attribution is what lets the API layer re-sum over the page it really emits"
+        );
+    }
+
+    #[test]
+    fn hybrid_legs_that_return_the_same_document_count_it_once() {
+        let leg = |id: &str| {
+            PayloadSavings::new(
+                SavingsMethod::Exact,
+                "note",
+                false,
+                vec![(id.to_string(), 500)],
+            )
+            .unwrap()
+        };
+        let merged = merge_sub_savings(vec![leg("a"), leg("a")]).expect("one document saved bytes");
+        assert_eq!(
+            merged.bytes, 500,
+            "a document found by both legs saved its bytes once, not twice"
+        );
+    }
+
+    // ── the sampled estimator: on by default, so its error is a first-class
+    //    property, not an implementation detail ─────────────────────────────
+
+    /// Deterministic LCG — the shapes below must be identical on every run,
+    /// or a tolerance assertion is just a coin flip.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_unit(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+    }
+
+    /// The shape XERJ's own built-in embedder actually emits: mostly exact
+    /// zeros with a scattered minority of full-width floats. This bimodal
+    /// distribution is what breaks naive sampling.
+    fn sparse_companion_vector() -> Value {
+        let mut rng = Lcg(0x5eed);
+        Value::Array(
+            (0..384)
+                .map(|i| {
+                    if i % 6 == 0 {
+                        json!(rng.next_unit())
+                    } else {
+                        json!(0.0)
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn dense_vector(dims: usize, seed: u64) -> Value {
+        let mut rng = Lcg(seed);
+        Value::Array((0..dims).map(|_| json!(rng.next_unit())).collect())
+    }
+
+    #[test]
+    fn sampling_tracks_the_exact_count_on_the_shapes_that_matter() {
+        let mut rng = Lcg(99);
+        let chunk_matrix = Value::Array((0..64).map(|i| dense_vector(384, 1000 + i)).collect());
+        let mixed = Value::Array(
+            (0..1000)
+                .map(|i| match i % 4 {
+                    0 => json!(1.0e-9),
+                    1 => json!(1),
+                    2 => json!(123456.789),
+                    _ => json!(rng.next_unit()),
+                })
+                .collect(),
+        );
+        let cases: Vec<(&str, Value, f64)> = vec![
+            ("sparse companion (384)", sparse_companion_vector(), 0.5),
+            ("dense vector (384)", dense_vector(384, 7), 1.5),
+            ("dense vector (1536)", dense_vector(1536, 11), 1.5),
+            ("chunk matrix (64x384)", chunk_matrix, 1.5),
+            ("mixed magnitudes (1000)", mixed, 3.0),
+            (
+                "integers (1000)",
+                Value::Array((0..1000).map(|i| json!(i * 7919)).collect()),
+                0.0,
+            ),
+        ];
+        for (name, value, tolerance) in cases {
+            let exact = json_wire_len(&value);
+            let sampled = json_len_sampled(&value);
+            let err = (sampled as f64 - exact as f64) / exact as f64 * 100.0;
+            eprintln!("{name}: exact={exact} sampled={sampled} err={err:+.2}%");
+            assert!(
+                err.abs() <= tolerance,
+                "{name}: sampled estimate is {err:+.2}% off exact \
+                 (exact={exact}, sampled={sampled}), budget {tolerance}%"
+            );
+        }
+    }
+
+    #[test]
+    fn anything_cheap_enough_to_count_exactly_is_counted_exactly() {
+        for value in [
+            json!({"title": "quarterly report", "year": 2026}),
+            json!({"body": "x".repeat(20_000)}),
+            dense_vector(SAVINGS_ARRAY_SAMPLE, 3),
+            json!([1, 2, 3, 4, 5]),
+            json!([]),
+            json!({}),
+        ] {
+            assert_eq!(
+                json_len_sampled(&value),
+                json_wire_len(&value),
+                "no sampling should have happened for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn zeros_never_enter_the_sample() {
+        let all_zero = Value::Array((0..4096).map(|_| json!(0.0)).collect());
+        assert_eq!(json_len_sampled(&all_zero), json_wire_len(&all_zero));
+        let signed_zero = Value::Array(
+            (0..4096)
+                .map(|i| json!(if i % 2 == 0 { 0.0 } else { -0.0 }))
+                .collect(),
+        );
+        assert_eq!(json_len_sampled(&signed_zero), json_wire_len(&signed_zero));
+    }
+
+    #[test]
+    fn the_default_projection_baseline_is_itself_sampled_consistently() {
+        // The baseline never serializes the companions, so it must agree with
+        // an independently built default projection under both modes.
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let source = companion_source();
+        let oracle = wire_len(&default_projected(&source, &companions));
+        assert_eq!(
+            default_projection_len(&source, &companions, SavingsMode::Exact),
+            oracle
+        );
+        let sampled = default_projection_len(&source, &companions, SavingsMode::Sampled);
+        let err = (sampled as f64 - oracle as f64) / oracle as f64 * 100.0;
+        assert!(
+            err.abs() <= 1.5,
+            "baseline drifted {err:+.2}% under sampling"
+        );
+    }
+
+    #[test]
+    fn the_method_is_labelled_on_every_record() {
+        let companions = generated_embedding_companion_fields(&embedded_schema());
+        let filter = SourceFilter::Includes(vec!["title".to_string()]);
+        for (request, expected) in [
+            (measuring(filter.clone()), SavingsMethod::Exact),
+            (measuring_sampled(filter.clone()), SavingsMethod::Sampled),
+        ] {
+            let (_, savings) = apply_source_filter_measured(
+                vec![hit("doc", companion_source())],
+                &filter,
+                &companions,
+                Some(&request),
+            );
+            assert_eq!(
+                savings.expect("bytes were withheld").measured,
+                expected,
+                "a reader must be able to tell an estimate from an exact count"
+            );
+        }
+    }
 }
 
 /// Simple field pattern matching — supports trailing `*` wildcard.
@@ -24542,17 +26866,33 @@ fn build_highlight_fragments(
     // window math below operates on `text` (the original), so mixing in
     // lowercased offsets would slice through multibyte codepoints and panic.
     let mut match_positions: Vec<(usize, usize)> = Vec::new();
+    // Parallel record of each candidate in LOWERCASED space, so scoring can
+    // look at surrounding text without needing an orig->lower reverse map.
+    let mut lower_positions: Vec<(usize, usize)> = Vec::new();
     for term in terms {
         let mut start = 0;
+        // Budget the scan PER TERM, not across all terms. A shared budget is
+        // spent entirely by whichever term happens to be scanned first, and
+        // `terms` arrives sorted alphabetically — so for `function
+        // human_time_diff`, the hundreds of early occurrences of "function"
+        // filled the quota and "human_time_diff" was never searched for at
+        // all. Two independent usability runs hit this: both asked for a
+        // phrase deep in a large file, both got fragments from the top of the
+        // file highlighting only the common word, and both abandoned
+        // highlighting and downloaded whole documents instead.
+        let mut per_term = 0usize;
+        let per_term_cap = (num_frags * 4).max(4);
         while let Some(pos) = text_lower[start..].find(term.as_str()) {
             let abs = start + pos;
             let (oa, ob) = lower_span_to_orig(lower_map, orig_len, abs, abs + term.len());
             if ob > oa {
                 match_positions.push((oa, ob));
+                lower_positions.push((abs, abs + term.len()));
             }
             start = abs + term.len();
-            if match_positions.len() > num_frags * 4 {
-                break; // enough candidates — stop scanning early
+            per_term += 1;
+            if per_term >= per_term_cap {
+                break; // enough candidates FOR THIS TERM; keep scanning others
             }
         }
     }
@@ -24561,8 +26901,41 @@ fn build_highlight_fragments(
         return Vec::new();
     }
 
-    // Sort by position so we pick the earliest matches first.
-    match_positions.sort_by_key(|&(s, _)| s);
+    // Rank candidates by how many DISTINCT query terms fall inside the window
+    // a fragment would cover, richest first, and only then by position.
+    //
+    // Sorting purely by position returns whatever appears earliest, which for
+    // a multi-term query is almost always the commonest word — the top of the
+    // file rather than the place the query is actually about. Counting
+    // distinct terms makes the spot where the terms co-occur win, which is the
+    // phrase the caller searched for.
+    let half_window = (frag_size / 2).max(1);
+    let lower_len = text_lower.len();
+    let mut scored: Vec<(usize, (usize, usize))> = match_positions
+        .iter()
+        .zip(lower_positions.iter())
+        .map(|(&orig, &(ls, le))| {
+            let lo = ls.saturating_sub(half_window).min(lower_len);
+            let hi = (le + half_window).min(lower_len);
+            // Snap to char boundaries: text_lower is UTF-8 and a naive slice
+            // could land mid-codepoint.
+            let lo = (0..=lo)
+                .rev()
+                .find(|&i| text_lower.is_char_boundary(i))
+                .unwrap_or(0);
+            let hi = (hi..=lower_len)
+                .find(|&i| text_lower.is_char_boundary(i))
+                .unwrap_or(lower_len);
+            let window = &text_lower[lo..hi];
+            let distinct = terms.iter().filter(|t| window.contains(t.as_str())).count();
+            (distinct, orig)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1 .0.cmp(&b.1 .0)));
+    let match_positions: Vec<(usize, usize)> = scored.into_iter().map(|(_, p)| p).collect();
+
+    // (Ordering is decided by the distinct-term ranking above; the old
+    // earliest-first sort would undo it.)
 
     let text_bytes = text.as_bytes();
     let total_bytes = text_bytes.len();
@@ -26004,15 +28377,28 @@ fn resolve_date_math_inner(expr: &str) -> String {
         None => return expr.to_string(),
     };
     let brace_end = match expr.rfind('}') {
-        Some(i) => i,
-        None => return expr.to_string(),
+        // The closing brace must come AFTER the opening one, or the slice
+        // below is `expr[4..0]` — a panic, not an empty string. `<}<}<>{>{}>`
+        // is enough, and `panic = "abort"` makes it the process rather than a
+        // 400 (#207, found by the `index_name_date_math` fuzz target). Braces
+        // in the wrong order are not date math, so the name passes through.
+        Some(i) if i > brace_start => i,
+        _ => return expr.to_string(),
     };
 
     let prefix = &expr[..brace_start];
     let date_part = &expr[brace_start + 1..brace_end];
 
     let (math_expr, fmt) = if let Some(inner_brace) = date_part.find('{') {
-        let inner_end = date_part.rfind('}').unwrap_or(date_part.len());
+        // The closing brace has to come AFTER the opening one. `<{}{}>` gives a
+        // `date_part` of `}{`, where `rfind('}')` is 0 and `inner_brace` is 1 —
+        // and `date_part[2..0]` is a panic, not an error. With
+        // `panic = "abort"` that is the process, from an index name in a
+        // request URI. Same class as the two date-math offsets below.
+        let inner_end = date_part
+            .rfind('}')
+            .filter(|end| *end > inner_brace)
+            .unwrap_or(date_part.len());
         (
             &date_part[..inner_brace],
             &date_part[inner_brace + 1..inner_end],
@@ -26025,6 +28411,73 @@ fn resolve_date_math_inner(expr: &str) -> String {
     let date = resolve_now_date(math_expr, now);
     let formatted = format_date_expr(date, fmt);
     format!("{}{}", prefix, formatted)
+}
+
+#[cfg(test)]
+mod index_name_date_math_tests {
+    use super::resolve_date_math;
+
+    /// Two regressions in one, both reachable from an index name in a request
+    /// URI, and both aborts rather than errors because the release profile sets
+    /// `panic = "abort"` (#207).
+    ///
+    /// * `<{}{}>` gives an inner `date_part` of `}{`, where the closing brace
+    ///   is found *before* the opening one — and `date_part[2..0]` is a panic,
+    ///   not an empty slice.
+    /// * `<logs-{now+9999999999999d}>` reached `chrono::Duration::days`, which
+    ///   panics on a count that does not fit a `TimeDelta`. Same defect the
+    ///   `date_math` fuzz target found in `xerj_query::dates::add_unit`.
+    ///
+    /// Before the fix each of these aborts the test process.
+    #[test]
+    fn a_malformed_or_unrepresentable_index_name_resolves_instead_of_aborting() {
+        for name in [
+            "<{}{}>",
+            "<}{>",
+            "<a{}{}z>",
+            "<{{}}>",
+            "<logs-{now+9999999999999d}>",
+            "<logs-{now-9999999999999d}>",
+            "<logs-{now+9223372036854775807y}>",
+            "<logs-{now+9223372036854775807M}>",
+            "<logs-{now+9223372036854775807w}>",
+            "<logs-{now+9223372036854775807h}>",
+            "<logs-{now/d",
+            "<>",
+            // The unit position holding a multi-byte character — the digit
+            // scan stops there and the old code sliced one byte out of it.
+            "<logs-{now+9\u{1be}999d}>",
+            "<logs-{now+1\u{4e2d}}>",
+            "<logs-{now-\u{e9}}>",
+            "<logs-{now+1d/\u{4e2d}}>",
+            "<logs-{now\u{1be}}>",
+            // Braces in the wrong order, outer pair and inner pair.
+            "<}<}<>{>{}>",
+            "}{",
+            "<a}b{c>",
+            "<a{b}c{d>",
+        ] {
+            // Any string is allowed to come back. None may take the process.
+            let _ = resolve_date_math(name);
+        }
+    }
+
+    /// The ordinary forms still resolve, so the guards above did not turn the
+    /// feature off to make the crash go away.
+    #[test]
+    fn ordinary_index_name_date_math_still_resolves() {
+        let today = chrono::Utc::now().format("%Y.%m.%d").to_string();
+        assert_eq!(resolve_date_math("<logs-{now/d}>"), format!("logs-{today}"));
+        assert_eq!(
+            resolve_date_math("<logs-{now/d{yyyy.MM.dd}}>"),
+            format!("logs-{today}")
+        );
+        assert_eq!(
+            resolve_date_math("plain-index"),
+            "plain-index",
+            "a name with no date math is returned unchanged"
+        );
+    }
 }
 
 fn resolve_now_date(
@@ -26046,20 +28499,35 @@ fn resolve_now_date(
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(rest.len());
         let n: i64 = rest[..end].parse().unwrap_or(0) * sign;
-        let (unit, rest) = if end < rest.len() {
-            (&rest[end..end + 1], &rest[end + 1..])
-        } else {
-            ("", &rest[end..])
+        // The unit is one CHARACTER, not one byte. `end` lands on the first
+        // non-digit, which may be multi-byte: `<logs-{now+9ƾ999d}>` made
+        // `rest[end..end + 1]` split U+01BE in half and panic. With
+        // `panic = "abort"` that is the process, from an index name in a
+        // request URI. Found by the `index_name_date_math` fuzz target (#207).
+        let (unit, rest) = match rest[end..].chars().next() {
+            Some(c) => rest[end..].split_at(c.len_utf8()),
+            None => ("", &rest[end..]),
         };
+        // `Duration::days` and friends PANIC when the count does not fit a
+        // `TimeDelta`, and `n * 30` overflows before that. `expr` is the
+        // date-math inside an index name (`<logs-{now+9999999999999d}>`), which
+        // arrives in a request URI — so the panicking constructors are an
+        // unauthenticated crash. Same defect the `date_math` fuzz target found
+        // in `xerj_query::dates::add_unit`; this is the second copy.
+        //
+        // An offset that cannot be represented degrades to "no offset", which
+        // is what this resolver already does for an unrecognised unit. It has
+        // no error channel to report into.
         let offset = match unit {
-            "d" => Duration::days(n),
-            "h" => Duration::hours(n),
-            "w" => Duration::weeks(n),
-            "M" => Duration::days(n * 30),
-            "y" => Duration::days(n * 365),
-            _ => Duration::zero(),
-        };
-        (base + offset, rest)
+            "d" => Duration::try_days(n),
+            "h" => Duration::try_hours(n),
+            "w" => Duration::try_weeks(n),
+            "M" => n.checked_mul(30).and_then(Duration::try_days),
+            "y" => n.checked_mul(365).and_then(Duration::try_days),
+            _ => Some(Duration::zero()),
+        }
+        .unwrap_or_else(Duration::zero);
+        (base.checked_add_signed(offset).unwrap_or(base), rest)
     } else {
         (base, rest)
     };
@@ -26317,11 +28785,13 @@ fn passage_match_from_source(
         return None;
     }
     let page = passage_page_from_source(source);
+    let (start_usize, end_usize) = refine_code_passage(source, field, text, start_usize, end_usize)
+        .unwrap_or((start_usize, end_usize));
     Some(PassageMatch {
         field: field.to_string(),
         ordinal,
-        start_offset: start,
-        end_offset: end,
+        start_offset: start_usize as u64,
+        end_offset: end_usize as u64,
         text: text[start_usize..end_usize].to_string(),
         page,
     })
@@ -26334,6 +28804,43 @@ fn passage_page_from_source(source: &Value) -> Option<u64> {
         .or_else(|| get_field_value(source, "page_number"))
         .or_else(|| get_field_value(source, "metadata.page"))
         .and_then(|value| value.as_u64())
+}
+
+/// For CODE documents only, widen a computed `_passage` window to the
+/// smallest enclosing semantic block (function/method/class/...) instead of
+/// the raw byte window (a 512-char index-time chunk for semantic hits, a
+/// line-snapped query-time window for lexical hits) — see `code_blocks`
+/// (#174 follow-up). `None` means "leave the window exactly as computed",
+/// which is what every non-code document gets: unconditionally.
+///
+/// Deliberately conservative about what counts as "a code document": the
+/// `language` field alone is not enough signal, since an unrelated document
+/// is free to carry a field literally named `language` (e.g. a
+/// `"language": "python"` tag on a course-catalog entry) without being
+/// source code. Only documents that ALSO carry autoindex's code-extractor
+/// signature (`symbol_count`, a number — see
+/// `xerj-autoindex/src/extract/code.rs`) qualify, and only their canonical
+/// `body` field (the one that extractor always populates) is ever handed to
+/// a parser — never an arbitrary field name.
+fn refine_code_passage(
+    source: &Value,
+    field: &str,
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    if field != "body" {
+        return None;
+    }
+    if !matches!(
+        get_field_value(source, "symbol_count"),
+        Some(Value::Number(_))
+    ) {
+        return None;
+    }
+    let language = get_field_value(source, "language")?;
+    let language = language.as_str()?;
+    crate::code_blocks::enclosing_block(language, text, start, end)
 }
 
 /// Maximum byte length of a query-time lexical `_passage` window.
@@ -26722,6 +29229,44 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                     select_lexical_passage(text, lower, map, &weighted_terms)
                 {
                     if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                        // `[start, end)` is the already CONTEXT-PADDED window
+                        // (matched line plus surrounding lines up to the
+                        // byte budget) — handing that whole span to
+                        // `refine_code_passage` would usually force it back
+                        // to the tree root (the padding routinely spills
+                        // outside the enclosing function) and silently no-op
+                        // the refinement. Anchor on one actual query-term
+                        // occurrence inside the window instead — any point
+                        // inside the matched region resolves to the same
+                        // enclosing block. ASCII-lowercase only (not the
+                        // Unicode-aware `lower`/`map` used above): it never
+                        // changes byte length, so `pos` lines up with `text`
+                        // without a second offset table; source identifiers
+                        // are ASCII in the overwhelming case, and a missed
+                        // non-ASCII anchor just skips the refinement, not a
+                        // correctness bug.
+                        let (start, end) = weighted_terms
+                            .iter()
+                            .find_map(|&(term, _)| {
+                                if term.is_empty() {
+                                    return None;
+                                }
+                                text.get(start..end)?
+                                    .to_ascii_lowercase()
+                                    .find(term)
+                                    .map(|pos| start + pos)
+                            })
+                            .and_then(|anchor| {
+                                let anchor_end = (anchor + 1).min(text.len());
+                                refine_code_passage(
+                                    &hit.source,
+                                    field_name,
+                                    text,
+                                    anchor,
+                                    anchor_end,
+                                )
+                            })
+                            .unwrap_or((start, end));
                         best = Some((
                             score,
                             PassageMatch {
@@ -26755,6 +29300,7 @@ fn knn_result_from_scored(
     mut scored: Vec<(String, f32, Value, Option<u32>)>,
     k: usize,
     started: std::time::Instant,
+    generated_companion_fields: &HashSet<String>,
 ) -> SearchResult {
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     // `k` bounds the kNN candidate pool; `from`/`size` then window into
@@ -26814,7 +29360,12 @@ fn knn_result_from_scored(
         }
     })
     .collect();
-    let hits = apply_source_filter(hits, &request.source);
+    let (hits, savings) = apply_source_filter_measured(
+        hits,
+        &request.source,
+        generated_companion_fields,
+        Some(request),
+    );
 
     SearchResult {
         hits,
@@ -26828,6 +29379,7 @@ fn knn_result_from_scored(
         profile: None,
         max_score: None,
         script_failure: None,
+        savings,
     }
 }
 
@@ -28153,10 +30705,21 @@ fn infer_field_type(val: &Value, date_detection: bool) -> FieldType {
 /// `KeywordFieldMapper("keyword").ignoreAbove(256)`).
 const DYNAMIC_KEYWORD_IGNORE_ABOVE: u32 = 256;
 
-/// ES default `index.mapping.depth.limit` — how many `properties` levels a
-/// dynamically discovered document may nest before recursion stops. Applies
-/// only to the nested-object walk below; it does not change how deep an
-/// *explicit* `_mapping` PUT may nest (that path is unaffected by this cap).
+/// Same numeric default as ES's `index.mapping.depth.limit` -- but NOT the
+/// same behavior. Real ES rejects the document with a `MapperParsingException`
+/// once nesting exceeds the limit; this cap silently stops recursing and
+/// maps everything past it as an opaque, un-recursed `Object`, the same way
+/// the whole dynamic-mapping-evolution path already treats
+/// `max_fields_per_index` (see `evolve_schema_from_docs`'s own
+/// silently-skip-and-`tracing::warn!` handling right next to where this cap
+/// is consulted) -- every guard in this call chain is fire-and-forget by
+/// design today, not just this one. Making depth rejection hard (a real
+/// client-visible error, the #204 "accepted-and-ignored" class this repo
+/// otherwise avoids) would mean giving `evolve_schema_from_doc`/
+/// `evolve_schema_from_docs` a `Result` and deciding how a mixed bulk
+/// request (one oversized document among many) should behave -- a bigger,
+/// separate change than this cap alone, tracked as a follow-up rather than
+/// bundled in here inconsistently with the neighboring guard.
 const DYNAMIC_MAPPING_DEPTH_LIMIT: usize = 20;
 
 /// Build the [`FieldConfig`] for a dynamically discovered field.
@@ -28210,13 +30773,7 @@ fn dynamic_field_config_at_depth(
             fc.fields.push(kw);
         }
         FieldType::Object if depth < DYNAMIC_MAPPING_DEPTH_LIMIT => {
-            // `val` itself may be the Array whose first element inferred
-            // Object (see doc comment) -- unwrap to whichever object is the
-            // real source of the nested keys.
-            let obj = val
-                .as_object()
-                .or_else(|| val.as_array()?.iter().find(|v| !v.is_null())?.as_object());
-            if let Some(obj) = obj {
+            if let Some(obj) = object_keys_of(val) {
                 for (sub_key, sub_val) in obj {
                     fc.fields.push(dynamic_field_config_at_depth(
                         sub_key,
@@ -28230,6 +30787,137 @@ fn dynamic_field_config_at_depth(
         _ => {}
     }
     fc
+}
+
+/// Unwrap `val` to whichever object actually carries a set of keys to walk
+/// -- either `val` itself, or (mirroring `infer_field_type`'s own
+/// first-non-null-element handling for arrays) the first non-null element
+/// of an array whose inferred type is `Object`. Shared by the fresh-field
+/// discovery path above and the existing-field merge path below so both
+/// treat array-of-objects the same way.
+fn object_keys_of(val: &Value) -> Option<&serde_json::Map<String, Value>> {
+    val.as_object()
+        .or_else(|| val.as_array()?.iter().find(|v| !v.is_null())?.as_object())
+}
+
+/// FNV-1a hash of every field NAME in `val`, at EVERY nesting depth, into
+/// `h` -- not just the top-level keys. Used by the single-doc ingest path's
+/// schema-evolution throttle (`index_document_with_version_inner_guarded`)
+/// to fingerprint "does this document's field-name shape differ from the
+/// last one we evolved the schema for". A shallow, top-level-only hash
+/// would miss a document whose top-level keys are unchanged but whose
+/// NESTED shape changed -- e.g. `metadata.kind` on one document,
+/// `metadata.project` on the next -- silently suppressing the schema-evolve
+/// call that new nested key needs, for up to 100 documents. For a
+/// document with no nested objects this hashes exactly the same bytes in
+/// the same order as hashing only the top-level keys, so it's a strict
+/// superset, not a behavior change, for the common flat-document case.
+fn hash_all_field_names(val: &Value, h: &mut u64) {
+    let Some(obj) = val.as_object() else {
+        return;
+    };
+    for (k, v) in obj {
+        for b in k.bytes() {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x00000100000001b3);
+        }
+        hash_all_field_names(v, h);
+    }
+}
+
+/// Cheap, read-only check: would merging `val`'s keys into `existing`
+/// actually add anything new? Mirrors `merge_dynamic_children_into`'s walk
+/// without mutating, so `evolve_schema_from_doc`/`evolve_schema_from_docs`
+/// can decide whether a write lock is worth taking at all -- the common
+/// case, once a field's shape has stabilized, is "no" for every field in
+/// most documents.
+fn field_config_needs_merge(existing: &FieldConfig, val: &Value) -> bool {
+    if !matches!(existing.field_type, FieldType::Object | FieldType::Nested) {
+        return false;
+    }
+    let Some(obj) = object_keys_of(val) else {
+        return false;
+    };
+    obj.iter().any(
+        |(key, sub_val)| match existing.fields.iter().find(|f| f.name == *key) {
+            Some(child) => field_config_needs_merge(child, sub_val),
+            None => true,
+        },
+    )
+}
+
+/// Merge newly-seen dynamic children from `val` into `field`'s existing
+/// `fields`, recursively -- the fix for a real gap found in review:
+/// dynamic mapping used to gate purely on whether a field's TOP-LEVEL name
+/// already existed in the schema, so once e.g. `metadata` was known from a
+/// first document's `{"kind": "..."}`, a later document's
+/// `metadata.project` was never inspected again no matter how many more
+/// documents arrived, even though it stayed perfectly queryable via
+/// `_source` dotted-path resolution the whole time -- the exact
+/// "queryable but invisible" symptom this whole fix is about, one level
+/// down. Real ES doesn't have this gap: it registers dynamic mappers keyed
+/// on the full dotted path, so a later document introducing a new nested
+/// key is mapped normally.
+///
+/// `field_count`/`limit` enforce the same per-schema `max_fields_per_index`
+/// budget the top-level dynamic-mapping loop already enforces (see
+/// `Schema::field_count`, which now counts nested children too) --
+/// `field_count` is threaded through and incremented in place so multiple
+/// calls sharing one document (or one bulk batch) share a single running
+/// budget rather than each independently getting the full limit.
+fn merge_dynamic_children_into(
+    field: &mut FieldConfig,
+    val: &Value,
+    date_detection: bool,
+    depth: usize,
+    field_count: &mut u32,
+    limit: u32,
+) -> bool {
+    if !matches!(field.field_type, FieldType::Object | FieldType::Nested) {
+        return false;
+    }
+    if depth >= DYNAMIC_MAPPING_DEPTH_LIMIT {
+        return false;
+    }
+    let Some(obj) = object_keys_of(val) else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, sub_val) in obj {
+        match field.fields.iter_mut().find(|f| f.name == *key) {
+            Some(existing) => {
+                if merge_dynamic_children_into(
+                    existing,
+                    sub_val,
+                    date_detection,
+                    depth + 1,
+                    field_count,
+                    limit,
+                ) {
+                    changed = true;
+                }
+            }
+            None => {
+                if *field_count >= limit {
+                    tracing::warn!(
+                        field = %key,
+                        limit,
+                        "rejecting new nested field: field limit reached"
+                    );
+                    break;
+                }
+                field.fields.push(dynamic_field_config_at_depth(
+                    key,
+                    sub_val,
+                    date_detection,
+                    depth + 1,
+                ));
+                *field_count += 1;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 // ── DocValues fast-path helpers ───────────────────────────────────────────────
@@ -28548,8 +31236,10 @@ async fn try_aggs_fast_with_segments(
 
 /// Extract a plain-text query string from a QueryNode (for memtable BM25 search).
 ///
-/// Only full-text query types are handled here. Term-level queries (Term, Terms,
-/// Range, Exists, Prefix, Wildcard) are handled by doc scanning instead.
+/// Only full-text query types are handled here. Term-level queries are handled
+/// by the memtable's structured paths or doc scanning; scalar keyword terms
+/// are kept in the segment FTS bool projection so mixed clauses retain exact
+/// membership and scoring there.
 fn extract_query_text(q: &QueryNode) -> Option<String> {
     match q {
         // Wildcard field match must use doc scanning, not BM25.
@@ -33652,11 +36342,14 @@ fn query_string_has_no_tokens(
 /// Convert a QueryNode to an FTS Query for segment search.
 ///
 /// `exact_fields` are the non-Text schema fields (keyword / numeric / date /
-/// bool / ip).  `build_fts_field_configs` indexes those with the `keyword`
+/// bool / ip). `build_fts_field_configs` indexes those with the `keyword`
 /// analyzer — the whole value becomes ONE case-preserved term — so the query
 /// side must look them up by whole value too (ES semantics: `match` /
 /// `multi_match` / query-string clauses on a keyword field are exact
 /// whole-value comparisons, because the keyword analyzer is a no-op).
+/// `keyword_fields` is the narrower schema-typed subset that is safe for a
+/// scalar `term` projection. Numeric/date/bool/IP terms remain on their
+/// source/doc-values path, where typed equality and formatting are preserved.
 /// Tokenizing the query with the `standard` analyzer here would produce
 /// terms (e.g. "claude" from "claude-haiku-4-5") that can never exist in a
 /// keyword field's FST — the cause of the multi_match / query_string /
@@ -33702,10 +36395,23 @@ fn collect_field_boosts(q: &QueryNode, out: &mut HashMap<String, f32>) {
     }
 }
 
+#[cfg(test)]
 fn query_node_to_fts(
     q: &QueryNode,
     text_fields: &[String],
     exact_fields: &std::collections::HashSet<String>,
+) -> Option<FtsQuery> {
+    // The projection tests below pass the exact-field set as their keyword
+    // subset. The search path uses the schema-aware helper so IP/date/numeric
+    // terms retain their source/DV semantics.
+    query_node_to_fts_with_keyword_fields(q, text_fields, exact_fields, exact_fields)
+}
+
+fn query_node_to_fts_with_keyword_fields(
+    q: &QueryNode,
+    text_fields: &[String],
+    exact_fields: &std::collections::HashSet<String>,
+    keyword_fields: &std::collections::HashSet<String>,
 ) -> Option<FtsQuery> {
     match q {
         QueryNode::MatchAll => {
@@ -33718,7 +36424,9 @@ fn query_node_to_fts(
         // applied post-hoc by the top-level override in `search` (the
         // keyword-schema shape is served bit-exactly by `scored_columnar`
         // before this projection is ever consulted).
-        QueryNode::Constant { query, .. } => query_node_to_fts(query, text_fields, exact_fields),
+        QueryNode::Constant { query, .. } => {
+            query_node_to_fts_with_keyword_fields(query, text_fields, exact_fields, keyword_fields)
+        }
         QueryNode::Match {
             field,
             query,
@@ -34027,17 +36735,36 @@ fn query_node_to_fts(
                 Some(combined)
             }
         }
-        QueryNode::Term { .. } => {
-            // Term queries are routed through stored-doc scanning
-            // (json_values_equal) because the FTS index applies the text
-            // analyzer at index time — so `term {method: "GET"}` against a
-            // keyword/int/date field would miss (stopword for "GET", wrong
-            // type for integer).  Doc scanning handles all field types
-            // correctly.  Trade-off: slower on huge segments, but segments
-            // are merged aggressively and most term queries are highly
-            // selective.
-            None
+        QueryNode::Term {
+            field,
+            value,
+            boost,
+        } if keyword_fields.contains(field) && exact_fields.contains(field) => {
+            // Declared keyword fields use the keyword analyzer, so a scalar
+            // term is already the exact FTS term. Keeping it in the FTS tree
+            // is essential for a mixed bool: the FTS bool executor can then
+            // union/intersect it with text clauses and add its BM25 score
+            // instead of routing the whole tree through the schema-blind
+            // stored-source fallback.
+            //
+            // This does not change the repository's existing post-flush
+            // multi-valued-keyword limitation: the segment sidecar flattens
+            // source arrays into one keyword token. Array/object query values
+            // therefore decline here, and scalar keyword coverage is the
+            // deliberately safe projection fixed by this change.
+            let term = match value {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null | Value::Array(_) | Value::Object(_) => return None,
+            };
+            Some(FtsQuery::Term(FtsTerm::boosted(
+                field.as_str(),
+                &term,
+                boost.unwrap_or(1.0),
+            )))
         }
+        QueryNode::Term { .. } => None,
         QueryNode::Bool {
             must,
             should,
@@ -34074,10 +36801,15 @@ fn query_node_to_fts(
             // with keyword-field projections now producing real matches, a
             // dropped filter would silently overcount. Project them as
             // `must`, or fall back to the stored scan when one can't
-            // project (Term/Range/etc. all project to None, so classic
-            // filters keep taking the doc-scan path as before).
+            // project (unsupported Term/Range/etc. still project to None, so
+            // classic filters keep taking the doc-scan path as before).
             for sub in must.iter().chain(filter.iter()) {
-                let fq = query_node_to_fts(sub, text_fields, exact_fields)?;
+                let fq = query_node_to_fts_with_keyword_fields(
+                    sub,
+                    text_fields,
+                    exact_fields,
+                    keyword_fields,
+                )?;
                 bool_q = bool_q.must(fq);
                 projected_any = true;
             }
@@ -34087,14 +36819,24 @@ fn query_node_to_fts(
                 // dropped — dropping it makes the bool LESS permissive and
                 // loses docs that match only via that clause. Fall back to
                 // the stored-doc scan, which handles every child shape.
-                let fq = query_node_to_fts(sub, text_fields, exact_fields)?;
+                let fq = query_node_to_fts_with_keyword_fields(
+                    sub,
+                    text_fields,
+                    exact_fields,
+                    keyword_fields,
+                )?;
                 bool_q = bool_q.should(fq);
                 projected_any = true;
             }
             // `must_not` children that don't project are similar: dropping
             // a must_not relaxes the filter, which is wrong.
             for sub in must_not {
-                let fq = query_node_to_fts(sub, text_fields, exact_fields)?;
+                let fq = query_node_to_fts_with_keyword_fields(
+                    sub,
+                    text_fields,
+                    exact_fields,
+                    keyword_fields,
+                )?;
                 bool_q = bool_q.must_not(fq);
                 projected_any = true;
             }
@@ -36539,9 +39281,14 @@ mod date_detection_tests {
             cur = next;
             levels += 1;
         }
-        assert!(
-            levels < DYNAMIC_MAPPING_DEPTH_LIMIT + 5,
-            "recursion must stop before reaching the artificially deep bottom, got {levels} levels"
+        // Pin the exact stopping point, not just "somewhere before the
+        // bottom": the root itself is depth 1, so the last node the walk
+        // still recurses *into* is depth DYNAMIC_MAPPING_DEPTH_LIMIT -- one
+        // fewer hop than the limit's own value.
+        assert_eq!(
+            levels,
+            DYNAMIC_MAPPING_DEPTH_LIMIT - 1,
+            "recursion must stop at exactly the depth cap, got {levels} levels"
         );
 
         // Array of objects: infer_field_type already only looks at the
@@ -36560,6 +39307,122 @@ mod date_detection_tests {
             "only the first element's keys are discovered"
         );
         assert_eq!(fc.fields[0].name, "kind");
+    }
+
+    /// The core fix for a real gap found in review: a top-level field
+    /// already known to the schema (from an earlier document) must still
+    /// pick up a NEW nested child a later document introduces, instead of
+    /// staying frozen the moment it was first registered.
+    #[test]
+    fn merge_dynamic_children_into_adds_new_nested_keys_to_an_existing_field() {
+        let mut field =
+            dynamic_field_config("metadata", &serde_json::json!({"kind": "preference"}), true);
+        assert_eq!(field.fields.len(), 1);
+
+        let mut field_count = 10u32;
+        let changed = merge_dynamic_children_into(
+            &mut field,
+            &serde_json::json!({"project": "xerj"}),
+            true,
+            1,
+            &mut field_count,
+            100,
+        );
+        assert!(changed);
+        assert_eq!(field.fields.len(), 2, "{field:?}");
+        assert!(field.fields.iter().any(|f| f.name == "kind"));
+        assert!(field.fields.iter().any(|f| f.name == "project"));
+        assert_eq!(field_count, 11, "one new field was actually added");
+
+        // Re-merging the exact same shape adds nothing and reports no change.
+        let mut field_count2 = 11u32;
+        let changed_again = merge_dynamic_children_into(
+            &mut field,
+            &serde_json::json!({"project": "xerj"}),
+            true,
+            1,
+            &mut field_count2,
+            100,
+        );
+        assert!(!changed_again);
+        assert_eq!(field.fields.len(), 2);
+        assert_eq!(field_count2, 11);
+    }
+
+    #[test]
+    fn merge_dynamic_children_into_respects_the_field_count_budget() {
+        let mut field = dynamic_field_config("metadata", &serde_json::json!({"a": 1}), true);
+        let mut field_count = 5u32;
+        // Budget already exhausted -- must add nothing even though "b" is new.
+        let changed = merge_dynamic_children_into(
+            &mut field,
+            &serde_json::json!({"b": 2}),
+            true,
+            1,
+            &mut field_count,
+            5,
+        );
+        assert!(!changed);
+        assert_eq!(field.fields.len(), 1, "{field:?}");
+        assert_eq!(field_count, 5, "budget must not be exceeded");
+    }
+
+    #[test]
+    fn field_config_needs_merge_matches_merge_dynamic_children_into() {
+        let field =
+            dynamic_field_config("metadata", &serde_json::json!({"kind": "preference"}), true);
+
+        assert!(
+            field_config_needs_merge(&field, &serde_json::json!({"project": "xerj"})),
+            "a genuinely new nested key must be flagged"
+        );
+        assert!(
+            !field_config_needs_merge(&field, &serde_json::json!({"kind": "other"})),
+            "an already-known nested key changing VALUE (not shape) needs no merge"
+        );
+        assert!(
+            !field_config_needs_merge(&field, &serde_json::json!("not an object")),
+            "a non-object value has no keys to discover"
+        );
+    }
+
+    /// A document whose top-level key set is unchanged must still hash
+    /// differently once its NESTED shape changes -- otherwise the
+    /// single-doc ingest path's schema-evolution throttle
+    /// (`index_document_with_version_inner_guarded`) silently suppresses
+    /// the evolve call a new nested key needs, for up to 100 documents.
+    #[test]
+    fn hash_all_field_names_is_sensitive_to_nested_shape_not_just_top_level_keys() {
+        let mut h1: u64 = 0xcbf29ce484222325;
+        hash_all_field_names(
+            &serde_json::json!({"text": "x", "metadata": {"kind": "preference"}}),
+            &mut h1,
+        );
+
+        let mut h2: u64 = 0xcbf29ce484222325;
+        hash_all_field_names(
+            &serde_json::json!({"text": "x", "metadata": {"project": "xerj"}}),
+            &mut h2,
+        );
+
+        assert_ne!(
+            h1, h2,
+            "same top-level keys, different nested shape, must hash differently"
+        );
+
+        // Sanity: a flat document with no nested objects hashes the exact
+        // same bytes as hashing only its top-level keys would (no behavior
+        // change for the common case this throttle was written for).
+        let mut h_flat: u64 = 0xcbf29ce484222325;
+        hash_all_field_names(&serde_json::json!({"a": 1, "b": 2}), &mut h_flat);
+        let mut h_manual: u64 = 0xcbf29ce484222325;
+        for k in ["a", "b"] {
+            for b in k.bytes() {
+                h_manual ^= b as u64;
+                h_manual = h_manual.wrapping_mul(0x00000100000001b3);
+            }
+        }
+        assert_eq!(h_flat, h_manual);
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on
@@ -36676,6 +39539,23 @@ mod fts_projection_tests {
                 assert_eq!(t.term, "claude-haiku-4-5", "whole value, not tokens");
             }
             other => panic!("expected single term, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn scalar_term_on_keyword_field_projects_whole_value() {
+        let q = QueryNode::Term {
+            field: "ax_path".into(),
+            value: Value::String("no/such/file.php".into()),
+            boost: None,
+        };
+        let fq = query_node_to_fts(&q, &[], &kw(&["ax_path"])).expect("projects");
+        match fq {
+            FtsQuery::Term(term) => {
+                assert_eq!(term.field, "ax_path");
+                assert_eq!(term.term, "no/such/file.php");
+            }
+            other => panic!("expected keyword term, got {other:?}"),
         }
     }
 
@@ -37732,6 +40612,42 @@ mod highlight_multibyte_tests {
     }
 
     #[test]
+    fn fragment_highlight_finds_a_rare_term_buried_after_many_common_ones() {
+        // The defect this guards: the candidate scan used to share one budget
+        // across all terms and `terms` arrives sorted, so a common word
+        // exhausted the quota and the distinctive word was never searched for.
+        // Candidates were then ordered earliest-first, so even when both were
+        // found the top-of-document match won. Two blind usability runs asked
+        // for a phrase deep in a large file, both got fragments from the head
+        // of the file, and both abandoned highlighting entirely.
+        // Each filler block is far wider than `fragment_size`, so every common
+        // match claims its own fragment window instead of collapsing into a
+        // shared one — the shape of a real source file, where the rare term
+        // sits thousands of bytes past hundreds of common ones.
+        let pad = "x".repeat(600);
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!("function helper_{i}() {{ /* {pad} */ }}\n"));
+        }
+        text.push_str("function human_time_diff( $from, $to = 0 ) { return 1; }\n");
+        for i in 0..300 {
+            text.push_str(&format!("function tail_{i}() {{ /* {pad} */ }}\n"));
+        }
+
+        let (lower, map) = build_lower_offset_map(&text);
+        // Sorted, as `extract_highlight_terms` produces: the common term first.
+        let terms = vec!["function".to_string(), "human_time_diff".to_string()];
+        let frags = build_highlight_fragments(&text, &lower, &map, &terms, "<em>", "</em>", 200, 2);
+
+        assert!(!frags.is_empty(), "expected fragments");
+        assert!(
+            frags.iter().any(|f| f.contains("human_time_diff")),
+            "the rare term is what the caller searched for; fragments must reach \
+             it rather than returning the head of the document: {frags:?}"
+        );
+    }
+
+    #[test]
     fn fragment_highlight_after_multibyte_does_not_panic() {
         let text = "İstanbul cafe";
         let (lower, map) = build_lower_offset_map(text);
@@ -37951,6 +40867,102 @@ mod lexical_passage_tests {
         assert_eq!(
             passage.field, "body",
             "body window holds more weighted occurrences than the symbol list"
+        );
+    }
+
+    /// #174: the lexical path must widen a code hit's passage to its
+    /// enclosing function too, exactly like the semantic path.
+    #[test]
+    fn code_hit_passage_widens_to_enclosing_function() {
+        let body = format!(
+            "{}fn target(x: i32) -> i32 {{\n    let y = x + 1;\n    y * needle_marker\n}}\n{}",
+            "// filler line of no consequence\n".repeat(80),
+            "// trailing filler\n".repeat(80)
+        );
+        let query = QueryNode::Match {
+            field: "body".into(),
+            query: "needle_marker".into(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+        };
+        let hit = Hit {
+            id: "doc-1".into(),
+            score: 1.0,
+            source: json!({"body": body, "language": "rust", "symbol_count": 1}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![hit], &query);
+        let passage = out[0].passage.as_ref().expect("lexical passage filled");
+        assert!(
+            passage.text.starts_with("fn target"),
+            "passage must start at the enclosing function's declaration, got: {:?}",
+            passage.text
+        );
+        assert_eq!(
+            passage.text,
+            &body[passage.start_offset as usize..passage.end_offset as usize]
+        );
+    }
+
+    /// #174: a document that merely carries a field named `language` (not
+    /// autoindex's code-extractor shape — no `symbol_count`) must keep the
+    /// exact line-snapped window the lexical selector already computed.
+    #[test]
+    fn non_code_document_lexical_passage_ignores_stray_language_field() {
+        let body = format!(
+            "{}fn target(x: i32) -> i32 {{\n    let y = x + 1;\n    y * needle_marker\n}}\n{}",
+            "// filler line of no consequence\n".repeat(80),
+            "// trailing filler\n".repeat(80)
+        );
+        let query = QueryNode::Match {
+            field: "body".into(),
+            query: "needle_marker".into(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+        };
+        let plain_hit = Hit {
+            id: "doc-1".into(),
+            score: 1.0,
+            source: json!({"body": body}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let tagged_hit = Hit {
+            id: "doc-2".into(),
+            score: 1.0,
+            // Same body, but with a stray `language` field and no
+            // `symbol_count` — not autoindex's code-doc shape.
+            source: json!({"body": body, "language": "rust"}),
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let plain_out = apply_lexical_passages(vec![plain_hit], &query);
+        let tagged_out = apply_lexical_passages(vec![tagged_hit], &query);
+        let plain_passage = plain_out[0].passage.as_ref().expect("plain passage filled");
+        let tagged_passage = tagged_out[0]
+            .passage
+            .as_ref()
+            .expect("tagged passage filled");
+        assert_eq!(plain_passage.start_offset, tagged_passage.start_offset);
+        assert_eq!(plain_passage.end_offset, tagged_passage.end_offset);
+        assert_eq!(plain_passage.text, tagged_passage.text);
+        assert!(
+            !plain_passage.text.starts_with("fn target"),
+            "without symbol_count this must stay the raw line-snapped window, not a widened block"
         );
     }
 
@@ -38476,6 +41488,69 @@ mod chunk_embed_tests {
             passage_match_from_source(&malformed, "embedding", Some(0)).is_none(),
             "offset inside the multibyte 'P/é' sequence must be refused"
         );
+    }
+
+    /// #174 AST-aligned passages: a document that merely carries a field
+    /// literally named `language` (e.g. a course-catalog entry tagged
+    /// `"language": "rust"`, not a source file) must NOT trigger AST
+    /// refinement — `refine_code_passage` also requires autoindex's
+    /// code-extractor signature (`symbol_count`) and the canonical `body`
+    /// field. Every non-code document must come back byte-identical to the
+    /// window computed from the stored chunk offsets, unconditionally.
+    #[test]
+    fn non_code_document_passage_is_byte_identical_regardless_of_language_field() {
+        // Deliberately shaped like the reported bug (a dangling brace mid
+        // window) so a wrongly-triggered AST pass would have visibly changed
+        // the span rather than silently agreeing with it.
+        let text = "\t}\n\n\tif ( isset( $x ) ) {\n\t\tdo_thing();\n\t}\n";
+        let start = text.find("if (").unwrap();
+        let end = start + "if ( isset( $x ) )".len();
+        let source = serde_json::json!({
+            "body": text,
+            "language": "rust",
+            "__xerj_passage_meta__embedding": {
+                "field": "body",
+                "chunks": [[start, end]]
+            }
+        });
+        let passage = passage_match_from_source(&source, "embedding", Some(0)).unwrap();
+        assert_eq!(passage.start_offset as usize, start);
+        assert_eq!(passage.end_offset as usize, end);
+        assert_eq!(passage.text, &text[start..end]);
+    }
+
+    /// #174: a CODE document (autoindex's `language` + `symbol_count` +
+    /// `body` shape) whose stored chunk offsets land mid-statement inside a
+    /// function — exactly the reported bug, a passage opening on a dangling
+    /// brace — must be widened to the smallest enclosing function.
+    #[test]
+    fn code_document_passage_widens_to_enclosing_function() {
+        let body = "fn before() {\n    1\n}\n\nfn target(x: i32) -> i32 {\n    let y = x + 1;\n    y * 2\n}\n\nfn after() {\n    2\n}\n";
+        let needle = "y * 2";
+        let start = body.find(needle).unwrap();
+        let end = start + needle.len();
+        let source = serde_json::json!({
+            "body": body,
+            "language": "rust",
+            "symbol_count": 3,
+            "__xerj_passage_meta__embedding": {
+                "field": "body",
+                "chunks": [[start, end]]
+            }
+        });
+        let passage = passage_match_from_source(&source, "embedding", Some(0)).unwrap();
+        assert!(
+            passage.text.starts_with("fn target"),
+            "passage must start at the enclosing function's declaration, got: {:?}",
+            passage.text
+        );
+        assert_eq!(
+            passage.text,
+            &body[passage.start_offset as usize..passage.end_offset as usize],
+            "start/end offsets must still slice exactly onto `text`"
+        );
+        assert!(!passage.text.contains("before"));
+        assert!(!passage.text.contains("after"));
     }
 
     #[test]

@@ -348,8 +348,11 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i] as char;
-        // Skip whitespace
-        if c.is_whitespace() {
+        // Skip whitespace. ASCII-only for the same reason the identifier scan
+        // below is: `is_whitespace()` is true for Latin-1 NBSP (0xA0), which in
+        // valid UTF-8 is only ever a continuation byte, so accepting it lets
+        // the scanner step into the middle of a character.
+        if c.is_ascii_whitespace() {
             i += 1;
             continue;
         }
@@ -454,11 +457,28 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         // Identifier / keyword
-        if c.is_alphabetic() || c == '_' || c == '$' {
+        //
+        // ASCII-only, and that is load-bearing rather than a limitation of the
+        // subset. This tokeniser walks BYTES (`bytes[i] as char` reinterprets
+        // each byte as Latin-1) but slices `&src[start..i]` as a `&str`. Every
+        // continuation byte of a multi-byte character reads as an alphabetic
+        // Latin-1 char, so the old `is_alphabetic()` test let the scan start or
+        // stop inside one — and the slice then panicked on a char boundary.
+        // With `panic = "abort"` in the release profile that is not a 400, it
+        // is the process: `{"script":{"source":"doc[\"title\"].valueʋ..."}}`
+        // took the whole server down. Found by the `painless` fuzz target in
+        // under a second.
+        //
+        // Restricting the scan to ASCII keeps both ends on a character
+        // boundary by construction. A non-ASCII byte now falls through to the
+        // punctuation arms and ends at the `unexpected char` error below,
+        // which is the correct answer for an identifier this subset cannot
+        // evaluate anyway.
+        if c.is_ascii_alphabetic() || c == '_' || c == '$' {
             let start = i;
             while i < bytes.len() {
                 let cc = bytes[i] as char;
-                if cc.is_alphanumeric() || cc == '_' || cc == '$' {
+                if cc.is_ascii_alphanumeric() || cc == '_' || cc == '$' {
                     i += 1;
                 } else {
                     break;
@@ -3918,6 +3938,57 @@ mod tests {
             c.work_units() > 5_000,
             "a whole-document clone was charged {} work units",
             c.work_units()
+        );
+    }
+
+    /// Regression for the crash the `painless` fuzz target found in under a
+    /// second (issue #207). The tokeniser walks bytes but slices `&src[..]` as
+    /// a `&str`, and every continuation byte of a multi-byte character reads as
+    /// an alphabetic Latin-1 char — so an identifier scan could stop inside one
+    /// and the slice panicked on a char boundary. Scripts arrive in ordinary
+    /// search and update bodies and the release profile sets `panic = "abort"`,
+    /// so this was not a 400, it was the process.
+    ///
+    /// Before the fix each of these aborts the test process rather than
+    /// failing an assertion.
+    #[test]
+    fn a_non_ascii_character_in_a_script_is_an_error_not_a_panic() {
+        let doc = json!({ "title": "the quick brown fox" });
+        let params = json!({});
+
+        for src in [
+            // The input libFuzzer minimised to: an identifier scan that runs
+            // into U+028B.
+            "emit(doc[\"title\"].value\u{28b}oUppe",
+            "\u{28b}",
+            "value\u{28b}",
+            "\u{28b}value",
+            "doc[\"title\"].\u{4e2d}\u{6587}",
+            // Multi-byte inside a string literal must still be fine — the
+            // fix must not have made ordinary Unicode text unusable.
+            "\"caf\u{e9} \u{4e2d}\u{6587} \u{28b}\"",
+            // Non-ASCII at the very end, where the scan runs off the input.
+            "a\u{e9}",
+            "\u{e9}\u{e9}\u{e9}",
+        ] {
+            // Neither entry point may panic. Both are allowed to fail.
+            let _ = check_script_limits(src);
+            let _ = eval_painless(src, &ctx(&doc, &params, 0.0));
+        }
+
+        // A string literal carrying non-ASCII still evaluates to itself: the
+        // fix narrows the *identifier* scan, not the language.
+        let v = eval_painless("\"caf\u{e9}\"", &ctx(&doc, &params, 0.0)).expect("evaluate");
+        assert!(
+            matches!(&v, PainlessValue::String(s) if s == "caf\u{e9}"),
+            "{v:?}"
+        );
+
+        // ASCII identifiers are untouched by the narrowed scan.
+        let v = eval_painless("doc['title'].value", &ctx(&doc, &params, 0.0)).expect("evaluate");
+        assert!(
+            matches!(&v, PainlessValue::String(s) if s == "the quick brown fox"),
+            "{v:?}"
         );
     }
 }

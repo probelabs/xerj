@@ -1,0 +1,23 @@
+{
+  "schema": "xerj.cluster-state-format1-fixtures.v1",
+  "format1_writer_commit": "ee29361bccce77de527baac3fe6ed387cd1f6dff",
+  "format1_writer_tree": "7227e51db69f9910a355bfd6b30b6a64b52dac87",
+  "provenance": {
+    "method": "runtime-capture-through-public-apis",
+    "writer_source": "engine/crates/xerj-engine/src/engine.rs",
+    "reproduction": "REPRODUCE.txt",
+    "reproduction_sha256": "84a08f9fd38809fe25343b4ee503641ea1a3d25b83601066d10f4e494da10022",
+    "writer_build": "git worktree add ../xerj-format1-writer ee29361bccce77de527baac3fe6ed387cd1f6dff && cd ../xerj-format1-writer/engine && cargo build --locked --profile profiling -j 32 -p xerj-server",
+    "capture_contract": "six documented ES-compatible PUTs, six matching GETs, graceful shutdown, then copy cluster_state.json",
+    "note": "The all-fields fixture is byte-identical to captured-cluster-state.json emitted after public PUT and GET of all six managed map types and a clean shutdown."
+  },
+  "fixtures": {
+    "v1-duplicate-nested-value-key.json": {"bytes": 202, "sha256": "e815f8872638de2ce5fce2520dcf9ab38869cb6aceedb5baecbbdcf5837b121c"},
+    "v1-duplicate-version.json": {"bytes": 145, "sha256": "6e5e671200fdda04567d4201c9abed40695f33c5f36adab4ee5de41f55093153"},
+    "v1-ee29361-all-fields.json": {"bytes": 1275, "sha256": "ae9f96a1dbf70cc711eadfdf8cd2e6701004b66f39c197f1e74cde556d64bb7b"},
+    "v1-unknown-data-stream-field.json": {"bytes": 259, "sha256": "dda0121ed37ff4a8cff4ac17280f07eeb932f552c78bacacaa0e4aa129391f0f"},
+    "v1-unknown-index-template-field.json": {"bytes": 224, "sha256": "93a057bae38183ddda637f3c6d23a63153f8e9e77ae5387134dca189c0394f7b"},
+    "v1-unknown-top-level.json": {"bytes": 155, "sha256": "d0f5b5e976899a6e4d46d648c001a9867e3cbf52f4e74834fe9bd083e09fd2c6"},
+    "v2-format-version-minimal.json": {"bytes": 176, "sha256": "28894ecec5edf98baa3988d365013f6ba13b7024c9e4292bc5fe56dc92d0b7d3"}
+  }
+}

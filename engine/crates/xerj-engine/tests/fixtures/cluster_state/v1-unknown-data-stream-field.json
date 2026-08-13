@@ -1,0 +1,1 @@
+{"version":1,"index_templates":{},"legacy_templates":{},"component_templates":{},"pipelines":{},"data_streams":{"events":{"name":"events","backing_indices":[".ds-events-000001"],"timestamp_field":"@timestamp","generation":1,"future":true}},"ilm_policies":{}}

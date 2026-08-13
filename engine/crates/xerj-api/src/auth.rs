@@ -179,7 +179,7 @@ pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: 
     if is_authorized(&state, auth_header) {
         next.run(req).await
     } else {
-        unauthorized_response()
+        unauthorized_response(&state.config.server.data_dir)
     }
 }
 
@@ -396,9 +396,49 @@ fn extract_key(header: &str) -> Option<&str> {
     }
 }
 
+/// The `WWW-Authenticate` challenge sent with every 401.
+///
+/// RFC 7235 §3.1 makes the header **mandatory** on a 401, and Elasticsearch
+/// sends one; xerj sent none, so a conforming client (or a human running `curl
+/// -i`) got a 401 with no statement of *how* to authenticate.
+///
+/// The scheme name is `ApiKey` because that is a scheme this server genuinely
+/// honours — [`extract_key`] accepts `ApiKey <key>` (and `Bearer <key>`), and
+/// it is the one every xerj client actually writes: the autoindex HTTP client
+/// sends `Authorization: ApiKey <key>`, and `xerj.default.toml` documents
+/// exactly that spelling beside `[auth] enabled = true`. `Bearer` and `Basic`
+/// are deliberately **not** advertised even though both authenticate:
+/// advertising `Basic` makes browsers pop a username/password dialog for a
+/// credential that has no username half, and one challenge naming the
+/// canonical scheme is more useful to a newcomer than three naming synonyms.
+pub const WWW_AUTHENTICATE_CHALLENGE: &str = "ApiKey realm=\"xerj\"";
+
 /// Build an ES-compatible 401 Unauthorized response.
-fn unauthorized_response() -> Response {
-    let reason = "missing or invalid API key in Authorization header".to_string();
+///
+/// `data_dir` is the server's configured data directory, threaded in from
+/// `state.config.server.data_dir` so the body can name the **real**
+/// `admin.key` path rather than a `<data_dir>` placeholder. xerj has no config
+/// discovery and `data_dir` defaults to the *relative* `./data`, so the key
+/// lands wherever the server happened to be launched from — "where is my key?"
+/// is genuinely unanswerable from the client side, and a placeholder would not
+/// have answered it.
+///
+/// The ES error envelope (`security_exception`, `root_cause`, `status`) is a
+/// wire-compat surface with a conformance suite behind it: only the free-text
+/// `reason` changes here, never a field name or the structure.
+fn unauthorized_response(data_dir: &str) -> Response {
+    let key_path = std::path::Path::new(data_dir)
+        .join("admin.key")
+        .display()
+        .to_string();
+    let reason = format!(
+        "missing or invalid API key in Authorization header. \
+         Send `Authorization: ApiKey <key>`. This server writes its admin key to {key_path} \
+         on first start, so `export XERJ_API_KEY=\"$(cat {key_path})\"` (every xerj CLI reads \
+         that variable, `xerj autoindex` included) or pass `--api-key <key>`. \
+         To run with no authentication at all — local development only — restart the server \
+         with `--insecure`, which disables TLS *and* auth."
+    );
     let error_type = "security_exception".to_string();
 
     let body = EsErrorResponse {
@@ -420,9 +460,18 @@ fn unauthorized_response() -> Response {
             request_id: None,
         },
         status: 401,
+        xerj_hint: None,
     };
 
-    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            WWW_AUTHENTICATE_CHALLENGE,
+        )],
+        Json(body),
+    )
+        .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -975,6 +1024,125 @@ mod tests {
             status,
             StatusCode::UNAUTHORIZED,
             "metrics still demands a credential"
+        );
+    }
+
+    /// RFC 7235 §3.1: a 401 **must** carry a `WWW-Authenticate` challenge, and
+    /// the scheme it names must be one this server actually honours. xerj sent
+    /// none, so a client that got a 401 was told it was unauthenticated and
+    /// nothing about how to fix that (ONBOARDING-401-REPRO.md).
+    ///
+    /// The advertised scheme is proved honoured *here*, in the same test, so
+    /// the header can never drift into naming something the middleware
+    /// rejects: the challenge's scheme name is spliced onto the admin key and
+    /// must authenticate.
+    #[tokio::test]
+    async fn unauthorized_carries_a_www_authenticate_challenge() {
+        let admin = "admin-secret-key";
+        let state = test_state(admin);
+        let app = app(state.clone());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_security/_authenticate")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let challenge = resp
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .expect("401 must carry WWW-Authenticate (RFC 7235 §3.1)")
+            .to_str()
+            .expect("challenge must be printable ASCII")
+            .to_string();
+        assert_eq!(challenge, WWW_AUTHENTICATE_CHALLENGE);
+        assert!(
+            challenge.contains(r#"realm="xerj""#),
+            "challenge must carry a realm, got {challenge:?}"
+        );
+
+        // The named scheme is a scheme the server genuinely accepts.
+        let scheme = challenge
+            .split_whitespace()
+            .next()
+            .expect("challenge names a scheme");
+        assert!(
+            is_authorized(&state, Some(&format!("{scheme} {admin}"))),
+            "advertised scheme {scheme:?} must authenticate the admin key"
+        );
+
+        // A rejected *credential* gets the challenge too, not just a missing
+        // one — the client needs to be told how to retry either way.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_security/_authenticate")
+            .header("authorization", "ApiKey not-the-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some(WWW_AUTHENTICATE_CHALLENGE),
+            "a rejected key must be challenged too"
+        );
+    }
+
+    /// The 401 body must name the recovery, and must keep the ES error
+    /// envelope byte-compatible while doing it. The old `reason` was accurate
+    /// and useless — a newcomer following the shipped `xerj.default.toml`
+    /// (which enables auth) read "missing or invalid API key" and concluded
+    /// their server lacked a feature, then disabled auth.
+    ///
+    /// The real `admin.key` path is threaded in from the server's own config,
+    /// not a `<data_dir>` placeholder: `data_dir` defaults to the *relative*
+    /// `./data`, so the key lands wherever the server was launched from and a
+    /// placeholder answers nothing.
+    #[tokio::test]
+    async fn unauthorized_body_names_the_recovery() {
+        let admin = "admin-secret-key";
+        let state = test_state(admin);
+        let data_dir = state.config.server.data_dir.clone();
+        let app = app(state);
+
+        let (status, body) = send(&app, "GET", "/_security/_authenticate", None, "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // ES envelope — field names and structure unchanged. This is a
+        // wire-compat surface; only `reason` is free text.
+        assert_eq!(body["status"], 401);
+        assert_eq!(body["error"]["type"], "security_exception");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "security_exception");
+        let reason = body["error"]["reason"].as_str().expect("reason string");
+        assert_eq!(
+            body["error"]["root_cause"][0]["reason"], reason,
+            "root_cause reason must mirror the top-level reason"
+        );
+
+        // The recovery, named. Each of these is a thing the user must type.
+        let expected_path = std::path::Path::new(&data_dir)
+            .join("admin.key")
+            .display()
+            .to_string();
+        assert!(
+            reason.contains(&expected_path),
+            "reason must name this server's real admin.key path ({expected_path}), got {reason:?}"
+        );
+        assert!(
+            reason.contains("XERJ_API_KEY"),
+            "reason must name the env var, got {reason:?}"
+        );
+        assert!(
+            reason.contains("--insecure"),
+            "reason must name the explicit auth opt-out, got {reason:?}"
+        );
+        assert!(
+            reason.contains("ApiKey"),
+            "reason must name the scheme to send, got {reason:?}"
         );
     }
 

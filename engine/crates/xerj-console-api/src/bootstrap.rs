@@ -48,6 +48,16 @@ pub async fn run(
     data_dir: &Path,
     bind_url: &str,
 ) -> ConsoleResult<BootstrapOutcome> {
+    // Console bootstrap is a storage migration: it creates fourteen system
+    // indices, writes a master key and publishes seeded dashboard segments.
+    // Keep this guard inside the crate as well as at the server call site so a
+    // future embedder cannot accidentally bypass the compatibility fence.
+    if !engine.cluster_state_boot_status().is_writable() {
+        return Err(ConsoleApiError::Internal(
+            "cluster-state storage is unavailable; Console bootstrap requires a supported restart"
+                .to_owned(),
+        ));
+    }
     let master_key = load_or_init_master_key(data_dir)?;
 
     indices::ensure_all(engine)?;

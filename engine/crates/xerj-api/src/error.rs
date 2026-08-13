@@ -71,6 +71,16 @@ pub struct EsErrorBody {
 pub struct EsErrorResponse {
     pub error: EsErrorBody,
     pub status: u16,
+    /// Additive, non-ES field carrying an actionable recovery hint (e.g. for
+    /// `index_not_found_exception`: nearby index names, the `ax-*` wildcard
+    /// an autoindex-managed cluster searches with). Same `_xerj` convention
+    /// as the hint on a successful `_search` response — see
+    /// `es_compat::search_response_hint`. Absent whenever no handler had
+    /// anything more specific to offer than the `reason` string already
+    /// says, so this never becomes noise on errors that are already
+    /// self-explanatory.
+    #[serde(rename = "_xerj", skip_serializing_if = "Option::is_none")]
+    pub xerj_hint: Option<Value>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +95,7 @@ pub struct EsErrorResponse {
 pub struct ApiError {
     pub inner: XerjError,
     pub request_id: Option<String>,
+    pub hint: Option<Value>,
 }
 
 impl ApiError {
@@ -92,11 +103,19 @@ impl ApiError {
         Self {
             inner,
             request_id: None,
+            hint: None,
         }
     }
 
     pub fn with_request_id(mut self, id: impl Into<String>) -> Self {
         self.request_id = Some(id.into());
+        self
+    }
+
+    /// Attach an actionable `_xerj` recovery hint (see [`EsErrorResponse`]).
+    /// Additive only — never changes `error.type` / `error.reason` / status.
+    pub fn with_hint(mut self, hint: Value) -> Self {
+        self.hint = Some(hint);
         self
     }
 }
@@ -235,6 +254,7 @@ impl ApiError {
                 request_id: self.request_id,
             },
             status: status_code,
+            xerj_hint: self.hint,
         };
 
         (http_status, body)
@@ -302,6 +322,7 @@ fn xerj_error_type(e: &XerjError) -> String {
         XerjError::InvalidDocumentJson { .. } => "json_parse_exception",
         // ── Configuration ─────────────────────────────────────────────────
         XerjError::ConfigError { .. } => "action_request_validation_exception",
+        XerjError::ClusterStateUnavailable => "cluster_state_unavailable",
         // ── Auth ──────────────────────────────────────────────────────────
         XerjError::AuthError { .. } => "security_exception",
         // ── TLS ───────────────────────────────────────────────────────────

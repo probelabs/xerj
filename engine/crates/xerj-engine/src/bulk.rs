@@ -2623,7 +2623,9 @@ mod semantic_lifecycle_tests {
             .iter()
             .map(|(field, _)| ((*field).to_string(), json!({"type": "semantic_text"})))
             .collect::<serde_json::Map<_, _>>();
-        engine.put_index_mapping(name, json!({"properties": properties}));
+        engine
+            .put_index_mapping(name, json!({"properties": properties}))
+            .unwrap();
         (dir, engine)
     }
 
@@ -3199,10 +3201,12 @@ mod semantic_lifecycle_tests {
         });
         schema.fields.push(content);
         engine.create_index(fails, schema).unwrap();
-        engine.put_index_mapping(
-            fails,
-            json!({"properties": {"content": {"type": "semantic_text"}}}),
-        );
+        engine
+            .put_index_mapping(
+                fails,
+                json!({"properties": {"content": {"type": "semantic_text"}}}),
+            )
+            .unwrap();
         let ledger: &'static Ledger = Box::leak(Box::new(Ledger::new()));
         let engine = Arc::new(engine);
         let hook_engine = Arc::clone(&engine);

@@ -1,9 +1,14 @@
 //! Hand-rolled arg parser (house style of xerj-server — no clap).
 
+use crate::gate::{Approval, DEFAULT_MAX_MINUTES};
 use crate::ignore_rules::IgnoreOptions;
 use crate::progress::ProgressMode;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Largest `--max-minutes` accepted: one week. Past that the flag is a typo,
+/// and `--max-minutes 0` already exists to mean "never ask".
+pub const MAX_MAX_MINUTES: u64 = 7 * 24 * 60;
 
 /// Largest `--bulk-mb` accepted. Past this a single bulk body stops being a
 /// unit of work and starts being a memory incident on the server.
@@ -14,6 +19,10 @@ pub struct IndexCfg {
     pub root: PathBuf,
     pub url: String,
     pub api_key: Option<String>,
+    /// Set only when `api_key` was discovered on disk rather than supplied by
+    /// the user, so completion hints can reference the file instead of
+    /// printing the secret into output people paste into bug reports.
+    pub api_key_file: Option<PathBuf>,
     /// Phase-B index workers (concurrent bulk senders).
     pub workers: usize,
     /// Phase-A scan pool width (content hashing, sniffing, sampling). Both come
@@ -42,6 +51,12 @@ pub struct IndexCfg {
     /// Disable edge detection entirely (no `.xerj-memory-*-edges` writes).
     pub no_graph: bool,
     pub dry_run: bool,
+    /// Stop and ask before indexing when phase A's measured estimate exceeds
+    /// this many minutes. `0` disables the gate outright.
+    pub max_minutes: u64,
+    /// An answer to a previous decision request. `None` means "nobody has
+    /// answered yet", which is what arms the gate.
+    pub approve: Option<Approval>,
     pub json: bool,
     pub quiet: bool,
     /// Progress surface. Orthogonal to `json`: `--json` shapes *stdout* (the
@@ -88,7 +103,13 @@ a --no-graph state directory written before the generation format must be rebuil
 --state-dir and --prefix; graph-enabled journals keep the existing crash-resume behaviour";
 
 pub fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+/// The help text as a value, so tests can assert that a documented flag is
+/// still documented instead of trusting a `println!`.
+pub fn help_text() -> String {
+    format!(
         "xerj autoindex — point it at any folder and make the contents AI-searchable, zero config\n\
          \n\
          USAGE:\n\
@@ -131,6 +152,14 @@ pub fn print_help() {
                                   .xerj-memory-<NAME>-edges (default: folder name slug)\n\
              --no-graph           skip relationship detection (wikilinks, local links,\n\
                                   section order, directory chains) — no edges are written\n\
+             --max-minutes <N>    stop and ask before indexing if phase A's MEASURED estimate\n\
+                                  is longer than this (default 10; 0 disables the gate;\n\
+                                  max 10080). See ESTIMATE + DECISION GATE below.\n\
+             --approve <ID>       answer a decision request: proceed | fast | cancel.\n\
+                                  `fast` also applies --no-semantic --no-graph. `narrower`\n\
+                                  is NOT accepted here — it means re-running against a\n\
+                                  subdirectory, which this flag cannot do.\n\
+             --yes, -y            alias for --approve proceed\n\
              --dry-run            walk+sniff+infer, print the plan, index nothing\n\
              --json               machine-readable RESULT on stdout (map: raw catalog docs).\n\
                                   Orthogonal to --progress, which owns stderr.\n\
@@ -142,7 +171,12 @@ pub fn print_help() {
                                   progress cadence, 1..=3600 (default 1 on a terminal,\n\
                                   5 otherwise). This is the guaranteed upper bound on\n\
                                   silence between phases.\n\
-             --quiet              errors only (implies --progress none)\n\
+             --quiet              errors only (implies --progress none). The decision gate\n\
+                                  NEVER prompts under this flag, even at a terminal — the\n\
+                                  question would be silenced with everything else. It emits\n\
+                                  the JSON decision request on stdout and exits 4 instead,\n\
+                                  exactly like an agent-driven run. See ESTIMATE + DECISION\n\
+                                  GATE.\n\
              --dataset <SLUG>     (map) show a single dataset\n\
              --help, -h           this help\n\
          \n\
@@ -209,6 +243,11 @@ pub fn print_help() {
              terminal line, in every progress mode EXCEPT `none` (which --quiet\n\
              selects), so an outcome never has to be guessed from silence:\n\
                xerj-done ok=true exit=3 reason=completed-with-junk wall=57.6s …\n\
+             The terminal line also carries code coverage — code_files=N\n\
+             code_files_indexed=M code_files_junked=K — so a corpus whose\n\
+             source files were ALL dropped cannot print the same line as a\n\
+             healthy one. code_files>0 with code_files_indexed=0 is always a\n\
+             defect, and the run says so in words as well.\n\
              --quiet/--progress none prints no progress and NO terminal line\n\
              (only a fatal `error:` line, if any) — poll `autoindex status\n\
              --state-dir <dir>` or read the exit code instead of waiting for\n\
@@ -238,6 +277,39 @@ pub fn print_help() {
              bar obeys the same rule: `[????…]` when there is no denominator,\n\
              and a full bar only at a real 100%.\n\
          \n\
+         ESTIMATE + DECISION GATE:\n\
+             Phase A already reads and parses every file to sniff and sample it, so it\n\
+             measures throughput per format family ON THIS MACHINE. autoindex turns that\n\
+             into a RANGE (never one confident number) for the indexing phase and prints\n\
+             the basis with it. Families phase A never read end to end are named and left\n\
+             OUT of the arithmetic instead of being priced at some other family's rate;\n\
+             if nothing could be measured, it says so and does not gate.\n\
+             The range covers CLIENT-SIDE EXTRACTION only — server indexing, embedding\n\
+             and network time are not in it, which is why the gate compares the upper end.\n\
+             If that upper end is longer than --max-minutes and no --approve/--yes was\n\
+             given, nothing is indexed: a JSON decision request goes to stdout and the\n\
+             process exits 4 (a code of its own — 1 is the catch-all for real failures).\n\
+             Answer by re-running the same command with --approve proceed|fast|cancel.\n\
+             A person at a terminal is prompted instead — but ONLY when the question can\n\
+             actually be seen. All three must hold: stdin is a terminal, stderr is a\n\
+             terminal, and the progress surface is on. --quiet / --progress none silences\n\
+             the question, so those runs are never prompted and never wait on stdin; a\n\
+             piped or agent-driven run is not prompted either. Every un-prompted run\n\
+             behaves identically: the JSON decision request goes to stdout (which --quiet\n\
+             does NOT silence) and the process exits 4. The payload's\n\
+             `prompt_not_offered_because` says which of the three was missing.\n\
+             autoindex never waits on stdin for a question it did not print.\n\
+         \n\
+         WORK ORDER:\n\
+             Phase B drains source and documents first, then configuration, then\n\
+             structured data, then logs and line files, and vendored/generated/minified\n\
+             paths last — so stopping early, or searching while it runs, still gives you\n\
+             the files you cared about. Inside a band the biggest file starts first (with\n\
+             several workers it then runs alongside the rest instead of becoming the\n\
+             tail); a single-worker run goes smallest-first instead. One exception: a file\n\
+             so large that it outlasts everything ranked above it starts first whatever\n\
+             band it is in. The full breakdown is printed with the plan.\n\
+         \n\
          RESUME POLICY:\n\
              {resume_policy_help}.\n\
              On a graph-enabled or pre-generation journal the durable plan supports no-op\n\
@@ -256,13 +328,16 @@ pub fn print_help() {
              Validate before switching readers; explicitly clean the shared\n\
              autoindex-catalog and old target only after validation.\n\
          \n\
-         EXIT CODES: 0 complete; 3 completed-with-junk (junk recorded, never fatal);\n\
+         EXIT CODES: 0 complete (also: gate answered with --approve cancel);\n\
+                     3 completed-with-junk (junk recorded, never fatal);\n\
+                     4 NEEDS A DECISION — the estimate exceeded --max-minutes and\n\
+                       nothing was indexed; a JSON decision request is on stdout;\n\
                      2 usage; 1 endpoint/journal failure, a refused corpus removal, or a\n\
                      refused unsafe state transition\n",
         fresh_help = FRESH_HELP,
         resume_policy_help = RESUME_POLICY_HELP,
         defaults = crate::ignore_rules::DEFAULT_IGNORE_PATTERNS.join(" ")
-    );
+    )
 }
 
 pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
@@ -272,6 +347,9 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
 
     let mut url = "http://localhost:9200".to_string();
     let mut api_key = std::env::var("XERJ_API_KEY").ok().filter(|s| !s.is_empty());
+    // Set only when the key was discovered on disk, so output can reference the
+    // file instead of echoing the secret.
+    let mut api_key_file: Option<PathBuf> = None;
     // Worker counts are decided by `crate::resources::plan` once every flag is
     // known, because the answer depends on --bulk-mb and on the machine. `None`
     // here means "the user did not ask for a number".
@@ -294,6 +372,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut brain: Option<String> = None;
     let mut no_graph = false;
     let mut dry_run = false;
+    let mut max_minutes = DEFAULT_MAX_MINUTES;
+    let mut max_minutes_explicit = false;
+    let mut approve: Option<Approval> = None;
+    let mut approve_explicit = false;
     let mut json = false;
     let mut quiet = false;
     let mut progress: Option<ProgressMode> = None;
@@ -399,6 +481,53 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 brain = Some(name);
             }
             "--no-graph" => no_graph = true,
+            "--max-minutes" => {
+                max_minutes_explicit = true;
+                max_minutes = it
+                    .next()
+                    .ok_or("--max-minutes needs a number of minutes (0 disables the gate)")?
+                    .parse()
+                    .map_err(|_| {
+                        format!("--max-minutes needs an integer from 0 to {MAX_MAX_MINUTES}")
+                    })?;
+                if max_minutes > MAX_MAX_MINUTES {
+                    return Err(format!(
+                        "--max-minutes must be from 0 to {MAX_MAX_MINUTES} (0 disables the gate)"
+                    ));
+                }
+            }
+            "--approve" => {
+                let raw = it.next().ok_or(
+                    "--approve needs one of: proceed, fast, cancel (narrower means re-running \
+                     against a subdirectory)",
+                )?;
+                let parsed = Approval::parse(&raw)?;
+                // Two different answers in one invocation is not something to
+                // resolve in either side's favour.
+                if let Some(previous) = approve {
+                    if previous != parsed {
+                        return Err(format!(
+                            "--approve {} and --approve {} contradict each other; pass one",
+                            previous.as_str(),
+                            parsed.as_str()
+                        ));
+                    }
+                }
+                approve = Some(parsed);
+                approve_explicit = true;
+            }
+            "--yes" | "-y" => {
+                if let Some(previous) = approve {
+                    if previous != Approval::Proceed {
+                        return Err(format!(
+                            "--yes means --approve proceed and contradicts --approve {}; pass one",
+                            previous.as_str()
+                        ));
+                    }
+                }
+                approve = Some(Approval::Proceed);
+                approve_explicit = true;
+            }
             "--dry-run" => dry_run = true,
             "--json" => json = true,
             "--md" => json = false,
@@ -483,6 +612,22 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         );
     }
 
+    // `--approve fast` is not a hint: it is the answer "index everything, but
+    // without the two expensive features", and the run has to actually apply
+    // them. Accepting the word and indexing semantically anyway is precisely
+    // the accepted-and-silently-ignored class from #204.
+    if approve == Some(Approval::Fast) {
+        no_semantic = true;
+        no_graph = true;
+    }
+    if approve == Some(Approval::Cancel) && dry_run {
+        return Err(
+            "--approve cancel and --dry-run contradict each other: a dry run already indexes \
+             nothing. Drop one of the two"
+                .into(),
+        );
+    }
+
     // `map` reads the catalog off the server and `status` reads the local
     // journal; neither walks a filesystem, so an ignore flag on either cannot
     // change one byte of the output. Measured before this check existed:
@@ -496,7 +641,40 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     .filter_map(|(name, used)| used.then_some(name))
     .collect();
 
+    // Last resort for credentials: the key the server wrote for itself.
+    //
+    // The shipped default config has `[auth] enabled = true`, and the server
+    // mints `<data_dir>/admin.key` on first start. `xerj brain` already reads
+    // that file, which is why it works with no flags; `autoindex` did not, so
+    // the documented "copy the default config, then autoindex" path ended in a
+    // 401 and users turned auth off to escape it.
+    //
+    // Only for a loopback `--url`: reading a local key file is meaningful when
+    // we are talking to a server on this machine, and sending it anywhere else
+    // would leak a credential to a host it does not belong to.
+    if api_key.is_none() && url_is_loopback(&url) {
+        if let Some((key, path)) = discover_local_admin_key() {
+            // Announced, never silent: a blind onboarding run found this
+            // fallback made success depend on the working directory, because
+            // `./data/admin.key` is resolved relative to cwd. Saying which
+            // file was used turns "it worked here and not there" into
+            // something the reader can see and reason about.
+            eprintln!(
+                "autoindex: no --api-key/XERJ_API_KEY given; using the admin key at {}",
+                path.display()
+            );
+            api_key = Some(key);
+            api_key_file = Some(path);
+        }
+    }
+
     match (sub.as_deref(), folder) {
+        (Some("map"), _) | (Some("status"), _) if max_minutes_explicit || approve_explicit => {
+            Err(format!(
+                "--max-minutes/--approve/--yes apply only to indexing, not `autoindex {}`",
+                sub.as_deref().unwrap_or_default()
+            ))
+        }
         (Some("map"), _) | (Some("status"), _) if progress_explicit => Err(format!(
             "--progress/--progress-interval apply only to indexing, not `autoindex {}`",
             sub.as_deref().unwrap_or_default()
@@ -539,6 +717,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 root,
                 url,
                 api_key,
+                api_key_file,
                 workers: plan.index_workers,
                 scan_workers: plan.scan_threads,
                 pdf_workers: plan.pdf_workers,
@@ -564,6 +743,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 brain,
                 no_graph,
                 dry_run,
+                max_minutes,
+                approve,
                 json,
                 quiet,
                 progress,
@@ -574,9 +755,72 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     }
 }
 
+/// True when `url`'s host is this machine, so a locally readable admin key is
+/// the right credential to send. Anything else — a LAN address, a hostname, a
+/// remote deployment — must be given a key explicitly.
+///
+/// Parsed with a real URL parser rather than string surgery, because the
+/// hand-rolled version of this was wrong in a way that leaked credentials:
+/// splitting on the last `:` treats the userinfo in
+/// `http://localhost:9200@evil.com/` as a host:port pair, judges it loopback,
+/// and sends the admin key to `evil.com`. `Url::host_str` resolves that to
+/// `evil.com`, which is the whole point of using it.
+fn url_is_loopback(url: &str) -> bool {
+    // A schemeless `localhost:9200` parses as scheme `localhost`, path `9200`,
+    // with no host at all, so retry those through `http://`. The retry still
+    // goes through the parser: `localhost:9200@evil.com` becomes
+    // `http://localhost:9200@evil.com`, whose host is `evil.com`, not loopback.
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") => u,
+        _ => match reqwest::Url::parse(&format!("http://{url}")) {
+            Ok(u) => u,
+            // Unparseable is not loopback. Failing closed here costs a user
+            // with an exotic URL one explicit --api-key; failing open costs
+            // them the key itself.
+            Err(_) => return false,
+        },
+    };
+    match parsed.host_str() {
+        // `host_str` strips the brackets from `[::1]` and does not lowercase
+        // an IPv6 literal, so compare case-insensitively and cover both forms.
+        Some(h) => {
+            let h = h.trim_start_matches('[').trim_end_matches(']');
+            h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0"
+        }
+        None => false,
+    }
+}
+
+/// The admin key a local server wrote for itself, if we can find it.
+///
+/// Checked in the order a user is most likely to have created them: the
+/// working directory's data dir (what the quickstart tells you to use), then
+/// the documented package install location. Absent or unreadable is not an
+/// error — the caller falls back to the actionable 401 message.
+fn discover_local_admin_key() -> Option<(String, PathBuf)> {
+    const CANDIDATES: &[&str] = &[
+        "./data/admin.key",
+        "./xerj-data/admin.key",
+        "/var/lib/xerj/admin.key",
+    ];
+    let mut paths: Vec<PathBuf> = CANDIDATES.iter().map(PathBuf::from).collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(&home).join(".xerj/brain/admin.key"));
+        paths.push(PathBuf::from(&home).join(".xerj/admin.key"));
+    }
+    paths.into_iter().find_map(|p| {
+        std::fs::read_to_string(&p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|k| (k, p))
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse, Cmd, Duration, ProgressMode};
+    use super::{parse, Approval, Cmd, Duration, ProgressMode, DEFAULT_MAX_MINUTES};
+    use std::path::PathBuf;
 
     fn index(args: &[&str]) -> super::IndexCfg {
         match parse(args.iter().map(|s| s.to_string()).collect()).unwrap() {
@@ -782,6 +1026,135 @@ mod tests {
         assert!(parse(["map", "--quiet"].into_iter().map(str::to_string).collect()).is_ok());
     }
 
+    /// The owner's threshold, verbatim: "if estimated more than 10min work
+    /// needs to ask AI back what to do".
+    #[test]
+    fn the_gate_defaults_to_ten_minutes_and_to_unanswered() {
+        let cfg = index(&["data"]);
+        assert_eq!(DEFAULT_MAX_MINUTES, 10);
+        assert_eq!(cfg.max_minutes, 10);
+        assert_eq!(cfg.approve, None, "an unanswered run is what arms the gate");
+        assert_eq!(index(&["data", "--max-minutes", "45"]).max_minutes, 45);
+        // 0 is the documented "never ask" value, not a rejected one.
+        assert_eq!(index(&["data", "--max-minutes", "0"]).max_minutes, 0);
+    }
+
+    #[test]
+    fn an_unusable_max_minutes_is_refused_not_clamped() {
+        for args in [
+            vec!["data", "--max-minutes"],
+            vec!["data", "--max-minutes", "soon"],
+            vec!["data", "--max-minutes", "-1"],
+            vec!["data", "--max-minutes", "10081"],
+        ] {
+            let rendered = args.join(" ");
+            let err = parse(args.into_iter().map(str::to_string).collect())
+                .expect_err(&format!("`{rendered}` must be refused"));
+            assert!(err.contains("--max-minutes"), "{err}");
+        }
+        assert_eq!(
+            index(&["data", "--max-minutes", "10080"]).max_minutes,
+            10080
+        );
+    }
+
+    /// `--approve fast` is an instruction, not a label: the run must really
+    /// drop semantic fields and edges. Accepting it and indexing everything
+    /// anyway is the #204 defect class.
+    #[test]
+    fn approve_fast_actually_applies_the_flags_it_names() {
+        let cfg = index(&["data", "--approve", "fast"]);
+        assert_eq!(cfg.approve, Some(Approval::Fast));
+        assert!(cfg.no_semantic, "--approve fast must set --no-semantic");
+        assert!(cfg.no_graph, "--approve fast must set --no-graph");
+        // The other two answers change nothing about what gets indexed.
+        let proceed = index(&["data", "--approve", "proceed"]);
+        assert_eq!(proceed.approve, Some(Approval::Proceed));
+        assert!(!proceed.no_semantic && !proceed.no_graph);
+        assert_eq!(
+            index(&["data", "--approve", "cancel"]).approve,
+            Some(Approval::Cancel)
+        );
+    }
+
+    #[test]
+    fn yes_is_an_alias_for_approve_proceed() {
+        for flag in ["--yes", "-y"] {
+            assert_eq!(index(&["data", flag]).approve, Some(Approval::Proceed));
+        }
+        // Agreeing with yourself twice is fine; disagreeing is not.
+        assert_eq!(
+            index(&["data", "--yes", "--approve", "proceed"]).approve,
+            Some(Approval::Proceed)
+        );
+        assert!(err(&["data", "--approve", "cancel", "--yes"]).contains("--yes"));
+        for contradiction in [
+            vec!["data", "--yes", "--approve", "cancel"],
+            vec!["data", "--approve", "fast", "--approve", "cancel"],
+        ] {
+            assert!(err(&contradiction).contains("contradict each other"));
+        }
+    }
+
+    /// `narrower` is a real option in the decision request and an impossible
+    /// one for this flag: it means running against a different folder.
+    #[test]
+    fn approve_refuses_the_answer_it_cannot_carry_out() {
+        let refused = err(&["data", "--approve", "narrower"]);
+        assert!(refused.contains("subdirectory"), "{refused}");
+        assert!(err(&["data", "--approve", "maybe"]).contains("proceed, fast, cancel"));
+        assert!(err(&["data", "--approve"]).contains("--approve"));
+    }
+
+    #[test]
+    fn cancel_and_dry_run_are_refused_rather_than_silently_merged() {
+        let err = err(&["data", "--approve", "cancel", "--dry-run"]);
+        assert!(err.contains("already indexes nothing"), "{err}");
+        // A dry run may still be told what threshold to report against.
+        assert_eq!(
+            index(&["data", "--dry-run", "--max-minutes", "3"]).max_minutes,
+            3
+        );
+    }
+
+    #[test]
+    fn gate_flags_are_rejected_for_non_index_subcommands() {
+        for args in [
+            vec!["map", "--max-minutes", "5"],
+            vec!["status", "--approve", "proceed"],
+            vec!["--yes", "map"],
+        ] {
+            let err = parse(args.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(err.contains("apply only to indexing"), "{err}");
+        }
+    }
+
+    /// A flag the engine honours but never mentions is only half-shipped, and
+    /// the exit code is the one thing an agent cannot discover by trying.
+    #[test]
+    fn the_help_documents_the_gate_its_exit_code_and_the_work_order() {
+        let help = super::help_text();
+        for expected in [
+            "--max-minutes",
+            "--approve <ID>",
+            "--yes, -y",
+            "0 disables the gate",
+            "ESTIMATE + DECISION GATE:",
+            "exits 4",
+            "4 NEEDS A DECISION",
+            "WORK ORDER:",
+            "vendored/generated/minified",
+            "CLIENT-SIDE EXTRACTION only",
+            // A run that silently stops asking has to say so where the user
+            // looks: --quiet is the flag, the gate section is the rule.
+            "NEVER prompts under this flag",
+            "never waits on stdin for a question it did not print",
+            "prompt_not_offered_because",
+        ] {
+            assert!(help.contains(expected), "help is missing {expected:?}");
+        }
+    }
+
     #[test]
     fn bulk_timeout_is_rejected_for_non_index_subcommands_in_any_position() {
         for args in [
@@ -867,5 +1240,263 @@ mod tests {
     fn ignore_flags_still_apply_to_an_index_run() {
         assert!(!index(&["data", "--no-ignore"]).ignore.enabled);
         assert!(!index(&["data", "--no-default-ignores"]).ignore.defaults);
+    }
+
+    // ─── local admin-key discovery ──────────────────────────────────────
+
+    /// `url_is_loopback` decides whether a credential read off this machine's
+    /// disk is put on the wire, so a false positive is a credential leak, not
+    /// a cosmetic bug. The negatives below are the shapes an attacker would
+    /// reach for: a subdomain that starts with the magic word, a hostname that
+    /// merely contains it, a private address, and the loopback name appearing
+    /// somewhere in the URL that is not the host.
+    #[test]
+    fn url_is_loopback_is_true_only_for_this_machine() {
+        for url in [
+            "http://localhost:9200",
+            "https://127.0.0.1",
+            "http://[::1]:9200/path",
+            "http://localhost",
+            "http://127.0.0.1:9200/",
+            "http://127.0.0.1/_cluster/health",
+            "http://0.0.0.0:9200",
+            "https://localhost:9200/?pretty",
+            // No scheme at all: `--url localhost:9200` still names this box.
+            "localhost:9200",
+        ] {
+            assert!(super::url_is_loopback(url), "{url} is this machine");
+        }
+        for url in [
+            "http://localhost.evil.com",
+            "http://localhost.evil.com:9200",
+            "http://notlocalhost",
+            "http://notlocalhost:9200",
+            "http://xerj-localhost.example.com:9200",
+            "http://192.168.1.5:9200",
+            "http://10.0.0.7",
+            "http://169.254.169.254/latest/meta-data",
+            "http://example.com",
+            "https://search.example.com:9200/path",
+            "http://127.0.0.1.evil.com:9200",
+            "http://1270.0.0.1:9200",
+            "http://[fe80::1]:9200",
+            // The word appears, but never as the host.
+            "http://evil.com/localhost",
+            "http://evil.com:9200/localhost",
+            "http://evil.com/?next=http://localhost:9200",
+            "http://evil.com#localhost",
+        ] {
+            assert!(!super::url_is_loopback(url), "{url} is NOT this machine");
+        }
+    }
+
+    /// The bug this function was rewritten to fix: `rsplit_once(':')` read the
+    /// userinfo in `http://localhost:9200@evil.com/` as a host:port pair, called
+    /// it loopback, and would have sent the local admin key to `evil.com` as
+    /// `Authorization: ApiKey <key>`. Found by an adversarial review of the
+    /// original hand-rolled parser, not by the happy-path cases above.
+    #[test]
+    fn userinfo_cannot_disguise_a_remote_host_as_loopback() {
+        for url in [
+            "http://localhost:9200@evil.com/",
+            "http://127.0.0.1:80@evil.com/",
+            "http://localhost@evil.com/",
+            "https://[::1]:443@evil.com/",
+            "localhost:9200@evil.com",
+            "http://user:pass@evil.com/",
+        ] {
+            assert!(
+                !super::url_is_loopback(url),
+                "{url} is NOT this machine - treating it as loopback leaks the admin key"
+            );
+        }
+    }
+
+    /// Forms that are genuinely this machine and must keep working, including
+    /// the ones the hand-rolled version got wrong in the safe direction.
+    #[test]
+    fn loopback_spellings_all_resolve_to_this_machine() {
+        for url in [
+            "http://localhost:9200",
+            "http://LOCALHOST:9200",
+            "https://127.0.0.1",
+            "http://[::1]",
+            "http://[::1]:9200/path",
+            "localhost:9200",
+            "http://0.0.0.0:9200",
+        ] {
+            assert!(super::url_is_loopback(url), "{url} is this machine");
+        }
+    }
+
+    /// Serialises the tests that move process-global state. Both inputs to
+    /// `discover_local_admin_key` — the working directory and `HOME` — are
+    /// per-process, so these tests cannot be isolated any other way.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A temporary working directory and `HOME`, restored on drop (including
+    /// on panic) so no other test in this binary observes the mutation for
+    /// longer than the lock is held.
+    struct Sandbox {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        dir: tempfile::TempDir,
+        previous_dir: PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+        previous_env_key: Option<std::ffi::OsString>,
+    }
+
+    impl Sandbox {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let previous_dir = std::env::current_dir().unwrap();
+            let previous_home = std::env::var_os("HOME");
+            let previous_env_key = std::env::var_os("XERJ_API_KEY");
+            std::env::set_current_dir(dir.path()).unwrap();
+            std::env::set_var("HOME", dir.path().join("home"));
+            std::env::remove_var("XERJ_API_KEY");
+            Self {
+                _lock: lock,
+                dir,
+                previous_dir,
+                previous_home,
+                previous_env_key,
+            }
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_dir).unwrap();
+            match &self.previous_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_env_key {
+                Some(key) => std::env::set_var("XERJ_API_KEY", key),
+                None => std::env::remove_var("XERJ_API_KEY"),
+            }
+        }
+    }
+
+    /// The order matters: a user who is running a server out of this very
+    /// directory means that key, not one left in `$HOME` by an older run
+    /// against a different data dir.
+    #[test]
+    fn discovery_walks_the_candidates_in_order_and_trims_the_key() {
+        let sandbox = Sandbox::new();
+        assert_eq!(super::discover_local_admin_key(), None, "nothing to find");
+
+        // Weakest candidate first, then override it one rung at a time.
+        sandbox.write("home/.xerj/admin.key", "home-key\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("home-key")
+        );
+
+        sandbox.write("home/.xerj/brain/admin.key", "  brain-key \t\r\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("brain-key"),
+            "the brain data dir outranks the bare ~/.xerj key, and is trimmed"
+        );
+
+        sandbox.write("xerj-data/admin.key", "xerj-data-key\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("xerj-data-key"),
+            "a data dir in the working directory outranks anything in $HOME"
+        );
+
+        sandbox.write("data/admin.key", "\ndata-key\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("data-key"),
+            "./data is the quickstart's own path and wins outright"
+        );
+    }
+
+    /// A server that has not finished writing its key, or a file truncated by
+    /// hand, must not turn into `Authorization: ApiKey ` — that produces the
+    /// same 401 with none of the diagnosis.
+    #[test]
+    fn an_empty_key_file_is_skipped_not_returned_as_an_empty_key() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "   \n\t\n");
+        sandbox.write("xerj-data/admin.key", "");
+        assert_eq!(
+            super::discover_local_admin_key(),
+            None,
+            "whitespace-only and zero-byte files are not credentials"
+        );
+
+        sandbox.write("home/.xerj/admin.key", "real-key\n");
+        assert_eq!(
+            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("real-key"),
+            "an empty candidate must be skipped over, not stop the search"
+        );
+    }
+
+    /// The wiring: discovery only ever fires when the run has no credential of
+    /// its own AND the target is this machine. Sending a locally readable
+    /// admin key to a host that did not write it is the failure mode this
+    /// whole feature has to avoid.
+    #[test]
+    fn a_discovered_key_is_used_for_a_local_url_and_never_for_a_remote_one() {
+        let sandbox = Sandbox::new();
+        assert_eq!(
+            index(&["notes"]).api_key,
+            None,
+            "no key file, no invented credential"
+        );
+
+        sandbox.write("data/admin.key", "local-admin-key\n");
+        assert_eq!(
+            index(&["notes"]).api_key.as_deref(),
+            Some("local-admin-key"),
+            "the default --url is loopback, so the run picks the key up"
+        );
+        assert_eq!(
+            index(&["notes", "--url", "http://localhost:9201"])
+                .api_key
+                .as_deref(),
+            Some("local-admin-key")
+        );
+
+        for remote in [
+            "http://search.example.com:9200",
+            "http://192.168.1.5:9200",
+            "https://localhost.evil.com:9200",
+        ] {
+            assert_eq!(
+                index(&["notes", "--url", remote]).api_key,
+                None,
+                "{remote} must never be sent a key found on this disk"
+            );
+        }
+
+        assert_eq!(
+            index(&["notes", "--api-key", "explicit"])
+                .api_key
+                .as_deref(),
+            Some("explicit"),
+            "an explicit flag is never overwritten by discovery"
+        );
+
+        std::env::set_var("XERJ_API_KEY", "from-env");
+        let from_env = index(&["notes"]).api_key;
+        std::env::remove_var("XERJ_API_KEY");
+        assert_eq!(
+            from_env.as_deref(),
+            Some("from-env"),
+            "the environment is also never overwritten by discovery"
+        );
     }
 }

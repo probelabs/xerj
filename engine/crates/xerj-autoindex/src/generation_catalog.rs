@@ -95,6 +95,9 @@ pub fn project_generation(
         .as_ref()
         .context("catalog generation has no execution identity")?;
     let mut documents = BTreeMap::new();
+    // #294 tripwire: counted from the sealed manifest, so a resumed or no-op
+    // generation republishes the same coverage instead of an empty one.
+    let mut code = crate::CodeCoverage::default();
 
     for group in &desired.groups {
         let assignment = desired.plan.files.get(&group.content_id).with_context(|| {
@@ -104,6 +107,7 @@ pub fn project_generation(
             )
         })?;
         let format = assignment_format(assignment.family.as_str(), assignment.gzip);
+        code.observe(&format, group.expected_records);
         let (id, doc) = catalog::file_doc(
             &group.content_id,
             &group.canonical.rel,
@@ -130,6 +134,9 @@ pub fn project_generation(
     }
 
     for junk in &desired.plan.junk_files {
+        // A junk/skipped file has no `plan.files` entry by construction, so
+        // these cannot double-count the groups above.
+        code.observe(&junk.format, 0);
         let (id, doc) = catalog::file_doc(
             &junk.file_key,
             &junk.rel,
@@ -216,6 +223,12 @@ pub fn project_generation(
         "files_junk": desired.plan.junk_files.len(),
         "records_total": total_records,
         "junk_records_total": total_junk_records,
+        // Code/AST coverage (`CodeCoverage`): `records_total` counts records,
+        // not families, so it cannot say that every source file in the corpus
+        // was junked. These three can, and they travel to the terminal line.
+        "code_files": code.files,
+        "code_files_indexed": code.indexed,
+        "code_files_junked": code.junked,
         "semantic": desired
             .plan
             .datasets
@@ -441,6 +454,82 @@ mod tests {
             generation_id: id.into(),
             started: "2026-08-03T00:00:00Z".into(),
         }
+    }
+
+    /// #294 dropped every source file on this path — prepared as zero
+    /// documents, then committed and reported as a success. The run document
+    /// could not say so: `records_total` counts records, not families, so a
+    /// corpus whose whole code half was junked projected the same shape as a
+    /// healthy one-prose-file corpus. Coverage is what distinguishes them, and
+    /// it is what the terminal line reads.
+    #[test]
+    fn the_run_document_reports_code_coverage_for_junked_and_indexed_source_files() {
+        let mut code_assignment = assignment("app.py");
+        code_assignment.family = "code".into();
+        let mut plan = Plan {
+            datasets: vec![dataset()],
+            ..Plan::default()
+        };
+        plan.files.insert("prose".into(), assignment("notes.md"));
+        plan.files.insert("code".into(), code_assignment);
+        let base = committed(manifest(0, "generation-0", Plan::default(), vec![]));
+
+        // The defect: the code file prepared nothing at all.
+        let mut junked = group("code", "app.py", vec![]);
+        junked.expected_records = 0;
+        junked.expected_junk_records = 1;
+        let desired = manifest(
+            1,
+            "generation-1",
+            plan.clone(),
+            vec![group("prose", "notes.md", vec![]), junked],
+        );
+        let projection = project_generation(
+            &base,
+            &desired,
+            &metadata("generation-1"),
+            &stats(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let run = &projection.documents["run:generation-1"];
+        assert_eq!(run["code_files"], 1);
+        assert_eq!(
+            run["code_files_indexed"], 0,
+            "a corpus that indexed no source code must say so: {run}"
+        );
+        assert_eq!(run["code_files_junked"], 1);
+
+        // The healthy shape of the same corpus.
+        let desired = manifest(
+            1,
+            "generation-1",
+            plan,
+            vec![
+                group("prose", "notes.md", vec![]),
+                group("code", "app.py", vec![]),
+            ],
+        );
+        let projection = project_generation(
+            &base,
+            &desired,
+            &metadata("generation-1"),
+            &stats(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let run = &projection.documents["run:generation-1"];
+        assert_eq!(
+            (
+                run["code_files"].clone(),
+                run["code_files_indexed"].clone(),
+                run["code_files_junked"].clone()
+            ),
+            (json!(1), json!(1), json!(0)),
+            "{run}"
+        );
     }
 
     #[test]

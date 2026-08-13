@@ -14,6 +14,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 fn config_for(dir: &std::path::Path) -> xerj_common::config::Config {
@@ -27,11 +28,162 @@ fn config_for(dir: &std::path::Path) -> xerj_common::config::Config {
 /// dropped in between) is a restart: nothing is handed over in memory, the
 /// second boot sees only what reached the disk.
 fn app_over(dir: &std::path::Path) -> axum::Router {
+    app_and_engine_over(dir).0
+}
+
+fn app_and_engine_over(dir: &std::path::Path) -> (axum::Router, xerj_engine::Engine) {
+    let (es_app, _native_app, engine) = apps_and_engine_over(dir);
+    (es_app, engine)
+}
+
+fn apps_and_engine_over(
+    dir: &std::path::Path,
+) -> (axum::Router, axum::Router, xerj_engine::Engine) {
     let config = config_for(dir);
     let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
     let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
-    let state = xerj_api::state::AppState::new(config, engine, metrics);
-    xerj_api::router::build_es_compat_router(state)
+    let state = xerj_api::state::AppState::new(config, engine.clone(), metrics);
+    (
+        xerj_api::router::build_es_compat_router(state.clone()),
+        xerj_api::router::build_native_router(state),
+        engine,
+    )
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn recursive_inventory(root: &std::path::Path) -> Vec<String> {
+    fn walk(root: &std::path::Path, path: &std::path::Path, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(path)
+            .expect("read inventory directory")
+            .map(|entry| entry.expect("read inventory entry"))
+            .collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let entry_path = entry.path();
+            let relative = entry_path
+                .strip_prefix(root)
+                .expect("inventory entry under root")
+                .to_string_lossy()
+                .into_owned();
+            let kind = entry.file_type().expect("inventory file type");
+            out.push(format!(
+                "{}:{relative}",
+                if kind.is_dir() {
+                    "d"
+                } else if kind.is_symlink() {
+                    "l"
+                } else {
+                    "f"
+                }
+            ));
+            if kind.is_dir() {
+                walk(root, &entry_path, out);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+fn recursive_storage_snapshot(root: &std::path::Path) -> Vec<String> {
+    fn walk(root: &std::path::Path, path: &std::path::Path, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(path)
+            .expect("read storage snapshot directory")
+            .map(|entry| entry.expect("read storage snapshot entry"))
+            .collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let entry_path = entry.path();
+            let relative = entry_path
+                .strip_prefix(root)
+                .expect("storage snapshot entry under root")
+                .to_string_lossy();
+            let kind = entry.file_type().expect("storage snapshot file type");
+            if kind.is_dir() {
+                out.push(format!("d:{relative}"));
+                walk(root, &entry_path, out);
+            } else if kind.is_symlink() {
+                out.push(format!(
+                    "l:{relative}->{}",
+                    std::fs::read_link(&entry_path)
+                        .expect("read storage snapshot symlink")
+                        .to_string_lossy()
+                ));
+            } else {
+                let bytes = std::fs::read(&entry_path).expect("read storage snapshot file");
+                out.push(format!(
+                    "f:{relative}:{}:{}",
+                    bytes.len(),
+                    hex_digest(&bytes)
+                ));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ManagedInventory {
+    indices: Vec<String>,
+    aliases: Vec<(String, Vec<String>)>,
+    index_templates: Vec<String>,
+    legacy_templates: Vec<String>,
+    component_templates: Vec<String>,
+    pipelines: Vec<String>,
+    data_streams: Vec<String>,
+    ilm_policies: Vec<String>,
+    directory_entries: Vec<String>,
+}
+
+async fn managed_inventory(
+    engine: &xerj_engine::Engine,
+    dir: &std::path::Path,
+) -> ManagedInventory {
+    fn keys<V>(map: &dashmap::DashMap<String, V>) -> Vec<String> {
+        let mut keys: Vec<_> = map.iter().map(|entry| entry.key().clone()).collect();
+        keys.sort();
+        keys
+    }
+
+    let mut indices: Vec<_> = engine
+        .list_indices()
+        .await
+        .into_iter()
+        .map(|index| index.name)
+        .collect();
+    indices.sort();
+    let mut aliases: Vec<_> = engine
+        .aliases
+        .iter()
+        .map(|entry| {
+            let mut targets = entry.value().clone();
+            targets.sort();
+            (entry.key().clone(), targets)
+        })
+        .collect();
+    aliases.sort();
+    ManagedInventory {
+        indices,
+        aliases,
+        index_templates: keys(&engine.templates),
+        legacy_templates: keys(&engine.legacy_templates),
+        component_templates: keys(&engine.component_templates),
+        pipelines: keys(&engine.pipelines),
+        data_streams: keys(&engine.data_streams),
+        ilm_policies: keys(&engine.ilm_policies),
+        directory_entries: recursive_inventory(dir),
+    }
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -63,6 +215,22 @@ async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
         Request::get(path).body(Body::empty()).expect("request"),
     )
     .await
+}
+
+async fn get_text(app: &axum::Router, path: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (
+        status,
+        String::from_utf8(bytes.to_vec()).expect("utf8 body"),
+    )
 }
 
 async fn delete(app: &axum::Router, path: &str) -> (StatusCode, Value) {
@@ -342,8 +510,8 @@ async fn a_rollover_interrupted_before_its_flush_does_not_wedge_the_stream() {
 /// first `PUT /_index_template/...` rewrote the file — taking whatever was
 /// still legible in it along. Hand-recovery out of a damaged document is the
 /// operator's last option; it should not be silently removed. The write is
-/// refused (the original stays where it is) *and* a copy is kept, because
-/// un-wedging the node means moving the original aside by hand.
+/// refused and the original stays where it is. A blocked diagnostic boot must
+/// not create a second recovery file either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -359,14 +527,30 @@ async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
     let original = std::fs::read_to_string(&state_path).expect("read state");
     let truncated = &original[..original.len() / 2];
     std::fs::write(&state_path, truncated).expect("write truncated");
+    let truncated_digest = hex_digest(truncated.as_bytes());
 
-    let app = app_over(dir.path());
-    let (st, _) = get(&app, "/_index_template/logs").await;
+    let (app, native_app, engine) = apps_and_engine_over(dir.path());
+    let (st, _) = get(&app, "/health/live").await;
     assert_eq!(
         st,
-        StatusCode::NOT_FOUND,
-        "a corrupt document cannot be restored — this is the honest outcome"
+        StatusCode::OK,
+        "malformed state blocks readiness, not liveness"
     );
+    for (surface, path) in [(&app, "/health/ready"), (&native_app, "/v1/health/ready")] {
+        let (st, body) = get_text(surface, path).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(
+            body,
+            "not ready: persisted cluster metadata was not accepted at boot; inspect server logs"
+        );
+    }
+    let (st, body) = get(&app, "/_index_template/logs").await;
+    assert_eq!(
+        st,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a corrupt document cannot be restored, but an empty-map 404 would be a lie: {body}"
+    );
+    assert_eq!(body["error"]["type"], "cluster_state_unavailable");
 
     // The write that would have destroyed the evidence.
     let (st, body) = put_json(
@@ -377,31 +561,31 @@ async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
     .await;
     assert_eq!(
         st,
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::SERVICE_UNAVAILABLE,
         "a management write on top of a state that did not load must be \
          refused, not acknowledged: {body}"
     );
 
-    let salvage = dir.path().join("cluster_state.corrupt.json");
     assert!(
-        salvage.is_file(),
-        "the corrupt document must be kept for recovery"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&salvage).expect("read salvage"),
-        truncated,
-        "the preserved copy must be the bytes that were found, unmodified"
+        !dir.path().join("cluster_state.corrupt.json").exists(),
+        "a blocked diagnostic boot must not create recovery files"
     );
     assert_eq!(
         std::fs::read_to_string(&state_path).expect("read state"),
         truncated,
-        "the live document must be left exactly as it was found — the copy is \
-         a convenience, not a licence to overwrite the original"
+        "the live document must be left exactly as it was found"
+    );
+    assert_eq!(
+        hex_digest(&std::fs::read(&state_path).expect("hash live malformed state")),
+        truncated_digest,
+        "the live malformed bytes must keep the exact SHA-256"
     );
 
     // Moving the damaged file aside is the documented recovery, and it must
     // actually work: the next boot loads cleanly and writes are accepted again.
     drop(app);
+    drop(native_app);
+    drop(engine);
     std::fs::remove_file(&state_path).expect("operator moves the file aside");
     let app = app_over(dir.path());
     let (st, body) = put_json(
@@ -429,11 +613,11 @@ async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
 /// This is the worse half of the corrupt case and it was missed on the first
 /// pass: the bytes are perfectly good, only the `read(2)` failed — a uid
 /// change on a container volume, a backup tool's chmod, `EIO`, `EMFILE` at
-/// boot. The maps come up empty, and `write_file_atomic` renames
-/// `cluster_state.tmp` over the target; `rename(2)` needs write permission on
-/// the *directory*, not on the file, so a `PUT` answering
+/// boot. The maps come up empty, and `write_file_atomic` renames its staged
+/// file over the target; `rename(2)` needs write permission on the *directory*,
+/// not on the file, so a `PUT` answering
 /// `{"acknowledged": true}` unlinked a fully recoverable document. Measured
-/// on this test before the fix, with `chmod 000` for the boot only:
+/// before the fix with a read-error target that the atomic writer could replace:
 ///
 /// ```text
 /// PUT /_index_template/fresh -> 200 {"acknowledged":true}
@@ -443,7 +627,7 @@ async fn a_corrupt_cluster_state_is_preserved_before_it_is_overwritten() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreadable_cluster_state_is_never_overwritten() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
 
     let dir = tempfile::tempdir().expect("tempdir");
     {
@@ -452,25 +636,65 @@ async fn an_unreadable_cluster_state_is_never_overwritten() {
     }
 
     let state_path = dir.path().join("cluster_state.json");
+    let saved_path = dir.path().join("cluster_state.saved.json");
     let original = std::fs::read_to_string(&state_path).expect("read state");
     assert!(original.contains("logs-*"), "fixture must be on disk");
 
-    // Unreadable for the boot only; restored immediately afterwards so the
-    // assertions below read the file the node was left holding, and so a
-    // failure cannot be blamed on the test's own permissions.
-    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o000))
-        .expect("chmod 000");
-    let app = app_over(dir.path());
-    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o644))
-        .expect("chmod 644");
+    // Prove that this filesystem permits the destructive operation the latch
+    // prevents. A directory at the target would be a bad oracle because rename
+    // fails independently; a regular file can replace a symlink atomically.
+    let control_path = dir.path().join("replaceability-control");
+    let control_staged = dir.path().join("replaceability-staged");
+    symlink("replaceability-control", &control_path).expect("create control self-loop");
+    std::fs::write(&control_staged, b"replacement").expect("write control staging file");
+    std::fs::rename(&control_staged, &control_path)
+        .expect("a regular staged file must be able to replace the self-loop");
+    assert_eq!(
+        std::fs::read(&control_path).expect("read replacement control"),
+        b"replacement"
+    );
+    std::fs::remove_file(&control_path).expect("remove replacement control");
 
-    let (st, _) = get(&app, "/_index_template/logs").await;
+    // A self-referential symlink makes read(2) fail with ELOOP even under root,
+    // while remaining replaceable by the atomic writer. Keep the valid bytes
+    // beside it so we can prove that the failed boot and refused writes did not
+    // alter the operator's configuration.
+    std::fs::rename(&state_path, &saved_path).expect("save valid cluster state");
+    symlink("cluster_state.json", &state_path).expect("create cluster-state self-loop");
+    let read_error = std::fs::read(&state_path).expect_err("self-loop must fail to read");
+    assert_ne!(
+        read_error.kind(),
+        std::io::ErrorKind::NotFound,
+        "the fixture must exercise the non-NotFound read-error branch"
+    );
+    assert!(
+        std::fs::symlink_metadata(&state_path)
+            .expect("inspect cluster-state self-loop")
+            .file_type()
+            .is_symlink(),
+        "the failing target must be a symlink, not a directory"
+    );
+
+    let (app, native_app, engine) = apps_and_engine_over(dir.path());
+
+    let (st, _) = get(&app, "/health/live").await;
+    assert_eq!(st, StatusCode::OK, "the blocked node remains live");
+    for (surface, path) in [(&app, "/health/ready"), (&native_app, "/v1/health/ready")] {
+        let (st, _) = get(surface, path).await;
+        assert_eq!(
+            st,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} must expose the boot-time cluster-state fence"
+        );
+    }
+
+    let (st, body) = get(&app, "/_index_template/logs").await;
     assert_eq!(
         st,
-        StatusCode::NOT_FOUND,
-        "a document that could not be read cannot be restored — that part is \
-         honest already"
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the diagnostic shell must not turn unloaded durable objects into a false 404: {body}"
     );
+    assert_eq!(body["error"]["type"], "cluster_state_unavailable");
 
     // The write that used to destroy it.
     let (st, body) = put_json(
@@ -481,47 +705,78 @@ async fn an_unreadable_cluster_state_is_never_overwritten() {
     .await;
     assert_eq!(
         st,
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::SERVICE_UNAVAILABLE,
         "a management write must be refused while the persisted state is \
          unloaded, not acknowledged: {body}"
     );
-    assert!(
-        body["error"]["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("could not be loaded at boot"),
-        "the 500 must say why, so the operator can act on it: {body}"
-    );
+    assert_eq!(body["error"]["type"], "cluster_state_unavailable", "{body}");
+    let reason = body["error"]["reason"].as_str().unwrap_or_default();
+    for required in [
+        "start a compatible XERJ build",
+        "restore supported cluster_state.json bytes",
+        "then restart",
+    ] {
+        assert!(
+            reason.contains(required),
+            "the refusal must give both bounded recovery actions: {body}"
+        );
+    }
 
     assert_eq!(
-        std::fs::read_to_string(&state_path).expect("read state"),
+        std::fs::read_link(&state_path).expect("read cluster-state self-loop"),
+        std::path::PathBuf::from("cluster_state.json"),
+        "the refused write must not replace the unreadable target"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&saved_path).expect("read saved state"),
         original,
-        "the intact document must still be on disk, byte for byte"
+        "the intact document must remain recoverable, byte for byte"
     );
     assert!(
-        !dir.path().join("cluster_state.tmp").exists(),
-        "a refused write must not even stage a temp file"
+        !dir.path().join("cluster_state.corrupt.json").exists(),
+        "a read error must not be mislabeled as parse corruption"
+    );
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("list data directory")
+            .all(|entry| !entry
+                .expect("read data-directory entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cluster_state.json.tmp.")),
+        "a refused write must not even stage a uniquely named temp file"
     );
 
-    // And the refusal is not a one-off: the in-memory map must not be left
-    // holding a change that was reported as failed.
-    let (st, _) = get(&app, "/_index_template/fresh").await;
+    // And the refusal is not a one-off. Reads remain unavailable too: the
+    // node did not open storage, so an empty-map 404 would be a lie.
+    let (st, body) = get(&app, "/_index_template/fresh").await;
     assert_eq!(
         st,
-        StatusCode::NOT_FOUND,
-        "a refused PUT must roll its in-memory change back"
+        StatusCode::SERVICE_UNAVAILABLE,
+        "blocked reads must stay unavailable: {body}"
     );
+    assert_eq!(body["error"]["type"], "cluster_state_unavailable");
     let (st, _) = delete(&app, "/_ilm/policy/hot-warm").await;
     assert_eq!(
         st,
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::SERVICE_UNAVAILABLE,
         "deletes are writes too — they must be refused as well"
     );
 
-    // Recovery path: the file was readable all along, so a plain restart is
-    // the whole fix.
+    // Recovery path: remove the bad directory entry, put the saved bytes back,
+    // and restart. The latch belongs to the failed engine lifetime only.
     drop(app);
+    drop(native_app);
+    drop(engine);
+    std::fs::remove_file(&state_path).expect("remove cluster-state self-loop");
+    std::fs::rename(&saved_path, &state_path).expect("restore valid cluster state");
     let app = app_over(dir.path());
+    let (st, _) = get(&app, "/health/ready").await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "valid replacement plus restart clears the fence"
+    );
     let (st, body) = get(&app, "/_index_template/logs").await;
     assert_eq!(
         st,
@@ -540,6 +795,465 @@ async fn an_unreadable_cluster_state_is_never_overwritten() {
         "and writes must work again — the refusal must not be sticky across a \
          clean boot"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_state_format1_fence_refuses_every_current_metadata_mutation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let future = include_bytes!(
+        "../../xerj-engine/tests/fixtures/cluster_state/v2-format-version-minimal.json"
+    );
+    let state_path = dir.path().join("cluster_state.json");
+    std::fs::write(&state_path, future).expect("write future state");
+
+    // A complete-looking snapshot source proves the fence fires before the
+    // restore handler can copy it into a new index and open its WAL. Keeping
+    // the source under data_dir satisfies the normal repository allowlist.
+    let snapshot_repo = dir.path().join("snapshot-repo");
+    let snapshot = snapshot_repo.join("ready");
+    let snapshot_index = snapshot.join("restored-index");
+    std::fs::create_dir_all(snapshot_index.join("wal/s1")).expect("create snapshot fixture");
+    std::fs::write(
+        snapshot.join("manifest.json"),
+        br#"{"indices":["restored-index"]}"#,
+    )
+    .expect("write snapshot manifest");
+    std::fs::write(
+        snapshot_index.join("wal/s1/0000000000000001.wal"),
+        b"sentinel",
+    )
+    .expect("write snapshot WAL sentinel");
+
+    let (app, native_app, engine) = apps_and_engine_over(dir.path());
+    let before = managed_inventory(&engine, dir.path()).await;
+    let before_storage = recursive_storage_snapshot(dir.path());
+    assert!(before.indices.is_empty());
+    assert!(before.aliases.is_empty());
+    assert!(before.index_templates.is_empty());
+    assert!(before.legacy_templates.is_empty());
+    assert!(before.component_templates.is_empty());
+    assert!(before.pipelines.is_empty());
+    assert!(before.data_streams.is_empty());
+    assert!(before.ilm_policies.is_empty());
+
+    for (surface, path) in [(&app, "/health/ready"), (&native_app, "/v1/health/ready")] {
+        let (status, body) = get_text(surface, path).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(
+            body,
+            "not ready: persisted cluster metadata was not accepted at boot; inspect server logs",
+            "the unauthenticated probe must not expose paths, object names, or state contents"
+        );
+    }
+    let (status, _) = get(&app, "/health/live").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The fence is admission-wide, not a hand-maintained list of metadata
+    // handlers. These routes cover read, user-index creation, direct ingest,
+    // and the native surface; none may return an ordinary success/404 shape
+    // from the deliberately empty diagnostic engine.
+    let (status, response) = get(&app, "/").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["error"]["type"], "cluster_state_unavailable");
+    let (status, response) = put_json(&app, "/blocked-index", json!({"mappings":{}})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["error"]["type"], "cluster_state_unavailable");
+    for (surface, path, body) in [
+        (&app, "/_bulk", json!({"must":"not parse"})),
+        (
+            &native_app,
+            "/v1/indices",
+            json!({"name":"blocked-native","schema":{"fields":[]}}),
+        ),
+    ] {
+        let (status, response) = post(surface, path, body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path}: {response}"
+        );
+        assert_eq!(
+            response["error"]["type"], "cluster_state_unavailable",
+            "{path}: {response}"
+        );
+    }
+
+    let put_cases = [
+        ("/_index_template/new", json!({"index_patterns":["new-*"]})),
+        ("/_template/new", json!({"index_patterns":["legacy-*"]})),
+        ("/_component_template/new", json!({"template":{}})),
+        (
+            "/_ilm/policy/new",
+            json!({"policy":{"phases":{"hot":{"actions":{}}}}}),
+        ),
+        ("/_ingest/pipeline/new", json!({"processors":[]})),
+        ("/_data_stream/new", json!({})),
+    ];
+    for (path, body) in put_cases {
+        let (status, response) = put_json(&app, path, body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PUT {path}: {response}"
+        );
+        assert_eq!(
+            response["error"]["type"], "cluster_state_unavailable",
+            "PUT {path}: {response}"
+        );
+    }
+
+    let delete_cases = [
+        "/_index_template/missing",
+        "/_template/missing",
+        "/_component_template/missing",
+        "/_ilm/policy/missing",
+        "/_ingest/pipeline/missing",
+        "/_data_stream/missing",
+    ];
+    for path in delete_cases {
+        let (status, response) = delete(&app, path).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DELETE {path}: {response}"
+        );
+        assert_eq!(response["error"]["type"], "cluster_state_unavailable");
+    }
+
+    let (status, response) = post(&app, "/missing/_rollover", json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "rollover must guard before stream lookup: {response}"
+    );
+
+    let (status, response) = put_json(
+        &app,
+        "/_snapshot/blocked-repo",
+        json!({"type":"fs","settings":{"location":snapshot_repo}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["error"]["type"], "cluster_state_unavailable");
+    let (status, response) = post(&app, "/_snapshot/blocked-repo/ready/_restore", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["error"]["type"], "cluster_state_unavailable");
+
+    let restore_err: xerj_common::XerjError = engine
+        .restore_snapshot(
+            snapshot_repo.to_str().expect("UTF-8 snapshot path"),
+            "ready",
+            None,
+        )
+        .await
+        .expect_err("direct restore must share the storage fence")
+        .into();
+    assert!(matches!(
+        restore_err,
+        xerj_common::XerjError::ClusterStateUnavailable
+    ));
+
+    assert_eq!(
+        std::fs::read(&state_path).expect("read future state"),
+        future,
+        "readiness and refused mutations must preserve future bytes"
+    );
+    assert_eq!(
+        managed_inventory(&engine, dir.path()).await,
+        before,
+        "every refused mutation must preserve the exact alias, index, map, and directory inventories"
+    );
+    assert_eq!(
+        recursive_storage_snapshot(dir.path()),
+        before_storage,
+        "refused HTTP and direct restore paths must not copy, open, replay, or rewrite storage"
+    );
+    assert!(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".ds-new-")),
+        "refused data-stream creation must not create a backing directory"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_app_state_skips_ml_registries_and_http_preserves_auth_order() {
+    const ADMIN: &str = "blocked-admin";
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("cluster_state.json"),
+        br#"{"format_version":2}"#,
+    )
+    .expect("write future cluster state");
+    let ml_dir = dir.path().join("_ml");
+    std::fs::create_dir_all(&ml_dir).expect("create ML registry dir");
+    let detectors = br#"[{"detector_id":"seeded-detector","source_index":"logs","time_field":"@timestamp","function":"count","bucket_span":"1h","anomaly_threshold":3.0,"create_time_ms":1}]"#;
+    let datafeeds = br#"[{"datafeed_id":"seeded-feed","job_id":"seeded-detector","indices":["logs"],"query":{"match_all":{}},"frequency_secs":60,"state":"started"}]"#;
+    std::fs::write(ml_dir.join("detectors.json"), detectors).expect("seed detectors");
+    std::fs::write(ml_dir.join("datafeeds.json"), datafeeds).expect("seed datafeeds");
+
+    let mut config = config_for(dir.path());
+    config.auth.enabled = true;
+    config.auth.admin_api_key = ADMIN.to_owned();
+    config.limits.max_body_bytes = 16;
+    let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+    let engine = xerj_engine::Engine::new(config.clone()).expect("blocked engine");
+    assert!(!engine.cluster_state_boot_status().is_writable());
+    // Seed one non-superuser credential without using the deliberately fenced
+    // persistence API. It can authenticate but has no reserved-index grant.
+    engine.api_keys.insert(
+        "limited".to_owned(),
+        xerj_engine::engine::ApiKeyRecord::new("limited", "secret", 1, None, Vec::new()),
+    );
+    let before_state = recursive_storage_snapshot(dir.path());
+    let state = xerj_api::state::AppState::new(config, engine, metrics);
+    assert!(
+        state.ml_detectors.is_empty() && state.ml_datafeeds.is_empty(),
+        "a blocked AppState must not load valid persisted ML entries"
+    );
+    assert_eq!(
+        recursive_storage_snapshot(dir.path()),
+        before_state,
+        "constructing a blocked AppState must not rewrite any seeded ML byte"
+    );
+
+    let native_app = xerj_api::router::build_native_router(state.clone());
+    let app = xerj_api::router::build_es_compat_router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/_bulk")
+                .header("authorization", format!("ApiKey {ADMIN}"))
+                .header("content-type", "application/x-ndjson")
+                // A real HTTP transport supplies Content-Length for this
+                // fixed body. Set it explicitly because Router::oneshot does
+                // not synthesize transport headers; without it the limit
+                // layer can discover overflow only when an inner handler
+                // reads the streaming body, and the storage fence correctly
+                // prevents that handler from running.
+                .header("content-length", "17")
+                .body(Body::from("x".repeat(17)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the existing request-size gate must keep precedence over the storage fence"
+    );
+    let response = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "authentication must run before the storage fence"
+    );
+    let response = native_app
+        .clone()
+        .oneshot(Request::get("/v1/indices").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "native authentication must run before the storage fence"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/_memory/bob")
+                .header("authorization", "ApiKey bGltaXRlZDpzZWNyZXQ=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "authorization must run before the storage fence"
+    );
+    let response = native_app
+        .clone()
+        .oneshot(
+            Request::post("/v1/indices/.xerj-memory-bob-edges/search")
+                .header("authorization", "ApiKey bGltaXRlZDpzZWNyZXQ=")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "native authorization must run before the storage fence"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/")
+                .header("authorization", format!("ApiKey {ADMIN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an authenticated, authorized request must reach the storage fence"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["type"], "cluster_state_unavailable");
+    let response = native_app
+        .clone()
+        .oneshot(
+            Request::get("/v1/indices")
+                .header("authorization", format!("ApiKey {ADMIN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "authorized native storage access must reach the storage fence"
+    );
+    assert_eq!(
+        recursive_storage_snapshot(dir.path()),
+        before_state,
+        "auth and fence responses must not touch seeded ML registries"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_incompatible_format1_fixture_is_fenced_across_two_full_boots() {
+    let fixtures = [
+        "v1-unknown-top-level.json",
+        "v1-unknown-index-template-field.json",
+        "v1-unknown-data-stream-field.json",
+        "v1-duplicate-version.json",
+        "v1-duplicate-nested-value-key.json",
+        "v2-format-version-minimal.json",
+    ];
+
+    for fixture in fixtures {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../xerj-engine/tests/fixtures/cluster_state")
+            .join(fixture);
+        let original = std::fs::read(&fixture_path).expect("read fixture");
+        let original_digest = hex_digest(&original);
+        let state_path = dir.path().join("cluster_state.json");
+        std::fs::write(&state_path, &original).expect("install fixture");
+        let mut first_boot_inventory = None;
+
+        for boot in 1..=2 {
+            let (app, native_app, engine) = apps_and_engine_over(dir.path());
+            let before = managed_inventory(&engine, dir.path()).await;
+            assert!(before.indices.is_empty(), "{fixture}, boot {boot}");
+            assert!(before.aliases.is_empty(), "{fixture}, boot {boot}");
+            assert!(before.index_templates.is_empty(), "{fixture}, boot {boot}");
+            assert!(before.legacy_templates.is_empty(), "{fixture}, boot {boot}");
+            assert!(
+                before.component_templates.is_empty(),
+                "{fixture}, boot {boot}"
+            );
+            assert!(before.pipelines.is_empty(), "{fixture}, boot {boot}");
+            assert!(before.data_streams.is_empty(), "{fixture}, boot {boot}");
+            assert!(before.ilm_policies.is_empty(), "{fixture}, boot {boot}");
+            if let Some(first) = &first_boot_inventory {
+                assert_eq!(
+                    &before.directory_entries, first,
+                    "{fixture}: a refused restart must not add a directory entry"
+                );
+            } else {
+                first_boot_inventory = Some(before.directory_entries.clone());
+            }
+
+            let (status, _) = get(&app, "/health/live").await;
+            assert_eq!(status, StatusCode::OK, "{fixture}, boot {boot}");
+            for (surface, path) in [(&app, "/health/ready"), (&native_app, "/v1/health/ready")] {
+                let (status, body) = get_text(surface, path).await;
+                assert_eq!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{fixture}, boot {boot}, {path}"
+                );
+                assert_eq!(
+                    body,
+                    "not ready: persisted cluster metadata was not accepted at boot; inspect server logs",
+                    "{fixture}, boot {boot}, {path}"
+                );
+            }
+
+            let (status, body) = put_json(
+                &app,
+                "/_index_template/must-not-land",
+                json!({"index_patterns": ["blocked-*"]}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{fixture}, boot {boot}, PUT: {body}"
+            );
+            assert_eq!(body["error"]["type"], "cluster_state_unavailable");
+
+            let (status, body) = delete(&app, "/_ilm/policy/must-not-land").await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{fixture}, boot {boot}, DELETE: {body}"
+            );
+            assert_eq!(body["error"]["type"], "cluster_state_unavailable");
+
+            assert_eq!(
+                managed_inventory(&engine, dir.path()).await,
+                before,
+                "{fixture}, boot {boot}: blocked mutations changed an alias, index, map, or directory"
+            );
+            let after = std::fs::read(&state_path).expect("read state after refused writes");
+            assert_eq!(after, original, "{fixture}, boot {boot}");
+            assert_eq!(
+                hex_digest(&after),
+                original_digest,
+                "{fixture}, boot {boot}"
+            );
+            assert!(
+                !dir.path().join("cluster_state.corrupt.json").exists(),
+                "{fixture}: unsupported, unknown, and duplicate-key bytes are never salvage"
+            );
+
+            drop(app);
+            drop(native_app);
+            drop(engine);
+            assert_eq!(
+                recursive_inventory(dir.path()),
+                first_boot_inventory.clone().unwrap(),
+                "{fixture}, boot {boot}: shutdown changed the persisted inventory"
+            );
+            let after_shutdown = std::fs::read(&state_path).expect("read after shutdown");
+            assert_eq!(after_shutdown, original, "{fixture}, boot {boot}");
+            assert_eq!(
+                hex_digest(&after_shutdown),
+                original_digest,
+                "{fixture}, boot {boot}"
+            );
+        }
+    }
 }
 
 /// Concurrent writers must not trip over each other.

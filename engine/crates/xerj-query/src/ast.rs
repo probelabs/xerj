@@ -1011,6 +1011,36 @@ pub struct SearchRequest {
     /// indices (wrong page windows + `max_score: null`).
     #[serde(skip)]
     pub leaf_ts_field: Option<String>,
+
+    /// INTERNAL (never on the wire — `serde(skip)`): whether, and how, to
+    /// measure the `_source` payload this request did NOT have to send.
+    ///
+    /// The ES-compat `_search` handler sets [`SavingsMode::Sampled`] unless
+    /// `?savings=` says otherwise, so the statistic is on by default for
+    /// user-facing searches. The AST default is [`SavingsMode::Off`] so that
+    /// the many internal engine searches (reindex, update-by-query, terms
+    /// lookups, suggesters) never pay for a number nobody will read.
+    #[serde(skip)]
+    pub savings: SavingsMode,
+}
+
+/// Whether — and how precisely — to measure withheld `_source` bytes.
+///
+/// Measurement is not free: it has to look at the values being discarded.
+/// `Sampled` bounds that work by extrapolating long arrays from a sample,
+/// which is what makes the statistic affordable on every search; `Exact`
+/// serializes every omitted byte for callers who need the precise figure.
+/// The choice is reported on the wire as `_savings.measured`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SavingsMode {
+    /// Do not measure. The engine's internal searches, and any caller that
+    /// passes `?savings=false`.
+    #[default]
+    Off,
+    /// Bounded, stratified sampling of long arrays; everything else exact.
+    Sampled,
+    /// Serialize and count every omitted byte.
+    Exact,
 }
 
 fn default_query() -> QueryNode {
@@ -1042,14 +1072,22 @@ impl Default for SearchRequest {
             rescore: Vec::new(),
             min_score: None,
             leaf_ts_field: None,
+            savings: SavingsMode::Off,
         }
     }
 }
 
 /// Controls which source fields are returned with each hit.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SourceFilter {
+    /// `_source` was omitted; the engine applies its default source projection.
+    ///
+    /// This is intentionally a unit variant.  With an untagged enum serde
+    /// serialises it as `null`, so it must stay before the value-carrying
+    /// variants for the corresponding round-trip to deserialize correctly.
+    #[default]
+    Default,
     /// `true` → return all source fields; `false` → return none.
     Enabled(bool),
     /// Return only the listed fields.
@@ -1061,12 +1099,6 @@ pub enum SourceFilter {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         excludes: Vec<String>,
     },
-}
-
-impl Default for SourceFilter {
-    fn default() -> Self {
-        SourceFilter::Enabled(true)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1137,4 +1169,69 @@ pub struct CollapseField {
     /// Optional inner_hits — return additional hits per group (opaque JSON for now).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inner_hits: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod source_filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn source_filter_shapes_round_trip_through_serde() {
+        let cases = [
+            (SourceFilter::Default, json!(null)),
+            (SourceFilter::Enabled(true), json!(true)),
+            (SourceFilter::Enabled(false), json!(false)),
+            (
+                SourceFilter::Includes(vec!["field".to_string()]),
+                json!(["field"]),
+            ),
+        ];
+
+        for (filter, expected_wire) in cases {
+            let wire = serde_json::to_value(&filter).unwrap();
+            assert_eq!(wire, expected_wire);
+            let round_tripped: SourceFilter = serde_json::from_value(wire).unwrap();
+            assert_eq!(round_tripped, filter);
+        }
+    }
+
+    #[test]
+    fn omitted_source_and_explicit_booleans_keep_distinct_variants() {
+        let omitted = crate::parser::parse_request(&json!({})).unwrap();
+        assert_eq!(omitted.source, SourceFilter::Default);
+
+        let explicitly_enabled = crate::parser::parse_request(&json!({
+            "_source": true
+        }))
+        .unwrap();
+        assert_eq!(explicitly_enabled.source, SourceFilter::Enabled(true));
+
+        let explicitly_disabled = crate::parser::parse_request(&json!({
+            "_source": false
+        }))
+        .unwrap();
+        assert_eq!(explicitly_disabled.source, SourceFilter::Enabled(false));
+    }
+
+    #[test]
+    fn search_request_source_shapes_round_trip_after_parsing() {
+        let cases = [
+            (json!({}), SourceFilter::Default),
+            (json!({"_source": true}), SourceFilter::Enabled(true)),
+            (json!({"_source": false}), SourceFilter::Enabled(false)),
+            (
+                json!({"_source": ["field"]}),
+                SourceFilter::Includes(vec!["field".to_string()]),
+            ),
+        ];
+
+        for (body, expected_source) in cases {
+            let request = crate::parser::parse_request(&body).unwrap();
+            assert_eq!(request.source, expected_source);
+            let serialized = serde_json::to_value(&request).unwrap();
+            let round_tripped: SearchRequest = serde_json::from_value(serialized).unwrap();
+            assert_eq!(round_tripped.source, expected_source);
+        }
+    }
 }

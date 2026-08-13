@@ -23,6 +23,9 @@ jobs:
   cla-config:
     name: CLA gate config
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +36,43 @@ jobs:
         run: |
           jq -e 'type == "array" and all(.[]; type == "string")' .contributors
           jq -e 'index("dependabot[bot]") != null' .contributors
+
+      # cla-bot matches commit AUTHORS only, so a maintainer re-land whose
+      # commits carry the fork contributor's Co-authored-by trailer goes green
+      # without that contributor ever signing (issue #269; live instance
+      # PR #248 re-landing #166). Check the trailers too.
+      - name: Co-author CLA check unit tests
+        run: python3 scripts/test_cla_coauthors.py
+
+      - name: Co-authored-by trailers resolve to signed contributors
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 scripts/check_cla_coauthors.py --pr "$PR_NUMBER"
+
+  reference-coding:
+    name: Reference-coding toolkit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          for f in tools/xerj-code/scripts/*.sh tools/xerj-code/tests/*.sh; do
+            bash -n "$f"
+          done
+          python3 -m py_compile tools/xerj-code/scripts/xc.py \
+                                tools/xerj-code/tests/validate_manifest.py
+
+      # The corpus manifests are the shareable artifact (issue #319): if they
+      # cannot rebuild a corpus, publishing them is worse than not shipping
+      # them. Offline — the fixtures are local git repos served over file://.
+      - name: Corpus manifest round-trip
+        run: tools/xerj-code/tests/test_xc_corpus.sh
+
+      - name: Vetted hub manifests validate
+        run: python3 tools/xerj-code/tests/validate_manifest.py --hub tools/xerj-code/hub/*.json
 
   lint:
     name: Format + Clippy
@@ -46,15 +86,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-lint-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-lint-cargo-
+          workspaces: engine
 
       - name: rustfmt (check)
         working-directory: engine
@@ -63,6 +97,100 @@ jobs:
       - name: clippy (deny warnings)
         working-directory: engine
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # XERJ's security pitch is "no JVM, so none of the Log4Shell class of supply
+  # chain CVEs" — which is only worth anything if somebody is actually watching
+  # the 660-odd crates we do depend on. This job is that somebody. It was
+  # documented as existing long before it did (#207); a claimed gate that no
+  # runner executes is worse than no gate, because readers price it in.
+  #
+  # Failure policy: RUSTSEC *vulnerabilities* fail the build. Informational
+  # warnings (unmaintained / unsound / yanked) are printed and do not, because
+  # most of ours sit in transitive crates we cannot upgrade unilaterally and a
+  # gate that is red for reasons nobody can act on gets ignored, then disabled.
+  # They are still in the log on every run, which is the point.
+  security-audit:
+    name: Dependency advisory audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the binary, not the advisory database — the database is the part
+      # that must be fetched fresh on every run. Bump the `-vN` suffix to force
+      # a cargo-audit upgrade (a very old binary can fail to read a newer
+      # advisory-db schema).
+      - name: Cache cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ci-cargo-audit-bin-v1
+
+      - name: Install cargo-audit
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+
+      - name: cargo audit
+        working-directory: engine
+        run: cargo audit
+
+  # Real fuzzing, for the same reason: `user-feedback/09-security/` promised
+  # "fuzz testing (cargo-fuzz) on all input parsing paths" while the tree held
+  # no fuzz target at all (#207). The harnesses live in engine/fuzz and cover
+  # the parsers an unauthenticated request reaches: the ES query DSL, the
+  # Lucene query_string grammar, date math and date formats, SQL, and Painless.
+  #
+  # On a pull request this is mostly a *regression* run — every checked-in seed
+  # is replayed through every target, and the leftover budget explores. For a
+  # real campaign, run the same script with a bigger budget:
+  #   FUZZ_SECONDS=3600 bash .github/scripts/fuzz-smoke.sh
+  fuzz:
+    name: Fuzz harnesses (cargo-fuzz)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # libFuzzer + the sanitizer runtimes are nightly-only.
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-fuzz
+            engine/fuzz/target
+          key: ci-fuzz-${{ hashFiles('engine/Cargo.lock', 'engine/fuzz/Cargo.toml') }}
+          restore-keys: ci-fuzz-
+
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
+
+      # The fuzz crate is its own workspace, so the `lint` job's
+      # `cargo fmt --all` never sees it. No `--all` here: it would follow the
+      # path dependencies back into the engine and re-check what `lint` covers.
+      - name: rustfmt the fuzz crate
+        working-directory: engine
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --check
+
+      - name: Build + run every fuzz target
+        run: bash .github/scripts/fuzz-smoke.sh
+
+      # A crashing input is the entire product of this job; losing it would
+      # mean the failure is unreproducible.
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: engine/fuzz/artifacts/
+          if-no-files-found: ignore
 
   build-test:
     name: Build + Test
@@ -74,23 +202,57 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+          # Single writer for the Linux [profile.ci-test] dependency cache.
+          # This job compiles the whole workspace, so its dependency set is a
+          # superset of what api-checks / conformance / usecase-smoke need;
+          # they restore this same key read-only. rust-cache's default key is
+          # per-job, which meant five near-identical ~700 MB copies competing
+          # for a 10 GB repo budget and evicting each other.
+          shared-key: ci-test-linux
+
+      # One cargo invocation, not two. `cargo build --release --workspace` used
+      # to run first, but `panic = "abort"` in [profile.release] makes cargo
+      # rebuild the whole dependency graph with `panic = "unwind"` for the test
+      # targets, so that step handed the tests almost nothing: on run
+      # 31571998506 it compiled 39 crates in 9m17s and the test step then
+      # compiled 453. The fat-LTO link of every workspace member is still
+      # gated -- it moved to the `release-build` job, which runs concurrently
+      # instead of in front of this one.
+      #
+      # [profile.ci-test] keeps opt-level 3 and release's assertion settings and
+      # only drops whole-program LTO / codegen-unit merging. Fat-LTO linking of
+      # ~99 separate test binaries was 76m05s of this job's 78-minute test step;
+      # the tests themselves ran in 1m52s.
+      - name: Unit + integration tests
+        working-directory: engine
+        run: cargo test --profile ci-test --workspace -- --test-threads=2
+
+  # Fat LTO + codegen-units=1 + panic=abort over every workspace member is a
+  # failure mode of its own (LTO ICEs, symbol collisions, panic-strategy
+  # mismatches) and is not covered by `cargo clippy --all-targets` in `lint`
+  # nor by the `-p xerj-server` builds elsewhere -- xerj-wasm, for one, is in
+  # no other job's dependency closure. So it stays gated, just not in series
+  # with the tests.
+  release-build:
+    name: Release build (fat LTO, all members link)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
 
       - name: Build (release)
         working-directory: engine
         run: cargo build --release --workspace
-
-      - name: Unit + integration tests
-        working-directory: engine
-        run: cargo test --release --workspace -- --test-threads=2
 
   onnx-feature:
     name: ONNX feature compile + tests
@@ -104,15 +266,9 @@ jobs:
           components: clippy
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-onnx-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-onnx-cargo-
+          workspaces: engine
 
       - name: Compile the server ONNX feature path
         working-directory: engine
@@ -140,28 +296,34 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Build xerj (release)
+      # ci-test, not release: this job boots the binary and checks liveness,
+      # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
+      # checks. Same opt-level and features, only LTO scope differs.
+      - name: Build xerj (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server
+        run: cargo build --profile ci-test -p xerj-server
 
       # Boots the binary, seeds a real corpus, then gates on:
       #   smoke suite (61/61), API liveness (no 5xx across the read surface),
       #   and prints the hot-path benchmark. Deterministic — no model needed.
       - name: API smoke + liveness + benchmark
+        env:
+          XERJ_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj
         run: bash demo/playbooks/ci-check.sh
 
   conformance:
@@ -174,19 +336,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
-      - name: Build server + conformance runner (release)
+      # ci-test: conformance asserts wire behaviour, not throughput.
+      - name: Build server + conformance runner (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server -p es-yaml-runner
+        run: cargo build --profile ci-test -p xerj-server -p es-yaml-runner
 
       # rc.3 regression: the shipped xerj.default.toml failed to parse
       # (`unknown field hnsw_offload_threshold`) so the documented
@@ -201,7 +365,7 @@ jobs:
           set -euo pipefail
           SMOKE="$(mktemp -d)"
           cd "$SMOKE"
-          "$GITHUB_WORKSPACE/engine/target/release/xerj" \
+          "$GITHUB_WORKSPACE/engine/target/ci-test/xerj" \
             --config "$GITHUB_WORKSPACE/engine/xerj.default.toml" > server.log 2>&1 &
           SMOKE_PID=$!
           up=""
@@ -226,7 +390,7 @@ jobs:
           set -euo pipefail
           DATA="$(mktemp -d)"
           echo "XERJ_DATA=$DATA" >> "$GITHUB_ENV"
-          ./target/release/xerj --insecure --data-dir "$DATA" > "$DATA/server.log" 2>&1 &
+          ./target/ci-test/xerj --insecure --data-dir "$DATA" > "$DATA/server.log" 2>&1 &
           echo "XERJ_PID=$!" >> "$GITHUB_ENV"
           for _ in $(seq 1 80); do
             if curl -fs -m1 localhost:9200/_cluster/health >/dev/null 2>&1; then
@@ -299,24 +463,46 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-cargo-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-cargo-
+          workspaces: engine
+          # Read-only consumer of build-test's ci-test dependency cache.
+          # save-if:false is what makes sharing safe: these jobs run
+          # concurrently, and a cache key is immutable once written, so if
+          # they all saved it one would win and the rest would log
+          # "Unable to reserve cache" -- the collision this PR set out to fix.
+          shared-key: ci-test-linux
+          save-if: false
 
       - name: Build xerj + xerj-mcp (release)
         working-directory: engine
-        run: cargo build --release -p xerj-server -p xerj-mcp
+        run: cargo build --profile ci-test -p xerj-server -p xerj-mcp
 
       # Drives the demo/usecases scripts themselves, so the thing CI gates is
       # the same thing a reader runs. No browser, no model, no network.
       - name: Use-case smoke (brain transcript, MCP tools, autoindex discovery)
+        env:
+          XERJ_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj
+          XERJ_MCP_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj-mcp
         run: bash .github/scripts/usecase-smoke.sh
+
+      # The published agent-facing schema vs what the server actually serves.
+      # It drifted once already — six tools published against ten served, every
+      # xerj_brain_* tool missing — and nothing failed, because nothing
+      # compared them. This drives `xerj mcp` (the subcommand a user who ran
+      # the installer has, not a dev-only binary), issues a real tools/list
+      # over stdio, and diffs the response against
+      # landing/docs/agents/schemas/mcp-tools.json. Needs no running node:
+      # tools/list is answered before any proxying.
+      # XERJ_BIN must be set explicitly: this job builds with --profile ci-test
+      # (#331), so the binary lands in target/ci-test/, while the script's
+      # default is target/release/. Without this the gate looks for a binary CI
+      # never built. Each PR was green alone; the interaction only appears once
+      # both are on main.
+      - name: MCP published-schema drift gate (xerj mcp ↔ mcp-tools.json)
+        env:
+          XERJ_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj
+        run: bash scripts/mcp-schema-check.sh
 
   # Per-OS runtime gate. The earlier autoindex "Too many open files" crash was
   # macOS-only and slipped through because nothing in CI actually RAN the binary
@@ -338,20 +524,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-            engine/target
-          key: ci-smoke-${{ matrix.os }}-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: ci-smoke-${{ matrix.os }}-
+          workspaces: engine
 
-      - name: Build xerj (release)
+      # ci-test, not release: this job boots the binary and checks liveness,
+      # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
+      # checks. Same opt-level and features, only LTO scope differs.
+      - name: Build xerj (ci-test profile)
         working-directory: engine
-        run: cargo build --release -p xerj-server
+        run: cargo build --profile ci-test -p xerj-server
 
       - name: Autoindex a many-dataset corpus (must not exhaust file descriptors)
         shell: bash
+        env:
+          XERJ_BIN: engine/target/ci-test/xerj
         run: bash .github/scripts/autoindex-fd-smoke.sh

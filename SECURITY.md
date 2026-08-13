@@ -70,6 +70,32 @@ We ask that reporters give us a reasonable opportunity to remediate an issue
 before any public disclosure. We aim to resolve critical issues promptly and
 will work with you to agree on a disclosure timeline.
 
+## Automated checks that run on every change
+
+Both of these run in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on
+every push and pull request. This section describes what the CI actually does —
+if you find a gap between this text and the workflow file, that is itself a bug
+worth reporting.
+
+- **`security-audit`** — [`cargo-audit`](https://github.com/rustsec/rustsec)
+  against `engine/Cargo.lock`. A RUSTSEC *vulnerability* advisory fails the
+  build. Informational advisories (unmaintained, unsound, yanked) are printed in
+  the job log but do not fail it, because they usually name transitive crates we
+  cannot upgrade on our own.
+- **`fuzz`** — [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
+  harnesses in [`engine/fuzz/`](engine/fuzz/), covering the parsers an
+  unauthenticated request reaches: the Elasticsearch query DSL, the Lucene
+  `query_string` grammar, date math and date-format patterns, index-name date
+  math, SQL, `xerj_engine::painless` scripts, and the two separate script
+  tokenisers inside the aggregation engine (`scripted_metric`, and
+  `bucket_script` / `bucket_selector`). Each target replays a checked-in seed
+  corpus and then fuzzes for a bounded budget. That list is the coverage — it is
+  not every parser in the engine.
+
+Neither is a substitute for a report. Fuzzing finds crashes and hangs, not logic
+flaws, and an advisory database only knows about vulnerabilities somebody has
+already published.
+
 ## Scope
 
 This policy applies to the XERJ engine and its official crates in the

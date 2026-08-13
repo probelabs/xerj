@@ -2,15 +2,19 @@
 //!
 //! ## On-disk layout
 //!
-//! For each indexed field `<field>` a segment produces two files:
+//! For each indexed field `<field-component>` a segment produces four files:
 //!
 //! ```text
-//! seg-<id>.<field>.fst       — FST term dictionary
+//! seg-<id>.<field-component>.fst       — FST term dictionary
 //!                              value = byte offset into .post file
-//! seg-<id>.<field>.post      — concatenated posting lists
-//! seg-<id>.<field>.meta      — JSON: FieldStats + per-term TermPostings headers
-//! seg-<id>.<field>.norms     — u16 per doc (field length, capped at 65535)
+//! seg-<id>.<field-component>.post      — concatenated posting lists
+//! seg-<id>.<field-component>.meta      — FieldStats + per-term metadata
+//! seg-<id>.<field-component>.norms     — encoded per-doc field lengths
+//! seg-<id>.fts-layout-v2               — exact marker when components are encoded
 //! ```
+//!
+//! Short portable field names are used literally for on-disk compatibility;
+//! all other logical field names map to a bounded digest component.
 //!
 //! The FST key is the term text (UTF-8 bytes, lexicographically sorted by construction).
 //! The FST output value is the byte offset in the `.post` file.
@@ -21,18 +25,141 @@ use crate::{
     bm25::FieldStats,
     postings::{PostingsWriter, TermPostings},
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fst::{Map, MapBuilder};
 use memmap2::Mmap;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+/// Longest field name that can remain literal inside an FTS side-car filename.
+///
+/// The complete filename also carries a segment UUID, separators, an extension,
+/// and sometimes `.tmp`. Keeping the user-controlled component at 128 bytes
+/// leaves comfortable room below the common 255-byte component limit.
+const MAX_LITERAL_FIELD_COMPONENT_BYTES: usize = 128;
+
+/// Namespace for field names that cannot safely be used as portable filesystem
+/// components. Literal names in this namespace are encoded too, so a user field
+/// cannot alias another field's digest-derived component.
+const ENCODED_FIELD_COMPONENT_PREFIX: &str = "__xerj_fts_field_sha256_";
+
+/// Immutable per-segment discriminator for encoded field filename components.
+///
+/// This name has no FTS side-car extension, so it cannot equal any v1 file:
+/// every historical file is `<segment>.<raw-field>.(fst|post|meta|norms)`.
+/// It retains the segment prefix so publication manifests, rollback, orphan
+/// recovery, and retirement treat it as part of the same artifact family.
+const FTS_FILENAME_LAYOUT_V2_MARKER_SUFFIX: &str = "fts-layout-v2";
+const FTS_FILENAME_LAYOUT_V2_MARKER_BYTES: &[u8] = b"XERJ_FTS_FILENAME_LAYOUT_V2\n";
+
+fn segment_filename_layout_v2_marker_path(segment_dir: &Path, segment_id: &str) -> PathBuf {
+    segment_dir.join(format!(
+        "{segment_id}.{FTS_FILENAME_LAYOUT_V2_MARKER_SUFFIX}"
+    ))
+}
+
+/// Absence means v1/raw. Exact magic means v2/encoded. Any other visible
+/// marker is corruption. File-family existence is never layout evidence.
+fn segment_uses_encoded_filename_layout(segment_dir: &Path, segment_id: &str) -> Result<bool> {
+    let marker = segment_filename_layout_v2_marker_path(segment_dir, segment_id);
+    match fs::read(&marker) {
+        Ok(bytes) if bytes == FTS_FILENAME_LAYOUT_V2_MARKER_BYTES => Ok(true),
+        Ok(_) => bail!("corrupt FTS filename-layout discriminator {:?}", marker),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("reading FTS filename-layout discriminator {:?}", marker)),
+    }
+}
+
+fn is_windows_reserved_device_name(field: &str) -> bool {
+    let stem = field.split('.').next().unwrap_or(field);
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return true;
+    }
+    let bytes = stem.as_bytes();
+    bytes.len() == 4
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
+}
+
+/// Return the bounded, portable component used for every side-car of `field`.
+///
+/// Existing short field names that are portable across supported filesystems
+/// remain byte-for-byte compatible with the historical on-disk layout.
+/// Everything else is represented by a SHA-256 digest. In particular, path
+/// separators, traversal-like names, platform-reserved punctuation, controls,
+/// and overlong names can never create a child path or exceed a normal
+/// filesystem's component limit. Unicode, `@`, and internal spaces are valid
+/// portable literals; trailing spaces and dots are not portable to Windows.
+/// Preserving literals also preserves v1's pre-existing limitation: distinct
+/// portable names can alias on a filesystem that case-folds or normalizes
+/// Unicode. Digest-derived names remain distinct by exact UTF-8 bytes modulo a
+/// SHA-256 collision; eliminating literal aliases would require a new all-name
+/// encoding or name table and is outside filename layout v2.
+fn field_file_component(field: &str) -> Cow<'_, str> {
+    let portable_literal = !field.is_empty()
+        && field.len() <= MAX_LITERAL_FIELD_COMPONENT_BYTES
+        && field != "."
+        && field != ".."
+        && !field.starts_with(ENCODED_FIELD_COMPONENT_PREFIX)
+        && !is_windows_reserved_device_name(field)
+        && !field.ends_with(' ')
+        && !field.ends_with('.')
+        && field.chars().all(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+                )
+        });
+
+    if portable_literal {
+        return Cow::Borrowed(field);
+    }
+
+    let digest = Sha256::digest(field.as_bytes());
+    Cow::Owned(format!("{ENCODED_FIELD_COMPONENT_PREFIX}{digest:x}"))
+}
+
+/// Derive one FTS side-car path from controlled components only.
+fn field_sidecar_path(
+    segment_dir: &Path,
+    segment_id: &str,
+    field_name: &str,
+    extension: &str,
+) -> PathBuf {
+    let field_component = field_file_component(field_name);
+    segment_dir.join(format!("{segment_id}.{field_component}.{extension}"))
+}
+
+/// Return the exact pre-fix raw path only when it remains one child of the
+/// segment directory on this host.
+///
+/// This reader-only bridge keeps already-published Linux fields such as a raw
+/// backslash, a reserved digest-prefix literal, or a formerly accepted long
+/// component readable after upgrade. It never creates a path and it refuses
+/// slash/backslash-as-separator shapes through the parent equality check.
+fn legacy_field_sidecar_path(
+    segment_dir: &Path,
+    segment_id: &str,
+    field_name: &str,
+    extension: &str,
+) -> Option<PathBuf> {
+    let candidate = segment_dir.join(format!("{segment_id}.{field_name}.{extension}"));
+    (candidate.parent() == Some(segment_dir)).then_some(candidate)
+}
 
 // ── FieldIndexConfig ──────────────────────────────────────────────────────────
 
@@ -193,7 +320,12 @@ const POST_MAGIC_ZSTD: &[u8; 4] = b"ZPS1";
 /// (merge-dominated long-term storage barely changes; only the
 /// freshest tier-0 segments are larger before they merge).  See
 /// `engine/reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`.
-const ZSTD_DURABLE_LEVEL: i32 = 3;
+///
+/// This is the **flush** level and the writer default. A merge-time caller
+/// raises it via [`FtsIndexWriter::with_zstd_level`] to honour the operator's
+/// `compression.level` (#318) — merge is off the ingest critical path, which
+/// is exactly the distinction the paragraph above is about.
+pub const ZSTD_DURABLE_LEVEL: i32 = 3;
 const ZFM3_RECORD_LEN: usize = 4 + 8 + 8 + 4; // 24 bytes: df, ttf, off, len
 
 /// Header byte length for a ZFM3 file (magic + total_docs + total_field_length
@@ -230,6 +362,7 @@ fn encode_field_meta_v4(
     has_positions: bool,
     sorted_terms: &[String],
     term_postings: &HashMap<String, TermPostings>,
+    zstd_level: i32,
 ) -> Result<Vec<u8>> {
     let num_terms = sorted_terms.len();
     // Build the records section in the same byte layout that ZFM3
@@ -253,7 +386,7 @@ fn encode_field_meta_v4(
     }
     let uncompressed_len = records.len() as u32;
     let compressed =
-        zstd::bulk::compress(&records, ZSTD_DURABLE_LEVEL).with_context(|| "ZFM4 zstd compress")?;
+        zstd::bulk::compress(&records, zstd_level).with_context(|| "ZFM4 zstd compress")?;
     let mut out: Vec<u8> = Vec::with_capacity(ZFM3_HEADER_LEN + 4 + 4 + compressed.len());
     out.extend_from_slice(META_MAGIC_V4);
     out.write_u64::<LittleEndian>(stats.total_docs).unwrap();
@@ -415,6 +548,10 @@ fn decode_field_meta_binary(bytes: &[u8]) -> Result<FieldMeta> {
 /// ```text
 /// let mut writer = FtsIndexWriter::new(dir, segment_id, registry);
 /// for doc in docs { writer.add_document(doc_id, &fields); }
+/// if writer.uses_encoded_field_filename_components() {
+///     // The engine advances its data-directory format before this step.
+///     writer.publish_encoded_filename_layout()?;
+/// }
 /// writer.finish()?;
 /// ```
 pub struct FtsIndexWriter {
@@ -423,6 +560,10 @@ pub struct FtsIndexWriter {
     registry: Arc<AnalyzerRegistry>,
     /// Per-field: (config, postings_writer, field_stats, norms)
     fields: HashMap<String, FieldData>,
+    encoded_filename_layout_published: bool,
+    /// Zstd effort for the `.meta` (ZFM4) and `.post` (ZPS1) envelopes.
+    /// [`ZSTD_DURABLE_LEVEL`] unless [`Self::with_zstd_level`] raised it.
+    zstd_level: i32,
 }
 
 struct FieldData {
@@ -445,7 +586,22 @@ impl FtsIndexWriter {
             segment_id: segment_id.into(),
             registry,
             fields: HashMap::new(),
+            encoded_filename_layout_published: false,
+            zstd_level: ZSTD_DURABLE_LEVEL,
         }
+    }
+
+    /// Re-encode this segment's `.meta` / `.post` at `level` instead of the
+    /// flush default [`ZSTD_DURABLE_LEVEL`].
+    ///
+    /// For merge callers only — flush must not raise the level, and
+    /// [`ZSTD_DURABLE_LEVEL`] records the measured reason. Both envelopes
+    /// stay byte-format-identical across levels (zstd decode does not consult
+    /// the level a payload was written at), so this changes only how hard the
+    /// encoder works and how large the result is.
+    pub fn with_zstd_level(mut self, level: i32) -> Self {
+        self.zstd_level = level;
+        self
     }
 
     /// Register a field with its indexing configuration.
@@ -465,6 +621,67 @@ impl FtsIndexWriter {
                 norms: Vec::new(),
             },
         );
+    }
+
+    /// Whether finishing this writer can create a v2 digest-derived field
+    /// filename.
+    ///
+    /// Engine callers use this after configuration/document ingestion and
+    /// before [`Self::finish`] to durably advance the data-directory marker.
+    pub fn uses_encoded_field_filename_components(&self) -> bool {
+        self.fields
+            .keys()
+            .any(|field| matches!(field_file_component(field), Cow::Owned(_)))
+    }
+
+    /// Durably publish this segment's immutable v2 filename discriminator.
+    ///
+    /// The engine must durably advance the data-directory format first, call
+    /// this method second, and call [`Self::finish`] last. `finish` refuses to
+    /// emit encoded side-cars without this proof. An existing discriminator is
+    /// accepted only when it contains the exact v2 magic.
+    pub fn publish_encoded_filename_layout(&mut self) -> Result<()> {
+        if !self.uses_encoded_field_filename_components() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.segment_dir)
+            .with_context(|| format!("creating segment dir {:?}", self.segment_dir))?;
+        let marker = segment_filename_layout_v2_marker_path(&self.segment_dir, &self.segment_id);
+        match fs::read(&marker) {
+            Ok(bytes) if bytes == FTS_FILENAME_LAYOUT_V2_MARKER_BYTES => {
+                // A previous attempt can have made the rename visible and
+                // then failed its durability confirmation. A fresh writer has
+                // no process-local proof, so confirm the directory entry
+                // before authorizing encoded side-cars.
+                #[cfg(not(windows))]
+                xerj_common::fsio::fsync_dir(&self.segment_dir).with_context(|| {
+                    format!("confirming FTS filename-layout discriminator {:?}", marker)
+                })?;
+                // Windows has no parent-directory fsync contract. Replacing
+                // the exact marker through MoveFileExW WRITE_THROUGH also
+                // repairs a visible discriminator produced by an older build
+                // whose Windows directory-sync shim was a no-op.
+                #[cfg(windows)]
+                xerj_common::fsio::write_file_durable(&marker, FTS_FILENAME_LAYOUT_V2_MARKER_BYTES)
+                    .with_context(|| {
+                        format!("confirming FTS filename-layout discriminator {:?}", marker)
+                    })?;
+            }
+            Ok(_) => bail!("corrupt FTS filename-layout discriminator {:?}", marker),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                xerj_common::fsio::write_file_durable(&marker, FTS_FILENAME_LAYOUT_V2_MARKER_BYTES)
+                    .with_context(|| {
+                        format!("publishing FTS filename-layout discriminator {:?}", marker)
+                    })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reading FTS filename-layout discriminator {:?}", marker)
+                });
+            }
+        }
+        self.encoded_filename_layout_published = true;
+        Ok(())
     }
 
     /// Index all text fields of one document.
@@ -643,11 +860,17 @@ impl FtsIndexWriter {
     pub fn finish(self) -> Result<HashMap<String, FieldStats>> {
         use rayon::prelude::*;
 
+        if self.uses_encoded_field_filename_components() && !self.encoded_filename_layout_published
+        {
+            bail!("encoded FTS field filenames require a durable per-segment layout discriminator");
+        }
+
         fs::create_dir_all(&self.segment_dir)
             .with_context(|| format!("creating segment dir {:?}", self.segment_dir))?;
 
         let segment_dir = self.segment_dir.clone();
         let segment_id = self.segment_id.clone();
+        let zstd_level = self.zstd_level;
 
         // Drain fields into a Vec so we can parallelise the iterator.
         // Cloning `stats` before consuming `field_data` — `stats` goes into
@@ -667,8 +890,14 @@ impl FtsIndexWriter {
         let results: Vec<Result<(String, FieldStats)>> = fields
             .into_par_iter()
             .map(|(field_name, stats, field_data)| {
-                Self::write_field_static(&segment_dir, &segment_id, &field_name, field_data)
-                    .with_context(|| format!("writing field '{}'", field_name))?;
+                Self::write_field_static(
+                    &segment_dir,
+                    &segment_id,
+                    &field_name,
+                    field_data,
+                    zstd_level,
+                )
+                .with_context(|| format!("writing field '{}'", field_name))?;
                 Ok((field_name, stats))
             })
             .collect();
@@ -688,13 +917,14 @@ impl FtsIndexWriter {
         segment_id: &str,
         field_name: &str,
         field_data: FieldData,
+        zstd_level: i32,
     ) -> Result<()> {
         // NOTE: `PathBuf::with_extension` replaces the final `.ext` in the path,
         // so using `segment_dir.join("segment_id.field_name")` followed by
         // `with_extension("fst")` would strip `.field_name` and collapse every
-        // field to the same file.  Build filenames by hand to avoid that.
-        let filename =
-            |ext: &str| segment_dir.join(format!("{}.{}.{}", segment_id, field_name, ext));
+        // field to the same file. The shared helper also keeps untrusted field
+        // names from becoming paths.
+        let filename = |ext: &str| field_sidecar_path(segment_dir, segment_id, field_name, ext);
         let fst_path = filename("fst");
         let post_path = filename("post");
         let meta_path = filename("meta");
@@ -760,7 +990,7 @@ impl FtsIndexWriter {
             Vec::new()
         } else {
             let uncompressed_len = post_data.len() as u32;
-            let compressed = zstd::bulk::compress(&post_data, ZSTD_DURABLE_LEVEL)
+            let compressed = zstd::bulk::compress(&post_data, zstd_level)
                 .with_context(|| "ZPS1 zstd compress")?;
             let mut out = Vec::with_capacity(4 + 4 + compressed.len());
             out.extend_from_slice(POST_MAGIC_ZSTD);
@@ -768,13 +998,14 @@ impl FtsIndexWriter {
             out.extend_from_slice(&compressed);
             out
         };
-        // RC4 W1 #10 — every FTS side-car write below goes through the
-        // durable tmp+fsync+rename+dir-fsync pattern.  These files are
-        // part of the segment publish chain: the WAL entries they cover
-        // are pruned ~1 s after the flush, so side-cars sitting only in
-        // the volatile page cache meant a power loss could leave a
-        // registered segment with missing/torn FTS data (silently wrong
-        // query results or unreadable fields) with no WAL to recover from.
+        // RC4 W1 #10 — every FTS side-car write below goes through durable
+        // temporary-file sync plus platform-appropriate publication: rename
+        // and parent-directory fsync on Unix, write-through replacement on
+        // Windows. These files are part of the segment publish chain: the WAL
+        // entries they cover are pruned ~1 s after the flush, so side-cars
+        // sitting only in the volatile page cache meant a power loss could
+        // leave a registered segment with missing/torn FTS data (silently
+        // wrong query results or unreadable fields) with no WAL to recover from.
         xerj_common::fsio::write_file_durable(&post_path, &post_bytes_wrapped)
             .with_context(|| format!("writing postings to {:?}", post_path))?;
 
@@ -790,9 +1021,9 @@ impl FtsIndexWriter {
         // holds df + ttf + postings_offset + length, so one FST hit →
         // one bounded mmap read.
         // FST streams into a same-directory temp file; fsync + rename +
-        // dir-fsync publishes it durably (RC4 W1 #10 — see the postings
-        // note above).
-        let fst_tmp = segment_dir.join(format!("{}.{}.fst.tmp", segment_id, field_name));
+        // platform-specific durable replacement publishes it (RC4 W1 #10 —
+        // see the postings note above).
+        let fst_tmp = filename("fst.tmp");
         let fst_file = BufWriter::new(
             File::create(&fst_tmp).with_context(|| format!("creating FST file {:?}", fst_tmp))?,
         );
@@ -817,9 +1048,8 @@ impl FtsIndexWriter {
             .sync_all()
             .with_context(|| "fsyncing FST")?;
         drop(fst_out);
-        fs::rename(&fst_tmp, &fst_path)
+        xerj_common::fsio::replace_file_durable(&fst_tmp, &fst_path)
             .with_context(|| format!("publishing FST {:?}", fst_path))?;
-        xerj_common::fsio::fsync_dir(segment_dir).with_context(|| "fsyncing segment dir (fst)")?;
 
         // 4. Write meta in the ZFM4 format — Zstd-19 envelope around
         //    the per-term records section; ZFM3-compatible header so
@@ -831,6 +1061,7 @@ impl FtsIndexWriter {
             has_positions,
             &sorted_terms,
             &term_postings,
+            zstd_level,
         )?;
         xerj_common::fsio::write_file_durable(&meta_path, &meta_bytes)
             .with_context(|| format!("writing meta to {:?}", meta_path))?;
@@ -1037,17 +1268,35 @@ impl FtsIndexReader {
     ) -> Result<Self> {
         let segment_dir = segment_dir.as_ref().to_path_buf();
         let segment_id = segment_id.into();
+        let encoded_layout = segment_uses_encoded_filename_layout(&segment_dir, &segment_id)?;
         let mut fields = HashMap::new();
 
         for &field_name in field_names {
-            // Build filenames explicitly — see note in `write_field_static`
-            // for why `with_extension()` would be wrong here.
-            let filename =
-                |ext: &str| segment_dir.join(format!("{}.{}.{}", segment_id, field_name, ext));
-            let fst_path = filename("fst");
-            let post_path = filename("post");
-            let meta_path = filename("meta");
-            let norms_path = filename("norms");
+            // The immutable segment discriminator is the sole authority.
+            // Existence is deliberately irrelevant: otherwise a v1 field
+            // whose literal name equals another field's digest component can
+            // alias, and partial or stray files can alter layout selection.
+            let filename = |ext: &str| -> Option<PathBuf> {
+                if encoded_layout {
+                    Some(field_sidecar_path(
+                        &segment_dir,
+                        &segment_id,
+                        field_name,
+                        ext,
+                    ))
+                } else {
+                    legacy_field_sidecar_path(&segment_dir, &segment_id, field_name, ext)
+                }
+            };
+            let Some(fst_path) = filename("fst") else {
+                continue;
+            };
+            let post_path =
+                filename("post").expect("FTS family path containment is extension-invariant");
+            let meta_path =
+                filename("meta").expect("FTS family path containment is extension-invariant");
+            let norms_path =
+                filename("norms").expect("FTS family path containment is extension-invariant");
 
             // Skip fields that haven't been indexed yet
             if !fst_path.exists() {
@@ -1478,6 +1727,7 @@ impl FtsIndexReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     fn make_registry() -> Arc<AnalyzerRegistry> {
@@ -1585,5 +1835,404 @@ mod tests {
         let tp = reader.lookup_term("title", "hello").unwrap();
         let data = reader.postings_data("title", &tp);
         assert!(data.is_some() && !data.unwrap().is_empty());
+    }
+
+    #[test]
+    fn safe_field_component_preserves_existing_filename_layout() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "seg-safe", make_registry());
+        let fields = ["title.body-2", "@timestamp", "space field", "配置.名字"];
+        let document: HashMap<String, String> = fields
+            .into_iter()
+            .enumerate()
+            .map(|(index, field)| (field.to_owned(), format!("needle{index}")))
+            .collect();
+        writer.add_document(0, &document);
+        writer.finish().unwrap();
+
+        for field in fields {
+            assert_eq!(field_file_component(field), Cow::Borrowed(field));
+            for extension in ["fst", "post", "meta", "norms"] {
+                assert!(dir
+                    .path()
+                    .join(format!("seg-safe.{field}.{extension}"))
+                    .is_file());
+            }
+        }
+    }
+
+    fn write_legacy_raw_field_fixture(segment_dir: &Path, segment_id: &str, legacy_field: &str) {
+        let source_field = "legacy_fixture_source";
+        let mut writer = FtsIndexWriter::new(segment_dir, segment_id, make_registry());
+        let document = [(source_field.to_owned(), "legacyneedle".to_owned())]
+            .into_iter()
+            .collect();
+        writer.add_document(0, &document);
+        writer.finish().unwrap();
+        for extension in ["fst", "post", "meta", "norms"] {
+            let source = field_sidecar_path(segment_dir, segment_id, source_field, extension);
+            let destination =
+                legacy_field_sidecar_path(segment_dir, segment_id, legacy_field, extension)
+                    .expect("test fixture must be one component on this host");
+            fs::rename(source, destination).unwrap();
+        }
+    }
+
+    #[test]
+    fn new_reader_opens_existing_single_component_legacy_fields() {
+        let root = TempDir::new().unwrap();
+        let segment_dir = root.path().join("segments");
+        fs::create_dir_all(&segment_dir).unwrap();
+        let overlong = "a".repeat(MAX_LITERAL_FIELD_COMPONENT_BYTES + 1);
+        let platform_fields: &[&str] = if cfg!(windows) {
+            &[]
+        } else {
+            &[r"legacy\backslash", "legacy:colon*question?", "trailing "]
+        };
+        let fields: Vec<&str> = vec![
+            "@timestamp",
+            "space field",
+            "配置.名字",
+            "CON.txt",
+            ENCODED_FIELD_COMPONENT_PREFIX,
+            overlong.as_str(),
+        ]
+        .into_iter()
+        .chain(platform_fields.iter().copied())
+        .collect();
+
+        for (index, field) in fields.iter().enumerate() {
+            let segment_id = format!("legacy-{index}");
+            write_legacy_raw_field_fixture(&segment_dir, &segment_id, field);
+            let raw_fst = legacy_field_sidecar_path(&segment_dir, &segment_id, field, "fst")
+                .expect("legacy field must remain contained");
+            assert!(raw_fst.is_file());
+
+            let reader = FtsIndexReader::open(&segment_dir, &segment_id, &[*field]).unwrap();
+            assert!(reader.term_exists(field, "legacyneedle"));
+        }
+    }
+
+    fn collision_fields() -> (String, String) {
+        let unsafe_name = "CON".to_owned();
+        let legacy_alias = format!(
+            "{ENCODED_FIELD_COMPONENT_PREFIX}{:x}",
+            Sha256::digest(unsafe_name.as_bytes())
+        );
+        (unsafe_name, legacy_alias)
+    }
+
+    fn write_v1_collision_fixture(segment_dir: &Path, segment_id: &str) -> (String, String) {
+        let (unsafe_name, legacy_alias) = collision_fields();
+        let source_fields = ["source_unsafe", "source_alias"];
+        let mut writer = FtsIndexWriter::new(segment_dir, segment_id, make_registry());
+        let document = [
+            (source_fields[0].to_owned(), "unsafeneedle".to_owned()),
+            (source_fields[1].to_owned(), "aliasneedle".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        writer.add_document(0, &document);
+        writer.finish().unwrap();
+        for (source, destination) in source_fields
+            .into_iter()
+            .zip([unsafe_name.as_str(), legacy_alias.as_str()])
+        {
+            for extension in ["fst", "post", "meta", "norms"] {
+                fs::rename(
+                    field_sidecar_path(segment_dir, segment_id, source, extension),
+                    legacy_field_sidecar_path(segment_dir, segment_id, destination, extension)
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        (unsafe_name, legacy_alias)
+    }
+
+    fn assert_collision_fields_read(
+        segment_dir: &Path,
+        segment_id: &str,
+        unsafe_name: &str,
+        legacy_alias: &str,
+    ) {
+        for stats_only in [false, true] {
+            let reader = if stats_only {
+                FtsIndexReader::open_stats_only(
+                    segment_dir,
+                    segment_id,
+                    &[unsafe_name, legacy_alias],
+                )
+            } else {
+                FtsIndexReader::open(segment_dir, segment_id, &[unsafe_name, legacy_alias])
+            }
+            .unwrap();
+            assert!(reader.term_exists(unsafe_name, "unsafeneedle"));
+            assert!(!reader.term_exists(unsafe_name, "aliasneedle"));
+            assert!(reader.term_exists(legacy_alias, "aliasneedle"));
+            assert!(!reader.term_exists(legacy_alias, "unsafeneedle"));
+        }
+    }
+
+    #[test]
+    fn discriminator_prevents_same_segment_v1_digest_alias_collision_across_reader_reopens() {
+        let root = TempDir::new().unwrap();
+        let segment_dir = root.path().join("segments");
+        fs::create_dir_all(&segment_dir).unwrap();
+        let segment_id = "v1-collision";
+        let (unsafe_name, legacy_alias) = write_v1_collision_fixture(&segment_dir, segment_id);
+        assert!(!segment_filename_layout_v2_marker_path(&segment_dir, segment_id).exists());
+        assert_collision_fields_read(&segment_dir, segment_id, &unsafe_name, &legacy_alias);
+        // Reopening creates a fresh reader and must make the same selection.
+        assert_collision_fields_read(&segment_dir, segment_id, &unsafe_name, &legacy_alias);
+    }
+
+    #[test]
+    fn discriminator_keeps_same_segment_v2_digest_alias_fields_distinct_across_reader_reopens() {
+        let root = TempDir::new().unwrap();
+        let segment_dir = root.path().join("segments");
+        let segment_id = "v2-collision";
+        let (unsafe_name, legacy_alias) = collision_fields();
+        let mut writer = FtsIndexWriter::new(&segment_dir, segment_id, make_registry());
+        let document = [
+            (unsafe_name.clone(), "unsafeneedle".to_owned()),
+            (legacy_alias.clone(), "aliasneedle".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        writer.add_document(0, &document);
+        writer.publish_encoded_filename_layout().unwrap();
+        writer.finish().unwrap();
+        assert!(segment_filename_layout_v2_marker_path(&segment_dir, segment_id).is_file());
+        assert_ne!(
+            field_sidecar_path(&segment_dir, segment_id, &unsafe_name, "fst"),
+            field_sidecar_path(&segment_dir, segment_id, &legacy_alias, "fst")
+        );
+        assert_collision_fields_read(&segment_dir, segment_id, &unsafe_name, &legacy_alias);
+        assert_collision_fields_read(&segment_dir, segment_id, &unsafe_name, &legacy_alias);
+    }
+
+    #[test]
+    fn v1_discriminator_state_ignores_stray_and_partial_v2_families_and_fails_on_raw_corruption() {
+        let root = TempDir::new().unwrap();
+        let segment_dir = root.path().join("segments");
+        fs::create_dir_all(&segment_dir).unwrap();
+        let segment_id = "v1-stray-v2";
+        let field = ".";
+        write_legacy_raw_field_fixture(&segment_dir, segment_id, field);
+        let raw_fst = legacy_field_sidecar_path(&segment_dir, segment_id, field, "fst").unwrap();
+        let encoded_fst = field_sidecar_path(&segment_dir, segment_id, field, "fst");
+        let encoded_meta = field_sidecar_path(&segment_dir, segment_id, field, "meta");
+        fs::copy(&raw_fst, &encoded_fst).unwrap();
+        fs::write(&encoded_meta, b"corrupt-stray-v2-meta").unwrap();
+
+        let full = FtsIndexReader::open(&segment_dir, segment_id, &[field]).unwrap();
+        assert!(full.term_exists(field, "legacyneedle"));
+        let stats = FtsIndexReader::open_stats_only(&segment_dir, segment_id, &[field]).unwrap();
+        assert!(stats.term_exists(field, "legacyneedle"));
+
+        // The raw v1 family does not make an invalid visible discriminator
+        // ignorable. Layout selection is discriminator-only and corruption
+        // fails closed before either family is opened.
+        let marker = segment_filename_layout_v2_marker_path(&segment_dir, segment_id);
+        fs::write(&marker, b"corrupt-layout-marker-over-raw-v1-family").unwrap();
+        assert!(FtsIndexReader::open(&segment_dir, segment_id, &[field]).is_err());
+        assert!(FtsIndexReader::open_stats_only(&segment_dir, segment_id, &[field]).is_err());
+        fs::remove_file(&marker).unwrap();
+
+        let raw_post = legacy_field_sidecar_path(&segment_dir, segment_id, field, "post").unwrap();
+        let raw_post_bytes = fs::read(&raw_post).unwrap();
+        fs::remove_file(&raw_post).unwrap();
+        assert!(FtsIndexReader::open(&segment_dir, segment_id, &[field]).is_err());
+        assert!(
+            FtsIndexReader::open_stats_only(&segment_dir, segment_id, &[field])
+                .unwrap()
+                .term_exists(field, "legacyneedle")
+        );
+        fs::write(&raw_post, raw_post_bytes).unwrap();
+
+        let raw_meta = legacy_field_sidecar_path(&segment_dir, segment_id, field, "meta").unwrap();
+        fs::write(&raw_meta, b"corrupt-selected-v1-meta").unwrap();
+        assert!(FtsIndexReader::open(&segment_dir, segment_id, &[field]).is_err());
+        assert!(FtsIndexReader::open_stats_only(&segment_dir, segment_id, &[field]).is_err());
+    }
+
+    #[test]
+    fn v2_discriminator_state_ignores_raw_strays_and_fails_closed_on_partial_or_corrupt_state() {
+        let root = TempDir::new().unwrap();
+        let segment_dir = root.path().join("segments");
+        let segment_id = "v2-partial";
+        let field = ".";
+        let mut writer = FtsIndexWriter::new(&segment_dir, segment_id, make_registry());
+        writer.add_document(
+            0,
+            &[(field.to_owned(), "encodedneedle".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        writer.publish_encoded_filename_layout().unwrap();
+        writer.finish().unwrap();
+
+        // A corrupt complete raw family is a stray in explicit v2 state.
+        for extension in ["fst", "post", "meta", "norms"] {
+            let raw =
+                legacy_field_sidecar_path(&segment_dir, segment_id, field, extension).unwrap();
+            fs::write(raw, b"corrupt-raw-stray").unwrap();
+        }
+        assert!(FtsIndexReader::open(&segment_dir, segment_id, &[field])
+            .unwrap()
+            .term_exists(field, "encodedneedle"));
+        assert!(
+            FtsIndexReader::open_stats_only(&segment_dir, segment_id, &[field])
+                .unwrap()
+                .term_exists(field, "encodedneedle")
+        );
+
+        // Full mode needs postings and norms; stats-only intentionally does not.
+        let encoded_post = field_sidecar_path(&segment_dir, segment_id, field, "post");
+        let encoded_post_bytes = fs::read(&encoded_post).unwrap();
+        fs::remove_file(&encoded_post).unwrap();
+        assert!(FtsIndexReader::open(&segment_dir, segment_id, &[field]).is_err());
+        assert!(
+            FtsIndexReader::open_stats_only(&segment_dir, segment_id, &[field])
+                .unwrap()
+                .term_exists(field, "encodedneedle")
+        );
+        fs::write(&encoded_post, encoded_post_bytes).unwrap();
+
+        let encoded_meta = field_sidecar_path(&segment_dir, segment_id, field, "meta");
+        let encoded_meta_bytes = fs::read(&encoded_meta).unwrap();
+        fs::write(&encoded_meta, b"corrupt-selected-v2-meta").unwrap();
+        assert!(FtsIndexReader::open(&segment_dir, segment_id, &[field]).is_err());
+        assert!(FtsIndexReader::open_stats_only(&segment_dir, segment_id, &[field]).is_err());
+        fs::write(&encoded_meta, encoded_meta_bytes).unwrap();
+
+        fs::write(
+            segment_filename_layout_v2_marker_path(&segment_dir, segment_id),
+            b"corrupt-layout-marker",
+        )
+        .unwrap();
+        assert!(FtsIndexReader::open(&segment_dir, segment_id, &[field]).is_err());
+        assert!(FtsIndexReader::open_stats_only(&segment_dir, segment_id, &[field]).is_err());
+    }
+
+    #[test]
+    fn writer_reports_when_filename_v2_preflight_is_required() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "seg", make_registry());
+        writer.configure_field("title", FieldIndexConfig::default());
+        assert!(!writer.uses_encoded_field_filename_components());
+        writer.configure_field("bad/field", FieldIndexConfig::default());
+        assert!(writer.uses_encoded_field_filename_components());
+        assert!(writer.finish().is_err());
+    }
+
+    #[test]
+    fn unsafe_field_components_are_bounded_portable_and_distinct() {
+        let overlong = "a".repeat(MAX_LITERAL_FIELD_COMPONENT_BYTES + 1);
+        let encoded_alias = format!(
+            "{ENCODED_FIELD_COMPONENT_PREFIX}{:x}",
+            Sha256::digest(b"bad/field")
+        );
+        let fields = vec![
+            "bad/field",
+            r"bad\field",
+            "../traversal",
+            ".",
+            "..",
+            "trailing ",
+            "line\nfield",
+            "nul\0field",
+            "bad:windows*name?",
+            "CON",
+            "con.txt",
+            "PRN",
+            "aux.log",
+            "NUL",
+            "COM1",
+            "com9.log",
+            "LPT1",
+            "lpt9.txt",
+            ENCODED_FIELD_COMPONENT_PREFIX,
+            encoded_alias.as_str(),
+            overlong.as_str(),
+        ];
+        let components: Vec<String> = fields
+            .iter()
+            .map(|field| field_file_component(field).into_owned())
+            .collect();
+
+        assert_eq!(
+            components.len(),
+            components.iter().collect::<HashSet<_>>().len()
+        );
+        for (field, component) in fields.iter().zip(&components) {
+            assert_eq!(component.as_str(), field_file_component(field).as_ref());
+            assert!(component.starts_with(ENCODED_FIELD_COMPONENT_PREFIX));
+            assert!(component.is_ascii());
+            assert!(component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
+            assert!(component.len() < MAX_LITERAL_FIELD_COMPONENT_BYTES);
+            assert!(!component.contains('/'));
+            assert!(!component.contains('\\'));
+        }
+        assert_ne!(
+            field_file_component("bad/field"),
+            field_file_component(&encoded_alias),
+            "an encoded component used as a literal field must enter the reserved namespace"
+        );
+        for field in ["COM0", "COM10", "LPT0", "CONSOLE"] {
+            assert_eq!(field_file_component(field), Cow::Borrowed(field));
+        }
+    }
+
+    #[test]
+    fn unsafe_field_names_round_trip_without_creating_child_paths() {
+        let root = TempDir::new().unwrap();
+        let segment_dir = root.path().join("segments");
+        let overlong = "long".repeat(80);
+        let fields = [
+            "bad/field",
+            r"bad\field",
+            "../../escape",
+            "nul\0field",
+            "bad:windows*name?",
+            overlong.as_str(),
+        ];
+        for field in ["bad/field", "../../escape"] {
+            assert!(legacy_field_sidecar_path(&segment_dir, "seg-unsafe", field, "fst").is_none());
+        }
+        let mut writer = FtsIndexWriter::new(&segment_dir, "seg-unsafe", make_registry());
+        let document: HashMap<String, String> = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| ((*field).to_owned(), format!("needle{index}")))
+            .collect();
+        writer.add_document(0, &document);
+        writer.publish_encoded_filename_layout().unwrap();
+        writer.finish().unwrap();
+
+        let field_refs: Vec<&str> = fields.to_vec();
+        let reader = FtsIndexReader::open(&segment_dir, "seg-unsafe", &field_refs).unwrap();
+        for (index, field) in fields.iter().enumerate() {
+            assert!(reader.term_exists(field, &format!("needle{index}")));
+            for extension in ["fst", "post", "meta", "norms"] {
+                let path = field_sidecar_path(&segment_dir, "seg-unsafe", field, extension);
+                assert_eq!(path.parent(), Some(segment_dir.as_path()));
+                assert!(path.is_file(), "missing {}", path.display());
+            }
+            assert!(!field_sidecar_path(&segment_dir, "seg-unsafe", field, "fst.tmp").exists());
+        }
+
+        let entries: Vec<_> = fs::read_dir(&segment_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(entries.len(), fields.len() * 4 + 1);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.file_type().unwrap().is_file()));
+        assert!(!root.path().join("escape").exists());
     }
 }

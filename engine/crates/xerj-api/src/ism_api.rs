@@ -85,9 +85,12 @@ pub async fn put_ism_policy(
         let err = xerj_common::XerjError::invalid_query(format!("invalid ISM policy: {reason}"));
         return ApiError::new(err).into_response();
     }
-    state
+    if let Err(error) = state
         .engine
-        .put_ism_policy(policy_id.clone(), policy.clone());
+        .put_ism_policy(policy_id.clone(), policy.clone())
+    {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     Json(json!({
         "_id": policy_id,
         "_version": 1,
@@ -178,11 +181,14 @@ pub async fn delete_ism_policy(
     State(state): State<AppState>,
     Path(policy_id): Path<String>,
 ) -> impl IntoResponse {
-    if state.engine.remove_ism_policy(&policy_id) {
-        Json(json!({ "_id": policy_id, "result": "deleted" })).into_response()
-    } else {
-        let e = xerj_common::XerjError::index_not_found(format!("policy [{policy_id}] not found"));
-        ApiError::new(e).into_response()
+    match state.engine.remove_ism_policy(&policy_id) {
+        Ok(true) => Json(json!({ "_id": policy_id, "result": "deleted" })).into_response(),
+        Ok(false) => {
+            let e =
+                xerj_common::XerjError::index_not_found(format!("policy [{policy_id}] not found"));
+            ApiError::new(e).into_response()
+        }
+        Err(error) => ApiError::new(xerj_common::XerjError::from(error)).into_response(),
     }
 }
 
@@ -210,6 +216,9 @@ pub async fn add_ism_policy(
 /// `es_compat` (a single index↔policy association model, per the design —
 /// not two).
 pub async fn attach_policy(state: &AppState, index: &str, policy_id: &str) -> Response {
+    if let Err(error) = state.engine.ensure_cluster_state_writable() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     if state.engine.get_index(index).is_err() {
         let e = xerj_common::XerjError::index_not_found(index);
         return ApiError::new(e).into_response();
@@ -235,7 +244,9 @@ pub async fn attach_policy(state: &AppState, index: &str, policy_id: &str) -> Re
         .engine
         .managed_indices
         .insert(index.to_string(), managed);
-    state.engine.persist_managed_indices();
+    if let Err(error) = state.engine.persist_managed_indices() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
 
     Json(json!({
         "failures": false,
@@ -243,6 +254,23 @@ pub async fn attach_policy(state: &AppState, index: &str, policy_id: &str) -> Re
         "failed_indices": [],
     }))
     .into_response()
+}
+
+/// Shared detach implementation — the counterpart to `attach_policy`, used
+/// by both the ES-shape `index.lifecycle.name: null` settings directive
+/// (`es_compat::put_settings`) and `POST {index}/_ilm/remove` (real ES's
+/// own dedicated detach verb). Removing the `managed_indices` entry is
+/// authoritative here: nothing else in this engine ever re-derives "is
+/// this index managed" from stored index settings, so there is no
+/// fallback path that could resurrect a detached index — unlike the
+/// architecture #262 found this exact defect in, which needed a separate
+/// persisted tombstone because its resolver fell back to settings.json
+/// when its own map had no entry. Here, absence from `managed_indices` IS
+/// unambiguously "not managed", so a plain removal is the whole fix.
+/// Returns whether the index was actually managed (false is not an error —
+/// detaching an already-unmanaged index is idempotent, matching real ES).
+pub fn detach_ilm_policy(state: &AppState, index: &str) -> xerj_engine::Result<bool> {
+    state.engine.detach_lifecycle(index)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -257,8 +285,10 @@ pub async fn remove_ism_policy(
         // One shared detach path (engine method) for all three detach
         // routes, so the acknowledged detach is tombstoned and persisted
         // identically whichever surface the operator used (#282).
-        state.engine.detach_lifecycle(&index);
-        Json(single_index_success()).into_response()
+        match state.engine.detach_lifecycle(&index) {
+            Ok(_) => Json(single_index_success()).into_response(),
+            Err(error) => ApiError::new(xerj_common::XerjError::from(error)).into_response(),
+        }
     } else {
         Json(not_managed_failure(
             &index,
@@ -299,6 +329,9 @@ pub async fn change_ism_policy(
     Path(index): Path<String>,
     Json(body): Json<ChangePolicyBody>,
 ) -> impl IntoResponse {
+    if let Err(error) = state.engine.ensure_cluster_state_writable() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     let Some(mut managed) = state
         .engine
         .managed_indices
@@ -362,7 +395,9 @@ pub async fn change_ism_policy(
     managed.info_message = format!("policy changed to '{}'", body.policy_id);
     managed.last_updated_ms = lifecycle::now_ms();
     state.engine.managed_indices.insert(index, managed);
-    state.engine.persist_managed_indices();
+    if let Err(error) = state.engine.persist_managed_indices() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
 
     Json(single_index_success()).into_response()
 }
@@ -391,6 +426,9 @@ pub async fn retry_ism_index(
     Path(index): Path<String>,
     body: OptionalJson<RetryBody>,
 ) -> impl IntoResponse {
+    if let Err(error) = state.engine.ensure_cluster_state_writable() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
     let body = body.0.unwrap_or_default();
     let Some(mut managed) = state
         .engine
@@ -441,7 +479,9 @@ pub async fn retry_ism_index(
     managed.info_message = "retrying".to_string();
     managed.last_updated_ms = lifecycle::now_ms();
     state.engine.managed_indices.insert(index, managed);
-    state.engine.persist_managed_indices();
+    if let Err(error) = state.engine.persist_managed_indices() {
+        return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+    }
 
     Json(single_index_success()).into_response()
 }
@@ -728,5 +768,146 @@ mod managed_index_action_tests {
                 .unwrap()
                 .failed
         );
+    }
+
+    /// #262 (a since-closed, independent ILM implementation superseded by
+    /// this one) found that an acknowledged
+    /// `PUT {index}/_settings {"index.lifecycle.name": null}` detach was
+    /// silently ignored, and the index was deleted by its policy anyway on
+    /// the next pass. Confirmed live against this engine before this fix:
+    /// the detach call returned `acknowledged: true`, `_ilm/explain` still
+    /// showed `managed: true`, and the index was gone (404) after the next
+    /// lifecycle tick. This test reproduces that exact scenario through the
+    /// real HTTP router and asserts the index survives.
+    #[tokio::test]
+    async fn settings_null_detach_actually_prevents_the_scheduled_delete() {
+        let state = test_state();
+        let state_handle = state.clone();
+        let app = crate::router::build_es_compat_router(state);
+
+        call(&app, "PUT", "/detach-idx", Some(json!({}))).await;
+        call(&app, "PUT", "/control-idx", Some(json!({}))).await;
+        // A policy whose one and only action is an unconditional delete —
+        // the next tick deletes any index still pointing at it.
+        let delete_policy = json!({
+            "policy": {
+                "phases": {
+                    "delete": {"min_age": "0ms", "actions": {"delete": {}}}
+                }
+            }
+        });
+        call(&app, "PUT", "/_ilm/policy/delete-now", Some(delete_policy)).await;
+        call(
+            &app,
+            "PUT",
+            "/detach-idx/_settings",
+            Some(json!({"index.lifecycle.name": "delete-now"})),
+        )
+        .await;
+        call(
+            &app,
+            "PUT",
+            "/control-idx/_settings",
+            Some(json!({"index.lifecycle.name": "delete-now"})),
+        )
+        .await;
+
+        let (_, explain) = call(&app, "GET", "/detach-idx/_ilm/explain", None).await;
+        assert_eq!(
+            explain["indices"]["detach-idx"]["managed"], true,
+            "explain: {explain}"
+        );
+
+        // Detach exactly the way a real client does it.
+        let (status, body) = call(
+            &app,
+            "PUT",
+            "/detach-idx/_settings",
+            Some(json!({"index.lifecycle.name": null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["acknowledged"], true);
+
+        let (_, explain) = call(&app, "GET", "/detach-idx/_ilm/explain", None).await;
+        assert_eq!(
+            explain["indices"]["detach-idx"]["managed"], false,
+            "detach must be reflected immediately, not just acknowledged: {explain}"
+        );
+
+        // Drive one real lifecycle pass — the same code path a live
+        // background tick would run.
+        xerj_engine::lifecycle::tick(&state_handle.engine).await;
+
+        let get_detach = call(&app, "GET", "/detach-idx", None).await;
+        assert_eq!(
+            get_detach.0,
+            StatusCode::OK,
+            "the detached index must survive the pass that would have deleted it"
+        );
+        let get_control = call(&app, "GET", "/control-idx", None).await;
+        assert_eq!(
+            get_control.0,
+            StatusCode::NOT_FOUND,
+            "the control index (never detached) must actually be deleted by the same pass \
+             — otherwise this test would pass even if detach were a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn ilm_remove_detaches_and_404s_on_a_nonexistent_index() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+
+        call(&app, "PUT", "/remove-verb-idx", Some(json!({}))).await;
+        call(
+            &app,
+            "PUT",
+            "/_ilm/policy/remove-verb-policy",
+            Some(simple_policy("only")),
+        )
+        .await;
+        call(
+            &app,
+            "PUT",
+            "/remove-verb-idx/_settings",
+            Some(json!({"index.lifecycle.name": "remove-verb-policy"})),
+        )
+        .await;
+
+        let (status, body) = call(&app, "POST", "/remove-verb-idx/_ilm/remove", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["has_failures"], false);
+
+        let (_, explain) = call(&app, "GET", "/remove-verb-idx/_ilm/explain", None).await;
+        assert_eq!(explain["indices"]["remove-verb-idx"]["managed"], false);
+
+        // Real ES's `ignore_unavailable=false` default: a name that was
+        // never an index 404s rather than silently acknowledging — the
+        // same accept-and-ignore shape #262 found on this exact endpoint
+        // in its own implementation.
+        let (status, _) = call(&app, "POST", "/does-not-exist/_ilm/remove", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn detaching_an_already_unmanaged_index_is_idempotent_not_an_error() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        call(&app, "PUT", "/never-managed-idx", Some(json!({}))).await;
+
+        let (status, body) = call(
+            &app,
+            "PUT",
+            "/never-managed-idx/_settings",
+            Some(json!({"index.lifecycle.name": null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["acknowledged"], true);
+
+        let (status, body) = call(&app, "POST", "/never-managed-idx/_ilm/remove", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["has_failures"], false);
     }
 }

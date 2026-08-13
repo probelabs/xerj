@@ -111,9 +111,10 @@ destructive step (engine/crates/xerj-storage/src/index_store.rs:595-608, 772-778
 **Config sprawl — "3,000+ settings" (01-operational-complexity/learning-curve.md:18-20).** An empty
 or absent config file is valid; every setting has a production default; a typo'd key fails startup
 (`deny_unknown_fields`); schema-present-but-unwired features are rejected loudly at startup
-(config.rs:42-47, 94-108, 198-229). The true count is 102 serde-visible settings (field-by-field
-verified) — the published "38"/"<50" figures are wrong and are blocker 10. 102 vs 3,000+ is ~29x
-fewer (PROJECTED: 3000/102), told truthfully.
+(config.rs:42-47, 94-108, 198-229). The true count is 105 serde-visible settings — measured by
+`count_user_facing_settings`, which serialises `Config::default()` and counts leaf keys, not by
+hand. The published "38"/"<50" figures were wrong; they were corrected with blocker 10
+(2026-08-09, #207). 105 vs 3,000+ is ~29x fewer (PROJECTED: 3000/105), told truthfully.
 
 **Shard sizing expertise (04-scaling-and-shards, cluster-management.md:11).** No up-front shard
 decision exists: ES `number_of_shards` is stored and echoed for wire-compat but never used as a
@@ -428,11 +429,20 @@ Files: engine/crates/xerj-api/src/es_compat.rs, engine/crates/xerj-common/src/me
 migrating users' dashboards silently lose their breaker signal, and the engine's strongest anti-OOM
 feature is experienced as a regression.
 
-### 10. Correct the settings-count claim and make the count drift-proof (small)
+### 10. Correct the settings-count claim and make the count drift-proof (small) — DONE 2026-08-09 (#207)
+
+> Landed as described: the count test now serialises `Config::default()` and counts leaf
+> keys (`journey_zero_config`), the measured total was **103** at the time (104 after
+> rc.14 added `server.allow_insecure_network_bind`, 105 after #247 added
+> `lifecycle.tick_interval_secs`), and the 38/56/60/`<50`
+> figures are corrected across config.rs, xerj-common/src/lib.rs, engine/README.md,
+> xerj.default.toml and the feedback responses. Per-sub-config annotations are corrected
+> too (limits 3 → 13, storage 5 → 10, cluster 4 → 5, embedding 4 → 19, merge 5 → 8,
+> tls 3 → 4, auth 2 → 3). The adversarial pass counted 102; the measured figure is 103.
 
 **Pain.** The "<50 configuration settings (ES has 3,000+)" figure is published in the shipped
 feedback responses (user-feedback/01-operational-complexity/cluster-management.md:63).
-**Today.** config.rs simultaneously claims 38 settings (lines 1-5 and 274-276), 56 fields (89-92),
+**Was (before the fix).** config.rs simultaneously claimed 38 settings (lines 1-5 and 274-276), 56 fields (89-92),
 and 60 (the count test, 1592-1617 — whose own comment two lines earlier says 50, and which sums
 hardcoded integers referencing no struct); per-section doc comments are also stale (config.rs:49-86:
 limits "3" vs actual 13, storage "5" vs 10, cluster "4" vs 5). The true count is 102 serde-visible
@@ -442,8 +452,9 @@ verifier disputed it to blocking under the repo's honest-claims rules — a publ
 doing it before GA, not waiving it. This roadmap adopts the verifier's position.]
 **Build.** Fix all inconsistent counts; replace the hand-written count test with introspection
 (serialize `Config::default()` to `toml::Value`, count leaf keys) so the number can never drift;
-sweep public docs and the feedback responses for the stale "<50"/"38". 102 vs 3,000+ is still the
-winning story, told truthfully. Files: engine/crates/xerj-common/src/config.rs, docs, user-feedback
+sweep public docs and the feedback responses for the stale "<50"/"38". 105 vs 3,000+ is still the
+winning story, told truthfully. [DONE 2026-08-09, #207 — the measured figure was 103 then and is
+105 now; the point of the fix is that it is measured, so it moves with the code.] Files: engine/crates/xerj-common/src/config.rs, docs, user-feedback
 response sections.
 **If shipped without.** A reviewer counts the TOML keys, finds 2.7x the claimed number, and every
 other XERJ number takes the credibility hit.

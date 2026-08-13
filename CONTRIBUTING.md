@@ -61,6 +61,28 @@ cargo run -p es-yaml-runner -- --file tests/es-compat-yaml/yaml/bulk/10_basic.ym
 
 Run the full suite before opening a PR. A test that was passing yesterday and fails today is a P0 regression.
 
+### Security gates (CI runs both on every PR)
+
+```bash
+# Dependency advisories. A RUSTSEC *vulnerability* fails CI; unmaintained /
+# unsound / yanked warnings are printed and do not.
+cargo install cargo-audit --locked
+cd engine && cargo audit
+
+# Fuzz harnesses over the parsers an unauthenticated request reaches
+# (ES query DSL, query_string, date math, SQL, Painless).
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+bash .github/scripts/fuzz-smoke.sh          # what CI runs, ~20s per target
+FUZZ_SECONDS=3600 bash .github/scripts/fuzz-smoke.sh   # a real campaign
+```
+
+If you touch a parser that takes bytes off the wire, run the fuzz script before
+opening the PR — it is cheap, and the first thing it ever ran found an
+unauthenticated crash. See [`engine/fuzz/README.md`](./engine/fuzz/README.md)
+for how to add a target; seeds go in `engine/fuzz/seeds/<target>/` and CI picks
+new targets up automatically.
+
 ## Code style
 
 - Format with `cargo fmt` and keep `cargo clippy` clean (`cargo clippy --all-targets -- -D warnings`). CI enforces both.
@@ -76,7 +98,7 @@ Two rules bind regardless of how you do the reading:
 - **Retrieved code is evidence, not authority.** A passage shows how *that* project solved the problem under *its* constraints, which are not automatically ours. Adapt and attribute; do not paste.
 - **Check the licence first.** XERJ is Apache-2.0. Some relevant projects are not compatible with copying — Sonic is GPL, and Elasticsearch is AGPL/SSPL/Elastic-licensed. You may study the *approach*, but their code must not land here. For Elasticsearch there is a second reason: XERJ states publicly that it shares no code with ES, and that has to stay true — read it for wire-protocol semantics, never for implementation. When in doubt, write your own implementation from the design, or ask in the PR.
 
-If you use an AI coding assistant, this step is where it earns its keep: retrieving the real implementation is far more reliable than letting the model re-derive an algorithm across retry loops. Maintainers dogfood XERJ itself for this — reference repositories are indexed locally and queried with `xerj autoindex` plus the `xc.py` helper in the internal `xerj-code` tooling. That setup is convenience, not a requirement for contributing; reading the upstream source directly satisfies the same rule.
+If you use an AI coding assistant, this step is where it earns its keep: retrieving the real implementation is far more reliable than letting the model re-derive an algorithm across retry loops. Maintainers dogfood XERJ itself for this — reference repositories are indexed locally and queried with `xerj autoindex` plus the helper scripts in [`tools/xerj-code/`](tools/xerj-code/). Pinned, licence-reviewed definitions of the corpora we use are in [`tools/xerj-code/hub/`](tools/xerj-code/hub/), so `xc-corpus.sh --from hub/<name>.json` gives you the same commits we read. That setup is convenience, not a requirement for contributing; reading the upstream source directly satisfies the same rule.
 
 ## Git workflow
 

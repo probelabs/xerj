@@ -107,6 +107,7 @@ struct CliArgs {
     config: Option<PathBuf>,
     data_dir: Option<String>,
     bind: Option<String>,
+    port: Option<String>,
     insecure: bool,
     embed_mode: Option<String>,
     onnx_model: Option<String>,
@@ -120,6 +121,7 @@ fn parse_args() -> CliArgs {
     let mut config = None;
     let mut data_dir = None;
     let mut bind = None;
+    let mut port: Option<String> = None;
     let mut insecure = false;
     let mut embed_mode = None;
     let mut onnx_model = None;
@@ -137,6 +139,9 @@ fn parse_args() -> CliArgs {
             }
             "--bind" | "-b" => {
                 bind = args.next();
+            }
+            "--port" => {
+                port = args.next();
             }
             "--insecure" | "-k" => {
                 insecure = true;
@@ -167,6 +172,7 @@ fn parse_args() -> CliArgs {
         config,
         data_dir,
         bind,
+        port,
         insecure,
         embed_mode,
         onnx_model,
@@ -177,13 +183,28 @@ fn parse_args() -> CliArgs {
 }
 
 fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+/// The help text as a value, so tests can assert that a documented behaviour is
+/// still documented instead of trusting a `println!`. Same house style as
+/// `xerj_autoindex::cli::help_text`.
+fn help_text() -> String {
+    format!(
         "xerj v{} — the unified search engine for AI (Elasticsearch wire-compatible)\n\
          \n\
          USAGE:\n\
-             xerj [OPTIONS]\n\
+             xerj [OPTIONS]                      start the server (options below)\n\
+             xerj autoindex <folder> [OPTIONS]   zero-config discovery + indexing — the\n\
+                                                  flagship path for most agents (see xerj\n\
+                                                  autoindex --help)\n\
+             xerj autoindex map                  print the discovered data map\n\
+             xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
+                                                  index --help)\n\
+             xerj brain <folder>                 index + browse in one command (see xerj\n\
+                                                  brain --help)\n\
          \n\
-         OPTIONS:\n\
+         OPTIONS (for `xerj [OPTIONS]`, the bare server start):\n\
              --config,   -c <PATH>  Path to TOML config file\n\
              --data-dir, -d <PATH>  Override data directory\n\
              --bind,     -b <ADDR>  Interface to bind every listener to. Default 127.0.0.1 —\n\
@@ -194,7 +215,11 @@ fn print_help() {
                                       XERJ_ALLOW_INSECURE_NETWORK_BIND=true), because every\n\
                                       request — API key included — would cross the network in\n\
                                       cleartext. Env: XERJ_BIND_ADDRESS\n\
-             --insecure, -k         Disable TLS\n\
+             --insecure, -k         Disable TLS *and* API-key authentication — local dev only.\n\
+                                      Auth is ON by default, so without this flag every client\n\
+                                      (`xerj autoindex` and `xerj brain` included) must send the\n\
+                                      key this server writes to <data_dir>/admin.key on first\n\
+                                      start — export XERJ_API_KEY=$(cat ./data/admin.key)\n\
              --embed-mode <MODE>    Embedding backend: lexical | neural | proxy | auto |\n\
                                       onnx-experimental\n\
                                       lexical  built-in feature-hash (default; offline, not neural)\n\
@@ -227,6 +252,10 @@ fn print_help() {
                                       client library versions aren't a reliable stand-in for a\n\
                                       compatible server version, confirmed against a real OSD\n\
                                       container). Example: --compat-version 2.11.0\n\
+             --port      <PORT>     Port for the Elasticsearch-compatible API (default 9200).\n\
+                                      Also claims PORT+1 for the native REST API and PORT+2\n\
+                                      for gRPC, so a second instance needs only this one flag:\n\
+                                      xerj --insecure --port 9300 -d ./other-data\n\
              --help,     -h         Show this help\n\
              --version,  -V         Print version and exit\n\
          \n\
@@ -236,6 +265,22 @@ fn print_help() {
              xerj autoindex  map             print the discovered data map\n\
              xerj brain      <folder>        one command: index a folder into a running, browsable\n\
                                              second brain in your browser (see xerj brain --help)\n\
+             xerj mcp        [opts]          Model Context Protocol stdio server: exposes 10 tools\n\
+                                             (search, semantic, vector, hybrid, memory, second-brain)\n\
+                                             to any MCP client. Proxies to a node you already started\n\
+                                             — set XERJ_URL or --url (see xerj mcp --help)\n\
+         \n\
+         SEARCHING A CODEBASE:\n\
+             A search hit returns the whole indexed document, which for source code is the\n\
+             whole file. To get only the matching function or class, ask for the passage:\n\
+         \n\
+                 curl -s $URL/<index>/_search -H 'Content-Type: application/json' \\\n\
+                   -d '{{\"query\":{{\"bool\":{{\"should\":[{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\n\
+                        \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":4}}}}}}]}}}},\n\
+                        \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
+         \n\
+             the `match_phrase` clause ranks the file that DEFINES a symbol above files that merely call it;\n\
+             `_passage` returns the enclosing block. Without them you get whole files.\n\
          \n\
          ENVIRONMENT:\n\
              XERJ_LOG         Log level filter (default: info)\n\
@@ -272,7 +317,7 @@ fn print_help() {
                 (or set only XERJ_COMPAT_VERSION and leave distribution to auto-detect — the two\n\
                 settings are resolved independently, mix and match as needed.)\n",
         env!("CARGO_PKG_VERSION")
-    );
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -432,6 +477,23 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         cfg.server.data_dir = dir.clone();
     }
 
+    // Merge settings this build accepts but does not act on. An operator who
+    // throttles merges to protect query latency was getting no throttle and no
+    // signal (#207); the signal is the minimum. See
+    // `MergeConfig::dormant_overrides` for why these are a warning rather than
+    // the hard startup error `storage.backend` gets.
+    for (key, effect) in cfg.merge.dormant_overrides() {
+        warn!("{key} is set but has no effect in this build: {effect}");
+    }
+
+    // Same treatment for `[compression]` (#318): `level` is wired into the
+    // merge re-encode, `enabled` and `block_size_docs` are not, and an
+    // operator who set all three to trade CPU for $/GB previously got three
+    // no-ops in silence.
+    for (key, effect) in cfg.compression.dormant_overrides() {
+        warn!("{key} is set but has no effect in this build: {effect}");
+    }
+
     // Bind address override: `--bind` flag or `XERJ_BIND_ADDRESS` env (flag
     // wins). Both exist because the default is loopback (#228): without a way
     // to say "expose me" that is not a TOML file, a container image or a
@@ -447,6 +509,33 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         }
         info!("server.bind_address = {addr} (from CLI/env)");
         cfg.server.bind_address = addr;
+    }
+
+    // Running a second instance used to require hand-writing a TOML file, and
+    // the three port keys are not mentioned in `--help`. In a blind usability
+    // run an agent tried `-b 127.0.0.1:9310`, got "not an IP address", and
+    // ended up running `strings` on the binary to find the config key names.
+    // One flag removes that entirely. The sibling ports are derived so a second
+    // instance does not collide on them either; set them individually in a
+    // config file when that matters.
+    if let Some(p) = args.port.clone() {
+        let base: u16 = p.parse().map_err(|_| {
+            anyhow::anyhow!("--port must be a number between 1 and 65533, got {p:?}")
+        })?;
+        if base == 0 || base > 65_533 {
+            anyhow::bail!(
+                "--port must be between 1 and 65533 (it also claims PORT+1 for the \
+                 native REST API and PORT+2 for gRPC), got {base}"
+            );
+        }
+        info!(
+            "server.es_compat_port = {base}, rest_port = {}, grpc_port = {} (from --port)",
+            base + 1,
+            base + 2
+        );
+        cfg.server.es_compat_port = base;
+        cfg.server.rest_port = base + 1;
+        cfg.server.grpc_port = base + 2;
     }
 
     // The #228 opt-out, also settable from the environment so a container can
@@ -1082,6 +1171,8 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
     // Load config but override to a minimal in-process shape.
     let fake_cli = CliArgs {
         config: cmd.config.clone(),
+        // No listener is bound for in-process indexing, so no port applies.
+        port: None,
         data_dir: cmd.data_dir.clone(),
         // In-process CLI indexing binds no listener at all, so the bind
         // address is irrelevant here — take whatever the config says.
@@ -1554,6 +1645,30 @@ fn main() -> Result<()> {
     if matches!(std::env::args().nth(1).as_deref(), Some("__extract-pdf")) {
         std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
     }
+
+    // `xerj mcp` — MCP stdio server (newline-delimited JSON-RPC on
+    // stdin/stdout), proxying to an already-running XERJ node.
+    //
+    // Dispatched HERE, ahead of the production runtime, for two reasons:
+    //
+    //  1. Size. A stdio proxy that awaits one line at a time does not need
+    //     8×cores worker threads at 4 MiB of stack each; two threads is the
+    //     whole shape of the work. Same reasoning as the PDF worker above.
+    //  2. stdout purity. MCP's stdio transport reserves stdout exclusively for
+    //     the JSON-RPC stream — one stray banner line and the host's parser
+    //     desynchronises. Everything below this point (`parse_args`'s
+    //     --help/--version fast paths, the startup banner, the console setup
+    //     link) writes to stdout; nothing above it does. `xerj-mcp` logs to
+    //     stderr only, by construction.
+    //
+    // This is what makes the MCP server obtainable: before it, `xerj-mcp` was
+    // a workspace crate that CI built and no release shipped, so the only way
+    // to get it was to clone the repo and compile. Now `curl … | sh` is enough.
+    if matches!(std::env::args().nth(1).as_deref(), Some("mcp")) {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let rt = build_runtime(2)?;
+        return rt.block_on(xerj_mcp::run(&args));
+    }
     // Cores from the resource policy, so `XERJ_NUM_CPUS` and a container CPU
     // quota reach the async runtime the same way they reach every pool (#240).
     let cores = xerj_common::resource::cores();
@@ -1621,6 +1736,56 @@ fn build_runtime(worker_threads: usize) -> Result<tokio::runtime::Runtime> {
         .thread_name("xerj-rt")
         .build()
         .context("build tokio runtime")
+}
+
+#[cfg(test)]
+mod help_text_tests {
+    use super::help_text;
+
+    /// `--insecure` disables TLS **and** auth (see `apply_overrides`, which
+    /// sets `cfg.tls.enabled = false; cfg.auth.enabled = false;`), but the
+    /// help said only "Disable TLS". Auth is on by default, so that flag is
+    /// precisely what makes `xerj autoindex` work against a fresh server — and
+    /// a user reading only `--help` could not learn that. The help must
+    /// describe both halves of what the flag does.
+    #[test]
+    fn insecure_help_documents_auth_not_just_tls() {
+        let help = help_text();
+        let line = help
+            .lines()
+            .position(|l| l.contains("--insecure"))
+            .expect("--insecure must be documented");
+        // The flag's own paragraph: its line plus the indented continuation
+        // lines under it, stopping at the next flag.
+        let para: String = help
+            .lines()
+            .skip(line)
+            .take(1)
+            .chain(
+                help.lines()
+                    .skip(line + 1)
+                    .take_while(|l| !l.trim_start().starts_with("--")),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            para.contains("TLS"),
+            "--insecure must still say it disables TLS, got:\n{para}"
+        );
+        assert!(
+            para.contains("auth"),
+            "--insecure disables authentication too and the help must say so, got:\n{para}"
+        );
+        assert!(
+            para.contains("admin.key"),
+            "the help must point at the key a non-insecure server demands, got:\n{para}"
+        );
+        assert!(
+            para.contains("XERJ_API_KEY"),
+            "the help must name the env var that carries the key, got:\n{para}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1857,6 +2022,7 @@ async fn async_main() -> Result<()> {
 
     // 8. Engine (opens existing indices from disk)
     let engine = Engine::new(cfg.clone()).context("initialise engine")?;
+    let storage_available = engine.cluster_state_boot_status().is_writable();
 
     // This node's own cluster address, composed from the parsed bind IP.
     // Needed twice — by the transport (8b) and by the console's node identity
@@ -1865,7 +2031,7 @@ async fn async_main() -> Result<()> {
     let cluster_listen_addr = cfg.socket_addr(cfg.cluster.port);
 
     // 8b. Cluster runner (if cluster mode is enabled)
-    let _cluster_shutdown = if cfg.cluster.enabled {
+    let _cluster_shutdown = if cfg.cluster.enabled && storage_available {
         // Fail closed (issue #75). The cluster port carries Raft control
         // messages; without a shared secret every frame on it is
         // unauthenticated, so refuse to start rather than open it. This must
@@ -1936,6 +2102,11 @@ async fn async_main() -> Result<()> {
         }
 
         Some(shutdown_tx)
+    } else if cfg.cluster.enabled {
+        warn!(
+            "cluster transport is disabled while cluster-state storage is unavailable; restart with supported bytes before rejoining peers"
+        );
+        None
     } else {
         info!("Cluster mode disabled — running in single-node mode");
         None
@@ -1945,6 +2116,13 @@ async fn async_main() -> Result<()> {
     //    boot, persists a 32-byte master key under data_dir/.xerj_master_key
     //    (mode 0600), and prints the first-launch magic-link banner to
     //    stderr if no active user exists yet.  Idempotent on reboot.
+    //
+    //    This is storage activation, not cosmetic UI setup. When the engine's
+    //    cluster-state compatibility fence is blocked, boot must remain live
+    //    only for diagnostics: opening and seeding Console indices can replay
+    //    their WAL and flush a new segment. The Console surface is therefore
+    //    absent until a supported restart instead of mounting with a made-up
+    //    key or partially-initialized stores.
     let xerj_console_bind_url = format!(
         "http://{}:{}",
         if cfg.server.bind_address == "0.0.0.0" || cfg.server.bind_address == "::" {
@@ -1957,14 +2135,6 @@ async fn async_main() -> Result<()> {
         },
         cfg.server.es_compat_port,
     );
-    let xerj_console_outcome = xerj_console_api::bootstrap::run(
-        &engine,
-        Path::new(&cfg.server.data_dir),
-        &xerj_console_bind_url,
-    )
-    .await
-    .context("xerj-console bootstrap")?;
-
     let xerj_console_node_id: String = match (cfg.cluster.enabled, cluster_listen_addr) {
         // The same string the cluster transport registered as this node's id.
         (true, Some(addr)) => addr.to_string(),
@@ -1996,13 +2166,29 @@ async fn async_main() -> Result<()> {
             }
         );
     }
-    let xerj_console_state = ConsoleState::new(
-        engine.clone(),
-        xerj_console_node_id,
-        xerj_console_outcome.master_key,
-        xerj_console_cluster_mode,
-    )
-    .with_trusted_proxies(trusted_proxies);
+    let xerj_console_state = if storage_available {
+        let outcome = xerj_console_api::bootstrap::run(
+            &engine,
+            Path::new(&cfg.server.data_dir),
+            &xerj_console_bind_url,
+        )
+        .await
+        .context("xerj-console bootstrap")?;
+        Some(
+            ConsoleState::new(
+                engine.clone(),
+                xerj_console_node_id,
+                outcome.master_key,
+                xerj_console_cluster_mode,
+            )
+            .with_trusted_proxies(trusted_proxies),
+        )
+    } else {
+        warn!(
+            "Xerj Console bootstrap and routes are disabled while cluster-state storage is unavailable"
+        );
+        None
+    };
 
     // 9b. Application state
     let state = AppState::new(cfg.clone(), engine, metrics);
@@ -2016,7 +2202,9 @@ async fn async_main() -> Result<()> {
     //       / wal_size_bytes / memory_usage live (otherwise a flat zero even at
     //       millions of docs, hiding the RSS-runaway and WAL-growth signals).
     xerj_engine::set_engine_metrics(state.metrics.clone());
-    tokio::spawn(xerj_api::es_compat::run_metrics_gauge_loop(state.clone()));
+    if storage_available {
+        tokio::spawn(xerj_api::es_compat::run_metrics_gauge_loop(state.clone()));
+    }
 
     // 9c. Routers — engine and Xerj Console are *peer* surfaces.  Each crate
     //     builds a complete Router (routes + its own auth + its own
@@ -2026,9 +2214,13 @@ async fn async_main() -> Result<()> {
     //     /_xerj-console/api/v1/* routes.  Yanking xerj-console-api out of this
     //     merge would leave xerj-api compiling and serving on its own
     //     — a property worth preserving.
-    let xerj_console_router = xerj_console_api::xerj_console_router(xerj_console_state);
-    let native_router = build_native_router(state.clone()).merge(xerj_console_router.clone());
-    let es_router = build_es_compat_router(state.clone()).merge(xerj_console_router);
+    let mut native_router = build_native_router(state.clone());
+    let mut es_router = build_es_compat_router(state.clone());
+    if let Some(console_state) = xerj_console_state {
+        let xerj_console_router = xerj_console_api::xerj_console_router(console_state);
+        native_router = native_router.merge(xerj_console_router.clone());
+        es_router = es_router.merge(xerj_console_router);
+    }
 
     // 10. Banner (includes total startup time)
     let startup_ms = startup_start.elapsed().as_millis();
@@ -2056,24 +2248,30 @@ async fn async_main() -> Result<()> {
         .with_context(|| bad_bind_address(&cfg))?;
 
     // 12. Background flush timer
-    let flusher = spawn_periodic_flusher(
-        state.engine.clone(),
-        std::time::Duration::from_secs(cfg.storage.flush_interval_secs),
-    );
+    let flusher = storage_available.then(|| {
+        spawn_periodic_flusher(
+            state.engine.clone(),
+            std::time::Duration::from_secs(cfg.storage.flush_interval_secs),
+        )
+    });
 
     // 12b. Resource governor sampler (RC4 W3 items 1 & 3): refreshes the
     //      process-wide memtable / RSS / disk-usage atomics that drive the
     //      parent circuit breaker and the disk flood-stage write block. This
     //      is the structural guard against the 112 GiB OOM class — writes get
     //      a 429 circuit_breaking_exception before the kernel OOM-kills us.
-    state.engine.spawn_resource_sampler();
+    if storage_available {
+        state.engine.spawn_resource_sampler();
+    }
 
     // 12c. ISM/ILM lifecycle-management background job: drives every
     //      managed index's state machine (actions, then transitions) on
     //      `lifecycle.tick_interval_secs` (default 5 minutes).
-    state.engine.spawn_lifecycle_manager();
+    if storage_available {
+        state.engine.spawn_lifecycle_manager();
+    }
 
-    let _ingest_memory_trace = ingest_memory_trace::spawn(&state.engine);
+    let _ingest_memory_trace = storage_available.then(|| ingest_memory_trace::spawn(&state.engine));
     // 13. Start servers concurrently
     let rest_tls = tls_config.clone();
     let rest = tokio::spawn(async move {
@@ -2113,7 +2311,9 @@ async fn async_main() -> Result<()> {
     // boot, flush-permit exhaustion on the last write) sat in memory —
     // pinning its WAL generations on disk — until shutdown or the next
     // explicit `_flush`.
-    flusher.abort();
+    if let Some(flusher) = flusher {
+        flusher.abort();
+    }
 
     // 15. Final synchronous flush across every index.
     //
@@ -2126,10 +2326,12 @@ async fn async_main() -> Result<()> {
     // sessions) loses 100 % of its data on restart because startup index
     // discovery looks for segment-bearing directories first.  See POV
     // report 2026-04-24T23-58-00 (B-2) for the full failure mode.
-    info!("flushing in-memory state before exit…");
-    let flush_started = std::time::Instant::now();
-    state.engine.flush_all_force().await;
-    info!("final flush complete in {:.0?}", flush_started.elapsed());
+    if storage_available {
+        info!("flushing in-memory state before exit…");
+        let flush_started = std::time::Instant::now();
+        state.engine.flush_all_force().await;
+        info!("final flush complete in {:.0?}", flush_started.elapsed());
+    }
 
     info!("xerj v{} stopped. Goodbye.", env!("CARGO_PKG_VERSION"));
     Ok(())

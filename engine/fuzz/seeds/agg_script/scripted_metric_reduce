@@ -1,0 +1,1 @@
+state.sum = 0; for (s : states) { state.sum += s; } return state.sum;

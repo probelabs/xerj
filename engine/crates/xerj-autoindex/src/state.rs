@@ -50,7 +50,57 @@ pub struct PlanDataset {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_id_in_second, Journal};
+    use super::{run_id_in_second, Journal, StateLock};
+
+    /// `flock` ownership follows the open file description, so an inherited
+    /// descriptor can unlock the acquiring parent's lock. Model that post-fork
+    /// relationship deterministically with `try_clone`: a guard whose recorded
+    /// owner is a different PID must close only, while the acquiring owner's
+    /// guard must still release the lock.
+    #[cfg(unix)]
+    #[test]
+    fn foreign_pid_drop_preserves_lock_until_owner_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.lock");
+        let owner_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&owner_file).unwrap();
+        let inherited_file = owner_file.try_clone().unwrap();
+        let owner_pid = std::process::id();
+        let foreign_pid = if owner_pid == u32::MAX {
+            owner_pid - 1
+        } else {
+            owner_pid + 1
+        };
+        let owner = StateLock {
+            file: owner_file,
+            owner_pid,
+        };
+        let inherited = StateLock {
+            file: inherited_file,
+            owner_pid: foreign_pid,
+        };
+
+        drop(inherited);
+
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&contender)
+            .expect_err("a foreign-PID drop must not unlock the live owner's flock");
+
+        drop(owner);
+        fs2::FileExt::try_lock_exclusive(&contender)
+            .expect("the acquiring owner's drop must release its flock");
+        fs2::FileExt::unlock(&contender).unwrap();
+    }
 
     #[test]
     fn legacy_journal_can_resume_with_a_custom_operational_timeout() {
@@ -370,7 +420,7 @@ pub struct FileDone {
 pub struct Journal {
     path: PathBuf,
     file: std::fs::File,
-    _state_lock: std::fs::File,
+    _state_lock: StateLock,
     pub run_id: String,
     pub resumed: bool,
     pub done: HashMap<String, FileDone>,
@@ -386,6 +436,27 @@ pub struct Journal {
     pub committed_manifest: Option<crate::sync::CommittedManifest>,
     pub pending_sync: Option<crate::sync::PendingSync>,
     pub legacy_migration_reasons: Vec<String>,
+}
+
+/// Owns the process-wide state-directory exclusion lock.
+///
+/// Closing the file normally releases an `flock`, but a concurrently forked
+/// child can temporarily retain the same open-file description until it
+/// execs. The acquiring process explicitly unlocks before close so its
+/// completed Journal cannot be retained by that child. An inherited copy must
+/// only close: `LOCK_UN` on the shared open-file description would also release
+/// the still-live parent's lock.
+struct StateLock {
+    file: std::fs::File,
+    owner_pid: u32,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        if std::process::id() == self.owner_pid {
+            let _ = fs2::FileExt::unlock(&self.file);
+        }
+    }
 }
 
 /// Per-process monotonic suffix for [`new_run_id`].
@@ -512,11 +583,10 @@ fn read_plan_for_preflight(
             // preflight accepts. It cannot be treated as durable here.
             break;
         }
-        let value: Value =
-            serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice()))
-                .with_context(|| {
-                    format!(
-                        "journal corruption at byte {record_start} in {}: malformed \
+        let record_bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice());
+        let value = crate::sync::decode_unique_durable_json(record_bytes).with_context(|| {
+            format!(
+                "journal corruption at byte {record_start} in {}: malformed \
                          newline-terminated record. Refusing to discard later records. Restore \
                          the journal from a backup, or truncate it to exactly {record_start} \
                          bytes to keep every completion recorded before the corruption. Deleting \
@@ -527,9 +597,9 @@ fn read_plan_for_preflight(
                          new --state-dir, new --prefix, and new --brain when graph detection \
                          is enabled (or --no-graph); explicitly validate and clean the shared \
                          catalog and old target",
-                        path.display()
-                    )
-                })?;
+                path.display()
+            )
+        })?;
         match value.get("kind").and_then(Value::as_str) {
             Some("run") => {
                 let recorded_root = value.get("root").and_then(Value::as_str).unwrap_or("");
@@ -565,7 +635,24 @@ fn read_plan_for_preflight(
                 }
             }
             Some(kind) if crate::sync::is_sync_record_kind(kind) => {
-                crate::sync::replay_record(&value, &mut committed_manifest, &mut pending_sync)?;
+                // Same contract as the authoritative replay in
+                // `open_after_preflight` (#283): this preflight runs first, so
+                // an invariant that leaks here bare is the one the user sees.
+                crate::sync::replay_durable_record(
+                    &value,
+                    record_bytes,
+                    &mut committed_manifest,
+                    &mut pending_sync,
+                )
+                .with_context(|| {
+                    format!(
+                        "the durable {kind} record at byte {record_start} in {} failed to \
+                         replay; the generation journal is not internally consistent, \
+                         and re-running will not repair it. No remote data was changed. \
+                         Rebuild with a new --state-dir and a new --prefix",
+                        path.display()
+                    )
+                })?;
                 if matches!(kind, "sync_bootstrap" | "sync_commit") {
                     plan = committed_manifest
                         .as_ref()
@@ -591,7 +678,7 @@ fn read_plan_for_preflight(
 
 pub struct JournalPreflight {
     state_dir: PathBuf,
-    state_lock: std::fs::File,
+    state_lock: StateLock,
     pub plan: Option<Plan>,
     pub committed_manifest: Option<crate::sync::CommittedManifest>,
     pub pending_sync: Option<crate::sync::PendingSync>,
@@ -620,19 +707,26 @@ impl Journal {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
         let lock_path = state_dir.join(".autoindex.lock");
-        let state_lock = std::fs::OpenOptions::new()
+        let state_lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
-        state_lock.try_lock_exclusive().with_context(|| {
+        state_lock_file.try_lock_exclusive().with_context(|| {
             format!(
                 "autoindex state {} is already in use by another process; wait for it to \
                  finish or choose a different --state-dir",
                 state_dir.display()
             )
         })?;
+        // Capture the acquiring process before any later fallible work. A
+        // forked child inherits this value and therefore closes without
+        // unlocking the parent's shared open-file description.
+        let state_lock = StateLock {
+            file: state_lock_file,
+            owner_pid: std::process::id(),
+        };
         let journal_path = state_dir.join("journal.ndjson");
         let journal_exists = journal_path.exists();
         let (plan, committed_manifest, pending_sync, legacy_migration_reasons, unreadable_plan) =
@@ -735,9 +829,8 @@ impl Journal {
                     break;
                 }
                 let newline_terminated = bytes.last() == Some(&b'\n');
-                match serde_json::from_slice::<Value>(
-                    bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice()),
-                ) {
+                let record_bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes.as_slice());
+                match crate::sync::decode_unique_durable_json(record_bytes) {
                     Ok(v) if newline_terminated => {
                         valid_end += read as u64;
                         match v.get("kind").and_then(|k| k.as_str()) {
@@ -838,11 +931,27 @@ impl Journal {
                                 embedding_identity_resumable = resumable;
                             }
                             Some(kind) if crate::sync::is_sync_record_kind(kind) => {
-                                crate::sync::replay_record(
+                                // A durable record that no longer re-validates
+                                // is unrepairable by re-running; surface the
+                                // rebuild route instead of a bare internal
+                                // invariant, keeping the invariant as the
+                                // cause (#283).
+                                crate::sync::replay_durable_record(
                                     &v,
+                                    record_bytes,
                                     &mut committed_manifest,
                                     &mut pending_sync,
-                                )?;
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "the durable {kind} record at byte {record_start} in {} \
+                                         failed to replay; the generation journal is not \
+                                         internally consistent, and re-running will not repair \
+                                         it. No remote data was changed. Rebuild with a new \
+                                         --state-dir and a new --prefix",
+                                        jpath.display()
+                                    )
+                                })?;
                                 if matches!(kind, "sync_bootstrap" | "sync_commit") {
                                     plan = committed_manifest
                                         .as_ref()
@@ -902,7 +1011,7 @@ impl Journal {
                     Err(error) => {
                         anyhow::bail!(
                             "journal corruption at byte {record_start} in {}: malformed \
-                             newline-terminated record ({error}). Refusing to discard records \
+                            newline-terminated record ({error:#}). Refusing to discard records \
                              after corruption. Restore the journal from a backup, or truncate it \
                              to exactly {record_start} bytes to keep every completion recorded \
                              before the corruption (files journaled after that point are \
@@ -1393,6 +1502,144 @@ mod sync_journal_tests {
             },
         )
         .unwrap()
+    }
+
+    fn historical_issue_283_journal(sync_begin: &str) -> Vec<u8> {
+        let run = serde_json::json!({
+            "v": 1,
+            "kind": "run",
+            "root": "root",
+            "url": "url",
+            "prefix": "prefix",
+            "bulk_timeout_secs": 300,
+            "run_id": "run-issue-283-fixture",
+            "started": "2026-08-10T00:00:00Z"
+        });
+        let bootstrap = serde_json::json!({
+            "kind": "sync_bootstrap",
+            "manifest": crate::sync::CommittedManifest::genesis().unwrap(),
+        });
+        format!("{run}\n{bootstrap}\n{sync_begin}\n").into_bytes()
+    }
+
+    fn historical_issue_283_begin() -> String {
+        // Mechanical whitespace removal preserves the checked-in decimal
+        // token; parsing it here would erase the historical boundary.
+        include_str!("../tests/fixtures/issue_283_sync_begin.json")
+            .lines()
+            .collect()
+    }
+
+    fn assert_preflight_and_authoritative_open_reject(
+        valid_journal: &[u8],
+        invalid_journal: &[u8],
+        marker: &str,
+    ) {
+        let preflight_dir = tempfile::tempdir().unwrap();
+        std::fs::write(preflight_dir.path().join("journal.ndjson"), invalid_journal).unwrap();
+        let error = Journal::preflight(preflight_dir.path(), "root", "url", "prefix", false)
+            .err()
+            .expect("preflight must reject the raw durable mutation");
+        assert!(format!("{error:#}").contains(marker), "{error:#}");
+
+        // Pass preflight over valid bytes, then mutate the journal while its
+        // lock remains held. This directly exercises the authoritative replay
+        // in open_after_preflight rather than failing in preflight twice.
+        let open_dir = tempfile::tempdir().unwrap();
+        let path = open_dir.path().join("journal.ndjson");
+        std::fs::write(&path, valid_journal).unwrap();
+        let preflight =
+            Journal::preflight(open_dir.path(), "root", "url", "prefix", false).unwrap();
+        std::fs::write(&path, invalid_journal).unwrap();
+        let error = Journal::open_after_preflight(preflight, "root", "url", "prefix", 300, false)
+            .err()
+            .expect("authoritative open must reject the raw durable mutation");
+        assert!(format!("{error:#}").contains(marker), "{error:#}");
+    }
+
+    #[test]
+    fn raw_sync_begin_mutations_fail_at_preflight_and_authoritative_open() {
+        let begin = historical_issue_283_begin();
+        let valid = historical_issue_283_journal(&begin);
+        let cases = [
+            (
+                "desired payload",
+                begin.replacen("245.44444444444446", "245.44444444444449", 1),
+                "desired manifest digest does not match sync_begin payload",
+            ),
+            (
+                "operation list",
+                begin.replacen(
+                    "\"operations\": []",
+                    "\"operations\": [{\"operation_id\":\"delete:ghost\",\"kind\":\"delete\",\"group_id\":\"ghost\"}]",
+                    1,
+                ),
+                "sync operation list was not derived exactly",
+            ),
+            (
+                "desired digest",
+                begin.replacen(
+                    "axm1-5e314eb29c9617433af240313b94e544",
+                    "axm1-5e314eb29c9617433af240313b94e545",
+                    1,
+                ),
+                "desired manifest digest does not match sync_begin payload",
+            ),
+            (
+                "execution identity",
+                begin.replacen("\"chunker_identity\": \"chunker-v1\"", "\"chunker_identity\": \"chunker-v2\"", 1),
+                "desired manifest digest does not match sync_begin payload",
+            ),
+        ];
+        for (label, mutated, marker) in cases {
+            assert_ne!(mutated, begin, "mutation did not apply: {label}");
+            assert_preflight_and_authoritative_open_reject(
+                &valid,
+                &historical_issue_283_journal(&mutated),
+                marker,
+            );
+        }
+    }
+
+    #[test]
+    fn raw_content_identity_mutation_fails_at_preflight_and_authoritative_open() {
+        let source = tempfile::tempdir().unwrap();
+        let mut journal = journal_with_plan(source.path());
+        journal.sync_begin(&pending(&journal)).unwrap();
+        drop(journal);
+        let valid = std::fs::read(source.path().join("journal.ndjson")).unwrap();
+        let valid_text = String::from_utf8(valid.clone()).unwrap();
+        // Target only the ManifestGroup field. The plan's FileAssignment has
+        // the same digest text but a different following field.
+        let mutated_text = valid_text.replacen(
+            "\"content_digest\":\"digest-a\",\"content_size\":10,\"canonical\"",
+            "\"content_digest\":\"digest-b\",\"content_size\":10,\"canonical\"",
+            1,
+        );
+        assert_ne!(mutated_text, valid_text, "content mutation did not apply");
+        assert_preflight_and_authoritative_open_reject(
+            &valid,
+            mutated_text.as_bytes(),
+            "plan canonical projection disagrees with manifest group",
+        );
+    }
+
+    #[test]
+    fn duplicate_kind_is_rejected_before_last_key_can_bypass_sync_routing() {
+        let valid = concat!(
+            "{\"v\":1,\"kind\":\"run\",\"root\":\"root\",\"url\":\"url\",",
+            "\"prefix\":\"prefix\",\"run_id\":\"valid\"}\n"
+        );
+        let duplicate = concat!(
+            "{\"v\":1,\"kind\":\"sync_begin\",\"kind\":\"run\",",
+            "\"root\":\"root\",\"url\":\"url\",\"prefix\":\"prefix\",",
+            "\"run_id\":\"ambiguous\"}\n"
+        );
+        assert_preflight_and_authoritative_open_reject(
+            valid.as_bytes(),
+            duplicate.as_bytes(),
+            "duplicate JSON object key \"kind\"",
+        );
     }
 
     #[test]

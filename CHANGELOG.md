@@ -7,10 +7,182 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.0.0-rc.16] - 2026-08-13
+
+Both rc.15 known issues (the progress-stream forgery and the outer-`.gitignore`
+reach into nested checkouts) are fixed in this release — see Fixed below.
+
+### Performance
+
+- **An idle node with many indices burned ~4 CPU cores and made the host
+  machine unusable.** `IndexStore` spawned one OS thread per index that woke
+  every `wal_batch_ms` (default 100 ms) and locked *every* WAL shard of that
+  store to ask whether it was dirty. With the default 16 ingest shards that is
+  ~1.5M lock operations per second on a 9,382-index node, for an answer that is
+  always "no" on an idle index. WAL fsync is now scheduled by one process-wide,
+  event-driven pool (`(cores/2).clamp(2,8)` threads, spawned lazily): a shard
+  arms itself when a write arrives, and **an index with no pending writes costs
+  nothing — no thread, no wakeup**.
+
+  Measured on a real 9,382-index corpus, idle, with zero clients (10 samples ×
+  15s): threads **9,709 → 339**; CPU **718-760% → 59.7-68.3%**; context
+  switches **~197,000/s → ~4,000/s**; interrupts **~142,000/s → ~7,600/s**.
+  Thread count no longer scales with index count — 20 indices versus 200 is 335
+  threads versus 335, where it was 365 versus 541.
+
+  Durability is unchanged and was verified with `strace -f -y -tt` so WAL
+  fsyncs are distinguishable from snapshot fsyncs: `sync` fsyncs before ack,
+  `batched` issues exactly one fsync inside the `wal_batch_ms` window, `async`
+  issues none, and `kill -9` plus restart recovered every acked document in all
+  three modes. RSS is a smaller win and reported as such: marginal 0.699 → 0.682
+  MB per index (~12 KB/index of thread stack), since per-index RSS is dominated
+  by index state rather than the thread. (#334)
+
+  Not fixed here: ~0.65 core remains on that node from node-global sampling and
+  O(indices)-per-tick work on shared timers — a different mechanism, tracked
+  separately.
+
+### Security
+
+- **`cargo-audit` and `cargo-fuzz` now actually run in CI — they were only ever
+  documented** ([#207](https://github.com/xerj-org/xerj/issues/207)).
+  `user-feedback/09-security/cves-and-vulnerabilities.md` listed "`cargo-audit`
+  for dependency vulnerability scanning" and "fuzz testing (cargo-fuzz) on all
+  input parsing paths" as part of XERJ's answer to Elasticsearch's CVE history.
+  Neither existed: no audit job, no fuzz job, no fuzz target anywhere in the
+  tree. A reader comparing the two engines priced in a fuzzed parser surface
+  that was not there.
+  - New CI job `security-audit` runs `cargo audit` on every push and pull
+    request; a RUSTSEC vulnerability advisory fails the build.
+  - New CI job `fuzz` builds and runs seven libFuzzer harnesses
+    (`engine/fuzz/`) over checked-in seeds: the Elasticsearch query DSL, the
+    Lucene `query_string` grammar, date math and date-format patterns,
+    index-name date math, SQL, Painless scripts, and the aggregation engine's
+    two separate script tokenisers. `.github/scripts/fuzz-smoke.sh` is the same
+    entry point locally and in CI.
+  - `xerj-engine/tests/security_tooling_claims.rs` fails if a documented tool
+    stops running, if a fuzz target ships without a seed corpus, or if the
+    "all input parsing paths" overclaim reappears in any prose file.
+  - The claim itself is now specific about what is and is not covered.
+  - **Known gap, stated because the point of this entry is not to overclaim
+    again:** seven harnesses are seven parsers, not the engine's whole input
+    surface, and one parser outside them is already known to abort.
+    `aggs::parse_time_zone_offset` slices a `time_zone` string at byte 2 after
+    a *byte*-length check, so a `date_histogram` with `"time_zone": "+中a"` in
+    an unauthenticated `_search` body dies on a character boundary. It is
+    pre-existing, is not touched by this change, and is tracked in
+    [#272](https://github.com/xerj-org/xerj/issues/272) with a fix and a
+    proposed harness for the aggregation date parsers.
+
+- **Fixed two high-severity advisories in the document-ingest XML parser.**
+  Turning the audit gate on found `quick-xml` 0.36.2 in `xerj-autoindex`, which
+  parses `.docx`, `.xlsx` and `.xml` files supplied by whoever owns the folder
+  being indexed: RUSTSEC-2026-0195 (unbounded namespace-declaration allocation →
+  memory-exhaustion DoS, CVSS 7.5) and RUSTSEC-2026-0194 (quadratic run time on
+  duplicate attribute names, CVSS 7.5). Upgraded to 0.41, which also
+  de-duplicates the crate — 0.41 was already in the tree via `pdf_oxide`.
+  `crossbeam-epoch` moved 0.9.18 → 0.9.20 for RUSTSEC-2026-0204.
+
 ### Fixed
 
+
+- **Following the documented setup and running `xerj autoindex` failed with a
+  401.** `AuthConfig::default()` is `enabled: true`, so copying the shipped
+  config as the docs instruct produced an auth-enabled server, while the pages
+  that show `autoindex` all pass `--insecure` and the pages that tell you to
+  write a config never mention a key. `ping()` also discarded the HTTP status,
+  so the 401 on the first round trip was swallowed and the run printed ~15 lines
+  of healthy-looking progress before dying at the embedding-identity probe with
+  a message about the server's *capabilities* — leading the reporter to conclude
+  their server lacked a feature rather than a credential. `ping()` and
+  `embedding_execution_identity()` now fail fast and actionably on 401/403,
+  `autoindex` gained the `admin.key` fallback `brain` already had (loopback
+  only), the server sends `WWW-Authenticate: ApiKey realm="xerj"`, and the 401
+  body names the real data dir plus `XERJ_API_KEY`, `--api-key` and
+  `--insecure`. Reported by a user on macOS. (#333)
+
+- **`xerj-done` reported an identical success line whether or not any source
+  code was indexed.** A corpus in which every code file was junked printed the
+  same terminal record as a healthy one, which is how a silently degraded
+  index went unnoticed. The terminal line and run document now carry
+  `code_files`, `code_files_indexed` and `code_files_junked` on both the
+  generated and legacy paths, and a warning is emitted before the terminal line
+  when code files were detected and none produced an indexed record. Named
+  `code_files_indexed` rather than `ast` deliberately: a code file with no
+  captured symbols still indexes correctly, so `ast` would overstate. (#294,
+  #316)
+
+
+- **The licence detector was wrong on 2 of the 13 repositories it had
+  classified.** `sonic` was recorded as `GPL` when it is **MPL-2.0** — MPL-2.0
+  defines "Secondary License" in terms of the GNU GPL inside its own text, and
+  restrictive-first *body* matching hit that first. `quickwit` was recorded as
+  `Apache-2.0/UNKNOWN` when it is plain **Apache-2.0** — `LICENSE-3rdparty.csv`
+  is a dependency inventory, not the project's licence. The classifier now
+  reads the title line before the body and skips third-party inventories.
+  Elasticsearch's triple licence still resolves to `AGPL` from its title, so
+  the safe direction is preserved where it matters most; that is a test.
+
+- **A corpus manifest could write outside the corpus directory and destroy an
+  unrelated checkout.** `--from` is documented as "rebuild a corpus someone
+  else defined", so a manifest is untrusted input — but only the *corpus* name
+  was screened, while the per-repo `repo` field, from the same file, was used
+  directly as a path. A manifest with `"repo": "../../../work/repo"` moved that
+  checkout to the manifest's commit, discarded its uncommitted changes and
+  untracked files (`checkout --force`, `clean -fd`), and rewrote its `origin`
+  remote. `repo` must now be a plain directory name, enforced in `xc-corpus.sh`
+  and in `validate_manifest.py`, with the destructive path double-guarded.
+
+- **`xc-index.sh` silently ignored an unrecognised argument.**
+  `xc-index.sh <corpus> --frsh` set no flag, ran an *incremental* index and
+  exited 0. Because `autoindex` keeps incremental state in `~/.xerj/autoindex/`,
+  a run that should have been fresh skips every file as "already indexed" and
+  leaves a corpus with 0 documents that retrieves nothing, reporting no error
+  anywhere. Unknown arguments are now rejected by name.
+
+- **`xc.py` warned about only `GPL` and `LGPL`, by exact match**, so it was
+  silent on every restricted repository the hub deliberately ships:
+  elasticsearch (AGPL/SSPL/Elastic), meilisearch's BUSL Enterprise Edition
+  parts, and — once the detector above was corrected from `GPL` to `MPL-2.0` —
+  sonic, which had been warning before. The warning at retrieval time is the
+  one that counts, because that is when an agent is looking at the code and
+  deciding whether to lift it; it now covers the same set as `xc-corpus.sh`.
+
+- New CI job `reference-coding`: shell and Python syntax, the offline
+  round-trip suite (`tools/xerj-code/tests/test_xc_corpus.sh`, 28 checks, local
+  git repositories over `file://`, never touching the real `~/.xerj-code`), and
+  `validate_manifest.py --hub` over every shipped manifest.
+
+- **A binary that does not understand `cluster_state.json` now fails closed
+  before activating storage.** The previous loader accepted future and
+  partially-understood shapes, dropped fields it did not know, and could later
+  rewrite the reduced document over the original. Boot now accepts only the
+  complete shipped format-1 envelope, including duplicate-key and nested-shape
+  checks. A rejected document leaves liveness at 200 and readiness at 503, but
+  opens no user index, Console system index, WAL, segment, or durable audit
+  sink; Console bootstrap and storage background jobs remain disabled until a
+  supported restart. After the existing request-size, authentication, and
+  authorization gates, HTTP storage access returns the stable
+  `cluster_state_unavailable` 503; authenticated gRPC calls return
+  `UNAVAILABLE`. Existing 401/403/body-limit precedence is unchanged. Client
+  responses give the category and recovery action without a local path or
+  persisted object names; the server log carries the detailed classification
+  and path for the operator. The original bytes and any legacy staging file
+  stay in place, and a blocked boot creates no salvage copy. Format-1 rewrites
+  retain the existing
+  same-directory temp-file fsync and atomic rename; parent-directory sync is a
+  best-effort attempt whose errors are ignored, so this change does not claim
+  strict namespace durability across power loss. Data-directory creation,
+  `node.lock` acquisition/PID diagnostics, and the server's earlier
+  credential/TLS preparation retain their existing behavior; the no-open/no-
+  replay claim begins at the cluster-state classification and covers storage
+  stores, not those process-bootstrap files.
+
 - **`PUT /{index}/_settings {"index.lifecycle.name": null}` actually detaches
-  the index, and the detach survives a restart** (#282, ported from #262). The
+  the index, and the detach survives a restart** (#282, ported from #262;
+  regression-tested in [#290](https://github.com/xerj-org/xerj/pull/290)). The
   null previously fell through a string-only settings reader, so the operator
   got `200 acknowledged` while the index stayed attached — to a policy whose
   delete phase then destroyed it. A detach now removes the execution cursor,
@@ -25,8 +197,237 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time with the action named** (400), instead of being stored with the action
   silently dropped — the accepted-and-ignored class (#204). Executable ILM
   actions are `rollover`, `delete`, `readonly`.
+- **`autoindex` no longer rejects a resumed generation after journal replay
+  when inferred floating-point schema statistics need exact decimal
+  round-tripping.** Unchanged reruns and junk-bearing corpus shrink now replay
+  correctly; existing affected journals resume without a rebuild, while the
+  manifest format and integrity checks remain unchanged.
+
+- **A `query_string` containing one non-ASCII character aborted the process.**
+  `{"query_string":{"query":"_\u0660"}}` — or the same text in `?q=` — took the
+  server down. The Lucene tokeniser walks bytes but slices `&q[start..i]` as a
+  `&str`, and it broke on `is_whitespace()`, which is true for Latin-1 NBSP
+  (0xA0). In valid UTF-8 that byte is only ever a *continuation* byte, so the
+  scan stopped between the two bytes of U+0660 and the slice panicked on a
+  character boundary. Every delimiter test in that scanner is now `is_ascii_*`,
+  which makes "the scan can only stop on a character boundary" true by
+  construction. Nothing is lost: the only non-ASCII bytes the old test accepted
+  were 0x85 and 0xA0, neither of which is a standalone character in UTF-8.
+
+- **An index name of `<{}{}>` aborted the process.** Index-name date math finds
+  the first `{` and the last `}` inside the braces; when the `}` comes first,
+  `date_part[2..0]` is a panic, not an empty slice. Reachable from any request
+  that names an index. The closing brace is now required to come after the
+  opening one.
+
+- **A Painless script containing one non-ASCII character aborted the process.**
+  The second thing the new fuzz harnesses found, inside a second. The tokeniser
+  walks *bytes* (`bytes[i] as char` reinterprets each byte as Latin-1) but
+  slices `&src[start..i]` as a `&str`. Every continuation byte of a multi-byte
+  character reads as an alphabetic Latin-1 char, so an identifier scan could
+  start or stop inside one and the slice panicked on a char boundary —
+  `end byte index 24 is not a char boundary; it is inside 'ʋ'`. Scripts arrive
+  in ordinary search and update bodies and the release profile sets
+  `panic = "abort"`, so this was not a 400, it was the whole server. The
+  identifier scan is now ASCII-only, which keeps both ends on a character
+  boundary by construction; a non-ASCII byte reaches the tokeniser's
+  `unexpected char` error instead. String literals still carry any Unicode.
+
+- **A search body could abort the whole process: `{"range":{"ts":{"gte":"now+33333333333333H"}}}`.**
+  The first thing the new `date_math` fuzz target found, 20 seconds into its
+  first run. `chrono`'s `Duration::hours` and its siblings **panic** when the
+  count does not fit a `TimeDelta`, and they run before the
+  `checked_add_signed` that was supposed to make
+  `xerj_query::dates::add_unit` total — so the careful checking around them
+  bought nothing. A range bound goes straight from the request body into this
+  code (`parser.rs:931`), the release profile sets `panic = "abort"`, and the
+  result is an unauthenticated remote denial of service on a released binary.
+  Fixed with the fallible `try_*` constructors. Grepping for the same pattern
+  found **three** more copies in the index-name date-math resolvers —
+  `xerj-engine/src/index.rs`, and *both* branches of
+  `xerj-api/src/es_compat.rs`: the `now` form (`<logs-{now+9999999999999d}>`)
+  and the anchored form (`<logs-{2026-01-01||+9999999999999d}>`), which are
+  handled by two different functions sixty lines apart. All three are fixed,
+  their `n * 30` / `n * 365` multiplications are `checked_mul`, the unit is read
+  as one character rather than one byte, and the addition goes through
+  `checked_add_signed`. `es_compat`'s resolver is the one that runs on the wire
+  — the index path parameter of every create/index call and the `_search` index
+  list — so `crates/xerj-api/tests/index_name_date_math_is_total.rs` now drives
+  it at the crate boundary; the same-file fix that missed the anchored branch
+  passed because nothing exercised the public entry point.
+
+- **A `_search` aggregation script containing one non-ASCII character aborted
+  the process.** `painless::tokenize` was not the only Painless-subset scanner
+  in the tree: `aggs.rs` holds two more with the identical byte-walk /
+  `&str`-slice shape — `lex_script` (`scripted_metric`) and `tokenize_script`
+  (`bucket_script` / `bucket_selector`) — and both took `&src[i..i + 2]` to test
+  for a two-character operator at a byte index that can sit inside a multi-byte
+  character, because every arm above it is ASCII-only.
+  `{"m":{"scripted_metric":{"map_script":"中"}}}` was `end byte index 2 is not a
+  char boundary`. Both also skipped whitespace with `is_whitespace()` on
+  `bytes[i] as char`, which is true for Latin-1 NEL and NBSP — bytes that in
+  valid UTF-8 are only ever *continuation* bytes. The two-character probe now
+  requires both bytes to be ASCII (every such operator is ASCII, so nothing is
+  lost) and whitespace is `is_ascii_whitespace`. A new `agg_script` fuzz target
+  covers all three entry points, which is how the next one gets found instead of
+  reported.
+
+- **An XML entity nobody declared no longer discards the text around it.**
+  Fallout from the `quick-xml` upgrade above, which is a breaking change to how
+  character data arrives: 0.38 stopped folding `&amp;` into the surrounding
+  `Event::Text` and began emitting each reference as its own
+  `Event::GeneralRef`. Entity handling is preserved across that change (a
+  reader that ignored the new event would have silently dropped every `&`, `<`,
+  `>` and `&#233;` while the words around them still arrived), and one case
+  gets better: 0.36's `BytesText::unescape()` failed the whole text node on an
+  entity no DTD declared for us, and `unwrap_or_default()` then discarded it —
+  now only the reference itself is dropped. Character data is also reassembled
+  from its fragments before being emitted, so an entity-bearing field stays one
+  value instead of becoming an array of pieces.
+
+- **`constant_score` on a mixed flushed/unflushed corpus returned the wrong
+  page, and any tied hit set could be re-sorted into `_id` order**
+  ([#270](https://github.com/xerj-org/xerj/issues/270),
+  [#300](https://github.com/xerj-org/xerj/pull/300)). Two defects. A
+  top-level `constant_score` (or `boost`) wrapper defeated the match-all
+  shortcut, so the stored scan ran in exact-counting mode and a bounded page
+  came back all-memtable — `size:1` on 40 flushed + 300 unflushed identical
+  docs returned the memtable doc where the oldest flushed doc was correct;
+  the wrapper is now peeled for the count/bounds decisions only, with scoring
+  unchanged. Separately, five post-sort re-sorts — the bool-text IDF rescore,
+  the near-zero-BM25 TF-IDF fallback, and the three `rescore` sorts — tied by
+  `_id` alone, so any of them firing on tied scores reordered the page; the
+  main sort and all five now route through the one page-order key
+  (`score DESC, seq_no ASC, _id ASC`). Known residual, documented rather
+  than asserted around: bounded pages for multi-clause bools on a mixed
+  corpus are still admitted under first-pass scores (#188's remit).
+
+- **A shrinking file set on a junk-bearing `autoindex` generation aborted the
+  cutover with `desired manifest digest does not match sync_begin payload`**
+  ([#283](https://github.com/xerj-org/xerj/issues/283),
+  [#296](https://github.com/xerj-org/xerj/pull/296)). A fresh plan kept
+  duplicate-file aliases whose content was junk or skipped while the
+  incremental projection dropped them, so the two disagreed on byte-identical
+  junk duplicates — two empty files suffice. The fresh plan now projects
+  exactly like the incremental path, so the shrink reconciles cleanly. Where
+  a journal is *genuinely* inconsistent, the replay and validation paths now
+  say what to do — no remote data changed, re-running will not repair it,
+  rebuild with a new `--state-dir` and `--prefix` — with the invariant kept
+  as the error cause.
+
+- **An outer repository's `.gitignore` no longer judges files inside a nested
+  checkout** (the second rc.15 known issue below;
+  [#287](https://github.com/xerj-org/xerj/pull/287), repairing
+  [#279](https://github.com/xerj-org/xerj/pull/279)). The rule walk had no
+  repository-boundary stop, so a root `*.md` hid the README of every
+  vendored dependency beneath it. The git-sourced rule kinds now stop at a
+  `.git` boundary — the set kept under a nested checkout is byte-for-byte
+  what `git status --untracked-files=all` reports there — while
+  `.xerjignore` and the built-in defaults deliberately still govern the
+  whole folder you named. Three more defects from the same merge: hidden
+  directories pruned by the dotfile rule were deep-counted into
+  `ignored_files_in_pruned_dirs` (97,731 phantom files on this repository's
+  own walk); that number reached the `xerj-done` line and `--progress json`
+  as a bare total when it is budget-capped — a new
+  `ignored_files_in_pruned_dirs_exact` flag now says whether it is a total
+  or a floor; and `--no-ignore`/`--no-default-ignores` were accepted and
+  ignored (#204) on `autoindex map` and `status`, which never walk a
+  filesystem — both are now refused there with the reason. The shipped docs
+  that contradicted the code are corrected.
+
+- **A finished `autoindex` run could leave its state-directory lock held, so
+  the immediately following run on the same state dir was refused as
+  already in use** ([#305](https://github.com/xerj-org/xerj/pull/305)).
+  `flock` ownership follows the open file description, so a helper
+  subprocess forked while the journal was live (the PDF extraction helper,
+  git invocations) could inherit the descriptor and keep the lock held past
+  the owner's close. The lock guard now records the acquiring PID and
+  unlocks on drop only in that process — a fork-inherited copy closes its
+  descriptor without releasing the live owner's lock. No retry, wait or
+  takeover behaviour was added; crash recovery is unchanged. Covered by a
+  same-OFD unit oracle and a real-fork integration regression on
+  Linux/macOS.
+
+- **`autoindex` indexed a `.mts` or `.cts` file as prose**
+  ([#284](https://github.com/xerj-org/xerj/pull/284)). The extension
+  registry claimed `.mjs`/`.cjs` but not TypeScript's own ESM/CJS
+  counterparts, and an unclaimed extension does not degrade to "code without
+  symbols" — it fell through to the prose extractor, so the file carried no
+  `language`, no `defs`, no `symbols`, was split into several body-only
+  records, and was invisible to symbol search.
+
+- **An exported module `const` reached `defs` in neither TypeScript nor
+  JavaScript** ([#285](https://github.com/xerj-org/xerj/pull/285),
+  [#304](https://github.com/xerj-org/xerj/pull/304), closes
+  [#293](https://github.com/xerj-org/xerj/issues/293)). Capture only fired
+  when the value was a function, so a module whose whole public surface is
+  built by factory calls — `export const users = pgTable(...)`, a router, a
+  config object — extracted zero symbols and could not be found by symbol
+  search at all. The new pattern is exported-only, anchored to module scope,
+  and matches the `const` token, so function-local bindings and mutable
+  exported `let` stay out; module-private `const` was measured and excluded
+  because it added weight without retrieval gain.
+
+- **A PHP 8.1 enum extracted zero symbols, and class constants were never
+  captured** ([#286](https://github.com/xerj-org/xerj/pull/286)). An enum
+  declares no class, interface or trait, so a file holding one could not be
+  found by its own name through symbol search. Enums, enum cases and `const`
+  declarations — class-level and file-scope — now land in `defs`, with
+  cases treated as named constants the way Go's `const_spec` members are;
+  `define()` calls stay uncaptured.
 
 ### Added
+
+
+- **`xerj mcp` — the MCP server now ships in the installed binary.** XERJ had a
+  complete, tested 10-tool MCP server that no user could obtain: releases built
+  only `xerj-server`, the installer shipped only `xerj`, and MCP appeared in no
+  agent-facing doc. It is now a subcommand, so anyone who ran
+  `curl -fsSL https://xerj.org/get | sh` gets it on their next upgrade, with no
+  installer or release-matrix change and no new third-party dependencies. Tools:
+  `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`,
+  `xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall`,
+  `xerj_brain_ego`, `xerj_brain_link`, `xerj_brain_unlink`,
+  `xerj_brain_overview`. A XERJ node must already be running; `xerj mcp` does
+  not start one. The published tool schema at
+  `/docs/agents/schemas/mcp-tools.json` had drifted to six tools against ten
+  served — it is now generated from a real `tools/list` and gated in CI against
+  drifting again.
+
+- **`[profile.quick]` and `[profile.ci-test]`** for the build and test halves of
+  the verify loop. `[profile.release]` is `lto = "fat"` + `codegen-units = 1`,
+  deliberately the slowest build Rust can produce because it yields the fastest
+  binary — correct for a shipped artifact, wrong for "does this compile?". CI's
+  test job spent 76m05s compiling for 1m52s of tests. Neither profile is ever
+  valid for a released artifact or a published performance number.
+  `docs/FAST_BUILDS.md` documents the remaining levers.
+
+
+- **The reference-coding toolkit ships in the repo, and a corpus definition can
+  now rebuild a corpus** ([#319](https://github.com/xerj-org/xerj/issues/319)).
+  `xc-corpus.sh`, `xc-index.sh`, `xc.py` and `SKILL.md` lived only in a
+  gitignored working copy, so `git ls-files | grep xc-` returned nothing while
+  the case study, `CONTRIBUTING.md` and the landing page all told a reader to
+  run them. They are now in [`tools/xerj-code/`](tools/xerj-code/), with a
+  `!tools/**/*.md` re-include in `.gitignore` — the blanket `*.md` rule was what
+  swallowed `SKILL.md`, the same failure mode that hid this repo's pull-request
+  template for its entire history.
+  - `corpus.json` records the **full 40-character SHA**. The old
+    `rev-parse --short` value cannot be fetched from a remote
+    (`git fetch --depth 1 origin e449d17` → "couldn't find remote ref"), so a
+    manifest could not pin anything. A manifest carrying a short SHA is now
+    rejected with a SHA-specific error rather than silently rebuilt at the tip.
+  - `xc-corpus.sh --from <manifest>` rebuilds a corpus at its pinned commits —
+    fetch-by-SHA at depth 1 with progressively deeper fallbacks — and an
+    existing clone is *moved* to the recorded SHA instead of skipped.
+  - [`tools/xerj-code/hub/`](tools/xerj-code/hub/) carries vetted definitions
+    for the four corpora this repo uses. Each entry has a `review` block a
+    human filled in: SPDX expression, `adapt-with-attribution` /
+    `approach-only` / `mixed`, reviewer and date.
+  - Hosting pre-built *indexes* remains out of scope (on-disk format version,
+    embedder identity, redistribution of the indexed source), as does the
+    measurement harness — `CASE_STUDY.md` and `SKILL.md` previously pointed at
+    a `MEASURE.md` that is not in the repo, and now say plainly what ships.
 
 - **`GET /_ilm/status`, `POST /_ilm/start`, `POST /_ilm/stop`** (#282): the
   operator can halt lifecycle execution without stopping the node; a stopped
@@ -36,6 +437,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same tombstoned detach path as the settings-null route. A literal name
   that is not an index answers 404 rather than writing a tombstone for a
   ghost.
+
+- **A dynamically-discovered nested object field is no longer permanently
+  opaque to `GET _mapping`/`_field_caps`**
+  ([#292](https://github.com/xerj-org/xerj/pull/292),
+  [#307](https://github.com/xerj-org/xerj/pull/307)). A subfield like `metadata.kind`
+  was already queryable (dotted-path resolution against `_source` doesn't
+  care about the mapping) but had no way to be *discovered* by a client that
+  reads the mapping instead of already knowing the field name — indistinguishable
+  from not existing to Kibana/OSD's own field-list UI. Three compounding gaps,
+  all fixed together: dynamic mapping never recursed into `Value::Object`
+  (`{"type": "object"}` was a terminal, not real ES/OS default behavior);
+  `GET _mapping`/`_field_caps` served the index-creation-time explicit mapping
+  blob verbatim forever, so *any* field discovered dynamically after creation
+  — flat or nested — never surfaced, no matter how many documents arrived; and
+  `_field_caps`'s per-field walk only ever registered top-level names, so a
+  nested object's own children were still invisible even once the mapping
+  correctly described them. Measured end-to-end on `/_memory`'s own backing
+  index: `GET .xerj-memory-{ns}/_field_caps?fields=metadata.kind` returned
+  `{"fields": {}}` before, the real entry after. The cluster-wide
+  `GET /_field_caps` (as opposed to the per-index `GET /{index}/_field_caps`)
+  had the same gaps independently and is fixed the same way — the two no
+  longer disagree about which fields exist. Dynamic mapping also now
+  re-inspects nested fields on *every* document — a later document adding a
+  new nested key merges it into the existing mapping instead of leaving it
+  permanently invisible — and `Schema::field_count()` counts nested children
+  and multi-fields recursively, closing a `max_fields_per_index` bypass
+  where one top-level object could carry unbounded uncounted children. Note
+  the tightening this implies: a dynamic text field with its `.keyword`
+  multi-field now costs 2 against the default limit of 500, which matches
+  how ES counts `index.mapping.total_fields.limit`. Two bounded residuals
+  from review (a one-shot budget overshoot on a single deeply-keyed insert;
+  array-nested keys deferred to the 100-doc recheck) are filed as
+  [#312](https://github.com/xerj-org/xerj/issues/312).
+  **Known limitation**: this only benefits indices created after this
+  ships. An index (a `/_memory` namespace or otherwise) created before it
+  already has its stored mapping written, and that isn't retroactively
+  edited — existing indices need either re-creation or an explicit
+  `PUT _mapping` to pick up the fix. No automatic migration is included.
 
 - **A crafted filename can no longer forge records on the agent progress
   stream** (the first rc.15 known issue below). Every externally-controlled
@@ -56,6 +495,211 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance made the enforced floor `interval/2` shorter — 12.5 s at the
   shipped defaults. Measured at `--progress-interval 10`: 11 of 11 same-phase
   gaps under 15 s (min 10.0 s) before, none after (min 19.3 s).
+- **`/{index}/_refresh` reports segment-publication failures instead of
+  claiming every shard succeeded.** The endpoint previously discarded every
+  error returned by the synchronous engine flush and always answered HTTP 200
+  with `successful == total`. It now includes the index, status, and underlying
+  reason in `_shards.failures`, attempts every resolved index, and returns the
+  first failed shard's HTTP status as Elasticsearch 8.13.4 does for refresh.
+
+- **Text field names containing path separators can be flushed and reopened.**
+  FTS side-car filenames previously interpolated the raw field name, so a name
+  such as `styles_blocks_core/site-title` became a child path and prevented the
+  segment from being published. Unsafe or overlong field names now use one
+  deterministic bounded filename component. Existing portable names retain
+  their byte-identical paths. Each segment has an immutable filename-layout
+  discriminator: absence means the historical raw layout; an explicit marker
+  means the encoded layout. Readers never infer the layout from side-car file
+  existence, preventing partial files and raw names that resemble digests from
+  aliasing another field. Before the discriminator or first encoded side-car
+  is written, the index durably advances its data-directory marker to format 2;
+  older binaries refuse that index instead of silently missing the new layout.
+  A retry after a post-rename marker failure must re-establish durable marker
+  publication before writing the discriminator or encoded FTS paths. Unix
+  confirms the parent-directory fsync; Windows uses a same-directory Win32
+  write-through replacement rather than claiming its directory-sync no-op is
+  durable. Safe-only indices remain format 1.
+
+### Changed
+
+- **Default `_search` source payloads omit engine-generated embedding
+  companions** ([#309](https://github.com/xerj-org/xerj/pull/309)). A search
+  with no `_source` now returns ordinary source fields without
+  `<field>_vector` and `<field>_vector_chunks` — identified from the
+  mapping's embedding config, not by name; measured payload size fell from
+  211,432 to 21,069 bytes for 5 hits (about 90%). Explicit `"_source": true`,
+  `"_source": ["field"]`, and include/exclude forms are unchanged, vectors
+  remain stored and used for kNN/semantic/hybrid scoring, and the
+  document-copying paths (`_reindex`, index clone, enrich execution) request
+  the full source explicitly so copies keep embeddings byte-for-byte. Add
+  `"_source": true` to restore the previous complete payload, including
+  vectors. Two residuals disclosed from review: a `fields` request naming a
+  companion resolves against the already-filtered source and comes back
+  empty under the new default — name it in `_source` instead
+  ([#310](https://github.com/xerj-org/xerj/issues/310)) — and the new
+  default arm copies each hit's source even on indices with no embedding
+  fields, a constant-factor read-path cost filed as
+  [#311](https://github.com/xerj-org/xerj/issues/311).
+
+- **`merge.strategy = "log_structured"` is now refused at startup instead of
+  silently running the size-tiered policy**
+  ([#207](https://github.com/xerj-org/xerj/issues/207)). Nothing in the tree
+  ever read `merge.strategy`; `run_merge_once` always builds a
+  `SizeTieredMergePolicy`. An operator who chose a levelled policy for its read
+  amplification got the other one, quietly. This follows the `storage.backend`
+  and `vector.default_quantization` guards already in `Config::validate`.
+
+- **The three dormant `[merge]` settings now say so, in the code, in the shipped
+  TOML, on the docs site, and in the log at startup**
+  ([#207](https://github.com/xerj-org/xerj/issues/207)). The issue reported
+  merge I/O rate limiting as "claimed but dormant" and it is: the `RateLimiter`
+  that honours `io_rate_mb_per_sec` is wired only into `xerj-storage`'s legacy
+  `MergeExecutor`, which the engine never constructs. `min_segments` and
+  `max_concurrent` are unread too — the real per-tier trigger is
+  `min_merge_count`, and merge parallelism comes from `XERJ_MERGE_PARALLELISM`.
+  `MergeConfig::dormant_overrides` names any of the three the operator has moved
+  off its default and `xerj-server` logs each at WARN, so the operator throttling
+  merges to protect query latency finds out instead of guessing. They stay
+  accepted rather than becoming hard errors because the wrong value costs
+  latency, not data, and `io_rate_mb_per_sec = 100` has shipped in
+  `xerj.default.toml` since v0.1. Wiring a real throttle into `run_merge_once`
+  is the fix that makes this list shorter.
+
+- **`engine/xerj.default.toml` disagreed with the defaults it claims to
+  document, in four places.** `max_segment_mb` said 5120 against a real 8192,
+  `wal_max_size_mb` 512 against 1024, `flush_size_mb` 256 against 512, and
+  `default_quantization` `"scalar8"` against `"none"` — so `cp xerj.default.toml
+  xerj.toml`, the documented first step, silently changed four engine behaviours
+  including turning on 8-bit vector quantization. The file is corrected and
+  `shipped_default_config_documents_the_real_defaults` now diffs every leaf key
+  against `Config::default()`, so it cannot drift again.
+
+- **The docs site had drifted the same way, and now has the same guard.**
+  `landing/docs/config.html` shipped `wal_max_size_mb = 512`,
+  `flush_size_mb = 256` and `default_quantization = "scalar8"` in its
+  copy-pasteable `[storage]` and `[vector]` blocks while its own DEFAULT
+  table — thirty lines up, on the same page — said 1024, 512 and `"none"`;
+  `landing/docs/storage.html` said the WAL rolls at 512 MiB;
+  `landing/docs/vectors.html` called `scalar8` "the default" and listed a
+  `scalar4` mode that no config or mapping value can reach; and
+  `engine/README.md` put `flush_size_mb` at 256 MiB. All four are corrected,
+  along with the docs search-index blob duplicated across 44 landing pages,
+  which offered `scalar4` as a selectable quantization mode.
+  A second guard, `the_docs_site_config_page_agrees_with_the_real_defaults`,
+  now diffs *both* halves of that page — every DEFAULT cell in the reference
+  table and every assignment in the example blocks — against
+  `Config::default()`. An example that deliberately differs (the blocks whose
+  point is switching TLS or cluster mode on) has to carry `# not a default` on
+  the line, so the reader is told as well as the test.
+  - **Known gap, found while correcting the `scalar4` prose and disclosed
+    rather than quietly fixed:** the guard reads `config.html` against
+    `Config::default()`, so it covers the *config* half only. Nothing checks a
+    *mapping*, and a mapping is not validated either —
+    `es_compat.rs` matches `"scalar8" | "int8" | "none"` on a `dense_vector`
+    field's `quantization` and falls through `_ => {}`, so
+    `"quantization": "scalar4"` (or `"binary"`, or a typo like `"sq8"`) is
+    accepted with a 200, echoed back verbatim by `GET /_mapping`, and ignored
+    — the field is stored at full-precision f32 while the mapping says it is
+    quantized. Measured through the ES-compat router at this commit. It is
+    pre-existing and outside this diff; it is another instance of the
+    accepted-and-ignored class in
+    [#204](https://github.com/xerj-org/xerj/issues/204), is filed with the
+    repro and a proposed 400 as
+    [#275](https://github.com/xerj-org/xerj/issues/275), and
+    `landing/docs/vectors.html` now says so on the page instead of leaving
+    "not a mode you can select" to imply the value is rejected.
+
+- **Four other claims from [#207](https://github.com/xerj-org/xerj/issues/207)
+  now match the source.**
+  - *Settings count.* `config.rs` said 38 in its header and 56 twenty lines
+    down while the count test asserted 60 — and the test asserted it by
+    re-adding a hardcoded sum (`5 + 2 + 3 + … - 1 == 38`), an identity that
+    could not fail whatever `Config` held. There was a second copy of the same
+    non-test in `config.rs` itself (`count_user_facing_settings`, `61 == 61`).
+    Both now serialise `Config::default()` and count leaf keys, section by
+    section. The measured figure is **105** (103 when this work was done; the
+    rc.14 `server.allow_insecure_network_bind` key made it 104 and #247's
+    `lifecycle.tick_interval_secs` makes it 105 — which is the point: it is
+    measured, so it moves with the code), and 38 / 50 /
+    56 / 60 / 61 / "<50"
+    are corrected in `config.rs`, `xerj-common/src/lib.rs`, `engine/README.md`,
+    `xerj.default.toml` and the feedback responses, along with the stale
+    per-sub-config annotations (limits 3 → 13, storage 5 → 10, embedding 4 → 19,
+    merge 5 → 8, cluster 4 → 5, tls 3 → 4, auth 2 → 3). This closes item 10 of
+    `user-feedback/ROADMAP-TO-GA.md`. 105 versus 3,000+ is still the winning
+    story, told truthfully.
+  - *Wire-compatibility test framing.* `journey_es_migration` was described as
+    proving "the same curl commands" work. It calls the Rust engine API
+    directly and never makes an HTTP request. The response-shape assertions are
+    real and stay; the comment now says what the test does and points at the
+    ES-compat YAML conformance suite, which is what actually covers the wire.
+  - *OpenAPI spec.* `landing/openapi.json` declared `version: 1.0` while
+    specifying 7 routes out of the 200-plus the router registers. It is now
+    titled and versioned as a partial spec, and says so.
+
+- **`autoindex` estimates the job on the user's own machine and hands the
+  decision back before it takes their laptop.** Phase A already reads and
+  parses every file to sniff and sample it, so it now *times* that work per
+  format family and turns it into a range with its basis printed next to it —
+  `code 500 files 749.3 MB at 11.7 MB/s measured over 500 file(s) → 64.2 s` —
+  rather than a constant calibrated on someone else's hardware. A family is
+  priced only from files phase A **provably** read end to end (whole-file
+  parsers always; streaming parsers only when the file was under the sampling
+  byte cap *and* stopped short of the record cap; never `sqlite`, never
+  gzip), and everything else is named under `unmeasured_families` with its
+  bytes instead of being priced at another family's rate. If nothing could be
+  measured there is no number at all and no gate. The two ends are the
+  classical list-scheduling bounds (Graham, 1969) over the phase-B worker
+  count that #240's resource policy chose.
+  The number is a **floor**, labelled as one on every surface: it covers
+  client-side extraction only, because measuring the server, the network or
+  embedding would mean writing to the index the estimate exists to ask
+  permission for. Measured on a 68 MB source tree the floor was 0.1 s against
+  a real 8.9 s run; on a 793 MB one, 64.2 s against ~350 s. The gate therefore
+  under-asks and never over-asks, and says so where a reader would otherwise
+  mistake silence for a promise.
+- **`--max-minutes` (default 10) stops the run and asks instead of deciding.**
+  Past the threshold with no answer, autoindex indexes nothing, writes a JSON
+  decision request to stdout and exits **4** — a code of its own, because exit
+  1 is already the catch-all for every real failure and an agent must be able
+  to tell "choose something" from "your endpoint is down". The payload carries
+  the estimate and its basis, file/byte counts, the per-band work order, the
+  heaviest directories with real byte counts (flagged when they match the
+  vendored/generated rule), and four options: `proceed`, `fast`, `narrower`,
+  `cancel`. Answer with `--approve <id>` (`--yes` = proceed), which skips the
+  gate; `--max-minutes 0` disables it. A person at a terminal gets the same
+  facts as prose plus a prompt; a piped or agent-driven run is **never**
+  blocked on stdin, and an unanswerable prompt is a cancel, never consent.
+  `--approve fast` really applies `--no-semantic --no-graph`, and `--approve
+  narrower` is refused with instructions rather than accepted and ignored
+  (#204). The `fast` option states no speed-up factor: it reports the datasets
+  and file count it changes and says plainly that this run did not measure the
+  factor.
+  The gate governs the phase-B route. An **incremental reconcile of an already
+  committed generation** (a `--no-graph` re-run over a folder that already has
+  one) processes only what changed and publishes from a sealed snapshot, so
+  `--max-minutes` does not apply there — and that route now *says so* on
+  stderr rather than accepting the flag and quietly not honouring it.
+
+- **`autoindex` indexes what matters first.** Phase B's queue was sorted by
+  size alone — right about scheduling, silent about value, so a user who
+  stopped early got whatever was largest, which on a source tree is
+  `node_modules`. Work is now ordered by value band (source and documents →
+  configuration → structured data → logs and line files → vendored, generated
+  and minified paths), with the old biggest-first rule kept *inside* each band
+  so a large file still runs alongside its band instead of becoming the tail;
+  a single-worker run goes smallest-first, where there is no tail to hide in.
+  One exception keeps the new order from costing wall clock: a file whose own
+  extraction outlasts everything ranked above it (`size × workers > the rest`)
+  starts first regardless of band. The bands, their file/byte counts and the
+  reason each sits where it does are printed with the plan and included in the
+  decision payload as `priority_order` — an unexplained order is
+  indistinguishable from an arbitrary one. Verified live on a 28 MB mixed
+  corpus at two workers: the first second of phase B was spent on
+  `src/mod_*.rs`, and the 1.7 MB `node_modules/**` files — the largest in the
+  corpus, and therefore *first* under the old rule — drained last.
+  Bytes-based progress and its percent are unaffected: reordering does not
+  change the denominator.
 
 ## [1.0.0-rc.15] - 2026-08-10
 
@@ -825,7 +1469,8 @@ documented "at most one bar per 15 s" floor is really 12.5 s.
     over a file whose bytes were perfectly good. The load failure now latches:
     every management mutation is refused with a 500 naming the file, and the
     file is not touched, until a boot loads it cleanly. The corrupt-parse arm
-    refuses too, and still keeps a `cluster_state.corrupt.json` copy.
+    refuses too. The later format-compatibility fence above tightens that
+    diagnostic boot further: it creates no `cluster_state.corrupt.json` copy.
   - `DELETE /_data_stream/<name>` recorded the removal before destroying the
     backing indices, so a crash in that window stranded `.ds-<name>-00000N`
     directories that no data-stream API could reach — GET and DELETE answered

@@ -1,0 +1,1 @@
+SELECT ts, msg FROM logs WHERE ts > 100 ORDER BY ts DESC LIMIT 50

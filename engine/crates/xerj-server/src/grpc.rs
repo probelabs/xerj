@@ -373,6 +373,17 @@ impl tonic::service::Interceptor for GrpcAuth {
             ));
         }
         request.extensions_mut().insert(principal);
+        // Authentication deliberately runs first: an unauthenticated caller
+        // must not learn whether this node rejected persisted metadata. Once
+        // identity is established, reject every RPC centrally before tonic
+        // dispatches to a handler. Individual handlers used to translate the
+        // same blocked Engine error into not-found, invalid-argument, or a
+        // partial bulk response depending on the method.
+        if !self.state.engine.cluster_state_boot_status().is_writable() {
+            return Err(Status::unavailable(
+                xerj_common::XerjError::cluster_state_unavailable().to_string(),
+            ));
+        }
         Ok(request)
     }
 }
@@ -452,6 +463,17 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("gRPC client could not connect to {addr}");
+    }
+
+    fn with_authorization<T>(
+        message: T,
+        authorization: &tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+    ) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request
+            .metadata_mut()
+            .insert("authorization", authorization.clone());
+        request
     }
 
     #[tokio::test]
@@ -666,6 +688,158 @@ mod tests {
         let _ = server.await;
     }
 
+    /// A rejected persisted-metadata format leaves the process available only
+    /// for HTTP liveness/readiness diagnostics. The gRPC surface has no split
+    /// liveness service, so every generated XerjSearch method is unavailable.
+    /// Authentication stays outside that fence: missing credentials remain
+    /// UNAUTHENTICATED and a valid credential reaches the UNAVAILABLE latch.
+    #[tokio::test]
+    async fn grpc_cluster_state_fence_covers_all_methods_after_authentication() {
+        use tonic::Code;
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("cluster_state.json"),
+            br#"{"format_version":2}"#,
+        )
+        .unwrap();
+        let admin = "grpc-blocked-admin";
+        let state = app_state_with_auth(&dir, admin);
+        assert!(!state.engine.cluster_state_boot_status().is_writable());
+
+        let port = free_port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_grpc(addr, state, async move {
+            let _ = rx.await;
+        }));
+        let url = format!("http://127.0.0.1:{port}");
+        let mut client = connect(&url).await;
+
+        macro_rules! assert_code {
+            ($future:expr, $code:expr, $method:literal) => {{
+                let status = $future
+                    .await
+                    .expect_err(concat!($method, " must be rejected"));
+                assert_eq!(status.code(), $code, "{}: {status:?}", $method);
+            }};
+        }
+
+        // Authentication is evaluated before the storage-format latch for
+        // every unary and streaming method.
+        assert_code!(
+            client.health(pb::HealthRequest {}),
+            Code::Unauthenticated,
+            "health"
+        );
+        assert_code!(
+            client.search(pb::SearchRequest {
+                index: "blocked".into(),
+                query_json: String::new(),
+                size: 0,
+                from: 0,
+            }),
+            Code::Unauthenticated,
+            "search"
+        );
+        assert_code!(
+            client.index(pb::IndexRequest {
+                index: "blocked".into(),
+                id: "1".into(),
+                source_json: "{}".into(),
+            }),
+            Code::Unauthenticated,
+            "index"
+        );
+        assert_code!(
+            client.bulk_index(tokio_stream::empty::<pb::IndexRequest>()),
+            Code::Unauthenticated,
+            "bulk_index"
+        );
+        assert_code!(
+            client.get_document(pb::GetRequest {
+                index: "blocked".into(),
+                id: "1".into(),
+            }),
+            Code::Unauthenticated,
+            "get_document"
+        );
+        assert_code!(
+            client.delete_document(pb::DeleteRequest {
+                index: "blocked".into(),
+                id: "1".into(),
+            }),
+            Code::Unauthenticated,
+            "delete_document"
+        );
+
+        let authorization: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
+            format!("ApiKey {admin}").parse().unwrap();
+        assert_code!(
+            client.health(with_authorization(pb::HealthRequest {}, &authorization)),
+            Code::Unavailable,
+            "authenticated health"
+        );
+        assert_code!(
+            client.search(with_authorization(
+                pb::SearchRequest {
+                    index: "blocked".into(),
+                    query_json: String::new(),
+                    size: 0,
+                    from: 0,
+                },
+                &authorization,
+            )),
+            Code::Unavailable,
+            "authenticated search"
+        );
+        assert_code!(
+            client.index(with_authorization(
+                pb::IndexRequest {
+                    index: "blocked".into(),
+                    id: "1".into(),
+                    source_json: "{}".into(),
+                },
+                &authorization,
+            )),
+            Code::Unavailable,
+            "authenticated index"
+        );
+        let mut bulk = tonic::Request::new(tokio_stream::empty::<pb::IndexRequest>());
+        bulk.metadata_mut()
+            .insert("authorization", authorization.clone());
+        assert_code!(
+            client.bulk_index(bulk),
+            Code::Unavailable,
+            "authenticated bulk_index"
+        );
+        assert_code!(
+            client.get_document(with_authorization(
+                pb::GetRequest {
+                    index: "blocked".into(),
+                    id: "1".into(),
+                },
+                &authorization,
+            )),
+            Code::Unavailable,
+            "authenticated get_document"
+        );
+        assert_code!(
+            client.delete_document(with_authorization(
+                pb::DeleteRequest {
+                    index: "blocked".into(),
+                    id: "1".into(),
+                },
+                &authorization,
+            )),
+            Code::Unavailable,
+            "authenticated delete_document"
+        );
+
+        let _ = tx.send(());
+        let _ = server.await;
+    }
+
     /// Standard-alphabet base64, so the test can build the `id:secret`
     /// credential a minted key presents. `xerj_api`'s encoder is crate-private.
     fn b64(input: &str) -> String {
@@ -698,10 +872,13 @@ mod tests {
     /// Mint a key straight into the engine's store and return the
     /// `authorization` metadata value a client would present.
     fn mint_key(state: &AppState, id: &str, roles: Vec<xerj_engine::rbac::Role>) -> String {
-        state.engine.persist_api_key(
-            id.to_string(),
-            xerj_engine::engine::ApiKeyRecord::new(id, "s3cret", 0, None, roles),
-        );
+        state
+            .engine
+            .persist_api_key(
+                id.to_string(),
+                xerj_engine::engine::ApiKeyRecord::new(id, "s3cret", 0, None, roles),
+            )
+            .unwrap();
         format!("ApiKey {}", b64(&format!("{id}:s3cret")))
     }
 

@@ -420,6 +420,25 @@ impl FieldConfig {
     pub fn is_aggregatable(&self) -> bool {
         self.options.doc_values && !matches!(self.field_type, FieldType::Text | FieldType::Binary)
     }
+
+    /// This field plus every nested child, recursively -- both real
+    /// `properties` children of an `Object`/`Nested` field and leaf
+    /// multi-fields under `fields` live in the same `fields` vec (see the
+    /// dual meaning documented on that field above), so one count covers
+    /// both. `Schema::field_count()` sums this over every top-level field
+    /// instead of just counting `self.fields.len()`, since a single
+    /// top-level `Object` field can carry unboundedly many nested
+    /// children once dynamic mapping recurses into them (see
+    /// `xerj-engine`'s `dynamic_field_config_at_depth`) -- an
+    /// un-recursive count would let nested fields bypass every
+    /// `max_fields_per_index` mapping-explosion guard entirely.
+    pub fn total_field_count(&self) -> usize {
+        1 + self
+            .fields
+            .iter()
+            .map(FieldConfig::total_field_count)
+            .sum::<usize>()
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -455,6 +474,14 @@ impl Schema {
         self.fields.iter().find(|f| f.name == name)
     }
 
+    /// Mutable counterpart to [`Self::field`] -- lets a caller merge new
+    /// dynamically-discovered nested children into an already-registered
+    /// top-level field's own `fields` in place, instead of only ever being
+    /// able to add brand-new top-level fields via [`Self::add_field`].
+    pub fn field_mut(&mut self, name: &str) -> Option<&mut FieldConfig> {
+        self.fields.iter_mut().find(|f| f.name == name)
+    }
+
     /// Return `true` if a field with this name already exists.
     pub fn has_field(&self, name: &str) -> bool {
         self.field(name).is_some()
@@ -476,9 +503,17 @@ impl Schema {
         Ok(())
     }
 
-    /// Total number of fields (counting only top-level fields).
+    /// Total number of fields, counting every nested child at every depth
+    /// -- not just top-level fields. Every `max_fields_per_index`
+    /// mapping-explosion guard in the engine (both the dynamic-ingest path
+    /// and the explicit `PUT _mapping`/`POST .../evolve` path, #76 S5-5)
+    /// calls this to bound real schema growth; counting only
+    /// `self.fields.len()` would let a single top-level `Object` field
+    /// carry unboundedly many nested children uncounted, once dynamic
+    /// mapping recurses into them (see `xerj-engine`'s
+    /// `dynamic_field_config_at_depth`).
     pub fn field_count(&self) -> usize {
-        self.fields.len()
+        self.fields.iter().map(FieldConfig::total_field_count).sum()
     }
 }
 

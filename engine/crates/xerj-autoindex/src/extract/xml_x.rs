@@ -6,13 +6,37 @@
 
 use super::{
     sanitize_field_name, ExtractStats, FieldOrigin, RawRecord, Sink, MAX_FIELDS_PER_RECORD,
+    MAX_LINE,
 };
 use anyhow::Result;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::Reader;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Resolve one `&…;` general reference to the text it stands for.
+///
+/// quick-xml >= 0.38 no longer folds entity references into the surrounding
+/// `Event::Text`: it emits each one as its own `Event::GeneralRef`, so a
+/// consumer that wants `5 &lt; 10` to read as `5 < 10` has to reassemble the
+/// text itself. Predefined XML entities and numeric character references
+/// resolve here; anything else (an entity a DTD we never read would have
+/// declared) yields `None` and the reference is dropped.
+///
+/// Dropping just the reference is deliberately *better* than what 0.36 did:
+/// there, one unknown entity failed `BytesText::unescape()` for the whole node
+/// and `unwrap_or_default()` threw the entire text away.
+pub(super) fn resolve_general_ref(r: &BytesRef) -> Option<String> {
+    match r.resolve_char_ref() {
+        Ok(Some(c)) => return Some(c.to_string()),
+        Ok(None) => {}
+        // Out-of-range or malformed `&#…;` — not text, so contribute nothing.
+        Err(_) => return None,
+    }
+    let name = r.decode().ok()?;
+    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_string)
+}
 
 struct State {
     record_tag: Option<String>,
@@ -29,8 +53,17 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
 
     let r = super::open_reader(path, gzip, None)?;
     let mut reader = Reader::from_reader(r);
-    reader.config_mut().trim_text(true);
+    // Deliberately NOT `trim_text(true)`: the reader trims each fragment
+    // independently, and `5 &lt; 10` arrives as three fragments, so trimming
+    // per fragment would splice it back together as `5<10`. Trim once, at the
+    // element boundary, over the reassembled text instead.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
+    // Character data accumulates here and is flushed as ONE value when the
+    // next structural event arrives. Text, CDATA and entity references are all
+    // fragments of the same logical value; emitting them separately would turn
+    // every entity-bearing field into an array of pieces.
+    let mut pending = String::new();
     let mut st = State {
         record_tag,
         capture: None,
@@ -43,9 +76,11 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                flush_text(&mut pending, &mut st);
                 handle_open(&e, false, &mut st);
             }
             Ok(Event::Empty(e)) => {
+                flush_text(&mut pending, &mut st);
                 if let Some(fields) = handle_open(&e, true, &mut st) {
                     // `<record …/>` self-closing: complete record, no End event.
                     if !fields.is_empty() {
@@ -64,6 +99,7 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
                 }
             }
             Ok(Event::End(e)) => {
+                flush_text(&mut pending, &mut st);
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if let Some(m) = st.capture.as_mut() {
                     if st.stack.is_empty() && st.record_tag.as_deref() == Some(name.as_str()) {
@@ -90,20 +126,25 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
                 }
             }
             Ok(Event::Text(t)) => {
-                let txt = t.unescape().unwrap_or_default().trim().to_string();
-                if !txt.is_empty() {
-                    handle_text(&txt, &mut st);
+                push_text(&mut pending, &t.xml10_content().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(entity)) => {
+                if let Some(resolved) = resolve_general_ref(&entity) {
+                    push_text(&mut pending, &resolved);
                 }
             }
             Ok(Event::CData(t)) => {
-                let txt = String::from_utf8_lossy(&t).trim().to_string();
-                if !txt.is_empty() {
-                    handle_text(&txt, &mut st);
-                }
+                push_text(&mut pending, &String::from_utf8_lossy(&t));
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                flush_text(&mut pending, &mut st);
+                break;
+            }
             Ok(_) => {}
             Err(_) => {
+                // Everything read before the break is still emitted, so the
+                // text already buffered has to land before we stop.
+                flush_text(&mut pending, &mut st);
                 stats.junk += 1;
                 break;
             }
@@ -188,6 +229,31 @@ fn handle_open(e: &BytesStart, empty: bool, st: &mut State) -> Option<Map<String
         }
     }
     None
+}
+
+/// Append one character-data fragment to the pending value.
+///
+/// SECURITY: the fragments of a single value are now concatenated rather than
+/// emitted one at a time, so a document that never closes an element could
+/// otherwise grow `pending` for the whole file. Stop appending at the same
+/// 16 MB bound the line-oriented extractors use; no real XML text node is
+/// anywhere near it.
+fn push_text(pending: &mut String, fragment: &str) {
+    if pending.len() < MAX_LINE {
+        pending.push_str(fragment);
+    }
+}
+
+/// Emit whatever character data has accumulated as one value, keyed by the
+/// element path that was open while it was read — so this must run *before*
+/// the structural event that triggered it mutates the stack.
+fn flush_text(pending: &mut String, st: &mut State) {
+    let txt = pending.trim();
+    if !txt.is_empty() {
+        let txt = txt.to_string();
+        handle_text(&txt, st);
+    }
+    pending.clear();
 }
 
 fn handle_text(txt: &str, st: &mut State) {
@@ -401,6 +467,35 @@ mod tests {
         let p = recs[0].fields["p"].as_array().unwrap();
         assert!(p.contains(&serde_json::json!("5 < 10 & rising")));
         assert!(p.contains(&serde_json::json!("<b>raw</b>")));
+    }
+
+    /// quick-xml >= 0.38 splits `a &amp; b` into Text / GeneralRef / Text, so a
+    /// reader that emits each fragment as it arrives turns one field into an
+    /// array of pieces — and, with the reader's own `trim_text`, one that has
+    /// lost the spaces that separated them. Both failures are silent: the words
+    /// are all still there, in the wrong shape. Character references have to
+    /// come through the same path.
+    #[test]
+    fn text_split_around_a_reference_is_reassembled_into_one_value() {
+        let (_, recs) = run(
+            r#"<doc><row><v>Ben &amp; Jerry &lt;ice&gt; caf&#233; &#x21;</v></row>
+               <row><v>plain</v></row><row><v>plain</v></row></doc>"#,
+        );
+        assert_eq!(
+            recs[0].fields["v"],
+            serde_json::json!("Ben & Jerry <ice> café !"),
+            "one text node is one value, spaces intact, references resolved"
+        );
+    }
+
+    /// An entity no DTD declared for us resolves to nothing. It must cost only
+    /// itself: quick-xml 0.36's `unescape()` failed the whole node, and
+    /// `unwrap_or_default()` then threw away every word around it.
+    #[test]
+    fn an_unresolvable_reference_costs_only_itself() {
+        let (_, recs) = run(r#"<doc><row><v>before &nosuchentity; after</v></row>
+               <row><v>plain</v></row><row><v>plain</v></row></doc>"#);
+        assert_eq!(recs[0].fields["v"], serde_json::json!("before  after"));
     }
 
     #[test]

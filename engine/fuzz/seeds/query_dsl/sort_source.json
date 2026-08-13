@@ -1,0 +1,1 @@
+{"query":{"match_all":{}},"sort":[{"date":"desc"},"_score"],"_source":{"includes":["a","b"],"excludes":["c"]},"from":0,"size":25}

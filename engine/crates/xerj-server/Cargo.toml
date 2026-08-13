@@ -24,6 +24,9 @@ xerj-compress = { path = "../xerj-compress" }
 xerj-cluster  = { path = "../xerj-cluster" }
 xerj-console-api     = { path = "../xerj-console-api" }
 xerj-autoindex = { path = "../xerj-autoindex" }
+# `xerj mcp` — the MCP stdio server, in the one binary users install. Pulls in
+# only reqwest + serde_json, both already in this tree.
+xerj-mcp     = { path = "../xerj-mcp" }
 
 tokio.workspace = true
 axum.workspace = true
@@ -95,3 +98,4 @@ protox = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 flate2 = "1"
+tokio-stream = "0.1"

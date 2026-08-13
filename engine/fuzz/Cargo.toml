@@ -1,0 +1,77 @@
+[package]
+name = "xerj-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+description = "libFuzzer harnesses for xerj's untrusted-input parsers"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+xerj-query = { path = "../crates/xerj-query" }
+xerj-engine = { path = "../crates/xerj-engine" }
+# The index-name date-math resolver that actually runs on the wire lives here,
+# not in xerj-engine — see the note at the top of
+# fuzz_targets/index_name_date_math.rs.
+xerj-api = { path = "../crates/xerj-api" }
+
+# Keep the harnesses out of the engine workspace: they only build under a
+# nightly toolchain with sanitizers, so a `cargo build --workspace` on stable
+# must not try to compile them.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "query_dsl"
+path = "fuzz_targets/query_dsl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_string"
+path = "fuzz_targets/query_string.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "date_math"
+path = "fuzz_targets/date_math.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql"
+path = "fuzz_targets/sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "painless"
+path = "fuzz_targets/painless.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_name_date_math"
+path = "fuzz_targets/index_name_date_math.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agg_script"
+path = "fuzz_targets/agg_script.rs"
+test = false
+doc = false
+bench = false

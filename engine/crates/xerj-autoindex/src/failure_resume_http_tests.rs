@@ -503,6 +503,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         root: root.to_owned(),
         url: url.to_owned(),
         api_key: None,
+        api_key_file: None,
         workers: 1,
         scan_workers: 1,
         pdf_workers: 1,
@@ -523,6 +524,12 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         // incremental non-graph behavior has its own HTTP suite.
         brain: None,
         no_graph: false,
+        // The gate is switched off in these fixtures on purpose: they assert
+        // indexing, resume and edge behaviour, and a timing-derived stop would
+        // make them depend on how loaded the runner was. The gate's own
+        // behaviour is covered in `gate_tests` and `cli::tests`.
+        max_minutes: 0,
+        approve: None,
         dry_run: false,
         json: false,
         quiet: true,
@@ -642,6 +649,69 @@ fn assert_unsupported_delta_without_remote_mutation(
 /// The documented headline workflow: point autoindex at a folder, add a file,
 /// rerun. The rerun must not fail, must say plainly that the added file was
 /// not indexed, and `--fresh` must then absorb it in place.
+/// Code/AST coverage on the LEGACY (graph-enabled) path.
+///
+/// #294 only ever affected the generated `--no-graph` executor, and that
+/// asymmetry is exactly why it survived: the two paths reported identically,
+/// so comparing their terminal lines told a caller nothing. The counters exist
+/// on both, from one definition (`CodeCoverage`), so the next divergence
+/// between them is visible in the output rather than only in the index.
+#[test]
+fn the_legacy_terminal_line_and_run_document_report_code_coverage() {
+    let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("alpha.rs"),
+        "pub struct AlphaConfig {\n    pub retries: u32,\n}\n\n\
+         pub fn alpha_connect(cfg: &AlphaConfig) -> bool {\n    cfg.retries > 0\n}\n",
+    )
+    .unwrap();
+    fs::write(corpus.path().join("rows.csv"), "id,value\n1,first\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert!(!config.no_graph, "this module covers the legacy path");
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, report) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0);
+    let report = report.unwrap();
+    assert_eq!(report["code_files"], 1, "{report}");
+    assert_eq!(report["code_files_indexed"], 1, "{report}");
+    assert_eq!(report["code_files_junked"], 0, "{report}");
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let done = stream
+        .lines()
+        .find(|line| line.starts_with("xerj-done "))
+        .unwrap_or_else(|| panic!("{stream}"));
+    assert!(
+        done.contains("code_files=1 code_files_indexed=1 code_files_junked=0"),
+        "{done}"
+    );
+    assert!(!stream.contains("warning:"), "{stream}");
+    let locked = endpoint.state.lock().unwrap();
+    let ast = locked
+        .docs
+        .values()
+        .find(|doc| doc.get("language").is_some())
+        .unwrap_or_else(|| panic!("the legacy path indexes an AST document for alpha.rs"));
+    assert_eq!(ast["language"], "rust", "{ast}");
+    assert_eq!(ast["title"], "alpha.rs", "{ast}");
+    assert!(
+        ast["defs"]
+            .as_str()
+            .is_some_and(|defs| defs.contains("struct AlphaConfig")),
+        "{ast}"
+    );
+}
+
 #[test]
 fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
     let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
@@ -2675,6 +2745,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &crate::estimate::Meter::new(),
         },
         100,
         1,
@@ -2759,6 +2830,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &crate::estimate::Meter::new(),
         },
         100,
         1,
@@ -2834,6 +2906,7 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &crate::estimate::Meter::new(),
         },
         100,
         1,

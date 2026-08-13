@@ -11,13 +11,16 @@ pub mod correlate;
 pub mod dataset;
 pub mod detect;
 pub mod esclient;
+pub mod estimate;
 pub mod extract;
+pub mod gate;
 mod generation_catalog;
 #[cfg(test)]
 mod generation_catalog_http_tests;
 pub mod ids;
 pub mod ignore_rules;
 pub mod infer;
+pub mod order;
 pub mod pool;
 pub mod progress;
 mod reconcile_plan;
@@ -50,6 +53,57 @@ use state::{DuplicateFile, FileAssignment, FileDone, JunkFile, Plan, PlanDataset
 const PREPARED_RECORDS_IDENTITY: &str = "prepared-records-v1";
 const DOCUMENT_IDS_IDENTITY: &str = "document-ids-v1";
 const DETECTOR_DISABLED_IDENTITY: &str = "disabled";
+
+/// Render the `next:` guidance printed after a successful index run.
+///
+/// The run's own credential and URL are carried into the printed commands.
+/// They used to be printed bare, so against an auth-enabled server — which is
+/// the default, and what `xerj brain` boots — a *successful* run signed off by
+/// handing the user two commands that both answer 401
+/// (`ONBOARDING-401-REPRO.md` §3). Guidance that cannot be pasted is worse
+/// than no guidance: it reads as a broken server.
+///
+/// `api_key` is the credential this run used (`None` means the server needs
+/// none — `--insecure` or auth off — and the bare commands really do work).
+/// `env_key` is the ambient `XERJ_API_KEY`; when it already holds the run's
+/// key the hints reference `$XERJ_API_KEY` rather than the literal secret, so
+/// the command still pastes into the same shell while the admin key stays out
+/// of a banner users routinely paste into bug reports.
+///
+/// When the key came from neither the environment nor the user's own command
+/// line — i.e. it was discovered on disk — the hint must still not echo it.
+/// A blind onboarding run caught exactly that: `autoindex` found
+/// `./data/admin.key` by itself and then printed the admin key verbatim in a
+/// banner. The reader never typed that secret, so seeing it in copyable output
+/// is a disclosure, not a convenience.
+pub fn next_hint(
+    url: &str,
+    prefix: &str,
+    api_key: Option<&str>,
+    env_key: Option<&str>,
+    key_file: Option<&std::path::Path>,
+) -> String {
+    let Some(key) = api_key else {
+        return format!(
+            "\nnext: `xerj autoindex map --url {url}` for the data map; \
+             search via `curl '{url}/{prefix}-*/_search'`"
+        );
+    };
+    // A shell *expression* in every arm, so all renderings quote identically.
+    let key_expr = if env_key == Some(key) {
+        "$XERJ_API_KEY".to_string()
+    } else if let Some(path) = key_file {
+        // Reads the same secret at paste time without printing it here.
+        format!("$(cat {})", path.display())
+    } else {
+        key.to_string()
+    };
+    format!(
+        "\nnext: `xerj autoindex map --url {url} --api-key \"{key_expr}\"` for the data map;\n\
+         \x20     search via `curl -H \"Authorization: ApiKey {key_expr}\" \
+         '{url}/{prefix}-*/_search'`"
+    )
+}
 
 fn prepared_records_identity(cfg: &IndexCfg) -> Result<String> {
     let value = json!({
@@ -172,6 +226,7 @@ fn project_reconcile_plan(
     cfg: &IndexCfg,
     state_dir: &Path,
     pr: &Progress,
+    meter: &estimate::Meter,
 ) -> Result<Plan> {
     let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
     let ctx = PhaseAContext {
@@ -179,6 +234,7 @@ fn project_reconcile_plan(
         budget: &budget,
         capacity_warning: None,
         progress: pr,
+        meter,
     };
     pr.phase(
         "scan",
@@ -205,6 +261,88 @@ fn project_reconcile_plan(
             .collect()
     });
     reconcile_plan::reconcile_plan(inventory, base_plan, scans, cfg.sample)
+}
+
+/// Code/AST coverage for one corpus: how much of what a person would call
+/// "the source code" actually reached the index.
+///
+/// This exists because success looked identical to total loss. #294 junked
+/// EVERY source file on the durable `--no-graph` path, and the run still
+/// printed
+///
+/// ```text
+/// xerj-done ok=true exit=3 reason=completed-with-junk wall=0.6s files=4 records=1 generation=1
+/// ```
+///
+/// over a corpus of three source files and one `.md` — the same line a healthy
+/// one-prose-file corpus prints. `records` counts records, not families, so
+/// nothing on that line could distinguish "small corpus" from "the entire code
+/// half is gone". These three counters make that state unrepresentable: a run
+/// whose `code_files` is non-zero while `code_files_indexed` is zero can never
+/// again print the same terminal line as a healthy one, on either path.
+///
+/// Counted per FILE, not per record, and derived from the same durable
+/// artifacts the catalog is projected from (the plan's family strings plus the
+/// per-file record counts), so a resumed run reports the corpus it holds rather
+/// than the slice this invocation happened to touch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeCoverage {
+    /// Source files classified into `Family::Code`, junked ones included.
+    pub files: u64,
+    /// …of those, the ones that produced at least one indexed record.
+    pub indexed: u64,
+    /// …of those, the ones that produced none.
+    pub junked: u64,
+}
+
+impl CodeCoverage {
+    /// Both call sites hold a catalog FORMAT string, which is the plan's
+    /// family (`Family::as_str`) plus the `(gzip)` suffix `format_str` and
+    /// `assignment_format` append — match the family, not the compression.
+    fn is_code_format(format: &str) -> bool {
+        format.strip_suffix("(gzip)").unwrap_or(format) == Family::Code.as_str()
+    }
+
+    /// Count one file the run classified as `format` and which produced
+    /// `records` indexed records. Non-code files are ignored, so both paths can
+    /// feed this their whole file list without pre-filtering.
+    pub fn observe(&mut self, format: &str, records: u64) {
+        if !Self::is_code_format(format) {
+            return;
+        }
+        self.files += 1;
+        if records > 0 {
+            self.indexed += 1;
+        } else {
+            self.junked += 1;
+        }
+    }
+
+    /// The terminal-line and run-document fields, in a fixed order. One
+    /// definition, so the legacy and generated paths cannot drift into
+    /// spelling the same measurement differently.
+    pub fn fields(&self) -> [(&'static str, u64); 3] {
+        [
+            ("code_files", self.files),
+            ("code_files_indexed", self.indexed),
+            ("code_files_junked", self.junked),
+        ]
+    }
+
+    /// The one state that is always a defect: source code was found, and none
+    /// of it reached the index. Cheap to compute and worth a sentence, because
+    /// the counters alone still need a reader who knows to look at them.
+    pub fn warning(&self) -> Option<String> {
+        (self.files > 0 && self.indexed == 0).then(|| {
+            format!(
+                "warning: {} source-code file(s) were detected and NONE produced an indexed \
+                 record — code search over this corpus will return nothing. Check the catalog's \
+                 file documents (doc_kind=file, status=indexed, records=0) before trusting \
+                 this index.",
+                self.files
+            )
+        })
+    }
 }
 
 /// Exit code for a run that committed (or confirmed) a corpus generation.
@@ -235,6 +373,24 @@ fn generated_exit_code(summary: &Value) -> i32 {
 /// out in words rather than left as a bare number.
 fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
     let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+    // Read back from the committed generation's own run document, exactly like
+    // every other number on this line — a resumed or no-op run therefore
+    // reports the corpus's coverage, not an empty one.
+    let coverage = CodeCoverage {
+        files: count("code_files"),
+        indexed: count("code_files_indexed"),
+        junked: count("code_files_junked"),
+    };
+    // Before `finish`: the terminal line is the last thing this stream emits.
+    if let Some(warning) = coverage.warning() {
+        pr.note(&warning);
+    }
+    let mut extra = vec![
+        ("files", count("files_indexed")),
+        ("records", count("records_total")),
+        ("generation", count("generation")),
+    ];
+    extra.extend(coverage.fields());
     pr.finish(
         true,
         code,
@@ -243,11 +399,7 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
         } else {
             "completed"
         },
-        &[
-            ("files", count("files_indexed")),
-            ("records", count("records_total")),
-            ("generation", count("generation")),
-        ],
+        &extra,
     );
 }
 
@@ -407,7 +559,20 @@ fn begin_non_graph_generation(
         plan,
         groups,
     };
-    let pending = sync::PendingSync::new(tx_id, &base, desired)?;
+    // A failure here is the generation machinery contradicting itself about
+    // durable state, and the invariant text alone gives the user nothing to
+    // act on (#283). Name the recovery route; the invariant stays attached as
+    // the cause so the report keeps its diagnostic value.
+    let pending = sync::PendingSync::new(tx_id, &base, desired).with_context(|| {
+        format!(
+            "autoindex could not derive generation {} from committed generation {}; the durable \
+             generation state in {} is not internally consistent, and re-running will not repair \
+             it. No remote data was changed. Rebuild with a new --state-dir and a new --prefix",
+            base.generation + 1,
+            base.generation,
+            state_dir.display()
+        )
+    })?;
     journal.sync_begin(&pending)
 }
 
@@ -664,6 +829,10 @@ struct PhaseAContext<'a> {
     budget: &'a std::sync::Arc<extract::pdf::ExtractionSpoolBudget>,
     capacity_warning: Option<&'a str>,
     progress: &'a Progress,
+    /// Throughput evidence for the pre-index estimate. Phase A already parses
+    /// every file; timing that parse is the only way to price the run on the
+    /// machine it will actually run on rather than on ours.
+    meter: &'a estimate::Meter,
 }
 
 fn scan_file(
@@ -751,15 +920,23 @@ fn scan_file(
             (entry.1 as usize) < sample
         }
     };
+    // Timed span: the extraction itself, nothing around it. The PDF spool's
+    // post-parse `content::verify` re-read is deliberately outside it — phase
+    // B never repeats that read, so charging it here would price a cost the
+    // estimate is trying to predict away.
+    let extraction_started = Instant::now();
+    let extraction_elapsed;
     let extraction = if sn.family == Family::Pdf {
-        match extract::pdf::extract_and_spool(
+        let parsed = extract::pdf::extract_and_spool(
             path,
             state_dir,
             size,
             digest,
             pdf_spool_budget,
             &mut sink,
-        ) {
+        );
+        extraction_elapsed = extraction_started.elapsed();
+        match parsed {
             Ok((stats, spool, fallback)) => {
                 // The inventory digest was computed before Phase A. Only hand
                 // bytes to Phase B when the source still matches that exact
@@ -795,7 +972,9 @@ fn scan_file(
             Err(error) => Err(error),
         }
     } else {
-        extract::extract(path, &sn, limit, &mut sink)
+        let parsed = extract::extract(path, &sn, limit, &mut sink);
+        extraction_elapsed = extraction_started.elapsed();
+        parsed
     };
     match extraction {
         Ok(stats) => {
@@ -816,6 +995,21 @@ fn scan_file(
             }
         }
     }
+    // Throughput evidence, but only where the read was provably complete: the
+    // sampler stops at whichever of the byte cap or the record cap comes
+    // first, and timing a partial read against the full file size would invent
+    // a rate this machine never demonstrated. `exact_scan_bytes` owns that
+    // judgement; a junked file is never timed at all, because phase B will
+    // not process it.
+    if out.junk.is_none() {
+        let sampled = groups.values().map(|(_, records, _)| *records).max();
+        if let Some(bytes) = sampled.and_then(|records| {
+            estimate::exact_scan_bytes(sn.family, sn.gzip, size, records, sample)
+        }) {
+            ctx.meter.record(sn.family, bytes, extraction_elapsed);
+        }
+    }
+
     out.sketches = groups
         .into_iter()
         .map(|(group, (fields, records, key_fields))| GroupSketch {
@@ -842,11 +1036,13 @@ mod clustering_key_tests {
         // reuse: a zero budget keeps these cases on the plain parse path.
         let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
         let progress = Progress::silent();
+        let meter = estimate::Meter::new();
         let ctx = PhaseAContext {
             state_dir: dir,
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &meter,
         };
         scan_file(&path, size, "d0", &ctx, 500, 2)
     }
@@ -932,6 +1128,7 @@ mod phase_a_grouping_tests {
             root: root.to_path_buf(),
             url: "http://unused.invalid".into(),
             api_key: None,
+            api_key_file: None,
             workers: 1,
             scan_workers: 1,
             pdf_workers: 1,
@@ -950,6 +1147,12 @@ mod phase_a_grouping_tests {
             no_semantic: false,
             brain: None,
             no_graph: true,
+            // The gate is switched off in these fixtures on purpose: they assert
+            // indexing, resume and edge behaviour, and a timing-derived stop would
+            // make them depend on how loaded the runner was. The gate's own
+            // behaviour is covered in `gate_tests` and `cli::tests`.
+            max_minutes: 0,
+            approve: None,
             dry_run: true,
             json: false,
             quiet: true,
@@ -969,11 +1172,13 @@ mod phase_a_grouping_tests {
         // file on the plain parse path so no artifact is ever retained.
         let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
         let progress = Progress::silent();
+        let meter = estimate::Meter::new();
         let ctx = PhaseAContext {
             state_dir: root,
             budget: &budget,
             capacity_warning: None,
             progress: &progress,
+            meter: &meter,
         };
         build_phase_a(
             root,
@@ -1374,6 +1579,17 @@ fn build_phase_a(
             file_count: c.members.len(),
         });
     }
+    // Aliases of junk/skipped content have no `plan.files` entry and therefore
+    // no manifest group to attach to, so keeping them made the generation
+    // cutover fail its own alias-projection invariant on any folder holding
+    // two byte-identical junk files — two empty files are enough (#283). The
+    // incremental projection already drops them (`reconcile_plan`'s
+    // `live_content` filter); the fresh plan must project the same way or a
+    // no-op re-run would see a changed plan and commit a spurious generation.
+    let duplicate_files = duplicate_files
+        .into_iter()
+        .filter(|alias| file_assignments.contains_key(&alias.file_key))
+        .collect();
     let plan = Plan {
         datasets,
         files: file_assignments,
@@ -1416,6 +1632,31 @@ fn build_mapping(specs: &[infer::FieldSpec]) -> Value {
 }
 
 // ─── the main run ────────────────────────────────────────────────────────
+
+/// Files phase B still has work for: planned, with a real content key, and
+/// either never finished or finished against different bytes.
+///
+/// This predicate is evaluated twice per run — once to price the work for the
+/// pre-index estimate, once to build the real queue — against two different
+/// snapshots of `journal.done`. The two agree by construction: between the two
+/// calls the only thing that removes a key from `done` is `file_replace_start`,
+/// which is driven from `content_changed`, and for a key in `content_changed`
+/// this predicate ignores `done` altogether. Keeping it in one function is what
+/// makes "the estimate priced what the run then did" true rather than hoped.
+fn pending_for_phase_b(
+    keys: &[String],
+    plan: &Plan,
+    done: &std::collections::HashSet<String>,
+    content_changed: &std::collections::HashSet<String>,
+) -> Vec<usize> {
+    (0..keys.len())
+        .filter(|&i| {
+            !keys[i].is_empty()
+                && plan.files.contains_key(&keys[i])
+                && !(done.contains(&keys[i]) && !content_changed.contains(&keys[i]))
+        })
+        .collect()
+}
 
 fn select_resume_plan_keys(
     files: &[walk::FileEntry],
@@ -2121,6 +2362,10 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             .unwrap_or_else(|| progress::default_interval(surface)),
     );
     let ticker = pr.spawn_ticker();
+    // One throughput meter for the whole run: both phase-A routes (the legacy
+    // scan and the generated route's `project_reconcile_plan`) feed it, so the
+    // estimate is built from whatever this invocation actually parsed.
+    let scan_meter = estimate::Meter::new();
     // What this run decided to take from the machine, before it takes it.
     pr.note(&format!(
         "autoindex: {} scan threads, {} index workers, {} pdf workers, --bulk-mb {} [{}]",
@@ -2304,7 +2549,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                 .committed_manifest
                 .as_ref()
                 .context("branch guard proved a committed manifest")?;
-            let plan = project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr)?;
+            let plan =
+                project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr, &scan_meter)?;
             let unchanged = serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
             // stdout is the RESULT, stderr is PROGRESS: the projection above is
@@ -2360,7 +2606,24 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             .as_ref()
             .context("generated journal lost its committed manifest")?
             .clone();
-        let plan = project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr)?;
+        let plan =
+            project_reconcile_plan(&inventory, &base.plan, &cfg, &state_dir, &pr, &scan_meter)?;
+        // Say out loud that the decision gate is not on this route. It is an
+        // incremental reconcile of an already-committed generation, so the work
+        // is the *changed* set and is published from a sealed snapshot rather
+        // than through the phase-B queue the estimate prices. Accepting
+        // `--max-minutes` here and quietly not applying it would be the
+        // accepted-and-ignored class from #204 — so the run states the
+        // exemption instead of leaving the caller to discover it.
+        if cfg.max_minutes > 0 && cfg.approve.is_none() {
+            pr.note(&format!(
+                "gate: --max-minutes {} does not apply to an incremental reconcile of committed \
+                 generation {} — only files that changed are processed, and they are published \
+                 from a sealed snapshot rather than through the queue the estimate prices. Use \
+                 --dry-run to see the projected plan before committing to it",
+                cfg.max_minutes, base.generation
+            ));
+        }
         if serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)? {
             if let Some(expected) = &base.execution {
                 let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
@@ -2697,6 +2960,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         budget: &pdf_spool_budget,
         capacity_warning: pdf_spool_capacity_warning.as_deref(),
         progress: &pr,
+        meter: &scan_meter,
     };
     let mut plan: Plan = if let Some(p) = journal.plan.clone().filter(|_| !genesis_recovery) {
         p
@@ -2778,6 +3042,206 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         })
         .map(|junk| junk.file_key.clone())
         .collect();
+
+    // ── estimate → work order → decision gate ────────────────────────────
+    //
+    // Everything below happens BEFORE the first remote mutation: no index has
+    // been created, no mapping upgraded, no plan persisted, no document
+    // written. That placement is the whole point — a run that stops here has
+    // cost the user a read of their folder and nothing else.
+    let pending = pending_for_phase_b(&keys, &plan, &journal.done_keys(), &content_changed);
+    let scan_rates = scan_meter.rates();
+    let planned_for_estimate: Vec<estimate::PlannedFile> = pending
+        .iter()
+        .map(|&i| estimate::PlannedFile {
+            family: plan.files[&keys[i]].family.clone(),
+            bytes: files[i].size,
+        })
+        .collect();
+    let run_estimate = estimate::Estimate::compute(&planned_for_estimate, &scan_rates, cfg.workers);
+    let work_items: Vec<order::Item> = pending
+        .iter()
+        .map(|&i| order::Item {
+            index: i,
+            band: order::band_from_family_str(&files[i].rel, &plan.files[&keys[i]].family),
+            bytes: files[i].size,
+        })
+        .collect();
+    let bands = order::summarize(&work_items);
+    let rel_bytes: Vec<(String, u64)> = pending
+        .iter()
+        .map(|&i| (files[i].rel.clone(), files[i].size))
+        .collect();
+    let rel_family_bytes: Vec<(String, String, u64)> = pending
+        .iter()
+        .map(|&i| {
+            (
+                files[i].rel.clone(),
+                plan.files[&keys[i]].family.clone(),
+                files[i].size,
+            )
+        })
+        .collect();
+    let heaviest = gate::heaviest_directories(&rel_bytes, 5);
+
+    pr.note(&format!("estimate: {}", run_estimate.headline()));
+    pr.note(&format!("estimate: basis — {}", run_estimate.basis));
+    for family in &run_estimate.families {
+        pr.note(&format!(
+            "  estimate: {:<10} {:>5} files {:>9} at {}/s measured over {} file(s) / {} → {}",
+            family.family,
+            family.planned_files,
+            estimate::human_bytes(family.planned_bytes),
+            estimate::human_bytes(family.bytes_per_sec as u64),
+            family.measured_files,
+            estimate::human_bytes(family.measured_bytes),
+            estimate::human_secs(family.seconds_of_work),
+        ));
+    }
+    for family in &run_estimate.unmeasured_families {
+        pr.note(&format!(
+            "  estimate: {:<10} {:>5} files {:>9} NOT priced — {}",
+            family.family,
+            family.planned_files,
+            estimate::human_bytes(family.planned_bytes),
+            family.reason,
+        ));
+    }
+    for exclude in &run_estimate.excludes {
+        pr.note(&format!("  estimate excludes: {exclude}"));
+    }
+    pr.note(&format!(
+        "work order: {} — {} inside each band at {} worker(s); a file that outlasts everything \
+         above it starts first regardless of band",
+        bands
+            .iter()
+            .map(|band| format!(
+                "{} ({} files, {})",
+                band.band,
+                band.files,
+                estimate::human_bytes(band.bytes)
+            ))
+            .collect::<Vec<_>>()
+            .join(" → "),
+        if cfg.workers == 1 {
+            "smallest first"
+        } else {
+            "biggest first"
+        },
+        cfg.workers,
+    ));
+    for band in &bands {
+        pr.note(&format!("  {:<16} {}", band.band, band.why));
+    }
+
+    if gate::over_threshold(&run_estimate, cfg.max_minutes) {
+        let semantic_datasets: Vec<String> = plan
+            .datasets
+            .iter()
+            .filter(|dataset| dataset.semantic_field.is_some())
+            .map(|dataset| dataset.slug.clone())
+            .collect();
+        // Decided once, before anything is printed, and used for both halves:
+        // whether to touch stdin at all, and what the payload says about why
+        // nobody was asked. `pr.enabled()` is the missing third condition —
+        // `--quiet` / `--progress none` routes every `pr.note` below to
+        // nothing, so without it the gate printed no question and then waited
+        // on stdin for the answer to it.
+        let prompt_blocked = gate::detect_prompt_block(pr.enabled());
+        let request = gate::DecisionRequest {
+            root: root_str.clone(),
+            estimate: &run_estimate,
+            max_minutes: cfg.max_minutes,
+            bands: bands.clone(),
+            heaviest: heaviest.clone(),
+            without_generated: gate::without_generated_directories(
+                &run_estimate,
+                &scan_rates,
+                &heaviest,
+                &rel_family_bytes,
+            ),
+            semantic_datasets,
+            total_datasets: plan.datasets.len(),
+            graph_files: if cfg.no_graph {
+                0
+            } else {
+                pending.len() as u64
+            },
+            prompt_blocked,
+        };
+        match cfg.approve {
+            Some(answer) => pr.note(&format!(
+                "gate: {} — answered with --approve {}",
+                request.reason(),
+                answer.as_str()
+            )),
+            None if cfg.dry_run => pr.note(&format!(
+                "gate: a real run would STOP here and exit {} — {}",
+                gate::EXIT_NEEDS_DECISION,
+                request.reason()
+            )),
+            None => {
+                for line in request.prose() {
+                    pr.note(&line);
+                }
+                // Ask only where an answer can arrive AND the question was
+                // actually shown. A pipe, a CI job or an agent has no one at
+                // the keyboard; a quiet run has someone at the keyboard who
+                // was shown nothing. Blocking on stdin in either case is an
+                // invisible deadlock — the failure this gate was added to
+                // prevent, not to introduce. When it is blocked, stdin is not
+                // opened at all.
+                let answer = gate::answer_from_terminal(
+                    prompt_blocked,
+                    || std::io::stdin().lock(),
+                    |line| pr.note(line),
+                );
+                match answer {
+                    Some(gate::Approval::Proceed) => pr.note("gate: proceeding"),
+                    Some(gate::Approval::Fast) => {
+                        // Not honourable mid-run: --no-semantic decides the
+                        // mappings this plan was inferred with. Saying so beats
+                        // silently indexing semantically anyway (#204).
+                        pr.note(
+                            "gate: 'fast' changes the inferred mappings, so it cannot be applied \
+                             to a plan that is already frozen. Nothing was indexed — re-run the \
+                             same command with --approve fast",
+                        );
+                        println!("{}", request.to_json());
+                        pr.finish(false, gate::EXIT_NEEDS_DECISION, "needs-decision", &[]);
+                        return Ok((gate::EXIT_NEEDS_DECISION, None));
+                    }
+                    Some(gate::Approval::Cancel) => {
+                        pr.note("gate: cancelled — nothing was indexed");
+                        pr.finish(true, 0, "cancelled", &[]);
+                        return Ok((0, None));
+                    }
+                    None => {
+                        println!("{}", request.to_json());
+                        pr.finish(false, gate::EXIT_NEEDS_DECISION, "needs-decision", &[]);
+                        return Ok((gate::EXIT_NEEDS_DECISION, None));
+                    }
+                }
+            }
+        }
+    } else if cfg.max_minutes > 0 && run_estimate.gate_seconds().is_some() {
+        // Say what the silence means. "Under the threshold" is a statement
+        // about the floor, not a promise about the run, and an agent relaying
+        // it to a person needs the difference.
+        pr.note(&format!(
+            "gate: not triggered — the measured extraction floor {} is under --max-minutes {}. \
+             That is NOT a promise the run finishes in {} minutes: server, network and embedding \
+             time are not measured before indexing starts",
+            run_estimate.range_text(),
+            cfg.max_minutes,
+            cfg.max_minutes
+        ));
+    }
+    if cfg.approve == Some(gate::Approval::Cancel) {
+        pr.note("gate: --approve cancel — nothing was indexed");
+        pr.finish(true, 0, "cancelled", &[]);
+        return Ok((0, None));
+    }
 
     if cfg.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -2942,14 +3406,14 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         .map(|j| j.file_key.as_str())
         .collect();
     let mut new_unplanned: Vec<JunkFile> = Vec::new();
-    let mut todo: Vec<usize> = Vec::new();
+    // The same predicate the estimate above priced — see `pending_for_phase_b`
+    // for why the two snapshots of `journal.done` cannot disagree.
+    let mut todo: Vec<usize> = pending_for_phase_b(&keys, &plan, &done0, &content_changed);
     for i in 0..files.len() {
         if keys[i].is_empty() || done0.contains(&keys[i]) && !content_changed.contains(&keys[i]) {
             continue;
         }
-        if plan.files.contains_key(&keys[i]) {
-            todo.push(i);
-        } else if !planned_junk.contains(keys[i].as_str()) {
+        if !plan.files.contains_key(&keys[i]) && !planned_junk.contains(keys[i].as_str()) {
             // file appeared after the plan was frozen — recorded, not fatal
             new_unplanned.push(JunkFile {
                 file_key: keys[i].clone(),
@@ -3174,9 +3638,28 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         })
     };
 
-    // ascending by size — workers pop() from the tail, so the BIGGEST files
-    // start first and can't serialize the end of the run.
-    todo.sort_by_key(|&i| files[i].size);
+    // Value first, then biggest-first inside each band — `crate::order` owns
+    // the rule and the reasoning, and the bands were already printed with the
+    // estimate above so the order is explained rather than asserted. The queue
+    // is drained with `pop()`, so this is the start order reversed.
+    //
+    // This replaces a plain ascending sort by size. That rule was right about
+    // scheduling (a huge file must not be left to serialise the tail) and
+    // silent about value: a user who stopped early got whatever was largest,
+    // which on a source tree is `node_modules`. `order` keeps the scheduling
+    // property inside each band and adds a critical-path exception so a file
+    // that genuinely dominates the run still starts first.
+    todo = {
+        let items: Vec<order::Item> = todo
+            .iter()
+            .map(|&i| order::Item {
+                index: i,
+                band: order::band_from_family_str(&files[i].rel, &plan.files[&keys[i]].family),
+                bytes: files[i].size,
+            })
+            .collect();
+        order::start_order_as_pop_queue(&items, cfg.workers)
+    };
     let n_todo = todo.len();
     // Percent and ETA are bytes-based, never file-count-based. The queue is
     // biggest-first, so a files-done percent races to ~100% and then sits
@@ -4069,6 +4552,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     }
 
     // file docs — indexed (from journal) + junk/skipped (from plan + this run)
+    //
+    // The same pass produces this path's code/AST coverage (`CodeCoverage`):
+    // the journal's completions are the corpus, not just this invocation's
+    // slice, so a resume reports what is live rather than what it re-parsed.
+    let mut code_coverage = CodeCoverage::default();
     {
         let j = journal_mx.lock().unwrap();
         for fd in j.done.values() {
@@ -4088,6 +4576,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     }
                 })
                 .unwrap_or_else(|| "unknown".into());
+            code_coverage.observe(&fmt, fd.records);
             let (id, doc) = catalog::file_doc(
                 &fd.file_key,
                 current_path,
@@ -4115,6 +4604,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // junk-plan update below mutates.
     let junk_file_count = all_junk.len();
     for jf in &all_junk {
+        // Disjoint from the journal completions above: a file that reached
+        // `file_done` never appears here, so nothing is counted twice.
+        code_coverage.observe(&jf.format, 0);
         let (id, doc) = catalog::file_doc(
             &jf.file_key,
             &jf.rel,
@@ -4269,6 +4761,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     if let Some(g) = &graph_summary {
         run_doc["graph"] = g.clone();
     }
+    // Appended rather than written into the literal above: `serde_json::json!`
+    // recurses once per key and that literal is already 30 deep — the same
+    // reason `catalog::catalog_mapping` inserts its tail fields.
+    for (key, value) in code_coverage.fields() {
+        run_doc[key] = json!(value);
+    }
     push_doc(&format!("run:{run_id}"), &run_doc, &mut cat_buf);
 
     if !cat_buf.is_empty() {
@@ -4359,9 +4857,62 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             );
         }
         println!(
-            "\nnext: `xerj autoindex map --url {}` for the data map; search via GET /{}-*/_search",
-            cfg.url, cfg.prefix
+            "{}",
+            next_hint(
+                &cfg.url,
+                &cfg.prefix,
+                cfg.api_key.as_deref(),
+                std::env::var("XERJ_API_KEY").ok().as_deref(),
+                cfg.api_key_file.as_deref(),
+            )
         );
+        // This line is where an agent learns how to search, so it is where the
+        // code-aware form belongs. A blind usability run showed the cost of
+        // omitting it: the agent followed exactly this guidance, got whole
+        // files back, and reinvented client-side slicing rather than
+        // discovering `_passage` — which it never saw mentioned anywhere.
+        // Only printed when source code was actually indexed; for a PDF or log
+        // corpus it would be noise.
+        let indexed_code = plan.files.values().any(|fa| fa.family == "code");
+        if indexed_code {
+            println!(
+                "      code was indexed — for a function/class instead of a whole file:\n\
+                 \x20       curl -s $URL/{}-*/_search -H 'Content-Type: application/json' \\\n\
+                 \x20         -d '{{\"query\":{{\"bool\":{{\"should\":[{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\
+                 \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":4}}}}}}]}}}},\
+                 \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
+                 \x20       (the `match_phrase` clause ranks the file that DEFINES a symbol above files that merely call it; `_passage` returns \
+                 the enclosing block, not the file)",
+                cfg.prefix
+            );
+        }
+        // A mixed corpus needs one more thing said out loud. Code volume
+        // swamps prose on shared vocabulary: in a blind run, a question about
+        // documentation ("exit code 3") matched WordPress PHP on `exit` and
+        // `code` and returned nothing but source, costing a wasted round trip.
+        // The agent worked out the fix itself afterwards — scope the query —
+        // which is exactly the sort of thing that should not have to be
+        // rediscovered.
+        let indexed_prose = plan
+            .files
+            .values()
+            .any(|fa| fa.family.starts_with("txt") || fa.family == "html");
+        if indexed_code && indexed_prose {
+            println!(
+                "      this corpus mixes code and prose — code volume can swamp prose on\n\
+                 \x20     shared words. Scope the side you want:\n\
+                 \x20       …,\"query\":{{\"bool\":{{\"must\":[{{\"match\":{{\"body\":\"<text>\"}}}}],\
+                 \"filter\":[{{\"term\":{{\"ax_format\":\"code\"}}}}]}}}}\n\
+                 \x20       (values for `ax_format` in this run: {})",
+                {
+                    let mut fams: Vec<&str> =
+                        plan.files.values().map(|fa| fa.family.as_str()).collect();
+                    fams.sort_unstable();
+                    fams.dedup();
+                    fams.join(", ")
+                }
+            );
+        }
     }
     // Exit 3 means "completed, some input was unusable". Backend rejections
     // are not consulted and must not be: a rejected item aborts the run with
@@ -4377,6 +4928,16 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // selects, and which prints nothing by definition). Exit 3 means
     // "completed, some files were unparseable" — success — and an agent reading
     // a bare `3` off a silent stream reads failure (#241 §9). Say it in words.
+    if let Some(warning) = code_coverage.warning() {
+        pr.note(&warning);
+    }
+    let mut done_fields = vec![
+        ("files", files_done.load(Ordering::Relaxed)),
+        ("records", total_records),
+        ("datasets", plan.datasets.len() as u64),
+        ("junk_files", junk_file_count as u64),
+    ];
+    done_fields.extend(code_coverage.fields());
     pr.finish(
         true,
         code,
@@ -4385,12 +4946,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         } else {
             "completed"
         },
-        &[
-            ("files", files_done.load(Ordering::Relaxed)),
-            ("records", total_records),
-            ("datasets", plan.datasets.len() as u64),
-            ("junk_files", junk_file_count as u64),
-        ],
+        &done_fields,
     );
     drop(ticker);
     Ok((code, Some(run_doc)))
@@ -5365,11 +5921,217 @@ mod generation_contract_identity_tests {
         assert_ne!(index_changed.1, expected.1);
     }
 
+    /// ONBOARDING-401-REPRO.md §3: a *successful* run signed off by printing
+    /// `next:` commands that carried no credential, so against an auth-enabled
+    /// server (the default) every one of them answered 401 — including the
+    /// `xerj autoindex map` line `xerj brain` prints after "your second brain
+    /// is ready". The run's own key and url must ride into the hints.
+    #[test]
+    fn next_hint_carries_the_runs_credential() {
+        // Key came from `--api-key` (or a file), not the environment: print it
+        // literally, because nothing else in the user's shell holds it.
+        let hint = next_hint("http://localhost:9510", "ax", Some("s3cret"), None, None);
+        assert!(
+            hint.contains("--api-key \"s3cret\""),
+            "map hint must carry the key, got: {hint}"
+        );
+        assert!(
+            hint.contains("Authorization: ApiKey s3cret"),
+            "search hint must carry the key, got: {hint}"
+        );
+        assert!(
+            hint.contains("http://localhost:9510/ax-*/_search"),
+            "search hint must target the run's url and prefix, got: {hint}"
+        );
+        // Nothing is left as an un-runnable `GET /…` sketch.
+        assert!(
+            !hint.contains("search via GET"),
+            "hints must be runnable commands, got: {hint}"
+        );
+
+        // The key is already exported: reference the variable instead of
+        // echoing the admin secret into a banner people paste into issues.
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            Some("s3cret"),
+            None,
+        );
+        assert!(
+            !hint.contains("s3cret"),
+            "must not echo a secret already in the environment, got: {hint}"
+        );
+        assert!(
+            hint.contains("--api-key \"$XERJ_API_KEY\"")
+                && hint.contains("Authorization: ApiKey $XERJ_API_KEY"),
+            "must reference the exported variable, got: {hint}"
+        );
+
+        // A different value in the environment is not the run's credential.
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            Some("other"),
+            None,
+        );
+        assert!(
+            hint.contains("--api-key \"s3cret\""),
+            "a stale env var must not shadow the run's key, got: {hint}"
+        );
+
+        // Open server: no credential to carry, and none invented.
+        let hint = next_hint("http://localhost:9200", "ax", None, Some("ignored"), None);
+        assert!(
+            !hint.contains("api-key") && !hint.contains("Authorization"),
+            "an auth-free server must get auth-free hints, got: {hint}"
+        );
+        assert!(hint.contains("xerj autoindex map --url http://localhost:9200"));
+    }
+
+    /// A blind onboarding run found `autoindex` discovering `./data/admin.key`
+    /// on its own and then printing that admin key verbatim in its completion
+    /// banner. The reader never typed the secret, so echoing it into copyable
+    /// output is a disclosure — and this banner is exactly what people paste
+    /// into bug reports. Reference the file instead; `$(cat …)` still pastes.
+    #[test]
+    fn a_discovered_key_is_referenced_by_path_never_echoed() {
+        let path = std::path::Path::new("./data/admin.key");
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            None,
+            Some(path),
+        );
+        assert!(
+            !hint.contains("s3cret"),
+            "a key discovered on disk must never be echoed, got: {hint}"
+        );
+        assert!(
+            hint.contains("$(cat ./data/admin.key)"),
+            "the hint must read the key back from its file, got: {hint}"
+        );
+    }
+
     #[test]
     fn internal_contract_versions_are_explicit() {
         assert_eq!(PREPARED_RECORDS_IDENTITY, "prepared-records-v1");
         assert_eq!(DOCUMENT_IDS_IDENTITY, "document-ids-v1");
         assert_eq!(DETECTOR_DISABLED_IDENTITY, "disabled");
+    }
+}
+
+#[cfg(test)]
+mod code_coverage_tests {
+    use super::*;
+
+    fn captured(buffer: &std::sync::Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    /// The exact line that made #294 survivable for a whole release: over a
+    /// corpus of three source files and one `.md`, with every source file
+    /// junked, the run printed `files=4 records=1` — indistinguishable from a
+    /// healthy one-file corpus. Coverage plus a warning is what makes those
+    /// two runs print different lines.
+    #[test]
+    fn the_generated_terminal_line_carries_coverage_and_warns_when_no_code_indexed() {
+        let (pr, buffer) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        finish_generated_progress(
+            &pr,
+            3,
+            &json!({
+                "files_indexed": 4,
+                "records_total": 1,
+                "generation": 1,
+                "code_files": 3,
+                "code_files_indexed": 0,
+                "code_files_junked": 3,
+            }),
+        );
+        let text = captured(&buffer);
+        let done = text
+            .lines()
+            .find(|line| line.starts_with("xerj-done "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            done.contains("code_files=3 code_files_indexed=0 code_files_junked=3"),
+            "{done}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("warning:") && line.contains("NONE")),
+            "a corpus that indexed no source code is warned about in words: {text}"
+        );
+        assert!(
+            text.trim_end()
+                .lines()
+                .next_back()
+                .unwrap()
+                .starts_with("xerj-done "),
+            "the terminal line stays terminal — the warning precedes it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_corpus_reports_its_coverage_without_a_warning() {
+        let (pr, buffer) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        finish_generated_progress(
+            &pr,
+            0,
+            &json!({
+                "files_indexed": 4,
+                "records_total": 8,
+                "generation": 1,
+                "code_files": 3,
+                "code_files_indexed": 3,
+                "code_files_junked": 0,
+            }),
+        );
+        let text = captured(&buffer);
+        assert!(
+            text.contains("code_files=3 code_files_indexed=3 code_files_junked=0"),
+            "{text}"
+        );
+        assert!(!text.contains("warning:"), "{text}");
+    }
+
+    /// A corpus with no source code in it at all must not start warning, and a
+    /// gzipped source file is still a source file.
+    #[test]
+    fn coverage_counts_families_not_compression_and_stays_quiet_without_code() {
+        let mut coverage = CodeCoverage::default();
+        coverage.observe("txt-prose", 4);
+        coverage.observe("csv", 0);
+        assert_eq!(coverage, CodeCoverage::default());
+        assert!(coverage.warning().is_none());
+
+        coverage.observe("code", 1);
+        coverage.observe("code(gzip)", 0);
+        assert_eq!(
+            (coverage.files, coverage.indexed, coverage.junked),
+            (2, 1, 1)
+        );
+        assert!(
+            coverage.warning().is_none(),
+            "partial loss is reported by the counters, not by the warning"
+        );
+        assert_eq!(
+            coverage.fields(),
+            [
+                ("code_files", 2),
+                ("code_files_indexed", 1),
+                ("code_files_junked", 1)
+            ]
+        );
     }
 }
 

@@ -165,7 +165,12 @@ const CROSS_DEP_MAX_SRC_CARDINALITY: usize = 256;
 /// the on-flush overhead is only paid by the freshest tier-0 segments
 /// before they merge anyway).  See
 /// `engine/reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md`.
-const STORED_ZSTD_LEVEL: i32 = 3;
+///
+/// This is now the level used **on flush**, which the operator cannot raise —
+/// that is the whole content of the paragraph above.  Merge re-encodes at
+/// whatever `compression.level` resolves to (#318); see
+/// [`encode_stored_v2_at_level`].
+pub const STORED_ZSTD_LEVEL: i32 = 3;
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -196,7 +201,22 @@ impl ColCodec {
 /// On tiny segments (< `V2_MIN_DOCS` docs) or on any shape that doesn't
 /// fit the column assumptions, the function silently falls back to the
 /// v1 LZ4 encoder — the caller never has to care which was used.
+///
+/// Encodes at [`STORED_ZSTD_LEVEL`]; merge calls
+/// [`encode_stored_v2_at_level`] instead to honour `compression.level`.
 pub fn encode_stored_v2(stored_docs_json: &[u8]) -> Vec<u8> {
+    encode_stored_v2_at_level(stored_docs_json, STORED_ZSTD_LEVEL)
+}
+
+/// [`encode_stored_v2`] at a caller-chosen zstd effort level.
+///
+/// Only the merge path passes anything but [`STORED_ZSTD_LEVEL`] — flush is
+/// back-pressure-critical and stays pinned (see that constant). The output is
+/// the same ZBS2 format at any level: zstd decode does not need to know the
+/// level a payload was written at, so segments written before and after an
+/// operator changes `compression.level` interleave with no migration and no
+/// format flag.
+pub fn encode_stored_v2_at_level(stored_docs_json: &[u8], level: i32) -> Vec<u8> {
     // Parse the JSON array of documents.  Failure → v1 fallback.
     let docs: Vec<serde_json::Value> = match serde_json::from_slice(stored_docs_json) {
         Ok(v) => v,
@@ -250,7 +270,13 @@ pub fn encode_stored_v2(stored_docs_json: &[u8]) -> Vec<u8> {
         }
     }
 
-    encode_v2_columns(num_docs, &col_order, &columns, Some(stored_docs_json))
+    encode_v2_columns(
+        num_docs,
+        &col_order,
+        &columns,
+        Some(stored_docs_json),
+        level,
+    )
 }
 
 /// P2.2 — columnar V2 encoder fed directly from already-parsed values.
@@ -394,7 +420,16 @@ fn encode_stored_v2_from_values_inner(
         );
     }
 
-    encode_v2_columns(num_docs, &col_order, &columns, stored_docs_json)
+    // Flush-only entry point — pinned to the flush level, never the
+    // operator's (#318): raising the level here is the ingest regression
+    // documented on `STORED_ZSTD_LEVEL`.
+    encode_v2_columns(
+        num_docs,
+        &col_order,
+        &columns,
+        stored_docs_json,
+        STORED_ZSTD_LEVEL,
+    )
 }
 
 /// Shared tail of the two V2 entry points: per-column codec selection +
@@ -409,6 +444,7 @@ fn encode_v2_columns(
     col_order: &[String],
     columns: &[Vec<&serde_json::Value>],
     stored_docs_json: Option<&[u8]>,
+    level: i32,
 ) -> Vec<u8> {
     // THROWAWAY prof (XERJ_PROF): encode-phase breakdown.
     let prof = std::env::var_os("XERJ_PROF").is_some();
@@ -497,7 +533,7 @@ fn encode_v2_columns(
             continue;
         }
         if let Some(src_ix) = cross_dep_src[cix] {
-            let (payload, ok) = encode_cross_dep(col, src_ix, &dict_encoded);
+            let (payload, ok) = encode_cross_dep(col, src_ix, &dict_encoded, level);
             if ok {
                 col_payloads.push((cname.clone(), ColCodec::CrossDep as u8, payload));
                 continue;
@@ -505,15 +541,15 @@ fn encode_v2_columns(
         }
         if let Some((entries, ids)) = &dict_encoded[cix] {
             if entries.len() <= DICT_MAX_CARDINALITY && all_scalar_dict_entries(entries) {
-                let payload = encode_dict_bitpack(entries, ids);
+                let payload = encode_dict_bitpack(entries, ids, level);
                 col_payloads.push((cname.clone(), ColCodec::DictBitpack as u8, payload));
                 continue;
             }
         }
         // Fallback: zstd over JSON-array of the column's values.
         let col_json = serde_json::to_vec(col).unwrap_or_default();
-        let zstd_payload = zstd::encode_all(Cursor::new(&col_json), STORED_ZSTD_LEVEL)
-            .unwrap_or_else(|_| col_json.clone());
+        let zstd_payload =
+            zstd::encode_all(Cursor::new(&col_json), level).unwrap_or_else(|_| col_json.clone());
         // Choose RAW_JSON vs LZ4_JSON by size.
         let lz4_payload = lz4_flex::compress_prepend_size(&col_json);
         if lz4_payload.len() + 1 < zstd_payload.len() {
@@ -2041,7 +2077,7 @@ fn decode_constant(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json::Va
     Ok(values)
 }
 
-fn encode_dict_bitpack(entries: &[serde_json::Value], ids: &[u32]) -> Vec<u8> {
+fn encode_dict_bitpack(entries: &[serde_json::Value], ids: &[u32], level: i32) -> Vec<u8> {
     let dict_count = entries.len();
     // Reserve one extra id for null → dict_count (which might be past the
     // packed range, so we allocate `bit_width` large enough for dict_count
@@ -2059,8 +2095,7 @@ fn encode_dict_bitpack(entries: &[serde_json::Value], ids: &[u32]) -> Vec<u8> {
 
     // Dict entries as zstd(json array).
     let dict_json = serde_json::to_vec(entries).unwrap_or_default();
-    let dict_zstd =
-        zstd::encode_all(Cursor::new(&dict_json), STORED_ZSTD_LEVEL).unwrap_or(dict_json.clone());
+    let dict_zstd = zstd::encode_all(Cursor::new(&dict_json), level).unwrap_or(dict_json.clone());
     out.write_u32::<LittleEndian>(dict_zstd.len() as u32)
         .unwrap();
     out.extend_from_slice(&dict_zstd);
@@ -2069,8 +2104,7 @@ fn encode_dict_bitpack(entries: &[serde_json::Value], ids: &[u32]) -> Vec<u8> {
     let packed = bitpack_u32(ids, bit_width);
     // zstd over the bit-packed stream — gives another 20-40 % on log
     // data because repeated ids cluster.
-    let packed_zstd =
-        zstd::encode_all(Cursor::new(&packed), STORED_ZSTD_LEVEL).unwrap_or(packed.clone());
+    let packed_zstd = zstd::encode_all(Cursor::new(&packed), level).unwrap_or(packed.clone());
     out.write_u32::<LittleEndian>(ids.len() as u32).unwrap();
     out.write_u32::<LittleEndian>(packed_zstd.len() as u32)
         .unwrap();
@@ -2166,6 +2200,7 @@ fn encode_cross_dep<B: std::borrow::Borrow<serde_json::Value>>(
     target_col: &[B],
     src_ix: usize,
     dict_encoded: &[Option<(Vec<serde_json::Value>, Vec<u32>)>],
+    level: i32,
 ) -> (Vec<u8>, bool) {
     let (_src_entries, src_ids) = match &dict_encoded[src_ix] {
         Some(e) => e,
@@ -2234,7 +2269,7 @@ fn encode_cross_dep<B: std::borrow::Borrow<serde_json::Value>>(
         prev_ord = *ord;
     }
     // zstd the whole thing.
-    let compressed = zstd::encode_all(Cursor::new(&out), STORED_ZSTD_LEVEL).unwrap_or(out.clone());
+    let compressed = zstd::encode_all(Cursor::new(&out), level).unwrap_or(out.clone());
     // Save the smaller of raw vs zstd.
     let mut final_out = Vec::with_capacity(1 + compressed.len().max(out.len()));
     if compressed.len() + 1 < out.len() {

@@ -34,9 +34,12 @@ async fn test_semantic_vectors_stay_stored_but_not_fts_indexed_after_merge_and_r
 
     async fn assert_queries(idx: &xerj_engine::Index) {
         let semantic = idx
-            .search(&make_search(json!({
-                "semantic": {"field": "content", "query": "quarterly liquidity", "k": 10}
-            })))
+            .search(&make_search_with_source(
+                json!({
+                    "semantic": {"field": "content", "query": "quarterly liquidity", "k": 10}
+                }),
+                json!(true),
+            ))
             .await
             .unwrap();
         assert_eq!(semantic.total.value, 2);
@@ -399,6 +402,15 @@ async fn passage_provenance_rejects_ambiguous_multi_vector_composition_in_any_or
 
 fn make_search(query_json: Value) -> SearchRequest {
     parse_request(&json!({ "query": query_json, "size": 100 })).expect("parse_request")
+}
+
+fn make_search_with_source(query_json: Value, source: Value) -> SearchRequest {
+    parse_request(&json!({
+        "query": query_json,
+        "size": 100,
+        "_source": source
+    }))
+    .expect("parse_request")
 }
 
 fn make_search_with_size(query_json: Value, size: usize) -> SearchRequest {
@@ -1716,7 +1728,7 @@ async fn test_alias_search() {
         .unwrap();
 
     // Add alias "my_alias" → "real_index".
-    engine.add_alias("my_alias", "real_index");
+    engine.add_alias("my_alias", "real_index").unwrap();
 
     // Search via alias should return the same results as searching via the real name.
     let idx_via_alias = engine.get_index("my_alias").unwrap();
@@ -1734,7 +1746,7 @@ async fn test_alias_search() {
     assert!(ids.contains(&"a2"));
 
     // Remove alias and verify it no longer resolves.
-    engine.remove_alias("my_alias", "real_index");
+    engine.remove_alias("my_alias", "real_index").unwrap();
     let resolved = engine.resolve_alias("my_alias");
     assert_eq!(
         resolved,
@@ -5447,7 +5459,10 @@ async fn test_semantic_text_match_survives_flush() {
     idx.flush().await.unwrap();
 
     let post = idx
-        .search(&make_search(json!({"match": {"content": "quick fox"}})))
+        .search(&make_search_with_source(
+            json!({"match": {"content": "quick fox"}}),
+            json!(true),
+        ))
         .await
         .unwrap();
     assert_eq!(

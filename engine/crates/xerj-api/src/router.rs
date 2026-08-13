@@ -12,7 +12,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderValue, Method},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
@@ -173,6 +173,10 @@ pub fn build_native_router(state: AppState) -> Router {
         // spelling (`/v1/indices/{name}/…`), so it carries the same
         // authorization layer — otherwise the reserved `.xerj-memory-*`
         // namespace would be closed on :9200 and open on :8080.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            storage_fence_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             authz::authz_middleware,
@@ -888,6 +892,10 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         // configured admin key — short-circuits it on the first line.
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            storage_fence_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             authz::authz_middleware,
         ))
         .layer(middleware::from_fn_with_state(
@@ -915,6 +923,29 @@ pub fn build_es_compat_router(state: AppState) -> Router {
 // ─────────────────────────────────────────────────────────────────────────────
 // Middleware helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Admit only health probes while the boot-time persistence contract is
+/// blocked. The engine deliberately opened no index in this state, so letting
+/// an arbitrary handler continue would either lie from empty maps or find a
+/// filesystem-shaped bypass (snapshot restore was the important example) and
+/// activate storage after the preflight had refused it.
+async fn storage_fence_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.engine.cluster_state_boot_status().is_writable()
+        || matches!(
+            req.uri().path(),
+            "/health/live" | "/health/ready" | "/v1/health/ready"
+        )
+    {
+        return next.run(req).await;
+    }
+
+    crate::error::ApiError::from(xerj_common::XerjError::cluster_state_unavailable())
+        .into_response()
+}
 
 /// Middleware that sets ES-compatible product headers on every response.
 ///
