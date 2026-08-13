@@ -374,7 +374,31 @@ Large documents — ask for the snippet, not the whole file (see §2):
   `match_phrase` on `defs` with "boost":4 (`defs` is autoindex's per-file symbol
   index — one "kind name" line per definition) ranks a file that DEFINES a symbol
   over one that merely mentions it — `xerj autoindex map` prints this exact query
-  pre-built for every code dataset it finds.
+  pre-built for every code dataset it finds. Do NOT reach for a `defs^N` boost
+  instead: `defs` is an OR over the query's tokens, so a boost amplifies incidental
+  symbol-word overlap; the phrase clause requires the whole token sequence, which is
+  what makes a symbol lookup land on its definition and a multi-word conceptual query
+  contribute nothing.
+
+Field contract for autoindexed documents (this is the full list `/llms.txt` refers to):
+  Written by the code extractor, only when it finds definitions —
+    title          file name
+    language       detected language, e.g. "rust", "python"
+    defs           newline-joined "kind name", one line per definition
+    symbols        array of {name, kind, line}
+    symbol_count   number of entries in `symbols`
+    body           the full file text
+  Written by every autoindex run, on every document of every locator —
+    ax_path        path relative to the folder you indexed (cite <project>/<ax_path>:<line>,
+                   taking <line> from the matching `symbols` entry)
+    ax_paths       every path this content was seen at, when the same bytes appear more than once
+    ax_file        content-addressed key for the source bytes — NOT a filename
+    ax_locator     which extractor produced the record; "code" for the fields above
+    ax_dataset     dataset slug (the `<dataset-slug>` half of the index name)
+    ax_format      source file extension, lower-cased; "unknown" when there is none
+    ax_run         identity of the autoindex generation that wrote the document
+  `defs`/`symbols`/`symbol_count` are absent when the extractor parsed no definitions,
+  so query them with that in mind rather than assuming every code document has them.
 
 --- 3.2 xerj_semantic_search — meaning over a semantic_text field ----
 Prereq: the field must be mapped as `semantic_text` (auto-embedded at ingest).
