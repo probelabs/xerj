@@ -10,6 +10,15 @@
 # To use: copy this file to xerj.toml and start the server:
 #   xerj --config /path/to/xerj.toml
 #
+# Doing that gives you an AUTHENTICATED server: [auth] enabled = true
+# below is the default. The admin key is auto-generated on first start,
+# printed in a banner, and written to <data_dir>/admin.key — and every
+# client has to send it, `xerj autoindex` included:
+#   export XERJ_API_KEY="$(cat <data_dir>/admin.key)"
+#   xerj autoindex <folder>
+# For a local dev node with no key at all, skip the config file and run
+# `xerj --insecure --data-dir ./data` (that disables TLS *and* auth).
+#
 # All settings are optional — an empty file is valid and uses
 # every default below.
 # ============================================================
@@ -88,6 +97,14 @@ trusted_proxies = []
 # When true, every request must carry:
 #   Authorization: ApiKey <key>
 # On first startup, the admin key is written to <data_dir>/admin.key.
+# This is the DEFAULT, so copying this file as-is enables auth. That
+# includes the CLI clients: `xerj autoindex` never takes the key from
+# this file, so pass `--api-key <key>` or set
+# XERJ_API_KEY=$(cat <data_dir>/admin.key), or it fails with 401.
+# One exception: against a loopback --url, `xerj autoindex` falls back to
+# reading <data_dir>/admin.key itself and prints which file it used. That
+# path is relative to the working directory, so a run started from anywhere
+# else still needs the key passed explicitly.
 # Set to false only in trusted private networks or development environments.
 enabled = true
 
@@ -230,23 +247,36 @@ max_merge_count = 16
 
 [compression]
 
-# Enable block compression for stored document fields.
-# Disabling compression increases disk usage but reduces CPU overhead on read.
+# ACCEPTED BUT NOT WIRED. Every durable artifact xerj writes is a compressed
+# envelope — stored (ZBS2), .meta (ZFM4), .post (ZPS1), .dv — and none of them
+# has an uncompressed write path; the legacy uncompressed layouts survive only
+# so old segments stay readable. Setting this to false logs a warning at
+# startup and changes nothing on disk.
 enabled = true
 
-# Compression algorithm and level.
+# Zstandard effort level, applied when segments are re-encoded AT MERGE.
 #
-#   "fast"     — LZ4. Maximum throughput (~500 MB/s), moderate compression ratio.
-#                Best for hot indexes accessed frequently.
-#   "balanced" — Zstandard level 3. Good ratio (~3–4×) with low CPU overhead.
-#                Recommended for most workloads.
-#   "best"     — Zstandard level 19. Maximum ratio (~5–6×) at higher CPU cost.
-#                Best for cold storage or archival indexes.
+#   "fast"     — Zstd level 1. Fastest encode, loosest ratio.
+#   "balanced" — Zstd level 3. Recommended for most workloads.
+#   "best"     — Zstd level 6. Tightest measured ratio per byte of decode
+#                window. Best for cold storage or archival indexes.
+#
+# Flush ignores this and always writes level 3. Flush is the back-pressure-
+# critical bound on sustained ingest: raising its level to 19 once collapsed
+# throughput from 1.55M docs/s to 21k docs/s with 75% of documents rejected
+# (reports/2026-04-25T21-50-00_ingest_perf_regression_zstd19.md). Merge runs
+# off that path and produces the long-lived segments where footprint matters.
+#
+# A change therefore takes effect as segments merge, not at restart. To apply
+# it to data already on disk, re-merge: POST /{index}/_forcemerge. Segments
+# written at different levels coexist — zstd decode does not consult the level
+# a payload was written at, so no migration or reindex is needed.
 level = "balanced"
 
-# Number of documents grouped into a single compressed block.
-# Larger blocks compress better (more context) but increase read amplification
-# when fetching individual documents. Range: 16 – 4096.
+# ACCEPTED BUT NOT WIRED. The stored codec is columnar over the whole segment
+# section rather than blocked by document count, so there is no doc-block for
+# this to size. Still range-checked (16 – 4096) and warned about when moved off
+# the default, so a typo fails at startup instead of being ignored.
 block_size_docs = 128
 
 # ── Full-Text Search (1 setting) ──────────────────────────────────────────────

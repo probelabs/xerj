@@ -54,6 +54,57 @@ const PREPARED_RECORDS_IDENTITY: &str = "prepared-records-v1";
 const DOCUMENT_IDS_IDENTITY: &str = "document-ids-v1";
 const DETECTOR_DISABLED_IDENTITY: &str = "disabled";
 
+/// Render the `next:` guidance printed after a successful index run.
+///
+/// The run's own credential and URL are carried into the printed commands.
+/// They used to be printed bare, so against an auth-enabled server — which is
+/// the default, and what `xerj brain` boots — a *successful* run signed off by
+/// handing the user two commands that both answer 401
+/// (`ONBOARDING-401-REPRO.md` §3). Guidance that cannot be pasted is worse
+/// than no guidance: it reads as a broken server.
+///
+/// `api_key` is the credential this run used (`None` means the server needs
+/// none — `--insecure` or auth off — and the bare commands really do work).
+/// `env_key` is the ambient `XERJ_API_KEY`; when it already holds the run's
+/// key the hints reference `$XERJ_API_KEY` rather than the literal secret, so
+/// the command still pastes into the same shell while the admin key stays out
+/// of a banner users routinely paste into bug reports.
+///
+/// When the key came from neither the environment nor the user's own command
+/// line — i.e. it was discovered on disk — the hint must still not echo it.
+/// A blind onboarding run caught exactly that: `autoindex` found
+/// `./data/admin.key` by itself and then printed the admin key verbatim in a
+/// banner. The reader never typed that secret, so seeing it in copyable output
+/// is a disclosure, not a convenience.
+pub fn next_hint(
+    url: &str,
+    prefix: &str,
+    api_key: Option<&str>,
+    env_key: Option<&str>,
+    key_file: Option<&std::path::Path>,
+) -> String {
+    let Some(key) = api_key else {
+        return format!(
+            "\nnext: `xerj autoindex map --url {url}` for the data map; \
+             search via `curl '{url}/{prefix}-*/_search'`"
+        );
+    };
+    // A shell *expression* in every arm, so all renderings quote identically.
+    let key_expr = if env_key == Some(key) {
+        "$XERJ_API_KEY".to_string()
+    } else if let Some(path) = key_file {
+        // Reads the same secret at paste time without printing it here.
+        format!("$(cat {})", path.display())
+    } else {
+        key.to_string()
+    };
+    format!(
+        "\nnext: `xerj autoindex map --url {url} --api-key \"{key_expr}\"` for the data map;\n\
+         \x20     search via `curl -H \"Authorization: ApiKey {key_expr}\" \
+         '{url}/{prefix}-*/_search'`"
+    )
+}
+
 fn prepared_records_identity(cfg: &IndexCfg) -> Result<String> {
     let value = json!({
         "contract": PREPARED_RECORDS_IDENTITY,
@@ -212,6 +263,88 @@ fn project_reconcile_plan(
     reconcile_plan::reconcile_plan(inventory, base_plan, scans, cfg.sample)
 }
 
+/// Code/AST coverage for one corpus: how much of what a person would call
+/// "the source code" actually reached the index.
+///
+/// This exists because success looked identical to total loss. #294 junked
+/// EVERY source file on the durable `--no-graph` path, and the run still
+/// printed
+///
+/// ```text
+/// xerj-done ok=true exit=3 reason=completed-with-junk wall=0.6s files=4 records=1 generation=1
+/// ```
+///
+/// over a corpus of three source files and one `.md` — the same line a healthy
+/// one-prose-file corpus prints. `records` counts records, not families, so
+/// nothing on that line could distinguish "small corpus" from "the entire code
+/// half is gone". These three counters make that state unrepresentable: a run
+/// whose `code_files` is non-zero while `code_files_indexed` is zero can never
+/// again print the same terminal line as a healthy one, on either path.
+///
+/// Counted per FILE, not per record, and derived from the same durable
+/// artifacts the catalog is projected from (the plan's family strings plus the
+/// per-file record counts), so a resumed run reports the corpus it holds rather
+/// than the slice this invocation happened to touch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeCoverage {
+    /// Source files classified into `Family::Code`, junked ones included.
+    pub files: u64,
+    /// …of those, the ones that produced at least one indexed record.
+    pub indexed: u64,
+    /// …of those, the ones that produced none.
+    pub junked: u64,
+}
+
+impl CodeCoverage {
+    /// Both call sites hold a catalog FORMAT string, which is the plan's
+    /// family (`Family::as_str`) plus the `(gzip)` suffix `format_str` and
+    /// `assignment_format` append — match the family, not the compression.
+    fn is_code_format(format: &str) -> bool {
+        format.strip_suffix("(gzip)").unwrap_or(format) == Family::Code.as_str()
+    }
+
+    /// Count one file the run classified as `format` and which produced
+    /// `records` indexed records. Non-code files are ignored, so both paths can
+    /// feed this their whole file list without pre-filtering.
+    pub fn observe(&mut self, format: &str, records: u64) {
+        if !Self::is_code_format(format) {
+            return;
+        }
+        self.files += 1;
+        if records > 0 {
+            self.indexed += 1;
+        } else {
+            self.junked += 1;
+        }
+    }
+
+    /// The terminal-line and run-document fields, in a fixed order. One
+    /// definition, so the legacy and generated paths cannot drift into
+    /// spelling the same measurement differently.
+    pub fn fields(&self) -> [(&'static str, u64); 3] {
+        [
+            ("code_files", self.files),
+            ("code_files_indexed", self.indexed),
+            ("code_files_junked", self.junked),
+        ]
+    }
+
+    /// The one state that is always a defect: source code was found, and none
+    /// of it reached the index. Cheap to compute and worth a sentence, because
+    /// the counters alone still need a reader who knows to look at them.
+    pub fn warning(&self) -> Option<String> {
+        (self.files > 0 && self.indexed == 0).then(|| {
+            format!(
+                "warning: {} source-code file(s) were detected and NONE produced an indexed \
+                 record — code search over this corpus will return nothing. Check the catalog's \
+                 file documents (doc_kind=file, status=indexed, records=0) before trusting \
+                 this index.",
+                self.files
+            )
+        })
+    }
+}
+
 /// Exit code for a run that committed (or confirmed) a corpus generation.
 ///
 /// `3` is "completed with junk — recorded, never fatal", the same contract the
@@ -240,6 +373,24 @@ fn generated_exit_code(summary: &Value) -> i32 {
 /// out in words rather than left as a bare number.
 fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
     let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+    // Read back from the committed generation's own run document, exactly like
+    // every other number on this line — a resumed or no-op run therefore
+    // reports the corpus's coverage, not an empty one.
+    let coverage = CodeCoverage {
+        files: count("code_files"),
+        indexed: count("code_files_indexed"),
+        junked: count("code_files_junked"),
+    };
+    // Before `finish`: the terminal line is the last thing this stream emits.
+    if let Some(warning) = coverage.warning() {
+        pr.note(&warning);
+    }
+    let mut extra = vec![
+        ("files", count("files_indexed")),
+        ("records", count("records_total")),
+        ("generation", count("generation")),
+    ];
+    extra.extend(coverage.fields());
     pr.finish(
         true,
         code,
@@ -248,11 +399,7 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
         } else {
             "completed"
         },
-        &[
-            ("files", count("files_indexed")),
-            ("records", count("records_total")),
-            ("generation", count("generation")),
-        ],
+        &extra,
     );
 }
 
@@ -981,6 +1128,7 @@ mod phase_a_grouping_tests {
             root: root.to_path_buf(),
             url: "http://unused.invalid".into(),
             api_key: None,
+            api_key_file: None,
             workers: 1,
             scan_workers: 1,
             pdf_workers: 1,
@@ -4404,6 +4552,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     }
 
     // file docs — indexed (from journal) + junk/skipped (from plan + this run)
+    //
+    // The same pass produces this path's code/AST coverage (`CodeCoverage`):
+    // the journal's completions are the corpus, not just this invocation's
+    // slice, so a resume reports what is live rather than what it re-parsed.
+    let mut code_coverage = CodeCoverage::default();
     {
         let j = journal_mx.lock().unwrap();
         for fd in j.done.values() {
@@ -4423,6 +4576,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     }
                 })
                 .unwrap_or_else(|| "unknown".into());
+            code_coverage.observe(&fmt, fd.records);
             let (id, doc) = catalog::file_doc(
                 &fd.file_key,
                 current_path,
@@ -4450,6 +4604,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // junk-plan update below mutates.
     let junk_file_count = all_junk.len();
     for jf in &all_junk {
+        // Disjoint from the journal completions above: a file that reached
+        // `file_done` never appears here, so nothing is counted twice.
+        code_coverage.observe(&jf.format, 0);
         let (id, doc) = catalog::file_doc(
             &jf.file_key,
             &jf.rel,
@@ -4604,6 +4761,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     if let Some(g) = &graph_summary {
         run_doc["graph"] = g.clone();
     }
+    // Appended rather than written into the literal above: `serde_json::json!`
+    // recurses once per key and that literal is already 30 deep — the same
+    // reason `catalog::catalog_mapping` inserts its tail fields.
+    for (key, value) in code_coverage.fields() {
+        run_doc[key] = json!(value);
+    }
     push_doc(&format!("run:{run_id}"), &run_doc, &mut cat_buf);
 
     if !cat_buf.is_empty() {
@@ -4694,8 +4857,14 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             );
         }
         println!(
-            "\nnext: `xerj autoindex map --url {}` for the data map; search via GET /{}-*/_search",
-            cfg.url, cfg.prefix
+            "{}",
+            next_hint(
+                &cfg.url,
+                &cfg.prefix,
+                cfg.api_key.as_deref(),
+                std::env::var("XERJ_API_KEY").ok().as_deref(),
+                cfg.api_key_file.as_deref(),
+            )
         );
     }
     // Exit 3 means "completed, some input was unusable". Backend rejections
@@ -4712,6 +4881,16 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // selects, and which prints nothing by definition). Exit 3 means
     // "completed, some files were unparseable" — success — and an agent reading
     // a bare `3` off a silent stream reads failure (#241 §9). Say it in words.
+    if let Some(warning) = code_coverage.warning() {
+        pr.note(&warning);
+    }
+    let mut done_fields = vec![
+        ("files", files_done.load(Ordering::Relaxed)),
+        ("records", total_records),
+        ("datasets", plan.datasets.len() as u64),
+        ("junk_files", junk_file_count as u64),
+    ];
+    done_fields.extend(code_coverage.fields());
     pr.finish(
         true,
         code,
@@ -4720,12 +4899,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         } else {
             "completed"
         },
-        &[
-            ("files", files_done.load(Ordering::Relaxed)),
-            ("records", total_records),
-            ("datasets", plan.datasets.len() as u64),
-            ("junk_files", junk_file_count as u64),
-        ],
+        &done_fields,
     );
     drop(ticker);
     Ok((code, Some(run_doc)))
@@ -5700,11 +5874,217 @@ mod generation_contract_identity_tests {
         assert_ne!(index_changed.1, expected.1);
     }
 
+    /// ONBOARDING-401-REPRO.md §3: a *successful* run signed off by printing
+    /// `next:` commands that carried no credential, so against an auth-enabled
+    /// server (the default) every one of them answered 401 — including the
+    /// `xerj autoindex map` line `xerj brain` prints after "your second brain
+    /// is ready". The run's own key and url must ride into the hints.
+    #[test]
+    fn next_hint_carries_the_runs_credential() {
+        // Key came from `--api-key` (or a file), not the environment: print it
+        // literally, because nothing else in the user's shell holds it.
+        let hint = next_hint("http://localhost:9510", "ax", Some("s3cret"), None, None);
+        assert!(
+            hint.contains("--api-key \"s3cret\""),
+            "map hint must carry the key, got: {hint}"
+        );
+        assert!(
+            hint.contains("Authorization: ApiKey s3cret"),
+            "search hint must carry the key, got: {hint}"
+        );
+        assert!(
+            hint.contains("http://localhost:9510/ax-*/_search"),
+            "search hint must target the run's url and prefix, got: {hint}"
+        );
+        // Nothing is left as an un-runnable `GET /…` sketch.
+        assert!(
+            !hint.contains("search via GET"),
+            "hints must be runnable commands, got: {hint}"
+        );
+
+        // The key is already exported: reference the variable instead of
+        // echoing the admin secret into a banner people paste into issues.
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            Some("s3cret"),
+            None,
+        );
+        assert!(
+            !hint.contains("s3cret"),
+            "must not echo a secret already in the environment, got: {hint}"
+        );
+        assert!(
+            hint.contains("--api-key \"$XERJ_API_KEY\"")
+                && hint.contains("Authorization: ApiKey $XERJ_API_KEY"),
+            "must reference the exported variable, got: {hint}"
+        );
+
+        // A different value in the environment is not the run's credential.
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            Some("other"),
+            None,
+        );
+        assert!(
+            hint.contains("--api-key \"s3cret\""),
+            "a stale env var must not shadow the run's key, got: {hint}"
+        );
+
+        // Open server: no credential to carry, and none invented.
+        let hint = next_hint("http://localhost:9200", "ax", None, Some("ignored"), None);
+        assert!(
+            !hint.contains("api-key") && !hint.contains("Authorization"),
+            "an auth-free server must get auth-free hints, got: {hint}"
+        );
+        assert!(hint.contains("xerj autoindex map --url http://localhost:9200"));
+    }
+
+    /// A blind onboarding run found `autoindex` discovering `./data/admin.key`
+    /// on its own and then printing that admin key verbatim in its completion
+    /// banner. The reader never typed the secret, so echoing it into copyable
+    /// output is a disclosure — and this banner is exactly what people paste
+    /// into bug reports. Reference the file instead; `$(cat …)` still pastes.
+    #[test]
+    fn a_discovered_key_is_referenced_by_path_never_echoed() {
+        let path = std::path::Path::new("./data/admin.key");
+        let hint = next_hint(
+            "http://localhost:9200",
+            "ax",
+            Some("s3cret"),
+            None,
+            Some(path),
+        );
+        assert!(
+            !hint.contains("s3cret"),
+            "a key discovered on disk must never be echoed, got: {hint}"
+        );
+        assert!(
+            hint.contains("$(cat ./data/admin.key)"),
+            "the hint must read the key back from its file, got: {hint}"
+        );
+    }
+
     #[test]
     fn internal_contract_versions_are_explicit() {
         assert_eq!(PREPARED_RECORDS_IDENTITY, "prepared-records-v1");
         assert_eq!(DOCUMENT_IDS_IDENTITY, "document-ids-v1");
         assert_eq!(DETECTOR_DISABLED_IDENTITY, "disabled");
+    }
+}
+
+#[cfg(test)]
+mod code_coverage_tests {
+    use super::*;
+
+    fn captured(buffer: &std::sync::Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    /// The exact line that made #294 survivable for a whole release: over a
+    /// corpus of three source files and one `.md`, with every source file
+    /// junked, the run printed `files=4 records=1` — indistinguishable from a
+    /// healthy one-file corpus. Coverage plus a warning is what makes those
+    /// two runs print different lines.
+    #[test]
+    fn the_generated_terminal_line_carries_coverage_and_warns_when_no_code_indexed() {
+        let (pr, buffer) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        finish_generated_progress(
+            &pr,
+            3,
+            &json!({
+                "files_indexed": 4,
+                "records_total": 1,
+                "generation": 1,
+                "code_files": 3,
+                "code_files_indexed": 0,
+                "code_files_junked": 3,
+            }),
+        );
+        let text = captured(&buffer);
+        let done = text
+            .lines()
+            .find(|line| line.starts_with("xerj-done "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            done.contains("code_files=3 code_files_indexed=0 code_files_junked=3"),
+            "{done}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("warning:") && line.contains("NONE")),
+            "a corpus that indexed no source code is warned about in words: {text}"
+        );
+        assert!(
+            text.trim_end()
+                .lines()
+                .next_back()
+                .unwrap()
+                .starts_with("xerj-done "),
+            "the terminal line stays terminal — the warning precedes it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_corpus_reports_its_coverage_without_a_warning() {
+        let (pr, buffer) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        finish_generated_progress(
+            &pr,
+            0,
+            &json!({
+                "files_indexed": 4,
+                "records_total": 8,
+                "generation": 1,
+                "code_files": 3,
+                "code_files_indexed": 3,
+                "code_files_junked": 0,
+            }),
+        );
+        let text = captured(&buffer);
+        assert!(
+            text.contains("code_files=3 code_files_indexed=3 code_files_junked=0"),
+            "{text}"
+        );
+        assert!(!text.contains("warning:"), "{text}");
+    }
+
+    /// A corpus with no source code in it at all must not start warning, and a
+    /// gzipped source file is still a source file.
+    #[test]
+    fn coverage_counts_families_not_compression_and_stays_quiet_without_code() {
+        let mut coverage = CodeCoverage::default();
+        coverage.observe("txt-prose", 4);
+        coverage.observe("csv", 0);
+        assert_eq!(coverage, CodeCoverage::default());
+        assert!(coverage.warning().is_none());
+
+        coverage.observe("code", 1);
+        coverage.observe("code(gzip)", 0);
+        assert_eq!(
+            (coverage.files, coverage.indexed, coverage.junked),
+            (2, 1, 1)
+        );
+        assert!(
+            coverage.warning().is_none(),
+            "partial loss is reported by the counters, not by the warning"
+        );
+        assert_eq!(
+            coverage.fields(),
+            [
+                ("code_files", 2),
+                ("code_files_indexed", 1),
+                ("code_files_junked", 1)
+            ]
+        );
     }
 }
 

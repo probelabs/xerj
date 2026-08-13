@@ -31,6 +31,7 @@ pub mod segment;
 pub mod stored_codec;
 pub mod version_map;
 pub mod wal;
+pub mod wal_fsync;
 
 // ── Public re-exports ────────────────────────────────────────────────────────
 

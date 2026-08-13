@@ -325,9 +325,18 @@ pub struct WalWriter {
     max_size_bytes: u64,
     sync_mode: SyncMode,
     /// True when bytes were appended since the last `fsync` — consumed by
-    /// the `wal_batch_ms` background fsync loop (RC4 W1 #9) so idle shards
+    /// the `wal_batch_ms` fsync scheduler (RC4 W1 #9) so idle shards
     /// don't get pointless fsyncs.
     dirty: bool,
+    /// Issue #334 — registration with the process-wide, event-driven fsync
+    /// scheduler ([`crate::wal_fsync`]).  `Some` only when the owning store
+    /// runs `wal_sync = "batched"` with `wal_batch_ms > 0`; `Strict` fsyncs
+    /// inline and `Async` never fsyncs, so neither registers.
+    ///
+    /// This replaces the per-`IndexStore` fsync thread that made an idle
+    /// node cost one OS thread and `1000 / wal_batch_ms` wakeups per second
+    /// *per index*.
+    sync_handle: Option<Arc<crate::wal_fsync::WalSyncHandle>>,
     /// Set when torn-frame recovery could neither truncate nor rotate
     /// (e.g. disk completely full).  Appends fail fast while set; each
     /// append first re-attempts the fresh-generation heal so the writer
@@ -447,9 +456,33 @@ impl WalWriter {
             max_size_bytes,
             sync_mode,
             dirty: false,
+            sync_handle: None,
             poisoned: false,
             seq_counter,
         })
+    }
+
+    /// Install (or clear) this shard's registration with the batched-fsync
+    /// scheduler.  Set once, right after the writer is placed in its `Arc`
+    /// by [`crate::index_store::IndexStore::open`].
+    pub fn set_sync_handle(&mut self, handle: Option<Arc<crate::wal_fsync::WalSyncHandle>>) {
+        self.sync_handle = handle;
+    }
+
+    /// Mark the shard as holding un-fsynced bytes and, in batched mode, ask
+    /// the shared scheduler for an fsync `wal_batch_ms` from now.
+    ///
+    /// LOAD-BEARING: this is the single chokepoint that every append path
+    /// goes through, which is why the arming lives here rather than in the
+    /// individual append methods — a future append path cannot forget to
+    /// schedule its own durability.  Called under the shard mutex; `arm` is
+    /// one atomic swap when the shard is already queued.
+    #[inline]
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        if let Some(h) = &self.sync_handle {
+            h.arm();
+        }
     }
 
     /// Current sync mode (used by the batch path to temporarily suppress
@@ -539,7 +572,7 @@ impl WalWriter {
 
         let written = WAL_FRAME_OVERHEAD as u64 + payload.len() as u64;
         self.current_offset += written;
-        self.dirty = true;
+        self.mark_dirty();
 
         if self.sync_mode == SyncMode::Strict {
             self.sync()?;
@@ -650,7 +683,7 @@ impl WalWriter {
         let res: Result<()> = (|| {
             self.writer.write_all(frames)?;
             self.current_offset += total_written;
-            self.dirty = true;
+            self.mark_dirty();
             if self.sync_mode == SyncMode::Strict {
                 self.sync()?;
             } else {
@@ -744,7 +777,7 @@ impl WalWriter {
         let res: Result<()> = (|| {
             self.writer.write_all(&out)?;
             self.current_offset += written_total;
-            self.dirty = true;
+            self.mark_dirty();
             if self.sync_mode == SyncMode::Strict {
                 self.sync()?;
             } else {

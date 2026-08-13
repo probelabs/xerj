@@ -317,14 +317,15 @@ pub struct IndexStoreConfig {
     ///   bulk paths this is one fsync per bulk request (group commit) —
     ///   the same granularity as ES's per-request translog fsync.
     /// - `Batched` (`wal_sync = "batched"`): writes reach the kernel page
-    ///   cache before ack (process-crash durable); a background loop
-    ///   fsyncs every dirty WAL shard every `wal_batch_ms` (power-loss
-    ///   window bounded to `wal_batch_ms`).
+    ///   cache before ack (process-crash durable); every dirty WAL shard
+    ///   is fsynced within `wal_batch_ms` of the write that dirtied it
+    ///   (power-loss window bounded to `wal_batch_ms`) by the shared
+    ///   [`crate::wal_fsync`] scheduler.
     pub sync_mode: SyncMode,
-    /// RC4 W1 #9 — fsync cadence (milliseconds) of the background WAL
-    /// fsync loop when `sync_mode == Batched`.  `0` disables the loop
-    /// (used by `wal_sync = "async"`: never fsync, OS decides — and by
-    /// unit tests that don't want the thread).
+    /// RC4 W1 #9 — batched-fsync deadline (milliseconds) applied to a WAL
+    /// shard when a write dirties it, `sync_mode == Batched`.  `0` opts the
+    /// store out of scheduled fsyncs entirely (used by `wal_sync = "async"`:
+    /// never fsync, OS decides — and by unit tests that don't want them).
     pub wal_batch_ms: u64,
     /// Schema version for new segments.
     pub schema_version: u32,
@@ -478,7 +479,12 @@ pub struct IndexStore {
     /// Sharded WAL writers — each shard has its own WAL file and mutex.
     /// Batches route to a shard by `xxh3(doc_id) & (num_shards - 1)`.
     /// When num_wal_shards=1, this is equivalent to the old single-WAL path.
-    wal_shards: Vec<Mutex<WalWriter>>,
+    ///
+    /// Issue #334 — each shard is behind its own `Arc` so the process-wide
+    /// batched-fsync scheduler ([`crate::wal_fsync`]) can hold a `Weak` to
+    /// exactly the shards that have un-fsynced bytes, instead of this store
+    /// owning a thread that polls all of them.
+    wal_shards: Vec<Arc<Mutex<WalWriter>>>,
     /// Per-document version map.
     pub version_map: Arc<VersionMap>,
     /// Monotonically increasing sequence number.
@@ -657,7 +663,19 @@ impl IndexStore {
                 config.sync_mode,
                 Arc::clone(&seq_counter),
             )?;
-            wal_shards.push(Mutex::new(w));
+            let shard = Arc::new(Mutex::new(w));
+            // Issue #334 — register with the shared, event-driven fsync
+            // scheduler instead of spawning a thread per store.  Nothing is
+            // scheduled and no thread starts until a write actually dirties
+            // this shard.
+            if config.sync_mode == SyncMode::Batched && config.wal_batch_ms > 0 {
+                let handle = crate::wal_fsync::register(
+                    &shard,
+                    std::time::Duration::from_millis(config.wal_batch_ms),
+                );
+                shard.lock().unwrap().set_sync_handle(Some(handle));
+            }
+            wal_shards.push(shard);
         }
 
         // Load the persisted snapshot (segment registry). A PRESENT-but-
@@ -783,30 +801,25 @@ impl IndexStore {
         // documented `wal_sync = "batched"` as "fsync every wal_batch_ms"
         // since 0.x, but nothing implemented it: the only fsyncs happened
         // at flush/rotate boundaries, so the real power-loss window was
-        // unbounded (up to `flush_interval_secs`).  A detached thread now
-        // fsyncs every DIRTY WAL shard on the configured cadence.  It
-        // holds only a Weak ref — the loop exits within one tick of the
-        // store being dropped.  Strict mode fsyncs inline per request and
-        // Async mode opts out of fsync entirely; neither spawns the loop
-        // (wal_batch_ms is forced to 0 for them by `store_config_from`).
-        if store.config.sync_mode == SyncMode::Batched && store.config.wal_batch_ms > 0 {
-            let weak: std::sync::Weak<IndexStore> = Arc::downgrade(&store);
-            let period = std::time::Duration::from_millis(store.config.wal_batch_ms);
-            let _ = std::thread::Builder::new()
-                .name("xerj-wal-fsync".into())
-                .spawn(move || loop {
-                    std::thread::sleep(period);
-                    let Some(s) = weak.upgrade() else { break };
-                    for shard in &s.wal_shards {
-                        let mut wal = shard.lock().unwrap();
-                        if wal.is_dirty() {
-                            if let Err(e) = wal.sync() {
-                                warn!("wal_batch_ms fsync failed: {e}");
-                            }
-                        }
-                    }
-                });
-        }
+        // unbounded (up to `flush_interval_secs`).
+        //
+        // Issue #334 — that first implementation spawned a dedicated OS
+        // thread PER STORE which slept `wal_batch_ms` and polled its shards
+        // for dirt.  On a node holding many indices (which is what `xerj
+        // autoindex` produces — one index per inferred dataset per repo)
+        // that is one thread and `1000 / wal_batch_ms` wakeups per second
+        // per index, forever, even with zero clients and zero writes: 9 382
+        // indices measured at 9 709 threads, ~197 k context switches/s and
+        // 718-760 % CPU while completely idle.
+        //
+        // The registration now happens per WAL shard at construction above,
+        // and the fsync itself is driven by the process-wide, event-driven
+        // scheduler in `wal_fsync`: a shard is queued when a write dirties
+        // it and dequeued when it has been fsynced, so an index that is not
+        // being written to costs no thread, no timer and no wakeup.  Strict
+        // mode still fsyncs inline per request and Async mode still opts out
+        // entirely (`store_config_from` forces `wal_batch_ms = 0` for both),
+        // so neither registers a handle.
 
         // RC4 W3 #10 — the open fully succeeded; stamp the data-dir format
         // marker so this and future opens are versioned. Fresh dirs and

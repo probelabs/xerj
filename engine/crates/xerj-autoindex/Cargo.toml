@@ -37,7 +37,10 @@ reqwest = { workspace = true, features = ["blocking"] }
 
 # --- AST code extraction (tree-sitter). Grammars expose a tree-sitter-language
 # LanguageFn, decoupled from the core version, so one core serves all. ---
-tree-sitter = "0.25"
+# Core 0.26: forced by tree-sitter-perl 1.1.2, the only #295 grammar with a
+# hard (`links`) core dep — same story as the c-sharp 0.24→0.25 bump. Every
+# other grammar binds through tree-sitter-language and does not care.
+tree-sitter = "0.26"
 tree-sitter-python = "0.23"
 tree-sitter-c = "0.23"
 tree-sitter-rust = "0.23"
@@ -50,6 +53,44 @@ tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-bash = "0.23"
+# --- #295 Tier 1: mainstream languages users expect. Versions are the ones
+# checked against crates.io in the issue; each must expose a Language loadable
+# by core 0.26 (ABI 13–15) — the all-grammars smoke test enforces that.
+# NOT `tree-sitter-kotlin` (0.3.8): that crate hard-links core >=0.21,<0.23
+# and cannot coexist with core 0.26. The `-ng` fork is the maintained
+# tree-sitter-language binding of the same fwcd grammar.
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-swift = "0.7"
+tree-sitter-scala = "0.26"
+tree-sitter-dart = "0.2"
+tree-sitter-lua = "0.5"
+tree-sitter-perl = "1.1"
+tree-sitter-r = "1.3"
+tree-sitter-julia = "0.23"
+tree-sitter-haskell = "0.23"
+tree-sitter-elixir = "0.3"
+# --- #295 Tier 2: common in ecosystems we already serve.
+# NOT tree-sitter-clojure: its only release (0.1.0) hard-links core ^0.25.6,
+# mutually exclusive with the core 0.26 that Tier 1's perl grammar forces —
+# revisit when a clojure release against 0.26 exists.
+# NOT tree-sitter-sql: 0.0.2 is immature (the issue itself says evaluate
+# first or defer) and `.sql` routing must not steal sqldump files — deferred.
+tree-sitter-erlang = "0.20"
+tree-sitter-ocaml = "0.25"
+tree-sitter-zig = "1.1"
+tree-sitter-objc = "3.0"
+tree-sitter-groovy = "0.1"
+tree-sitter-powershell = "0.26"
+tree-sitter-fsharp = "0.3"
+tree-sitter-nix = "0.3"
+# --- #295 Tier 3: long tail, only where the grammar proves solid.
+# NOT tree-sitter-nim / tree-sitter-crystal: their only releases (0.1.0) are
+# toy grammars (~17 node types, no module/struct/def nodes — verified in
+# their node-types.json); they cannot parse real code in either language and
+# no alternative crate exists on crates.io.
+tree-sitter-fortran = "0.6"
+tree-sitter-matlab = "1.3"
+tree-sitter-solidity = "1.2"
 streaming-iterator = "0.1"
 
 
