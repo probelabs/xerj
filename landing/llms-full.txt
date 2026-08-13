@@ -60,10 +60,32 @@ Handshake:
   libraries connect unchanged. Responses carry `X-Elastic-Product: Elasticsearch`.
 
 Auth:
-  - A node started with `--insecure` requires no auth.
-  - Otherwise send the credential the node was configured with (API key or basic auth)
-    in the `Authorization` header. See https://xerj.org/docs/security.html
+  - A node started with `--insecure` requires no auth (that flag disables TLS AND auth).
+  - Otherwise auth is ON by default: the node generates an admin API key on first run,
+    prints it, and writes it to `<data_dir>/admin.key` (0600, reused on later starts).
+    Send it as `Authorization: ApiKey <key>`. See https://xerj.org/docs/security.html
   - The `autoindex` CLI takes `--api-key <K>` or env `XERJ_API_KEY`.
+
+Node lifecycle (verified against `xerj --help` and a live node; `xerj --help` is the
+authority whenever your binary disagrees):
+  - Start detached and poll rather than booting in the foreground:
+      xerj --insecure --data-dir ~/xerj-data > ~/xerj-node.log 2>&1 &
+      until curl -sf localhost:9200/_cluster/health >/dev/null; do sleep 1; done
+  - On a released binary (v1.0.0-rc.16 and earlier) there is NO `--port` flag —
+    ports are TOML settings passed with `--config`. A `--port <PORT>` flag, which
+    also claims PORT+1 for the native REST API and PORT+2 for gRPC, is on main and
+    ships in the next release:
+      [server] rest_port = 8080 · grpc_port = 8081 · es_compat_port = 9200
+    All three must be distinct. If a port is taken (e.g. a real Elasticsearch on
+    :9200) the node does not fall back — it exits with
+    `bind 127.0.0.1:9200: Address already in use (os error 98)`; give it its own
+    ports and point clients at them (`xerj autoindex … --url http://localhost:9280`).
+  - `--bind` sets the interface; default 127.0.0.1 (loopback only). Exposing it with
+    TLS off additionally requires `server.allow_insecure_network_bind = true`.
+  - Stop with Ctrl-C / SIGTERM: the node flushes state and prints
+    `xerj vX.Y.Z stopped. Goodbye.` There is no `xerj stop` subcommand.
+  - Restarting with the same `--data-dir` preserves every index and doc count
+    (verified). A different data dir is a different, empty node.
 
 Content types:
   - JSON for document / search / memory bodies.
@@ -95,13 +117,26 @@ Content types:
   embedder: word unigrams and intra-word character trigrams hashed into a fixed-width,
   L2-normalised f32 vector (default 384 dims → cosine similarity). What you get is
   hybrid lexical+vector retrieval — lexical / sub-word overlap, NOT deep semantic
-  understanding or synonym-level recall. For real neural semantics, start the server
+  understanding or synonym-level recall. This is what `semantic_text`, the `semantic`
+  query and `/_memory` recall use unless you say otherwise: the operation named
+  "semantic search" is lexical by default. For real neural semantics, start the server
   with `--embed-mode neural` — a built-in in-process BERT encoder (all-MiniLM-L6-v2)
   that ships in the binary and auto-downloads its model (~90 MB) on first use, no
   external service — or `--embed-mode proxy` (any OpenAI-compatible `/v1/embeddings`).
   You can also declare `semantic_text` with an external `inference_id` /
   `inference_endpoint`, or index your own vectors into a `dense_vector` field and use
   `knn`. Only describe output as neural when one of those modes is actually running.
+    * `--embed-mode` is a server-start flag that applies AT INGEST: a document keeps
+      the embedding produced by the mode in force when it was indexed. Switching
+      lexical → neural does not re-embed anything already indexed — you must
+      re-index. Decide before indexing your first corpus.
+    * `--embed-mode neural` fetches its model over HTTPS from the HuggingFace Hub
+      (`sentence-transformers/all-MiniLM-L6-v2`: config.json, tokenizer.json,
+      model.safetensors, ~90 MB) into `~/.cache/huggingface` on first use, then runs
+      from that cache. XERJ pins no checksum of its own for those files — the
+      integrity guarantee is TLS plus the Hub, not a digest XERJ verifies. For
+      air-gapped or policy-constrained hosts, pre-download them and set
+      `embedding.local_model_dir`; nothing is then fetched.
 
 - Default `_search` source is compact. When `_source` is omitted, ordinary source fields
   are returned but engine-generated `<field>_vector` and `<field>_vector_chunks` companions
@@ -115,6 +150,13 @@ Content types:
   currently retains heap per indexed doc — an open, tracked RSS-runaway defect (the
   exact ceiling depends on the box and document shape, so no single figure is quoted).
   Do not plan corpora beyond a few million documents until that fix lands.
+  Sizing, because this collides with the reference-coding workload (clone and index
+  several large repositories): server RSS keeps climbing with total documents indexed
+  for the life of the process. One observed data point, not a formula — a
+  lexical-mode node part-way through a large multi-repository code corpus was
+  resident at 20.2 GB. Index one corpus at a time, watch the process
+  (`ps -o rss= -p <pid>`), and restart the node between corpora on a small box: a
+  restart with the same --data-dir keeps every index and releases the heap.
 
 - Default `_search` returns whole documents; project `_source` and use `_passage`
   to shrink it. With no `_source`/`fields` in the request, every hit's `_source` is
@@ -157,14 +199,63 @@ Ships inside the `xerj` binary itself — no sidecar tool, no Python dependency.
 a pure ES-compat HTTP client feature (it does not link the engine), so it works
 against any XERJ endpoint — local, remote, or one you did not start — and cannot
 destabilize the server.
+CLI-ONLY: this is the one canonical operation with no HTTP equivalent. There is no
+`POST /_autoindex`, no trigger endpoint, and no way to make a remote node walk a
+folder — the command runs where the files are, and only the ES-compat writes it
+issues travel to the node. An HTTP-only agent either has an operator run it, or
+builds the index itself with PUT /{index} + POST /_bulk.
 
   xerj autoindex <folder> [--url http://localhost:9200] [--api-key K] [--workers N]
                           [--bulk-mb N] [--prefix ax] [--state-dir P] [--fresh]
                           [--follow-symlinks] [--max-file-gb N] [--sample N]
-                          [--no-semantic] [--dry-run] [--json] [--quiet]
+                          [--no-semantic] [--no-graph] [--brain NAME]
+                          [--max-minutes N] [--approve proceed|fast|cancel] [--yes]
+                          [--dry-run] [--json] [--quiet]
+                          [--progress auto|plain|json|none] [--progress-interval SECS]
                           [--no-ignore] [--no-default-ignores]
   xerj autoindex map      [--url U] [--json] [--dataset SLUG]
   xerj autoindex status   [--url U] [--state-dir P]
+
+Index naming: every index this creates is `<prefix>-<dataset-slug>`; `--prefix`
+defaults to `ax` and the dataset slug comes from content clustering, not from the
+folder name. Corpora indexed with the same prefix share one wildcard namespace, so
+give each corpus its own `--prefix` (and `--state-dir`) when they must stay
+separable, and scope queries as `POST /<prefix>-*/_search`.
+
+ESTIMATE + DECISION GATE (`--max-minutes`, `--approve`, exit 4):
+  Where the gate exists, phase A measures per-format throughput on the user's own
+  machine and prints a range with its basis before phase B starts. If the upper end
+  exceeds --max-minutes (default 10; 0 disables it; max 10080) and no --approve was
+  passed, the run indexes NOTHING, writes one JSON decision request to stdout
+  ({"xerj":"autoindex-decision-request","exit_code":4,"reason":…,"estimate":{…},
+  "priority_order":[…],"heaviest_directories":[…],"options":[…]}) and exits 4 — its
+  own code, so "I need a decision" is never confused with exit 1's catch-all. Answer
+  by re-running the IDENTICAL command with --approve proceed|fast|cancel (--yes =
+  proceed); `fast` also applies --no-semantic --no-graph; `cancel` indexes nothing
+  and exits 0; "narrower" is not an --approve value — it means re-running against a
+  subdirectory. The number is a MEASURED FLOOR for client-side extraction only
+  (server indexing, embedding and merge time are excluded), so the gate under-asks
+  and never over-asks. A person at a terminal is prompted instead, but only when the
+  question is actually visible (stdin+stderr a terminal, progress surface on);
+  --quiet/--progress none take the agent path (payload on stdout, exit 4).
+  VERSION: the gate ships in v1.0.0-rc.16 (2026-08-13, the current release).
+  --approve/--max-minutes/exit 4 are absent from every earlier release, including
+  v1.0.0-rc.15; on those binaries a long index simply starts and YOU are the gate.
+  `xerj autoindex --help` is the authority for the binary in front of you. Full
+  agent protocol: https://xerj.org/llms.txt
+
+WARNING — `--no-graph` (and therefore `--approve fast`) on source code, on every
+binary UP TO AND INCLUDING v1.0.0-rc.15: --no-graph took the durable-generation
+path, where source files were sniffed correctly as code and then prepared as ZERO
+documents and recorded as junk (issue #294; live A/B-confirmed 2026-08-12 — 0 code
+documents carrying language/defs/symbols, versus full extraction on the graph
+path). The run still reported success (ok=true, exit 0 or 3), so nothing in the
+output showed the loss. FIXED IN v1.0.0-rc.16, which also reports code_files /
+code_files_indexed / code_files_junked on the terminal line and warns when code was
+detected and none of it indexed. On an older binary, verify rather than trust:
+after any --no-graph/--approve fast run over code,
+  POST /<prefix>-*/_count  {"query":{"exists":{"field":"language"}}}
+must be > 0 for a tree that contains source. If it is 0, re-run without --no-graph.
 
 --fresh ignores the resume journal and restarts (ids stay idempotent); on a
 graph-enabled or pre-generation state directory that is how you pick up files
@@ -206,9 +297,15 @@ Your global gitignore (core.excludesFile) is deliberately not read. The folder
 you point at is never excluded: if it is itself ignored, it is indexed anyway
 and the run says which rule it would have matched.
 
-Exit codes: 0 complete · 3 completed-with-junk (junk recorded, never fatal) ·
-2 usage · 1 endpoint/journal error, a refused corpus removal, or a refused
-unsafe corpus-state transition.
+Exit codes: 0 complete (also: the gate was answered `--approve cancel`) ·
+3 completed-with-junk (junk recorded, never fatal — this is SUCCESS, do not report
+it as a failure) · 2 usage · 1 endpoint/journal error, a refused corpus removal, or
+a refused unsafe corpus-state transition (1 is the catch-all for every real failure:
+read the `error:` line on stderr before acting) · 4 needs a decision — the estimate
+gate stopped the run before writing anything, the JSON decision request is on stdout
+and the answer is `--approve`, never a retry. 0/3/2/1 are every code a binary
+WITHOUT the estimate gate returns — that includes every release through
+v1.0.0-rc.15; only v1.0.0-rc.16 and later ever return 4.
 
 Pipeline: walk → sniff → sample → infer → map → extract → bulk → correlate →
 catalog → verify.
@@ -281,6 +378,10 @@ Large documents — ask for the snippet, not the whole file (see §2):
 
 --- 3.2 xerj_semantic_search — meaning over a semantic_text field ----
 Prereq: the field must be mapped as `semantic_text` (auto-embedded at ingest).
+NAME CAVEAT: "semantic" here is whichever embedder the node was started with. The
+default is LEXICAL feature hashing (§2) — word / sub-word overlap, not meaning, and
+it will miss a synonym-only paraphrase. Neural requires `--embed-mode neural` at
+server start, and it applies at ingest (re-index to change).
 POST /{index}/_search
   { "query": { "semantic": { "field": "body", "query": "how do I rotate API keys", "k": 10 } },
     "size": 10 }
@@ -342,6 +443,8 @@ POST /_memory/{namespace}/_recall
 Response: { "namespace", "hits": [ { "id", "text", "metadata", "score" } ] }
   - Recall mode precedence: explicit `vector` (kNN) → `semantic:true` (server embeds `query`)
     → plain `query` text (BM25 relevance).
+  - `semantic:true` embeds with the node's embedder — lexical by default (§2), so
+    "recall by meaning" is word / sub-word overlap unless `--embed-mode neural` runs.
 
 Other memory endpoints:
   GET    /_memory/{namespace}          → { "namespace", "count", "entries":[...] } (recent first, bounded to 100)
@@ -751,6 +854,17 @@ POST /_memory/agent-42/_recall  { "query": "what did they ask about security", "
   Case-studies hub (web) .. https://xerj.org/case-studies.html
   Front door (short) ...... https://xerj.org/llms.txt
 
+Tool schemas (ready to paste into an agent framework; none of them can trigger
+autoindex, which is CLI-only):
+  MCP ..................... https://xerj.org/docs/agents/schemas/mcp-tools.json
+  OpenAI .................. https://xerj.org/docs/agents/schemas/openai-tools.json
+  Anthropic ............... https://xerj.org/docs/agents/schemas/anthropic-tools.json
+The OpenAI and Anthropic files carry the six HTTP operations above; the MCP file
+carries ten (those six plus xerj_brain_ego / _link / _unlink / _overview) and is
+generated from a real tools/list of the server that serves them. If you can run a
+process, `xerj mcp` is that stdio server, inside the same binary since
+v1.0.0-rc.16; it does not start a node — point it at one you already started with
+--url or XERJ_URL.
 =====================================================================
 10. RUNNING AN INDEX FOR A HUMAN  (full protocol — the short version
     lives in /llms.txt)
@@ -808,11 +922,11 @@ a RANGE measured on THAT machine during the dry pass, never a single confident n
 and it covers CLIENT-SIDE EXTRACTION ONLY — server-side indexing, embedding and merge
 time are excluded (`excludes` says so), so treat it as a floor with a shape.
 
-VERSION CHECK. The gate, `--approve`, `--max-minutes` and exit 4 landed together in
-v1.0.0-rc.15; no released binary through v1.0.0-rc.14 has them, and there a long index
-simply starts. `xerj autoindex --help` is the authority for the binary in front of you:
-if it lists `--approve`, steps 2–3 apply; if it does not, YOU are the gate — estimate,
-ask, and only then run.
+VERSION CHECK. The gate, `--approve`, `--max-minutes` and exit 4 ship in
+v1.0.0-rc.16 (2026-08-13, the current release); no earlier release has them,
+including v1.0.0-rc.15, and there a long index simply starts. `xerj autoindex --help`
+is the authority for the binary in front of you: if it lists `--approve`, steps 2–3
+apply; if it does not, YOU are the gate — estimate, ask, and only then run.
 
 - PLAN BEFORE YOU INDEX. `xerj autoindex <folder> --dry-run` walks, sniffs and samples
   every file, prints the plan, and indexes nothing. The line to report is the job size —
@@ -835,7 +949,7 @@ ask, and only then run.
   user a range and say it is an estimate; never state a confident single number you have
   not measured on their machine.
 
-- THE BINARY NOW ENFORCES THE ASK. Since v1.0.0-rc.15, `autoindex` measures per-format
+- WHERE THE GATE EXISTS, THE BINARY ENFORCES THE ASK. Since v1.0.0-rc.16, `autoindex` measures per-format
   throughput ON THE USER'S OWN MACHINE during phase A (it is already parsing every file
   to sniff it) and prints a range with its basis before phase B starts: `estimate: at
   least 64.2 s–64.2 s — a MEASURED FLOOR for client-side extraction…`, then one line per
@@ -877,6 +991,10 @@ ask, and only then run.
     the same files — a better-than-grep experience for a fraction of the time. (XERJ's
     default embedder is lexical feature-hashing, not neural, so `--no-semantic` costs you
     less than the word "semantic" suggests unless the node runs `--embed-mode neural`.)
+    ON A CODE CORPUS, CHECK THE BINARY FIRST: through v1.0.0-rc.15 `--no-graph` indexed
+    ZERO code documents while still reporting success — see the WARNING in §3.0. Fixed
+    in v1.0.0-rc.16; on anything older prefer FULL or NARROWER, or verify with
+    `POST /ax-*/_count {"query":{"exists":{"field":"language"}}}` after the run.
   * NARROWER — index the subdirectory that matters. Build output is already handled (see
     the ignore-rules bullet); narrowing beyond that is still usually the biggest win.
   * Also useful when their machine must stay usable: `--workers N` and `--pdf-workers N`
@@ -988,7 +1106,7 @@ ask, and only then run.
   is only the most common one; a bulk failure, an index-creation conflict, a
   journal-config mismatch, a state-dir lock conflict, corruption or a disk error all exit 1
   too, and restarting the node "because 1 means it is down" will not fix any of them.
-  Those four are every code a binary through v1.0.0-rc.14 returns; `4` MEANS "NEEDS A
+  Those four are every code a binary through v1.0.0-rc.15 returns; `4` MEANS "NEEDS A
   DECISION" — the estimate gate stopped the run before writing anything, the JSON decision
   request is on stdout, and the answer is `--approve`, never a retry.
 
