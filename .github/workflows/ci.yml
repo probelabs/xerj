@@ -494,7 +494,14 @@ jobs:
       # over stdio, and diffs the response against
       # landing/docs/agents/schemas/mcp-tools.json. Needs no running node:
       # tools/list is answered before any proxying.
+      # XERJ_BIN must be set explicitly: this job builds with --profile ci-test
+      # (#331), so the binary lands in target/ci-test/, while the script's
+      # default is target/release/. Without this the gate looks for a binary CI
+      # never built. Each PR was green alone; the interaction only appears once
+      # both are on main.
       - name: MCP published-schema drift gate (xerj mcp ↔ mcp-tools.json)
+        env:
+          XERJ_BIN: ${{ github.workspace }}/engine/target/ci-test/xerj
         run: bash scripts/mcp-schema-check.sh
 
   # Per-OS runtime gate. The earlier autoindex "Too many open files" crash was
