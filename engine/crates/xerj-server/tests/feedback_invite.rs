@@ -26,11 +26,15 @@ const ISSUES_URL: &str = "https://github.com/xerj-org/xerj/issues";
 const MAX_LINE: usize = 10;
 
 /// Every surface, as the argv a caller would type.
-const SURFACES: [&[&str]; 4] = [
+const SURFACES: [&[&str]; 5] = [
     &["--help"],
     &["index", "--help"],
     &["autoindex", "--help"],
     &["brain", "--help"],
+    // Added after #337 introduced this surface: the top-level help advertises
+    // `xerj mcp`, so by this feature's own rule it must ask too, and it would
+    // otherwise have been the one screen that never does.
+    &["mcp", "--help"],
 ];
 
 fn help(args: &[&str], env: Option<&str>) -> String {

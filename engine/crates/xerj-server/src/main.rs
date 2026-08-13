@@ -1770,10 +1770,12 @@ mod help_text_tests {
     /// describe both halves of what the flag does.
     #[test]
     fn insecure_help_documents_auth_not_just_tls() {
-        // `false` so this test reads the flag documentation alone: whether the
-        // feedback invitation is present is a separate concern with its own
-        // tests, and mixing them would make this one fail for the wrong reason.
-        let help = help_text(false);
+        // `true` — the shipped default. Asserting against the real default also
+        // proves the invitation, which splices in above USAGE:, does not reflow
+        // the --insecure paragraph this test reads. (Resolution taken from the
+        // maintainer's conflict analysis on #335; an earlier version passed
+        // `false`, which tested less.)
+        let help = help_text(true);
         let line = help
             .lines()
             .position(|l| l.contains("--insecure"))
