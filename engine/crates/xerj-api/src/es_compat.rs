@@ -11185,8 +11185,8 @@ async fn search_impl(
                                         }
                                     }
                                 }
-                            } else {
-                                if cur.get(seg).is_some() { matched = Some(seg.to_string()); }
+                            } else if cur.get(seg).is_some() {
+                                matched = Some(seg.to_string());
                             }
                             let Some(resolved_seg) = matched else { break };
                             let spec = match cur.get(&resolved_seg).cloned() {

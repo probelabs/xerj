@@ -1653,7 +1653,7 @@ fn pending_for_phase_b(
         .filter(|&i| {
             !keys[i].is_empty()
                 && plan.files.contains_key(&keys[i])
-                && !(done.contains(&keys[i]) && !content_changed.contains(&keys[i]))
+                && (!done.contains(&keys[i]) || content_changed.contains(&keys[i]))
         })
         .collect()
 }
