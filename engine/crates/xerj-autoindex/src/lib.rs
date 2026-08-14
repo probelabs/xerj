@@ -34,7 +34,7 @@ pub mod walk;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -529,6 +529,7 @@ fn begin_non_graph_generation(
             expected_passages: 0,
             expected_vectors: 0,
             expected_junk_records: 0,
+            expected_records_by_dataset: BTreeMap::new(),
         });
     }
     let mut groups = sync::reconcile_groups(&base.groups, candidates)?;

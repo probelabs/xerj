@@ -1498,6 +1498,7 @@ mod sync_journal_tests {
                     expected_passages: 1,
                     expected_vectors: 1,
                     expected_junk_records: 0,
+                    expected_records_by_dataset: std::collections::BTreeMap::new(),
                 }],
             },
         )
