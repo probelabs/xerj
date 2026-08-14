@@ -48,7 +48,7 @@ at the same commits anyone else is using:
 
 | corpus | projects | use it for |
 |---|---|---|
-| `xerj-search` | tantivy, meilisearch, quickwit, sonic, elasticsearch | FTS, BM25, postings, merge policy, typo tolerance, segment layout, ES wire semantics |
+| `xerj-search` | lucene, tantivy, meilisearch, quickwit, sonic, elasticsearch | FTS, BM25, postings, merge policy, typo tolerance, segment layout, ES wire semantics |
 | `xerj-vector` | qdrant, usearch, instant-distance, hnswlib | HNSW build, neighbour heuristics, quantisation, filtered kNN |
 | `xerj-storage` | sled, fjall, redb | WAL, flush epochs, crash recovery, compaction, page allocation |
 | `xerj-columnar` | clickhouse | columnar storage, aggregation execution, compression codecs, vectorised scans |
