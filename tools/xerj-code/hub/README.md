@@ -10,7 +10,7 @@ tools/xerj-code/scripts/xc-index.sh  xerj-storage
 
 | corpus | projects | use it for | approx. checkout |
 |---|---|---|---|
-| [`xerj-search`](xerj-search.json) | tantivy, quickwit, meilisearch, sonic, elasticsearch | FTS, BM25, postings, merge policy, typo tolerance, segment layout, ES wire semantics | ~680 MB |
+| [`xerj-search`](xerj-search.json) | lucene, tantivy, quickwit, meilisearch, sonic, elasticsearch | FTS, BM25, postings, merge policy, typo tolerance, segment layout, ES wire semantics | ~880 MB |
 | [`xerj-vector`](xerj-vector.json) | qdrant, usearch, instant-distance, hnswlib | HNSW construction, neighbour heuristics, quantisation, filtered kNN | ~44 MB |
 | [`xerj-storage`](xerj-storage.json) | sled, fjall, redb | WAL, flush epochs, crash recovery, compaction, page allocation | ~28 MB |
 | [`xerj-columnar`](xerj-columnar.json) | clickhouse | columnar storage, aggregation execution, compression codecs, vectorised scans | ~1.2 GB |
