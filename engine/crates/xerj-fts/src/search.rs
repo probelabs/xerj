@@ -6,7 +6,7 @@
 //! |-------------|--------------------------------------------------|
 //! | `TermQuery` | Single-term lookup: FST → postings → BM25 score  |
 //! | `PhraseQuery`| Ordered adjacent term positions in same document |
-//! | `BoolQuery` | must / should / must_not combinator              |
+//! | `BoolQuery` | must / should / must_not / filter combinator      |
 //! | `PrefixQuery`| FST range scan for all terms with a given prefix |
 //!
 //! ## Parallelism
@@ -353,6 +353,16 @@ pub struct BoolQuery {
     /// No must_not clause must match.
     #[serde(default)]
     pub must_not: Vec<Query>,
+    /// All filter clauses must match, but they contribute NOTHING to
+    /// `_score` — the same split Lucene draws in `BooleanClause.isScoring()`
+    /// (`occur == MUST || occur == SHOULD`, BooleanClause.java:84-87) and
+    /// enforces structurally in `BooleanWeight`'s ctor by building a FILTER
+    /// clause's `Weight` with `ScoreMode.COMPLETE_NO_SCORES`
+    /// (BooleanWeight.java:49-64). Projecting a `filter` child as `must`
+    /// instead (what this crate's caller used to do) makes the clause
+    /// scoring, which is #361.
+    #[serde(default)]
+    pub filter: Vec<Query>,
     /// Minimum number of `should` clauses that must match (default = 1 when
     /// there are no `must` clauses, 0 otherwise — same as ES).
     pub min_should_match: Option<u32>,
@@ -371,6 +381,7 @@ impl Default for BoolQuery {
             must: Vec::new(),
             should: Vec::new(),
             must_not: Vec::new(),
+            filter: Vec::new(),
             min_should_match: None,
             boost: 1.0,
         }
@@ -1084,16 +1095,21 @@ impl FtsSearcher {
     // ── Bool query ────────────────────────────────────────────────────────────
 
     fn execute_bool(&self, bq: &BoolQuery, explain: bool) -> Result<Vec<ScoredHit>> {
-        // Determine effective min_should_match
-        let min_should = bq.min_should_match.unwrap_or(if bq.must.is_empty() {
-            if bq.should.is_empty() {
-                0
-            } else {
-                1
-            }
-        } else {
-            0
-        });
+        // Determine effective min_should_match.  `filter` counts as a
+        // required clause here exactly like `must` — ES defaults the minimum
+        // to 1 only when the bool has should clauses and NO must/filter
+        // clause — so a `bool{filter, should}` keeps optional shoulds.
+        let min_should =
+            bq.min_should_match
+                .unwrap_or(if bq.must.is_empty() && bq.filter.is_empty() {
+                    if bq.should.is_empty() {
+                        0
+                    } else {
+                        1
+                    }
+                } else {
+                    0
+                });
 
         // Execute all sub-queries.
         //
@@ -1134,6 +1150,11 @@ impl FtsSearcher {
         let Some(must_hits) = run_clauses(&bq.must, false)? else {
             return Ok(Vec::new());
         };
+        // `filter` narrows exactly like `must` (partial_ok = false for the
+        // same reason: dropping one would RELAX the query).
+        let Some(filter_hits) = run_clauses(&bq.filter, false)? else {
+            return Ok(Vec::new());
+        };
         let Some(should_hits) = run_clauses(&bq.should, true)? else {
             return Ok(Vec::new());
         };
@@ -1163,6 +1184,21 @@ impl FtsSearcher {
             }
         }
 
+        // Intersect filter clauses — membership ONLY.  Lucene builds a FILTER
+        // clause's Weight with `ScoreMode.COMPLETE_NO_SCORES`
+        // (BooleanWeight.java:49-64, gated on `BooleanClause.isScoring()` at
+        // BooleanClause.java:84-87), so a filter is structurally incapable of
+        // contributing to the score; there is nothing to add and then
+        // subtract.  Deliberately no `score_map` update below (#361).
+        for filter_result in &filter_hits {
+            let doc_set: std::collections::HashSet<u32> =
+                filter_result.iter().map(|h| h.doc_id).collect();
+            candidate_docs = Some(match candidate_docs {
+                None => doc_set,
+                Some(prev) => prev.intersection(&doc_set).copied().collect(),
+            });
+        }
+
         // Should clauses: track per-doc match count and scores
         let mut should_match_count: std::collections::HashMap<u32, u32> =
             std::collections::HashMap::new();
@@ -1173,8 +1209,9 @@ impl FtsSearcher {
             }
         }
 
-        // If no must clauses, candidate set is the union of should docs
-        if bq.must.is_empty() {
+        // If no REQUIRED clauses at all (must ∪ filter), the candidate set is
+        // the union of should docs.
+        if bq.must.is_empty() && bq.filter.is_empty() {
             candidate_docs = Some(should_match_count.keys().copied().collect());
         }
 
@@ -1494,6 +1531,12 @@ impl BoolQuery {
         self
     }
 
+    /// Required, but non-scoring — see the `filter` field's note.
+    pub fn filter(mut self, q: Query) -> Self {
+        self.filter.push(q);
+        self
+    }
+
     pub fn min_should_match(mut self, n: u32) -> Self {
         self.min_should_match = Some(n);
         self
@@ -1772,6 +1815,75 @@ mod tests {
             both.score,
             expected
         );
+    }
+
+    /// #361 — a `filter` clause narrows exactly like a second `must`, and
+    /// contributes exactly nothing to `_score`.  Lucene builds a FILTER
+    /// clause's Weight with `ScoreMode.COMPLETE_NO_SCORES`
+    /// (BooleanWeight.java:49-64, gated on `BooleanClause.isScoring()` at
+    /// BooleanClause.java:84-87).
+    #[test]
+    fn bool_query_filter_narrows_without_scoring() {
+        let dir = TempDir::new().unwrap();
+        let searcher = setup_searcher(dir.path());
+
+        let fox = || Query::Term(TermQuery::new("body", "fox"));
+        let quick = || Query::Term(TermQuery::new("body", "quick"));
+
+        let bare = searcher
+            .search(
+                &Query::Bool(Box::new(BoolQuery::new().must(fox()))),
+                10,
+                false,
+            )
+            .unwrap();
+        let bare_scores: HashMap<u32, f32> = bare.iter().map(|h| (h.doc_id, h.score)).collect();
+
+        let filtered = searcher
+            .search(
+                &Query::Bool(Box::new(BoolQuery::new().must(fox()).filter(quick()))),
+                10,
+                false,
+            )
+            .unwrap();
+        let conjunction = searcher
+            .search(
+                &Query::Bool(Box::new(BoolQuery::new().must(fox()).must(quick()))),
+                10,
+                false,
+            )
+            .unwrap();
+
+        // Same membership as the two-`must` conjunction …
+        let mut filtered_ids: Vec<u32> = filtered.iter().map(|h| h.doc_id).collect();
+        let mut conjunction_ids: Vec<u32> = conjunction.iter().map(|h| h.doc_id).collect();
+        filtered_ids.sort_unstable();
+        conjunction_ids.sort_unstable();
+        assert_eq!(
+            filtered_ids, conjunction_ids,
+            "filter must narrow like must"
+        );
+        assert!(!filtered_ids.is_empty(), "fixture: docs 0 and 1 match both");
+
+        // … the `fox` score unchanged …
+        for hit in &filtered {
+            let bare_score = bare_scores[&hit.doc_id];
+            assert!(
+                (hit.score - bare_score).abs() < 1e-6,
+                "doc {} scored {} with a filter but {bare_score} without it",
+                hit.doc_id,
+                hit.score
+            );
+        }
+        // … and the same clause as a `must` DOES add its BM25, which is the
+        // behaviour the projection used to give every `bool.filter`.
+        for hit in &conjunction {
+            assert!(
+                hit.score > bare_scores[&hit.doc_id],
+                "doc {} did not gain score from a scoring `must` clause",
+                hit.doc_id
+            );
+        }
     }
 
     #[test]
