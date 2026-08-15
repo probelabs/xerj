@@ -161,8 +161,12 @@ Content types:
   Sort on a numeric field if you want numeric order. (b) The ceiling above is what
   `_search?scroll=` enforces, against the request's total over every index it resolves. The
   `POST /{index}/_search_scroll` alias applies it PER INDEX instead, so a multi-index scroll
-  sent there can snapshot the full ceiling from each — permissive, not lossy; nothing is
-  truncated. Tracked in https://github.com/xerj-org/xerj/issues/405.
+  sent there can snapshot the full ceiling from each — permissive rather than truncating
+  (measured: 2x6,000 docs over that route paged out 12,000 hits across 120 pages). But
+  per-hit `_index` is NOT reliable on that route: continuation pages return the raw
+  comma-separated index spec rather than the resolving index, so `(_index, _id)` is not a
+  distinct key there and export/reindex tooling must not depend on it.
+  Tracked in https://github.com/xerj-org/xerj/issues/405.
 
 - Default `_search` source is compact. When `_source` is omitted, ordinary source fields
   are returned but engine-generated `<field>_vector` and `<field>_vector_chunks` companions

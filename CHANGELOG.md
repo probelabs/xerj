@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the hit it comes from, and states the lexicographic ordering that produced the
   mistake. `published_search_after_recipe_walks_the_whole_corpus` parses the
   transcript out of the page, seeds the corpus the transcript itself names,
-  replays the printed request bodies verbatim against the real router, and
+  replays the printed *paging* request bodies (the two carrying `sort`) against the real router, and
   asserts the walk collects every seeded `_id` over the page count the
   transcript claims — so a wrong cursor, an early stop, a repeated page or a
   drifted claim all fail the build.
@@ -76,9 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Verified by `cargo test -p xerj-api --test
   scroll_snapshot_cap_is_documented` — 3 passed in the `ci-test` profile
   (8.67s, overflow-checks off) and 3 passed in `dev` (12.40s, overflow-checks
-  on). It drives `build_es_compat_router` over tempdir engines: an
-  11,450-document `logs` index
-  refuses the scroll open with `400 illegal_argument_exception` naming `[11450]`
+  on). It drives `build_es_compat_router` over tempdir engines: a
+  10,001-document index (`SCROLL_SNAPSHOT_MAX_HITS + 1`)
+  refuses the scroll open with `400 illegal_argument_exception` naming `[10001]`
   and `[10000]`; a 128-document control scroll returns a `_scroll_id`; the
   printed first page returns 1,000 hits ending at `_id` `"10897"` with
   `sort: ["10897"]`; and the published walk from that cursor returns 11,450
