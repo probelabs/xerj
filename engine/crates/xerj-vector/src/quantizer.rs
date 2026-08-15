@@ -183,7 +183,11 @@ impl Quantizer for NoneQuantizer {
 /// Each dimension gets its own `min` and `scale` computed from the training
 /// set, so the quantization is adaptive to the actual data distribution.
 ///
-/// Memory usage: 1 byte per dimension vs. 4 bytes for f32 — 4x compression.
+/// Encoding size: 1 byte per dimension vs. 4 bytes for f32 — 4x. That is a
+/// property of this codec, not of the engine: the kNN serving path does not
+/// hold SQ8 codes resident, it quantizes each candidate's f32 vector per query
+/// (see [`Sq8Params`], and issue #392 for the ingest-time code array that would
+/// turn this ratio into a resident saving).
 #[derive(Debug, Default, Clone)]
 pub struct Scalar8Quantizer;
 

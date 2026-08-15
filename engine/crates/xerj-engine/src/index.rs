@@ -10935,11 +10935,27 @@ impl Index {
             // because it outlived the query that produced it.
             //
             // ACCEPTED CONSEQUENCE: the codebook now depends on the candidate
-            // set, so the same document can score marginally differently under
-            // two different `filter`s. The difference is bounded by SQ8's own
-            // quantization step (1/255 of the fitted range per dimension) —
-            // inside the approximation error `scalar8` already advertises, and
-            // the same class of dependency Lucene has by fitting per segment.
+            // set, and that changes the RETURNED ORDER, not merely the score.
+            // Each individual score moves by at most SQ8's own quantization
+            // step (1/255 of the fitted range per dimension), which is inside
+            // the approximation error `scalar8` already advertises — but
+            // near-tied documents swap, so a caller sees a different ranking.
+            // Measured at the HTTP boundary on a 60-document 4-dim cosine
+            // field: adding a `filter` that removes only unrelated documents
+            // returned the same 30 survivors with max |Δ_score| 1.976e-05 but
+            // a different order at 19 of 30 positions. The trigger is the
+            // candidate set, not the `filter` keyword — indexing one more
+            // unrelated document moved the same corpus by max 7.100e-06 and
+            // reordered its top 10 — and on an unfiltered corpus over 1000
+            // documents every score also differs from rc.17, which fitted from
+            // the first <=1000 candidates and cached that (1500 documents: all
+            // of the top 40 changed, max 4.880e-05, one adjacent-rank swap).
+            // Documented in docs/recipes/vector-quantization.md and #392.
+            //
+            // This is NOT the dependency Lucene has. Lucene fits per segment at
+            // INDEX time, so a Lucene score is a function of the index state
+            // alone; here it is a function of the query's candidate set too.
+            // #392 is what would close that gap.
             let params = Sq8Params::fit_borrowed(cand.iter().map(|(_, _, v)| v.as_slice()), dim);
             debug!(
                 field,

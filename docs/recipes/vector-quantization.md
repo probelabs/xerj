@@ -149,13 +149,34 @@ variance); the printed kNN scores are likewise identical each run.
 - **`scalar8` disables ANN.** A quantized field is excluded from HNSW-served
   kNN and always takes the exact brute-force scan, so it is slower, not
   faster, than leaving the field full-precision. Also [#392](https://github.com/xerj-org/xerj/issues/392).
-- **A `scalar8` `_score` depends on the candidate set.** The codebook is
-  fitted per query over the candidates being scored — which is what keeps an
-  updated document from being scored on a stale codebook
-  ([#371](https://github.com/xerj-org/xerj/issues/371)) — so the same
-  document can score marginally differently under two different `filter`s.
-  The difference is bounded by SQ8's own quantization step (1/255 of the
-  fitted per-dimension range), i.e. inside the approximation error `scalar8`
-  already carries. Elasticsearch fixes its codebook per segment at index
-  time and does not have this property; [#392](https://github.com/xerj-org/xerj/issues/392)
-  is what would bring XERJ in line.
+- **A `scalar8` `_score` — and the order it produces — depends on the
+  candidate set.** The codebook is fitted per query over the candidates being
+  scored, which is what keeps an updated document from being scored on a stale
+  codebook ([#371](https://github.com/xerj-org/xerj/issues/371)). Three things
+  follow, all of them measured, none of them true of a full-precision field:
+
+  - **A `filter` reorders the documents it does not remove.** On a 60-document
+    4-dim cosine corpus (30 tightly clustered `grp:a` documents, 30 spread
+    `grp:b` ones), adding `filter: {"term": {"grp": "a"}}` — which removes only
+    `grp:b` — returned the same 30 documents with a maximum `_score` difference
+    of **1.976e-05**, but in a **different order at 19 of the 30 positions**.
+    The score delta is tiny; the reordering is what a caller actually sees.
+  - **The trigger is the candidate set, not the `filter` keyword.** Indexing
+    one more unrelated document moves existing documents too. Same corpus, one
+    document added far from the query: maximum `_score` difference **7.100e-06**
+    over the 30 pre-existing documents, and a reordered top 10.
+  - **Unfiltered corpora over 1000 documents also score differently from
+    v1.0.0-rc.17**, which fitted the codebook from the first ≤1000 candidates
+    and then cached it for the life of the process. On 1500 documents, **all 40
+    of the top-40 `_score` values changed** (maximum difference **4.880e-05**)
+    and two adjacent ranks swapped. Below 1000 documents, unfiltered and never
+    updated, scores are byte-identical to rc.17.
+
+  Every individual difference is bounded by SQ8's own quantization step (1/255
+  of the fitted per-dimension range), i.e. inside the approximation error
+  `scalar8` already carries — but documents whose true scores are close will
+  swap places, so treat `scalar8` ordering as stable only for a fixed corpus
+  and a fixed filter. Elasticsearch fits its codebook per segment at index time
+  and does not have this property;
+  [#392](https://github.com/xerj-org/xerj/issues/392) is what would bring XERJ
+  in line.

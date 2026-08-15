@@ -87,20 +87,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     query, so it **does not reduce resident memory** — it buys the precision
     profile of int8 and nothing else. Making it a memory win means the
     ordinal-addressed, ingest-time code array described in #371, written next
-    to the data it describes as Lucene does it. The "~4x smaller vector working
-    set" wording has been corrected wherever it appeared rather than left
-    standing: `demo/playbooks/ES_COMPATIBILITY.md`,
-    `demo/playbooks/STUB_AUDIT.md`, `demo/playbooks/USER_FEEDBACK_SCORECARD_RC4.md`,
+    to the data it describes as Lucene does it.
+
+    The "~4x smaller vector working set" wording has been corrected in every
+    place this change could find it, listed exhaustively so the claim is
+    checkable rather than taken on trust. **Docs and shipped artifacts:**
     `docs/recipes/vector-quantization.md`, `docs/recipes/README.md`,
     `docs/examples/vector-quantization/quant_demo.py`,
-    `recipes/vector_quantization.py`, `xerj-common/src/config.rs` and
-    `xerj-vector/src/quantizer.rs`.
+    `recipes/vector_quantization.py`, `engine/xerj.default.toml`,
+    `xerj-common/src/config.rs`, `xerj-common/src/types.rs`,
+    `xerj-vector/src/quantizer.rs`, `demo/playbooks/ES_COMPATIBILITY.md`,
+    `demo/playbooks/STUB_AUDIT.md`,
+    `demo/playbooks/USER_FEEDBACK_SCORECARD_RC4.md`. **Published site**
+    (`landing/docs/*.html` is the hand-maintained mirror of `docs/*.md`):
+    `landing/docs/recipes/vector-quantization.html`,
+    `landing/docs/recipes/index.html`, `landing/docs/index.html`,
+    `landing/docs/vectors.html`, `landing/docs/config.html` (both the
+    reference table and the example TOML), `landing/docs/operations.html` (the
+    RAM capacity-planning line), `landing/docs/playbooks/vector-search.html`,
+    plus the two `docs-index` search snippets that are duplicated into all 44
+    docs pages. **Marketing copy:** `landing/solutions/index.html`,
+    `landing/pricing/index.html`, `landing/resources/index.html`,
+    `landing/industries/finserv.html`, `landing/agent-search/index.html`,
+    `landing/use-cases/ai-search-retrieval.html`, `landing/product.html`,
+    `landing/llms-full.txt`.
+
+    **Deliberately NOT corrected here**, because replacing them needs numbers
+    this change cannot supply: the interactive capacity model on
+    `landing/industries/retail.html` (lines 82/93/177) and the matching row on
+    `landing/industries/healthcare.html:188` size a deployment from an SQ8
+    vector footprint (e.g. "18 GB (SQ8)" vs "92 GB (float32)"), as does the
+    "10 M SKUs ON ONE NODE · SQ8" card at `landing/industries/index.html:123`.
+    Those are product claims with a whole page built on them and they are
+    wrong until #392 lands; they need replacement figures and sign-off, not a
+    silent edit. Also left as-is: the dated review record
+    `engine/reports/FEATURE_FAIRNESS_REVIEW_v0.6.0_2026-04-25.md` (lines
+    81/272), which is an archive of what was believed on 2026-04-25, and the
+    synthetic demo corpus article "Scalar quantization: 4x memory savings for
+    free" (`demo/data/generate_ai_kb.py:56`, echoed as sample search output at
+    `demo/DEMO_RUNBOOK.md:528`), which is generic industry text in a sample
+    knowledge base rather than a claim about XERJ.
   * because the codebook is now fitted per query, a `scalar8` `_score` depends
-    on the candidate set: the same document can score marginally differently
-    under two different `filter`s. The difference is bounded by SQ8's own
-    quantization step (1/255 of the fitted per-dimension range), inside the
-    approximation error `scalar8` already carries, but it is a real difference
-    from Elasticsearch, which fixes its codebook per segment at index time.
+    on the candidate set — **and that changes the returned order, not merely
+    the score.** Each individual score moves by at most SQ8's own quantization
+    step (1/255 of the fitted per-dimension range), inside the approximation
+    error `scalar8` already carries, but documents whose true scores are close
+    swap places, so a caller sees a different ranking. Measured at the HTTP
+    boundary against this branch, on a 60-document 4-dimension cosine field:
+
+    - adding `filter: {"term": {"grp": "a"}}`, which removes only the 30
+      unrelated `grp:b` documents, returned the same 30 survivors with a
+      maximum `_score` difference of **1.976e-05** but a **different order at
+      19 of the 30 positions**;
+    - the trigger is the candidate set, not the `filter` keyword — indexing
+      **one** more unrelated document moved the same 30 by up to **7.100e-06**
+      and reordered their top 10;
+    - on an **unfiltered corpus over 1000 documents** the scores also differ
+      from v1.0.0-rc.17, which fitted the codebook from the first ≤1000
+      candidates and cached it for the life of the process. On 1500 documents
+      all 40 of the top-40 `_score` values changed (maximum **4.880e-05**) and
+      two adjacent ranks swapped. This is a wire-visible change on any
+      `scalar8` field with more than 1000 candidates. Below 1000 documents,
+      unfiltered and never updated, scores are byte-identical to rc.17 — that
+      is the shape the recipe corpus has, and the only shape the
+      "byte-identical scores" note above covers.
+
+    None of this could happen on rc.17 once the first query pinned the
+    codebook, so it is behaviour this change introduces; it is the price of
+    the codebook not outliving the query. It is also **not** the dependency
+    Lucene has: Lucene fits per segment at index time, so a Lucene score is a
+    function of the index state alone, while here it is a function of the
+    query's candidate set as well.
   * `scalar8` continues to disqualify a field from HNSW-served kNN, so opting
     in still costs ANN.
 
