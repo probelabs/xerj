@@ -908,6 +908,99 @@ async fn redelivery_converges_at_a_target_that_honours_external_versioning() {
     );
 }
 
+/// The health signal counts **polls** that applied nothing, not `_bulk`
+/// requests.
+///
+/// How many chunks a poll splits into is `max_batch_bytes` arithmetic, not a
+/// statement about replication. Charging the unapplied counter once per chunk
+/// meant one legitimate at-least-once redelivery — the path the module
+/// documents as expected and benign, and the entire reason every action
+/// carries `version_type: external` — tripped the three-in-a-row threshold on
+/// its own and reported the tap as broken.
+///
+/// Fails before the fix with `healthy = false`,
+/// `consecutive_unapplied_polls = 4`, and
+/// `last_error = "target rejected every action of the last 4 polls with
+/// version_conflict_engine_exception … so nothing is being replicated"` — a
+/// message that is factually wrong, because all four documents are at the
+/// target and this test asserts so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_chunk_redelivery_is_one_unapplied_poll_not_four() {
+    let target = StubTarget::start_with(TargetSemantics::ExternalVersioning).await;
+    let dir = TempDir::new().unwrap();
+    let mut tap = tap_config(&target.url, &["edge-logs"]);
+    // One action per `_bulk`: the smallest legal cap, and the shape any
+    // operator with a low `http.max_content_length` at the target gets.
+    tap.max_batch_bytes = 1;
+    let engine = engine_with_tap(&dir, tap);
+
+    write_docs(&engine, "edge-logs", &["a", "b", "c", "d"]).await;
+    engine.wal_tap.tick(&engine).await;
+    let landed = target.stored_versions();
+    assert_eq!(
+        landed.len(),
+        4,
+        "the first delivery must land all four documents: {landed:?}"
+    );
+    let first_batches = engine.wal_tap.stats()["edge-logs"].batches_sent;
+    assert!(
+        first_batches >= 4,
+        "the point of this test is a MULTI-chunk poll; got {first_batches} _bulk request(s)"
+    );
+
+    // One rewind, one poll: four all-conflict `_bulk` responses that are
+    // together a single, correct, no-op redelivery.
+    engine.wal_tap.rewind_for_test("edge-logs");
+    engine.wal_tap.tick(&engine).await;
+
+    let stats = engine.wal_tap.stats();
+    let edge = stats.get("edge-logs").expect("stats");
+    assert_eq!(
+        edge.version_conflicts, 4,
+        "every redelivered action must still be reported as a conflict"
+    );
+    assert_eq!(
+        edge.consecutive_unapplied_polls, 1,
+        "one poll that applied nothing is ONE, however many chunks it took"
+    );
+    assert!(
+        edge.healthy(),
+        "a redelivery is the documented-benign path and must not report the tap broken: \
+         last_error = {:?}",
+        edge.last_error
+    );
+    assert_eq!(
+        edge.last_error, None,
+        "…and must not leave an operator-facing message behind either"
+    );
+    assert_eq!(
+        target.stored_versions(),
+        landed,
+        "the target still holds exactly the four documents it already had"
+    );
+
+    // The signal must still fire on a genuinely stuck stream: three polls in a
+    // row that apply nothing is not a redelivery.
+    for _ in 0..2 {
+        engine.wal_tap.rewind_for_test("edge-logs");
+        engine.wal_tap.tick(&engine).await;
+    }
+    let stats = engine.wal_tap.stats();
+    let edge = stats.get("edge-logs").expect("stats");
+    assert_eq!(edge.consecutive_unapplied_polls, 3);
+    assert!(
+        !edge.healthy(),
+        "three unapplied polls in a row is a real stall and must still be reported"
+    );
+    assert!(
+        edge.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("last 3 polls")),
+        "and the message must count the unit it actually counts: {:?}",
+        edge.last_error
+    );
+}
+
 /// A target that holds a higher version for every `_id` — a second writer got
 /// there first — turns every action into a rejected no-op. `_stats` used to
 /// call that healthy with `lag_seq: 0` and a climbing `docs_shipped`, because
@@ -1084,7 +1177,7 @@ async fn health_recovers_once_the_target_accepts_again() {
         edge.last_error
     );
     assert_eq!(
-        edge.consecutive_unapplied_batches, 0,
+        edge.consecutive_unapplied_polls, 0,
         "the run counter must reset, not decay"
     );
     assert!(

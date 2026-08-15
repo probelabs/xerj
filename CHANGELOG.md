@@ -87,13 +87,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `wal_tap.min_retained_generations` (default `0`, unchanged behaviour) buys
     **bounded** slack: it is a floor, not an Elasticsearch-style retention
     lease, so it holds at most `n × storage.wal_max_size_mb` per WAL shard
-    however far behind any consumer is.
+    however far behind any consumer is. The floor is enforced inside
+    `IndexStore::wal_maintain_all_verified` — the prune pass the engine actually
+    runs — using the same arithmetic and the same "inside the deletion pass, not
+    in its callers" placement as Lucene's
+    `KeepLastNCommitsDeletionPolicy.onCommit`
+    (`lucene/core/src/java/org/apache/lucene/index/KeepLastNCommitsDeletionPolicy.java:51-58`,
+    Apache-2.0). At the default `0` the loop is unchanged: no extra syscall, no
+    behaviour change.
+  - **The retention floor is live, and the API no longer promises otherwise.**
+    `min_retained_generations` is the one `[wal_tap]` setting that does not live
+    in the tap — it lives in every open index's `WalWriter`, seeded at open from
+    `Engine.config`, an `Arc<Config>` written once at boot and never mutated.
+    `PUT /_xerj/wal_tap` therefore pushes it straight onto the live writers
+    (`Engine::apply_wal_retention_floor`, after Lucene's `LiveIndexWriterConfig`
+    and `IndexFileDeleter.revisitPolicy`,
+    `lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java:39-126`
+    and `IndexFileDeleter.java:516-543`) and answers with
+    `retention_floor_applied_to_indices` — the number of writers it reached —
+    instead of a warning. `DELETE /_xerj/wal_tap` releases it the same way, and
+    `Engine::new` folds the tap's effective configuration into the boot `Config`
+    so a store opened after a restart is seeded with the persisted floor rather
+    than the file's. Verified over HTTP end to end
+    (`xerj-api/tests/wal_tap_retention_floor_is_applied.rs`): after
+    `PUT {"min_retained_generations": 3}` an index opened before the call reads
+    `3` on all 16 WAL shards, an index created after it opens with `3`, and both
+    still read `3` after a restart whose config file still says `0`.
   - A configuration set through `PUT /_xerj/wal_tap` is persisted next to the
     cursors and re-applied over the config file on the next boot, so "runtime
     config, no restart" does not quietly mean "and gone after one".
-    `DELETE /_xerj/wal_tap` drops the overlay and reverts to the file. The state
-    file holds `target_auth`, so it is written `0600` through the same writer
-    the API-key store uses.
+    `DELETE /_xerj/wal_tap` drops the overlay and reverts to the file — to the
+    value the tap kept verbatim at construction, not to a re-read of
+    `Engine.config`. The state file holds `target_auth`, so it is written `0600`
+    through the same writer the API-key store uses.
+  - The unapplied-batch health signal counts **polls**, not `_bulk` requests.
+    How many chunks a poll splits into is `max_batch_bytes` arithmetic: at
+    `max_batch_bytes = 1` one legitimate at-least-once redelivery of four
+    documents produced four all-conflict `_bulk` responses, tripped the
+    three-in-a-row threshold on its own, and emitted `healthy: false` with
+    `last_error: "… nothing is being replicated"` about a poll in which every
+    document was already at the target. The field is now
+    `consecutive_unapplied_polls` and rises by at most one per poll; three
+    unapplied polls in a row still reports the stall.
+  - `wal_tap.max_retry_backoff_secs` is range-checked (`1..=86400`) by `PUT`
+    the way `poll_interval_ms` already was, and every multiply in the backoff
+    computation saturates. `Config::validate` does not bound the field, so
+    `xerj.toml` can put any `u64` there, and `secs.max(1) * 1000` overflowed
+    above ~1.8e16: a panic under `cargo test`'s overflow-checks that killed the
+    spawned tap task silently, and under a release profile a *wrapped* cap that
+    can be arbitrarily small — the value `18_446_744_073_709_552` wrapped to a
+    384 ms ceiling, i.e. a retry storm aimed at an already-failing target.
   - XERJ's own `.xerj*` system indices are never shipped, whatever the allowlist
     says, and a wildcard never expands to a hidden index.
   - There is no backfill. A new index is shipped whole; an established one ships

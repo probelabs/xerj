@@ -702,6 +702,16 @@ impl Engine {
         // reading the frozen boot config.
         let wal_tap_config = config.wal_tap.clone();
 
+        // Built HERE, ahead of the struct literal, because `WalTap::new` is
+        // what loads the persisted runtime configuration and it can override
+        // `min_retained_generations` — which `store_config_from` reads out of
+        // this `Config` when every index opens a few lines below. Freezing the
+        // *file's* floor into the `Arc` while the tap ran with a different one
+        // is how a floor set through `PUT /_xerj/wal_tap` survived a restart
+        // in `_stats` and still reached no `WalWriter`.
+        let wal_tap = Arc::new(crate::wal_tap::WalTap::new(&data_dir, wal_tap_config));
+        config.wal_tap = wal_tap.config();
+
         // Apply operator-tunable aggregation bucket cap. Stored in a static
         // AtomicUsize inside aggs.rs so all per-bucket-allocator hot loops
         // can read it with no plumbing through every agg signature.
@@ -755,7 +765,7 @@ impl Engine {
             frozen_indices: Arc::new(DashMap::new()),
             rollup_jobs: Arc::new(DashMap::new()),
             ccr_auto_follow: Arc::new(DashMap::new()),
-            wal_tap: Arc::new(crate::wal_tap::WalTap::new(&data_dir, wal_tap_config)),
+            wal_tap,
             api_keys: Arc::new(DashMap::new()),
             application_privileges: Arc::new(DashMap::new()),
             legacy_templates: Arc::new(DashMap::new()),
@@ -828,6 +838,13 @@ impl Engine {
                     match Index::open(index_name.clone(), &engine.config, &data_dir) {
                         Ok(idx) => {
                             info!(name = name_str.as_str(), "opened existing index");
+                            // #320 — `engine.config.wal_tap` is already the
+                            // tap's effective configuration (see `WalTap::new`
+                            // above), so the store opened with the right
+                            // floor; this makes that true by construction
+                            // rather than by argument, and covers a tap
+                            // reconfigured between two boot-loop iterations.
+                            idx.set_wal_min_retained_generations(engine.wal_retention_floor());
                             // Restore the raw ES mapping blob (analyzers, formats,
                             // dims — full fidelity) BEFORE any ingest/query can run,
                             // so GET /_mapping and mapping-dependent code paths see
@@ -1240,6 +1257,11 @@ impl Engine {
             &self.config,
             &self.data_dir,
         )?;
+        // #320 — the store was seeded from the boot `Config`; the tap's live
+        // floor is what an operator last asked for. Applied before the index
+        // is published, so no ingest (and therefore no prune) can run against
+        // the wrong floor.
+        idx.set_wal_min_retained_generations(self.wal_retention_floor());
         self.indices.insert(name.to_string(), idx);
         self.record_index_created_at(name);
         info!(name, "index created with custom settings");
@@ -2663,6 +2685,9 @@ impl Engine {
         let index_name = IndexName::new(name).map_err(EngineError::Common)?;
         match Index::open(index_name, &self.config, &self.data_dir) {
             Ok(idx) => {
+                // #320 — a reopened index gets the tap's live retention floor,
+                // not the boot file's.
+                idx.set_wal_min_retained_generations(self.wal_retention_floor());
                 // The store opened, but the full-fidelity mapping blob is part
                 // of what makes this index serveable (#202). Putting the index
                 // back with a silently reduced mapping is exactly the defect
@@ -2830,6 +2855,48 @@ impl Engine {
             .map(|e| e.key().clone())
             .filter(|n| crate::index_guard::visible(n))
             .collect()
+    }
+
+    /// The WAL-consumer retention floor the tap is currently configured with.
+    ///
+    /// Read from the tap, never from `self.config`: the tap's copy is the one
+    /// an operator can change at runtime, and after a restart it is the one
+    /// that was persisted. `self.config` is the boot file, frozen in an `Arc`.
+    fn wal_retention_floor(&self) -> u64 {
+        self.wal_tap.config().min_retained_generations
+    }
+
+    /// Push the tap's live retention floor onto every open index's WAL shards.
+    ///
+    /// Returns the number of indices it reached, so the `PUT /_xerj/wal_tap`
+    /// handler can report what actually happened instead of guessing.
+    ///
+    /// #320. A floor set through the API previously reached nothing: it lived
+    /// in the tap's own `RwLock` and in the state file, while every
+    /// `WalWriter` had been seeded from `Engine.config` — an `Arc<Config>`
+    /// written once at boot from `xerj.toml` and never mutated. The API
+    /// answered `200` with the new value and a warning that it would apply
+    /// after a restart; it did not apply after a restart either. This is the
+    /// half that makes it true for indices that are already open.
+    ///
+    /// Re-applying a policy to already-live state on change, rather than only
+    /// at construction, is Lucene's `IndexFileDeleter.revisitPolicy`
+    /// (lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java:516-543,
+    /// Apache-2.0), which re-runs `policy.onCommit(commits)` over the commits
+    /// that already exist rather than waiting for the next one.
+    pub fn apply_wal_retention_floor(&self) -> usize {
+        let floor = self.wal_retention_floor();
+        let mut applied = 0usize;
+        for entry in self.indices.iter() {
+            entry.value().set_wal_min_retained_generations(floor);
+            applied += 1;
+        }
+        tracing::debug!(
+            floor,
+            indices = applied,
+            "WAL tap: retention floor applied to open indices"
+        );
+        applied
     }
 
     /// Sum the internal query-result cache hit/miss counters across every open
@@ -3592,6 +3659,9 @@ impl Engine {
             // Reopen the index.
             match Index::open(index_name, &self.config, &self.data_dir) {
                 Ok(idx) => {
+                    // #320 — a restored index gets the tap's live retention
+                    // floor, not the boot file's.
+                    idx.set_wal_min_retained_generations(self.wal_retention_floor());
                     // Snapshot dirs carry es_mapping.json — reload it so the
                     // restored index serves the same mapping it was saved with.
                     // A corrupt blob in the snapshot fails the restore of that

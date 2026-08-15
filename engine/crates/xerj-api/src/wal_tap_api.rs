@@ -184,8 +184,16 @@ pub async fn put_wal_tap(
         config.request_timeout_secs = v;
     }
     if let Some(v) = patch.max_retry_backoff_secs {
-        if v == 0 {
-            return bad_request("wal_tap.max_retry_backoff_secs must be at least 1");
+        // Range-checked like `poll_interval_ms` above, not merely `!= 0`.
+        // `WalTap::arm_backoff` now saturates so no value here can overflow
+        // it, but a cap of "several thousand years" is not a backoff — it is a
+        // tap that stops retrying after its first failed send and reports
+        // nothing beyond `last_error`. One day is already far past any
+        // recovery window a `_bulk` target has.
+        if !(1..=86_400).contains(&v) {
+            return bad_request(
+                "wal_tap.max_retry_backoff_secs must be between 1 and 86400 (one day)",
+            );
         }
         config.max_retry_backoff_secs = v;
     }
@@ -209,20 +217,26 @@ pub async fn put_wal_tap(
     }
 
     let body = config_body(&config);
-    // `min_retained_generations` reaches `WalWriter` through
-    // `IndexStoreConfig` when a store is opened, so a runtime change to it
-    // applies to indices opened after this point (and to every index after a
-    // restart, which this patch now survives). Said plainly in the response
-    // rather than left for an operator to discover.
-    let retention_takes_effect_on_restart =
-        patch.min_retained_generations.is_some() && !state.engine.index_name_list().is_empty();
     state.engine.wal_tap.set_config(config);
+    // `min_retained_generations` is the one setting here that does not live in
+    // the tap — it lives in every open index's `WalWriter`, and those were
+    // seeded from `Engine.config`, an `Arc<Config>` written once at boot and
+    // never mutated. Push it onto the live writers NOW, before answering.
+    //
+    // The previous shape acknowledged the value and attached a warning saying
+    // it would take effect after a restart. It did not take effect after a
+    // restart: `store_config_from` read the boot file, not the persisted
+    // runtime config. An operator raising the floor to survive a target
+    // outage, seeing `200`, restarting, and still losing WAL entries had been
+    // told a falsehood by the API — on the one knob whose entire purpose is
+    // preventing that loss.
+    let applied_to = state.engine.apply_wal_retention_floor();
     let mut resp = json!({"acknowledged": true, "wal_tap": body, "persisted": true});
-    if retention_takes_effect_on_restart {
-        resp["warning"] = json!(
-            "min_retained_generations is read when an index store is opened: already-open \
-             indices keep the previous retention floor until this node restarts"
-        );
+    if patch.min_retained_generations.is_some() {
+        // Not a warning — a receipt. It names the number of live WAL writers
+        // the new floor reached, which is the only claim here that an operator
+        // cannot verify from the echoed config alone.
+        resp["retention_floor_applied_to_indices"] = json!(applied_to);
     }
     Json(resp).into_response()
 }
@@ -236,11 +250,17 @@ pub async fn put_wal_tap(
 /// deleting a file in the data directory. Modelled on `_cluster/settings`,
 /// where writing `null` clears a persistent setting.
 pub async fn delete_wal_tap(State(state): State<AppState>) -> Response {
-    // The engine's boot `Config` is the file's value: the tap took a clone of
-    // it at construction and only then layered the persisted runtime config
-    // on top, so this is genuinely "what xerj.toml says".
-    let file_config = state.engine.config().wal_tap.clone();
+    // Taken from the tap, which kept `xerj.toml`'s value verbatim at
+    // construction. It used to be read back off `state.engine.config()`, which
+    // was only correct while nothing else wrote to that field —
+    // `Engine::new` now folds the tap's *effective* config into the boot
+    // `Config` so index stores open with the retention floor actually in
+    // force, and reading it back here would have reverted a persisted runtime
+    // config to itself.
+    let file_config = state.engine.wal_tap.file_config();
     state.engine.wal_tap.clear_runtime_config(file_config);
+    // The file's floor is now the live one; the open indices have to be told.
+    state.engine.apply_wal_retention_floor();
     Json(json!({
         "acknowledged": true,
         "wal_tap": config_body(&state.engine.wal_tap.config()),

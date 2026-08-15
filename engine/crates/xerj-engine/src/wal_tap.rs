@@ -64,10 +64,13 @@
 //! version for every `_id` because a second writer got there first, or one
 //! rejecting every document with a `mapper_parsing_exception` — is a real
 //! state and used to be indistinguishable from a healthy tap.
-//! `consecutive_unapplied_batches`, `last_item_rejection` and
+//! `consecutive_unapplied_polls`, `last_item_rejection` and
 //! [`IndexTapStats::healthy`] exist so it is not. The counter is deliberately
 //! blind to *why* nothing applied: conflict and rejection are opposite
-//! diagnoses but the same fact, and it is the fact that `healthy` reports.
+//! diagnoses but the same fact, and it is the fact that `healthy` reports. It
+//! counts **polls**, not `_bulk` requests: how many chunks a poll splits into
+//! is `max_batch_bytes` arithmetic, and charging each of them separately made
+//! one ordinary redelivery look like a dead replication stream.
 //!
 //! **3. Backpressure.** Bounded by construction: one in-flight request per
 //! index, batches capped by `max_batch_docs` and `max_batch_bytes`, and
@@ -84,10 +87,11 @@
 //! Seed the target with snapshot/restore if it needs the existing documents.
 //!
 //! **4b. What falling behind costs.** WAL retention is *not* coupled to the
-//! tap, deliberately: `prune_verified` deletes a rotated generation as soon as
-//! its entries are durable in a segment, and making that wait on a remote
-//! target is how a slow consumer turns into a disk-full incident. So a tap
-//! that falls far enough behind loses entries — and always finds out. The
+//! tap, deliberately: `IndexStore::wal_maintain_all_verified` deletes a
+//! rotated generation as soon as its entries are durable in a segment, and
+//! making that wait on a remote target is how a slow consumer turns into a
+//! disk-full incident. So a tap that falls far enough behind loses entries —
+//! and always finds out. The
 //! cursor carries the generation it sits in, a pruned-out-from-under-us
 //! generation is detected exactly ([`WalShardTail::gap`]), and each occurrence
 //! logs at `warn` and increments `gaps` in `GET /_xerj/wal_tap/_stats`. The
@@ -97,12 +101,28 @@
 //! `storage.flush_interval_secs = 30` the WAL window is about one flush — so a
 //! minute of target downtime on a hot index loses data with nothing but a log
 //! line to offer. `wal_tap.min_retained_generations` is the middle path: a
-//! **bounded** floor under `prune_verified` that holds the newest N rotated
-//! generations whatever any consumer is doing. Deliberately not a retention
-//! lease (Elasticsearch's `ReplicationTracker.addRetentionLease`, Lucene's
+//! **bounded** floor inside that maintenance pass, holding the newest N
+//! rotated generations whatever any consumer is doing. Same arithmetic and
+//! same placement — inside the deletion pass, not in its callers — as Lucene's
+//! `KeepLastNCommitsDeletionPolicy.onCommit`
+//! (`lucene/core/src/java/org/apache/lucene/index/KeepLastNCommitsDeletionPolicy.java:51-58`,
+//! Apache-2.0). Deliberately **not** a retention lease (Elasticsearch's
+//! `ReplicationTracker.addRetentionLease`, Lucene's
 //! `SnapshotDeletionPolicy.snapshot`): a lease is held until the consumer
 //! releases it, which is exactly how a dead follower wedges a leader's disk.
 //! A floor costs `n * wal_max_size_mb` per shard and not one byte more.
+//!
+//! The floor is **live**: `PUT /_xerj/wal_tap` pushes it straight onto the
+//! open `WalWriter`s (`Engine::apply_wal_retention_floor`), because the value
+//! that reaches a store at open time comes from `Engine.config`, an
+//! `Arc<Config>` written once at boot and never mutated. Setting it through
+//! the API used to reach no writer at all — not the open ones, and not after a
+//! restart either — on the one knob whose whole purpose is preventing loss
+//! during a target outage. Live reconfiguration of an already-open writer is
+//! Lucene's `LiveIndexWriterConfig`
+//! (`lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java:39-126`),
+//! and re-applying a policy to state that already exists rather than only at
+//! construction is its `IndexFileDeleter.revisitPolicy` (`:516-543`).
 //!
 //! **4c. Where the configuration lives.** In the state file next to the
 //! cursors, not only in memory. `PUT /_xerj/wal_tap` is durable and is
@@ -268,8 +288,18 @@ pub struct IndexTapStats {
     /// instead is what let a target that rejected every single action report
     /// `lag_seq: 0` while `docs_shipped` climbed.
     pub last_shipped_seq: u64,
-    /// Consecutive `_bulk` responses in which the target accepted **nothing**
-    /// — every action inside came back with an error.
+    /// Consecutive **polls** in which the target accepted **nothing** — every
+    /// action of every `_bulk` the poll sent came back with an error.
+    ///
+    /// Counted per poll, not per `_bulk`. A poll splits its read into as many
+    /// chunks as `max_batch_bytes` dictates, and those chunks are one logical
+    /// delivery: at `max_batch_bytes = 1` a single legitimate at-least-once
+    /// redelivery of four documents produced four all-conflict `_bulk`
+    /// responses and tripped [`UNAPPLIED_UNHEALTHY_AFTER`] on its own, with a
+    /// `last_error` claiming "nothing is being replicated" about a poll in
+    /// which every document was already at the target. The chunk count is a
+    /// transport detail; the operator-visible unit of "did this tap make
+    /// progress" is the poll.
     ///
     /// Deliberately blind to *why*. A version conflict and a
     /// `mapper_parsing_exception` are opposite diagnoses but the same
@@ -279,11 +309,11 @@ pub struct IndexTapStats {
     /// read `healthy: true` with `docs_shipped: 0` — the exact class of lie
     /// the per-item accounting exists to remove.
     ///
-    /// One such batch is expected and benign: it is how external versioning
+    /// One such poll is expected and benign: it is how external versioning
     /// absorbs an at-least-once redelivery. A *sustained run* is not — it means
     /// the tap is a no-op and the two sides are diverging. See
     /// [`IndexTapStats::healthy`].
-    pub consecutive_unapplied_batches: u32,
+    pub consecutive_unapplied_polls: u32,
     /// Error `type` of the most recent item the target rejected for a reason
     /// other than a version conflict, e.g. `mapper_parsing_exception`.
     ///
@@ -293,13 +323,17 @@ pub struct IndexTapStats {
     pub last_item_rejection: Option<String>,
 }
 
-/// How many batches in a row that applied nothing stop counting as "a
+/// How many **polls** in a row that applied nothing stop counting as "a
 /// redelivery landed" and start counting as "this target is not taking our
 /// writes".
 ///
-/// A redelivery after a failed send re-ships exactly the chunks that did not
-/// land, so it clears on the next batch that contains anything new. Three in a
-/// row cannot be that.
+/// Polls, not `_bulk` requests. A poll that applies nothing still advances the
+/// cursor past the entries it read (rejected items are not retried — see
+/// [`WalTap::send_bulk`]), so the *next* poll reads new entries and a healthy
+/// stream clears the counter immediately. A redelivery — a rewound cursor, or
+/// a send that failed part-way through and re-ships its earlier chunks on the
+/// next poll — is at most one such poll, however many chunks it took.
+/// Three in a row cannot be that.
 const UNAPPLIED_UNHEALTHY_AFTER: u32 = 3;
 
 impl IndexTapStats {
@@ -310,7 +344,7 @@ impl IndexTapStats {
     /// every request while rejecting every action inside it — for any reason,
     /// conflict or otherwise.
     pub fn healthy(&self) -> bool {
-        self.last_error.is_none() && self.consecutive_unapplied_batches < UNAPPLIED_UNHEALTHY_AFTER
+        self.last_error.is_none() && self.consecutive_unapplied_polls < UNAPPLIED_UNHEALTHY_AFTER
     }
 }
 
@@ -322,6 +356,16 @@ impl IndexTapStats {
 /// surface can read stats and edit the allowlist without a restart.
 pub struct WalTap {
     config: RwLock<WalTapConfig>,
+    /// Exactly what `xerj.toml` said, kept verbatim so `DELETE
+    /// /_xerj/wal_tap` has something true to revert to.
+    ///
+    /// It used to be read back off `Engine.config`, which was safe only while
+    /// nothing else ever wrote to that field. `Engine::new` now folds the
+    /// tap's *effective* configuration into the boot `Config` (so index stores
+    /// open with the retention floor actually in force), which would have made
+    /// `DELETE` revert a persisted runtime config to… itself. Owning the file
+    /// value here removes the coupling instead of documenting around it.
+    file_config: WalTapConfig,
     state: RwLock<PersistedState>,
     stats: RwLock<BTreeMap<String, IndexTapStats>>,
     state_path: PathBuf,
@@ -383,6 +427,8 @@ impl WalTap {
             Err(_) => PersistedState::default(),
         };
 
+        let file_config = config.clone();
+
         // A configuration set through the API outlives the process that took
         // it. Without this a restart reverted to the file config — usually
         // `enabled = false` — and the tap went quiet while its cursors froze
@@ -408,6 +454,7 @@ impl WalTap {
 
         Self {
             config: RwLock::new(config),
+            file_config,
             state: RwLock::new(state),
             stats: RwLock::new(BTreeMap::new()),
             state_path,
@@ -423,6 +470,12 @@ impl WalTap {
     /// Snapshot of the live configuration.
     pub fn config(&self) -> WalTapConfig {
         self.config.read().clone()
+    }
+
+    /// What `xerj.toml` said at boot — the value `DELETE /_xerj/wal_tap`
+    /// reverts to.
+    pub fn file_config(&self) -> WalTapConfig {
+        self.file_config.clone()
     }
 
     /// Replace the live configuration **durably**.
@@ -603,20 +656,34 @@ impl WalTap {
     /// Capped exponential backoff with jitter, keyed off the worst
     /// consecutive-failure count across indices.
     ///
+    /// **Every multiply here saturates**, including the two that used to be
+    /// plain `*`. `max_retry_backoff_secs` and `poll_interval_ms` reach this
+    /// function from two places, and only one of them is range-checked:
+    /// `PUT /_xerj/wal_tap` bounds both, but `Config::validate` bounds
+    /// neither, so `xerj.toml` can put any `u64` in either field. At
+    /// `max_retry_backoff_secs > u64::MAX / 1000` (~1.8e16) the old
+    /// `secs.max(1) * 1000` overflowed — a panic under `cargo test`'s
+    /// overflow-checks that killed the spawned tap task with nothing in
+    /// `_stats` to say why, and in a release profile a *wrapped* cap that can
+    /// be arbitrarily small: the concrete value 18_446_744_073_709_552 wraps
+    /// to a 384 ms ceiling, i.e. a retry storm aimed at a target that is
+    /// already failing. `uncapped` on the line above already saturated for
+    /// exactly this reason.
+    ///
     /// Approach (not code) from Elasticsearch's `ShardFollowNodeTask.computeDelay`.
     fn arm_backoff(&self, config: &WalTapConfig, failures: u32) {
         let base = config.poll_interval_ms.max(50);
         let shift = failures.saturating_sub(1).min(20);
         let uncapped = base.saturating_mul(1u64 << shift);
-        let cap = config.max_retry_backoff_secs.max(1) * 1000;
+        let cap = config.max_retry_backoff_secs.max(1).saturating_mul(1000);
         let delay = uncapped.min(cap);
         // Deterministic, dependency-free jitter in [50%, 100%] of the delay:
         // enough to stop N indices from re-hammering a recovering target in
         // lockstep, without pulling in an RNG.
         let jitter = self.now_ms() % 50 + 50;
-        let delay = delay * jitter / 100;
+        let delay = delay.saturating_mul(jitter) / 100;
         self.retry_not_before_ms
-            .store(self.now_ms() + delay, Ordering::Relaxed);
+            .store(self.now_ms().saturating_add(delay), Ordering::Relaxed);
     }
 
     fn clear_backoff(&self) {
@@ -1037,7 +1104,11 @@ impl WalTap {
         let mut item_failures = 0u64;
         let mut version_conflicts = 0u64;
         let mut batches = 0u64;
-        let mut unapplied_batches = 0u32;
+        // Chunks in THIS poll that applied nothing. Kept separate from the
+        // health counter on purpose: that counter is per poll (see
+        // `UNAPPLIED_UNHEALTHY_AFTER`), and adding this into it is what made
+        // one legitimate multi-chunk redelivery report the tap unhealthy.
+        let mut unapplied_chunks = 0u32;
         let mut rejection_kind: Option<String> = None;
 
         for chunk in chunks {
@@ -1071,7 +1142,7 @@ impl WalTap {
                     // let an all-`mapper_parsing_exception` response read as a
                     // healthy zero-lag tap with `docs_shipped: 0`.
                     if accepted_here == 0 && !actions.is_empty() {
-                        unapplied_batches += 1;
+                        unapplied_chunks += 1;
                     }
                     if rejection.is_some() {
                         rejection_kind = rejection;
@@ -1117,17 +1188,24 @@ impl WalTap {
             if let Some(kind) = &rejection_kind {
                 s.last_item_rejection = Some(kind.clone());
             }
-            // A run of batches that applied nothing is not "replication
-            // working". Only a batch that landed something clears it.
-            if unapplied_batches > 0 && docs == 0 && deletes == 0 {
-                s.consecutive_unapplied_batches = s
-                    .consecutive_unapplied_batches
-                    .saturating_add(unapplied_batches);
+            // A run of POLLS that applied nothing is not "replication
+            // working". Only a poll that landed something clears it.
+            //
+            // `+= 1`, not `+= unapplied_chunks`. How many `_bulk` requests a
+            // poll needed is a function of `max_batch_bytes`, not of whether
+            // replication is progressing: at `max_batch_bytes = 1` the old
+            // shape turned ONE legitimate at-least-once redelivery of four
+            // documents into `consecutive_unapplied = 4`, tripping the
+            // three-in-a-row threshold on the documented-benign path and
+            // emitting a `last_error` saying "nothing is being replicated"
+            // about a poll in which every document was already at the target.
+            if unapplied_chunks > 0 && docs == 0 && deletes == 0 {
+                s.consecutive_unapplied_polls = s.consecutive_unapplied_polls.saturating_add(1);
             } else {
-                s.consecutive_unapplied_batches = 0;
+                s.consecutive_unapplied_polls = 0;
             }
-            if s.consecutive_unapplied_batches >= UNAPPLIED_UNHEALTHY_AFTER {
-                let run = s.consecutive_unapplied_batches;
+            if s.consecutive_unapplied_polls >= UNAPPLIED_UNHEALTHY_AFTER {
+                let run = s.consecutive_unapplied_polls;
                 // Name the cause the target gave *this poll*, not whatever it
                 // last gave: a conflict and a mapping error need opposite
                 // responses from the operator, and a stale reason would send
@@ -1138,13 +1216,13 @@ impl WalTap {
                         .or(s.last_item_rejection.as_deref())
                         .unwrap_or("an unnamed error");
                     format!(
-                        "target accepted nothing in the last {run} batches — it rejected \
+                        "target accepted nothing in the last {run} polls — it rejected \
                          every action, most recently with {kind}. Nothing is being \
                          replicated; these documents are being dropped, not retried."
                     )
                 } else {
                     format!(
-                        "target rejected every action of the last {run} batches with \
+                        "target rejected every action of the last {run} polls with \
                          version_conflict_engine_exception — it holds a higher version for \
                          every document this tap sends, so nothing is being replicated"
                     )
@@ -1401,6 +1479,38 @@ mod tests {
         assert!(
             delay >= 4_000,
             "backoff must still be substantial, got {delay}ms"
+        );
+    }
+
+    /// `max_retry_backoff_secs` reaches [`WalTap::arm_backoff`] from the config
+    /// file as well as from `PUT /_xerj/wal_tap`, and `Config::validate` does
+    /// not range-check it — so any `u64` in `xerj.toml` gets here.
+    ///
+    /// The value below is chosen so the OLD `secs.max(1) * 1000` fails in both
+    /// profiles rather than only one: `18_446_744_073_709_552 * 1000` is
+    /// `18_446_744_073_709_552_000`, which is `2^64 + 384`, so it panics under
+    /// `cargo test`'s overflow-checks (killing the spawned tap task with
+    /// nothing in `_stats` to say why) and **wraps to a 384 ms cap** under
+    /// `--profile ci-test` — a retry storm aimed at a target that is already
+    /// failing. Saturating leaves the exponential backoff itself in charge.
+    #[test]
+    fn an_unbounded_retry_cap_saturates_instead_of_wrapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WalTapConfig {
+            poll_interval_ms: 500,
+            max_retry_backoff_secs: 18_446_744_073_709_552,
+            ..Default::default()
+        };
+        let tap = WalTap::new(dir.path(), config.clone());
+        // failures = 3 → shift 2 → uncapped = 500 * 4 = 2_000 ms, then jitter
+        // in [50%, 100%].
+        tap.arm_backoff(&config, 3);
+        let armed = tap.retry_not_before_ms.load(Ordering::Relaxed);
+        let delay = armed.saturating_sub(tap.now_ms());
+        assert!(
+            (900..=2_000).contains(&delay),
+            "a cap too large to express in ms must not become a SMALL cap; the wrapped \
+             value gives at most 384ms. got {delay}ms"
         );
     }
 }

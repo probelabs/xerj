@@ -5747,6 +5747,22 @@ pub struct Index {
 }
 
 impl Index {
+    /// Apply a WAL-consumer retention floor to this index's WAL shards, live.
+    ///
+    /// #320. Called by [`Engine`](crate::engine::Engine) immediately after
+    /// every open/create, and again on every index when an operator changes
+    /// `wal_tap.min_retained_generations` through `PUT /_xerj/wal_tap`. See
+    /// [`xerj_storage::index_store::IndexStore::set_wal_min_retained_generations`]
+    /// for why the open-time config value alone was not enough.
+    pub fn set_wal_min_retained_generations(&self, n: u64) {
+        self.store.set_wal_min_retained_generations(n);
+    }
+
+    /// The retention floor in force on each of this index's WAL shards.
+    pub fn wal_min_retained_generations(&self) -> Vec<u64> {
+        self.store.wal_min_retained_generations()
+    }
+
     fn begin_hnsw_publication(&self) -> HnswPublicationGuard {
         HnswPublicationGuard::begin(
             &self.hnsw_publications_in_flight,
@@ -28174,13 +28190,18 @@ fn store_config_from(config: &Config, wal_shards_override: Option<usize>) -> Ind
         schema_version: 1,
         storage_mode: xerj_storage::StorageMode::Local,
         num_wal_shards: wal_shards_override.unwrap_or(config.engine.ingest_shards),
-        // #320 — the retention floor a WAL consumer needs. Read here, from
-        // the boot config, because it is consumed once when a `WalWriter` is
-        // opened; a runtime `PUT /_xerj/wal_tap` that changes it therefore
-        // applies to stores opened after the change (and to every store after
-        // a restart, which the persisted runtime config now survives). The
-        // `PUT` handler says so in its response rather than leaving it to be
-        // discovered.
+        // #320 — the retention floor a WAL consumer needs, as the store's
+        // *seed* value.
+        //
+        // `Engine::new` overwrites `config.wal_tap` with the tap's effective
+        // configuration before freezing the `Config` into its `Arc`, so this
+        // is the persisted runtime value when one exists and the file's value
+        // otherwise — i.e. correct from byte zero for every store opened at
+        // boot. A runtime `PUT /_xerj/wal_tap` cannot reach an `Arc<Config>`
+        // at all, so it is applied by
+        // `Engine::apply_wal_retention_floor` straight onto the live
+        // `WalWriter`s instead. Both halves are required: this one alone
+        // acknowledged a floor that never reached a writer.
         wal_min_retained_generations: config.wal_tap.min_retained_generations,
     }
 }

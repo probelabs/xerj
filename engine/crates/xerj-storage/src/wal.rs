@@ -342,9 +342,15 @@ pub struct WalWriter {
     /// append first re-attempts the fresh-generation heal so the writer
     /// self-recovers once space frees up.
     poisoned: bool,
-    /// Rotated generations [`prune_verified`](Self::prune_verified) must keep
-    /// even when every entry in them is proven durable — the retention floor
-    /// a WAL consumer (the #320 tap) needs to survive a target outage.
+    /// Rotated generations a prune pass must keep even when every entry in
+    /// them is proven durable — the retention floor a WAL consumer (the #320
+    /// tap) needs to survive a target outage.
+    ///
+    /// Read by **both** prune paths: [`prune_verified`](Self::prune_verified)
+    /// and — through [`min_retained_generations`](Self::min_retained_generations)
+    /// — `IndexStore::wal_maintain_all_verified`, which is the one the engine
+    /// actually runs. Enforcing it in only one of them is how this knob
+    /// managed to be fully tested and still have no effect on a live node.
     ///
     /// `0` (the default) is the historical behaviour: retention never waits
     /// for anyone. Anything above it is a *bounded* floor, not a lease: the
@@ -476,14 +482,28 @@ impl WalWriter {
         })
     }
 
-    /// Set the retention floor: rotated generations `prune_verified` keeps
-    /// even when it can prove every entry in them durable.
+    /// Set the retention floor: rotated generations a prune pass keeps even
+    /// when it can prove every entry in them durable.
     ///
-    /// Set once by [`crate::index_store::IndexStore::open`] from
-    /// `wal_tap.min_retained_generations`, right after the writer is placed
-    /// in its `Arc`.
+    /// Seeded by [`crate::index_store::IndexStore::open`] from
+    /// `wal_tap.min_retained_generations`, and re-set **live** by
+    /// [`IndexStore::set_wal_min_retained_generations`] when an operator
+    /// changes it through `PUT /_xerj/wal_tap`.
+    ///
+    /// [`IndexStore::set_wal_min_retained_generations`]:
+    /// crate::index_store::IndexStore::set_wal_min_retained_generations
     pub fn set_min_retained_generations(&mut self, n: u64) {
         self.min_retained_generations = n;
+    }
+
+    /// The retention floor currently in force on this shard.
+    ///
+    /// Exposed because the floor has to be enforced by the prune pass the
+    /// engine actually runs (`IndexStore::wal_maintain_all_verified`), not
+    /// only by [`prune_verified`](Self::prune_verified) — which no production
+    /// path calls.
+    pub fn min_retained_generations(&self) -> u64 {
+        self.min_retained_generations
     }
 
     /// Install (or clear) this shard's registration with the batched-fsync

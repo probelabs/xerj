@@ -1823,6 +1823,12 @@ pub struct WalTapConfig {
     /// It is deliberately **not** an Elasticsearch-style retention lease,
     /// which holds generations for as long as a follower is behind and is how
     /// a dead follower wedges a leader's disk.
+    ///
+    /// Unlike every other field here, this one does not live in the tap: it
+    /// lives in each index's `WalWriter`. `PUT /_xerj/wal_tap` therefore
+    /// pushes it onto the open writers itself
+    /// (`Engine::apply_wal_retention_floor`) and reports how many it reached,
+    /// rather than acknowledging a value that reaches nothing.
     pub min_retained_generations: u64,
 }
 
