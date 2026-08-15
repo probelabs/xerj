@@ -383,16 +383,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     name that you mapped yourself, or that XERJ mapped from a non-multi-vector
     value, is unaffected and still listed.
 
-    One consequence worth knowing: aggregating or sorting on that companion
-    stops working, because it no longer has a mapping entry to aggregate
-    through. On a real multi-vector this was never a meaningful operation, but
-    it was a `200` before and is not now.
-  - **Existing indices keep their bloat until a merge rewrites them.** This is a
-    write-side rule. Segments written by an earlier release keep their `.emb.*`
-    / `.emb_chunks.*` files, and the per-segment `fts_has_field` gate reads
-    whichever shape it finds. Run an explicit
-    `POST /<index>/_forcemerge?max_num_segments=1` to reclaim the bytes on an
-    index that already exists.
+    Aggregating and sorting on that companion still answer `200` — measured on
+    the wire against a live node with `emb` mapped `dense_vector` and
+    `emb_chunks` unregistered: `terms` returns real buckets, `stats` returns
+    `count: 0` byte-identical to the previous release, and `sort` returns sort
+    values. Nothing that worked before returns an error now.
+  - **Existing indices keep their bloat until a merge rewrites them, and an
+    index created by rc.16 or earlier only ever reclaims the base-vector half.**
+    This is a write-side rule. Segments written by an earlier release keep their
+    `.emb.*` / `.emb_chunks.*` files, and the per-segment `fts_has_field` gate
+    reads whichever shape it finds.
+
+    `POST /<index>/_forcemerge?max_num_segments=1` reclaims `.emb.*`. **It does
+    not reclaim the companion.** Measured by building an index on an rc.16
+    server (`emb` mapped `dense_vector` before ingest, 500 docs × 32 dim with
+    `emb_chunks` multi-vectors), then reopening the same data directory with
+    this release and force-merging: `.emb.fst` 262,904 B → 0, but
+    `.emb_chunks.fst` 525,200 B → 525,355 B, and
+    `wildcard {emb_chunks: "0*"}` still answers 501 of 501. The reason is not a
+    bug in the merge: rc.16 persisted `emb_chunks: {"type": "double"}` into the
+    mapping, and the by-name rule correctly yields to a field you (or an earlier
+    release) declared. Since a mapping entry cannot be dropped in place, the
+    remediation for an existing index is to **reindex into a fresh index**. On
+    the corpus this entry headlines that companion is 67% of the saving, so an
+    in-place upgrade recovers roughly a third of the published number.
 
     The companion rule has an ordering limit of the same kind, and it fails in
     the safe direction: XERJ can only decline to map a companion it can
@@ -402,6 +416,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     by-name rule then yields to — so that index keeps the companion's term
     dictionary (measured 9,467 B on a 50-doc × 16-dim fixture) instead of
     reclaiming it. It costs bytes, not answers.
+
+  *Known limitation, filed as [#382](https://github.com/xerj-org/xerj/issues/382):*
+  refusing a `FieldConfig` for the companion leaves the pre-existing schema-hash
+  throttle asserting the key set is unchanged, so if a later document puts a
+  differently-typed value under `<vector>_chunks` it stays unregistered for up
+  to 100 documents and queries on it answer zero until the throttle expires.
+  Doc-order-dependent and self-healing. The throttle is pre-existing and the fix
+  belongs to it.
 
   *Not changed:* ES rejects `term`/`match`/`range` on a `dense_vector` outright,
   where XERJ answers `200`. This release removes bytes and adopts Lucene's
