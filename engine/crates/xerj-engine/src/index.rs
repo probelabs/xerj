@@ -2042,6 +2042,60 @@ mod merge_publication_transaction_tests {
         config
     }
 
+    /// Open an engine plus one index with the background merge loop already
+    /// stopped, for a test that drives every merge itself.
+    ///
+    /// `Index::create` (index.rs:6191) and `Index::open` (index.rs:6554) both
+    /// start a 5-second merge pass, and with this module's
+    /// `min_merge_count = max_merge_count = 2` a single tick rewrites the
+    /// segment set two segments at a time.  Every test here calls
+    /// `run_merge_once()` by hand, so that tick is pure interference with two
+    /// distinct failure shapes: it can win the `merge_in_progress` CAS and turn
+    /// the test's own `run_merge_once()` into `Ok(0)` (the flake `fixture`
+    /// already guarded against), and it can collapse fixture segments before the
+    /// test has even looked at them — issue #372, where
+    /// `partial_multi_batch_failure_is_reported_without_losing_either_batch`
+    /// built its index inline, never stopped the loop, and failed its
+    /// *precondition* with `left: 3, right: 4` once a full-parallelism run
+    /// stretched the body past one tick.  Constructing every index in this
+    /// module here — including the one fixture that needs a custom `Config`,
+    /// through `hand_driven_index_with_config` — means the omission cannot be
+    /// reintroduced one test at a time.
+    fn hand_driven_index(dir: &TempDir, name: &str, schema: Schema) -> (Engine, Arc<Index>) {
+        hand_driven_index_with_config(config(dir), name, schema)
+    }
+
+    /// `hand_driven_index` for the fixture that needs a knob `config()` does
+    /// not set.
+    ///
+    /// Only `artifact_bytes_at_level` uses this: it varies
+    /// `compression.level` and pins `ingest_shards = 1`.  It exists so that
+    /// site does not have to remember `abort_background_tasks()` on its own —
+    /// it is the one index in this module that was still being built by hand.
+    fn hand_driven_index_with_config(
+        cfg: xerj_common::config::Config,
+        name: &str,
+        schema: Schema,
+    ) -> (Engine, Arc<Index>) {
+        let engine = Engine::new(cfg).unwrap();
+        engine.create_index(name, schema).unwrap();
+        let index = engine.get_index(name).unwrap();
+        index.abort_background_tasks();
+        (engine, index)
+    }
+
+    /// Reopen `name` from `dir` with the background merge loop already stopped.
+    ///
+    /// Same contract as `hand_driven_index`: the restart half of these tests
+    /// asserts on a recovered segment set, and `Index::open` starts its own
+    /// merge pass too (`spawn_merge_task(5)`, index.rs:6554).
+    fn reopen_hand_driven(dir: &TempDir, name: &str) -> (Engine, Arc<Index>) {
+        let engine = Engine::new(config(dir)).unwrap();
+        let index = engine.get_index(name).unwrap();
+        index.abort_background_tasks();
+        (engine, index)
+    }
+
     fn dot_field_schema() -> Schema {
         let mut schema = Schema::empty();
         schema
@@ -2063,10 +2117,7 @@ mod merge_publication_transaction_tests {
     ) -> (Engine, Arc<Index>, String, PathBuf) {
         use sha2::{Digest, Sha256};
 
-        let engine = Engine::new(config(dir)).unwrap();
-        engine.create_index(index_name, dot_field_schema()).unwrap();
-        let index = engine.get_index(index_name).unwrap();
-        index.abort_background_tasks();
+        let (engine, index) = hand_driven_index(dir, index_name, dot_field_schema());
         for (id, value) in [("one", "alpha"), ("two", "beta")] {
             index
                 .index_document(Some(id.into()), serde_json::json!({".": value}))
@@ -2164,10 +2215,7 @@ mod merge_publication_transaction_tests {
         schema
             .add_field(FieldConfig::new("body", FieldType::Text))
             .unwrap();
-        let engine = Engine::new(cfg).unwrap();
-        engine.create_index("compression", schema).unwrap();
-        let index = engine.get_index("compression").unwrap();
-        index.abort_background_tasks();
+        let (_engine, index) = hand_driven_index_with_config(cfg, "compression", schema);
 
         // Two flushes → two segments to merge. Each is comfortably over
         // `V2_MIN_DOCS` (128), so the stored section takes the columnar v2
@@ -2338,11 +2386,13 @@ mod merge_publication_transaction_tests {
     }
 
     async fn fixture(dir: &TempDir) -> (Engine, Arc<Index>) {
-        let engine = Engine::new(config(dir)).unwrap();
-        engine
-            .create_index("post-save-panic", Schema::empty())
-            .unwrap();
-        let index = engine.get_index("post-save-panic").unwrap();
+        // `hand_driven_index` stops the background merge loop *before* the two
+        // flushes below, not after them.  Stopping it afterwards still left the
+        // `segments.len() == 2` assertion exposed to a tick that landed while
+        // the fixture was still filling — the same window that broke
+        // `partial_multi_batch_failure_is_reported_without_losing_either_batch`
+        // in #372.
+        let (engine, index) = hand_driven_index(dir, "post-save-panic", Schema::empty());
         index
             .index_document(Some("a".into()), serde_json::json!({"value": "old-a"}))
             .await
@@ -2354,14 +2404,6 @@ mod merge_publication_transaction_tests {
             .unwrap();
         index.flush().await.unwrap();
         assert_eq!(index.store.snapshot().segments.len(), 2);
-        // Every test in this module drives the merge itself with an explicit
-        // `run_merge_once()`.  The 5-second background merge loop is pure
-        // interference here: a tick that wins the `merge_in_progress` CAS makes
-        // the test's own `run_merge_once()` return `Ok(0)`, after which
-        // `merge.await.unwrap_err()` fails with "called `unwrap_err()` on an
-        // `Ok` value" — a second, distinct flake mode.  Same precedent as
-        // `cancelling_waiter_while_blocking_worker_is_queued_still_restores`.
-        index.abort_background_tasks();
         (engine, index)
     }
 
@@ -2416,8 +2458,7 @@ mod merge_publication_transaction_tests {
         drop(index);
         drop(engine);
 
-        let reopened = Engine::new(config(&dir)).unwrap();
-        let reopened_index = reopened.get_index("post-save-panic").unwrap();
+        let (_reopened, reopened_index) = reopen_hand_driven(&dir, "post-save-panic");
         for (id, expected) in [("a", "old-a"), ("b", "old-b")] {
             assert_eq!(
                 reopened_index.get_document(id).await.unwrap().unwrap()["value"],
@@ -2498,8 +2539,7 @@ mod merge_publication_transaction_tests {
         );
         drop(index);
         drop(engine);
-        let reopened = Engine::new(config(&dir)).unwrap();
-        let reopened_index = reopened.get_index("post-save-panic").unwrap();
+        let (_reopened, reopened_index) = reopen_hand_driven(&dir, "post-save-panic");
         assert_eq!(
             reopened_index.get_document("a").await.unwrap().unwrap()["value"],
             "new-a"
@@ -2615,8 +2655,7 @@ mod merge_publication_transaction_tests {
         index.set_publication_test_hook(None);
         drop(index);
         drop(engine);
-        let reopened = Engine::new(config(&dir)).unwrap();
-        let recovered = reopened.get_index("post-save-panic").unwrap();
+        let (_reopened, recovered) = reopen_hand_driven(&dir, "post-save-panic");
         for id in ["a", "b"] {
             assert!(recovered.get_document(id).await.unwrap().is_some());
         }
@@ -2631,12 +2670,51 @@ mod merge_publication_transaction_tests {
         );
     }
 
+    /// Regression for #372: a background merge tick must not be able to move a
+    /// hand-driven fixture's segment set.
+    ///
+    /// `start_paused` is what makes this deterministic instead of a 5-second
+    /// sleep: with tokio's clock paused the runtime auto-advances to the next
+    /// timer deadline whenever it goes idle, so the `sleep` below fires exactly
+    /// the merge tick that `spawn_merge_task` scheduled — the tick that, on a
+    /// real clock, only lands when a full-parallelism run stretches a test body
+    /// past five seconds.  Without `hand_driven_index`'s
+    /// `abort_background_tasks()` this collapses two of the four segments and
+    /// the assertion reports `left: 3, right: 4`, which is verbatim the failure
+    /// reported against `index.rs:2650` on clean main.
+    #[tokio::test(start_paused = true)]
+    async fn a_background_merge_tick_cannot_move_a_hand_driven_fixture_segment_set() {
+        let dir = TempDir::new().unwrap();
+        let (_engine, index) = hand_driven_index(&dir, "tick-guard", Schema::empty());
+        for id in ["a", "b", "c", "d"] {
+            index
+                .index_document(
+                    Some(id.into()),
+                    serde_json::json!({"value": format!("source-{id}")}),
+                )
+                .await
+                .unwrap();
+            index.flush().await.unwrap();
+        }
+        assert_eq!(index.store.snapshot().segments.len(), 4);
+        // Jump the paused clock well past the 5 s merge cadence, several times
+        // over, and hand the runtime enough turns for a tick to run to
+        // completion if one were scheduled.
+        for _ in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            index.store.snapshot().segments.len(),
+            4,
+            "a background merge tick rewrote a fixture that drives its own merges"
+        );
+    }
+
     #[tokio::test]
     async fn partial_multi_batch_failure_is_reported_without_losing_either_batch() {
         let dir = TempDir::new().unwrap();
-        let engine = Engine::new(config(&dir)).unwrap();
-        engine.create_index("multi-batch", Schema::empty()).unwrap();
-        let index = engine.get_index("multi-batch").unwrap();
+        let (engine, index) = hand_driven_index(&dir, "multi-batch", Schema::empty());
         for id in ["a", "b", "c", "d"] {
             index
                 .index_document(
@@ -2671,8 +2749,7 @@ mod merge_publication_transaction_tests {
         drop(index);
         drop(engine);
 
-        let reopened = Engine::new(config(&dir)).unwrap();
-        let reopened_index = reopened.get_index("multi-batch").unwrap();
+        let (_reopened, reopened_index) = reopen_hand_driven(&dir, "multi-batch");
         for id in ["a", "b", "c", "d"] {
             assert_eq!(
                 reopened_index.get_document(id).await.unwrap().unwrap()["value"],
@@ -2715,8 +2792,7 @@ mod merge_publication_transaction_tests {
         drop(index);
         drop(engine);
 
-        let reopened = Engine::new(config(&dir)).unwrap();
-        let reopened_index = reopened.get_index("post-save-panic").unwrap();
+        let (_reopened, reopened_index) = reopen_hand_driven(&dir, "post-save-panic");
         assert_eq!(reopened_index.store.snapshot().segments.len(), 1);
         for (id, expected) in [("a", "old-a"), ("b", "old-b")] {
             assert_eq!(

@@ -230,6 +230,40 @@ jobs:
         working-directory: engine
         run: cargo test --profile ci-test --workspace -- --test-threads=2
 
+      # Issue #372. `--test-threads=2` above is a deliberate configuration, and
+      # it is not the one a contributor gets: plain `cargo test` runs one thread
+      # per core. Two xerj-engine lib tests failed on a clean checkout at that
+      # default and this workflow could not see either of them, because two
+      # threads serialise enough of the suite to hide the interleaving. The
+      # general rule the third such defect in one cycle earns: CI must run at
+      # least one configuration that matches what a contributor actually types.
+      #
+      # Honest about its reach, because "default parallelism" is not a fixed
+      # number: `ubuntu-latest` is a 2-4 vCPU runner, so the default here is
+      # 2-4 threads -- barely above the `--test-threads=2` that hid #372, and
+      # far from the 20 that surfaced it (11 of 16 clean-main runs red on a
+      # 20-core box). This step would most likely NOT have caught #372 on this
+      # runner. It is cheap insurance and the place a wider, better-sized gate
+      # (#384) can land -- not a claim that the class is now covered.
+      #
+      # Scoped to the one crate whose lib tests have been *measured* green at
+      # default parallelism (10 dev-profile and 5 ci-test-profile clean runs at
+      # this commit, 20 cores). `--workspace --lib` is the destination, not this
+      # commit: at default parallelism it is currently red in xerj-autoindex
+      # (5 failures in 10 runs), where the `incremental_reconcile_http_tests`
+      # module reaches the global `SNAPSHOT_FAILPOINT` without holding the
+      # `SNAPSHOT_TEST_LOCK` that guards it and steals another test's injected
+      # failure -- the same defect class as #372, in a different crate. That is
+      # issue #385; widening this step past xerj-engine is #384. A gate is
+      # worth nothing if it is merged red, so it goes in at the width it
+      # passes at.
+      #
+      # Reuses the binaries the step above already built: the added cost is test
+      # runtime, not another compile.
+      - name: Engine lib tests at default parallelism (contributor's `cargo test`)
+        working-directory: engine
+        run: cargo test --profile ci-test -p xerj-engine --lib
+
   # Fat LTO + codegen-units=1 + panic=abort over every workspace member is a
   # failure mode of its own (LTO ICEs, symbol collisions, panic-strategy
   # mismatches) and is not covered by `cargo clippy --all-targets` in `lint`

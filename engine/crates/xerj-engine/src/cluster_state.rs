@@ -85,6 +85,71 @@ impl PreparedClusterState {
     }
 }
 
+/// Serialises every test in this crate's `--lib` binary that can reach the
+/// `error!` in `PreparedClusterState::blocked` above.
+///
+/// `tracing-core` keeps one process-global `Interest` per callsite, and while a
+/// single dispatcher is registered it recomputes that slot from the *calling
+/// thread's* default subscriber — `rebuild_callsite_interest` ->
+/// `Rebuilder::JustOne` -> `dispatcher::get_default`, tracing-core-0.1.36
+/// `src/callsite.rs:490` and `:564`-`:565`.  A thread with no subscriber
+/// resolves to `NoSubscriber`, whose `register_callsite` returns
+/// `Interest::never()` (`src/subscriber.rs:676`).  So a test that reaches
+/// `blocked` with no subscriber installed pins the boot diagnostic to "never"
+/// for the whole process if it is the thread that first registers that
+/// callsite — and a `capture_preflight_log` running concurrently comes back
+/// with an empty string.  That is the `cluster_state` half of issue #372:
+/// `every_representative_block_class_logs_kind_detail_and_operator_path_at_boot`
+/// failed with an empty log, and only at full test parallelism, because
+/// `--test-threads=2` rarely produces the losing interleaving.
+///
+/// A poison that lands *before* a capture starts is harmless — installing a
+/// subscriber is `Dispatch::new`, which unconditionally rebuilds every
+/// registered callsite against the live dispatchers (`src/dispatcher.rs:479`
+/// -> `src/callsite.rs:484`), and our subscriber is one of them.  Only a poison
+/// that lands *inside* the install-subscriber-then-log window can blank the
+/// capture, so mutual exclusion is the whole fix.
+///
+/// Scope, exactly.  This is `pub(crate)` rather than private to
+/// `cluster_state::tests` because `blocked` is reachable from a *second* test
+/// module in the same binary, so "no interleaving remains" is only true if that
+/// one takes the lock too.  `blocked` has exactly one production caller —
+/// `preflight`, below — and `preflight` has exactly one production caller,
+/// `Engine::new` (engine.rs:763), so the reachers are enumerable by grep.  All
+/// of them, as of this commit:
+///
+///   - `tests::capture_preflight_log` — holds it across
+///     install-subscriber-then-log.  The victim.
+///   - `tests::preflight_serialised`, and `tests::preflight_bytes` through it —
+///     no subscriber installed, so a poisoner.
+///   - `tests::poison_boot_diagnostic_callsite` — the regression test's
+///     deliberate model of a subscriber-less sibling.
+///   - `lifecycle::tests::cluster_state_format1_lifecycle_delete_and_detach_guard_before_side_effects`
+///     — writes a `format_version: 2` state and calls `Engine::new`, which
+///     reaches `preflight`, classifies `UnsupportedFormat` and lands here.
+///     Also subscriber-less, so also a poisoner.
+///
+/// That last one is latent rather than live, and the reason is test-name
+/// ordering, not design: libtest runs a byte-sorted list, in which
+/// `cluster_state::tests::*` ends at #106 of 601 and the `lifecycle` case is
+/// #436 (measured with `--list` at this commit), and a callsite's registration
+/// is one-shot per process — the first capture wins it and nothing `lifecycle`
+/// does afterwards re-registers it.  Nothing *enforces* that ordering, so the
+/// lock is taken there rather than argued away.  Any new test that boots an
+/// `Engine` over a cluster state which classifies as blocked owes the same
+/// call.
+#[cfg(test)]
+pub(crate) static PREFLIGHT_CALLSITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lock `PREFLIGHT_CALLSITE`, ignoring poisoning.
+///
+/// A test that panics while holding it has already failed; propagating the
+/// poison would convert one real failure into a cascade of unrelated ones.
+#[cfg(test)]
+pub(crate) fn lock_preflight_callsite() -> std::sync::MutexGuard<'static, ()> {
+    PREFLIGHT_CALLSITE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Exact seven-field envelope emitted by the only shipped format-1 writer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -436,6 +501,7 @@ mod tests {
     }
 
     fn capture_preflight_log(dir: &Path) -> (PreparedClusterState, String) {
+        let _serialised = lock_preflight_callsite();
         let buffer = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
@@ -468,7 +534,32 @@ mod tests {
     fn preflight_bytes(bytes: &[u8]) -> PreparedClusterState {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("cluster_state.json"), bytes).unwrap();
-        preflight(dir.path())
+        preflight_serialised(dir.path())
+    }
+
+    /// `preflight`, but not while a `capture_preflight_log` is in flight.
+    ///
+    /// See `PREFLIGHT_CALLSITE`: this call has no subscriber installed, so it is
+    /// the poisoner, not the victim.
+    fn preflight_serialised(dir: &Path) -> PreparedClusterState {
+        let _serialised = lock_preflight_callsite();
+        preflight(dir)
+    }
+
+    /// Reproduce, on demand, what a subscriber-less sibling does to the
+    /// process-global callsite interest cache.
+    ///
+    /// `preflight_bytes` only pins the boot diagnostic to `Interest::never()` on
+    /// the process's *first* registration of that callsite, and a test cannot
+    /// re-trigger a one-shot registration.  Calling `rebuild_interest_cache`
+    /// from a thread with no subscriber reaches the identical end state: the
+    /// rebuild resolves to `NoSubscriber`, whose `register_callsite` is
+    /// `Interest::never()`.  Serialised on `PREFLIGHT_CALLSITE` because that is
+    /// what makes it a faithful model of a sibling rather than an unfair
+    /// hammer — a sibling holds the lock too.
+    fn poison_boot_diagnostic_callsite() {
+        let _serialised = lock_preflight_callsite();
+        tracing::callsite::rebuild_interest_cache();
     }
 
     #[test]
@@ -602,6 +693,55 @@ mod tests {
         }
     }
 
+    /// Regression for the `cluster_state` half of #372.
+    ///
+    /// The reported failure was this module's boot-diagnostic assertions firing
+    /// with an *empty* captured log at full test parallelism.  The cause is a
+    /// process-global cache, not the subscriber: a sibling test touching the
+    /// same callsite from a thread with no subscriber pins it to
+    /// `Interest::never()`, and if that lands inside a capture's window the
+    /// event never reaches the writer.  Model that sibling on a second thread
+    /// and assert every capture still sees the diagnostic.
+    #[test]
+    fn a_concurrent_subscriber_less_preflight_cannot_blank_the_boot_diagnostic_capture() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster_state.json");
+        std::fs::write(&path, br#"{"format_version":2}"#).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let poisoner = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    poison_boot_diagnostic_callsite();
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let mut blank = 0usize;
+        for _ in 0..200 {
+            let (prepared, log) = capture_preflight_log(dir.path());
+            assert_eq!(
+                prepared.status.block_kind(),
+                Some(&ClusterStateBlockKind::UnsupportedFormat)
+            );
+            if !log.contains("cluster state was rejected at boot") {
+                blank += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        poisoner.join().unwrap();
+
+        assert_eq!(
+            blank, 0,
+            "a concurrent subscriber-less preflight blanked {blank}/200 boot-diagnostic captures"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_failure_logs_the_same_boot_diagnostic_contract() {
@@ -676,7 +816,7 @@ mod tests {
             let staging_bytes = b"owned-by-another-or-interrupted-writer";
             std::fs::write(&staging, staging_bytes).unwrap();
 
-            let prepared = preflight(dir.path());
+            let prepared = preflight_serialised(dir.path());
             assert!(
                 !prepared.status.is_writable() || live.is_none(),
                 "fixture must not classify as loaded format 1"
@@ -693,7 +833,7 @@ mod tests {
         let staging = dir.path().join("cluster_state.tmp");
         std::fs::write(&staging, b"interrupted format-1 stage").unwrap();
 
-        let prepared = preflight(dir.path());
+        let prepared = preflight_serialised(dir.path());
         assert_eq!(prepared.status, ClusterStateBootStatus::LoadedV1);
         assert!(!staging.exists());
     }
