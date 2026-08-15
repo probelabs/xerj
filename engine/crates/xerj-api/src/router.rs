@@ -29,7 +29,7 @@ use xerj_common::config::CorsConfig;
 
 use crate::{
     auth::auth_middleware, authz, es_compat, graph_api, ism_api, memory_api, native,
-    state::AppState,
+    state::AppState, wal_tap_api,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -837,6 +837,17 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         )
         .route("/:index/_ccr/unfollow", post(es_compat::ccr_unfollow))
         .route("/:index/_ccr/info", get(es_compat::ccr_info))
+        // ── WAL tap (issue #320) ───────────────────────────────────────────────────
+        // Native surface, not an ES one: pushing this node's WAL to another
+        // cluster has no Elasticsearch endpoint, and hanging it off `_ccr/*`
+        // would make those honest 501s a lie.
+        .route(
+            "/_xerj/wal_tap",
+            get(wal_tap_api::get_wal_tap)
+                .put(wal_tap_api::put_wal_tap)
+                .delete(wal_tap_api::delete_wal_tap),
+        )
+        .route("/_xerj/wal_tap/_stats", get(wal_tap_api::wal_tap_stats))
         // ── Legacy index templates (v1) ────────────────────────────────────────────
         .route(
             "/_template/:name",

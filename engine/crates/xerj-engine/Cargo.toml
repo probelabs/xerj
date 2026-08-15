@@ -29,6 +29,9 @@ anyhow     = { workspace = true }
 dashmap    = { workspace = true }
 arc-swap   = { workspace = true }
 parking_lot = "0.12"
+# WAL tap (#320): the outbound `_bulk` sender. Already in the tree via
+# xerj-ai, so this adds no new external dependency.
+reqwest    = { workspace = true }
 rayon      = { workspace = true }
 libc       = "0.2"
 uuid       = { workspace = true }

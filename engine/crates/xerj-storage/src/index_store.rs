@@ -335,6 +335,16 @@ pub struct IndexStoreConfig {
     /// When > 1, each shard gets its own WAL file (`wal_s{N}/`) for
     /// parallel writes without cross-shard mutex contention.
     pub num_wal_shards: usize,
+    /// Rotated WAL generations kept per shard even once every entry in them
+    /// is durable in a segment (default: `0` — prune as soon as it is safe).
+    ///
+    /// This is the retention floor a WAL consumer needs: with the default,
+    /// `prune_verified` deletes a rotated generation the moment a flush makes
+    /// it redundant, so a #320 tap whose target is down for longer than one
+    /// flush interval loses entries. Raising it buys the consumer that much
+    /// slack at a cost bounded by `n * wal_max_size_bytes` per shard — a
+    /// floor, never a lease, so a stalled consumer still cannot fill the disk.
+    pub wal_min_retained_generations: u64,
 }
 
 /// A raw JSON batch that has been completely validated before publication.
@@ -409,6 +419,7 @@ impl Default for IndexStoreConfig {
             schema_version: 1,
             storage_mode: StorageMode::Local,
             num_wal_shards: 1,
+            wal_min_retained_generations: 0,
         }
     }
 }
@@ -657,12 +668,15 @@ impl IndexStore {
                 std::fs::create_dir_all(&d)?;
                 d
             };
-            let w = WalWriter::open(
+            let mut w = WalWriter::open(
                 &shard_dir,
                 config.wal_max_size_bytes,
                 config.sync_mode,
                 Arc::clone(&seq_counter),
             )?;
+            // Retention floor for WAL consumers (#320). Zero by default, so
+            // this is a no-op unless an operator has asked for slack.
+            w.set_min_retained_generations(config.wal_min_retained_generations);
             let shard = Arc::new(Mutex::new(w));
             // Issue #334 — register with the shared, event-driven fsync
             // scheduler instead of spawning a thread per store.  Nothing is
@@ -2681,7 +2695,43 @@ impl IndexStore {
             }
 
             // Prune pass over all rotated generations, cache-first.
-            for gen in wal.rotated_generations()? {
+            //
+            // #320 — the WAL-consumer retention floor is applied HERE, not
+            // only in `WalWriter::prune_verified`. `prune_verified` has no
+            // production caller (grep: `wal.rs` and its own unit tests are the
+            // only hits); this loop is the prune the engine actually runs, so
+            // a floor enforced only there was fully unit-tested and still had
+            // zero effect on a live node.
+            //
+            // `rotated_generations` is sorted ascending, so the newest are the
+            // tail and the prunable prefix is `len - keep`. Same arithmetic,
+            // and the same "enforce it inside the deletion pass rather than in
+            // its callers" placement, as Lucene's
+            // `KeepLastNCommitsDeletionPolicy.onCommit`
+            // (lucene/core/src/java/org/apache/lucene/index/KeepLastNCommitsDeletionPolicy.java:51-58,
+            // Apache-2.0): "The commits list is already sorted from oldest to
+            // newest / for (i = 0; i < size - numCommitsToKeep; i++)
+            // commits.get(i).delete()". Adapted, not copied.
+            //
+            // At the default floor of 0 this is `keep = 0` and the loop is
+            // byte-for-byte the old one: no extra syscall, no behaviour change.
+            let rotated = wal.rotated_generations()?;
+            let keep = (wal.min_retained_generations() as usize).min(rotated.len());
+            let prunable_prefix = rotated.len() - keep;
+            for (pos, gen) in rotated.into_iter().enumerate() {
+                if pos >= prunable_prefix {
+                    // Held for a WAL consumer. Deliberately skipped BEFORE the
+                    // cache lookup: decoding a generation we are not going to
+                    // delete is the O(retained WAL bytes)/tick cost the prune
+                    // cache exists to avoid.
+                    debug!(
+                        gen,
+                        shard = ws_idx,
+                        keep,
+                        "WAL generation retained: consumer retention floor"
+                    );
+                    continue;
+                }
                 let mut cache = self.wal_prune_cache.lock().unwrap();
                 let verdict = cache.entry((ws_idx, gen)).or_insert_with(|| {
                     // Cache miss: a generation rotated by the size-based
@@ -2745,6 +2795,46 @@ impl IndexStore {
                 WalEntry::Delete { doc_id } => Some((true, doc_id.clone(), e.seq_no)),
                 WalEntry::UpdateMapping { .. } => None,
             })
+            .collect()
+    }
+
+    /// Change the WAL-consumer retention floor on every shard of this store,
+    /// **live**.
+    ///
+    /// #320. `IndexStoreConfig.wal_min_retained_generations` is read once, at
+    /// open, from the boot config file — and `Engine.config` is an
+    /// `Arc<Config>` that is never mutated, so without this a floor set
+    /// through `PUT /_xerj/wal_tap` reached no writer at all: not the ones
+    /// already open, and not the ones opened after a restart either. The knob
+    /// exists to stop a target outage turning into data loss, so "acknowledged
+    /// but inert" is the one failure mode it must not have.
+    ///
+    /// Live reconfiguration of an already-open writer is Lucene's
+    /// `LiveIndexWriterConfig`
+    /// (lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java:39-126,
+    /// Apache-2.0): "Holds all the configuration used by IndexWriter with few
+    /// setters for settings that can be changed on an IndexWriter instance
+    /// 'live'." Everything else there is explicitly documented as "Only takes
+    /// effect when IndexWriter is first created"
+    /// (`IndexWriterConfig.setCodec`, :297-305). A setting is one or the
+    /// other, and says which; it is never claimed live and implemented at
+    /// create.
+    pub fn set_wal_min_retained_generations(&self, n: u64) {
+        for shard in &self.wal_shards {
+            shard.lock().unwrap().set_min_retained_generations(n);
+        }
+    }
+
+    /// The retention floor in force on each WAL shard, in shard order.
+    ///
+    /// Instrumentation for the property that
+    /// [`set_wal_min_retained_generations`](Self::set_wal_min_retained_generations)
+    /// exists to provide: it must be assertable that a runtime change reached
+    /// every writer, not just the first.
+    pub fn wal_min_retained_generations(&self) -> Vec<u64> {
+        self.wal_shards
+            .iter()
+            .map(|s| s.lock().unwrap().min_retained_generations())
             .collect()
     }
 
@@ -5196,6 +5286,93 @@ mod tests {
                 "late{i} lost"
             );
         }
+    }
+
+    /// #320 — the WAL-consumer retention floor must be honoured by the prune
+    /// pass the ENGINE runs, which is `wal_maintain_all_verified`, not
+    /// `WalWriter::prune_verified`.
+    ///
+    /// `prune_verified` has no production caller anywhere in the tree
+    /// (`rg 'prune_verified\('` hits `wal.rs` and its own unit tests only), so
+    /// a floor implemented and unit-tested there alone was decoration: on a
+    /// live node every rotated generation was still deleted the moment a flush
+    /// made it redundant, and a tap whose target was down for longer than one
+    /// flush interval still lost entries.
+    ///
+    /// Fails before the fix with `rotated after maintenance: 0`.
+    #[test]
+    fn the_retention_floor_holds_generations_through_engine_wal_maintenance() {
+        fn rotated_wal_files(store: &IndexStore) -> usize {
+            // One file per shard is the ACTIVE generation and is never a prune
+            // candidate; everything beyond that is retained-rotated.
+            walk_wal_files(&store.wal_dir()).len() - store.wal_min_retained_generations().len()
+        }
+
+        // Control: the default floor of 0 reclaims everything it can prove
+        // durable, exactly as before this change.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = open_test_store(bare_dir.path());
+        for round in 0..4 {
+            for i in 0..5 {
+                bare.index(format!("b{round}_{i}"), serde_json::json!({"v": i}))
+                    .unwrap();
+            }
+            bare.flush().unwrap();
+            bare.force_wal_maintenance().unwrap();
+        }
+        assert_eq!(
+            rotated_wal_files(&bare),
+            0,
+            "floor 0 must keep pruning to the active generation, files: {:?}",
+            walk_wal_files(&bare.wal_dir())
+        );
+
+        // Floor 2: the newest two rotated generations survive every
+        // maintenance pass, so a consumer two generations behind still finds
+        // its entries.
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store.set_wal_min_retained_generations(2);
+        for round in 0..4 {
+            for i in 0..5 {
+                store
+                    .index(format!("d{round}_{i}"), serde_json::json!({"v": i}))
+                    .unwrap();
+            }
+            store.flush().unwrap();
+            store.force_wal_maintenance().unwrap();
+        }
+        let retained = rotated_wal_files(&store);
+        assert_eq!(
+            retained,
+            2 * store.wal_min_retained_generations().len(),
+            "the floor must hold 2 rotated generations per shard through the maintenance \
+             path the engine actually runs; files on disk: {:?}",
+            walk_wal_files(&store.wal_dir())
+        );
+
+        // And it is a floor, not a lease: it holds the same two however many
+        // more passes run, so a stalled consumer cannot grow the WAL without
+        // bound.
+        for _ in 0..3 {
+            store.force_wal_maintenance().unwrap();
+        }
+        assert_eq!(
+            rotated_wal_files(&store),
+            retained,
+            "a floor must not grow with the number of maintenance passes"
+        );
+
+        // Lowering it back to 0 releases them on the next pass — the knob is
+        // live in both directions.
+        store.set_wal_min_retained_generations(0);
+        store.force_wal_maintenance().unwrap();
+        assert_eq!(
+            rotated_wal_files(&store),
+            0,
+            "clearing the floor must release the held generations, files: {:?}",
+            walk_wal_files(&store.wal_dir())
+        );
     }
 
     /// RC4 W2 #14 regression — a plain, never-re-indexed DELETE must not
