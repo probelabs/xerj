@@ -15363,6 +15363,23 @@ impl Index {
         // Set when scored_columnar already dropped the first `from` candidates
         // (page-offset hydration) — the final pagination then skips 0.
         let mut scored_from_applied = false;
+        // ── #361: request-level companion to `scored_fast_applied` ────────
+        // The segment FTS path (`fts_handled` below) also produces EXACT ES
+        // BM25, scored against index-wide statistics (#188), and the
+        // page-local IDF rescore further down must not overwrite it — that
+        // rescore derives its N from `final_hits.len()`, i.e. the RETURNED
+        // PAGE, so leaving it armed makes `_score` a function of `size`.
+        // `fts_handled` is a per-segment local, so accumulate here.
+        //
+        // The rescore is only skipped when EVERY arm that could contribute a
+        // hit was exact. `heuristic_scored_applied` starts true whenever the
+        // memtable holds documents — unflushed hits carry the IDF-less
+        // memtable/stored-scan score, and putting the two populations on one
+        // scale is precisely what the rescore was papering over until the
+        // score unification lands (#354 / #188). Mixed pages therefore keep
+        // today's behaviour; a fully-flushed index gets exact BM25.
+        let mut fts_scored_applied = false;
+        let mut heuristic_scored_applied = mem_doc_count > 0;
         if let Some(plan) = &scored_plan {
             if scored_fast_ready {
                 if let Some((hits, total, from_applied)) = self.scored_columnar(
@@ -15792,6 +15809,8 @@ impl Index {
                                 // way for count-only and size>0 so the fall-through
                                 // decision (and thus the count) agrees.
                                 fts_handled = true;
+                                // #361 — this segment's hits carry exact BM25.
+                                fts_scored_applied = true;
                                 // Exact count — identical for count_only and size>0.
                                 // GHOST WINDOW (b7 DEFECT 1c): `seg_total` is the
                                 // segment's PHYSICAL match count — between a flush
@@ -16294,6 +16313,11 @@ impl Index {
                 // returns correct results (just slower).
                 let scan_stored = scan_stored || (needs_fts && !fts_handled);
                 if !fts_handled && scan_stored {
+                    // #361 — this segment's hits are scored by
+                    // `score_query_against_doc` (no IDF, no length norm), so
+                    // the page mixes score scales and the IDF rescore below
+                    // stays armed.
+                    heuristic_scored_applied = true;
                     // M2 G3: for Range queries, compute the matching doc-id
                     // set from the segment's on-disk sorted numeric index
                     // and pass it as a pre-filter so `scan_stored_section_into`
@@ -17048,7 +17072,14 @@ impl Index {
         // (`!scored_fast_applied`: the columnar scored path already produced
         // exact ES BM25 scores — this heuristic rescore would rewrite
         // range-less scoring bools with ≥2 clauses.)
+        // (`exact_bm25_page`: #361 — the segment FTS path produced the same
+        // exact BM25 and needs the identical protection. Its N comes from
+        // `final_hits.len()`, so without this `_score` depends on `size` and
+        // `bool{must:[A],must:[B]}` ranks differently from the same clauses
+        // scoped with `post_filter`.)
+        let exact_bm25_page = fts_scored_applied && !heuristic_scored_applied;
         if !scored_fast_applied
+            && !exact_bm25_page
             && !final_hits.is_empty()
             && request.sort.is_empty()
             // Top-level constant_score: scores are the wrapper's constant —
@@ -17100,7 +17131,9 @@ impl Index {
         // < 0.001 under exact BM25 — e.g. status:ok over the 100k bench
         // corpus scores 0.012563465, but boosting×0.3 shapes go lower — and
         // this data-dependent fallback would silently rewrite exact scores.)
+        // (`exact_bm25_page`: #361 — same argument for the segment FTS path.)
         if !scored_fast_applied
+            && !exact_bm25_page
             && !final_hits.is_empty()
             && request.sort.is_empty()
             // Top-level constant_score with a small boost (< 0.001) is a
@@ -35476,25 +35509,24 @@ fn score_query_against_doc(q: &QueryNode, source: &Value) -> f32 {
 /// clauses. We only rescore this shape because mixed Bool trees (e.g.
 /// match_bool_prefix → [Match, Prefix]) have per-clause scores that
 /// would break if we zeroed out the non-Match contribution.
+///
+/// Only the SCORING children (`must`/`should`) are walked — see
+/// `BooleanClause.isScoring()` (BooleanClause.java:84-87).
 fn query_uses_bool_text(q: &QueryNode) -> bool {
     fn walk(q: &QueryNode) -> (u32, bool) {
         match q {
-            QueryNode::Bool {
-                must,
-                should,
-                filter,
-                must_not,
-                ..
-            } => {
+            QueryNode::Bool { must, should, .. } => {
                 let mut text_children = 0u32;
                 let mut any_disqualifying = false;
                 let mut any_sub_bool = false;
-                for sub in must
-                    .iter()
-                    .chain(should.iter())
-                    .chain(filter.iter())
-                    .chain(must_not.iter())
-                {
+                // SCORING clauses only. `BooleanClause.isScoring()` is
+                // `occur == MUST || occur == SHOULD`
+                // (BooleanClause.java:84-87), so `filter`/`must_not` children
+                // must neither count toward `text_children` nor disqualify
+                // the shape — counting them is what made
+                // `bool{must:[match], filter:[term]}` reach this rescore and
+                // lose its exact BM25 order (#361).
+                for sub in must.iter().chain(should.iter()) {
                     match sub {
                         QueryNode::Match { .. }
                         | QueryNode::MultiMatch { .. }
@@ -35574,13 +35606,12 @@ fn collect_match_field_terms(q: &QueryNode) -> Vec<(String, String, f32)> {
                     out.push((f.to_string(), query.clone(), mult * qb * fb));
                 }
             }
-            QueryNode::Bool {
-                must,
-                should,
-                filter,
-                ..
-            } => {
-                for sub in must.iter().chain(should.iter()).chain(filter.iter()) {
+            // SCORING clauses only — `filter`/`must_not` contribute nothing to
+            // `_score` (`BooleanClause.isScoring()`, BooleanClause.java:84-87),
+            // so their terms must not enter the rescore's weighting either
+            // (#361).
+            QueryNode::Bool { must, should, .. } => {
+                for sub in must.iter().chain(should.iter()) {
                     walk(sub, mult, out);
                 }
             }
@@ -37319,7 +37350,11 @@ fn ip_matches_cidr(ip_str: &str, cidr: &str) -> Option<bool> {
 /// Anything else keeps the conservative all-fields-present gate.
 fn prune_missing_should_fields(q: &FtsQuery, has_field: &dyn Fn(&str) -> bool) -> Option<FtsQuery> {
     let FtsQuery::Bool(b) = q else { return None };
-    if !b.must.is_empty() || !b.must_not.is_empty() || b.min_should_match.is_some() {
+    if !b.must.is_empty()
+        || !b.must_not.is_empty()
+        || !b.filter.is_empty()
+        || b.min_should_match.is_some()
+    {
         return None;
     }
     if b.should.is_empty() || !b.should.iter().all(|c| matches!(c, FtsQuery::Term(_))) {
@@ -37425,11 +37460,16 @@ fn collect_fts_query_fields(q: &FtsQuery, out: &mut Vec<String>) {
             }
         }
         FtsQuery::Bool(b) => {
+            // `filter` too: a non-scoring clause still names a field the
+            // segment must have FTS data for, and the caller's
+            // "reader has EVERY queried field" gate is what routes a
+            // segment missing it onto the stored-doc scan.
             for sub in b
                 .must
                 .iter()
                 .chain(b.should.iter())
                 .chain(b.must_not.iter())
+                .chain(b.filter.iter())
             {
                 collect_fts_query_fields(sub, out);
             }
@@ -37476,11 +37516,16 @@ fn collect_fts_query_terms(q: &FtsQuery, out: &mut Vec<(String, String)>) {
         }
         FtsQuery::Prefix(_) | FtsQuery::Wildcard(_) | FtsQuery::Fuzzy(_) | FtsQuery::MatchAll => {}
         FtsQuery::Bool(b) => {
+            // `filter` is non-scoring, so its df never reaches a `_score`;
+            // it is collected anyway because the clause is still EXECUTED
+            // (its hits are what narrows the conjunction) and an index-wide
+            // df keeps that execution identical across segments.
             for sub in b
                 .must
                 .iter()
                 .chain(b.should.iter())
                 .chain(b.must_not.iter())
+                .chain(b.filter.iter())
             {
                 collect_fts_query_terms(sub, out);
             }
@@ -38012,15 +38057,7 @@ fn query_node_to_fts_with_keyword_fields(
             // become more permissive than the original query.  Return
             // None in that case so the caller falls back to stored-scan,
             // which handles all child shapes correctly.
-            //
-            // `filter` children constrain the hit set exactly like `must`
-            // (they differ only in scoring). They MUST NOT be dropped —
-            // with keyword-field projections now producing real matches, a
-            // dropped filter would silently overcount. Project them as
-            // `must`, or fall back to the stored scan when one can't
-            // project (unsupported Term/Range/etc. still project to None, so
-            // classic filters keep taking the doc-scan path as before).
-            for sub in must.iter().chain(filter.iter()) {
+            for sub in must {
                 let fq = query_node_to_fts_with_keyword_fields(
                     sub,
                     text_fields,
@@ -38028,6 +38065,29 @@ fn query_node_to_fts_with_keyword_fields(
                     keyword_fields,
                 )?;
                 bool_q = bool_q.must(fq);
+                projected_any = true;
+            }
+            // `filter` children constrain the hit set exactly like `must` but
+            // contribute NOTHING to `_score` (`BooleanClause.isScoring()` is
+            // `MUST || SHOULD` — BooleanClause.java:84-87). They MUST NOT be
+            // dropped — with keyword-field projections now producing real
+            // matches, a dropped filter would silently overcount — so they
+            // project onto the FTS bool's own non-scoring `filter` slot, or
+            // fall back to the stored scan when one can't project
+            // (unsupported Term/Range/etc. still project to None, so classic
+            // filters keep taking the doc-scan path as before).
+            //
+            // #361: these used to be projected as `must`, which made
+            // `bool{must:[text], filter:[term]}` score the filter's BM25 on
+            // top of the text clause and reorder the page.
+            for sub in filter {
+                let fq = query_node_to_fts_with_keyword_fields(
+                    sub,
+                    text_fields,
+                    exact_fields,
+                    keyword_fields,
+                )?;
+                bool_q = bool_q.filter(fq);
                 projected_any = true;
             }
             for sub in should {
