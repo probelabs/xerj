@@ -3679,20 +3679,38 @@ fn collect_text_fields(
 ) {
     if let Value::Object(obj) = v {
         for (k, val) in obj {
-            if prefix.is_empty() && excluded.contains(k) {
-                continue;
-            }
             let path = if prefix.is_empty() {
                 k.clone()
             } else {
                 format!("{}.{}", prefix, k)
             };
+            // Matched on the FULL dotted path, not just the root key — #328.
+            // Every pre-#328 member of the set is a root-level name, for which
+            // `path == k` and this is the check that was here before; a
+            // `dense_vector` nested under an object mapping is the first member
+            // that can arrive as `passages.vec`.
+            if excluded.contains(&path) {
+                continue;
+            }
             match val {
                 Value::Object(_) => {
                     // Root-level JSON-blob for flattened-style
                     // whole-object queries.
+                    //
+                    // Built from a PRUNED copy of the object (#328): the blob
+                    // is where a nested `dense_vector` actually landed. The
+                    // recursion below skips `passages.vec`, but this line
+                    // serialised the whole `passages` object — vector included
+                    // — into one text field, so excluding the leaf alone moved
+                    // no bytes at all. Pinned by
+                    // `nested_dense_vector_is_excluded_from_its_parent_objects_term_dictionary`,
+                    // which reports `<seg>.passages.fst` and requires it under
+                    // 4 KiB — the fixture's 19,200 vector components cannot fit
+                    // in that. Both mapping shapes are covered there: the
+                    // dotted top-level name `"passages.vec"` and a `vec`
+                    // sub-mapping under a `passages` object.
                     if prefix.is_empty() {
-                        let t = extract_text_value(val);
+                        let t = extract_text_value_excluding(val, &path, excluded);
                         if !t.is_empty() && !out.contains_key(&path) {
                             out.insert(path.clone(), t);
                         }
@@ -3806,11 +3824,13 @@ pub fn semantic_derived_vector_fields(schema: &Schema) -> std::collections::Hash
 
 /// Every field that must be kept OUT of the full-text inverted index.
 ///
-/// Two disjoint reasons, unioned into one set so flush, merge, the memtable
+/// Three disjoint reasons, unioned into one set so flush, merge, the memtable
 /// analyser and `build_fts_field_configs` cannot disagree:
 ///
 ///  * semantic-derived vector fields (see above) — engine-internal payloads
 ///    that were never user text;
+///  * fields the user MAPPED as `dense_vector` (`FieldType::Vector`) — #328.
+///    See "Why a declared vector has no lexical form" below;
 ///  * fields whose mapping declares `"index": false` — #204's last open
 ///    accepted-and-ignored instance. The option was echoed by `GET _mapping`
 ///    and then ignored, so the field kept a full inverted index and stayed
@@ -3844,8 +3864,166 @@ pub fn semantic_derived_vector_fields(schema: &Schema) -> std::collections::Hash
 ///    `unsearchable_query_field` in `index.rs` rejects every query naming it
 ///    before execution — so no fallback of any strength ever runs, and the
 ///    postings are pure waste whatever the type.
+///
+/// ## Why a declared vector has no lexical form (#328)
+///
+/// `#12` removed the term dictionary for the vectors XERJ *generates* from a
+/// semantic mapping. A field the user maps as `dense_vector` took a different
+/// route through the same code and kept its own: kNN needs the HNSW graph, so
+/// the field is `"index": true`, so the `index: false` arm above never fires.
+/// The field then flowed through `extract_fts_fields_excluding` into
+/// `extract_field_text`, whose `Value::Array` arm joins the elements with
+/// spaces — turning a 128-dim vector into one enormous decimal-string term per
+/// document. kNN is served by `hnsw/graph.bin`; `exists` is resolved from
+/// `_source` / doc values; `_field_caps` and highlighting never open the
+/// field's FST — so every one of those bytes is unreadable by construction.
+///
+/// Lucene draws the type line in exactly the same place and gets the same
+/// consequence for free: `KnnFloatVectorField.createFieldType` sets vector
+/// attributes and then `freeze()`s, and sets nothing else
+/// (`lucene/core/src/java/org/apache/lucene/document/KnnFloatVectorField.java:70`;
+/// `KnnByteVectorField.java:82` is identical), so `IndexOptions` stays `NONE`
+/// (`lucene/core/src/java/org/apache/lucene/index/FieldInfo.java:565`) and a
+/// term dictionary for the field cannot exist. `ColumnValidation` enumerates
+/// "vectors" as an indexing feature DISJOINT from "index options"
+/// (`lucene/core/src/java/org/apache/lucene/document/column/ColumnValidation.java:104`)
+/// — the same type-level separation this is.
+///
+/// Measured — one harness, one corpus, built twice and diffed file by file
+/// after `force_merge(1)`. 5,000 docs × 128 dim: `text` + `keyword` + `long` +
+/// a `dense_vector` + its `_chunks` companion (the corpus carries the companion
+/// because that is the shape RFC #148 reports). Every byte below is a
+/// `std::fs::metadata().len()` sum over the data dir, not an estimate:
+///
+/// | file, 5,000 × 128 | `main` | this branch |
+/// |---|---:|---:|
+/// | `<seg>.emb.fst` | 13,256,659 B | 0 |
+/// | `<seg>.emb.post` | 10,834 B | 0 |
+/// | `<seg>.emb.norms` | 48 B | 0 |
+/// | `<seg>.emb_chunks.fst` | 26,518,005 B | 0 |
+/// | `<seg>.emb_chunks.post` | 10,834 B | 0 |
+/// | `<seg>.body.fst` | 278 B | 278 B |
+/// | `<seg>.cat.fst` | 53 B | 53 B |
+/// | `<seg>.n.fst` | 209 B | 209 B |
+/// | **durable index** (all files bar `.wal`) | **54,068,549 B** | **14,251,975 B** (−73.6%, 3.79×) |
+///
+/// Two observations the table is here to make. First, the term dictionary of a
+/// vector-carrying index essentially *is* the vector field: the three lexical
+/// `.fst` files total 540 B against 39.8 MB of vector postings. Second — and
+/// this is why the exclusion cannot stop at the base name — the `_chunks`
+/// companion is the BIGGER half. At 26,518,005 B it is twice `emb.fst` and 49%
+/// of `main`'s whole index on its own, so a base-name-only exclusion would
+/// leave more behind than it removes.
+///
+/// The row is the DURABLE index — every file in the data directory except
+/// `.wal` — because the write-ahead log's tail is reclaimed asynchronously and
+/// the whole-directory total is therefore not reproducible: eight runs of the
+/// 300-doc regression test put it anywhere between 858,147 B and 1,105,001 B
+/// while the durable bytes moved by 230 B. `.seg` (the stored documents, 11.2 MB
+/// here) is counted on both sides and is why the ratio is 3.79× rather than the
+/// 39.8 MB the term dictionaries cost outright.
+///
+/// The 300-doc × 128-dim fixture the regression tests actually run is the same
+/// shape one order of magnitude down: `emb.fst` 796,274 B, `emb.post` 591 B,
+/// `emb.norms` 313 B, `emb_chunks.fst` 1,592,118 B, `emb_chunks.post` 591 B,
+/// durable index 3,249,323 B → 857,843–858,071 B over eight runs. That test
+/// prints both totals and asserts a ceiling on the durable one, so this figure
+/// is enforced rather than merely published.
+///
+/// The exclusion is *by declared type*, not by value shape: an unmapped
+/// numeric array stays lexical exactly as before (the same line HNSW draws in
+/// `load_hnsw_artifacts_sync`, which refuses a graph pinned to a
+/// non-`dense_vector` field). `FieldType::Chunk` is deliberately NOT excluded:
+/// its declared payload is chunk *text* plus a vector, and only the vector
+/// half is droppable — that needs a value-shape-aware rule, not a type rule.
+///
+/// Removing the postings is only half of it, and the other half is NOT the
+/// `*`-expansion filter. Every other member of this set is protected from the
+/// stored-doc scan by `unsearchable_query_field`, which rejects the query
+/// before execution; a `dense_vector` is not, because it IS indexed. So two
+/// things happen on the query side:
+///
+///  * `text_fields` / `exact_fields` in `search_inner` drop vector fields, so a
+///    `*` expansion stops projecting a clause onto them;
+///  * and `index::lower_lexically_typeless_clauses` lowers any clause that
+///    NAMES one to `match_none` at plan time. The expansion filter alone does
+///    nothing for `{"term":{"emb":…}}` or `{"multi_match":{"fields":["emb"]}}`,
+///    which name the field outright — those fall through the per-segment
+///    `fts_has_field` gate onto the stored-doc scan, whose `Term` arm matches
+///    ANY ELEMENT of a JSON array (`json_values_equal`) and whose `match` arm
+///    splits on non-alphanumerics.
+///
+/// Measured on the corpus above, post-`force_merge`, three source states —
+/// `main` / write-side exclusion only (postings gone, no plan-time lowering) /
+/// this branch. Timings are the FIRST call for each shape, before the result
+/// cache has seen it; a repeat of any row here is ~0.002 ms on all three and
+/// measures the cache, not the plan:
+///
+/// | query | `main` | postings gone, no lowering | this branch |
+/// |---|---|---|---|
+/// | `term {emb: "<component>"}` | 0 hits, 89.2 ms | 0 hits, 186.8 ms | 0 hits, 0.061 ms |
+/// | `term {emb: <component>}` numeric | **1 hit**, 87.6 ms | **1 hit**, 187.6 ms | **0 hits**, 0.011 ms |
+/// | `terms {emb: [<component>]}` numeric | **1 hit**, 85.6 ms | **1 hit**, 112.0 ms | **0 hits**, 0.012 ms |
+/// | `prefix {emb: "0"}` | **2,500 hits**, 231.8 ms | 0 hits, 95.0 ms | **0 hits**, 0.008 ms |
+/// | `wildcard {emb: "0*"}` | **5,000 hits**, 316.6 ms | 0 hits, 95.1 ms | **0 hits**, 0.008 ms |
+/// | `fuzzy {emb: "0"~2}` | **5,000 hits**, 798.5 ms | 0 hits, 97.7 ms | **0 hits**, 0.011 ms |
+/// | `match_phrase_prefix {emb: "0"}` | **50 hits**, 84.6 ms | 0 hits, 89.3 ms | **0 hits**, 0.009 ms |
+/// | `range {emb: {gte:-2, lte:2}}` | 0 hits, 119.8 ms | 0 hits, 134.5 ms | 0 hits, 0.009 ms |
+/// | `multi_match {fields:["emb"], query:"0"}` | 0 hits, 0.409 ms | **5,000 hits**, 123.5 ms | 0 hits, 0.012 ms |
+/// | `simple_query_string {fields:["emb"]}` | 0 hits, 0.033 ms | 0 hits, 114.5 ms | 0 hits, 0.015 ms |
+/// | `term {emb_chunks: "<component>"}` | 0 hits, 86.0 ms | 0 hits, 116.6 ms | 0 hits, 0.008 ms |
+/// | `wildcard {emb_chunks: "0*"}` | **5,000 hits**, 626.9 ms | 0 hits, 89.9 ms | **0 hits**, 0.007 ms |
+/// | `multi_match {fields:["emb_chunks"], query:"0"}` | 0 hits, 2.24 ms | **5,000 hits**, 138.5 ms | 0 hits, 0.014 ms |
+/// | `bool{should:[term emb], must_not:[term cat]}` | 0 hits, 81.4 ms | 0 hits, 92.4 ms | 0 hits, 0.011 ms |
+/// | `bool{must_not:[term emb]}` | 5,000 hits, 84.9 ms | 5,000 hits, 98.9 ms | 5,000 hits, 2.31 ms |
+/// | `constant_score{filter: term emb}` | 0 hits, 83.0 ms | 0 hits, 110.3 ms | 0 hits, 0.012 ms |
+/// | `exists {field: emb}` | 5,000 hits, 83.0 ms | 5,000 hits, 108.0 ms | 5,000 hits, 88.5 ms |
+/// | `match {body: "liquidity"}` | 5,000 hits, 5.18 ms | 5,000 hits, 5.96 ms | 5,000 hits, 4.95 ms |
+/// | `term {cat: "even"}` | 2,500 hits, 2.32 ms | 2,500 hits, 2.87 ms | 2,500 hits, 2.27 ms |
+///
+/// The two `multi_match` rows are the ones that are not merely slow. Without the
+/// lowering they answer EVERY document, because the scan renders the float array
+/// to text and every component contains a `0` — a 0-hit query silently becomes
+/// a match-all. Those rows are the reason the write-side change cannot ship on
+/// its own.
+///
+/// A WHOLE CLASS OF ANSWERS CHANGES, and it is stated rather than buried. SEVEN
+/// rows above differ between `main` and this branch (nine shapes on the 300-doc
+/// regression fixture, which probes both companions), and they are all the same
+/// thing: a `dense_vector` and its `_chunks` companion no longer have any
+/// lexical surface, so every lexical leaf naming one answers 0. On `main` those
+/// clauses reached the stored-doc scan, which renders the float array back to
+/// decimal text and matches against THAT — its `Term` arm matches any ELEMENT of
+/// a JSON array (`json_values_equal`) and its `match` arm splits on
+/// non-alphanumerics — so a shape answered 0 or answered most of the corpus
+/// purely according to whether the rendered decimals happened to contain the
+/// probe. `wildcard {emb:"0*"}` and `fuzzy {emb:"0"~2}` matched EVERY document.
+/// None of that is a retrieval semantic anyone asked for: ES rejects these
+/// queries on a `dense_vector` outright (`DenseVectorFieldType` has no term
+/// query) and Lucene gives a field with no terms an empty scorer
+/// (`lucene/core/src/java/org/apache/lucene/index/Terms.java:40`). 0 is the
+/// Lucene answer. It is still a behaviour change and the CHANGELOG describes the
+/// class; `user_mapped_dense_vector_builds_no_fts_term_dictionary`'s (d) loop
+/// pins it shape by shape.
+///
+/// `_score` MOVES TOO, for bools whose hit count does not. Dropping the dead
+/// clause out of `should` makes the surviving bool projectable through
+/// `query_node_to_fts_with_keyword_fields`, so BM25 scores it where the
+/// stored-doc scan used to. On the 300-doc fixture,
+/// `bool{should:[term emb, term cat:"even"]}` keeps its 150 hits but goes
+/// `_score` 0.008402659 → 0.6931471 and `max_score` 1.6931472 → 0.6931471, and
+/// `bool{must:[match body], must_not:[term emb]}` keeps its 300 hits and its
+/// `_score` but goes `max_score` 1.6931472 → 0.008402659. Both moves are toward
+/// consistency: on `main` these reported a `max_score` no returned hit carried.
+/// Isolated to the plan-time fold — with the write-side exclusion alone and the
+/// lowering disabled, both are byte-identical to `main`. Pinned in that test's
+/// (d2c) block.
+///
+/// Not claimed and not changed: XERJ still answers 200 rather than 400 for
+/// these shapes. Adding ES's rejection is a separate, breaking change.
 pub fn fts_excluded_fields(schema: &Schema) -> std::collections::HashSet<String> {
     let mut excluded = semantic_derived_vector_fields(schema);
+    excluded.extend(lexically_typeless_fields(schema));
     for field in &schema.fields {
         if field.options.indexed {
             continue;
@@ -3857,6 +4035,83 @@ pub fn fts_excluded_fields(schema: &Schema) -> std::collections::HashSet<String>
         }
     }
     excluded
+}
+
+/// Fields whose DECLARED type has no lexical representation at all — #328.
+///
+/// Today that is exactly `FieldType::Vector` (`dense_vector`), so the base list
+/// is deliberately the SAME list, from the same walk, that decides which fields
+/// get an HNSW graph: [`crate::index::collect_dense_vector_fields`]. Two
+/// independent notions of "which fields are vectors" is how you end up with a
+/// field that has both a graph and a term dictionary, or neither — so there is
+/// one walk and this is a view of it.
+///
+/// Each vector contributes THREE names, exactly the shape
+/// [`semantic_derived_vector_fields`] already emits per target, because a
+/// `dense_vector` never arrives alone: `passage_scored_vector_fields` unions
+/// user-mapped vectors with semantic targets and both grow a `<field>_chunks`
+/// companion (the per-document MULTI-vector) and a
+/// `__xerj_passage_meta__<field>` sidecar. Excluding only the base name leaves
+/// the companion behind, and the companion is the BIGGER half: on the 5,000-doc
+/// × 128-dim corpus measured in [`fts_excluded_fields`], `<seg>.emb_chunks.fst`
+/// is 26,518,005 B against `<seg>.emb.fst`'s 13,256,659 B — twice the size, and
+/// 49% of `main`'s whole 54,068,549 B durable index on its own.
+///
+/// Lucene draws the same line and never lets a multi-vector reach an analyzer:
+/// its per-document float[][] shape is `LateInteractionField`, which `extends
+/// BinaryDocValuesField`
+/// (`lucene/core/src/java/org/apache/lucene/document/LateInteractionField.java:36`)
+/// and hands its constructor straight to `super(name, encode(value))` (`:44`)
+/// — doc values only, no index options, so no term dictionary can exist for it
+/// any more than for the single-vector `KnnFloatVectorField`
+/// (`KnnFloatVectorField.java:70`: vector attributes, then `freeze()`).
+///
+/// NAME SYNTHESIS, stated rather than discovered: a user field literally named
+/// `emb_chunks` alongside a `dense_vector` `emb` loses its term dictionary to
+/// this collision. That is the same collision `semantic_derived_vector_fields`
+/// has always accepted for `<target>_chunks`, and the same names
+/// `observe_passage_chunks_in_source` reserves, so the ambiguity is the
+/// engine's convention rather than something introduced here.
+///
+/// ALLOCATION: this runs once per SEARCH (`index::search_inner` calls it to
+/// decide whether the plan-time lowering has anything to do), and the vast
+/// majority of indices have no vector field at all. `collect_dense_vector_fields`
+/// clones the name of EVERY field it walks past, not just the vector ones, so
+/// the no-vector case is short-circuited by the allocation-free predicate
+/// below and returns an empty `HashSet`, which does not allocate either. The
+/// two must agree by construction, and
+/// `the_fast_path_predicate_agrees_with_the_walk` pins that they do.
+pub fn lexically_typeless_fields(schema: &Schema) -> std::collections::HashSet<String> {
+    let mut excluded = std::collections::HashSet::new();
+    if !has_vector_field(&schema.fields) {
+        return excluded;
+    }
+    for field in crate::index::collect_dense_vector_fields(schema) {
+        excluded.insert(format!("{field}_chunks"));
+        excluded.insert(format!(
+            "{}{}",
+            xerj_query::executor::PASSAGE_METADATA_PREFIX,
+            field
+        ));
+        excluded.insert(field);
+    }
+    excluded
+}
+
+/// Does this field list contain a `dense_vector` anywhere? Allocation-free.
+///
+/// The recursion condition is `collect_dense_vector_fields`'s, deliberately: it
+/// stops at a `Vector` rather than descending into its sub-fields, so the two
+/// walks visit exactly the same nodes and cannot disagree about whether the set
+/// would come back empty.
+fn has_vector_field(fields: &[xerj_common::types::FieldConfig]) -> bool {
+    fields.iter().any(|fc| {
+        if matches!(fc.field_type, FieldType::Vector) {
+            true
+        } else {
+            !fc.fields.is_empty() && has_vector_field(&fc.fields)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -4036,6 +4291,257 @@ fn extract_text_value(val: &Value) -> String {
             .join(" "),
         Value::Object(_) => serde_json::to_string(val).unwrap_or_default(),
         Value::Null => String::new(),
+    }
+}
+
+/// Does `excluded` hold anything strictly BELOW `path`?
+///
+/// Allocation-free on the hot path: the set is schema-derived and normally
+/// holds zero dotted entries, so this is a handful of length compares per
+/// object-valued field per document.
+pub(crate) fn has_excluded_descendant(
+    path: &str,
+    excluded: &std::collections::HashSet<String>,
+) -> bool {
+    excluded.iter().any(|entry| {
+        entry.len() > path.len() && entry.as_bytes()[path.len()] == b'.' && entry.starts_with(path)
+    })
+}
+
+/// [`extract_text_value`], with every descendant named in `excluded` removed
+/// from the flattened object first — #328.
+///
+/// `path` is the dotted path of `val` itself. Only objects can have
+/// descendants, so every other shape short-circuits to `extract_text_value`,
+/// and an object with no excluded descendant does too — the clone is paid only
+/// by the documents that actually carry an excluded sub-field.
+pub(crate) fn extract_text_value_excluding(
+    val: &Value,
+    path: &str,
+    excluded: &std::collections::HashSet<String>,
+) -> String {
+    fn prune(val: &Value, path: &str, excluded: &std::collections::HashSet<String>) -> Value {
+        match val {
+            Value::Object(map) => {
+                let mut kept = serde_json::Map::with_capacity(map.len());
+                for (key, child) in map {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if excluded.contains(&child_path) {
+                        continue;
+                    }
+                    kept.insert(key.clone(), prune(child, &child_path, excluded));
+                }
+                Value::Object(kept)
+            }
+            other => other.clone(),
+        }
+    }
+    if !matches!(val, Value::Object(_)) || !has_excluded_descendant(path, excluded) {
+        return extract_text_value(val);
+    }
+    extract_text_value(&prune(val, path, excluded))
+}
+
+/// Unit coverage for the three helpers #328 adds — the widest new surface in
+/// this file is [`lexically_typeless_fields`], which is `pub`.
+#[cfg(test)]
+mod lexically_typeless_fields_tests {
+    use super::*;
+    use serde_json::json;
+    use xerj_common::types::{FieldConfig, FieldType, Schema};
+
+    fn vector(name: &str, dims: usize) -> FieldConfig {
+        let mut f = FieldConfig::new(name, FieldType::Vector);
+        f.options.dimensions = Some(dims);
+        f.options.similarity = Some("cosine".to_string());
+        f
+    }
+
+    /// Every `dense_vector` contributes THREE names, because a vector never
+    /// arrives alone: the base field, the `_chunks` multi-vector companion and
+    /// the passage-metadata sidecar. Excluding only the base name is what left
+    /// `<seg>.emb_chunks.fst` — the bigger of the two artifacts — behind.
+    #[test]
+    fn every_vector_contributes_its_whole_family() {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema.add_field(vector("emb", 8)).unwrap();
+
+        let typeless = lexically_typeless_fields(&schema);
+        assert_eq!(
+            typeless,
+            std::collections::HashSet::from([
+                "emb".to_string(),
+                "emb_chunks".to_string(),
+                "__xerj_passage_meta__emb".to_string(),
+            ])
+        );
+        assert!(!typeless.contains("body"), "a text field is not typeless");
+    }
+
+    /// The exclusion is by DECLARED type, not by value shape: a numeric array
+    /// under a non-vector mapping stays lexical exactly as before.
+    #[test]
+    fn a_non_vector_field_is_never_typeless() {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("cat", FieldType::Keyword))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("n", FieldType::Long))
+            .unwrap();
+        assert!(lexically_typeless_fields(&schema).is_empty());
+    }
+
+    /// A vector nested under an object mapping arrives as a DOTTED path — the
+    /// first member of this set that is not a root-level name, and the reason
+    /// `collect_text_fields` had to start matching the full path.
+    #[test]
+    fn a_nested_vector_is_collected_by_its_dotted_path() {
+        let mut schema = Schema::empty();
+        let mut parent = FieldConfig::new("passages", FieldType::Object);
+        parent.fields.push(vector("vec", 4));
+        schema.add_field(parent).unwrap();
+
+        let typeless = lexically_typeless_fields(&schema);
+        assert!(typeless.contains("passages.vec"), "got {typeless:?}");
+        assert!(typeless.contains("passages.vec_chunks"));
+        assert!(
+            !typeless.contains("vec"),
+            "the leaf name alone must not match"
+        );
+    }
+
+    /// `fts_excluded_fields` is the union, so the vector family must appear
+    /// there too — that union is what flush, merge and `build_fts_field_configs`
+    /// all read.
+    #[test]
+    fn fts_excluded_fields_unions_the_vector_family_in() {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema.add_field(vector("emb", 8)).unwrap();
+
+        let excluded = fts_excluded_fields(&schema);
+        for name in ["emb", "emb_chunks", "__xerj_passage_meta__emb"] {
+            assert!(excluded.contains(name), "{name} missing from {excluded:?}");
+        }
+        assert!(!excluded.contains("body"));
+    }
+
+    /// The allocation-free short-circuit and the allocating walk must agree on
+    /// "is this set empty", for every shape either of them can see — otherwise
+    /// the fast path would silently disable the whole #328 query half on some
+    /// schema.
+    #[test]
+    fn the_fast_path_predicate_agrees_with_the_walk() {
+        let mut nested = FieldConfig::new("passages", FieldType::Object);
+        nested.fields.push(vector("vec", 4));
+        let mut deep = FieldConfig::new("a", FieldType::Object);
+        let mut mid = FieldConfig::new("b", FieldType::Object);
+        mid.fields.push(vector("c", 2));
+        deep.fields.push(mid);
+        let mut object_without_a_vector = FieldConfig::new("meta", FieldType::Object);
+        object_without_a_vector
+            .fields
+            .push(FieldConfig::new("note", FieldType::Text));
+
+        for (label, fields) in [
+            ("empty", vec![]),
+            ("text only", vec![FieldConfig::new("body", FieldType::Text)]),
+            ("object with no vector", vec![object_without_a_vector]),
+            ("root vector", vec![vector("emb", 8)]),
+            ("nested vector", vec![nested]),
+            ("two levels deep", vec![deep]),
+            (
+                "vector beside text",
+                vec![FieldConfig::new("body", FieldType::Text), vector("emb", 8)],
+            ),
+        ] {
+            let mut schema = Schema::empty();
+            for f in fields {
+                schema.add_field(f).unwrap();
+            }
+            assert_eq!(
+                has_vector_field(&schema.fields),
+                !crate::index::collect_dense_vector_fields(&schema).is_empty(),
+                "predicate and walk disagree on `{label}`"
+            );
+            assert_eq!(
+                has_vector_field(&schema.fields),
+                !lexically_typeless_fields(&schema).is_empty(),
+                "short-circuit changed the answer on `{label}`"
+            );
+        }
+    }
+
+    #[test]
+    fn has_excluded_descendant_matches_only_strictly_below_the_path() {
+        let set = std::collections::HashSet::from(["passages.vec".to_string(), "emb".to_string()]);
+        assert!(has_excluded_descendant("passages", &set));
+        // The path ITSELF is not a descendant of itself — the caller checks
+        // `excluded.contains(&path)` separately, and double-counting it here
+        // would make the prune fire for a leaf that was already skipped.
+        assert!(!has_excluded_descendant("passages.vec", &set));
+        assert!(!has_excluded_descendant("emb", &set));
+        // A shared PREFIX is not a path prefix: `passages_extra` must not match
+        // `passages.vec`, which is why the check tests for the `.` separator
+        // rather than calling `starts_with` alone.
+        assert!(!has_excluded_descendant("passages_extra", &set));
+        assert!(!has_excluded_descendant("other", &set));
+    }
+
+    /// The flattened root-level blob is where a nested vector actually lands,
+    /// so the prune has to happen there and not only in the recursion.
+    #[test]
+    fn extract_text_value_excluding_drops_the_nested_vector_from_the_blob() {
+        let set = std::collections::HashSet::from(["passages.vec".to_string()]);
+        let val = json!({
+            "text": "quarterly liquidity",
+            "vec": [0.125, 0.25, 0.5],
+            "nested": {"keep": "yes"}
+        });
+        let pruned = extract_text_value_excluding(&val, "passages", &set);
+        assert!(
+            pruned.contains("quarterly liquidity"),
+            "text kept: {pruned}"
+        );
+        assert!(
+            pruned.contains("yes"),
+            "unrelated sub-object kept: {pruned}"
+        );
+        assert!(
+            !pruned.contains("0.125") && !pruned.contains("0.25"),
+            "vector components must be gone: {pruned}"
+        );
+    }
+
+    /// No excluded descendant → identical to `extract_text_value`, and no clone
+    /// is paid. This is the path every document without a nested vector takes.
+    #[test]
+    fn extract_text_value_excluding_is_a_no_op_without_a_descendant() {
+        let set = std::collections::HashSet::from(["other.vec".to_string()]);
+        let val = json!({"text": "quarterly liquidity", "n": 7});
+        assert_eq!(
+            extract_text_value_excluding(&val, "passages", &set),
+            extract_text_value(&val)
+        );
+        // A non-object short-circuits regardless of what the set holds.
+        let scalar = json!("plain string");
+        assert_eq!(
+            extract_text_value_excluding(&scalar, "passages", &set),
+            extract_text_value(&scalar)
+        );
     }
 }
 

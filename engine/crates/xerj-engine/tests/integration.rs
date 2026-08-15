@@ -127,6 +127,766 @@ async fn test_semantic_vectors_stay_stored_but_not_fts_indexed_after_merge_and_r
     assert_queries(&idx).await;
 }
 
+/// #328 — a USER-MAPPED `dense_vector` must contribute no lexical artifacts.
+///
+/// The `#12` fix above covers the vectors XERJ *generates* from a semantic
+/// mapping. A field the user maps as `dense_vector` took a different route:
+/// it is `indexed == true` (kNN needs the HNSW graph), so the `index: false`
+/// arm of `memtable::fts_excluded_fields` never fired and the field's 128
+/// floats were flattened to decimal strings and tokenised into a term
+/// dictionary that no query path reads.
+///
+/// This pins all four halves of the fix:
+///   * no `<seg>.emb.{fst,post,norms}` is written, at flush or after merge —
+///     AND none for the `<field>_chunks` companion either. A `dense_vector`
+///     never arrives alone: `passage_scored_vector_fields` gives every one of
+///     them a `_chunks` multi-vector and a `__xerj_passage_meta__` sidecar, and
+///     the companion is the bigger artifact of the two on a chunked corpus;
+///   * kNN, `exists` and the lexical fields keep answering exactly as before;
+///   * EVERY lexical leaf on the vector field answers 0, which is a BEHAVIOUR
+///     CHANGE for a whole class of shapes rather than for one row. `main` sends
+///     these to the stored-doc scan, which renders the float array back to
+///     decimal text and matches against it, so `wildcard {emb:"0*"}` and
+///     `fuzzy {emb:"0"~2}` answered ALL 300 documents, `prefix {emb:"0"}` 146,
+///     `match_phrase_prefix {emb:"0"}` 50 and numeric `term`/`terms` 1 each.
+///     None of that is a retrieval semantic anyone asked for and all of it is
+///     now 0 — see the table in the (d) loop for the measured before/after;
+///   * and neither does an EXPLICITLY-FIELDED lexical query. This is the one
+///     the writer-side change cannot cover on its own and the one that fails
+///     loudly: with the postings gone but no plan-time lowering,
+///     `{"multi_match":{"query":"0","fields":["emb"]}}` returns EVERY document
+///     instead of none, because the scan renders the float array to text and
+///     every component contains a `0`. Measured on a 5,000-doc × 128-dim
+///     corpus, post-`force_merge`, three source states (first call each, before
+///     the result cache): `main` 0 hits / 0.409 ms, postings-removed-only
+///     **5,000 hits** / 123.5 ms, this branch 0 hits / 0.012 ms. The same run
+///     puts `{"term":{"emb":"<component>"}}` at 89.2 → 186.8 → 0.061 ms, all
+///     three answering 0.
+#[tokio::test]
+async fn user_mapped_dense_vector_builds_no_fts_term_dictionary() {
+    fn segment_files(dir: &std::path::Path) -> Vec<(String, u64)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), out);
+                } else {
+                    out.push((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.metadata().unwrap().len(),
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out
+    }
+
+    const DIMS: usize = 128;
+    const DOCS: usize = 300;
+
+    let dir = TempDir::new().unwrap();
+    let mut schema = Schema::empty();
+    schema
+        .fields
+        .push(FieldConfig::new("body", FieldType::Text));
+    schema
+        .fields
+        .push(FieldConfig::new("cat", FieldType::Keyword));
+    schema.fields.push(FieldConfig::new("n", FieldType::Long));
+    let mut emb = FieldConfig::new("emb", FieldType::Vector);
+    emb.options.dimensions = Some(DIMS);
+    emb.options.similarity = Some("cosine".to_string());
+    schema.fields.push(emb);
+
+    let engine = make_engine(&dir);
+    engine.create_index("duprobe", schema).unwrap();
+    let idx = engine.get_index("duprobe").unwrap();
+
+    // Deterministic pseudo-random components with enough decimal digits that
+    // each one is a distinct term — the shape that made the FST large.
+    let component = |doc: usize, dim: usize| -> f64 {
+        let h = (doc as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add((dim as u64).wrapping_mul(1_442_695_040_888_963_407));
+        ((h >> 11) as f64 / (1u64 << 53) as f64 * 2.0) - 1.0
+    };
+    let mut first_vector = Vec::new();
+    for d in 0..DOCS {
+        let v: Vec<f64> = (0..DIMS).map(|dim| component(d, dim)).collect();
+        if d == 0 {
+            first_vector = v.clone();
+        }
+        idx.index_document(
+            Some(format!("d{d}")),
+            json!({
+                "body": format!("quarterly liquidity evidence document number {d}"),
+                "cat": if d % 2 == 0 { "even" } else { "odd" },
+                "n": d,
+                "emb": v,
+                // The `_chunks` companion, i.e. the per-document MULTI-vector.
+                // Present in the fixture because a chunked corpus is the shape
+                // RFC #148 reports, and excluding only `emb` leaves this one
+                // fully tokenised.
+                "emb_chunks": [v, v],
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    idx.refresh().await.unwrap();
+    idx.force_merge(1).await.unwrap();
+
+    let files = segment_files(dir.path());
+    let bytes_of = |suffix: &str| -> u64 {
+        files
+            .iter()
+            .filter(|(name, _)| name.ends_with(suffix))
+            .map(|(_, len)| *len)
+            .sum()
+    };
+    // Reported so the saving is a measured number in the log, not a claim.
+    //
+    // TWO totals, and only the second one is quotable. The whole data dir
+    // includes the write-ahead log, whose tail is reclaimed asynchronously, so
+    // it is NOT reproducible: eight runs of this test on one machine printed a
+    // whole-dir total between 858,147 B and 1,105,001 B, a 29% spread, entirely
+    // because the surviving `.wal` files ranged from 256 B to 6 MB while the
+    // segment bytes did not move at all. `durable-index` excludes `.wal` and is
+    // reproducible to ~230 B (the run-to-run jitter in the HNSW `graph.bin`):
+    // the same eight runs printed 857,843 – 858,071 B. That is the number the
+    // CHANGELOG quotes and the one the ceiling below pins.
+    let whole_dir: u64 = files.iter().map(|(_, len)| *len).sum();
+    let durable: u64 = files
+        .iter()
+        .filter(|(name, _)| !name.ends_with(".wal"))
+        .map(|(_, len)| *len)
+        .sum();
+    eprintln!(
+        "#328 lexical bytes: emb.fst={} emb.post={} emb.norms={} emb_chunks.fst={} | \
+         body.fst={} body.post={} cat.fst={} n.fst={} | durable-index={durable} \
+         whole-dir={whole_dir}",
+        bytes_of(".emb.fst"),
+        bytes_of(".emb.post"),
+        bytes_of(".emb.norms"),
+        bytes_of(".emb_chunks.fst"),
+        bytes_of(".body.fst"),
+        bytes_of(".body.post"),
+        bytes_of(".cat.fst"),
+        bytes_of(".n.fst"),
+    );
+    // The published saving, enforced. `origin/main` writes 3,249,323 B of
+    // durable index for this fixture and this branch writes ~858 KB; the ceiling
+    // sits three orders of magnitude clear of the jitter and still 2.2 MB below
+    // `main`, so it is a real fail-before and not a golden-file trap. Watched
+    // fail at exactly 3,249,323 with both source files reverted to `origin/main`.
+    assert!(
+        durable < 1_500_000,
+        "durable index must lose the vector term dictionaries; got {durable} B \
+         (`origin/main` writes 3,249,323 B for this fixture, this branch ~858 KB)"
+    );
+
+    for suffix in [
+        ".emb.fst",
+        ".emb.post",
+        ".emb.norms",
+        // The companion, and it is the BIGGER half. On this 300-doc fixture,
+        // `main` writes `.emb.fst` = 796,274 B and `.emb_chunks.fst` =
+        // 1,592,118 B; at 5,000 × 128 it is 13,256,659 B against 26,518,005 B.
+        // Excluding the base name alone would leave more behind than it
+        // removes.
+        ".emb_chunks.fst",
+        ".emb_chunks.post",
+        ".emb_chunks.norms",
+    ] {
+        assert!(
+            !files.iter().any(|(name, _)| name.ends_with(suffix)),
+            "a dense_vector field must contribute no `{suffix}` artifact; got {:?}",
+            files
+                .iter()
+                .filter(|(name, _)| name.contains(".emb"))
+                .collect::<Vec<_>>()
+        );
+    }
+    // The lexical fields are untouched — this is a per-type exclusion, not a
+    // blanket one.
+    for suffix in [".body.fst", ".cat.fst", ".n.fst"] {
+        assert!(
+            files.iter().any(|(name, _)| name.ends_with(suffix)),
+            "lexical fields must keep their term dictionaries; missing {suffix}"
+        );
+    }
+
+    // (a) kNN still answers from the HNSW graph.
+    let knn = idx
+        .search(
+            &parse_request(&json!({
+                "query": {"knn": {"field": "emb", "query_vector": first_vector, "k": 3}},
+                "size": 10
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(knn.hits.len(), 3, "kNN must still retrieve neighbours");
+    assert_eq!(
+        knn.hits[0].id, "d0",
+        "nearest neighbour must be the probe doc"
+    );
+
+    // (b) `exists` is answered from `_source` / doc values, never the postings.
+    let exists = idx
+        .search(&make_search(json!({"exists": {"field": "emb"}})))
+        .await
+        .unwrap();
+    assert_eq!(exists.total.value, DOCS as u64);
+
+    // (c) the lexical fields still match.
+    let lexical = idx
+        .search(&make_search(json!({"match": {"body": "liquidity"}})))
+        .await
+        .unwrap();
+    assert_eq!(lexical.total.value, DOCS as u64);
+    let kw = idx
+        .search(&make_search(json!({"term": {"cat": "even"}})))
+        .await
+        .unwrap();
+    assert_eq!(kw.total.value, (DOCS / 2) as u64);
+
+    // (d) EVERY lexical leaf that names the vector field answers 0.
+    //
+    // This is a CLASS, not a list of individually interesting queries, and the
+    // class is the behaviour change this fix ships. On `main` a lexical clause
+    // on `emb` falls through the missing/oversized term dictionary onto the
+    // stored-doc scan, which renders the float array back to decimal text and
+    // matches against that text — so whether a shape answered 0 or answered
+    // most of the corpus on `main` depended entirely on whether the rendered
+    // decimals happened to contain the probe. Measured on THIS fixture with
+    // both source files reverted to `origin/main` (300 docs × 128 dim, after
+    // `force_merge(1)`), `main` → this branch:
+    //
+    //   term    {emb: <component>}   numeric  ..  1 →   0
+    //   terms   {emb: [<component>]} numeric  ..  1 →   0
+    //   prefix  {emb: "0"}                    .. 146 →   0
+    //   wildcard{emb: "0*"}                   .. 300 →   0   (every document)
+    //   fuzzy   {emb: {value:"0", fuzziness:2}} 300 →   0   (every document)
+    //   match_phrase_prefix {emb: "0"}        ..  50 →   0
+    //   prefix  {emb_chunks: "0"}             .. 146 →   0
+    //   wildcard{emb_chunks: "0*"}            .. 300 →   0   (every document)
+    //   fuzzy   {emb_chunks: {value:"0", …}}  .. 300 →   0   (every document)
+    //
+    // …and the shapes whose probe text simply never appeared in a rendered
+    // float answered 0 on both sides. All of them are pinned below at 0, so
+    // the class is closed rather than sampled: a `dense_vector` and its
+    // `_chunks` companion have no lexical surface at all.
+    //
+    // The two halves of the fix cover DIFFERENT rows of that table, which is why
+    // both are needed. Running the same loop with the write-side exclusion alone
+    // (the plan-time lowering disabled in `search_inner`) leaves exactly four
+    // shapes non-zero — numeric `term`/`terms` at 1 each and the two
+    // `multi_match`es at 300 — while `prefix`/`wildcard`/`fuzzy`/
+    // `match_phrase_prefix` are already 0, because a multi-term query has no
+    // term dictionary left to enumerate. Reverting both files to `origin/main`
+    // leaves nine non-zero. Both counts were watched.
+    //
+    // A POSITIVE component: a leading `-` is `query_string`'s NOT operator,
+    // which would make the probe measure the parser rather than the field.
+    let probe_num = first_vector
+        .iter()
+        .copied()
+        .find(|v| *v > 0.0)
+        .expect("fixture vector has a positive component");
+    let probe = format!("{probe_num}");
+    let mut lexical_leaks: Vec<String> = Vec::new();
+    for q in [
+        json!({"term": {"emb": probe}}),
+        json!({"match": {"emb": probe}}),
+        json!({"match": {"emb": "0.5"}}),
+        json!({"query_string": {"query": probe}}),
+        json!({"multi_match": {"query": probe, "fields": ["*"]}}),
+        // Numeric `term` / `terms` / `range`.
+        //
+        // The first two answered 1 on `main`: the stored-doc scan's `Term` arm
+        // matches any ELEMENT of a JSON array — "this document's vector happens
+        // to contain this float". ES rejects `term` on a `dense_vector`
+        // outright and Lucene gives a field with no terms an empty scorer, so 0
+        // is the answer this pins.
+        json!({"term": {"emb": probe_num}}),
+        json!({"terms": {"emb": [probe_num]}}),
+        json!({"terms": {"emb": [probe]}}),
+        json!({"range": {"emb": {"gte": -2.0, "lte": 2.0}}}),
+        // The MULTI-TERM leaves, and the loudest half of the class. A rendered
+        // float almost always contains a `0` somewhere, so on `main` these
+        // matched a large fraction of the corpus — `wildcard` and `fuzzy`
+        // matched ALL 300 documents — purely as an artifact of decimal
+        // rendering. Every one of them is a `field`-naming leaf in
+        // `lower_lexically_typeless_clauses`'s first arm.
+        json!({"prefix": {"emb": "0"}}),
+        json!({"wildcard": {"emb": "0*"}}),
+        json!({"fuzzy": {"emb": {"value": "0", "fuzziness": 2}}}),
+        json!({"regexp": {"emb": "0.*"}}),
+        json!({"match_phrase": {"emb": probe}}),
+        json!({"match_phrase_prefix": {"emb": "0"}}),
+        // EXPLICITLY-FIELDED forms — the half the writer-side change cannot
+        // reach. Each of these names `emb` outright rather than expanding onto
+        // it, so no `*`-expansion filter helps; without a plan-time lowering
+        // they land on the stored-doc scan. The `multi_match` one is the
+        // correctness failure, not merely a slow one: postings-removed-only,
+        // it answers DOCS instead of 0.
+        json!({"multi_match": {"query": "0", "fields": ["emb"]}}),
+        json!({"simple_query_string": {"query": "0", "fields": ["emb"]}}),
+        json!({"query_string": {"query": "0", "default_field": "emb"}}),
+        // …and the `_chunks` companion, which is in the exclusion set for the
+        // same reason and therefore needs the same lowering — including the
+        // multi-term leaves, which matched 146 and 300 documents on `main`.
+        json!({"term": {"emb_chunks": probe}}),
+        json!({"prefix": {"emb_chunks": "0"}}),
+        json!({"wildcard": {"emb_chunks": "0*"}}),
+        json!({"fuzzy": {"emb_chunks": {"value": "0", "fuzziness": 2}}}),
+        json!({"multi_match": {"query": "0", "fields": ["emb_chunks"]}}),
+    ] {
+        let hits = idx.search(&make_search(q.clone())).await.unwrap();
+        // Accumulated rather than asserted per row, deliberately: this loop is
+        // pinning a CLASS, so a regression report that names every shape that
+        // came back non-zero is worth far more than one that stops at the first.
+        if hits.total.value != 0 {
+            lexical_leaks.push(format!("{q} → {} hits", hits.total.value));
+        }
+    }
+    assert!(
+        lexical_leaks.is_empty(),
+        "a lexical query on a dense_vector (or its `_chunks` companion) must \
+         match nothing; {} of the shapes above did not:\n  {}",
+        lexical_leaks.len(),
+        lexical_leaks.join("\n  ")
+    );
+
+    // (d2) a MIXED field list keeps its lexical members. Only the vector entry
+    // is dropped, so this is `{"multi_match":{"query":"liquidity","fields":
+    // ["body"]}}` in effect — the whole corpus, not nothing. The empty-list
+    // lowering must not swallow a list that still has a real field in it.
+    let mixed = idx
+        .search(&make_search(
+            json!({"multi_match": {"query": "liquidity", "fields": ["emb", "body"]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed.total.value, DOCS as u64,
+        "dropping the vector entry must leave the rest of a `fields` list intact"
+    );
+
+    // (d2b) COMPOSITES. Lowering a leaf to `match_none` is only half a rewrite:
+    // the enclosing `bool` then has to fold it the way the EVALUATOR reads it,
+    // and `doc_matches_query`'s Bool arm makes `should` required whenever `must`
+    // and `filter` are empty — `must_not` does NOT relax it. The first cut of
+    // this fix skipped the "every optional clause is dead" fold whenever a
+    // `must_not` was present and then dropped the dead clause anyway, which
+    // turned the first row below from 0 hits into 150.
+    //
+    // Every expected value here is `main`'s answer for the same request: a
+    // lexical clause on `emb` matched nothing before the postings went away and
+    // must match nothing after.
+    for (q, want) in [
+        // The regression. `should` is required, its only clause is dead.
+        (
+            json!({"bool": {
+                "should": [{"term": {"emb": probe}}],
+                "must_not": [{"term": {"cat": "odd"}}]
+            }}),
+            0u64,
+        ),
+        // Should-only, no `must_not` — the shape a `simple_query_string` lowers
+        // to.
+        (json!({"bool": {"should": [{"term": {"emb": probe}}]}}), 0),
+        // A live `should` beside the dead one still matches on its own.
+        (
+            json!({"bool": {"should": [
+                {"term": {"emb": probe}},
+                {"term": {"cat": "even"}}
+            ]}}),
+            (DOCS / 2) as u64,
+        ),
+        // `must` / `filter`: an unsatisfiable REQUIRED clause sinks the bool.
+        (
+            json!({"bool": {
+                "must": [{"term": {"emb": probe}}, {"match": {"body": "liquidity"}}]
+            }}),
+            0,
+        ),
+        (json!({"bool": {"filter": [{"term": {"emb": probe}}]}}), 0),
+        // `must_not`: a clause that matches nothing EXCLUDES nothing. Same
+        // answer as `main`; what changes is the route — a `match_none` left
+        // sitting in `must_not` un-projects the whole bool in
+        // `query_node_to_fts_with_keyword_fields` and sends a query that used
+        // to run on the inverted index to the stored-doc scan.
+        (
+            json!({"bool": {"must_not": [{"term": {"emb": probe}}]}}),
+            DOCS as u64,
+        ),
+        (
+            json!({"bool": {
+                "must": [{"match": {"body": "liquidity"}}],
+                "must_not": [{"term": {"emb": probe}}]
+            }}),
+            DOCS as u64,
+        ),
+        // `constant_score` is the only wrapper with an arm in the FTS
+        // projection, so it is the only one where failing to bubble up the
+        // `match_none` costs an inverted-index lookup.
+        (
+            json!({"constant_score": {"filter": {"term": {"emb": probe}}}}),
+            0,
+        ),
+    ] {
+        let hits = idx.search(&make_search(q.clone())).await.unwrap();
+        assert_eq!(
+            hits.total.value, want,
+            "composite over a dense_vector clause: expected {want}, got {} for {q}",
+            hits.total.value
+        );
+    }
+
+    // (d2c) …and the composites that keep their HIT COUNT still change their
+    // `_score`, which is wire-visible and therefore has to be pinned here
+    // rather than discovered by a user.
+    //
+    // Cause: `lower_lexically_typeless_clauses` drops the dead clause out of
+    // `should`, which makes the surviving bool PROJECTABLE through
+    // `query_node_to_fts_with_keyword_fields`. On `main` the same bool contains
+    // a clause that cannot be projected, so the whole query runs on the
+    // stored-doc scan and is scored by `score_query_against_doc` instead of
+    // BM25. Isolated to the fold: with the write-side exclusion alone and the
+    // lowering disabled, both scores below are byte-identical to `main`.
+    //
+    // Measured on this fixture, `origin/main` → this branch:
+    //
+    //   bool{should:[term emb, term cat:even]}
+    //       hits    150 → 150          (unchanged)
+    //       _score  0.008402659 → 0.6931471
+    //       max_score 1.6931472 → 0.6931471
+    //   bool{must:[match body], must_not:[term emb]}
+    //       hits    300 → 300          (unchanged)
+    //       _score  0.008402659 → 0.008402659   (unchanged)
+    //       max_score 1.6931472 → 0.008402659
+    //
+    // The assertions are properties rather than golden floats, so they survive
+    // a BM25 tuning change but still fail on `main`:
+    //
+    //  1. `max_score` equals the top hit's `_score`. On `main` it does NOT for
+    //     either shape — the scan path reports a `max_score` of 1.6931472 that
+    //     no returned hit carries. That inconsistency is what goes away.
+    //  2. a bool whose only surviving `should` is `{"term":{"cat":"even"}}`
+    //     scores exactly like that term query on its own. On `main` it scores
+    //     0.008402659 against the term query's 0.6931471.
+    let cat_alone = idx
+        .search(&make_search(json!({"term": {"cat": "even"}})))
+        .await
+        .unwrap();
+    let should_mixed = idx
+        .search(&make_search(json!({"bool": {"should": [
+            {"term": {"emb": probe}},
+            {"term": {"cat": "even"}}
+        ]}})))
+        .await
+        .unwrap();
+    let mustnot_bool = idx
+        .search(&make_search(json!({"bool": {
+            "must": [{"match": {"body": "liquidity"}}],
+            "must_not": [{"term": {"emb": probe}}]
+        }})))
+        .await
+        .unwrap();
+    // Hit counts first, so a regression that empties one of these reports
+    // "expected 150 hits" rather than panicking on `hits[0]` below.
+    for (label, res, want) in [
+        ("term {cat:even}", &cat_alone, (DOCS / 2) as u64),
+        (
+            "bool{should:[dead, term cat]}",
+            &should_mixed,
+            (DOCS / 2) as u64,
+        ),
+        (
+            "bool{must:[match], must_not:[dead]}",
+            &mustnot_bool,
+            DOCS as u64,
+        ),
+    ] {
+        assert_eq!(
+            res.total.value, want,
+            "{label}: the score probes must keep `main`'s hit count"
+        );
+        assert!(!res.hits.is_empty(), "{label}: expected a scored top hit");
+    }
+    eprintln!(
+        "#328 scores: term{{cat}}={:?}/{:?} should-mixed={:?}/{:?} must-not={:?}/{:?} \
+         (top/max)",
+        cat_alone.hits[0].score,
+        cat_alone.max_score,
+        should_mixed.hits[0].score,
+        should_mixed.max_score,
+        mustnot_bool.hits[0].score,
+        mustnot_bool.max_score,
+    );
+    for (label, res) in [
+        ("bool{should:[dead, term cat]}", &should_mixed),
+        ("bool{must:[match], must_not:[dead]}", &mustnot_bool),
+    ] {
+        assert_eq!(
+            res.max_score,
+            Some(res.hits[0].score),
+            "{label}: max_score must be the top hit's _score, got max={:?} top={:?}",
+            res.max_score,
+            res.hits[0].score
+        );
+    }
+    assert_eq!(
+        should_mixed.hits[0].score, cat_alone.hits[0].score,
+        "a bool whose only live `should` is `term cat:even` must score exactly \
+         like that term query alone; got {:?} against {:?}",
+        should_mixed.hits[0].score, cat_alone.hits[0].score
+    );
+
+    // (d3) the mapping still describes the field — the exclusion is about
+    // lexical BYTES, not about the field's existence. This is the leaf of the
+    // `_field_caps` guarantee reachable from the engine crate: `_field_caps`
+    // is served by the API layer from exactly this schema and never opens a
+    // term dictionary, so a field that reports `dense_vector` here reports
+    // `dense_vector` there.
+    let mapped = idx.schema().await;
+    let emb_field = mapped
+        .fields
+        .iter()
+        .find(|f| f.name == "emb")
+        .expect("`emb` must still be a mapped field");
+    assert!(matches!(emb_field.field_type, FieldType::Vector));
+    assert_eq!(emb_field.options.dimensions, Some(DIMS));
+
+    // (d4) highlighting a vector field yields no fragments and no panic, while
+    // a real text field in the same request still highlights. Highlighting
+    // resolves against the stored document and never opens the field's FST,
+    // so removing the FST cannot change it.
+    let hl = idx
+        .search(
+            &parse_request(&json!({
+                "query": {"match": {"body": "liquidity"}},
+                "size": 1,
+                "highlight": {"fields": {"body": {}, "emb": {}}}
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let frags = hl.hits[0]
+        .highlight
+        .as_ref()
+        .expect("highlight must be present");
+    assert!(
+        frags.get("body").is_some_and(|f| !f.is_empty()),
+        "a text field must still highlight"
+    );
+    assert!(
+        frags.get("emb").is_none_or(|f| f.is_empty()),
+        "a dense_vector must produce no highlight fragments, got {:?}",
+        frags.get("emb")
+    );
+
+    // (e) the index reopens and searches after a restart. The exclusion is a
+    // WRITE-side rule and no reader requires the field's sidecar to exist, so
+    // a segment written without one loads exactly like one written with it.
+    // (This does not, and cannot from inside one test binary, exercise a
+    // segment produced by the previous release: those keep their `.emb.*`
+    // files until a merge rewrites them, and the per-segment `fts_has_field`
+    // gate reads whichever shape it finds.)
+    drop(idx);
+    drop(engine); // release the data dir's `node.lock` before reopening it
+    let reopened = make_engine(&dir);
+    let idx = reopened.get_index("duprobe").unwrap();
+    let after = idx
+        .search(&make_search(json!({"match": {"body": "liquidity"}})))
+        .await
+        .unwrap();
+    assert_eq!(after.total.value, DOCS as u64);
+}
+
+/// #328, nested half — a `dense_vector` under an OBJECT mapping.
+///
+/// Excluding the leaf path alone moves no bytes here, and that is the trap the
+/// first cut of this fix fell into: the segment builder never writes a
+/// `passages.vec` field at all. It flattens the whole `passages` object into
+/// ONE text field, so the vector's 64 decimal components land in
+/// `<seg>.passages.fst` under the parent's name. The size of that file is
+/// reported below rather than asserted to a golden number, and the ceiling is
+/// deliberately generous: the point is that the fixture's 19,200 vector
+/// components are gone, and they cannot fit in 4 KiB.
+///
+/// Both mapping shapes that reach `FieldType::Vector` are pinned, because they
+/// take different routes into the schema and only one of them was covered by
+/// the walk: a dotted top-level name (`"passages.vec"`, what `put_mapping`
+/// produces) and a `vec` sub-mapping under a `passages` object (what
+/// `es_properties_to_fields` produces from nested `properties`).
+#[tokio::test]
+async fn nested_dense_vector_is_excluded_from_its_parent_objects_term_dictionary() {
+    const DIMS: usize = 64;
+    const DOCS: usize = 300;
+
+    let component = |doc: usize, dim: usize| -> f64 {
+        let h = (doc as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add((dim as u64).wrapping_mul(1_442_695_040_888_963_407));
+        ((h >> 11) as f64 / (1u64 << 53) as f64 * 2.0) - 1.0
+    };
+
+    for shape in ["dotted-name", "sub-mapping"] {
+        let dir = TempDir::new().unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("body", FieldType::Text));
+        let mut vec_field = FieldConfig::new(
+            if shape == "dotted-name" {
+                "passages.vec"
+            } else {
+                "vec"
+            },
+            FieldType::Vector,
+        );
+        vec_field.options.dimensions = Some(DIMS);
+        vec_field.options.similarity = Some("cosine".to_string());
+        if shape == "dotted-name" {
+            schema.fields.push(vec_field);
+        } else {
+            let mut parent = FieldConfig::new("passages", FieldType::Object);
+            parent.fields.push(vec_field);
+            schema.fields.push(parent);
+        }
+
+        let engine = make_engine(&dir);
+        engine.create_index("nested-vec", schema).unwrap();
+        let idx = engine.get_index("nested-vec").unwrap();
+
+        let mut first_vector = Vec::new();
+        for d in 0..DOCS {
+            let v: Vec<f64> = (0..DIMS).map(|dim| component(d, dim)).collect();
+            if d == 0 {
+                first_vector = v.clone();
+            }
+            idx.index_document(
+                Some(format!("d{d}")),
+                json!({
+                    "body": format!("quarterly liquidity evidence {d}"),
+                    "passages": {"vec": v},
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        idx.refresh().await.unwrap();
+        idx.force_merge(1).await.unwrap();
+
+        let mut files: Vec<(String, u64)> = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), out);
+                } else {
+                    out.push((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.metadata().unwrap().len(),
+                    ));
+                }
+            }
+        }
+        walk(dir.path(), &mut files);
+
+        let parent_fst: u64 = files
+            .iter()
+            .filter(|(name, _)| name.ends_with(".passages.fst"))
+            .map(|(_, len)| *len)
+            .sum();
+        // Reported so the saving is a measured number in the log, not a claim.
+        // `passages.fst` is the load-bearing figure and it is exact — 398,558 B
+        // on `origin/main`, 45 B here, for both mapping shapes. `durable-index`
+        // is diagnostic only and `whole-dir` is not reproducible at all: it
+        // carries the write-ahead log, whose tail is reclaimed asynchronously.
+        // Nothing quotes either of them; see the sibling test for the numbers
+        // the CHANGELOG does quote.
+        let whole_dir: u64 = files.iter().map(|(_, len)| *len).sum();
+        let durable: u64 = files
+            .iter()
+            .filter(|(name, _)| !name.ends_with(".wal"))
+            .map(|(_, len)| *len)
+            .sum();
+        eprintln!(
+            "#328 nested [{shape}]: passages.fst={parent_fst} \
+             durable-index={durable} whole-dir={whole_dir}"
+        );
+        // A generous ceiling, not a golden number: the point is that the
+        // 19,200 vector components are gone, and they cannot fit in 4 KiB.
+        assert!(
+            parent_fst < 4096,
+            "[{shape}] the parent object's term dictionary must not carry the \
+             nested vector's components; `.passages.fst` = {parent_fst} B"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|(name, _)| name.ends_with(".passages.vec.fst")),
+            "[{shape}] the nested vector leaf must have no term dictionary either"
+        );
+
+        // The parent is still a real field, just without the vector in it.
+        let lexical = idx
+            .search(&make_search(json!({"match": {"body": "liquidity"}})))
+            .await
+            .unwrap();
+        assert_eq!(lexical.total.value, DOCS as u64, "[{shape}]");
+
+        // A component of the vector must not be findable through the parent.
+        let probe = format!(
+            "{}",
+            first_vector
+                .iter()
+                .copied()
+                .find(|v| *v > 0.0)
+                .expect("fixture vector has a positive component")
+        );
+        for q in [
+            json!({"match": {"passages": probe}}),
+            json!({"term": {"passages": probe}}),
+        ] {
+            let hits = idx.search(&make_search(q.clone())).await.unwrap();
+            assert_eq!(
+                hits.total.value, 0,
+                "[{shape}] a vector component must not be lexically findable \
+                 through its parent object, got {} for {q}",
+                hits.total.value
+            );
+        }
+
+        // kNN on the nested field still answers from the HNSW graph.
+        let knn = idx
+            .search(
+                &parse_request(&json!({
+                    "query": {"knn": {
+                        "field": "passages.vec", "query_vector": first_vector, "k": 3
+                    }},
+                    "size": 10
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(knn.hits.len(), 3, "[{shape}] kNN must still retrieve");
+        assert_eq!(
+            knn.hits[0].id, "d0",
+            "[{shape}] nearest must be the probe doc"
+        );
+    }
+}
+
 #[tokio::test]
 async fn semantic_passage_provenance_survives_update_merge_restart_and_source_filter() {
     let dir = TempDir::new().unwrap();

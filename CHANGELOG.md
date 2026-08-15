@@ -153,6 +153,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     from the moment it is allowlisted. Seed the target with snapshot/restore
     first if it needs the existing documents.
 
+### Performance
+
+- **A field mapped `dense_vector` no longer gets a full-text term dictionary**
+  ([#328](https://github.com/xerj-org/xerj/issues/328)). The field was fed
+  through the lexical indexing path and given an FST + postings that no query
+  path can read: kNN is served by `hnsw/graph.bin`, `exists` from
+  `_source`/doc values, and `_field_caps` and highlighting never open the
+  field's term dictionary. `extract_field_text`'s array arm joined the
+  components with spaces, so a 128-dim vector became one enormous
+  decimal-string term per document.
+
+  Measured on a 5,000-doc × 128-dim corpus (text + keyword + long +
+  `dense_vector` + its `_chunks` companion), after `force_merge(1)`, summing
+  every file in the data directory except the write-ahead log:
+  **54,068,549 B → 14,251,975 B (−73.6%, 3.79×)**. Per file, `<seg>.emb.fst`
+  13,256,659 B → 0, `<seg>.emb.post` 10,834 B → 0, `<seg>.emb.norms` 48 B → 0,
+  `<seg>.emb_chunks.fst` 26,518,005 B → 0, `<seg>.emb_chunks.post` 10,834 B → 0,
+  while the three lexical `.fst` files (`body` 278 B, `cat` 53 B, `n` 209 B) are
+  byte-identical on both sides.
+
+  `.wal` is excluded from that total because its tail is reclaimed
+  asynchronously and it is not reproducible: on the 300-doc fixture the
+  committed regression test uses, eight runs put the *whole directory* anywhere
+  between 858,147 B and 1,105,001 B while the durable bytes moved by 230 B. The
+  test prints both and asserts on the durable one. It reports
+  **3,249,323 B → 857,843–858,071 B** for that fixture (`main` side measured by
+  reverting `index.rs` and `memtable.rs` to `main` on the same fixture), which
+  is the same −73.6% at 1/17th the corpus.
+
+  A `dense_vector` nested under an object mapping is covered too — its
+  components were landing in the *parent's* term dictionary, because the segment
+  builder flattens the whole object into one text field. On the nested fixture
+  `<seg>.passages.fst` goes 398,558 B → 45 B, for both mapping shapes that reach
+  `FieldType::Vector` (a dotted top-level `passages.vec`, and a `vec`
+  sub-mapping under a `passages` object).
+
+  The exclusion covers the whole family a vector field generates, not just the
+  base name: `<field>_chunks` (the per-document multi-vector) and
+  `__xerj_passage_meta__<field>` are excluded on the same walk that decides
+  which fields get an HNSW graph. The companion is the bigger half —
+  26,518,005 B against `emb.fst`'s 13,256,659 B, 49% of the whole pre-change
+  index — so a base-name-only exclusion would leave more behind than it removes.
+
+  A lexical clause that NAMES a `dense_vector` (or one of its companions) is now
+  lowered to `match_none` at plan time rather than falling through to the
+  stored-doc scan. That is the correctness half of the change, not only the
+  speed half: with the postings removed and no lowering,
+  `{"multi_match":{"fields":["emb"],"query":"0"}}` returns **every document**
+  instead of none, because the scan renders the float array to text and every
+  component contains a `0`. Measured on the corpus above, first call for each
+  shape (`main` → postings-gone-without-lowering → this release):
+
+  | query | `main` | no lowering | this release |
+  |---|---|---|---|
+  | `multi_match {fields:["emb"], query:"0"}` | 0 hits, 0.409 ms | **5,000 hits**, 123.5 ms | 0 hits, 0.012 ms |
+  | `multi_match {fields:["emb_chunks"], query:"0"}` | 0 hits, 2.24 ms | **5,000 hits**, 138.5 ms | 0 hits, 0.014 ms |
+  | `term {emb: "<component>"}` | 0 hits, 89.2 ms | 0 hits, 186.8 ms | 0 hits, 0.061 ms |
+  | `range {emb: {gte:-2, lte:2}}` | 0 hits, 119.8 ms | 0 hits, 134.5 ms | 0 hits, 0.009 ms |
+  | `simple_query_string {fields:["emb"]}` | 0 hits, 0.033 ms | 0 hits, 114.5 ms | 0 hits, 0.015 ms |
+  | `constant_score {filter: term emb}` | 0 hits, 83.0 ms | 0 hits, 110.3 ms | 0 hits, 0.012 ms |
+  | `exists {field: "emb"}` | 5,000 hits, 83.0 ms | 5,000 hits, 108.0 ms | 5,000 hits, 88.5 ms |
+  | `match {body: "liquidity"}` | 5,000 hits, 5.18 ms | 5,000 hits, 5.96 ms | 5,000 hits, 4.95 ms |
+  | `term {cat: "even"}` | 2,500 hits, 2.32 ms | 2,500 hits, 2.87 ms | 2,500 hits, 2.27 ms |
+
+  `exists`, `knn` and `semantic` on the field are untouched, a mixed `fields`
+  list keeps its lexical members, and a `nested` query is deliberately not
+  rewritten (its field names resolve against the element, not the root).
+
+  **Three behaviour changes to know about:**
+
+  - **A `dense_vector` (and its `_chunks` companion) now has no lexical surface
+    at all: every lexical leaf naming one answers 0 hits.** Before this release
+    such a clause fell through to the stored-doc scan, which renders the float
+    array back to decimal text and matches against *that*, so whether a shape
+    answered 0 or answered most of the corpus depended entirely on whether the
+    rendered decimals happened to contain the probe. This is a CLASS of changed
+    answers, not one row. Measured on the 300-doc × 128-dim regression fixture,
+    `main` → this release:
+
+    | query | before | after |
+    |---|---:|---:|
+    | `wildcard {emb: "0*"}` | **300** (every document) | 0 |
+    | `fuzzy {emb: {value:"0", fuzziness:2}}` | **300** (every document) | 0 |
+    | `wildcard {emb_chunks: "0*"}` | **300** (every document) | 0 |
+    | `fuzzy {emb_chunks: {value:"0", fuzziness:2}}` | **300** | 0 |
+    | `prefix {emb: "0"}` | 146 | 0 |
+    | `prefix {emb_chunks: "0"}` | 146 | 0 |
+    | `match_phrase_prefix {emb: "0"}` | 50 | 0 |
+    | `term {emb: <exact component>}` numeric | 1 | 0 |
+    | `terms {emb: [<exact component>]}` numeric | 1 | 0 |
+
+    Shapes whose probe text never appeared in a rendered float (`term` with a
+    string, `match`, `match_phrase`, `regexp`, `range`, `simple_query_string`,
+    `query_string`) answered 0 on both sides. ES rejects these queries on a
+    `dense_vector` outright and Lucene gives a field with no terms an empty
+    scorer, so 0 is the answer this release adopts for all of them. The
+    regression test pins the whole class rather than sampling it.
+  - **A `bool` that mentions a `dense_vector` can change `_score` and
+    `max_score` without changing its hit count.** Dropping the dead clause makes
+    the surviving bool projectable onto the inverted index, so BM25 scores it
+    where the stored-doc scan used to. Measured on the same fixture:
+
+    | query | hits | `_score` | `max_score` |
+    |---|---|---|---|
+    | `bool{should:[term emb, term cat:"even"]}` | 150 → 150 | 0.008402659 → 0.6931471 | 1.6931472 → 0.6931471 |
+    | `bool{must:[match body], must_not:[term emb]}` | 300 → 300 | 0.008402659 (unchanged) | 1.6931472 → 0.008402659 |
+
+    Both moves are toward consistency — on `main` these queries reported a
+    `max_score` that **no returned hit carried**, and the first now scores
+    exactly like `{"term":{"cat":"even"}}` on its own, which is what it reduces
+    to. Absolute scores are not part of XERJ's compatibility surface, but
+    anything comparing scores across a version boundary or asserting on
+    `max_score` for a bool that touches a vector field will see this. Plain
+    lexical queries are unaffected; the blast radius is bools with a
+    `dense_vector` clause in them.
+  - **Existing indices keep their bloat until a merge rewrites them.** This is a
+    write-side rule. Segments written by an earlier release keep their `.emb.*`
+    / `.emb_chunks.*` files, and the per-segment `fts_has_field` gate reads
+    whichever shape it finds. Run an explicit
+    `POST /<index>/_forcemerge?max_num_segments=1` to reclaim the bytes on an
+    index that already exists.
+
+  *Not changed:* ES rejects `term`/`match`/`range` on a `dense_vector` outright,
+  where XERJ answers `200`. This release removes bytes and adopts Lucene's
+  zero-hit answer; it does not add the rejection.
+
 ## [1.0.0-rc.16] - 2026-08-13
 
 Both rc.15 known issues (the progress-stream forgery and the outer-`.gitignore`
