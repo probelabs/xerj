@@ -1395,11 +1395,38 @@ impl AnalyzerRegistry {
     /// `build_registry_from_settings` accepts.
     pub fn unsupported_analysis(settings: &serde_json::Value) -> Vec<String> {
         let root = settings.pointer("/settings").unwrap_or(settings);
+        let mut problems = Vec::new();
+
+        // The DOTTED spelling first, because it is not a variant of the block
+        // below — it is a block this build never reads at all.
+        // `analysis_block` resolves two JSON pointers, so
+        // `{"index.analysis.filter.my_lower.type": "lowercase"}` finds nothing:
+        // the gate passes it, `apply_settings` builds no filter from it, and
+        // `GET /{index}/_settings` echoes back an analyzer that analyses
+        // nothing. Byte-for-byte the same request as the nested form this gate
+        // 400s, one spelling apart — and `PUT /{index}/_settings` already
+        // refuses all four spellings, so accepting it here made the two gates
+        // disagree about the same string (issue #204).
+        //
+        // Reported rather than honoured: teaching the registry to expand
+        // dotted keys would change what an EXISTING index analyses the moment
+        // it reopens, which is the upgrade break `analysis-binding.json`
+        // exists to prevent. Refusing at create time changes nothing already
+        // on disk.
+        for key in Self::dotted_analysis_keys(root) {
+            problems.push(format!(
+                "setting [{key}]: the flat dotted spelling of an `analysis` declaration is \
+                 not read by this build — the analyzer registry resolves `analysis.*` and \
+                 `index.analysis.*` as nested objects only, so this declaration would be \
+                 stored, echoed back by `GET /_settings`, and applied to nothing. Write it \
+                 as a nested object instead"
+            ));
+        }
+
         let Some(analysis) = Self::analysis_block(root) else {
-            return Vec::new();
+            return problems;
         };
         let probe = Self::with_defaults();
-        let mut problems = Vec::new();
 
         // Declared names are collected even when their `type` is unsupported,
         // so a bad type is reported once (as a type problem) rather than twice
@@ -1718,6 +1745,69 @@ impl AnalyzerRegistry {
             AnalysisBinding::Canonical => shorthand.or_else(|| settings.pointer("/index/analysis")),
             AnalysisBinding::LegacyShorthandOnly => shorthand,
         }
+    }
+
+    /// Every key in `settings` that declares something under `analysis` using
+    /// a DOTTED path rather than a nested object, in the order they appear.
+    ///
+    /// The three spellings below are one request as far as an Elasticsearch
+    /// client is concerned, and xerj's settings handlers accept all of them for
+    /// other namespaces (`index.sort.field` is parsed dotted today):
+    ///
+    /// ```json
+    /// {"index.analysis.analyzer.x.type": "custom"}   // fully dotted
+    /// {"analysis.analyzer.x.type": "custom"}         // dotted, unnamespaced
+    /// {"index": {"analysis.analyzer.x.type": "custom"}}  // half-dotted
+    /// ```
+    ///
+    /// [`Self::analysis_block`] resolves none of them, so on their own they are
+    /// accepted-and-ignored. Callers that gate on
+    /// [`Self::unsupported_analysis`] get them reported; the registry builder
+    /// deliberately still ignores them, so nothing already on disk changes
+    /// meaning (issue #204).
+    ///
+    /// `settings` may be the full envelope or the inner settings object, the
+    /// same two shapes [`Self::unsupported_analysis`] accepts.
+    pub fn dotted_analysis_keys(settings: &serde_json::Value) -> Vec<String> {
+        let root = settings.pointer("/settings").unwrap_or(settings);
+        let mut keys = Vec::new();
+        if let Some(obj) = root.as_object() {
+            for k in obj.keys() {
+                // A bare `analysis` key IS the nested form `analysis_block`
+                // reads; it is not a dotted spelling and is gated elsewhere.
+                // `index.analysis` is dotted even though its value is nested,
+                // because the pointer this build resolves is `/index/analysis`
+                // — an `index` OBJECT with an `analysis` member, which a key
+                // literally named `index.analysis` is not.
+                if k == "analysis" {
+                    continue;
+                }
+                let bare = k.strip_prefix("index.").unwrap_or(k);
+                if bare == "analysis" || bare.starts_with("analysis.") {
+                    keys.push(k.clone());
+                }
+            }
+        }
+        if let Some(ix) = root.get("index").and_then(serde_json::Value::as_object) {
+            keys.extend(
+                ix.keys()
+                    .filter(|k| k.starts_with("analysis."))
+                    .map(|k| format!("index.{k}")),
+            );
+        }
+        keys
+    }
+
+    /// True when `settings` reaches into the `analysis` namespace in ANY
+    /// spelling — nested, namespaced, dotted or half-dotted.
+    ///
+    /// One helper so a caller cannot gate on a subset of the spellings it
+    /// accepts. A gate that tests only the nested one is not a gate (#204).
+    pub fn declares_analysis(settings: &serde_json::Value) -> bool {
+        let root = settings.pointer("/settings").unwrap_or(settings);
+        root.pointer("/analysis").is_some()
+            || root.pointer("/index/analysis").is_some()
+            || !Self::dotted_analysis_keys(root).is_empty()
     }
 
     /// True when the only `analysis` block in `settings` is the canonical
@@ -2601,6 +2691,76 @@ mod unsupported_analysis_tests {
         assert!(!AnalyzerRegistry::declares_namespaced_analysis_only(
             &json!({ "index": { "number_of_replicas": 0 } })
         ));
+    }
+
+    /// The flat dotted spelling of an analysis declaration is one `apply_settings`
+    /// never reads, so accepting it is accepting a block that analyses nothing.
+    ///
+    /// `PUT /{index}/_settings` refused all four spellings while `PUT /{index}`
+    /// refused two: `unsupported_analysis` resolved the pointers `/analysis` and
+    /// `/index/analysis` and nothing else, so the byte-equivalent dotted request
+    /// got a `200` and `GET /_settings` echoed the analyzer straight back
+    /// (issue #204).
+    #[test]
+    fn the_dotted_spellings_of_an_analysis_declaration_are_reported() {
+        for dotted in [
+            json!({ "index.analysis.filter.my_lower.type": "lowercase" }),
+            json!({ "analysis.filter.my_lower.type": "lowercase" }),
+            json!({ "index": { "analysis.filter.my_lower.type": "lowercase" } }),
+            // Dotted namespace, nested value — `pointer("/index/analysis")`
+            // wants an `index` OBJECT, which this key is not.
+            json!({ "index.analysis": { "filter": { "my_lower": { "type": "lowercase" } } } }),
+            // …and through the outer `settings` envelope, the shape index
+            // creation actually hands over.
+            json!({ "settings": { "index.analysis.analyzer.a.type": "custom" } }),
+        ] {
+            assert!(
+                AnalyzerRegistry::declares_analysis(&dotted),
+                "must be recognised as an analysis declaration: {dotted}"
+            );
+            let problems = AnalyzerRegistry::unsupported_analysis(&dotted);
+            assert_eq!(
+                problems.len(),
+                1,
+                "exactly one problem, naming the offending key: {dotted} -> {problems:?}"
+            );
+            assert!(
+                problems[0].contains("dotted"),
+                "the message must say what is wrong with it: {problems:?}"
+            );
+        }
+    }
+
+    /// …and the check stays narrow: a nested block is judged on its merits, and
+    /// a dotted key outside the `analysis` namespace is not an analysis
+    /// declaration at all. `index.sort.field` is parsed dotted by the same
+    /// create handler, so a prefix-only test would have 400'd it.
+    #[test]
+    fn a_dotted_key_outside_the_analysis_namespace_is_not_a_declaration() {
+        for innocent in [
+            json!({ "index.number_of_shards": 1 }),
+            json!({ "index.sort.field": "ts", "index.sort.order": "desc" }),
+            json!({ "index": { "number_of_replicas": 0 } }),
+            json!({}),
+            // The nested spellings are NOT dotted — they are read, and judged
+            // by the checks below rather than reported here.
+            json!({ "analysis": { "filter": { "lowercase": { "type": "lowercase" } } } }),
+            json!({ "index": { "analysis": { "filter": {} } } }),
+        ] {
+            assert!(
+                AnalyzerRegistry::dotted_analysis_keys(&innocent).is_empty(),
+                "not a dotted analysis declaration: {innocent}"
+            );
+        }
+        // A nested, honourable block is still accepted — the dotted check must
+        // not have turned the gate into a blanket refusal.
+        assert!(
+            AnalyzerRegistry::unsupported_analysis(&json!({
+                "analysis": { "filter": { "lowercase": { "type": "lowercase" } } }
+            }))
+            .is_empty(),
+            "a declaration whose NAME resolves to a built-in is honoured"
+        );
     }
 
     #[test]

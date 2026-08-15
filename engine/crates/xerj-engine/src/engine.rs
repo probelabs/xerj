@@ -983,6 +983,14 @@ impl Engine {
             // the operator designed. Must run after the index scan above, so a
             // restored data stream can report which of its backing indices are
             // actually present, and before the server accepts requests.
+            // Issue #204: the refusal markers are read BEFORE the pipelines
+            // they classify, and unconditionally — not from inside
+            // `apply_cluster_state`, which returns early when there is no
+            // `cluster_state.json`. On that path an unreadable sidecar left
+            // `pipeline_refusals_unreadable` false, so the first refused `PUT`
+            // would have overwritten the file with a one-entry map and erased
+            // every marker still in it.
+            engine.load_persisted_pipeline_refusals();
             engine.apply_cluster_state(prepared_cluster_state);
 
             // Then say plainly which `.ds-*` indices no restored stream claims.
@@ -1753,7 +1761,50 @@ impl Engine {
     /// one an older, gate-less build wrote, and would soften the refusal back
     /// into a `201` (issue #204). Same rule `flush_cluster_state` already
     /// enforces for the definition itself (issue #203).
+    ///
+    /// # Why the snapshot is taken inside the lock
+    ///
+    /// This writes the WHOLE map, so two concurrent refused `PUT`s are a
+    /// lost-update race, not a merge: each inserts its own marker, each
+    /// snapshots, and the one that writes SECOND with the OLDER snapshot
+    /// erases the other's marker from disk — while both callers are told
+    /// `{"acknowledged": true}`, which is exactly the promise this function's
+    /// `Err` contract exists to keep. Measured on the unlocked version at a
+    /// live node: 40 concurrent refused `PUT`s, 40 acknowledged, 37 markers on
+    /// disk; after a plain restart the three lost ones replayed at
+    /// `ReplayPersisted`, answered `201`, and dropped a field from a document
+    /// their `if` guard excluded. Sequential tests never see it.
+    ///
+    /// `cluster_state_write` is the mutex, not a second one, because the two
+    /// files are written back to back by the same callers and one order for
+    /// both is easier to reason about than two. It is taken and released here,
+    /// never held across `flush_cluster_state` — `parking_lot::Mutex` is not
+    /// reentrant.
     fn flush_pipeline_refusals(&self) -> Result<()> {
+        // A boot that could not READ this file has an empty in-memory map, so
+        // writing it would erase every marker still on disk: the next boot
+        // would parse the truncated file cleanly, conclude those definitions
+        // have no provenance, and replay them at `ReplayPersisted` — the very
+        // hole the marker closes, reopened by the fail-closed path itself.
+        // Refuse instead, and name the file, so the operator's repair is to
+        // move it aside rather than to discover the loss at the next restart
+        // (issue #204).
+        if self
+            .pipeline_refusals_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                format!(
+                    "{} could not be read at boot, so its markers are not in memory and \
+                     rewriting it here would erase every refusal it still holds; every \
+                     persisted pipeline is being replayed at definition strictness until \
+                     the file is moved aside and this node restarted",
+                    self.pipeline_refusals_path().display()
+                ),
+            )));
+        }
+        // One writer at a time, snapshot included — see the doc comment.
+        let _writing = self.cluster_state_write.lock();
         let snapshot: std::collections::BTreeMap<String, String> = self
             .definition_time_refusals
             .iter()
@@ -2351,8 +2402,11 @@ impl Engine {
         // exactly as it did before the restart.
         //
         // Which strictness a definition is replayed at is decided by
-        // PROVENANCE, never by the calendar (issue #204). Load the markers
-        // first — see `definition_time_refusals`.
+        // PROVENANCE, never by the calendar (issue #204). The markers are
+        // already loaded — `Engine::new` does it before this runs, so the
+        // no-`cluster_state.json` path sees them too — and loading is
+        // idempotent, so this call keeps every other caller of
+        // `apply_cluster_state` correct on its own.
         self.load_persisted_pipeline_refusals();
         let provenance_unknown = self
             .pipeline_refusals_unreadable
@@ -2607,32 +2661,33 @@ impl Engine {
     /// gets stored (and handed back by `GET /_ingest/pipeline/{id}`) when it
     /// compiles — the shape this endpoint has always returned.
     ///
-    /// `keep_if_uncompilable` says what to do when it does *not* compile, and
-    /// differs by surface:
+    /// A definition that does not compile is NOT stored: `Ok(Some(err))` is
+    /// returned, nothing is flushed, and any pipeline already registered under
+    /// this id is left untouched. A caller that must keep an uncompilable
+    /// definition readable — the ES-compat surface does, because Elasticsearch
+    /// accepts processors this build does not implement — calls
+    /// [`Self::register_unrunnable_pipeline`] instead, which stores the
+    /// definition *and* the reason it cannot run, and persists the refusal
+    /// marker that makes that reason survive a restart.
     ///
-    /// * `Some(doc)` — the ES-compat surface. It has always answered
-    ///   `acknowledged` and left the definition readable, so `doc` (the
-    ///   ES-shaped body as received) is stored and the compile error is
-    ///   returned as `Ok(Some(err))` for the caller to log.
-    /// * `None` — the xerj-native surface, which rejects a definition it
-    ///   cannot compile. Nothing is stored, nothing is flushed, and any
-    ///   pipeline already registered under this id is left untouched.
+    /// (This used to take a third `keep_if_uncompilable: Option<Value>`
+    /// argument whose `Some` arm stored the definition here. Every caller in
+    /// the workspace passed `None` — the ES surface routes through
+    /// `register_unrunnable_pipeline` — so the arm was unreachable, untested,
+    /// and held its own copy of the refusal-marker bookkeeping that the live
+    /// path already does. Issue #204: a security-relevant branch with no
+    /// caller is a liability, not a spare part.)
     ///
-    /// Either way a compile failure drops the *executable* form under this
-    /// id. Leaving the old one behind would mean `?pipeline={id}` kept
-    /// running a definition `GET` no longer shows — and stopped running it at
-    /// the next restart. A definition must behave the same before and after a
-    /// reboot; that is the whole point of persisting it.
+    /// A compile failure drops the *executable* form under this id. Leaving
+    /// the old one behind would mean `?pipeline={id}` kept running a
+    /// definition `GET` no longer shows — and stopped running it at the next
+    /// restart. A definition must behave the same before and after a reboot;
+    /// that is the whole point of persisting it.
     ///
     /// `Err` means the definition did not reach disk. The in-memory change is
     /// rolled back first, so the caller can report the write as failed
     /// without leaving behind a pipeline only this process can see.
-    pub fn put_pipeline(
-        &self,
-        id: &str,
-        config: Value,
-        keep_if_uncompilable: Option<Value>,
-    ) -> Result<Option<xerj_wasm::WasmError>> {
+    pub fn put_pipeline(&self, id: &str, config: Value) -> Result<Option<xerj_wasm::WasmError>> {
         // Up front, so a refused write never disturbs the compiled form of a
         // pipeline that is still running.
         self.ensure_cluster_state_writable()?;
@@ -2658,38 +2713,12 @@ impl Engine {
 
         // `compile_pipeline` mutates nothing when it fails, so an abort only
         // has to undo the two lines above.
-        let compile_err = match self.compile_pipeline(id, config) {
-            Ok(()) => None,
-            Err(e) => match keep_if_uncompilable {
-                None => {
-                    if let Some(p) = previous_compiled {
-                        self.transform_pipelines.insert(id.to_string(), p);
-                    }
-                    return Ok(Some(e));
-                }
-                Some(doc) => {
-                    self.pipelines.insert(id.to_string(), doc);
-                    // A definition that does not compile has nothing running,
-                    // so it cannot be running *degraded* either.
-                    self.degraded_pipelines.remove(id);
-                    // Issue #204: the kept definition is visible to `GET`, so
-                    // ingest through it must refuse WITH the reason rather
-                    // than claim the pipeline is missing.
-                    let reason = format!(
-                        "the stored definition does not compile ({e}); no \
-                         document can be ingested through pipeline [{id}]"
-                    );
-                    self.unrunnable_pipelines
-                        .insert(id.to_string(), reason.clone());
-                    // …and the refusal must survive a restart, or the boot
-                    // replay softens it and the definition starts running
-                    // with the refused option ignored (issue #204). Flushed
-                    // below, after the definition itself reaches disk.
-                    self.definition_time_refusals.insert(id.to_string(), reason);
-                    Some(e)
-                }
-            },
-        };
+        if let Err(e) = self.compile_pipeline(id, config) {
+            if let Some(p) = previous_compiled {
+                self.transform_pipelines.insert(id.to_string(), p);
+            }
+            return Ok(Some(e));
+        }
 
         // Every abort path restores exactly the state this call found, so a
         // write that did not reach disk leaves nothing only this process can
@@ -2753,12 +2782,10 @@ impl Engine {
             return Err(e);
         }
 
-        if let Some(e) = &compile_err {
-            warn!(pipeline = id, error = %e, "pipeline stored but failed to compile");
-        } else {
-            info!(name = id, "transform pipeline created");
-        }
-        Ok(compile_err)
+        info!(name = id, "transform pipeline created");
+        // `Ok(None)` is now the only success: a definition that does not
+        // compile returned `Ok(Some(err))` above without storing anything.
+        Ok(None)
     }
 
     /// Delete an ingest pipeline — both the stored definition and the
@@ -3803,9 +3830,22 @@ impl Engine {
     /// Like [`Engine::put_pipeline`], the stored definition is flushed to
     /// `cluster_state.json` before the caller may acknowledge it (issue
     /// #203). `Err` means it did not reach disk; the in-memory change is
-    /// rolled back first. The *reason* itself is in-memory only: after a
-    /// restart the boot replay fails to recompile the stored definition and
-    /// re-records why, so the pipeline stays unrunnable — loudly — either way.
+    /// rolled back first.
+    ///
+    /// The *reason* is persisted too, in
+    /// `<data_dir>/ingest-pipeline-refusals.json`, and that is not
+    /// belt-and-braces. This docstring used to claim the reason could stay in
+    /// memory "because the boot replay fails to recompile the stored
+    /// definition and re-records why" — which is false for the shape that
+    /// matters. A `stages`-shaped definition (the one `GET` hands an operator
+    /// to edit and re-`PUT`) recompiles at boot in the compatibility mode that
+    /// exists for definitions written by a gate-less build, so the refusal was
+    /// SOFTENED by a restart: measured, a refused `{"remove": {"field":
+    /// "secret", "if": …}}` went from `400` to `201` across a plain restart,
+    /// with `secret` dropped from a document the guard excludes. The marker is
+    /// what tells the replay "this build already answered 400 for this exact
+    /// definition", so the flush below is on the acknowledge path exactly like
+    /// the definition's own.
     pub fn register_unrunnable_pipeline(
         &self,
         name: &str,

@@ -1424,3 +1424,318 @@ async fn get_states_the_override_the_stage_actually_applies() {
         "a re-PUT of GET's own output must not start overwriting: {doc}"
     );
 }
+
+// ── The create-time analysis gate must cover every spelling it accepts ───────
+
+/// `PUT /{index}/_settings` refuses an `analysis` declaration in all four
+/// spellings; index CREATION refused two of them and handed a `200` to the
+/// byte-equivalent dotted one.
+///
+/// The create gate resolves the JSON pointers `/analysis` and `/index/analysis`
+/// only, so `{"index.analysis.filter.my_lower.type": "lowercase"}` — a flat
+/// dotted key, which this same handler already parses for `index.sort.field` —
+/// found nothing to check, built no filter, and was echoed straight back by
+/// `GET /{index}/_settings`. By this release's own words that declaration
+/// "never lowercased anything": accepted and not honoured, which is the silent
+/// lie the nested spelling was closed against.
+#[tokio::test]
+async fn every_spelling_of_an_unhonourable_analysis_block_is_refused_at_create() {
+    let (app, _dir) = app();
+
+    // The same declaration, written four ways. `my_lower` is a custom NAME
+    // that resolves to no built-in, so none of them can be honoured.
+    let nested = json!({
+        "filter": { "my_lower": { "type": "lowercase" } },
+        "analyzer": { "a": { "type": "custom", "tokenizer": "standard", "filter": ["my_lower"] } }
+    });
+    let bodies = [
+        ("nested", json!({ "settings": { "analysis": nested } })),
+        (
+            "namespaced",
+            json!({ "settings": { "index": { "analysis": nested } } }),
+        ),
+        (
+            "dotted",
+            json!({ "settings": {
+                "index.analysis.filter.my_lower.type": "lowercase",
+                "index.analysis.analyzer.a.type": "custom",
+                "index.analysis.analyzer.a.tokenizer": "standard"
+            } }),
+        ),
+        (
+            "half-dotted",
+            json!({ "settings": { "index": {
+                "analysis.filter.my_lower.type": "lowercase",
+                "analysis.analyzer.a.type": "custom"
+            } } }),
+        ),
+    ];
+
+    for (i, (spelling, body)) in bodies.iter().enumerate() {
+        let (status, resp) = send(&app, put(&format!("/spelling_{i}"), body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the {spelling} spelling must be refused like the others: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["type"], "action_request_validation_exception",
+            "{spelling}: {resp}"
+        );
+        assert!(
+            resp["error"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("my_lower")),
+            "{spelling}: the refusal must name the construct it cannot honour: {resp}"
+        );
+    }
+
+    // And the gate stays narrow: a settings body that declares no analysis at
+    // all still creates, and an unrelated dotted key does not trip it.
+    let (status, resp) = send(
+        &app,
+        put(
+            "/plain_idx",
+            json!({ "settings": { "index.number_of_shards": 1, "index.sort.field": "ts" } }),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "an unrelated dotted setting is not an analysis declaration: {resp}"
+    );
+}
+
+// ── A native definition read back in ES vocabulary must round-trip ───────────
+
+/// `GET /_ingest/pipeline` is the only read endpoint for a pipeline created in
+/// xerj's own `stages` vocabulary — the native surface registers no GET — and
+/// this release taught it to answer in Elasticsearch's `processors` vocabulary.
+/// PUTting that output back then went through the ES translation, which built a
+/// fresh `{description, stages}` object and dropped everything else: a
+/// pipeline's `on_error: "pass"` (keep the document) silently reverted to the
+/// `Drop` default (discard it), and its `timeout_ms` vanished — under a
+/// `200 {"acknowledged": true}`.
+#[tokio::test]
+async fn a_pipelines_error_policy_survives_a_round_trip_through_the_es_endpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_in(dir.path());
+
+    // A `stages`-shaped body takes the handler's pass-through branch, which is
+    // exactly what `PUT /v1/pipelines/{name}` stores.
+    let native = json!({
+        "description": "n3",
+        "on_error": "pass",
+        "timeout_ms": 250,
+        "stages": [{ "type": "set", "config": { "field": "e", "value": "prod" } }]
+    });
+    let (status, body) = send(&app, put("/_ingest/pipeline/n3", native)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, stored) = send(&app, get("/_ingest/pipeline/n3")).await;
+    assert_eq!(stored["n3"]["on_error"], "pass", "{stored}");
+    assert_eq!(stored["n3"]["timeout_ms"], 250, "{stored}");
+
+    // The operator PUTs back what GET handed them, unedited.
+    let (status, body) = send(&app, put("/_ingest/pipeline/n3", stored["n3"].clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, after) = send(&app, get("/_ingest/pipeline/n3")).await;
+    assert_eq!(
+        after["n3"]["on_error"], "pass",
+        "measured before this fix: the key was gone and the policy reverted from `pass` \
+         (keep the document) to the `Drop` default (discard it): {after}"
+    );
+    assert_eq!(after["n3"]["timeout_ms"], 250, "{after}");
+
+    // The same must hold across a restart, since it is the stored definition
+    // that the boot recompiles.
+    drop(app);
+    let app = app_in(dir.path());
+    let (_, rebooted) = send(&app, get("/_ingest/pipeline/n3")).await;
+    assert_eq!(rebooted["n3"]["on_error"], "pass", "{rebooted}");
+    assert_eq!(rebooted["n3"]["timeout_ms"], 250, "{rebooted}");
+}
+
+/// Elasticsearch metadata on a pipeline that compiles is echoed back rather
+/// than dropped — the same edit-do-not-rebuild rule, one level up.
+#[tokio::test]
+async fn es_pipeline_metadata_is_not_dropped_by_the_translation() {
+    let (app, _dir) = app();
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/meta",
+            json!({
+                "description": "d",
+                "version": 3,
+                "_meta": { "owner": "platform" },
+                "processors": [{ "set": { "field": "e", "value": "prod" } }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got) = send(&app, get("/_ingest/pipeline/meta")).await;
+    assert_eq!(got["meta"]["version"], 3, "{got}");
+    assert_eq!(got["meta"]["_meta"]["owner"], "platform", "{got}");
+    assert_eq!(got["meta"]["description"], "d", "{got}");
+    assert!(got["meta"].get("stages").is_none(), "{got}");
+}
+
+// ── Concurrency: the refusal marker under parallel writes ───────────────────
+
+/// The HTTP statement of the engine-level race: refusals issued CONCURRENTLY
+/// must all survive a restart. Every other restart test on this endpoint is
+/// sequential, which is why a green suite sat on top of a mechanism that did
+/// not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrently_refused_pipelines_are_all_still_refused_after_a_restart() {
+    const N: usize = 24;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_in(dir.path());
+
+    let mut tasks = Vec::with_capacity(N);
+    for i in 0..N {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            let (status, body) = send(
+                &app,
+                put(
+                    &format!("/_ingest/pipeline/sc{i}"),
+                    json!({ "stages": [{
+                        "type": "drop_field",
+                        "config": { "fields": ["secret"], "if": "ctx.tenant == 'a'" }
+                    }] }),
+                ),
+            )
+            .await;
+            (i, status, body)
+        }));
+    }
+    for t in tasks {
+        let (i, status, body) = t.await.expect("no panic");
+        assert_eq!(status, StatusCode::OK, "sc{i}: {body}");
+        assert_eq!(body["acknowledged"], true, "sc{i}: {body}");
+    }
+
+    // Restart. Nothing else — no PUT, no operator action.
+    drop(app);
+    let app = app_in(dir.path());
+
+    for i in 0..N {
+        let (status, body) = send(
+            &app,
+            put(
+                &format!("/docs/_doc/{i}?pipeline=sc{i}"),
+                json!({ "tenant": "b", "secret": "ssn-111" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "sc{i} was refused before the restart and must still be refused after it — \
+             measured before the flush was serialised: 3 of 40 markers never reached \
+             disk, and the identical write answered 201 with `secret` dropped from a \
+             document the guard excludes: {body}"
+        );
+        let (status, doc) = send(&app, get(&format!("/docs/_doc/{i}"))).await;
+        assert_ne!(status, StatusCode::OK, "sc{i}: {doc}");
+    }
+}
+
+/// A corrupt sidecar must not be silently repaired into a smaller one. Seen
+/// from HTTP: the refusal that would have overwritten it is not acknowledged.
+#[tokio::test]
+async fn a_refused_put_is_not_acknowledged_while_the_sidecar_is_unreadable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ingest-pipeline-refusals.json");
+    let corrupt = b"{\"older_refusal\": \"processor-level [if] is not supported\", ";
+    std::fs::write(&path, corrupt).unwrap();
+
+    let app = app_in(dir.path());
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/newly_refused",
+            json!({ "processors": [
+                { "set": { "field": "e", "value": "prod", "ignore_failure": true } }
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a refusal that cannot be recorded must not be acknowledged: {body}"
+    );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("ingest-pipeline-refusals.json")),
+        "and it must name the file to move aside: {body}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        corrupt,
+        "the sidecar must be left exactly as found"
+    );
+}
+
+// ── The native pipeline endpoint and the ES body it now hands out ───────────
+
+fn native_app_in(data_dir: &std::path::Path) -> axum::Router {
+    let mut config = xerj_common::config::Config::default();
+    config.server.data_dir = data_dir.to_string_lossy().into_owned();
+    config.storage.wal_sync = xerj_common::config::WalSync::Async;
+    let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+    let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+    let state = xerj_api::state::AppState::new(config, engine, metrics);
+    xerj_api::router::build_native_router(state)
+}
+
+/// `GET /_ingest/pipeline/{name}` is the only way to read a pipeline created
+/// through `PUT /v1/pipelines/{name}`, and it now answers in Elasticsearch's
+/// vocabulary. PUTting that body back to the native endpoint hit serde's
+/// "missing field stages" and surfaced as a bare `500 internal error` — a
+/// client-shaped mistake reported as an engine fault, with no hint of where the
+/// body belongs.
+#[tokio::test]
+async fn the_native_endpoint_answers_400_and_names_the_endpoint_for_an_es_body() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = native_app_in(dir.path());
+
+    let (status, body) = send(
+        &app,
+        put(
+            "/v1/pipelines/n1",
+            json!({ "description": "n1",
+                    "processors": [{ "set": { "field": "e", "value": "prod" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "measured before this fix: 500 internal error, missing field `stages`: {body}"
+    );
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("/_ingest/pipeline/n1")),
+        "the error must name the endpoint that accepts the body: {body}"
+    );
+
+    // The native shape still works.
+    let (status, body) = send(
+        &app,
+        put(
+            "/v1/pipelines/n1",
+            json!({ "stages": [{ "type": "set", "config": { "field": "e", "value": "prod" } }] }),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+}

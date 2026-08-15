@@ -874,7 +874,6 @@ async fn test_es_bulk_per_item_pipeline() {
                     { "type": "set", "config": { "field": "ingested", "value": "yes", "override": true } }
                 ]
             }),
-            None,
         )
         .expect("put_pipeline");
     assert!(

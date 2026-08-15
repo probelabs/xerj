@@ -6815,7 +6815,6 @@ async fn a_persisted_pipeline_the_new_checks_refuse_still_runs_after_a_restart()
                 json!({ "stages": [
                     { "type": "grok", "config": { "field": "msg", "pattern": "GENERIC" } }
                 ] }),
-                None,
             )
             .expect("a clean definition stores");
     }
@@ -6854,7 +6853,6 @@ async fn a_persisted_pipeline_the_new_checks_refuse_still_runs_after_a_restart()
             json!({ "stages": [
                 { "type": "grok", "config": { "field": "msg", "pattern": "NGINX_COMBINE" } }
             ] }),
-            None,
         )
         .expect("put_pipeline returns the compile error, not an Err");
     assert!(
@@ -6932,7 +6930,6 @@ async fn a_definition_that_compiles_clears_its_refusal_marker() {
             .put_pipeline(
                 "p",
                 json!({ "stages": [{ "type": "set", "config": { "field": "a", "value": 1 } }] }),
-                None,
             )
             .expect("no IO failure")
             .is_none());
@@ -6972,7 +6969,6 @@ async fn a_refusal_marker_deleted_with_its_pipeline_cannot_haunt_the_next_defini
             .put_pipeline(
                 "p",
                 json!({ "stages": [{ "type": "set", "config": { "field": "a", "value": 1 } }] }),
-                None,
             )
             .expect("no IO failure")
             .is_none());
@@ -6998,7 +6994,6 @@ async fn an_unparseable_refusal_marker_makes_the_replay_strict() {
                 json!({ "stages": [
                     { "type": "grok", "config": { "field": "msg", "pattern": "GENERIC" } }
                 ] }),
-                None,
             )
             .expect("a clean definition stores");
     }
@@ -7031,5 +7026,148 @@ async fn an_unparseable_refusal_marker_makes_the_replay_strict() {
     assert!(
         reason.contains("ingest-pipeline-refusals.json"),
         "the reason must name the file to repair: {reason}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — a refusal marker must survive CONCURRENT definition-time
+// refusals, not just sequential ones.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `flush_pipeline_refusals` writes the WHOLE map, so two refusals racing is a
+/// lost update, not a merge: both callers are told the write succeeded, and the
+/// one that writes second with the older snapshot erases the other's marker.
+/// The next boot then finds no provenance for that definition, replays it in
+/// the compatibility mode meant for gate-less builds, and answers `201` to the
+/// write an operator was already told was a `400` — with the field dropped from
+/// a document the `if` guard excludes.
+///
+/// Fail-before, measured on this test with only the `cluster_state_write.lock()`
+/// line removed from `flush_pipeline_refusals` and nothing else: 6 runs, 5
+/// failed — 3, 2, 8, 5 and 1 marker(s) of 64 acknowledged and never written,
+/// one run clean. Three bursts per run is what makes the detector reliable
+/// rather than 5-in-6; a false pass needs all three to come out clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_definition_time_refusals_all_reach_disk() {
+    const THREADS: usize = 64;
+    const BURSTS: usize = 3;
+
+    let dir = TempDir::new().unwrap();
+    let engine = std::sync::Arc::new(make_engine(&dir));
+    let path = dir.path().join("ingest-pipeline-refusals.json");
+    let mut expected: Vec<String> = Vec::with_capacity(THREADS * BURSTS);
+
+    for burst in 0..BURSTS {
+        // Deliberately NOT barriered. A barrier makes every insert land before
+        // the first snapshot is taken, which closes the very window this is
+        // about; the losses come from threads that snapshot while others are
+        // still inserting. `spawn_blocking` rather than `std::thread` because
+        // the engine's writes are synchronous but its constructor wants a
+        // runtime handle in scope.
+        let mut handles = Vec::with_capacity(THREADS);
+        for i in 0..THREADS {
+            let engine = std::sync::Arc::clone(&engine);
+            let id = format!("refused_{burst}_{i}");
+            expected.push(id.clone());
+            handles.push(tokio::task::spawn_blocking(move || {
+                engine.register_unrunnable_pipeline(
+                    &id,
+                    json!({ "stages": [
+                        { "type": "drop_field",
+                          "config": { "fields": ["secret"], "if": "ctx.tenant == 'a'" } }
+                    ] }),
+                    format!("processor-level [if] is not supported ({id})"),
+                )
+            }));
+        }
+        for (i, h) in handles.into_iter().enumerate() {
+            h.await
+                .expect("no panic")
+                .unwrap_or_else(|e| panic!("refused_{burst}_{i} was not acknowledgeable: {e}"));
+        }
+
+        // Every call returned `Ok`, which is the promise that the marker
+        // reached disk. Read the file back and hold it to that — including
+        // every marker from an earlier burst, which a stale snapshot erases
+        // just as easily.
+        let on_disk: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&path).expect("the sidecar must exist"))
+                .expect("and it must parse");
+        let missing: Vec<&String> = expected
+            .iter()
+            .filter(|id| !on_disk.contains_key(*id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "burst {burst}: {} of {} markers were acknowledged and never reached disk: \
+             {missing:?}",
+            missing.len(),
+            expected.len()
+        );
+    }
+
+    // …and the point of the marker: every one of them is still refused after a
+    // restart, with no PUT and no operator action in between.
+    drop(engine);
+    let rebooted = make_engine(&dir);
+    for id in &expected {
+        assert!(
+            !rebooted.transform_pipelines.contains_key(id),
+            "{id} was refused at definition time; a restart must not start running it"
+        );
+        assert!(
+            rebooted.unrunnable_pipelines.contains_key(id),
+            "{id} must still say why it cannot run"
+        );
+    }
+}
+
+/// A sidecar this build could not READ must not be overwritten by the next
+/// refusal.
+///
+/// The file is written whole from the in-memory map, and a boot that could not
+/// parse it starts with that map EMPTY. Flushing it then leaves exactly one
+/// marker on disk and erases every other refusal the file still held — after
+/// which the file parses cleanly, so the next boot concludes those definitions
+/// have no provenance and replays them softly. The fail-closed behaviour would
+/// last exactly one process lifetime and then convert itself into the hole it
+/// exists to close, with no signal.
+#[tokio::test]
+async fn a_refusal_is_not_acknowledged_while_the_sidecar_is_unreadable() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ingest-pipeline-refusals.json");
+    let corrupt = b"{\"still_refused\": \"processor-level [if] is not supported\", ";
+    std::fs::write(&path, corrupt).unwrap();
+
+    let engine = make_engine(&dir);
+    assert!(
+        engine
+            .pipeline_refusals_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "boot must record that the markers could not be classified"
+    );
+
+    let err = engine
+        .register_unrunnable_pipeline(
+            "newly_refused",
+            json!({ "stages": [{ "type": "drop_field", "config": { "fields": ["s"] } }] }),
+            "processor-level [if] is not supported".to_string(),
+        )
+        .expect_err("this must NOT be acknowledgeable while the sidecar is unreadable");
+    let err = err.to_string();
+    assert!(
+        err.contains("ingest-pipeline-refusals.json"),
+        "the error must name the file the operator has to move aside: {err}"
+    );
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        corrupt,
+        "the unreadable sidecar must be left exactly as found — rewriting it from an \
+         empty in-memory map is what erases every refusal it still holds"
+    );
+    assert!(
+        !engine.pipelines.contains_key("newly_refused"),
+        "and nothing may be left behind that only this process can see"
     );
 }

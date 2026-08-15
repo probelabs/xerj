@@ -220,6 +220,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a `synonym` filter whose `synonyms` is a bare string rather than an array
     (it built a filter with zero rules).
 
+  **The gate covers every spelling, at create as well as at update.** An
+  `analysis` declaration written with flat dotted keys
+  (`{"index.analysis.filter.my_lower.type": "lowercase"}`) or half-dotted ones
+  (`{"index": {"analysis.analyzer.a.type": "custom"}}`) is the same request as
+  the nested form to an Elasticsearch client, and this handler already parses
+  dotted keys for other settings (`index.sort.field`). The analyzer registry
+  resolves the nested spellings only, so a dotted declaration was accepted,
+  echoed back by `GET /{index}/_settings`, and applied to nothing. It is now a
+  `400` naming the offending key, on both `PUT /{index}` and
+  `PUT /{index}/_settings`. Measured on this release, the same
+  `my_lower`/`lowercase` declaration in four spellings — nested, `index.`-
+  namespaced, fully dotted, half-dotted — answers `400`, `400`, `400`, `400`;
+  a settings body with no analysis in it (`index.number_of_shards`,
+  `index.sort.field`) still answers `200`. Nothing already on disk changes
+  meaning: the dotted form is refused, not newly honoured, so no existing
+  index's analysis is re-derived on reopen.
+
   **Upgrading:** there is no opt-out flag. Either remove the analysis block and
   name a built-in analyzer on the field (`"analyzer": "english"`), or keep only
   the constructs in the table. The `400` names every offending construct in one
@@ -275,10 +292,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be read or parsed, no pipeline's provenance is known, so **every**
   persisted pipeline is replayed at definition strictness and any that fails is
   recorded unrunnable with the file named in the reason — fail closed and
-  loudly, rather than silently reopening the hole. An older binary reading a
+  loudly, rather than silently reopening the hole. **In that state a refusal is
+  also not acknowledged:** the file is written whole from the in-memory map,
+  which a failed load leaves empty, so the next refused `PUT` would have
+  replaced it with a one-entry map and erased every refusal it still held —
+  after which it parses cleanly, every earlier refusal reads as "no provenance",
+  and the fail-closed behaviour converts itself into the hole it exists to
+  close after exactly one process lifetime. `PUT /_ingest/pipeline/{id}` now
+  answers `500` naming the file instead, and the file is left byte-for-byte as
+  found; move it aside and restart to clear the state. An older binary reading a
   data dir written by this one simply ignores the file; it is a sidecar
   precisely because `cluster_state.json`'s format-1 envelope is
   `deny_unknown_fields` and widening it would break downgrades.
+
+  **The marker survives concurrent refusals, not just sequential ones.** The
+  sidecar is rewritten whole, so two refused `PUT`s in flight at once were a
+  lost update rather than a merge: each snapshotted the map, and whichever
+  wrote second with the older snapshot erased the other's marker — while both
+  callers were told `{"acknowledged": true}`. Measured at a live node against
+  the first cut of this work: 40 concurrent refused `PUT`s, 40 acknowledged, 37
+  markers on disk, and after a plain restart the three that were lost answered
+  `201` and dropped `secret` from a document their `if` guard excludes. The
+  snapshot and the write now happen under the same `cluster_state_write` mutex
+  that `flush_cluster_state` has always taken. Measured on this release: 40
+  concurrent refused `PUT`s, 40 acknowledged, 40 markers on disk, plain restart,
+  40 of 40 still `400`.
 
   The same rule applies one level up. Teaching the analysis resolver the
   canonical `settings.index.analysis` nesting (see the analysis entry above) is
@@ -397,17 +435,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now applies Elasticsearch's rule (default `true`; `false` leaves an existing
   non-null value alone).
 
-- **Three wire-visible refusals that were fixed in this sweep but not written
-  down** ([#204](https://github.com/xerj-org/xerj/issues/204)). All three
+  **This is also the only read endpoint for a pipeline created through
+  `PUT /v1/pipelines/{name}`** — the native surface registers no `GET` — so the
+  round trip has to be lossless in xerj's own vocabulary too, and it was not.
+  `PUT /_ingest/pipeline/{id}` rebuilt the stored definition as
+  `{description, stages}` and dropped every other top-level key, so PUTting
+  `GET`'s own output back silently discarded a natively-defined pipeline's
+  `on_error` and `timeout_ms`: the error policy reverted from `pass` (keep the
+  document) to the `Drop` default (discard it) under a
+  `200 {"acknowledged": true}`. The translation now edits the body instead of
+  rebuilding it — the same rule already applied to `remove`/`rename` one level
+  down. Measured on this release, `{"description":"n3","on_error":"pass",
+  "timeout_ms":250,"stages":[…]}` reads back with both keys intact, and PUTting
+  that body back leaves them intact, before and after a restart. Elasticsearch's
+  own pipeline metadata (`version`, `_meta`, `deprecated`) rides along the same
+  way and is now echoed back rather than dropped. `PUT /v1/pipelines/{name}`
+  given that ES-shaped body used to answer `500` with `internal error: missing
+  field stages`; it now answers `400` naming `/_ingest/pipeline/{name}` as the
+  endpoint that accepts it.
+
+- **Four wire-visible refusals that were fixed in this sweep but not written
+  down** ([#204](https://github.com/xerj-org/xerj/issues/204)). All four
   replace a silent fallback with an error, which is the point of the issue, but
   each changes a status code:
   `POST /v1/admin/backup` answers `400` on a request body that is present but
   unparseable, where it previously ran a *default* backup under a success
   response; `GET /{index}/_stats` and `GET /_all/_stats` carry an added
   non-Elasticsearch key `primaries.mappings.schema_persist_failures` inside an
-  otherwise ES-shaped response; and the authorization layer's response pruning
+  otherwise ES-shaped response; the authorization layer's response pruning
   answers `500` when it cannot parse the body it was asked to filter, instead
-  of falling back to the unfiltered bytes.
+  of falling back to the unfiltered bytes; and the bundled console's
+  `DELETE /_xerj-console/api/v1/auth/passkeys/{id}` propagates a failed delete
+  instead of discarding it — it answered `204 No Content` unconditionally, so a
+  revoke refused by the engine (index write block, disk flood stage, storage
+  error) reported success while the passkey stayed on disk and kept
+  authenticating. An already-absent credential is still a `204`; only a genuine
+  failure now surfaces.
 
   **The refusal now covers every ingest path, not only `PUT /{index}/_doc`.**
   `POST /_bulk?pipeline=`, `index.default_pipeline` under `_bulk`,
@@ -453,10 +516,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at write time; a write addressed to an **alias** does not pick up the
   backing index's `default_pipeline`; `_update_by_query` reports a `drop`
   processor as a per-document failure, because it updates in place and has no
-  delete path; and `Engine::degraded_pipelines` is in-memory only and has no
+  delete path; `Engine::degraded_pipelines` is in-memory only and has no
   HTTP surface yet, so a boot-replay degradation is visible in the startup log
   and nowhere else — unlike a definition-time refusal, which is now durable
-  (see *Changed*).
+  (see *Changed*); and a refusal marker is only read back at boot, so a data
+  dir opened by two processes at once is outside what the sidecar can promise
+  (the node lock already prevents that).
 
 ## [1.0.0-rc.16] - 2026-08-13
 

@@ -24206,21 +24206,14 @@ async fn sync_display_blocks(state: &AppState, name: &str) {
 /// (`{"index": {"analysis.analyzer.x.type": "custom"}}`) are the same request;
 /// this handler already accepts all three for other settings, so a gate that
 /// tests only the nested one is not a gate (issue #204).
+///
+/// The spelling set lives in `xerj-fts` next to the resolver that decides which
+/// of them the registry actually reads, so this gate and the create-time one
+/// (`AnalyzerRegistry::unsupported_analysis`) cannot drift apart — they did:
+/// this handler refused all four spellings while index creation refused two and
+/// handed a `200` to the byte-equivalent dotted one.
 fn declares_analysis(settings: &Value) -> bool {
-    let Some(obj) = settings.as_object() else {
-        return false;
-    };
-    obj.keys().any(|k| {
-        let k = k.strip_prefix("index.").unwrap_or(k);
-        k == "analysis" || k.starts_with("analysis.")
-    }) || settings.pointer("/index/analysis").is_some()
-        || settings
-            .get("index")
-            .and_then(Value::as_object)
-            .is_some_and(|ix| {
-                ix.keys()
-                    .any(|k| k == "analysis" || k.starts_with("analysis."))
-            })
+    xerj_engine::AnalyzerRegistry::declares_analysis(settings)
 }
 
 pub async fn put_settings(
@@ -24826,10 +24819,32 @@ pub async fn put_ingest_pipeline(
             }
             stages.push(json!({"type": xerj_type, "config": adapted_config}));
         }
-        json!({
-            "description": body.get("description").and_then(Value::as_str).unwrap_or(""),
-            "stages": stages
-        })
+        // Start from the body and REPLACE `processors` with `stages`, rather
+        // than building a two-key object from scratch. `GET /_ingest/pipeline`
+        // is the only read endpoint for a pipeline created through
+        // `PUT /v1/pipelines/{name}` (the native surface registers no GET), and
+        // it renders the stored definition in ES vocabulary — so GET's own
+        // output, PUT back here, is an ordinary request. Rebuilding dropped
+        // every key that is not `description`: a natively-defined pipeline's
+        // `on_error` and `timeout_ms` vanished, silently reverting the error
+        // policy from `pass` (keep the document) to the `Drop` default
+        // (discard it), under a `200 {"acknowledged": true}`. That is a write
+        // doing something smaller than asked — the defect class this sweep
+        // exists to remove — so carry the whole body through. `PipelineConfig`
+        // is not `deny_unknown_fields`, so ES-only keys (`version`, `_meta`,
+        // `deprecated`) ride along harmlessly and `GET` echoes them back, which
+        // is what Elasticsearch does too. Same rule as the processor-level
+        // translation directly above: edit the caller's object, never rebuild
+        // it (issue #204).
+        let mut translated = body.clone();
+        let obj = translated
+            .as_object_mut()
+            .expect("`body.get(\"processors\")` matched, so the body is an object");
+        obj.remove("processors");
+        obj.insert("stages".to_string(), Value::Array(stages));
+        obj.entry("description")
+            .or_insert_with(|| Value::String(String::new()));
+        translated
     } else {
         body.clone()
     };
@@ -24873,12 +24888,12 @@ pub async fn put_ingest_pipeline(
     //                         mis-ingested.
     //
     // Whichever way it goes, nothing is acknowledged before it reaches
-    // `cluster_state.json` (issue #203): `put_pipeline` (with `None`, so a
-    // refused definition stores nothing) and `register_unrunnable_pipeline`
+    // `cluster_state.json` (issue #203): `put_pipeline` (which stores nothing
+    // for a definition it cannot compile) and `register_unrunnable_pipeline`
     // both flush before returning, and an `Err` from either means the write
     // did not reach disk — answering `acknowledged` there would promise a
     // pipeline that is gone at the next boot.
-    match state.engine.put_pipeline(&id, xerj_config, None) {
+    match state.engine.put_pipeline(&id, xerj_config) {
         Ok(None) if unhonoured_top_level.is_some() => {
             // Every stage compiled, but a top-level key we cannot act on came
             // with it. `register_unrunnable_pipeline` drops the compiled form

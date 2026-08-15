@@ -2511,12 +2511,30 @@ pub async fn put_pipeline(
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
-    // `None` — this surface rejects a definition it cannot compile, so
-    // nothing is stored on a compile error. On success the pipeline is
-    // written to `<data_dir>/cluster_state.json` before we acknowledge it
-    // (issue #203): it used to live only in memory and vanish on restart,
-    // exactly like the ES-compat one.
-    match state.engine.put_pipeline(&name, body, None) {
+    // `GET /_ingest/pipeline/{name}` is the only read endpoint for a pipeline
+    // created here (this surface registers no native GET), and it answers in
+    // Elasticsearch's `processors` vocabulary. PUTting that output back here
+    // used to hit `serde`'s "missing field `stages`" and surface as a bare
+    // `500 internal error` — a client-shaped mistake reported as an engine
+    // fault, with no hint of where the body belongs. Name the endpoint that
+    // accepts it instead (issue #204).
+    if body.get("stages").is_none() && body.get("processors").is_some() {
+        let e = xerj_common::XerjError::config(format!(
+            "pipeline [{name}]: this body is Elasticsearch-shaped (`processors`), which \
+             this endpoint does not accept — it takes xerj's `stages` form. `GET \
+             /_ingest/pipeline/{name}` renders every stored pipeline in Elasticsearch \
+             vocabulary, so PUT that body to `/_ingest/pipeline/{name}` instead."
+        ));
+        return native_error(e, Some(&request_id), started.elapsed().as_millis() as u64)
+            .into_response();
+    }
+
+    // This surface rejects a definition it cannot compile, so nothing is
+    // stored on a compile error. On success the pipeline is written to
+    // `<data_dir>/cluster_state.json` before we acknowledge it (issue #203):
+    // it used to live only in memory and vanish on restart, exactly like the
+    // ES-compat one.
+    match state.engine.put_pipeline(&name, body) {
         Ok(None) => {
             let took_ms = started.elapsed().as_millis() as u64;
             let resp = NativeResponse::new(
