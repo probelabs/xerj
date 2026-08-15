@@ -18,6 +18,14 @@ use xerj_engine::Engine;
 use crate::error::{ConsoleApiError, ConsoleResult};
 use crate::indices;
 
+/// Single in-place upsert (one WAL append). delete-then-create used to
+/// drop the live row when the replacement write was refused (write
+/// block, unparseable date, crash between the two ops).
+async fn replace_document(idx: &xerj_engine::Index, id: String, doc: Value) -> ConsoleResult<()> {
+    idx.index_document(Some(id), doc).await?;
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // User
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,12 +82,7 @@ pub async fn find_user_by_email(engine: &Engine, email: &str) -> ConsoleResult<O
 pub async fn upsert_user(engine: &Engine, user: &User) -> ConsoleResult<()> {
     let idx = engine.get_index(indices::USERS)?;
     let doc = serde_json::to_value(user)?;
-    // delete-then-create gives us upsert semantics that work for both
-    // first-write and re-write. Engine's `index_document` would also
-    // work but we want to be explicit about idempotency on retries.
-    let _ = idx.delete_document(&user.id).await;
-    idx.create_document(user.id.clone(), doc).await?;
-    Ok(())
+    replace_document(&idx, user.id.clone(), doc).await
 }
 
 pub async fn count_active_users(engine: &Engine) -> ConsoleResult<u64> {
@@ -144,17 +147,13 @@ pub async fn mark_magic_link_used(
         .ok_or_else(|| ConsoleApiError::NotFound("magic link not found at consume time".into()))?;
     link.used_at = Some(used_at_iso.to_string());
     let doc = serde_json::to_value(&link)?;
-    let _ = idx.delete_document(token_hash).await;
-    idx.create_document(token_hash.to_string(), doc).await?;
-    Ok(())
+    replace_document(&idx, token_hash.to_string(), doc).await
 }
 
 pub async fn put_magic_link(engine: &Engine, link: &MagicLink) -> ConsoleResult<()> {
     let idx = engine.get_index(indices::MAGIC_LINKS)?;
     let doc = serde_json::to_value(link)?;
-    let _ = idx.delete_document(&link.id).await;
-    idx.create_document(link.id.clone(), doc).await?;
-    Ok(())
+    replace_document(&idx, link.id.clone(), doc).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -189,9 +188,7 @@ pub async fn list_passkeys_for_user(
 pub async fn put_passkey(engine: &Engine, pk: &StoredPasskey) -> ConsoleResult<()> {
     let idx = engine.get_index(indices::PASSKEYS)?;
     let doc = serde_json::to_value(pk)?;
-    let _ = idx.delete_document(&pk.id).await;
-    idx.create_document(pk.id.clone(), doc).await?;
-    Ok(())
+    replace_document(&idx, pk.id.clone(), doc).await
 }
 
 pub async fn count_passkeys_for_user(engine: &Engine, user_id: &str) -> ConsoleResult<u64> {
@@ -239,9 +236,7 @@ pub struct Session {
 pub async fn put_session(engine: &Engine, sess: &Session) -> ConsoleResult<()> {
     let idx = engine.get_index(indices::SESSIONS)?;
     let doc = serde_json::to_value(sess)?;
-    let _ = idx.delete_document(&sess.id).await;
-    idx.create_document(sess.id.clone(), doc).await?;
-    Ok(())
+    replace_document(&idx, sess.id.clone(), doc).await
 }
 
 pub async fn get_session(engine: &Engine, session_id: &str) -> ConsoleResult<Option<Session>> {
@@ -284,9 +279,7 @@ pub struct ApiToken {
 pub async fn put_api_token(engine: &Engine, token: &ApiToken) -> ConsoleResult<()> {
     let idx = engine.get_index(indices::API_TOKENS)?;
     let doc = serde_json::to_value(token)?;
-    let _ = idx.delete_document(&token.id).await;
-    idx.create_document(token.id.clone(), doc).await?;
-    Ok(())
+    replace_document(&idx, token.id.clone(), doc).await
 }
 
 pub async fn get_api_token(engine: &Engine, token_hash: &str) -> ConsoleResult<Option<ApiToken>> {

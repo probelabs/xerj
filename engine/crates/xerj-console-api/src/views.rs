@@ -120,7 +120,10 @@ pub async fn delete(
         return Err(ConsoleApiError::NotFound("view".into()));
     }
     let idx = state.engine.get_index(indices::VIEWS)?;
-    let _ = idx.delete_document(&id).await;
+    // Same contract as `store::delete_passkey`: `Ok(false)` is already-absent
+    // (idempotent), so only a refused write becomes an error. Swallowing
+    // that error used to return 204 while the view stayed on disk.
+    idx.delete_document(&id).await?;
     Ok(no_content())
 }
 

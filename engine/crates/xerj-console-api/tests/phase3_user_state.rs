@@ -450,6 +450,117 @@ async fn views_round_trip() {
     assert_eq!(r.status(), 204);
 }
 
+/// A write-block on `.xerj_views` must not produce `204 No Content`.
+/// `delete_document` returns `Err` when the index refuses writes; swallowing
+/// that error told the SPA the view was gone while it stayed searchable.
+#[tokio::test]
+async fn views_delete_on_write_block_is_not_204() {
+    let app = boot_with_session().await;
+
+    let r = app
+        .router
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/_xerj-console/api/v1/dashboards",
+            &app.cookie,
+            Some(json!({ "name": "D", "visibility": "private" })),
+        ))
+        .await
+        .unwrap();
+    let (_, body) = body_json(r).await;
+    let dash_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    let r = app
+        .router
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/_xerj-console/api/v1/views",
+            &app.cookie,
+            Some(json!({
+                "dashboard_id": dash_id, "name": "Keep me",
+                "time": { "from": "now-24h", "to": "now" }
+            })),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = body_json(r).await;
+    assert_eq!(status, 201, "{body}");
+    let view_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    app.engine
+        .get_index(xerj_console_api::indices::VIEWS)
+        .expect("views index")
+        .set_block("write")
+        .await
+        .unwrap();
+
+    let r = app
+        .router
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            &format!("/_xerj-console/api/v1/views/{view_id}"),
+            &app.cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    let (status, body) = body_json(r).await;
+    assert_ne!(
+        status, 204,
+        "write-blocked delete must not report success: {body}"
+    );
+    assert_eq!(status, 500, "engine write-block maps to internal: {body}");
+
+    let r = app
+        .router
+        .oneshot(req(
+            "GET",
+            &format!("/_xerj-console/api/v1/views/{view_id}"),
+            &app.cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    let (status, body) = body_json(r).await;
+    assert_eq!(status, 200, "view must still be readable: {body}");
+    assert_eq!(body["data"]["name"], "Keep me");
+}
+
+/// delete-then-create is not atomic: a replacement that the engine rejects
+/// (here, an unparseable `Date` field) must leave the previous user row in
+/// place. The old helper deleted first, so a failed create dropped the only
+/// copy.
+#[tokio::test]
+async fn upsert_user_keeps_the_row_when_the_replacement_is_rejected() {
+    let app = boot_with_session().await;
+    let original = store::get_user(&app.engine, "owner-test")
+        .await
+        .unwrap()
+        .expect("boot user");
+    assert_eq!(original.email, "owner@example.com");
+
+    let mut bad = original.clone();
+    bad.email = "replacement@example.com".into();
+    bad.last_seen_at = Some("not-a-date".into());
+    let err = store::upsert_user(&app.engine, &bad)
+        .await
+        .expect_err("invalid date must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("last_seen_at") || msg.contains("date"),
+        "expected a date-parse error, got {msg}"
+    );
+
+    let still = store::get_user(&app.engine, "owner-test")
+        .await
+        .unwrap()
+        .expect("rejected replacement must not delete the live user");
+    assert_eq!(still.email, "owner@example.com");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DATA SOURCES
 // ─────────────────────────────────────────────────────────────────────────────
