@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.0.0-rc.17] - 2026-08-15
+
 ### Added
 
 - **`xerj autoindex` understands Unity projects.** Text-serialized scenes,
