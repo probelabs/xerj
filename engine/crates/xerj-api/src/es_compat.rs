@@ -2729,10 +2729,9 @@ pub struct IndexDocAutoParams {
 /// - `Some(name)`    → that pipeline (an explicit `?pipeline=` always wins).
 /// - `None`          → the index's `index.default_pipeline` setting, if any.
 ///
-/// The default is read from `engine.index_settings`, handling the nested
-/// `{index: {default_pipeline: ..}}`, dotted `{"index.default_pipeline": ..}`,
-/// and flat `{default_pipeline: ..}` shapes — mirroring the `number_of_shards`
-/// lookup pattern used elsewhere in this module.
+/// The default is read by [`xerj_engine::Engine::default_pipeline_for`], which
+/// `_bulk` also uses — one lookup, so the two forms of the same write cannot
+/// disagree about which pipeline applies.
 fn resolve_effective_pipeline(
     state: &AppState,
     index: &str,
@@ -2741,14 +2740,7 @@ fn resolve_effective_pipeline(
     match explicit {
         Some("_none") => None,
         Some(p) => Some(p.to_string()),
-        None => state.engine.index_settings.get(index).and_then(|v| {
-            v.get("index")
-                .and_then(|ix| ix.get("default_pipeline"))
-                .or_else(|| v.get("index.default_pipeline"))
-                .or_else(|| v.get("default_pipeline"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
-        }),
+        None => state.engine.default_pipeline_for(index),
     }
 }
 
@@ -2823,14 +2815,16 @@ pub async fn index_doc_auto(
                 }
                 transformed
             }
-            Ok(_) => {
-                // Pipeline returned empty results — pass through original
-                serde_json::from_slice(&body).unwrap_or(Value::Null)
-            }
-            Err(e) => {
-                tracing::warn!(pipeline = %pipeline, error = %e, "pipeline execution failed, indexing without transform");
-                serde_json::from_slice(&body).unwrap_or(Value::Null)
-            }
+            // No output for this document: refused, not passed through
+            // unchanged — see `pipeline_empty_result_error`.
+            Ok(_) => return pipeline_empty_result_error(pipeline).into_response(),
+            // Issue #204, the purest form of the class on a user-DATA path:
+            // this used to warn and then index the ORIGINAL document. A
+            // pipeline whose job was to redact PII, drop a field or route the
+            // document simply did not run, and the caller got `201 Created`.
+            // `_bulk` already fails the item here; the single-document path now
+            // agrees with it.
+            Err(e) => return pipeline_execution_error(pipeline, &e).into_response(),
         }
     } else {
         doc
@@ -2951,7 +2945,13 @@ pub async fn index_doc(
                 }
                 transformed
             }
-            _ => doc,
+            // No output for this document: refused, not passed through
+            // unchanged — see `pipeline_empty_result_error`.
+            Ok(_) => return pipeline_empty_result_error(pipeline).into_response(),
+            // Issue #204: this arm was folded into `_ => doc`, so a pipeline
+            // that could not run left the document indexed UNTRANSFORMED under
+            // a success response. Refuse instead.
+            Err(e) => return pipeline_execution_error(pipeline, &e).into_response(),
         }
     } else {
         doc
@@ -3072,7 +3072,13 @@ pub async fn create_doc(
                 }
                 transformed
             }
-            _ => doc,
+            // No output for this document: refused, not passed through
+            // unchanged — see `pipeline_empty_result_error`.
+            Ok(_) => return pipeline_empty_result_error(pipeline).into_response(),
+            // Issue #204: this arm was folded into `_ => doc`, so a pipeline
+            // that could not run left the document indexed UNTRANSFORMED under
+            // a success response. Refuse instead.
+            Err(e) => return pipeline_execution_error(pipeline, &e).into_response(),
         }
     } else {
         doc
@@ -14469,6 +14475,10 @@ fn bulk_opts_from_query(
             _ => None,
         }),
         default_source_req,
+        // `?pipeline=` — the request-level default for every `index`/`create`
+        // action that names no pipeline of its own. Read but discarded before
+        // (issue #204): the bulk item was written untransformed under a `201`.
+        default_pipeline: qp.get("pipeline").cloned(),
     }
 }
 
@@ -14597,7 +14607,14 @@ async fn process_bulk_body(
             index: item.index,
             id: item.id,
             version,
-            result: item.result.unwrap_or_else(|| "deleted".to_string()),
+            // A successful action with no explicit result is a `delete`
+            // (the only one that does not set one). A FAILED action has no
+            // result at all — see `EsBulkItemResult::result`.
+            result: if item.error.is_some() {
+                None
+            } else {
+                Some(item.result.clone().unwrap_or_else(|| "deleted".to_string()))
+            },
             shards: crate::responses::EsShards::single_success(),
             seq_no,
             primary_term: 1,
@@ -14839,6 +14856,312 @@ mod malformed_bulk_route_tests {
                 "missing {expected:?} in public reason: {reason}"
             );
         }
+    }
+}
+
+/// Issue #204 — an ingest pipeline that cannot be compiled must be REFUSED,
+/// not stored, acknowledged and quietly skipped.
+#[cfg(test)]
+mod ingest_pipeline_fail_closed_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    async fn put_pipeline(state: AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response = crate::router::build_es_compat_router(state)
+            .oneshot(
+                Request::put(format!("/_ingest/pipeline/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_uncompilable_pipeline_is_rejected_and_not_stored() {
+        let state = test_state();
+
+        // `social_security` is not a PII type xerj can redact. Pre-fix this
+        // answered 200/acknowledged, `GET` echoed it back, and every document
+        // routed through it kept its PII.
+        let (status, body) = put_pipeline(
+            state.clone(),
+            "redact",
+            json!({
+                "processors": [
+                    { "pii_redaction": { "types": ["social_security"] } }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+        // Nothing was stored: GET must 404 rather than echo a pipeline that
+        // does not exist in compiled form.
+        let response = crate::router::build_es_compat_router(state.clone())
+            .oneshot(
+                Request::get("/_ingest/pipeline/redact")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!state.engine.pipelines.contains_key("redact"));
+        assert!(!state.engine.transform_pipelines.contains_key("redact"));
+    }
+
+    #[tokio::test]
+    async fn a_processor_entry_that_is_not_a_processor_is_rejected() {
+        // Pre-fix `filter_map` dropped this silently and the pipeline compiled
+        // with zero stages.
+        let (status, body) = put_pipeline(
+            test_state(),
+            "broken",
+            json!({ "processors": [ "lowercase" ] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_compilable_pipeline_still_round_trips() {
+        let state = test_state();
+        let (status, _) = put_pipeline(
+            state.clone(),
+            "ok",
+            json!({
+                "processors": [
+                    { "pii_redaction": { "types": ["email"] } },
+                    { "set": { "field": "env", "value": "prod" } }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.engine.transform_pipelines.contains_key("ok"));
+
+        let response = crate::router::build_es_compat_router(state)
+            .oneshot(
+                Request::get("/_ingest/pipeline/ok")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn index_doc(
+        state: AppState,
+        index: &str,
+        id: &str,
+        pipeline: &str,
+        doc: Value,
+    ) -> (StatusCode, Value) {
+        let response = crate::router::build_es_compat_router(state)
+            .oneshot(
+                Request::put(format!(
+                    "/{index}/_doc/{id}?refresh=true&pipeline={pipeline}"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(doc.to_string()))
+                .expect("request"),
+            )
+            .await
+            .expect("route response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn get_source(state: AppState, index: &str, id: &str) -> Value {
+        let response = crate::router::build_es_compat_router(state)
+            .oneshot(
+                Request::get(format!("/{index}/_doc/{id}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        serde_json::from_slice::<Value>(&bytes)
+            .expect("json")
+            .get("_source")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// A processor xerj does not implement is ACCEPTED (Elasticsearch accepts
+    /// it and `_simulate` still walks it) — but no document may then be
+    /// ingested through it. Pre-fix the write answered `201 Created` with the
+    /// document stored untransformed.
+    #[tokio::test]
+    async fn a_pipeline_with_an_unimplemented_processor_refuses_the_write() {
+        let state = test_state();
+
+        // `pipeline` (a pipeline calling another pipeline) is a real ES
+        // processor that xerj's compiled ingest path does not implement.
+        let (status, body) = put_pipeline(
+            state.clone(),
+            "outer",
+            json!({ "processors": [ { "pipeline": { "name": "inner" } } ] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["acknowledged"], json!(true));
+
+        // Stored and visible, exactly as ES does…
+        assert!(state.engine.pipelines.contains_key("outer"));
+        // …but explicitly marked as having no compiled form.
+        assert!(state.engine.unrunnable_pipelines.contains_key("outer"));
+        assert!(!state.engine.transform_pipelines.contains_key("outer"));
+
+        // …and a write through it is REFUSED rather than silently untransformed.
+        let (status, body) = index_doc(
+            state.clone(),
+            "logs",
+            "1",
+            "outer",
+            json!({ "msg": "hello" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        let reason = body["error"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("outer") && reason.contains("pipeline"),
+            "reason should name the pipeline: {reason}"
+        );
+
+        // Nothing was written.
+        assert!(get_source(state, "logs", "1").await.is_null());
+    }
+
+    /// The ES `rename` processor used to translate to a config shape the
+    /// `field_rename` plugin rejects (`from`/`to` instead of `mappings`), so
+    /// EVERY rename processor failed to compile — invisibly, under a 200.
+    #[tokio::test]
+    async fn the_es_rename_processor_actually_renames() {
+        let state = test_state();
+        let (status, body) = put_pipeline(
+            state.clone(),
+            "ren",
+            json!({
+                "processors": [
+                    { "rename": { "field": "old_name", "target_field": "new_name" } }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            state.engine.transform_pipelines.contains_key("ren"),
+            "rename must COMPILE, not merely be stored"
+        );
+
+        let (status, body) = index_doc(
+            state.clone(),
+            "renamed",
+            "1",
+            "ren",
+            json!({ "old_name": "v" }),
+        )
+        .await;
+        assert!(status.is_success(), "body: {body}");
+
+        let source = get_source(state, "renamed", "1").await;
+        assert_eq!(source["new_name"], json!("v"), "source: {source}");
+        assert!(source.get("old_name").is_none(), "source: {source}");
+    }
+
+    /// `DELETE` used to remove only the definition, leaving the compiled
+    /// pipeline live for anything that reached it by name.
+    #[tokio::test]
+    async fn deleting_a_pipeline_removes_the_compiled_form_too() {
+        let state = test_state();
+        let (status, _) = put_pipeline(
+            state.clone(),
+            "gone",
+            json!({ "processors": [ { "set": { "field": "a", "value": "b" } } ] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.engine.transform_pipelines.contains_key("gone"));
+
+        let response = crate::router::build_es_compat_router(state.clone())
+            .oneshot(
+                Request::delete("/_ingest/pipeline/gone")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.engine.pipelines.contains_key("gone"));
+        assert!(!state.engine.transform_pipelines.contains_key("gone"));
+    }
+
+    /// Re-defining a pipeline with something we cannot compile must not leave
+    /// the previous stages quietly running under the new definition's name.
+    #[tokio::test]
+    async fn redefining_with_an_unimplemented_processor_retires_the_old_stages() {
+        let state = test_state();
+        let (status, _) = put_pipeline(
+            state.clone(),
+            "evolving",
+            json!({ "processors": [ { "set": { "field": "a", "value": "b" } } ] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.engine.transform_pipelines.contains_key("evolving"));
+
+        let (status, _) = put_pipeline(
+            state.clone(),
+            "evolving",
+            json!({ "processors": [ { "pipeline": { "name": "other" } } ] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !state.engine.transform_pipelines.contains_key("evolving"),
+            "the superseded compiled pipeline must not keep running"
+        );
+        assert!(state.engine.unrunnable_pipelines.contains_key("evolving"));
     }
 }
 
@@ -17926,6 +18249,13 @@ pub async fn index_stats(
         // Aggregate across multiple indices.
         let mut all_doc_count = 0u64;
         let mut all_store_bytes = 0u64;
+        // Aggregated so `GET /_all/_stats` carries the same
+        // `primaries.mappings.schema_persist_failures` the per-index form does.
+        // Without it `Index::schema_persist_failures`'s doc-comment named an
+        // endpoint that did not report the counter, and a fleet-wide health
+        // check reading only `_all` saw nothing (issue #204: the claim has to
+        // match what the endpoint really answers).
+        let mut all_schema_persist_failures = 0u64;
         let mut all_indices = serde_json::Map::new();
         for name in &targets {
             let stats = match state.engine.index_stats(name).await {
@@ -17960,11 +18290,18 @@ pub async fn index_stats(
                 Ok(idx) => idx.hnsw_stats().await,
                 Err(_) => json!({ "present": false }),
             };
+            let schema_persist_failures = state
+                .engine
+                .get_index(name)
+                .map(|idx| idx.schema_persist_failures())
+                .unwrap_or(0);
+            all_schema_persist_failures += schema_persist_failures;
             let primaries = json!({
                 "docs": { "count": doc_count, "deleted": 0 },
                 "store": { "size_in_bytes": store_size_bytes },
                 "dense_vector": dv,
                 "hnsw": hnsw,
+                "mappings": { "schema_persist_failures": schema_persist_failures },
                 "merges": {
                     "current": if merging { 1 } else { 0 },
                     "current_docs": 0,
@@ -18028,6 +18365,7 @@ pub async fn index_stats(
         let all_primaries = json!({
             "docs": { "count": all_doc_count, "deleted": 0 },
             "store": { "size_in_bytes": all_store_bytes },
+            "mappings": { "schema_persist_failures": all_schema_persist_failures },
             "dense_vector": {
                 "value_count": all_dv_value_count,
                 "off_heap": {
@@ -18101,11 +18439,24 @@ pub async fn index_stats(
             )
         })
         .unwrap_or((0, false));
+    // XERJ extension (issue #204): dynamic-mapping evolution that could not be
+    // written to `schema.json`. Non-zero means the on-disk mapping is behind
+    // the live one and a restart will lose those fields. It is counted rather
+    // than raised because schema evolution runs after the document has been
+    // admitted — there is no caller left to fail — so a health check needs to
+    // be able to READ it. This is that read: without it the counter existed and
+    // nothing in the workspace looked at it.
+    let schema_persist_failures = state
+        .engine
+        .get_index(&index)
+        .map(|idx| idx.schema_persist_failures())
+        .unwrap_or(0);
     let primaries = json!({
         "docs": { "count": doc_count, "deleted": 0 },
         "store": { "size_in_bytes": store_size_bytes },
         "dense_vector": dense_vector_stats,
         "hnsw": hnsw_stats,
+        "mappings": { "schema_persist_failures": schema_persist_failures },
         "indexing": {
             // Real cumulative indexing counters (RC4 W4 item 1): plumbed from
             // the per-index `metric_index_count` / `metric_index_total_ms`
@@ -19831,6 +20182,14 @@ fn reindex_default_size() -> usize {
 #[derive(Debug, Deserialize)]
 pub struct ReindexDest {
     pub index: String,
+    /// `dest.pipeline` — the ingest pipeline every copied document is run
+    /// through before it is written to the destination.
+    ///
+    /// Issue #204: this field did not exist, so serde dropped it and a
+    /// `_reindex` asking for redaction on the way in answered
+    /// `{"created": N}` having copied every document VERBATIM.
+    #[serde(default)]
+    pub pipeline: Option<String>,
 }
 
 pub async fn reindex(
@@ -19878,6 +20237,41 @@ pub async fn reindex(
     let source_name = &body.source.index;
     let dest_name = &body.dest.index;
 
+    // `dest.pipeline` is checked BEFORE a single document is copied. A name
+    // that does not resolve, or one this build cannot run, fails the whole
+    // request with nothing written — rather than copying the corpus
+    // untransformed and reporting success (issue #204). `_none` means "no
+    // pipeline", matching the write paths.
+    let dest_pipeline: Option<String> = match body.dest.pipeline.as_deref() {
+        None | Some("_none") => None,
+        Some(p) => {
+            let reason = if !state.engine.pipelines.contains_key(p) {
+                Some(format!("pipeline with id [{p}] does not exist"))
+            } else {
+                state
+                    .engine
+                    .unrunnable_pipelines
+                    .get(p)
+                    .map(|r| format!("pipeline with id [{p}] cannot be run: {}", r.value()))
+            };
+            if let Some(reason) = reason {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+                            "type": "illegal_argument_exception",
+                            "reason": reason,
+                        },
+                        "status": 400,
+                    })),
+                )
+                    .into_response();
+            }
+            Some(p.to_string())
+        }
+    };
+
     // Get or create destination index.
     let dest_idx = match state.engine.get_or_create_index(dest_name) {
         Ok(i) => i,
@@ -19896,7 +20290,19 @@ pub async fn reindex(
     // reliably, so un-flushed recent writes would be skipped or duplicated
     // across pages. Reindex is a snapshot-style bulk op, so a single flush up
     // front is an acceptable cost and makes the whole source keyset-pageable.
-    let _ = source_idx.flush().await;
+    //
+    // Propagated, not swallowed, for the same reason as `clone_index_to`: the
+    // flush is a precondition of the paging being complete, so a failed flush
+    // must not be followed by a reindex that reports `"total": N` over a source
+    // it could not read consistently (issue #204).
+    if let Err(e) = source_idx.flush().await {
+        return ApiError::new(xerj_common::XerjError::internal(format!(
+            "reindex from [{source_name}] into [{dest_name}] was not attempted: flushing \
+             the source failed ({e}); the copy needs a flushed source to page over it \
+             without skipping or duplicating documents"
+        )))
+        .into_response();
+    }
 
     let query_val = body
         .source
@@ -19913,6 +20319,7 @@ pub async fn reindex(
     let mut total_fetched = 0usize;
     let mut created = 0usize;
     let mut updated = 0usize;
+    let mut noops = 0usize;
     let mut failures: Vec<Value> = Vec::new();
     let mut batches = 0usize;
     // Keyset cursor: `[last_id]` of the previous page (the sole sort key is
@@ -19970,6 +20377,49 @@ pub async fn reindex(
 
         for hit in results.hits {
             if !hit.source.is_null() {
+                // `dest.pipeline`, if the request named one. Already known to
+                // exist and to be runnable (checked before any copy started),
+                // so anything that goes wrong here is a per-document failure
+                // and is reported as one — never a pass-through of the
+                // untransformed source.
+                let doc_source = match dest_pipeline.as_deref() {
+                    None => hit.source,
+                    Some(p) => match state.engine.process_through_pipeline(p, vec![hit.source]) {
+                        Ok(mut results) if !results.is_empty() => {
+                            let (action, transformed) = results.remove(0);
+                            if matches!(action, xerj_wasm::pipeline::ProcessAction::Drop) {
+                                // ES: a pipeline that drops the document does
+                                // not write it, and the run reports a noop.
+                                noops += 1;
+                                continue;
+                            }
+                            transformed
+                        }
+                        Ok(_) => {
+                            failures.push(json!({
+                                "id": hit.id,
+                                "cause": {
+                                    "type": "reindex_error",
+                                    "reason": format!(
+                                        "pipeline [{p}] returned no document for [{}]",
+                                        hit.id
+                                    ),
+                                },
+                            }));
+                            continue;
+                        }
+                        Err(e) => {
+                            failures.push(json!({
+                                "id": hit.id,
+                                "cause": {
+                                    "type": "reindex_error",
+                                    "reason": format!("pipeline [{p}] failed: {e}"),
+                                },
+                            }));
+                            continue;
+                        }
+                    },
+                };
                 // Check if doc already exists in dest to track created vs updated.
                 let exists = dest_idx
                     .get_document(&hit.id)
@@ -19978,7 +20428,7 @@ pub async fn reindex(
                     .flatten()
                     .is_some();
                 match dest_idx
-                    .index_document(Some(hit.id.clone()), hit.source)
+                    .index_document(Some(hit.id.clone()), doc_source)
                     .await
                 {
                     Ok(_) => {
@@ -20019,7 +20469,7 @@ pub async fn reindex(
         "batches": batches,
         "failures": failures,
         "throttled_millis": 0,
-        "noops": 0,
+        "noops": noops,
         "version_conflicts": 0,
         "retries": { "bulk": 0, "search": 0 },
     }))
@@ -23155,6 +23605,42 @@ pub async fn update_by_query(
     // update happens in place (no duplicate-`_id` docs are appended).
     let script = body.script.as_ref().map(extract_update_script);
 
+    // `?pipeline=` — every matched document is run through it before being
+    // written back. Issue #204: the parameter used to be read by nothing, so
+    // `_update_by_query?pipeline=redact` reported `"updated": N` having
+    // rewritten every document EXACTLY as it was. Resolved and validated
+    // before any document is touched: an unknown or unrunnable name fails the
+    // whole request rather than half of it.
+    let pipeline = match params.get("pipeline").map(String::as_str) {
+        None | Some("_none") => None,
+        Some(p) => {
+            let reason = if !state.engine.pipelines.contains_key(p) {
+                Some(format!("pipeline with id [{p}] does not exist"))
+            } else {
+                state
+                    .engine
+                    .unrunnable_pipelines
+                    .get(p)
+                    .map(|r| format!("pipeline with id [{p}] cannot be run: {}", r.value()))
+            };
+            if let Some(reason) = reason {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+                            "type": "illegal_argument_exception",
+                            "reason": reason,
+                        },
+                        "status": 400,
+                    })),
+                )
+                    .into_response();
+            }
+            Some((state.engine.clone(), p.to_string()))
+        }
+    };
+
     // ES defaults `wait_for_completion` to true (synchronous); only an
     // explicit `false` switches to the async `{"task": "node:id"}` form.
     let wait_for_completion = params
@@ -23170,14 +23656,14 @@ pub async fn update_by_query(
         // Same reasoning as the `_delete_by_query` spawn above: the task owns
         // one already-authorized `Index` handle and can reach no other index.
         tokio::spawn(async move {
-            let response = run_update_by_query(&idx, &search_req, script).await;
+            let response = run_update_by_query(&idx, &search_req, script, pipeline).await;
             tasks.complete(&spawned_key, response);
             drop(handle);
         });
         return Json(json!({ "task": task_key })).into_response();
     }
 
-    let response = run_update_by_query(&idx, &search_req, script).await;
+    let response = run_update_by_query(&idx, &search_req, script, pipeline).await;
     drop(handle);
     by_query_response(response)
 }
@@ -23190,10 +23676,46 @@ pub async fn update_by_query(
 /// `wait_for_completion=false` form.
 const SCRIPTED_UPDATE_BUDGET_MS: u64 = 30_000;
 
+/// Run `doc` through `pipeline`, or say why it could not be run.
+///
+/// Issue #204: every caller must get a document that really went through the
+/// pipeline, or an error. There is deliberately no "return the input unchanged"
+/// branch — that is precisely how an unrun redaction became a `200`.
+///
+/// A `drop` action is an error here rather than a deletion:
+/// `_update_by_query` updates documents in place and has no delete path, so
+/// honouring `drop` is not something this endpoint can do. Saying so per
+/// document beats writing the document as if the processor had not asked.
+fn apply_pipeline_or_fail(
+    engine: &xerj_engine::Engine,
+    pipeline: &str,
+    doc_id: &str,
+    doc: Value,
+) -> std::result::Result<Value, String> {
+    match engine.process_through_pipeline(pipeline, vec![doc]) {
+        Ok(mut results) if !results.is_empty() => {
+            let (action, transformed) = results.remove(0);
+            if matches!(action, xerj_wasm::pipeline::ProcessAction::Drop) {
+                return Err(format!(
+                    "pipeline [{pipeline}] dropped document [{doc_id}]; _update_by_query \
+                     updates in place and cannot delete it, so the document was left \
+                     unchanged"
+                ));
+            }
+            Ok(transformed)
+        }
+        Ok(_) => Err(format!(
+            "pipeline [{pipeline}] returned no document for [{doc_id}]"
+        )),
+        Err(e) => Err(format!("pipeline [{pipeline}] failed: {e}")),
+    }
+}
+
 async fn run_update_by_query(
     idx: &xerj_engine::Index,
     search_req: &xerj_query::SearchRequest,
     script: Option<(String, Value)>,
+    pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
 ) -> Value {
     let started = Instant::now();
 
@@ -23253,6 +23775,13 @@ async fn run_update_by_query(
                     let result = idx
                         .transform_document_serialized(&hit.id, None, |mut current| {
                             apply_painless_update(&mut current, src, params)?;
+                            // ES runs `?pipeline=` on the result of the script,
+                            // and so do we — inside the same serialized
+                            // transform, so the pipeline sees exactly the
+                            // document that is about to be written.
+                            if let Some((engine, name)) = pipeline.as_ref() {
+                                current = apply_pipeline_or_fail(engine, name, &hit.id, current)?;
+                            }
                             Ok::<_, String>(current)
                         })
                         .await;
@@ -23269,8 +23798,24 @@ async fn run_update_by_query(
                         })),
                     }
                 } else {
-                    // No script: preserve the historical re-index-in-place behavior.
-                    match idx.index_document(Some(hit.id.clone()), hit.source).await {
+                    // No script: preserve the historical re-index-in-place
+                    // behavior, with `?pipeline=` applied when one was named.
+                    let doc = match pipeline.as_ref() {
+                        None => hit.source,
+                        Some((engine, name)) => {
+                            match apply_pipeline_or_fail(engine, name, &hit.id, hit.source) {
+                                Ok(d) => d,
+                                Err(reason) => {
+                                    failures.push(json!({
+                                        "id": hit.id,
+                                        "cause": { "reason": reason },
+                                    }));
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    match idx.index_document(Some(hit.id.clone()), doc).await {
                         Ok(_) => updated += 1,
                         Err(e) => {
                             failures.push(json!({
@@ -23393,6 +23938,7 @@ mod scripted_update_publication_tests {
                     &idx,
                     &xerj_query::SearchRequest::default(),
                     Some(("ctx._source.n += 1".into(), json!({}))),
+                    None,
                 )
                 .await
             }));
@@ -23652,6 +24198,24 @@ async fn sync_display_blocks(state: &AppState, name: &str) {
         .insert(name.to_string(), display);
 }
 
+/// Does this settings object reach into the `analysis` namespace, in ANY of the
+/// spellings Elasticsearch clients send?
+///
+/// Nested (`{"analysis": {..}}`, `{"index": {"analysis": {..}}}`), fully dotted
+/// (`{"index.analysis.analyzer.x.type": "custom"}`) and half-dotted
+/// (`{"index": {"analysis.analyzer.x.type": "custom"}}`) are the same request;
+/// this handler already accepts all three for other settings, so a gate that
+/// tests only the nested one is not a gate (issue #204).
+///
+/// The spelling set lives in `xerj-fts` next to the resolver that decides which
+/// of them the registry actually reads, so this gate and the create-time one
+/// (`AnalyzerRegistry::unsupported_analysis`) cannot drift apart — they did:
+/// this handler refused all four spellings while index creation refused two and
+/// handed a `200` to the byte-equivalent dotted one.
+fn declares_analysis(settings: &Value) -> bool {
+    xerj_engine::AnalyzerRegistry::declares_analysis(settings)
+}
+
 pub async fn put_settings(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -23665,6 +24229,34 @@ pub async fn put_settings(
 
     // Normalize body into the `{ "index": { ... } }` shape we store.
     let inner = body.get("index").cloned().unwrap_or(body.clone());
+
+    // An `analysis` block here is accepted-and-ignored, and it is the one hole
+    // that would walk straight around the create-time gate: this handler merges
+    // the body into `engine.index_settings` (the display copy read back by
+    // `GET /{index}/_settings`) and nothing else. The index's
+    // `AnalyzerRegistry` is built once, at create/open (index.rs:5428, :5617),
+    // and there is no rebuild path — so a settings PUT that "adds an analyzer"
+    // changes what the API echoes back and not one token of what is indexed.
+    // Refuse it. Elasticsearch also refuses analysis updates on an open index
+    // (they are non-dynamic settings), so this narrows behaviour towards ES
+    // rather than away from it (issue #204).
+    //
+    // The gate has to cover every spelling this handler ACCEPTS, not just the
+    // nested one. ES clients routinely send flat dotted keys
+    // (`{"index.analysis.analyzer.x.type": "custom"}`), this handler merges
+    // them into `index_settings` verbatim, and `GET /{index}/_settings` then
+    // echoes an analyzer that analyses nothing — the same silent lie the
+    // nested spelling was closed against, one string away.
+    if declares_analysis(&body) || declares_analysis(&inner) {
+        let e = xerj_common::XerjError::config(format!(
+            "index [{index}]: `analysis` settings cannot be updated after the index is \
+             created — the analyzer registry is built at index creation and this request \
+             would change only what `GET /{index}/_settings` echoes back, not how \
+             documents are analysed. Create a new index with the analysis block and \
+             reindex."
+        ));
+        return ApiError::new(e).into_response();
+    }
 
     for idx in &targets {
         let mut existing = state
@@ -23786,6 +24378,306 @@ fn ilm_lifecycle_directive_from_settings(body: &Value) -> Option<Option<String>>
 // POST   /_ingest/pipeline/{id}/_simulate
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Refuse a write whose ingest pipeline did not run.
+///
+/// Issue #204. Every single-document write path used to swallow this and index
+/// the untransformed document under a `201 Created` — the redaction, the field
+/// drop, the routing the caller configured simply did not happen, and the only
+/// trace was a warn line. `_bulk` already failed the item; these paths now
+/// agree with it. The reason is passed through verbatim so an operator is told
+/// *why* (missing pipeline vs a processor this build cannot run) rather than
+/// having to guess.
+fn pipeline_execution_error(pipeline: &str, e: &xerj_wasm::WasmError) -> ApiError {
+    tracing::warn!(pipeline = %pipeline, error = %e, "refusing write: ingest pipeline did not run");
+    ApiError::new(xerj_common::XerjError::config(format!(
+        "document not indexed: ingest pipeline [{pipeline}] did not run: {e}"
+    )))
+}
+
+/// A pipeline that returned no document for the one it was given.
+///
+/// `process_through_pipeline` zips one action per input document, so this is an
+/// internal invariant break rather than a configuration a caller can write.
+/// It still must not fall through to indexing the ORIGINAL document: "the
+/// pipeline produced nothing, so store what the caller sent" is the same
+/// silent-pass-through this whole change exists to remove, and it would land on
+/// exactly the redaction case where it costs the most.
+fn pipeline_empty_result_error(pipeline: &str) -> ApiError {
+    tracing::error!(pipeline = %pipeline, "refusing write: ingest pipeline returned no document");
+    ApiError::new(xerj_common::XerjError::config(format!(
+        "document not indexed: ingest pipeline [{pipeline}] returned no document"
+    )))
+}
+
+/// ES processor name → xerj stage type, for the processors whose names differ.
+///
+/// Paired with [`es_proc_name`], which MUST stay its inverse: `_simulate` walks
+/// a STORED pipeline, and after this sweep made ES `rename` compile, stored
+/// pipelines are in xerj's `stages` shape rather than the raw ES body. Renaming
+/// them back is what keeps `processor_type` reading `rename` and not
+/// `field_rename` in the simulate response (the ES-compat YAML conformance case
+/// "Test verbose simulate with error in pipeline").
+fn map_proc_name(es_name: &str) -> String {
+    match es_name {
+        "remove" => "drop_field".to_string(),
+        "rename" => "field_rename".to_string(),
+        "date" => "timestamp_parse".to_string(),
+        "json" => "json_parse".to_string(),
+        "convert" => "convert".to_string(),
+        // `append` used to be folded into `set` here, which REPLACES the
+        // field instead of extending it — a different document, under a
+        // 200, and in disagreement with the `_simulate` interpreter below,
+        // which has always implemented a real append (issue #204). There is
+        // now an `append` stage; the two agree.
+        "set" => "set".to_string(),
+        "copy" => "copy_field".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Inverse of [`map_proc_name`]: xerj stage type → ES processor name.
+fn es_proc_name(xerj_type: &str) -> &str {
+    match xerj_type {
+        "drop_field" => "remove",
+        "field_rename" => "rename",
+        "timestamp_parse" => "date",
+        "json_parse" => "json",
+        "copy_field" => "copy",
+        other => other,
+    }
+}
+
+/// Render one stored xerj stage back into the Elasticsearch processor shape
+/// `_simulate` interprets.
+///
+/// The inverse of the name mapping AND of the config adaptation in
+/// [`put_ingest_pipeline`]: `drop_field`'s `{"fields": [..]}` becomes
+/// `remove`'s `{"field": ..}`, and `field_rename`'s `{"mappings": {a: b}}`
+/// becomes one `rename` per entry (ES's `rename` is 1:1). Everything else on
+/// the stage config — `tag`, `description`, `if`, `on_failure` — is carried
+/// through untouched, because `_simulate`'s interpreter reads those to build
+/// its per-processor result entries.
+///
+/// Returns a list because one `field_rename` stage can hold several mappings.
+fn stage_to_es_processors(stage: &Value) -> Vec<Value> {
+    let Some(obj) = stage.as_object() else {
+        return Vec::new();
+    };
+    let Some(ty) = obj.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let cfg = obj
+        .get("config")
+        .cloned()
+        .unwrap_or(Value::Object(serde_json::Map::new()));
+    let es_name = es_proc_name(ty);
+
+    let wrap = |c: Value| {
+        let mut m = serde_json::Map::new();
+        m.insert(es_name.to_string(), c);
+        Value::Object(m)
+    };
+
+    match ty {
+        "drop_field" => {
+            let mut c = cfg.clone();
+            let fields = cfg.get("fields").and_then(Value::as_array).cloned();
+            if let Some(map) = c.as_object_mut() {
+                map.remove("fields");
+                match fields {
+                    // ES's `remove` accepts a single name or an array; emit the
+                    // single-name form for the common one-field case so the
+                    // response reads the way the caller wrote it.
+                    Some(f) if f.len() == 1 => {
+                        map.insert("field".to_string(), f[0].clone());
+                    }
+                    Some(f) => {
+                        map.insert("field".to_string(), Value::Array(f));
+                    }
+                    None => {}
+                }
+            }
+            vec![wrap(c)]
+        }
+        "field_rename" => {
+            let mappings = cfg
+                .get("mappings")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            if mappings.is_empty() {
+                return vec![wrap(cfg)];
+            }
+            mappings
+                .into_iter()
+                .map(|(from, to)| {
+                    let mut c = cfg.clone();
+                    if let Some(map) = c.as_object_mut() {
+                        map.remove("mappings");
+                        map.insert("field".to_string(), Value::String(from));
+                        map.insert("target_field".to_string(), to);
+                    }
+                    wrap(c)
+                })
+                .collect()
+        }
+        "set" => {
+            // `override` is the one key whose DEFAULT differs between the two
+            // vocabularies: Elasticsearch's `set` defaults it to `true`, xerj's
+            // native `set` stage to `false` (see `put_ingest_pipeline`, which
+            // is why the translation writes it in). Rendering a stored stage
+            // without it would therefore be a lie in one direction or the
+            // other — for a native stage a bare ES `set` claims it overwrites,
+            // when it preserves. State it instead, always, with the value the
+            // stage actually applies.
+            let mut c = cfg.clone();
+            if let Some(map) = c.as_object_mut() {
+                let effective = map
+                    .get("override")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                map.insert("override".to_string(), Value::Bool(effective));
+            }
+            vec![wrap(c)]
+        }
+        _ => vec![wrap(cfg)],
+    }
+}
+
+/// Every stage of a stored pipeline, in ES processor shape.
+fn stages_to_es_processors(stages: &[Value]) -> Vec<Value> {
+    stages.iter().flat_map(stage_to_es_processors).collect()
+}
+
+/// A stored pipeline definition as `GET /_ingest/pipeline` must answer it.
+///
+/// Two shapes reach `engine.pipelines`: the translated xerj `stages` body
+/// (everything that compiles) and the raw Elasticsearch body (kept verbatim
+/// for a definition this build stores but cannot run). Only the second was
+/// ever ES-shaped, so GET spoke xerj's internal vocabulary for every pipeline
+/// that worked — and that output is what an operator edits and PUTs back, which
+/// is how a `stages`-shaped body reached `put_ingest_pipeline`'s pass-through
+/// branch in the first place. `_simulate` was taught this inverse in this same
+/// sweep ([`stages_to_es_processors`]); GET was not.
+///
+/// A body that is already ES-shaped is returned untouched.
+fn stored_pipeline_as_es(doc: &Value) -> Value {
+    let Some(stages) = doc.get("stages").and_then(Value::as_array) else {
+        return doc.clone();
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = doc.as_object() {
+        for (k, v) in obj {
+            if k != "stages" {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out.insert(
+        "processors".to_string(),
+        Value::Array(stages_to_es_processors(stages)),
+    );
+    Value::Object(out)
+}
+
+#[cfg(test)]
+mod stored_pipeline_rendering_tests {
+    use super::*;
+
+    /// `GET /_ingest/pipeline/{id}` leaked xerj's internal `stages` vocabulary
+    /// for every pipeline that compiled. Measured before this fix:
+    /// `{"p":{"description":"d","stages":[{"type":"field_rename","config":
+    /// {"mappings":{"a":"b"}}}]}}`.
+    #[test]
+    fn a_stages_body_renders_as_elasticsearch_processors() {
+        let stored = json!({
+            "description": "d",
+            "stages": [{ "type": "field_rename", "config": { "mappings": { "a": "b" } } }]
+        });
+        let es = stored_pipeline_as_es(&stored);
+        assert_eq!(es["description"], "d");
+        assert_eq!(es["processors"][0]["rename"]["field"], "a", "{es}");
+        assert_eq!(es["processors"][0]["rename"]["target_field"], "b", "{es}");
+        assert_eq!(es.get("stages"), None, "{es}");
+    }
+
+    /// The raw Elasticsearch body kept for a definition this build stores but
+    /// cannot run is already ES-shaped and must not be touched.
+    #[test]
+    fn an_elasticsearch_body_is_returned_verbatim() {
+        let stored = json!({
+            "processors": [{ "grok": { "field": "m", "patterns": ["%{IP:c}"] } }]
+        });
+        assert_eq!(stored_pipeline_as_es(&stored), stored);
+    }
+
+    /// A NATIVE `set` stage preserves an existing value; a bare Elasticsearch
+    /// `set` claims the opposite, because ES defaults `override` to `true`.
+    /// Rendering must state the value the stage actually applies, in both
+    /// directions.
+    #[test]
+    fn set_renders_the_override_it_actually_applies() {
+        let native = json!({ "stages": [
+            { "type": "set", "config": { "field": "e", "value": "prod" } }
+        ] });
+        assert_eq!(
+            stored_pipeline_as_es(&native)["processors"][0]["set"]["override"],
+            false,
+            "a native `set` does not override"
+        );
+
+        let translated = json!({ "stages": [
+            { "type": "set", "config": { "field": "e", "value": "prod", "override": true } }
+        ] });
+        assert_eq!(
+            stored_pipeline_as_es(&translated)["processors"][0]["set"]["override"],
+            true,
+            "an Elasticsearch `set` does"
+        );
+
+        let explicit_false = json!({ "stages": [
+            { "type": "set", "config": { "field": "e", "value": "prod", "override": false } }
+        ] });
+        assert_eq!(
+            stored_pipeline_as_es(&explicit_false)["processors"][0]["set"]["override"],
+            false,
+            "an explicit `false` is carried through"
+        );
+    }
+
+    /// `_simulate` interpreted `set` as an unconditional overwrite, so it
+    /// reported a document the ingest path would never produce for a stage
+    /// that preserves. Now that GET states `override`, that disagreement is
+    /// reachable by copy-paste.
+    #[test]
+    fn simulate_honours_the_set_override_flag() {
+        let mut doc = json!({ "e": "dev" });
+        apply_single_processor(
+            "set",
+            &json!({ "field": "e", "value": "prod", "override": false }),
+            &mut doc,
+        )
+        .expect("set applies");
+        assert_eq!(doc["e"], "dev", "override:false preserves: {doc}");
+
+        let mut doc = json!({ "e": "dev" });
+        apply_single_processor("set", &json!({ "field": "e", "value": "prod" }), &mut doc)
+            .expect("set applies");
+        assert_eq!(doc["e"], "prod", "the ES default still overwrites: {doc}");
+
+        // A missing field is set even with `override: false` — ES only
+        // declines to REPLACE an existing non-null value.
+        let mut doc = json!({ "other": 1 });
+        apply_single_processor(
+            "set",
+            &json!({ "field": "e", "value": "prod", "override": false }),
+            &mut doc,
+        )
+        .expect("set applies");
+        assert_eq!(doc["e"], "prod", "{doc}");
+    }
+}
+
 pub async fn put_ingest_pipeline(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -23795,65 +24687,272 @@ pub async fn put_ingest_pipeline(
     // ES: {"processors": [{"set": {"field":"x","value":"y"}}]}
     // xerj: {"stages": [{"type": "set", "config": {"field":"x","value":"y"}}]}
     //
-    // ES → xerj name mapping for processors whose names differ:
-    fn map_proc_name(es_name: &str) -> String {
-        match es_name {
-            "remove" => "drop_field".to_string(),
-            "rename" => "field_rename".to_string(),
-            "date" => "timestamp_parse".to_string(),
-            "json" => "json_parse".to_string(),
-            "convert" => "convert".to_string(),
-            "append" | "set" => "set".to_string(),
-            "copy" => "copy_field".to_string(),
-            other => other.to_string(),
+    // Issue #204 — the raw body used to be stored FIRST and the compile
+    // failure only warn-logged, so a pipeline with an unsupported processor
+    // was answered `200 {"acknowledged": true}`, echoed back verbatim by
+    // `GET /_ingest/pipeline/{id}`, and never ran: the redaction / grok / date
+    // parsing the caller asked for silently did not happen. Compile first,
+    // store only on success, and answer 400 like ES does.
+    //
+    // ES → xerj name mapping lives at module scope (`map_proc_name`), paired
+    // with its inverse `es_proc_name`, so `_simulate` can render a stored
+    // pipeline back in ES vocabulary.
+
+    /// Elasticsearch `convert` target types that name exactly the same
+    /// conversion as one of xerj's, under a different word.
+    ///
+    /// Issue #204 permits an *equivalent* fallback; `ConvertTypePlugin`'s
+    /// `integer` parses to `i64` and its `float` to `f64` (`builtins.rs`), so
+    /// ES `long` and `double` are the same conversion and 400ing them rejected
+    /// previously-accepted ES pipelines for no gain. `auto`, `ip`, `short` and
+    /// `byte` have no equivalent here and stay refused rather than being
+    /// silently widened.
+    fn map_convert_type(es_type: &str) -> Option<&'static str> {
+        match es_type {
+            "long" => Some("integer"),
+            "double" => Some("float"),
+            _ => None,
         }
     }
-    let xerj_config =
-        if let Some(processors) = body.get("processors").and_then(Value::as_array) {
-            let stages: Vec<Value> = processors.iter().filter_map(|proc| {
-            let obj = proc.as_object()?;
-            let (proc_type, proc_config) = obj.iter().next()?;
+    let xerj_config = if let Some(processors) = body.get("processors").and_then(Value::as_array) {
+        let mut stages: Vec<Value> = Vec::with_capacity(processors.len());
+        for (i, proc) in processors.iter().enumerate() {
+            // A processor entry that is not a single-key object used to be
+            // dropped by `filter_map` — the pipeline then compiled with fewer
+            // stages than were written, and still acknowledged.
+            let Some((proc_type, proc_config)) = proc.as_object().and_then(|o| o.iter().next())
+            else {
+                let e = xerj_common::XerjError::invalid_mapping(format!(
+                    "pipeline [{id}] processor[{i}] is not a processor object \
+                     (expected {{\"<processor>\": {{...}}}})"
+                ));
+                return ApiError::new(e).into_response();
+            };
             let xerj_type = map_proc_name(proc_type.as_str());
             // Adapt ES config shapes to xerj config shapes where they differ.
-            let adapted_config = match proc_type.as_str() {
-                "remove" => {
+            //
+            // EVERY branch here starts from `proc_config.clone()` and edits it.
+            // `remove` and `rename` used to build a fresh `json!({..})` holding
+            // only the translated keys, which threw away the processor-level
+            // `if` / `on_failure` / `ignore_failure` / `ignore_missing` BEFORE
+            // `build_plugin` — the exact keys the compile-time gate exists to
+            // refuse. `{"remove": {"field": "secret", "if": "ctx.tenant ==
+            // 'a'"}}` then compiled, was acknowledged, and dropped the field on
+            // EVERY document: "compiled implies honoured" made false inside the
+            // gate meant to guarantee it, and self-inconsistent too — the same
+            // `if` on `set` was refused. Translate by editing, never by
+            // rebuilding.
+            let mut adapted_config = proc_config.clone();
+            let adapted_obj = adapted_config.as_object_mut();
+            match (proc_type.as_str(), adapted_obj) {
+                ("remove", Some(cfg)) => {
                     // ES: {"field": "x"} or {"field": ["x","y"]}
                     // xerj drop_field: {"fields": ["x","y"]}
-                    let fields = match proc_config.get("field") {
-                        Some(Value::String(s)) => json!({"fields": [s]}),
-                        Some(Value::Array(a)) => json!({"fields": a}),
-                        _ => proc_config.clone(),
-                    };
-                    fields
+                    match cfg.remove("field") {
+                        Some(Value::String(s)) => {
+                            cfg.insert("fields".to_string(), json!([s]));
+                        }
+                        Some(Value::Array(a)) => {
+                            cfg.insert("fields".to_string(), Value::Array(a));
+                        }
+                        // Put back whatever it was; the plugin's own
+                        // validation produces the error message.
+                        Some(other) => {
+                            cfg.insert("field".to_string(), other);
+                        }
+                        None => {}
+                    }
                 }
-                "rename" => {
+                ("rename", Some(cfg)) => {
                     // ES: {"field": "old", "target_field": "new"}
-                    // xerj field_rename: {"from": "old", "to": "new"}
-                    json!({
-                        "from": proc_config.get("field").cloned().unwrap_or(Value::Null),
-                        "to": proc_config.get("target_field").cloned().unwrap_or(Value::Null)
-                    })
+                    // xerj field_rename: {"mappings": {"old": "new"}}
+                    //
+                    // This used to emit `{"from": .., "to": ..}`, which the
+                    // `field_rename` plugin rejects with "missing 'mappings'
+                    // object" — so EVERY ES `rename` processor failed to
+                    // compile. Under the old warn-and-store handler that was
+                    // invisible: the pipeline was acknowledged, echoed back by
+                    // GET, and renamed nothing at ingest. Issue #204 is what
+                    // surfaced it; the translation is fixed here rather than
+                    // left as a permanently-unrunnable processor.
+                    let from = cfg.get("field").and_then(Value::as_str).map(str::to_string);
+                    let to = cfg
+                        .get("target_field")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let (Some(from), Some(to)) = (from, to) {
+                        cfg.remove("field");
+                        cfg.remove("target_field");
+                        cfg.insert("mappings".to_string(), json!({ from: to }));
+                    }
                 }
-                _ => proc_config.clone(),
-            };
-            Some(json!({"type": xerj_type, "config": adapted_config}))
-        }).collect();
-            json!({
-                "description": body.get("description").and_then(Value::as_str).unwrap_or(""),
-                "stages": stages
-            })
-        } else {
-            body.clone()
-        };
-    // `Some(body)` keeps this surface's long-standing behaviour: a definition
-    // that will not compile is still stored and still readable through
-    // `GET /_ingest/pipeline/{id}` (the engine logs the compile error and
-    // drops the executable form, so `?pipeline={id}` behaves identically
-    // before and after a restart). An `Err` means it did not reach disk —
-    // answering `acknowledged` there would promise a pipeline that is gone at
-    // the next boot, which is the whole of issue #203.
-    match state.engine.put_pipeline(&id, xerj_config, Some(body)) {
-        Ok(_) => Json(json!({ "acknowledged": true })).into_response(),
+                ("convert", Some(cfg)) => {
+                    // ES vocabulary → xerj vocabulary for the two targets that
+                    // are the same conversion under a different name.
+                    if let Some(mapped) = cfg
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .and_then(map_convert_type)
+                    {
+                        cfg.insert("type".to_string(), json!(mapped));
+                    }
+                }
+                ("set", Some(cfg)) => {
+                    // Elasticsearch's `set` processor defaults `override` to
+                    // TRUE (`SetProcessor.java:135` — read for semantics only,
+                    // no code reproduced). xerj's NATIVE `set` stage defaults it
+                    // to false and must keep doing so: native definitions are
+                    // recompiled from `cluster_state.json` at every boot, so
+                    // flipping the stage default would change what an
+                    // already-running cluster's pipelines do to documents on a
+                    // binary upgrade alone. ES parity belongs here, in the
+                    // translation, where it applies to ES processors only and
+                    // is written down explicitly instead of being a default
+                    // two layers away.
+                    //
+                    // `entry(..).or_insert(..)` rather than a
+                    // `contains_key` guard: an `override` the caller DID
+                    // write must survive untouched, including `false`.
+                    cfg.entry("override").or_insert(json!(true));
+                }
+                _ => {}
+            }
+            stages.push(json!({"type": xerj_type, "config": adapted_config}));
+        }
+        // Start from the body and REPLACE `processors` with `stages`, rather
+        // than building a two-key object from scratch. `GET /_ingest/pipeline`
+        // is the only read endpoint for a pipeline created through
+        // `PUT /v1/pipelines/{name}` (the native surface registers no GET), and
+        // it renders the stored definition in ES vocabulary — so GET's own
+        // output, PUT back here, is an ordinary request. Rebuilding dropped
+        // every key that is not `description`: a natively-defined pipeline's
+        // `on_error` and `timeout_ms` vanished, silently reverting the error
+        // policy from `pass` (keep the document) to the `Drop` default
+        // (discard it), under a `200 {"acknowledged": true}`. That is a write
+        // doing something smaller than asked — the defect class this sweep
+        // exists to remove — so carry the whole body through. `PipelineConfig`
+        // is not `deny_unknown_fields`, so ES-only keys (`version`, `_meta`,
+        // `deprecated`) ride along harmlessly and `GET` echoes them back, which
+        // is what Elasticsearch does too. Same rule as the processor-level
+        // translation directly above: edit the caller's object, never rebuild
+        // it (issue #204).
+        let mut translated = body.clone();
+        let obj = translated
+            .as_object_mut()
+            .expect("`body.get(\"processors\")` matched, so the body is an object");
+        obj.remove("processors");
+        obj.insert("stages".to_string(), Value::Array(stages));
+        obj.entry("description")
+            .or_insert_with(|| Value::String(String::new()));
+        translated
+    } else {
+        body.clone()
+    };
+    // Elasticsearch pipeline-level (top-level body) keys that decide what
+    // happens when a processor fails. The compiled pipeline has no equivalent:
+    // `PipelineConfig` carries a single `on_error` policy and no recovery
+    // chain, so a top-level `on_failure` was read by nothing.
+    //
+    // This is the SAME defect the repair fixed one level down
+    // (`UNHONOURED_PROCESSOR_KEYS` in `xerj-wasm/src/pipeline.rs`): refusing a
+    // processor-level `on_failure` while silently dropping the identical key at
+    // pipeline level would have left the endpoint inconsistent with itself.
+    // `description`, `version`, `_meta` and `deprecated` are NOT here — they
+    // are identification metadata that changes no document, the same line drawn
+    // for processor-level `tag`/`description`.
+    const UNHONOURED_PIPELINE_KEYS: &[(&str, &str)] = &[(
+        "on_failure",
+        "the pipeline-level recovery processors are not run; the compiled pipeline's \
+         `on_error` policy applies instead",
+    )];
+    let unhonoured_top_level = UNHONOURED_PIPELINE_KEYS
+        .iter()
+        .find(|(key, _)| body.get(*key).is_some())
+        .copied();
+    // Three outcomes, and the difference between them is the whole point of
+    // issue #204:
+    //
+    //   compiled            → store the translated config (the shape the boot
+    //                         replay can recompile, and one `_simulate` walks
+    //                         just as well as the ES body) and acknowledge.
+    //   config we refuse    → 400. The caller misconfigured a processor xerj
+    //                         does implement; storing it would mean answering
+    //                         "acknowledged" for redaction that never runs.
+    //   stage we don't have → accept, exactly as ES does — but record WHY it
+    //                         has no compiled form, so every ingest path
+    //                         refuses loudly instead of indexing the document
+    //                         untransformed. This is the "degrade loudly"
+    //                         half of the issue: the capability gap is xerj's,
+    //                         not the caller's, and it surfaces at the point
+    //                         where a document would otherwise be silently
+    //                         mis-ingested.
+    //
+    // Whichever way it goes, nothing is acknowledged before it reaches
+    // `cluster_state.json` (issue #203): `put_pipeline` (which stores nothing
+    // for a definition it cannot compile) and `register_unrunnable_pipeline`
+    // both flush before returning, and an `Err` from either means the write
+    // did not reach disk — answering `acknowledged` there would promise a
+    // pipeline that is gone at the next boot.
+    match state.engine.put_pipeline(&id, xerj_config) {
+        Ok(None) if unhonoured_top_level.is_some() => {
+            // Every stage compiled, but a top-level key we cannot act on came
+            // with it. `register_unrunnable_pipeline` drops the compiled form
+            // `put_pipeline` just installed, so nothing runs half-honoured.
+            let (option, reason) = unhonoured_top_level.expect("guarded by the match arm");
+            match state.engine.register_unrunnable_pipeline(
+                &id,
+                body,
+                format!(
+                    "pipeline-level [{option}] is not supported by this xerj build \
+                     ({reason}); no document can be ingested through pipeline [{id}]"
+                ),
+            ) {
+                Ok(()) => Json(json!({ "acknowledged": true })).into_response(),
+                Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            }
+        }
+        Ok(None) => Json(json!({ "acknowledged": true })).into_response(),
+        Ok(Some(xerj_wasm::WasmError::UnsupportedStage { stage })) => {
+            match state.engine.register_unrunnable_pipeline(
+                &id,
+                body,
+                format!(
+                    "processor [{stage}] is not implemented by this xerj build; \
+                     no document can be ingested through pipeline [{id}]"
+                ),
+            ) {
+                Ok(()) => Json(json!({ "acknowledged": true })).into_response(),
+                Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            }
+        }
+        // Same shape one level down: the processor exists, an option on it does
+        // not. ES accepts the definition, so we do too — and record why it
+        // cannot run, so no document is written as if the option had been
+        // honoured (issue #204 applied to this endpoint's own new contract).
+        Ok(Some(xerj_wasm::WasmError::UnsupportedOption {
+            stage,
+            option,
+            reason,
+        })) => {
+            match state.engine.register_unrunnable_pipeline(
+                &id,
+                body,
+                format!(
+                    "processor [{stage}] option [{option}] is not supported by this xerj \
+                     build ({reason}); no document can be ingested through pipeline [{id}]"
+                ),
+            ) {
+                Ok(()) => Json(json!({ "acknowledged": true })).into_response(),
+                Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            }
+        }
+        Ok(Some(e)) => {
+            tracing::warn!(pipeline = %id, error = %e, "rejected ingest pipeline definition");
+            let err = xerj_common::XerjError::invalid_mapping(format!(
+                "pipeline [{id}] cannot be created: {e}"
+            ));
+            ApiError::new(err).into_response()
+        }
         Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
 }
@@ -23865,13 +24964,13 @@ pub async fn get_ingest_pipeline(
     if id == "*" || id == "_all" {
         let mut result = serde_json::Map::new();
         for entry in state.engine.pipelines.iter() {
-            result.insert(entry.key().clone(), entry.value().clone());
+            result.insert(entry.key().clone(), stored_pipeline_as_es(entry.value()));
         }
         return Json(Value::Object(result)).into_response();
     }
     match state.engine.pipelines.get(&id) {
         Some(pipeline) => {
-            let result = json!({ id.clone(): pipeline.clone() });
+            let result = json!({ id.clone(): stored_pipeline_as_es(pipeline.value()) });
             Json(result).into_response()
         }
         None => {
@@ -23885,6 +24984,13 @@ pub async fn delete_ingest_pipeline(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Issue #204: only the definition used to be removed here. The COMPILED
+    // pipeline stayed in `transform_pipelines`, so a delete that answered
+    // `acknowledged: true` left the stages running for any caller that
+    // reached them by name (`POST /v1/ingest?pipeline=`) — deletion
+    // acknowledged, deletion not performed. `Engine::delete_pipeline` removes
+    // the definition, the compiled form and any recorded unrunnable reason
+    // together, and persists the removal (issue #203).
     match state.engine.delete_pipeline(&id) {
         Ok(true) => Json(json!({ "acknowledged": true })).into_response(),
         Ok(false) => {
@@ -23914,7 +25020,7 @@ pub struct SimulatePipelineParams {
 pub async fn get_all_ingest_pipelines(State(state): State<AppState>) -> impl IntoResponse {
     let mut out = serde_json::Map::new();
     for entry in state.engine.pipelines.iter() {
-        out.insert(entry.key().clone(), entry.value().clone());
+        out.insert(entry.key().clone(), stored_pipeline_as_es(entry.value()));
     }
     Json(Value::Object(out)).into_response()
 }
@@ -24051,20 +25157,10 @@ fn expand_pipeline_processors(state: &AppState, processors: &[Value]) -> Vec<Val
                     let inner = if let Some(p) = pipe.get("processors").and_then(Value::as_array) {
                         p.clone()
                     } else if let Some(stages) = pipe.get("stages").and_then(Value::as_array) {
-                        stages
-                            .iter()
-                            .filter_map(|st| {
-                                let obj = st.as_object()?;
-                                let ty = obj.get("type").and_then(Value::as_str)?;
-                                let cfg = obj
-                                    .get("config")
-                                    .cloned()
-                                    .unwrap_or(Value::Object(serde_json::Map::new()));
-                                let mut m = serde_json::Map::new();
-                                m.insert(ty.to_string(), cfg);
-                                Some(Value::Object(m))
-                            })
-                            .collect()
+                        // Back into ES vocabulary — `field_rename` is `rename`
+                        // to every caller of `_simulate`. See
+                        // `stages_to_es_processors`.
+                        stages_to_es_processors(stages)
                     } else {
                         Vec::new()
                     };
@@ -24750,6 +25846,19 @@ fn apply_single_processor(name: &str, cfg: &Value, source: &mut Value) -> Result
                 .ok_or_else(|| "set processor: 'field' required".to_string())?
                 .to_string();
             let value = cfg.get("value").cloned().unwrap_or(Value::Null);
+            // `override` is Elasticsearch's own key on `set`, defaulting to
+            // `true`. The interpreter used to overwrite unconditionally, so a
+            // `_simulate` of a stored pipeline that PRESERVES an existing value
+            // reported a document the ingest path would never produce — the
+            // same class of quiet disagreement issue #204 is about, and now
+            // reachable from GET, which states `override` explicitly.
+            let overrides = cfg.get("override").and_then(Value::as_bool).unwrap_or(true);
+            if !overrides
+                && get_dotted_path_mut(source_obj, &field)
+                    .is_some_and(|existing| !existing.is_null())
+            {
+                return Ok(());
+            }
             set_dotted_path(source_obj, &field, value);
             Ok(())
         }
@@ -24939,24 +26048,18 @@ pub async fn simulate_ingest_pipeline(
     // when it was round-tripped verbatim, OR in xerj internal shape
     // (`stages: [{type: "set", config: {...}}]`) after compilation.
     // Accept either — convert stages back into the ES-processor shape.
+    //
+    // The conversion has to invert BOTH halves of the translation
+    // `put_ingest_pipeline` applied, name and config. Emitting the internal
+    // name here reported `processor_type: "field_rename"` where ES reports
+    // `"rename"` — invisible while every ES `rename` failed to compile (the
+    // raw ES body was stored, so this branch was never taken), and a
+    // conformance failure the moment `rename` started compiling.
     let processors: Vec<Value> = if let Some(p) = stored.get("processors").and_then(Value::as_array)
     {
         p.clone()
     } else if let Some(stages) = stored.get("stages").and_then(Value::as_array) {
-        stages
-            .iter()
-            .filter_map(|st| {
-                let obj = st.as_object()?;
-                let ty = obj.get("type").and_then(Value::as_str)?;
-                let cfg = obj
-                    .get("config")
-                    .cloned()
-                    .unwrap_or(Value::Object(serde_json::Map::new()));
-                let mut m = serde_json::Map::new();
-                m.insert(ty.to_string(), cfg);
-                Some(Value::Object(m))
-            })
-            .collect()
+        stages_to_es_processors(stages)
     } else {
         Vec::new()
     };
@@ -27639,26 +28742,88 @@ async fn clone_index_to(state: &AppState, source: &str, target: &str) -> Result<
         .get_index(target)
         .map_err(|e| ApiError::new(xerj_common::XerjError::from(e)))?;
 
-    // Copy all documents.
-    let search_req = xerj_query::parse_request(&json!({
-        "query": { "match_all": {} },
-        "size": 10000,
-        "from": 0,
-        // Cloning copies documents verbatim: always read the COMPLETE `_source`,
-        // including engine-generated embedding companions, rather than inheriting
-        // the search default which hides them from ordinary API responses.
-        "_source": true,
-    }))
-    .map_err(|e| ApiError::new(xerj_common::XerjError::invalid_query(e.to_string())))?;
+    // Copy EVERY document, and fail loudly if any copy fails.
+    //
+    // Issue #204, the "a partial export instead of a full one" case, verbatim.
+    // This used to be a single `size: 10000` search whose per-document writes
+    // were swallowed with `let _ =`, and then answered `{"acknowledged": true,
+    // "shards_acknowledged": true}` — so cloning an index with 10,001
+    // documents silently produced a 10,000-document copy, and a clone in which
+    // every single write failed was reported as a success. `_clone`, `_shrink`
+    // and `_split` all land here, on user data.
+    //
+    // Same keyset (`search_after` on `_id`) paging the `_reindex` handler uses,
+    // for the same reason: `from`-offset paging truncates at
+    // `max_result_window`. The source is flushed first because the in-memory
+    // memtable's sort path does not order by `_id` reliably, so un-flushed
+    // writes would be skipped or duplicated across pages.
+    //
+    // That makes the flush a CORRECTNESS precondition of the paging below, not
+    // a best-effort hint — so it is propagated rather than swallowed. A
+    // `let _ =` here would have produced exactly the defect this function was
+    // rewritten to remove: a silently partial (or duplicated) copy answering
+    // `{"acknowledged": true, "shards_acknowledged": true}`.
+    src_idx.flush().await.map_err(|e| {
+        ApiError::new(xerj_common::XerjError::internal(format!(
+            "clone of [{source}] into [{target}] was not attempted: flushing the source \
+             failed ({e}); the copy needs a flushed source to page over it without \
+             skipping or duplicating documents"
+        )))
+    })?;
 
-    let results = src_idx
-        .search(&search_req)
-        .await
-        .map_err(|e| ApiError::new(xerj_common::XerjError::from(e)))?;
+    const CLONE_PAGE_SIZE: usize = 1_000;
+    let mut search_after: Option<Value> = None;
+    let mut copied = 0usize;
 
-    for hit in results.hits {
-        if !hit.source.is_null() {
-            let _ = dest_idx.index_document(Some(hit.id), hit.source).await;
+    loop {
+        let mut search_body = json!({
+            "query": { "match_all": {} },
+            "size": CLONE_PAGE_SIZE,
+            "sort": [{ "_id": "asc" }],
+            // Cloning copies documents verbatim: always read the COMPLETE
+            // `_source`, including engine-generated embedding companions,
+            // rather than inheriting the search default which hides them from
+            // ordinary API responses. Dropping this would make the clone a
+            // silently lossy copy — the same defect class the paging below
+            // exists to remove.
+            "_source": true,
+        });
+        if let Some(sa) = &search_after {
+            search_body["search_after"] = sa.clone();
+        }
+        let search_req = xerj_query::parse_request(&search_body)
+            .map_err(|e| ApiError::new(xerj_common::XerjError::invalid_query(e.to_string())))?;
+
+        let results = src_idx
+            .search(&search_req)
+            .await
+            .map_err(|e| ApiError::new(xerj_common::XerjError::from(e)))?;
+
+        let batch = results.hits.len();
+        if batch == 0 {
+            break;
+        }
+        search_after = results.hits.last().map(|h| json!([h.id.clone()]));
+
+        for hit in results.hits {
+            if hit.source.is_null() {
+                continue;
+            }
+            let id = hit.id.clone();
+            dest_idx
+                .index_document(Some(hit.id), hit.source)
+                .await
+                .map_err(|e| {
+                    ApiError::new(xerj_common::XerjError::internal(format!(
+                        "clone of [{source}] into [{target}] failed after {copied} \
+                         document(s): document [{id}] could not be written: {e}"
+                    )))
+                })?;
+            copied += 1;
+        }
+
+        if batch < CLONE_PAGE_SIZE {
+            break;
         }
     }
     Ok(())
@@ -28086,16 +29251,26 @@ pub async fn search_template(
                     }
                 }
             }
-            Value::Object(mut obj) => {
+            Value::Object(obj) => {
                 // JSON-encoded template object: recursively substitute in string values.
                 let rendered_str = render_template(
-                    &serde_json::to_string(&Value::Object(obj.clone())).unwrap_or_default(),
+                    &serde_json::to_string(&Value::Object(obj)).unwrap_or_default(),
                     &params,
                 );
-                serde_json::from_str(&rendered_str).unwrap_or(Value::Object({
-                    obj.insert("error".to_string(), Value::String("render failed".into()));
-                    obj
-                }))
+                // Issue #204: this used to fall back to the UNRENDERED object
+                // with an `"error": "render failed"` key bolted on, and then
+                // ran a search with it — a different query from the one the
+                // template describes, under a 200. The string arm ten lines
+                // above already refuses; both arms now agree.
+                match serde_json::from_str(&rendered_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err = xerj_common::XerjError::invalid_query(format!(
+                            "template rendered to invalid JSON: {e}"
+                        ));
+                        return ApiError::new(err).into_response();
+                    }
+                }
             }
             other => other,
         }
@@ -36944,6 +38119,7 @@ mod reindex_keyset_tests {
             },
             dest: ReindexDest {
                 index: "dst".into(),
+                pipeline: None,
             },
         };
         let resp = reindex(State(state.clone()), Json(body))

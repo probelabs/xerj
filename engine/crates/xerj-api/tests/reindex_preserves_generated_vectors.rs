@@ -150,3 +150,133 @@ async fn reindex_preserves_generated_embedding_companions() {
         );
     }
 }
+
+/// `_clone` / `_shrink` / `_split` all funnel through `clone_index_to`, which
+/// is a copy path with exactly the same requirement as `_reindex`: read the
+/// COMPLETE `_source`, companions included.
+///
+/// This pins the reconciliation of two changes that landed independently on
+/// the same function. One replaced the single `size: 10000` search with a
+/// keyset-paged loop that propagates write failures (issue #204 — a clone that
+/// silently copied the first 10,000 documents, or copied nothing at all, still
+/// answered `{"acknowledged": true}`). The other added the explicit
+/// `"_source": true` to the search body, because the default projection hides
+/// engine-generated embedding companions. Keeping the loop while dropping the
+/// projection would have traded a silently truncated copy for a silently lossy
+/// one — the same defect wearing a different hat — so the per-page body
+/// carries it, and this test fails if a future edit drops it again.
+#[tokio::test]
+async fn clone_preserves_generated_embedding_companions() {
+    let (app, _dir) = seeded_app().await;
+
+    let (status, source_search) = post(
+        &app,
+        "/src/_search",
+        json!({
+            "query": { "match_all": {} },
+            "size": 1,
+            "_source": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "source search with explicit full _source failed: {source_search}"
+    );
+    let source = &source_search["hits"]["hits"][0]["_source"];
+    let source_vector = source["body_vector"].clone();
+    assert!(
+        source_vector
+            .as_array()
+            .is_some_and(|values| !values.is_empty()),
+        "the source fixture must contain a generated body_vector: {source}"
+    );
+
+    // A second document whose companion was supplied by the CALLER and does
+    // not match what the embedder would produce from `body`. Without the
+    // explicit projection the clone reads the default `_source`, which hides
+    // companions, and the destination silently regenerates one from `body` —
+    // so this is the document that can tell a verbatim copy from a lossy one.
+    // (Document 1 cannot: the destination inherits the source schema, so its
+    // regenerated companion is byte-identical to the source's.)
+    let supplied: Vec<f64> = (0..32).map(|i| (i as f64) / 32.0).collect();
+    let (status, indexed) = post(
+        &app,
+        "/src/_doc/2?refresh=true",
+        json!({ "body": "a second document", "body_vector": supplied }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "seeding the caller-supplied companion failed: {indexed}"
+    );
+    let (status, supplied_search) = post(
+        &app,
+        "/src/_search",
+        json!({
+            "query": { "ids": { "values": ["2"] } },
+            "_source": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "source search failed: {supplied_search}"
+    );
+    let supplied_vector = supplied_search["hits"]["hits"][0]["_source"]["body_vector"].clone();
+
+    let (status, clone_response) = post(&app, "/src/_clone/cloned", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "clone failed: {clone_response}");
+
+    let (status, refresh_response) = post(&app, "/cloned/_refresh", json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "clone refresh failed: {refresh_response}"
+    );
+
+    let (status, cloned_search) = post(
+        &app,
+        "/cloned/_search",
+        json!({
+            "query": { "match_all": {} },
+            "size": 10,
+            "_source": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "clone search with explicit full _source failed: {cloned_search}"
+    );
+    assert_eq!(
+        cloned_search["hits"]["total"]["value"], 2,
+        "the clone must contain every source document: {cloned_search}"
+    );
+    let by_id = |id: &str| -> Value {
+        cloned_search["hits"]["hits"]
+            .as_array()
+            .expect("hits array")
+            .iter()
+            .find(|hit| hit["_id"] == id)
+            .unwrap_or_else(|| panic!("document [{id}] missing from the clone: {cloned_search}"))
+            ["_source"]
+            .clone()
+    };
+    assert_eq!(
+        by_id("1")["body_vector"],
+        source_vector,
+        "clone lost the generated body_vector"
+    );
+    assert_eq!(
+        by_id("2")["body_vector"],
+        supplied_vector,
+        "clone must request `_source: true` on every page: without it the copy \
+         reads the default projection, the companion never crosses, and the \
+         destination regenerates a DIFFERENT vector from `body` while still \
+         answering {{\"acknowledged\": true}}"
+    );
+}

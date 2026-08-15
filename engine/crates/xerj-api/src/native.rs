@@ -919,11 +919,29 @@ pub async fn admin_backup(State(state): State<AppState>, body: Bytes) -> impl In
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
-    // Body is optional and lenient — `{}` or empty both mean "defaults".
+    // Body is optional — empty and `{}` both mean "defaults". A body that is
+    // PRESENT but unparseable is not: issue #204, this was
+    // `.unwrap_or_default()`, so a malformed request silently discarded the
+    // caller's `repo_path` / `name` / `indices` and ran a *different* backup
+    // (default location, every index) under a `201 Created`. An operator
+    // reading "created" had no way to know the archive they asked for is not
+    // the archive that exists.
     let req: BackupRequest = if body.is_empty() {
         BackupRequest::default()
     } else {
-        serde_json::from_slice(&body).unwrap_or_default()
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return native_error(
+                    xerj_common::XerjError::invalid_document_json(format!(
+                        "backup request body is not valid BackupRequest JSON: {e}"
+                    )),
+                    Some(&request_id),
+                    started.elapsed().as_millis() as u64,
+                )
+                .into_response();
+            }
+        }
     };
 
     let data_dir = state.engine.config().server.data_dir.clone();
@@ -2493,12 +2511,30 @@ pub async fn put_pipeline(
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
-    // `None` — this surface rejects a definition it cannot compile, so
-    // nothing is stored on a compile error. On success the pipeline is
-    // written to `<data_dir>/cluster_state.json` before we acknowledge it
-    // (issue #203): it used to live only in memory and vanish on restart,
-    // exactly like the ES-compat one.
-    match state.engine.put_pipeline(&name, body, None) {
+    // `GET /_ingest/pipeline/{name}` is the only read endpoint for a pipeline
+    // created here (this surface registers no native GET), and it answers in
+    // Elasticsearch's `processors` vocabulary. PUTting that output back here
+    // used to hit `serde`'s "missing field `stages`" and surface as a bare
+    // `500 internal error` — a client-shaped mistake reported as an engine
+    // fault, with no hint of where the body belongs. Name the endpoint that
+    // accepts it instead (issue #204).
+    if body.get("stages").is_none() && body.get("processors").is_some() {
+        let e = xerj_common::XerjError::config(format!(
+            "pipeline [{name}]: this body is Elasticsearch-shaped (`processors`), which \
+             this endpoint does not accept — it takes xerj's `stages` form. `GET \
+             /_ingest/pipeline/{name}` renders every stored pipeline in Elasticsearch \
+             vocabulary, so PUT that body to `/_ingest/pipeline/{name}` instead."
+        ));
+        return native_error(e, Some(&request_id), started.elapsed().as_millis() as u64)
+            .into_response();
+    }
+
+    // This surface rejects a definition it cannot compile, so nothing is
+    // stored on a compile error. On success the pipeline is written to
+    // `<data_dir>/cluster_state.json` before we acknowledge it (issue #203):
+    // it used to live only in memory and vanish on restart, exactly like the
+    // ES-compat one.
+    match state.engine.put_pipeline(&name, body) {
         Ok(None) => {
             let took_ms = started.elapsed().as_millis() as u64;
             let resp = NativeResponse::new(

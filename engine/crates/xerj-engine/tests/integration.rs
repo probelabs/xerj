@@ -7880,3 +7880,688 @@ async fn test_bare_count_bucket_script_inside_a_terms_bucket_agrees_on_both_path
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — an analysis block xerj cannot honour must be REFUSED at create
+// time, not accepted and quietly replaced with something weaker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_index_rejects_an_analysis_block_it_cannot_honour() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+
+    // Pre-fix: `autocomplete_tok` was never declared, `apply_settings`
+    // substituted a StandardTokenizer, and the caller got a 200 plus an index
+    // that does not do prefix matching at all.
+    let settings = json!({
+        "analysis": {
+            "analyzer": {
+                "default": {
+                    "type": "custom",
+                    "tokenizer": "autocomplete_tok",
+                    "filter": ["lowercase"]
+                }
+            }
+        }
+    });
+    let err = engine
+        .create_index_with_settings("bad_tok_idx", Schema::empty(), settings)
+        .expect_err("an unresolvable tokenizer must fail index creation");
+    let msg = err.to_string();
+    assert!(msg.contains("autocomplete_tok"), "unhelpful error: {msg}");
+
+    // Refused before anything hit the disk, and not registered in the engine.
+    assert!(engine.get_index("bad_tok_idx").is_err());
+    assert!(
+        !dir.path().join("bad_tok_idx").exists(),
+        "a rejected create must not leave an index directory behind"
+    );
+
+    // An unresolvable token filter is refused for the same reason: dropping
+    // `lowercase` silently makes every match case-sensitive.
+    let err = engine
+        .create_index_with_settings(
+            "bad_filter_idx",
+            Schema::empty(),
+            json!({
+                "analysis": {
+                    "analyzer": {
+                        "default": {
+                            "type": "custom",
+                            "tokenizer": "standard",
+                            "filter": ["lowercse"]
+                        }
+                    }
+                }
+            }),
+        )
+        .expect_err("an unresolvable token filter must fail index creation");
+    assert!(err.to_string().contains("lowercse"), "{err}");
+}
+
+#[tokio::test]
+async fn create_index_still_accepts_every_analysis_construct_we_support() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+
+    // The full supported surface in one settings block — this is the guard
+    // against the #204 check over-rejecting.
+    let settings = json!({
+        "analysis": {
+            "filter": {
+                "my_synonyms": { "type": "synonym", "synonyms": ["fast,quick"] },
+                "my_length":   { "type": "length", "min": 2, "max": 40 },
+                "my_shingle":  { "type": "shingle", "max_shingle_size": 2 },
+                "my_fold":     { "type": "asciifolding" }
+            },
+            "tokenizer": {
+                "ng":   { "type": "ngram", "min_gram": 2, "max_gram": 3 },
+                "edge": { "type": "edge_ngram", "min_gram": 1, "max_gram": 8 },
+                "pat":  { "type": "pattern", "pattern": "\\W+" }
+            },
+            "analyzer": {
+                "default": {
+                    "type": "custom",
+                    "tokenizer": "edge",
+                    "filter": ["lowercase", "stop", "stemmer", "asciifolding",
+                               "my_synonyms", "my_length", "my_shingle", "my_fold"]
+                },
+                "plain": { "type": "english" }
+            }
+        }
+    });
+    engine
+        .create_index_with_settings("good_idx", Schema::empty(), settings)
+        .expect("a fully supported analysis block must still create");
+
+    let idx = engine.get_index("good_idx").unwrap();
+    idx.index_document(Some("1".into()), json!({ "title": "javascript" }))
+        .await
+        .unwrap();
+    let result = idx
+        .search(&make_search(json!({"match": {"title": "java"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 1,
+        "the edge-ngram analyzer must actually be in force"
+    );
+
+    // An index with no analysis block at all is untouched by the check.
+    engine
+        .create_index_with_settings("plain_idx", Schema::empty(), json!({}))
+        .expect("empty settings must still create");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — teaching the analysis resolver the canonical
+// `settings.index.analysis` nesting is a fix at index CREATE and a silent data
+// bug at index OPEN. `settings.json` keeps the caller's nesting verbatim, so an
+// index created before the sweep with the canonical shape has postings on disk
+// that were produced by `standard` — reopening it with the declared analyzers
+// live makes query-time analysis stop matching them, with no error and no log.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A 3-gram `default` analyzer under the CANONICAL `index.analysis` nesting.
+/// Chosen because the mismatch is unmistakable in one direction: a document
+/// indexed with `standard` holds the whole term, and a query analysed with this
+/// holds only 3-grams, so an exact-term search silently returns nothing.
+fn namespaced_ngram_settings() -> Value {
+    json!({
+        "index": {
+            "analysis": {
+                "tokenizer": { "ngram_tok": { "type": "ngram",
+                                              "min_gram": 3, "max_gram": 3 } },
+                "analyzer": { "default": { "type": "custom",
+                                           "tokenizer": "ngram_tok",
+                                           "filter": ["lowercase"] } }
+            }
+        }
+    })
+}
+
+/// Rewrite an index directory into the state a pre-sweep build would have left:
+/// `settings.json` holding the canonical nesting verbatim, and no record that
+/// the canonical binding was ever honoured.
+fn make_index_dir_look_pre_sweep(dir: &std::path::Path, index: &str) {
+    let index_dir = dir.join(index);
+    std::fs::write(
+        index_dir.join("settings.json"),
+        serde_json::to_vec_pretty(&namespaced_ngram_settings()).unwrap(),
+    )
+    .expect("rewrite settings.json");
+    let marker = index_dir.join("analysis-binding.json");
+    if marker.exists() {
+        std::fs::remove_file(&marker).expect("remove binding marker");
+    }
+}
+
+#[tokio::test]
+async fn reopening_a_pre_sweep_index_does_not_silently_change_how_it_analyses() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        // Created with no analysis at all: every token on disk is `standard`.
+        engine
+            .create_index_with_settings("legacy_idx", Schema::empty(), json!({}))
+            .unwrap();
+        let idx = engine.get_index("legacy_idx").unwrap();
+        idx.index_document(Some("1".into()), json!({ "name": "basketball" }))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        let result = idx
+            .search(&make_search(json!({"match": {"name": "basketball"}})))
+            .await
+            .unwrap();
+        assert_eq!(result.total.value, 1, "sanity: the term is findable");
+    }
+
+    // Now make it look exactly like an index a pre-sweep build created with
+    // the canonical nesting — settings declared, never honoured.
+    make_index_dir_look_pre_sweep(dir.path(), "legacy_idx");
+
+    let engine = make_engine(&dir);
+    let idx = engine.get_index("legacy_idx").unwrap();
+    // The document already on disk is still findable…
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "basketball"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 1,
+        "the existing document is still findable"
+    );
+
+    // …and a document written AFTER the reopen goes into the SAME term space.
+    //
+    // This is the half that actually breaks. A declared `default` analyzer is
+    // what the memtable indexes and searches with (`memtable.rs` —
+    // `get_analyzer("default").or_else(standard)`), while the on-disk segments
+    // hold `standard` postings. Honouring `index.analysis` on the open path
+    // therefore makes the reopened index tokenise every new write differently
+    // from everything already on disk: the same query answers differently
+    // depending on whether a document has been flushed yet, with no error and
+    // no log. `ket` is a 3-gram of `basketball` and matches under the declared
+    // analyzer only.
+    idx.index_document(Some("2".into()), json!({ "name": "basketball" }))
+        .await
+        .unwrap();
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "ket"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 0,
+        "reopening a pre-sweep index must keep analysing the way its postings \
+         were written — switching to the declared analyzers silently splits the \
+         index into two incompatible term spaces"
+    );
+
+    // And the plain term still finds both, before and after a flush.
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "basketball"}})))
+        .await
+        .unwrap();
+    assert_eq!(result.total.value, 2, "both documents share one term space");
+}
+
+#[tokio::test]
+async fn an_empty_pre_sweep_index_adopts_the_canonical_binding_and_records_it() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        engine
+            .create_index_with_settings("empty_idx", Schema::empty(), json!({}))
+            .unwrap();
+    }
+    // Same doctoring, but nothing was ever indexed: there are no postings for
+    // the declared analyzers to disagree with, so honouring them is free.
+    make_index_dir_look_pre_sweep(dir.path(), "empty_idx");
+
+    let marker = dir.path().join("empty_idx").join("analysis-binding.json");
+    assert!(!marker.exists(), "precondition: the marker was removed");
+
+    {
+        let engine = make_engine(&dir);
+        let idx = engine.get_index("empty_idx").unwrap();
+        idx.index_document(Some("1".into()), json!({ "name": "basketball" }))
+            .await
+            .unwrap();
+        // The 3-gram analyzer really is in force now.
+        let result = idx
+            .search(&make_search(json!({"match": {"name": "ket"}})))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.total.value, 1,
+            "an empty index may adopt the canonical binding"
+        );
+    }
+
+    // …and the decision was written down, so adding documents cannot make the
+    // next boot answer differently.
+    assert!(
+        marker.exists(),
+        "the adopted binding must be recorded, or a later restart would fall \
+         back to the legacy binding and stop matching what was just written"
+    );
+    let engine = make_engine(&dir);
+    let idx = engine.get_index("empty_idx").unwrap();
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "ket"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 1,
+        "the recorded binding must survive the restart"
+    );
+}
+
+#[tokio::test]
+async fn a_freshly_created_index_honours_the_canonical_analysis_nesting() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index_with_settings("new_idx", Schema::empty(), namespaced_ngram_settings())
+        .expect("the canonical nesting is a supported analysis block");
+    let idx = engine.get_index("new_idx").unwrap();
+    idx.index_document(Some("1".into()), json!({ "name": "basketball" }))
+        .await
+        .unwrap();
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "ket"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 1,
+        "a NEW index must honour `index.analysis` — that half of the fix stands"
+    );
+    assert!(
+        dir.path()
+            .join("new_idx")
+            .join("analysis-binding.json")
+            .exists(),
+        "a new index records the binding it was created with"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — boot replay of an ALREADY-PERSISTED pipeline is not definition
+// time. Refusing it at startup turns a working cluster's writes from 201 into
+// 400 on a binary upgrade alone, with no PUT and no operator action.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_persisted_pipeline_the_new_checks_refuse_still_runs_after_a_restart() {
+    let dir = TempDir::new().unwrap();
+    let cluster_state = dir.path().join("cluster_state.json");
+
+    // Write a cluster_state.json holding a pipeline in exactly the shape a
+    // pre-sweep build would have persisted and happily run: an unknown grok
+    // pattern name, which used to fall through to the catch-all.
+    {
+        let engine = make_engine(&dir);
+        engine
+            .put_pipeline(
+                "legacy_pipe",
+                json!({ "stages": [
+                    { "type": "grok", "config": { "field": "msg", "pattern": "GENERIC" } }
+                ] }),
+            )
+            .expect("a clean definition stores");
+    }
+    let mut state: Value =
+        serde_json::from_slice(&std::fs::read(&cluster_state).expect("cluster_state.json"))
+            .expect("parse cluster_state.json");
+    state["pipelines"]["legacy_pipe"]["stages"][0]["config"]["pattern"] = json!("NGINX_COMBINE");
+    std::fs::write(&cluster_state, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    // Boot again. The definition is on disk and must keep working.
+    let engine = make_engine(&dir);
+    assert!(
+        engine.transform_pipelines.contains_key("legacy_pipe"),
+        "a persisted pipeline must not be dropped by a check added after it was stored"
+    );
+    assert!(
+        !engine.unrunnable_pipelines.contains_key("legacy_pipe"),
+        "…and writes through it must not start 400ing on a binary upgrade alone"
+    );
+    // But the compatibility door is loud, not silent.
+    let degraded = engine
+        .degraded_pipelines
+        .get("legacy_pipe")
+        .map(|r| r.value().clone())
+        .expect("the replay must record what it had to wave through");
+    assert!(
+        degraded.contains("NGINX_COMBINE"),
+        "the degradation must name the offending config: {degraded}"
+    );
+
+    // A live re-PUT of the same definition is still refused — the operator's
+    // repair path answers with the real error.
+    let err = engine
+        .put_pipeline(
+            "legacy_pipe",
+            json!({ "stages": [
+                { "type": "grok", "config": { "field": "msg", "pattern": "NGINX_COMBINE" } }
+            ] }),
+        )
+        .expect("put_pipeline returns the compile error, not an Err");
+    assert!(
+        err.is_some_and(|e| e.to_string().contains("NGINX_COMBINE")),
+        "a definition-time PUT must still refuse the same config"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — …but the door above is for definitions written by a build with
+// NO gate. A definition THIS build already refused must not walk through it.
+// `ingest-pipeline-refusals.json` is the provenance that tells them apart, the
+// same role `analysis-binding.json` plays for an index.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_definition_time_refusal_is_recorded_on_disk_and_replayed_strictly() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("ingest-pipeline-refusals.json");
+
+    {
+        let engine = make_engine(&dir);
+        engine
+            .register_unrunnable_pipeline(
+                "guarded",
+                json!({ "stages": [
+                    { "type": "drop_field",
+                      "config": { "fields": ["secret"], "if": "ctx.tenant == 'a'" } }
+                ] }),
+                "processor [drop_field] option [if] is not supported by this xerj build".into(),
+            )
+            .expect("the refusal reaches disk");
+        assert!(
+            marker.exists(),
+            "the refusal must be durable, not process-local"
+        );
+    }
+
+    let engine = make_engine(&dir);
+    assert!(
+        !engine.transform_pipelines.contains_key("guarded"),
+        "a restart must not resurrect a definition this build refused"
+    );
+    let reason = engine
+        .unrunnable_pipelines
+        .get("guarded")
+        .map(|r| r.value().clone())
+        .expect("the refusal is still recorded after the restart");
+    assert!(
+        reason.contains("if"),
+        "and it answers with the reason the operator already read: {reason}"
+    );
+    assert!(
+        engine.definition_time_refusals.contains_key("guarded"),
+        "the marker itself survives too, or the NEXT restart would soften it"
+    );
+}
+
+#[tokio::test]
+async fn a_definition_that_compiles_clears_its_refusal_marker() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("ingest-pipeline-refusals.json");
+    {
+        let engine = make_engine(&dir);
+        engine
+            .register_unrunnable_pipeline(
+                "p",
+                json!({ "stages": [{ "type": "set",
+                                     "config": { "field": "a", "value": 1, "if": "ctx.x" } }] }),
+                "processor [set] option [if] is not supported by this xerj build".into(),
+            )
+            .expect("refusal stored");
+        // The operator drops the option.
+        assert!(engine
+            .put_pipeline(
+                "p",
+                json!({ "stages": [{ "type": "set", "config": { "field": "a", "value": 1 } }] }),
+            )
+            .expect("no IO failure")
+            .is_none());
+        let on_disk: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(&marker).expect("marker")).expect("parse");
+        assert!(
+            !on_disk.contains_key("p"),
+            "a marker that outlives its cause refuses a pipeline that runs: {on_disk:?}"
+        );
+    }
+    let engine = make_engine(&dir);
+    assert!(
+        engine.transform_pipelines.contains_key("p"),
+        "…and the accepted definition runs after the restart"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_marker_deleted_with_its_pipeline_cannot_haunt_the_next_definition() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        engine
+            .register_unrunnable_pipeline(
+                "p",
+                json!({ "stages": [{ "type": "set",
+                                     "config": { "field": "a", "value": 1, "if": "ctx.x" } }] }),
+                "processor [set] option [if] is not supported by this xerj build".into(),
+            )
+            .expect("refusal stored");
+        assert!(engine.delete_pipeline("p").expect("delete"));
+        assert!(
+            !engine.definition_time_refusals.contains_key("p"),
+            "the marker refers to a definition that no longer exists"
+        );
+        assert!(engine
+            .put_pipeline(
+                "p",
+                json!({ "stages": [{ "type": "set", "config": { "field": "a", "value": 1 } }] }),
+            )
+            .expect("no IO failure")
+            .is_none());
+    }
+    let engine = make_engine(&dir);
+    assert!(
+        engine.transform_pipelines.contains_key("p"),
+        "a fresh definition under a reused id must not inherit the old one's 400"
+    );
+}
+
+/// "Provenance unknown" is not "no refusal". A marker file that exists but
+/// cannot be parsed must fail CLOSED — replay everything at definition
+/// strictness — rather than silently reopen the hole it closes.
+#[tokio::test]
+async fn an_unparseable_refusal_marker_makes_the_replay_strict() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        engine
+            .put_pipeline(
+                "legacy_pipe",
+                json!({ "stages": [
+                    { "type": "grok", "config": { "field": "msg", "pattern": "GENERIC" } }
+                ] }),
+            )
+            .expect("a clean definition stores");
+    }
+    let cluster_state = dir.path().join("cluster_state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&cluster_state).unwrap()).unwrap();
+    state["pipelines"]["legacy_pipe"]["stages"][0]["config"]["pattern"] = json!("NGINX_COMBINE");
+    std::fs::write(&cluster_state, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    std::fs::write(
+        dir.path().join("ingest-pipeline-refusals.json"),
+        b"{not json",
+    )
+    .unwrap();
+
+    let engine = make_engine(&dir);
+    assert!(
+        engine
+            .pipeline_refusals_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the boot must record that it could not classify any pipeline"
+    );
+    assert!(
+        !engine.transform_pipelines.contains_key("legacy_pipe"),
+        "with no provenance the replay must not soften anything"
+    );
+    let reason = engine
+        .unrunnable_pipelines
+        .get("legacy_pipe")
+        .map(|r| r.value().clone())
+        .expect("and it must say why, naming the repair");
+    assert!(
+        reason.contains("ingest-pipeline-refusals.json"),
+        "the reason must name the file to repair: {reason}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — a refusal marker must survive CONCURRENT definition-time
+// refusals, not just sequential ones.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `flush_pipeline_refusals` writes the WHOLE map, so two refusals racing is a
+/// lost update, not a merge: both callers are told the write succeeded, and the
+/// one that writes second with the older snapshot erases the other's marker.
+/// The next boot then finds no provenance for that definition, replays it in
+/// the compatibility mode meant for gate-less builds, and answers `201` to the
+/// write an operator was already told was a `400` — with the field dropped from
+/// a document the `if` guard excludes.
+///
+/// Fail-before, measured on this test with only the `cluster_state_write.lock()`
+/// line removed from `flush_pipeline_refusals` and nothing else: 6 runs, 5
+/// failed — 3, 2, 8, 5 and 1 marker(s) of 64 acknowledged and never written,
+/// one run clean. Three bursts per run is what makes the detector reliable
+/// rather than 5-in-6; a false pass needs all three to come out clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_definition_time_refusals_all_reach_disk() {
+    const THREADS: usize = 64;
+    const BURSTS: usize = 3;
+
+    let dir = TempDir::new().unwrap();
+    let engine = std::sync::Arc::new(make_engine(&dir));
+    let path = dir.path().join("ingest-pipeline-refusals.json");
+    let mut expected: Vec<String> = Vec::with_capacity(THREADS * BURSTS);
+
+    for burst in 0..BURSTS {
+        // Deliberately NOT barriered. A barrier makes every insert land before
+        // the first snapshot is taken, which closes the very window this is
+        // about; the losses come from threads that snapshot while others are
+        // still inserting. `spawn_blocking` rather than `std::thread` because
+        // the engine's writes are synchronous but its constructor wants a
+        // runtime handle in scope.
+        let mut handles = Vec::with_capacity(THREADS);
+        for i in 0..THREADS {
+            let engine = std::sync::Arc::clone(&engine);
+            let id = format!("refused_{burst}_{i}");
+            expected.push(id.clone());
+            handles.push(tokio::task::spawn_blocking(move || {
+                engine.register_unrunnable_pipeline(
+                    &id,
+                    json!({ "stages": [
+                        { "type": "drop_field",
+                          "config": { "fields": ["secret"], "if": "ctx.tenant == 'a'" } }
+                    ] }),
+                    format!("processor-level [if] is not supported ({id})"),
+                )
+            }));
+        }
+        for (i, h) in handles.into_iter().enumerate() {
+            h.await
+                .expect("no panic")
+                .unwrap_or_else(|e| panic!("refused_{burst}_{i} was not acknowledgeable: {e}"));
+        }
+
+        // Every call returned `Ok`, which is the promise that the marker
+        // reached disk. Read the file back and hold it to that — including
+        // every marker from an earlier burst, which a stale snapshot erases
+        // just as easily.
+        let on_disk: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&path).expect("the sidecar must exist"))
+                .expect("and it must parse");
+        let missing: Vec<&String> = expected
+            .iter()
+            .filter(|id| !on_disk.contains_key(*id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "burst {burst}: {} of {} markers were acknowledged and never reached disk: \
+             {missing:?}",
+            missing.len(),
+            expected.len()
+        );
+    }
+
+    // …and the point of the marker: every one of them is still refused after a
+    // restart, with no PUT and no operator action in between.
+    drop(engine);
+    let rebooted = make_engine(&dir);
+    for id in &expected {
+        assert!(
+            !rebooted.transform_pipelines.contains_key(id),
+            "{id} was refused at definition time; a restart must not start running it"
+        );
+        assert!(
+            rebooted.unrunnable_pipelines.contains_key(id),
+            "{id} must still say why it cannot run"
+        );
+    }
+}
+
+/// A sidecar this build could not READ must not be overwritten by the next
+/// refusal.
+///
+/// The file is written whole from the in-memory map, and a boot that could not
+/// parse it starts with that map EMPTY. Flushing it then leaves exactly one
+/// marker on disk and erases every other refusal the file still held — after
+/// which the file parses cleanly, so the next boot concludes those definitions
+/// have no provenance and replays them softly. The fail-closed behaviour would
+/// last exactly one process lifetime and then convert itself into the hole it
+/// exists to close, with no signal.
+#[tokio::test]
+async fn a_refusal_is_not_acknowledged_while_the_sidecar_is_unreadable() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ingest-pipeline-refusals.json");
+    let corrupt = b"{\"still_refused\": \"processor-level [if] is not supported\", ";
+    std::fs::write(&path, corrupt).unwrap();
+
+    let engine = make_engine(&dir);
+    assert!(
+        engine
+            .pipeline_refusals_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "boot must record that the markers could not be classified"
+    );
+
+    let err = engine
+        .register_unrunnable_pipeline(
+            "newly_refused",
+            json!({ "stages": [{ "type": "drop_field", "config": { "fields": ["s"] } }] }),
+            "processor-level [if] is not supported".to_string(),
+        )
+        .expect_err("this must NOT be acknowledgeable while the sidecar is unreadable");
+    let err = err.to_string();
+    assert!(
+        err.contains("ingest-pipeline-refusals.json"),
+        "the error must name the file the operator has to move aside: {err}"
+    );
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        corrupt,
+        "the unreadable sidecar must be left exactly as found — rewriting it from an \
+         empty in-memory map is what erases every refusal it still holds"
+    );
+    assert!(
+        !engine.pipelines.contains_key("newly_refused"),
+        "and nothing may be left behind that only this process can see"
+    );
+}

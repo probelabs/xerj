@@ -420,6 +420,23 @@ impl TransformPlugin for GrokPlugin {
     }
 }
 
+/// Built-in grok pattern names accepted by the `grok` stage.
+///
+/// `GENERIC` is the explicit opt-in for the catch-everything-as-`message`
+/// pattern. It used to be reachable by *typo*: `grok_pattern` fell through to
+/// it for any unrecognised name, so `"pattern": "NGINX_COMBINE"` compiled
+/// happily and then extracted exactly one field (`message`) out of every
+/// access log line — an accepted-and-ignored configuration (issue #204).
+/// `build_plugin` now rejects names outside this list, so the generic pattern
+/// is only ever used when it was actually asked for.
+pub const GROK_PATTERN_NAMES: &[&str] = &[
+    "NGINX_COMBINED",
+    "APACHE_COMBINED",
+    "SYSLOG",
+    "POSTGRESQL",
+    "GENERIC",
+];
+
 /// Returns `(regex_str, field_names)` for a built-in grok pattern.
 fn grok_pattern(name: &str) -> (&'static str, &'static [&'static str]) {
     match name {
@@ -453,11 +470,9 @@ fn grok_pattern(name: &str) -> (&'static str, &'static [&'static str]) {
                 "message",
             ],
         ),
-        _ => (
-            // Generic: capture everything as `message`.
-            r#"^(?P<message>.+)$"#,
-            &["message"],
-        ),
+        // "GENERIC" (and, defensively, anything that slipped past
+        // `build_plugin`'s allow-list): capture everything as `message`.
+        _ => (r#"^(?P<message>.+)$"#, &["message"]),
     }
 }
 
@@ -479,11 +494,22 @@ pub struct PiiRedactionPlugin {
     patterns: Vec<(Regex, &'static str)>,
 }
 
+/// PII type names this plugin knows how to redact.
+///
+/// A name outside this list used to be accepted and then quietly matched
+/// nothing: `PiiRedactionPlugin::new(vec!["social_security".into()])` compiled
+/// to an EMPTY pattern set, so the stage ran on every document, redacted
+/// nothing, and reported success — unredacted PII in the index with no signal
+/// anywhere (issue #204). `build_plugin` now rejects unknown names at
+/// pipeline-creation time.
+pub const PII_TYPE_NAMES: &[&str] = &["email", "ip", "credit_card", "ssn", "phone"];
+
 impl PiiRedactionPlugin {
     /// Build a new plugin that redacts the given PII types.
     ///
-    /// `types` is a list of strings from `["email", "ip", "credit_card",
-    /// "ssn", "phone"]`.  An empty list enables all types.
+    /// `types` is a list of strings from [`PII_TYPE_NAMES`]. An empty list
+    /// enables all types. Callers must validate the names first (see
+    /// `build_plugin`) — an unknown name silently contributes no pattern.
     pub fn new(types: Vec<String>) -> Self {
         let all = types.is_empty();
 
@@ -611,10 +637,23 @@ impl TransformPlugin for CopyFieldPlugin {
 // ConvertTypePlugin
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Target types the `convert` stage can produce.
+///
+/// An unknown target type used to be accepted at pipeline-creation time and
+/// then hit `_ => None` per document: the field was left exactly as it was and
+/// the document passed. `"type": "int"` (instead of `"integer"`) therefore
+/// produced a pipeline that acknowledged the conversion and never performed it
+/// (issue #204). `build_plugin` now rejects unknown target types.
+pub const CONVERT_TARGET_TYPES: &[&str] = &["integer", "float", "string", "boolean"];
+
 /// Convert a field's value to a different type.
 ///
-/// Supported target types: `integer`, `float`, `string`, `boolean`.
-/// If conversion fails the document is passed through unchanged.
+/// Supported target types are [`CONVERT_TARGET_TYPES`]; an unknown one is
+/// rejected when the pipeline is created. If the *value* cannot be coerced
+/// (e.g. `"abc"` to `integer`) the document is passed through unchanged — a
+/// per-document data condition, not a configuration error. (ES's `convert`
+/// processor fails the document instead; that divergence is pre-existing and
+/// out of scope for the #204 sweep.)
 pub struct ConvertTypePlugin {
     field: String,
     target_type: String,
@@ -829,6 +868,68 @@ impl TransformPlugin for SetPlugin {
 
         if self.override_existing || !exists {
             doc[&self.field] = self.value.clone();
+        }
+        ProcessAction::Pass
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppendPlugin
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Append a value to a field, creating or widening a list as needed.
+///
+/// Elasticsearch's `append` semantics, which is what this exists for: the field
+/// becomes a list if it is not one already, a list `value` extends rather than
+/// nests, and a missing field is created as a single-element list
+/// (`IngestDocument.appendFieldValue`, read for semantics only).
+///
+/// Issue #204: `append` used to be *mapped onto `set`* in the ES→xerj processor
+/// translation (`es_compat.rs`), so `{"append": {"field": "tags", "value":
+/// "b"}}` REPLACED `["a"]` with `"b"` instead of producing `["a", "b"]` —
+/// under a `200 {"acknowledged": true}`, and disagreeing with the `_simulate`
+/// interpreter, which has always implemented a real append. Two behaviours for
+/// one pipeline; this is the one that runs at ingest.
+pub struct AppendPlugin {
+    field: String,
+    value: Value,
+}
+
+impl AppendPlugin {
+    pub fn new(field: impl Into<String>, value: Value) -> Self {
+        Self {
+            field: field.into(),
+            value,
+        }
+    }
+}
+
+impl TransformPlugin for AppendPlugin {
+    fn name(&self) -> &str {
+        "append"
+    }
+
+    fn process(&self, doc: &mut Value) -> ProcessAction {
+        let Some(obj) = doc.as_object_mut() else {
+            return ProcessAction::Pass;
+        };
+        let slot = obj
+            .entry(self.field.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        match slot {
+            Value::Array(existing) => match self.value.clone() {
+                Value::Array(more) => existing.extend(more),
+                one => existing.push(one),
+            },
+            scalar => {
+                let previous = scalar.clone();
+                let mut out = vec![previous];
+                match self.value.clone() {
+                    Value::Array(more) => out.extend(more),
+                    one => out.push(one),
+                }
+                *scalar = Value::Array(out);
+            }
         }
         ProcessAction::Pass
     }

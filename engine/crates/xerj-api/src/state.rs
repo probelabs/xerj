@@ -304,30 +304,63 @@ impl MlDetector {
     }
 
     /// Load all persisted detectors from `<data_dir>/_ml/detectors.json`.
-    /// Missing/corrupt files yield an empty registry (best effort).
+    ///
+    /// An ABSENT file is a fresh node and yields an empty registry silently. A
+    /// file that is present but unreadable or unparseable also yields an empty
+    /// registry — every detector the operator configured disappears — so it is
+    /// logged at ERROR rather than swallowed (issue #204). Boot is not failed
+    /// on it: a node that refuses to start is worse than one that starts with
+    /// its ML jobs missing and says so.
     pub fn load_all(data_dir: &str) -> DashMap<String, MlDetector> {
         let map = DashMap::new();
         let path = Self::registry_path(data_dir);
-        if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok(list) = serde_json::from_slice::<Vec<MlDetector>>(&bytes) {
-                for d in list {
-                    map.insert(d.detector_id.clone(), d);
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Vec<MlDetector>>(&bytes) {
+                Ok(list) => {
+                    for d in list {
+                        map.insert(d.detector_id.clone(), d);
+                    }
                 }
-            }
+                Err(e) => tracing::error!(
+                    path = %path.display(), error = %e,
+                    "ml detector registry is unparseable — ALL configured detectors are \
+                     being dropped; move the file aside to stop it being overwritten"
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::error!(
+                path = %path.display(), error = %e,
+                "ml detector registry could not be read — ALL configured detectors are \
+                 being dropped"
+            ),
         }
         map
     }
 
-    /// Persist the full registry to disk (best effort — swallows I/O errors).
+    /// Persist the full registry to disk.
+    ///
+    /// Issue #204: the write used to be `let _ = ..`, so a detector accepted
+    /// with a 200 could fail to reach disk and vanish at the next restart with
+    /// no signal anywhere. Still best-effort — the caller has already
+    /// acknowledged — but no longer silent.
     pub fn save_all(data_dir: &str, registry: &DashMap<String, MlDetector>) {
         let path = Self::registry_path(data_dir);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let list: Vec<MlDetector> = registry.iter().map(|e| e.value().clone()).collect();
-        if let Ok(bytes) = serde_json::to_vec_pretty(&list) {
-            let _ = std::fs::write(&path, bytes);
+        if let Err(e) = Self::write_registry(&path, &list) {
+            tracing::error!(
+                path = %path.display(), error = %e,
+                "failed to persist ml detector registry — detectors are live in memory \
+                 but WILL BE LOST on restart"
+            );
         }
+    }
+
+    fn write_registry(path: &std::path::Path, list: &[MlDetector]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(list)?;
+        std::fs::write(path, bytes)
     }
 }
 
@@ -396,31 +429,58 @@ impl MlDatafeed {
     /// Load all persisted datafeeds. Runtime state (`state`, cursor) is reset:
     /// background scoring tasks and the results store are in-memory only and do
     /// not survive a restart, so a freshly-loaded datafeed is always `stopped`.
+    ///
+    /// A present-but-unreadable registry drops every configured datafeed; that
+    /// is logged at ERROR rather than swallowed (issue #204). An absent file is
+    /// a fresh node and stays quiet.
     pub fn load_all(data_dir: &str) -> DashMap<String, MlDatafeed> {
         let map = DashMap::new();
         let path = Self::registry_path(data_dir);
-        if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok(list) = serde_json::from_slice::<Vec<MlDatafeed>>(&bytes) {
-                for mut d in list {
-                    d.state = "stopped".to_string();
-                    d.last_scored_ms = None;
-                    map.insert(d.datafeed_id.clone(), d);
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Vec<MlDatafeed>>(&bytes) {
+                Ok(list) => {
+                    for mut d in list {
+                        d.state = "stopped".to_string();
+                        d.last_scored_ms = None;
+                        map.insert(d.datafeed_id.clone(), d);
+                    }
                 }
-            }
+                Err(e) => tracing::error!(
+                    path = %path.display(), error = %e,
+                    "ml datafeed registry is unparseable — ALL configured datafeeds are \
+                     being dropped; move the file aside to stop it being overwritten"
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::error!(
+                path = %path.display(), error = %e,
+                "ml datafeed registry could not be read — ALL configured datafeeds are \
+                 being dropped"
+            ),
         }
         map
     }
 
-    /// Persist the full registry to disk (best effort — swallows I/O errors).
+    /// Persist the full registry to disk. Best-effort but not silent — see
+    /// [`MlDetector::save_all`] (issue #204).
     pub fn save_all(data_dir: &str, registry: &DashMap<String, MlDatafeed>) {
         let path = Self::registry_path(data_dir);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let list: Vec<MlDatafeed> = registry.iter().map(|e| e.value().clone()).collect();
-        if let Ok(bytes) = serde_json::to_vec_pretty(&list) {
-            let _ = std::fs::write(&path, bytes);
+        if let Err(e) = Self::write_registry(&path, &list) {
+            tracing::error!(
+                path = %path.display(), error = %e,
+                "failed to persist ml datafeed registry — datafeeds are live in memory \
+                 but WILL BE LOST on restart"
+            );
         }
+    }
+
+    fn write_registry(path: &std::path::Path, list: &[MlDatafeed]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(list)?;
+        std::fs::write(path, bytes)
     }
 }
 

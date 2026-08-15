@@ -1510,7 +1510,23 @@ async fn prune_response(
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(mut v) => {
                 prune_json(&mut v, sites, principal, &known);
-                serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec())
+                match serde_json::to_vec(&v) {
+                    Ok(v) => v,
+                    // Issue #204: this was
+                    // `.unwrap_or_else(|_| bytes.to_vec())` — a failure to
+                    // re-serialise the PRUNED document fell back to the
+                    // ORIGINAL bytes, i.e. the scoped principal received the
+                    // unfiltered listing this function exists to withhold.
+                    // Refuse, exactly as the buffering failure above does: a
+                    // filter that cannot run must not fail open.
+                    Err(e) => {
+                        tracing::error!(error = %e, "could not re-serialise pruned response");
+                        return es_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "response could not be authorized".to_string(),
+                        );
+                    }
+                }
             }
             // Not JSON after all (some `_cat` handlers answer text under a
             // JSON content type); fall through to the line filter.

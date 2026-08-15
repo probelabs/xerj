@@ -235,9 +235,15 @@ pub(crate) fn flush_finalize_gate() -> &'static tokio::sync::Semaphore {
 // ── Analyzer helpers ──────────────────────────────────────────────────────────
 
 use std::sync::Arc;
+// `AnalyzerRegistry` is `pub use`d, not merely imported, so the API layer can
+// gate `PUT /{index}/_settings` on exactly the `analysis` spellings the
+// registry resolves without xerj-api taking a direct dependency on xerj-fts.
+// The create-time and settings-time gates drifted apart once already — one
+// refused four spellings, the other two — and one shared symbol is what stops
+// that (issue #204).
+pub use xerj_fts::analyzer::AnalyzerRegistry;
 use xerj_fts::analyzer::{
-    AnalyzerRegistry, LowercaseFilter, StandardTokenizer, StemmerFilter, StopwordsFilter,
-    TokenFilter, Tokenizer,
+    LowercaseFilter, StandardTokenizer, StemmerFilter, StopwordsFilter, TokenFilter, Tokenizer,
 };
 
 /// Return a default [`AnalyzerRegistry`] pre-populated with all built-in analyzers.

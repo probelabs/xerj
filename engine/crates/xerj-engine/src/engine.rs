@@ -445,6 +445,72 @@ pub struct Engine {
     /// [`Engine::put_pipeline`] / [`Engine::delete_pipeline`], or the change
     /// will not survive a restart (issue #203).
     pub pipelines: Arc<DashMap<String, Value>>,
+    /// pipeline_id → why the stored definition has no compiled counterpart.
+    ///
+    /// Issue #204. A definition that carries a stage type this build does not
+    /// implement is still stored (Elasticsearch accepts it, and
+    /// `_ingest/pipeline/{id}/_simulate` still walks it), but nothing may be
+    /// ingested through it: `process_through_pipeline` refuses with the reason
+    /// recorded here instead of quietly indexing the untransformed document.
+    pub unrunnable_pipelines: Arc<DashMap<String, String>>,
+    /// pipeline_id → the reason a **gate-bearing build refused this exact
+    /// definition at PUT time**, persisted so a restart cannot overturn the
+    /// answer the operator already received.
+    ///
+    /// Issue #204. This is PROVENANCE, and it plays the same role for a
+    /// pipeline that `analysis-binding.json` plays for an index: its ABSENCE is
+    /// the load-bearing signal. A definition in `cluster_state.json` with no
+    /// entry here was written by a build that had no gate, so the boot replay
+    /// may soften it ([`CompileMode::ReplayPersisted`](xerj_wasm::pipeline::CompileMode)).
+    /// A definition WITH an entry here was already answered "no" by this
+    /// contract, and the replay must not resurrect it — without this marker,
+    /// `ReplayPersisted` cannot tell the two apart, and a plain restart turned a
+    /// PUT-time refusal back into a `201` that wrote the wrong document
+    /// (`GET` hands the operator the stored shape, they edit it, PUT it back,
+    /// get the refusal, restart, and the refusal is gone).
+    ///
+    /// Persisted in `<data_dir>/ingest-pipeline-refusals.json`, deliberately
+    /// NOT in `cluster_state.json`: that envelope is a closed format-1 contract
+    /// with `deny_unknown_fields` (see [`crate::cluster_state`]), so adding a
+    /// field to it would make every file this build writes unreadable to an
+    /// older binary. A sidecar an older build simply ignores does not.
+    ///
+    /// Reference: Lucene records the same kind of fact for the same reason.
+    /// `SegmentInfos.indexCreatedVersionMajor`
+    /// (`lucene/core/src/java/org/apache/lucene/index/SegmentInfos.java:172`,
+    /// "The Lucene version major that was used to create the index") is written
+    /// once into the commit
+    /// (`SegmentInfos.java:633`, `out.writeVInt(indexCreatedVersionMajor)`) and
+    /// then *decides how the bytes are read back* rather than being re-derived:
+    /// `readCommit` throws `CorruptIndexException` when a segment predates the
+    /// recorded creation version (`SegmentInfos.java:491-501`), and
+    /// `readLatestCommit(dir, minSupportedMajor)` refuses a commit whose
+    /// recorded creation major is below the caller's floor
+    /// (`SegmentInfos.java:572-578`). The lesson taken here is the shape, not
+    /// the code: what a *later* reader may assume about persisted bytes has to
+    /// be recorded WITH them at write time, because it cannot be recovered
+    /// afterwards. Lucene is Apache-2.0, the same licence as XERJ; no code is
+    /// reproduced.
+    pub definition_time_refusals: Arc<DashMap<String, String>>,
+    /// Set when `ingest-pipeline-refusals.json` exists but could not be read or
+    /// parsed, so no pipeline's provenance is known.
+    ///
+    /// Issue #204. "Unknown provenance" is not "no refusal": replaying softly
+    /// there would resurrect exactly the refusals the marker exists to keep.
+    /// Every persisted pipeline is replayed at DEFINITION strictness instead —
+    /// fail closed, and loudly, with the repair named in the reason.
+    pub pipeline_refusals_unreadable: Arc<std::sync::atomic::AtomicBool>,
+    /// pipeline_id → configuration the running build cannot honour but that
+    /// was already persisted by an older one.
+    ///
+    /// Issue #204. The pipeline RUNS — exactly as the build that stored it ran
+    /// it — because failing it at boot would turn a working cluster's writes
+    /// from 201 into 400 on a binary upgrade alone. This map is what stops that
+    /// compatibility door from being silent: it is populated only by the boot
+    /// replay ([`Engine::compile_pipeline_with_mode`] with
+    /// [`CompileMode::ReplayPersisted`](xerj_wasm::pipeline::CompileMode)), and
+    /// a re-`PUT` of the same definition answers 400 with the same reason.
+    pub degraded_pipelines: Arc<DashMap<String, String>>,
     /// index_name → open/closed state (true = closed)
     pub closed_indices: Arc<DashMap<String, bool>>,
     /// data stream name → DataStream. Persisted in
@@ -741,6 +807,10 @@ impl Engine {
             templates: Arc::new(DashMap::new()),
             scrolls: Arc::new(DashMap::new()),
             pipelines: Arc::new(DashMap::new()),
+            unrunnable_pipelines: Arc::new(DashMap::new()),
+            definition_time_refusals: Arc::new(DashMap::new()),
+            pipeline_refusals_unreadable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            degraded_pipelines: Arc::new(DashMap::new()),
             closed_indices: Arc::new(DashMap::new()),
             data_streams: Arc::new(DashMap::new()),
             ilm_policies: Arc::new(DashMap::new()),
@@ -913,6 +983,14 @@ impl Engine {
             // the operator designed. Must run after the index scan above, so a
             // restored data stream can report which of its backing indices are
             // actually present, and before the server accepts requests.
+            // Issue #204: the refusal markers are read BEFORE the pipelines
+            // they classify, and unconditionally — not from inside
+            // `apply_cluster_state`, which returns early when there is no
+            // `cluster_state.json`. On that path an unreadable sidecar left
+            // `pipeline_refusals_unreadable` false, so the first refused `PUT`
+            // would have overwritten the file with a one-entry map and erased
+            // every marker still in it.
+            engine.load_persisted_pipeline_refusals();
             engine.apply_cluster_state(prepared_cluster_state);
 
             // Then say plainly which `.ds-*` indices no restored stream claims.
@@ -1664,6 +1742,149 @@ impl Engine {
         }
     }
 
+    // ── Ingest-pipeline refusal provenance (issue #204) ─────────────────────
+
+    /// Sidecar holding [`Engine::definition_time_refusals`].
+    ///
+    /// A separate file rather than an eighth field in `cluster_state.json`:
+    /// that envelope is `deny_unknown_fields`, so widening it would make every
+    /// file this build writes unreadable to an older binary — a downgrade
+    /// break traded for an upgrade fix. An older binary ignores this file.
+    fn pipeline_refusals_path(&self) -> PathBuf {
+        self.data_dir.join("ingest-pipeline-refusals.json")
+    }
+
+    /// Write the whole refusal map atomically.
+    ///
+    /// `Err` means the marker did not reach disk, and the caller MUST NOT
+    /// acknowledge: without it the next boot cannot tell this definition from
+    /// one an older, gate-less build wrote, and would soften the refusal back
+    /// into a `201` (issue #204). Same rule `flush_cluster_state` already
+    /// enforces for the definition itself (issue #203).
+    ///
+    /// # Why the snapshot is taken inside the lock
+    ///
+    /// This writes the WHOLE map, so two concurrent refused `PUT`s are a
+    /// lost-update race, not a merge: each inserts its own marker, each
+    /// snapshots, and the one that writes SECOND with the OLDER snapshot
+    /// erases the other's marker from disk — while both callers are told
+    /// `{"acknowledged": true}`, which is exactly the promise this function's
+    /// `Err` contract exists to keep. Measured on the unlocked version at a
+    /// live node: 40 concurrent refused `PUT`s, 40 acknowledged, 37 markers on
+    /// disk; after a plain restart the three lost ones replayed at
+    /// `ReplayPersisted`, answered `201`, and dropped a field from a document
+    /// their `if` guard excluded. Sequential tests never see it.
+    ///
+    /// `cluster_state_write` is the mutex, not a second one, because the two
+    /// files are written back to back by the same callers and one order for
+    /// both is easier to reason about than two. It is taken and released here,
+    /// never held across `flush_cluster_state` — `parking_lot::Mutex` is not
+    /// reentrant.
+    fn flush_pipeline_refusals(&self) -> Result<()> {
+        // A boot that could not READ this file has an empty in-memory map, so
+        // writing it would erase every marker still on disk: the next boot
+        // would parse the truncated file cleanly, conclude those definitions
+        // have no provenance, and replay them at `ReplayPersisted` — the very
+        // hole the marker closes, reopened by the fail-closed path itself.
+        // Refuse instead, and name the file, so the operator's repair is to
+        // move it aside rather than to discover the loss at the next restart
+        // (issue #204).
+        if self
+            .pipeline_refusals_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                format!(
+                    "{} could not be read at boot, so its markers are not in memory and \
+                     rewriting it here would erase every refusal it still holds; every \
+                     persisted pipeline is being replayed at definition strictness until \
+                     the file is moved aside and this node restarted",
+                    self.pipeline_refusals_path().display()
+                ),
+            )));
+        }
+        // One writer at a time, snapshot included — see the doc comment.
+        let _writing = self.cluster_state_write.lock();
+        let snapshot: std::collections::BTreeMap<String, String> = self
+            .definition_time_refusals
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|e| {
+            xerj_common::XerjError::internal(format!(
+                "could not serialise the ingest-pipeline refusal markers: {e}"
+            ))
+        })?;
+        crate::index::write_file_atomic(&self.pipeline_refusals_path(), &bytes).map_err(|e| {
+            EngineError::Common(xerj_common::XerjError::internal(format!(
+                "could not persist {}: {e}",
+                self.pipeline_refusals_path().display()
+            )))
+        })
+    }
+
+    /// Clearing a refusal marker is not on the acknowledge path — a marker
+    /// that outlives its cause makes a pipeline *more* refused, never less —
+    /// so a write failure is logged rather than propagated.
+    fn flush_pipeline_refusals_best_effort(&self) {
+        if let Err(e) = self.flush_pipeline_refusals() {
+            warn!(
+                error = %e,
+                "could not clear an ingest-pipeline refusal marker; the pipeline will be \
+                 refused again after the next restart until a re-PUT succeeds"
+            );
+        }
+    }
+
+    /// Read the refusal markers back at boot, before any pipeline is replayed.
+    ///
+    /// A missing file is the normal case for a data dir written before this
+    /// build — every pipeline in it is then treated as "no provenance", which
+    /// is exactly the compatibility door the replay mode exists for. A corrupt
+    /// file is NOT treated as "no refusals": that would silently reopen the
+    /// hole this marker closes, so the boot refuses to run any pipeline it
+    /// cannot classify.
+    fn load_persisted_pipeline_refusals(&self) {
+        let path = self.pipeline_refusals_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                error!(
+                    path = %path.display(), error = %e,
+                    "ingest-pipeline refusal markers are unreadable; every persisted pipeline \
+                     will be replayed at DEFINITION strictness so a refusal cannot be lost"
+                );
+                self.pipeline_refusals_unreadable
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+        match serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&bytes) {
+            Ok(map) => {
+                let n = map.len();
+                for (id, reason) in map {
+                    self.definition_time_refusals.insert(id, reason);
+                }
+                if n > 0 {
+                    info!(
+                        count = n,
+                        "restored ingest-pipeline refusals recorded at definition time"
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    path = %path.display(), error = %e,
+                    "ingest-pipeline refusal markers are corrupt; every persisted pipeline will \
+                     be replayed at DEFINITION strictness so a refusal cannot be lost"
+                );
+                self.pipeline_refusals_unreadable
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
     // ── Lifecycle management (ISM/ILM) persistence ──────────────────────────
 
     fn ism_policies_path(&self) -> PathBuf {
@@ -2179,17 +2400,86 @@ impl Engine {
         // `?pipeline=x` would be accepted after a restart and quietly do
         // nothing. Keep the stored document either way so GET round-trips
         // exactly as it did before the restart.
+        //
+        // Which strictness a definition is replayed at is decided by
+        // PROVENANCE, never by the calendar (issue #204). The markers are
+        // already loaded — `Engine::new` does it before this runs, so the
+        // no-`cluster_state.json` path sees them too — and loading is
+        // idempotent, so this call keeps every other caller of
+        // `apply_cluster_state` correct on its own.
+        self.load_persisted_pipeline_refusals();
+        let provenance_unknown = self
+            .pipeline_refusals_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst);
         let mut pipelines_restored = 0usize;
         for (name, config) in state.pipelines {
             self.pipelines.insert(name.clone(), config.clone());
-            match self.compile_pipeline(&name, config) {
-                Ok(()) => pipelines_restored += 1,
-                Err(e) => error!(
-                    pipeline = name.as_str(), error = %e,
-                    "persisted ingest pipeline could not be recompiled — it is \
-                     still visible to GET /_ingest/pipeline but will NOT \
-                     transform anything; re-PUT the definition"
-                ),
+            let refused_at_definition_time = self
+                .definition_time_refusals
+                .get(&name)
+                .map(|r| r.value().clone());
+            // Replay strictness is for definitions written by a build with NO
+            // gate: those were accepted by whichever build wrote them and
+            // failing them at boot would flip a working cluster's writes from
+            // 201 to 400 on a binary upgrade alone. A definition THIS contract
+            // already refused is the opposite case — the operator asked, was
+            // told 400, and a restart must not answer differently. Softening
+            // it here dropped `secret` from documents an `if` guard excluded,
+            // under a 201, with no PUT in between.
+            let mode = if refused_at_definition_time.is_some() || provenance_unknown {
+                xerj_wasm::pipeline::CompileMode::Strict
+            } else {
+                xerj_wasm::pipeline::CompileMode::ReplayPersisted
+            };
+            match self.compile_pipeline_with_mode(&name, config, mode) {
+                Ok(()) => {
+                    if refused_at_definition_time.is_some() {
+                        // This build honours what the refusing one could not,
+                        // so the marker has outlived its cause. Clearing it is
+                        // what stops a capability upgrade needing a re-PUT.
+                        info!(
+                            pipeline = name.as_str(),
+                            "a pipeline refused at definition time by an earlier build compiles \
+                             cleanly here; the recorded refusal is cleared and it now runs"
+                        );
+                        self.definition_time_refusals.remove(&name);
+                        self.flush_pipeline_refusals_best_effort();
+                    }
+                    pipelines_restored += 1
+                }
+                Err(e) => {
+                    // Issue #204: record WHY there is no executable form, so
+                    // every ingest path refuses loudly with the reason
+                    // instead of reporting a pipeline GET plainly shows as
+                    // "not found" — the same contract as a fresh PUT.
+                    let reason = match (&refused_at_definition_time, provenance_unknown) {
+                        // Answer the operator with the words they already
+                        // read at PUT time, so the restart is visibly a
+                        // continuation rather than a new, different failure.
+                        (Some(recorded), _) => recorded.clone(),
+                        (None, true) => format!(
+                            "the persisted definition could not be recompiled at startup ({e}), \
+                             and `ingest-pipeline-refusals.json` could not be read, so this \
+                             build cannot tell an already-refused definition from one an \
+                             older build accepted; no document can be ingested through \
+                             pipeline [{name}] — repair or delete that file, or re-PUT the \
+                             definition"
+                        ),
+                        (None, false) => format!(
+                            "the persisted definition could not be recompiled \
+                             at startup ({e}); no document can be ingested \
+                             through pipeline [{name}] — re-PUT the definition"
+                        ),
+                    };
+                    self.unrunnable_pipelines.insert(name.clone(), reason);
+                    error!(
+                        pipeline = name.as_str(), error = %e,
+                        refused_at_definition_time = refused_at_definition_time.is_some(),
+                        "persisted ingest pipeline could not be recompiled — it is \
+                         still visible to GET /_ingest/pipeline but will NOT \
+                         transform anything; re-PUT the definition"
+                    )
+                }
             }
         }
 
@@ -2371,32 +2661,33 @@ impl Engine {
     /// gets stored (and handed back by `GET /_ingest/pipeline/{id}`) when it
     /// compiles — the shape this endpoint has always returned.
     ///
-    /// `keep_if_uncompilable` says what to do when it does *not* compile, and
-    /// differs by surface:
+    /// A definition that does not compile is NOT stored: `Ok(Some(err))` is
+    /// returned, nothing is flushed, and any pipeline already registered under
+    /// this id is left untouched. A caller that must keep an uncompilable
+    /// definition readable — the ES-compat surface does, because Elasticsearch
+    /// accepts processors this build does not implement — calls
+    /// [`Self::register_unrunnable_pipeline`] instead, which stores the
+    /// definition *and* the reason it cannot run, and persists the refusal
+    /// marker that makes that reason survive a restart.
     ///
-    /// * `Some(doc)` — the ES-compat surface. It has always answered
-    ///   `acknowledged` and left the definition readable, so `doc` (the
-    ///   ES-shaped body as received) is stored and the compile error is
-    ///   returned as `Ok(Some(err))` for the caller to log.
-    /// * `None` — the xerj-native surface, which rejects a definition it
-    ///   cannot compile. Nothing is stored, nothing is flushed, and any
-    ///   pipeline already registered under this id is left untouched.
+    /// (This used to take a third `keep_if_uncompilable: Option<Value>`
+    /// argument whose `Some` arm stored the definition here. Every caller in
+    /// the workspace passed `None` — the ES surface routes through
+    /// `register_unrunnable_pipeline` — so the arm was unreachable, untested,
+    /// and held its own copy of the refusal-marker bookkeeping that the live
+    /// path already does. Issue #204: a security-relevant branch with no
+    /// caller is a liability, not a spare part.)
     ///
-    /// Either way a compile failure drops the *executable* form under this
-    /// id. Leaving the old one behind would mean `?pipeline={id}` kept
-    /// running a definition `GET` no longer shows — and stopped running it at
-    /// the next restart. A definition must behave the same before and after a
-    /// reboot; that is the whole point of persisting it.
+    /// A compile failure drops the *executable* form under this id. Leaving
+    /// the old one behind would mean `?pipeline={id}` kept running a
+    /// definition `GET` no longer shows — and stopped running it at the next
+    /// restart. A definition must behave the same before and after a reboot;
+    /// that is the whole point of persisting it.
     ///
     /// `Err` means the definition did not reach disk. The in-memory change is
     /// rolled back first, so the caller can report the write as failed
     /// without leaving behind a pipeline only this process can see.
-    pub fn put_pipeline(
-        &self,
-        id: &str,
-        config: Value,
-        keep_if_uncompilable: Option<Value>,
-    ) -> Result<Option<xerj_wasm::WasmError>> {
+    pub fn put_pipeline(&self, id: &str, config: Value) -> Result<Option<xerj_wasm::WasmError>> {
         // Up front, so a refused write never disturbs the compiled form of a
         // pipeline that is still running.
         self.ensure_cluster_state_writable()?;
@@ -2404,43 +2695,103 @@ impl Engine {
         // Taken out up front so a failed compile cannot leave a stale
         // executable behind; put back verbatim on every abort path.
         let previous_compiled = self.transform_pipelines.remove(id).map(|(_, p)| p);
+        // `compile_pipeline` clears this on success; snapshot it so a failed
+        // flush can put the previous definition's unrunnable reason back too
+        // (issue #204 — a rolled-back write must not turn "stored but not
+        // runnable, and here is why" into a bare "not found").
+        let previous_reason = self.unrunnable_pipelines.get(id).map(|r| r.value().clone());
+        // Same for the persisted refusal marker (issue #204): a rolled-back
+        // write must not silently un-refuse a definition that is still the one
+        // on disk.
+        let previous_marker = self
+            .definition_time_refusals
+            .get(id)
+            .map(|r| r.value().clone());
+        // Same for the boot-replay degradation note: a rolled-back write must
+        // leave the previous definition described exactly as it was.
+        let previous_degradation = self.degraded_pipelines.get(id).map(|r| r.value().clone());
 
         // `compile_pipeline` mutates nothing when it fails, so an abort only
         // has to undo the two lines above.
-        let compile_err = match self.compile_pipeline(id, config) {
-            Ok(()) => None,
-            Err(e) => match keep_if_uncompilable {
-                None => {
-                    if let Some(p) = previous_compiled {
-                        self.transform_pipelines.insert(id.to_string(), p);
-                    }
-                    return Ok(Some(e));
-                }
-                Some(doc) => {
-                    self.pipelines.insert(id.to_string(), doc);
-                    Some(e)
-                }
-            },
-        };
-
-        if let Err(e) = self.flush_cluster_state() {
-            match previous_doc {
-                Some(d) => self.pipelines.insert(id.to_string(), d),
-                None => self.pipelines.remove(id).map(|(_, v)| v),
-            };
-            self.transform_pipelines.remove(id);
+        if let Err(e) = self.compile_pipeline(id, config) {
             if let Some(p) = previous_compiled {
                 self.transform_pipelines.insert(id.to_string(), p);
             }
+            return Ok(Some(e));
+        }
+
+        // Every abort path restores exactly the state this call found, so a
+        // write that did not reach disk leaves nothing only this process can
+        // see. Each expansion sits in a branch that returns, so the moves out
+        // of the `previous_*` snapshots never overlap.
+        macro_rules! rollback {
+            () => {{
+                match previous_doc {
+                    Some(d) => self.pipelines.insert(id.to_string(), d),
+                    None => self.pipelines.remove(id).map(|(_, v)| v),
+                };
+                self.transform_pipelines.remove(id);
+                if let Some(p) = previous_compiled {
+                    self.transform_pipelines.insert(id.to_string(), p);
+                }
+                match previous_reason {
+                    Some(r) => self.unrunnable_pipelines.insert(id.to_string(), r),
+                    None => self.unrunnable_pipelines.remove(id).map(|(_, v)| v),
+                };
+                match previous_marker {
+                    Some(r) => self.definition_time_refusals.insert(id.to_string(), r),
+                    None => self.definition_time_refusals.remove(id).map(|(_, v)| v),
+                };
+                match previous_degradation {
+                    Some(r) => self.degraded_pipelines.insert(id.to_string(), r),
+                    None => self.degraded_pipelines.remove(id).map(|(_, v)| v),
+                };
+            }};
+        }
+
+        // Issue #204: order the two files so the crash window fails CLOSED.
+        //
+        // Reaching here means the definition compiled, so the only marker
+        // change this function can make is a REMOVAL — `compile_pipeline`
+        // clears the marker on success, and nothing here sets one (a
+        // definition that does not compile returned above without storing
+        // anything; the caller that keeps such a definition readable goes
+        // through `register_unrunnable_pipeline`, which inserts, and therefore
+        // orders the two files the other way round for the same reason).
+        //
+        // A removal must land AFTER the definition:
+        //
+        //   definition without the clear — the marker is stale, so the boot
+        //     replays the NEW definition at definition strictness. It compiled
+        //     here, so it compiles there, and the self-heal clears the marker
+        //     and logs it. Loud at worst, and it repairs itself.
+        //   clear without the definition — the marker is gone while the OLD,
+        //     refused definition is still the one on disk, so the boot replays
+        //     it softly and the pipeline silently starts running with the
+        //     refused option ignored. That is exactly the defect this marker
+        //     exists to close, reached through the rollback path.
+        //
+        // Which is also why clearing is best-effort rather than on the
+        // acknowledge path: a failed clear only ever leaves a pipeline MORE
+        // refused, and the next boot undoes it without an operator.
+        if let Err(e) = self.flush_cluster_state() {
+            rollback!();
             return Err(e);
         }
 
-        if let Some(e) = &compile_err {
-            warn!(pipeline = id, error = %e, "pipeline stored but failed to compile");
-        } else {
-            info!(name = id, "transform pipeline created");
+        let marker_changed = self
+            .definition_time_refusals
+            .get(id)
+            .map(|r| r.value().clone())
+            != previous_marker;
+        if marker_changed {
+            self.flush_pipeline_refusals_best_effort();
         }
-        Ok(compile_err)
+
+        info!(name = id, "transform pipeline created");
+        // `Ok(None)` is now the only success: a definition that does not
+        // compile returned `Ok(Some(err))` above without storing anything.
+        Ok(None)
     }
 
     /// Delete an ingest pipeline — both the stored definition and the
@@ -2451,6 +2802,18 @@ impl Engine {
         let removed = self.persisted_remove(&self.pipelines, name)?;
         if removed {
             self.transform_pipelines.remove(name);
+            // Issue #204: a deleted pipeline must not leave a stale
+            // "stored but not runnable" reason behind either — the next
+            // definition under this id starts from a clean slate.
+            self.unrunnable_pipelines.remove(name);
+            self.degraded_pipelines.remove(name);
+            // …and neither may the persisted refusal marker outlive the
+            // definition it refers to, or a later PUT of a *different*
+            // definition under the same id would inherit its 400 at the next
+            // boot (issue #204).
+            if self.definition_time_refusals.remove(name).is_some() {
+                self.flush_pipeline_refusals_best_effort();
+            }
         }
         Ok(removed)
     }
@@ -3357,6 +3720,32 @@ impl Engine {
 
     // ── Transform pipeline methods ────────────────────────────────────────────
 
+    /// The `index.default_pipeline` setting for `index`, if it has one.
+    ///
+    /// One implementation for every write path. It used to live only in the
+    /// `_doc` handlers, which is why `_bulk` ignored the setting entirely and
+    /// stored documents untransformed under a `201` while the single-document
+    /// form of the same write refused (issue #204).
+    ///
+    /// Handles the three shapes settings arrive in — nested
+    /// `{index: {default_pipeline: ..}}`, dotted `{"index.default_pipeline": ..}`
+    /// and flat `{default_pipeline: ..}` — mirroring the `number_of_shards`
+    /// lookup pattern used elsewhere.
+    ///
+    /// `index` is matched literally: an alias has no settings of its own, so a
+    /// write addressed to an alias does not pick up its backing index's default
+    /// pipeline. That is a known gap, identical on every write path.
+    pub fn default_pipeline_for(&self, index: &str) -> Option<String> {
+        self.index_settings.get(index).and_then(|v| {
+            v.get("index")
+                .and_then(|ix| ix.get("default_pipeline"))
+                .or_else(|| v.get("index.default_pipeline"))
+                .or_else(|| v.get("default_pipeline"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    }
+
     /// Compile and register a typed transform pipeline from a JSON config,
     /// **in memory only**.
     ///
@@ -3374,11 +3763,162 @@ impl Engine {
         name: &str,
         config_json: Value,
     ) -> std::result::Result<(), xerj_wasm::WasmError> {
+        self.compile_pipeline_with_mode(name, config_json, xerj_wasm::pipeline::CompileMode::Strict)
+    }
+
+    /// [`Self::compile_pipeline`], with the strictness chosen by the caller.
+    ///
+    /// Issue #204. The boot replay passes
+    /// [`CompileMode::ReplayPersisted`](xerj_wasm::pipeline::CompileMode) — a
+    /// definition already in `cluster_state.json` was accepted by whichever
+    /// build wrote it, and there is no caller left to answer 400. Refusing it
+    /// at boot would flip a working cluster's writes from 201 to 400 on a
+    /// binary upgrade alone, with no PUT and no operator action. Whatever the
+    /// replay had to wave through is recorded in `degraded_pipelines` and
+    /// logged at ERROR, so it is loud instead of silent.
+    fn compile_pipeline_with_mode(
+        &self,
+        name: &str,
+        config_json: Value,
+        mode: xerj_wasm::pipeline::CompileMode,
+    ) -> std::result::Result<(), xerj_wasm::WasmError> {
         let cfg: xerj_wasm::pipeline::PipelineConfig =
             serde_json::from_value(config_json.clone()).map_err(xerj_wasm::WasmError::Json)?;
-        let pipeline = xerj_wasm::pipeline::Pipeline::from_config(name, &cfg)?;
+        let pipeline = match mode {
+            xerj_wasm::pipeline::CompileMode::Strict => {
+                xerj_wasm::pipeline::Pipeline::from_config(name, &cfg)?
+            }
+            xerj_wasm::pipeline::CompileMode::ReplayPersisted => {
+                xerj_wasm::pipeline::Pipeline::from_config_replaying_persisted(name, &cfg)?
+            }
+        };
+        if pipeline.degradations.is_empty() {
+            self.degraded_pipelines.remove(name);
+        } else {
+            let summary = pipeline.degradations.join("; ");
+            error!(
+                pipeline = name,
+                degradations = summary.as_str(),
+                "persisted ingest pipeline uses configuration this build cannot honour — it \
+                 is still running exactly as the build that stored it ran it, but it is NOT \
+                 doing what the definition says; re-PUT the definition to see the error"
+            );
+            self.degraded_pipelines.insert(name.to_string(), summary);
+        }
         self.pipelines.insert(name.to_string(), config_json);
         self.transform_pipelines.insert(name.to_string(), pipeline);
+        // Issue #204: a successful compile clears any recorded "stored but
+        // not runnable" reason left by a previous definition under this id —
+        // including the persisted refusal marker, whose only job is to keep a
+        // refusal alive across a restart. Persisting the removal is the
+        // caller's (`put_pipeline`, and the boot replay's self-heal); an
+        // orphaned marker only ever makes a pipeline more refused, and the
+        // next successful PUT clears it again.
+        self.unrunnable_pipelines.remove(name);
+        self.definition_time_refusals.remove(name);
+        Ok(())
+    }
+
+    /// Store a pipeline definition that could not be compiled, together with
+    /// the reason, and make sure nothing stale is left behind.
+    ///
+    /// Issue #204. This exists for one case: a definition xerj accepts for wire
+    /// compatibility (Elasticsearch does) but cannot execute — because it names
+    /// a processor this build does not implement, or sets an option on one that
+    /// this build cannot honour (a processor-level `if` guard, an `on_failure`
+    /// chain, a `grok` `patterns` array). Storing it keeps
+    /// `GET`/`_simulate` truthful about what was submitted; recording the
+    /// reason is what stops [`Self::process_through_pipeline`] from silently
+    /// passing documents through untransformed. A previously-compiled pipeline
+    /// under the same id is REMOVED — re-defining a pipeline must not leave the
+    /// old stages quietly running under the new definition's name.
+    ///
+    /// Like [`Engine::put_pipeline`], the stored definition is flushed to
+    /// `cluster_state.json` before the caller may acknowledge it (issue
+    /// #203). `Err` means it did not reach disk; the in-memory change is
+    /// rolled back first.
+    ///
+    /// The *reason* is persisted too, in
+    /// `<data_dir>/ingest-pipeline-refusals.json`, and that is not
+    /// belt-and-braces. This docstring used to claim the reason could stay in
+    /// memory "because the boot replay fails to recompile the stored
+    /// definition and re-records why" — which is false for the shape that
+    /// matters. A `stages`-shaped definition (the one `GET` hands an operator
+    /// to edit and re-`PUT`) recompiles at boot in the compatibility mode that
+    /// exists for definitions written by a gate-less build, so the refusal was
+    /// SOFTENED by a restart: measured, a refused `{"remove": {"field":
+    /// "secret", "if": …}}` went from `400` to `201` across a plain restart,
+    /// with `secret` dropped from a document the guard excludes. The marker is
+    /// what tells the replay "this build already answered 400 for this exact
+    /// definition", so the flush below is on the acknowledge path exactly like
+    /// the definition's own.
+    pub fn register_unrunnable_pipeline(
+        &self,
+        name: &str,
+        definition: Value,
+        reason: String,
+    ) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
+        let previous_doc = self.pipelines.get(name).map(|v| v.value().clone());
+        let previous_compiled = self.transform_pipelines.remove(name).map(|(_, p)| p);
+        let previous_reason = self
+            .unrunnable_pipelines
+            .get(name)
+            .map(|r| r.value().clone());
+        let previous_marker = self
+            .definition_time_refusals
+            .get(name)
+            .map(|r| r.value().clone());
+        self.pipelines.insert(name.to_string(), definition);
+        self.unrunnable_pipelines
+            .insert(name.to_string(), reason.clone());
+        // The marker that makes this refusal survive a restart. Without it the
+        // boot replay softens the refusal and the pipeline silently starts
+        // running, ignoring the very option it was refused for (issue #204).
+        self.definition_time_refusals
+            .insert(name.to_string(), reason.clone());
+        // Nothing is running under this id any more, so nothing is running
+        // degraded either.
+        let previous_degradation = self.degraded_pipelines.remove(name).map(|(_, v)| v);
+        macro_rules! rollback {
+            () => {{
+                match previous_doc {
+                    Some(d) => self.pipelines.insert(name.to_string(), d),
+                    None => self.pipelines.remove(name).map(|(_, v)| v),
+                };
+                match previous_reason {
+                    Some(r) => self.unrunnable_pipelines.insert(name.to_string(), r),
+                    None => self.unrunnable_pipelines.remove(name).map(|(_, v)| v),
+                };
+                match previous_marker {
+                    Some(r) => self.definition_time_refusals.insert(name.to_string(), r),
+                    None => self.definition_time_refusals.remove(name).map(|(_, v)| v),
+                };
+                if let Some(p) = previous_compiled {
+                    self.transform_pipelines.insert(name.to_string(), p);
+                }
+                if let Some(d) = previous_degradation {
+                    self.degraded_pipelines.insert(name.to_string(), d);
+                }
+            }};
+        }
+        // Marker before definition — see `put_pipeline` for why that order is
+        // load-bearing. An `Err` from either is NOT acknowledgeable: a refusal
+        // the next boot cannot see is the whole defect.
+        if let Err(e) = self.flush_pipeline_refusals() {
+            rollback!();
+            return Err(e);
+        }
+        if let Err(e) = self.flush_cluster_state() {
+            rollback!();
+            self.flush_pipeline_refusals_best_effort();
+            return Err(e);
+        }
+        warn!(
+            name,
+            reason = reason.as_str(),
+            "ingest pipeline stored but NOT runnable — documents may not be ingested through it"
+        );
         Ok(())
     }
 
@@ -3393,10 +3933,20 @@ impl Engine {
         mut docs: Vec<Value>,
     ) -> std::result::Result<Vec<(xerj_wasm::pipeline::ProcessAction, Value)>, xerj_wasm::WasmError>
     {
-        let pipeline = self
-            .transform_pipelines
-            .get(pipeline_name)
-            .ok_or_else(|| xerj_wasm::WasmError::PipelineNotFound(pipeline_name.to_string()))?;
+        let pipeline = self.transform_pipelines.get(pipeline_name).ok_or_else(|| {
+            // Issue #204: distinguish "no such pipeline" from "stored but this
+            // build cannot run it". Both must fail — what must not happen is a
+            // document being indexed untransformed — but reporting the second
+            // as the first sent operators hunting for a pipeline that is
+            // plainly there in `GET /_ingest/pipeline`.
+            match self.unrunnable_pipelines.get(pipeline_name) {
+                Some(reason) => xerj_wasm::WasmError::PipelineNotRunnable {
+                    pipeline: pipeline_name.to_string(),
+                    reason: reason.clone(),
+                },
+                None => xerj_wasm::WasmError::PipelineNotFound(pipeline_name.to_string()),
+            }
+        })?;
 
         let actions = pipeline.process_batch(&mut docs);
         Ok(actions.into_iter().zip(docs).collect())

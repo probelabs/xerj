@@ -178,6 +178,185 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     from the moment it is allowlisted. Seed the target with snapshot/restore
     first if it needs the existing documents.
 
+### Changed
+
+- **BREAKING — `PUT /{index}` now refuses an `analysis` block XERJ cannot
+  honour, instead of accepting it and analysing differently**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)).
+  `AnalyzerRegistry::apply_settings` is total by design (it also runs when an
+  existing index is opened, where a hard failure would brick it), so an
+  unresolvable tokenizer silently became `standard` and an unresolvable token
+  filter was dropped — the index was created, `GET /_settings` echoed the block
+  back, and the field was analysed in a way nobody asked for. Index creation
+  now validates the block and answers `400` with the exact constructs it cannot
+  build. `PUT /{index}/_settings` with an `analysis` block is likewise refused
+  (it only ever changed what `GET /_settings` echoed; the registry is built
+  once, at create/open, and there is no rebuild path — Elasticsearch also
+  refuses analysis updates on an open index). That refusal covers every
+  spelling this handler *accepts*, not just the nested one: the flat dotted
+  `{"index.analysis.analyzer.x.type": "custom"}` and half-dotted
+  `{"index": {"analysis.analyzer.x.type": "custom"}}` forms that ES clients
+  routinely send used to walk straight past it into the display copy, and
+  `GET /_settings` then echoed back an analyzer that analysed nothing.
+
+  **This rejects settings blocks that XERJ used to accept with a `200`, and the
+  ES-YAML conformance suite does not cover them — CI being green is not
+  evidence that your index still creates.** What is honoured:
+
+  | | honoured (still `200`) |
+  |---|---|
+  | `analysis.filter.*.type` | `synonym`, `length`, `shingle`, `asciifolding` |
+  | `analysis.tokenizer.*.type` | `ngram`, `edge_ngram`, `pattern` |
+  | `analysis.analyzer.*.type` (non-custom) | any name the built-in registry resolves — measured: `standard`, `english`, `whitespace`, `keyword` |
+  | `analysis.char_filter` | nothing — the char-filter slot is hard-coded empty |
+  | `analysis.normalizer` | nothing — never built |
+
+  Anything else in those positions is now a `400`. There is one important
+  exception to read first: XERJ resolves a declared filter or tokenizer by
+  **name**, not by `type`, so a declaration whose *name* is a built-in is still
+  honoured whatever its type says. Measured, all still `200`:
+  `{"english_stop": {"type": "stop", "stopwords": "_english_"}}`,
+  `{"lowercase": {"type": "lowercase"}}`,
+  `{"stemmer"|"english_stemmer": {"type": "stemmer", "language": "english"}}`
+  — the canonical Elasticsearch-docs `rebuilt_english` block among them, which
+  has a regression test pinning it. Naming a built-in analyzer on a field
+  (`"analyzer": "english"`) needs no `analysis` block at all and is unaffected.
+
+  What now fails is a declaration under a name that does NOT resolve — which is
+  the usual ES habit of naming filters after what they do in *your* index.
+  Measured blocks that returned `200` in rc.14 and return `400` from this
+  release:
+
+  - a `keyword` field's `normalizer` (any);
+  - a `char_filter` (any, including `html_strip` and `mapping`), declared
+    either under `analysis.char_filter` or as an analyzer's `char_filter`;
+  - a custom-named token filter whose `type` is `lowercase`, `stop`, `stemmer`,
+    `snowball`, `kstem`, `porter_stem`, `ngram`, `edge_ngram`,
+    `word_delimiter_graph`, `trim`, `unique`, `elision`, `decimal_digit`,
+    `apostrophe`, `limit`, `truncate`, `pattern_replace`, `keyword_marker`,
+    `uppercase` or `reverse` — e.g. `{"my_lowercase": {"type": "lowercase"}}`,
+    which never lowercased anything, because the analyzer referencing
+    `my_lowercase` found no such filter and dropped it;
+  - a custom-named tokenizer whose `type` is `standard`, `whitespace`,
+    `keyword`, `classic`, `uax_url_email`, `path_hierarchy`, `char_group`,
+    `letter`, `lowercase` or `simple_pattern`;
+  - an analyzer whose non-custom `type` is `simple`, `stop`, `pattern`,
+    `fingerprint`, or a language other than `english`;
+  - a `synonym` filter whose `synonyms` is a bare string rather than an array
+    (it built a filter with zero rules).
+
+  **The gate covers every spelling, at create as well as at update.** An
+  `analysis` declaration written with flat dotted keys
+  (`{"index.analysis.filter.my_lower.type": "lowercase"}`) or half-dotted ones
+  (`{"index": {"analysis.analyzer.a.type": "custom"}}`) is the same request as
+  the nested form to an Elasticsearch client, and this handler already parses
+  dotted keys for other settings (`index.sort.field`). The analyzer registry
+  resolves the nested spellings only, so a dotted declaration was accepted,
+  echoed back by `GET /{index}/_settings`, and applied to nothing. It is now a
+  `400` naming the offending key, on both `PUT /{index}` and
+  `PUT /{index}/_settings`. Measured on this release, the same
+  `my_lower`/`lowercase` declaration in four spellings — nested, `index.`-
+  namespaced, fully dotted, half-dotted — answers `400`, `400`, `400`, `400`;
+  a settings body with no analysis in it (`index.number_of_shards`,
+  `index.sort.field`) still answers `200`. Nothing already on disk changes
+  meaning: the dotted form is refused, not newly honoured, so no existing
+  index's analysis is re-derived on reopen.
+
+  **Upgrading:** there is no opt-out flag. Either remove the analysis block and
+  name a built-in analyzer on the field (`"analyzer": "english"`), or keep only
+  the constructs in the table. The `400` names every offending construct in one
+  response, so one round-trip is enough to see the whole list. **Two paths are
+  not covered and still accept these blocks silently: an index template's
+  `template.settings.analysis` is dropped wholesale before the gate ever sees
+  it, and option-level divergence inside a supported type (`synonyms_path`,
+  `length.min`, `asciifolding.preserve_original`) is not checked at all.**
+
+- **BREAKING — `PUT /_ingest/pipeline/{id}` refuses processor configuration
+  XERJ cannot honour, so a pipeline that used to be acknowledged can now be a
+  `400`, and a stored one can start refusing writes**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)). This is the same
+  change as the "`200 acknowledged` … means we will run this" entry under
+  *Fixed* below, stated from the upgrader's side, because it converts `201`
+  into `400` for any pipeline using an ES processor or option this build does
+  not implement. Read that entry for the full list.
+
+  **What is NOT broken, deliberately.** A definition persisted by a build with
+  **no gate** was accepted by whichever build wrote it, and there is no caller
+  left to answer `400` at boot. Boot replay therefore compiles *those*
+  definitions in a compatibility mode that reproduces the previously shipped
+  behaviour for every check this sweep added (unknown `grok` pattern name,
+  unknown `convert` target, a bare string where an array is required,
+  `set.copy_from`, a processor-level `if`/`on_failure`/`ignore_failure`), so
+  **an upgrade alone never turns a running cluster's writes from `201` into
+  `400`**. Each one is logged at ERROR naming the pipeline and the offending
+  config, and recorded in `Engine::degraded_pipelines`; a re-`PUT` of the same
+  definition answers `400` with the same reason, which is the repair path. A
+  definition that did not compile before the upgrade either (unknown stage
+  type, missing required field) still fails at boot and is recorded unrunnable,
+  as before.
+
+  **Which definitions those are is decided by provenance, not by the calendar.**
+  A definition THIS build refused at `PUT` time is recorded in
+  `<data_dir>/ingest-pipeline-refusals.json` and replayed at *definition*
+  strictness, so the refusal survives a restart. Without that marker the replay
+  could not tell "written by an older, laxer build" from "written by this build
+  and answered `400`", and a plain restart overturned the answer the operator
+  had already been given: measured, `PUT` a `{"remove": {"field": "secret"}}`
+  pipeline, add an `if` guard to it (refused — every write `400`s), restart the
+  node and nothing else, and the identical write answered `201` with `secret`
+  dropped from a document the guard EXCLUDES. It covered every check the sweep
+  added; only an unimplemented *stage* survived a restart, because the raw ES
+  body it stores does not deserialise. This is the same pattern as an index's
+  `<index>/analysis-binding.json`: the marker's ABSENCE is the load-bearing
+  signal.
+
+  The marker is provenance, not a tombstone. A marked definition that compiles
+  cleanly on the new build — because that build implements what the refusing
+  one could not — clears its own marker at boot and runs, with an INFO line; a
+  successful re-`PUT` or a `DELETE` clears it too. If the file exists but
+  cannot be read or parsed, no pipeline's provenance is known, so **every**
+  persisted pipeline is replayed at definition strictness and any that fails is
+  recorded unrunnable with the file named in the reason — fail closed and
+  loudly, rather than silently reopening the hole. **In that state a refusal is
+  also not acknowledged:** the file is written whole from the in-memory map,
+  which a failed load leaves empty, so the next refused `PUT` would have
+  replaced it with a one-entry map and erased every refusal it still held —
+  after which it parses cleanly, every earlier refusal reads as "no provenance",
+  and the fail-closed behaviour converts itself into the hole it exists to
+  close after exactly one process lifetime. `PUT /_ingest/pipeline/{id}` now
+  answers `500` naming the file instead, and the file is left byte-for-byte as
+  found; move it aside and restart to clear the state. An older binary reading a
+  data dir written by this one simply ignores the file; it is a sidecar
+  precisely because `cluster_state.json`'s format-1 envelope is
+  `deny_unknown_fields` and widening it would break downgrades.
+
+  **The marker survives concurrent refusals, not just sequential ones.** The
+  sidecar is rewritten whole, so two refused `PUT`s in flight at once were a
+  lost update rather than a merge: each snapshotted the map, and whichever
+  wrote second with the older snapshot erased the other's marker — while both
+  callers were told `{"acknowledged": true}`. Measured at a live node against
+  the first cut of this work: 40 concurrent refused `PUT`s, 40 acknowledged, 37
+  markers on disk, and after a plain restart the three that were lost answered
+  `201` and dropped `secret` from a document their `if` guard excludes. The
+  snapshot and the write now happen under the same `cluster_state_write` mutex
+  that `flush_cluster_state` has always taken. Measured on this release: 40
+  concurrent refused `PUT`s, 40 acknowledged, 40 markers on disk, plain restart,
+  40 of 40 still `400`.
+
+  The same rule applies one level up. Teaching the analysis resolver the
+  canonical `settings.index.analysis` nesting (see the analysis entry above) is
+  a fix at index *create* and a data bug at index *open*: `settings.json` keeps
+  the caller's nesting verbatim, so an index created before this release with
+  the canonical shape has postings that were written with `standard`, and
+  honouring the declaration on reopen would tokenise every new write
+  differently from everything already on disk. An index now records the
+  analysis binding it was created with (`<index>/analysis-binding.json`) and
+  keeps it for life. An index with no marker and analyzers declared *only*
+  under `index.analysis` keeps the legacy binding if it holds documents — with
+  an ERROR naming the index and saying a reindex is the repair — and adopts the
+  canonical binding if it is empty, recording that so a later restart cannot
+  disagree.
+
 ### Performance
 
 - **A field mapped `dense_vector` — and the undeclared `_chunks` companion the
@@ -430,6 +609,195 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero-hit answer; it does not add the rejection.
 
 ### Fixed
+
+- **`200 acknowledged` on an ingest pipeline now means "we will run this", and
+  every write path enforces it**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)).
+  `PUT /_ingest/pipeline/{id}` used to store the raw body first and only
+  warn-log a compile failure, so a pipeline that could never run was
+  acknowledged and echoed back by `GET`. It now compiles first, with three
+  outcomes: compiled → stored and acknowledged; a processor config we refuse →
+  `400`; a processor or option this build cannot honour → accepted (as
+  Elasticsearch does) but recorded as **unrunnable**, so the write refuses
+  rather than storing an untransformed document.
+
+  Defects this surfaced, each of which answered `200`/`201` and did something
+  smaller than asked: **every** ES `rename` processor failed to compile (the
+  handler emitted `{from, to}`, the plugin requires `{mappings: {…}}`) and
+  renamed nothing; ES `append` was executed as `set`, replacing the field
+  instead of extending it, and disagreeing with `_simulate`, which implemented
+  a real append; an ES `set` processor did not override an existing value where
+  Elasticsearch does (the ES→XERJ translation now writes `"override": true`
+  explicitly when the processor omits it — the **native** `type: "set"` stage
+  keeps its long-standing `override: false` default, because native definitions
+  are recompiled from `cluster_state.json` at every boot and flipping the stage
+  default would have changed what an already-running cluster's pipelines do to
+  documents on a binary upgrade alone); an unknown `pii_redaction` type built an
+  empty pattern set and redacted nothing; an unknown `grok` pattern name
+  silently became the
+  catch-all; an unknown `convert` target left the field unconverted per
+  document; array-typed keys given as a bare string were dropped and the stage
+  behaved as if unconfigured; and `DELETE /_ingest/pipeline/{id}` removed the
+  definition while leaving the compiled pipeline live under the same name.
+  ES `convert` `long`/`double` now map to XERJ's equivalent `integer`/`float`
+  rather than being refused.
+
+  Two more of the same, at the definition's own edges: a **pipeline-level**
+  `on_failure` block (the top-level body key, not the processor-level one) was
+  accepted, echoed by `GET`, and never run — the pipeline is now recorded
+  unrunnable, exactly as its processor-level twin already was; and `set` with
+  Elasticsearch's `copy_from` is reported as an unsupported *option* (accepted
+  at `PUT`, refused at the write) rather than as `mapper_parsing_exception:
+  missing value`, which told the caller their valid ES pipeline was malformed.
+
+  **The refusal reads the value, not the key.** A processor-level option is
+  refused only when what the caller *wrote* asks for behaviour this build does
+  not have; writing the value XERJ already implements is the same as omitting
+  it. `ignore_failure: false` is Elasticsearch's own default and ES clients emit
+  it verbatim — a presence check made that pipeline register and then `400`
+  every write through it, while the byte-identical processor without the key
+  indexed fine. Accepted: `ignore_failure: false`, an empty `on_failure: []`,
+  `ignore_missing: true` (which is exactly what `remove`/`rename`/`convert`/
+  `date` already do — they pass the document through unchanged when the field
+  is absent), `ignore_empty_value: false`, `allow_duplicates: true`. Refused:
+  the opposite value in each case, and any `if` at all. (Modelled on Lucene's
+  consume-then-complain: `AbstractAnalysisFactory.getBoolean(args, name,
+  default)` at `lucene/core/src/java/org/apache/lucene/analysis/AbstractAnalysisFactory.java:213-217`
+  removes the key and returns the default only when it was absent, and
+  `ArabicStemFilterFactory` at
+  `lucene/analysis/common/src/java/org/apache/lucene/analysis/ar/ArabicStemFilterFactory.java:44-51`
+  then throws on whatever is left. Lucene is Apache-2.0, the same licence as
+  XERJ; no code is reproduced.)
+
+  **`remove` and `rename` no longer walk around the gate.** Their ES→XERJ
+  translation built a fresh config object holding only the translated keys, so
+  a processor-level `if` / `on_failure` / `ignore_failure` / `ignore_missing` on
+  them was dropped *before* the gate ran: `{"remove": {"field": "secret", "if":
+  "ctx.tenant == 'a'"}}` compiled, was acknowledged, and dropped the field on
+  every document — while the identical `if` on `set` was refused. Every branch
+  of the translation now edits the caller's config instead of rebuilding it.
+
+  **`_simulate` speaks Elasticsearch's vocabulary again.** It walks the
+  *stored* pipeline, and once ES `rename` started compiling the stored form
+  became XERJ's internal `stages` shape — whose stage names leaked straight into
+  the response, so `processor_type` read `field_rename` where ES reports
+  `rename`. The stages→processors conversion now inverts both halves of the
+  translation, name and config.
+
+- **`GET /_ingest/pipeline[/{id}]` answers in Elasticsearch's `processors`
+  vocabulary instead of XERJ's internal `stages` shape**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)). Two shapes reach the
+  store: the translated `stages` body (everything that compiles) and the raw ES
+  body (kept verbatim for a definition XERJ stores but cannot run). Only the
+  second was ever ES-shaped, so `GET` spoke XERJ's vocabulary for every pipeline
+  that *worked* — measured before this release, an ES `rename` pipeline came
+  back as
+  `{"p":{"description":"d","stages":[{"type":"field_rename","config":{"mappings":{"a":"b"}}}]}}`.
+  This is a wire-visible change on both `GET /_ingest/pipeline/{id}` and
+  `GET /_ingest/pipeline`. It also mattered beyond cosmetics: `GET`'s output is
+  what an operator edits and `PUT`s back, and a `stages`-shaped body takes the
+  handler's pass-through branch — which is exactly how the restart hole
+  described under *Changed* was reached in ordinary use.
+
+  `set` is rendered with an explicit `"override"`, always, because it is the one
+  key whose default differs between the two vocabularies (Elasticsearch `true`,
+  XERJ's native `set` stage `false`). Emitting a bare ES `set` for a native
+  stage would claim it overwrites when it preserves. A pipeline created through
+  `PUT /_ingest/pipeline` therefore shows `"override": true` even when the
+  caller omitted it — that is the value XERJ applies, and it round-trips: PUTting
+  `GET`'s own output back cannot silently flip the stage's behaviour. Relatedly,
+  `_simulate`'s `set` interpreter honoured no `override` at all and always
+  overwrote, so it reported a document the ingest path would never produce; it
+  now applies Elasticsearch's rule (default `true`; `false` leaves an existing
+  non-null value alone).
+
+  **This is also the only read endpoint for a pipeline created through
+  `PUT /v1/pipelines/{name}`** — the native surface registers no `GET` — so the
+  round trip has to be lossless in xerj's own vocabulary too, and it was not.
+  `PUT /_ingest/pipeline/{id}` rebuilt the stored definition as
+  `{description, stages}` and dropped every other top-level key, so PUTting
+  `GET`'s own output back silently discarded a natively-defined pipeline's
+  `on_error` and `timeout_ms`: the error policy reverted from `pass` (keep the
+  document) to the `Drop` default (discard it) under a
+  `200 {"acknowledged": true}`. The translation now edits the body instead of
+  rebuilding it — the same rule already applied to `remove`/`rename` one level
+  down. Measured on this release, `{"description":"n3","on_error":"pass",
+  "timeout_ms":250,"stages":[…]}` reads back with both keys intact, and PUTting
+  that body back leaves them intact, before and after a restart. Elasticsearch's
+  own pipeline metadata (`version`, `_meta`, `deprecated`) rides along the same
+  way and is now echoed back rather than dropped. `PUT /v1/pipelines/{name}`
+  given that ES-shaped body used to answer `500` with `internal error: missing
+  field stages`; it now answers `400` naming `/_ingest/pipeline/{name}` as the
+  endpoint that accepts it.
+
+- **Four wire-visible refusals that were fixed in this sweep but not written
+  down** ([#204](https://github.com/xerj-org/xerj/issues/204)). All four
+  replace a silent fallback with an error, which is the point of the issue, but
+  each changes a status code:
+  `POST /v1/admin/backup` answers `400` on a request body that is present but
+  unparseable, where it previously ran a *default* backup under a success
+  response; `GET /{index}/_stats` and `GET /_all/_stats` carry an added
+  non-Elasticsearch key `primaries.mappings.schema_persist_failures` inside an
+  otherwise ES-shaped response; the authorization layer's response pruning
+  answers `500` when it cannot parse the body it was asked to filter, instead
+  of falling back to the unfiltered bytes; and the bundled console's
+  `DELETE /_xerj-console/api/v1/auth/passkeys/{id}` propagates a failed delete
+  instead of discarding it — it answered `204 No Content` unconditionally, so a
+  revoke refused by the engine (index write block, disk flood stage, storage
+  error) reported success while the passkey stayed on disk and kept
+  authenticating. An already-absent credential is still a `204`; only a genuine
+  failure now surfaces.
+
+  **The refusal now covers every ingest path, not only `PUT /{index}/_doc`.**
+  `POST /_bulk?pipeline=`, `index.default_pipeline` under `_bulk`,
+  `_reindex` `dest.pipeline` and `POST /{index}/_update_by_query?pipeline=`
+  previously read the instruction and dropped it — a redaction pipeline that
+  the single-document endpoint refused was ignored in bulk, and the document
+  was stored verbatim under `errors: false`. All four now run the pipeline, and
+  refuse when it cannot run. `_reindex` and `_update_by_query` validate the
+  name before touching a single document, so a bad pipeline fails the request
+  instead of half of it.
+
+  Two related honesty fixes on the same paths: `_clone` / `_shrink` / `_split`
+  copied at most 10,000 documents and swallowed every per-document write error
+  before answering `{"acknowledged": true}` (now full keyset paging, and any
+  failed write — or a failed source flush — fails the request); and a failed
+  `_bulk` item no longer reports `"result": "deleted"` alongside its own
+  `status: 400`, which claimed a deletion that never happened.
+
+  **`ignore_missing: false` is refused on purpose, and it is not the same call
+  as `ignore_failure: false`.** Both are Elasticsearch defaults that ES clients
+  emit verbatim, so the difference is worth stating plainly: the rule is *accept
+  the value this build actually implements*, and the two land on opposite sides
+  of it. `ignore_failure: false` means "a failing processor is not ignored",
+  which is exactly what XERJ does, so it is accepted. `ignore_missing: false`
+  means "FAIL the document when the field is absent", which XERJ cannot do at
+  all — `ProcessAction` has no error variant, and every field-reading stage
+  passes the document through untouched. Accepting it would be precisely the
+  silent lie this issue exists to remove, so it is refused: a `remove` /
+  `rename` / `convert` / `date` processor that spells out `ignore_missing:
+  false` registers and then `400`s every write through it. **Omitting the key
+  is accepted** and behaves as `true`. That asymmetry — omission accepted,
+  the ES default written out refused — is deliberate but is a hard `400` for
+  ES-generated pipelines; strip the key, or set it to `true`, to state what
+  XERJ will actually do. `ignore_empty_value` is the mirror image: omitting it
+  or writing `false` is honoured exactly, `true` is refused.
+
+  **Known gaps, stated rather than closed:** `_simulate` interprets the stored
+  ES body directly and covers processors the compiled path does not, so a
+  pipeline recorded as unrunnable can still show a transformation under
+  `_simulate` that ingest refuses to perform; `GET /_ingest/pipeline/{id}`
+  carries no runnability signal — it renders the stored definition in ES
+  vocabulary whether or not this build can run it, so an operator only learns
+  at write time; a write addressed to an **alias** does not pick up the
+  backing index's `default_pipeline`; `_update_by_query` reports a `drop`
+  processor as a per-document failure, because it updates in place and has no
+  delete path; `Engine::degraded_pipelines` is in-memory only and has no
+  HTTP surface yet, so a boot-replay degradation is visible in the startup log
+  and nowhere else — unlike a definition-time refusal, which is now durable
+  (see *Changed*); and a refusal marker is only read back at boot, so a data
+  dir opened by two processes at once is outside what the sidecar can promise
+  (the node lock already prevents that).
 
 - **Unity assets were sampled through a 4 MiB cap, silently junking whole
   object classes.** Unity YAML is a grouped family — each `unity_class` is its

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use xerj_common::config::Config;
 use xerj_common::schema::ManagedSchema;
 use xerj_common::types::{FieldConfig, FieldType, IndexName, Schema};
-use xerj_fts::analyzer::AnalyzerRegistry;
+use xerj_fts::analyzer::{AnalysisBinding, AnalyzerRegistry};
 use xerj_fts::index::FtsIndexReader;
 use xerj_fts::search::{
     BoolQuery as FtsBool, DisMaxQuery as FtsDisMax, FtsSearcher, Query as FtsQuery,
@@ -5744,6 +5744,9 @@ pub struct Index {
     /// because we only ever take/replace under it, never hold across
     /// any awaits.
     pub(crate) merge_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Failed writes of `schema.json` during dynamic-mapping evolution.
+    /// See [`Index::persist_evolved_schema`] (issue #204).
+    schema_persist_failures: AtomicU64,
 }
 
 impl Index {
@@ -5878,6 +5881,25 @@ impl Index {
         config: &Config,
         data_dir: &Path,
     ) -> Result<Arc<Self>> {
+        // Issue #204 — refuse an analysis block we would only pretend to
+        // honour. `apply_settings` is total (it has to be: it also runs on the
+        // open path), so an unresolvable tokenizer silently became `standard`
+        // and an unresolvable filter was silently dropped — the index was then
+        // built with an analyzer the caller never asked for and nothing in the
+        // 200 response said so. Checked BEFORE the index directory is created
+        // so a rejected create leaves nothing behind.
+        let analysis_problems = AnalyzerRegistry::unsupported_analysis(&settings);
+        if !analysis_problems.is_empty() {
+            return Err(EngineError::Common(xerj_common::XerjError::config(
+                format!(
+                    "index [{}] cannot be created: xerj cannot honour this analysis \
+                 configuration — {}",
+                    name.as_str(),
+                    analysis_problems.join("; ")
+                ),
+            )));
+        }
+
         let index_dir = data_dir.join(name.as_str());
         // Defense-in-depth: IndexName::validate rejects '.', '..', separators,
         // and '..' substrings, so join cannot escape data_dir. The debug_assert
@@ -5940,6 +5962,9 @@ impl Index {
         }
 
         // Build analyzer registry, applying any custom analysis settings.
+        // A NEW index always gets the canonical binding, and records that it
+        // did — see `analysis_binding_for_open` (issue #204).
+        record_canonical_analysis_binding(&index_dir);
         let registry = Arc::new(build_registry_from_settings(&settings));
 
         info!(name = name.as_str(), "index created");
@@ -6082,6 +6107,7 @@ impl Index {
             flush_signal: Arc::new(SyncFlushCoord::new()),
             external_versions: Arc::new(dashmap::DashMap::new()),
             merge_task: Arc::new(parking_lot::Mutex::new(None)),
+            schema_persist_failures: AtomicU64::new(0),
         });
         // Kick off the background merge pass.  5 s cadence is aggressive
         // enough to collapse a burst of flushes quickly without burning a
@@ -6134,8 +6160,19 @@ impl Index {
 
         // Build analyzer registry from persisted settings so WAL replay uses
         // the same custom analyzers (synonyms, ngrams, etc.) that were active
-        // when the documents were originally indexed.
-        let registry = Arc::new(build_registry_from_settings(&settings));
+        // when the documents were originally indexed — INCLUDING which
+        // `analysis` spelling was in force when they were written, which is
+        // not necessarily the one this build resolves at create time
+        // (issue #204; see `analysis_binding_for_open`).
+        let analysis_binding = analysis_binding_for_open(
+            &index_dir,
+            &settings,
+            segment_doc_count > 0 || store.version_map.live_count() > 0,
+        );
+        let registry = Arc::new(build_registry_from_settings_with_binding(
+            &settings,
+            analysis_binding,
+        ));
         let passage_scored_fields_at_open = passage_scored_vector_fields(&schema.schema);
         let mut wal_passage_chunk_fields = HashSet::new();
 
@@ -6436,6 +6473,7 @@ impl Index {
             flush_signal: Arc::new(SyncFlushCoord::new()),
             external_versions: Arc::new(dashmap::DashMap::new()),
             merge_task: Arc::new(parking_lot::Mutex::new(None)),
+            schema_persist_failures: AtomicU64::new(0),
         });
         index.spawn_merge_task(5);
         // RC4 W2 item 17: a flush-time-stale HNSW snapshot used to stay
@@ -18761,7 +18799,7 @@ impl Index {
             }
         }
         if schema_changed {
-            let _ = self.save_schema(&schema).await;
+            self.persist_evolved_schema(&schema).await;
         }
     }
 
@@ -18868,8 +18906,49 @@ impl Index {
             schema_changed = true;
         }
         if schema_changed {
-            let _ = self.save_schema(&schema).await;
+            self.persist_evolved_schema(&schema).await;
         }
+    }
+
+    /// Persist a dynamic-mapping evolution, complaining loudly if it does not
+    /// stick.
+    ///
+    /// Issue #204: both callers used to be `let _ = self.save_schema(..)`. The
+    /// in-memory schema had the new fields, `schema.json` did not, and the next
+    /// restart reopened the index with a mapping that had silently rolled back
+    /// — documents already on disk carrying those fields, no mapping for them,
+    /// and not one line anywhere saying why.
+    ///
+    /// This is a log-and-surface fix, not a fail-closed one, and deliberately
+    /// so: schema evolution runs *after* the document has been admitted, so
+    /// there is no caller left to fail. Losing the durable mapping is the lesser
+    /// evil against rejecting a document that is already indexed — but it is
+    /// an ERROR, not a shrug. `schema_persist_failures` counts it so a health
+    /// check can see it without reading logs.
+    async fn persist_evolved_schema(&self, schema: &ManagedSchema) {
+        if let Err(e) = self.save_schema(schema).await {
+            self.schema_persist_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                index = self.name.as_str(),
+                path = %self.data_dir.join("schema.json").display(),
+                error = %e,
+                "failed to persist dynamic mapping evolution — the new fields are \
+                 live in memory but WILL BE LOST on restart"
+            );
+        }
+    }
+
+    /// Number of times [`Self::persist_evolved_schema`] could not write
+    /// `schema.json`. Non-zero means the on-disk mapping is behind the
+    /// in-memory one and a restart will lose dynamically-mapped fields.
+    ///
+    /// Read by `GET /{index}/_stats`, which reports it as
+    /// `primaries.mappings.schema_persist_failures`, and by `GET /_all/_stats`,
+    /// which reports the sum over every index at
+    /// `_all.primaries.mappings.schema_persist_failures` — so a health check
+    /// can see it without reading logs.
+    pub fn schema_persist_failures(&self) -> u64 {
+        self.schema_persist_failures.load(Ordering::Relaxed)
     }
 
     async fn save_schema(&self, schema: &ManagedSchema) -> Result<()> {
@@ -40253,6 +40332,13 @@ fn combine_scores(query_score: f32, fn_score: f32, boost_mode: BoostMode) -> f32
 /// }
 /// ```
 fn build_registry_from_settings(settings: &Value) -> AnalyzerRegistry {
+    build_registry_from_settings_with_binding(settings, AnalysisBinding::Canonical)
+}
+
+fn build_registry_from_settings_with_binding(
+    settings: &Value,
+    binding: AnalysisBinding,
+) -> AnalyzerRegistry {
     let mut registry = AnalyzerRegistry::default();
 
     // Settings may be stored as the full settings envelope or as the inner
@@ -40260,8 +40346,87 @@ fn build_registry_from_settings(settings: &Value) -> AnalyzerRegistry {
     // as-is so that both shapes work.
     let analysis_root = settings.pointer("/settings").unwrap_or(settings);
 
-    registry.apply_settings(analysis_root);
+    registry.apply_settings_with_binding(analysis_root, binding);
     registry
+}
+
+/// Marker written into an index directory when its analyzer registry was built
+/// with [`AnalysisBinding::Canonical`].
+///
+/// Its ABSENCE is the load-bearing signal: an index directory laid down before
+/// the #204 sweep has no such file, and its postings were produced by a build
+/// that read `settings.analysis` only.
+const ANALYSIS_BINDING_MARKER: &str = "analysis-binding.json";
+
+/// Which `analysis` spellings to honour when REOPENING an existing index.
+///
+/// Issue #204. `analysis_block` learning to resolve the canonical
+/// `settings.index.analysis` is a fix at index-create time and a silent data
+/// bug at index-open time: `settings.json` persists the caller's nesting
+/// verbatim, so an index created before the sweep with the canonical ES shape
+/// was written with `standard` and would, after a binary upgrade alone, reopen
+/// with the declared analyzers live. Query-time analysis then stops matching
+/// the on-disk postings — no error, no log, results that quietly disappear.
+///
+/// The decision is stable for the life of the index:
+///
+/// * marker present → the index was created by a build that honoured the
+///   canonical form; honour it.
+/// * no canonical-only block → the two bindings resolve identically; nothing to
+///   decide, and the marker is written so this stays true.
+/// * canonical-only block, index EMPTY → no postings to disagree with. Adopt
+///   the canonical binding and record it, so adding documents now cannot flip
+///   the answer at the next boot.
+/// * canonical-only block, index has documents → keep the legacy binding, and
+///   say so at ERROR. Reindex is the only correct repair and only the operator
+///   can order it.
+fn analysis_binding_for_open(
+    index_dir: &Path,
+    settings: &Value,
+    has_documents: bool,
+) -> AnalysisBinding {
+    if index_dir.join(ANALYSIS_BINDING_MARKER).exists() {
+        return AnalysisBinding::Canonical;
+    }
+    if !AnalyzerRegistry::declares_namespaced_analysis_only(settings) {
+        record_canonical_analysis_binding(index_dir);
+        return AnalysisBinding::Canonical;
+    }
+    if !has_documents {
+        record_canonical_analysis_binding(index_dir);
+        return AnalysisBinding::Canonical;
+    }
+    tracing::error!(
+        index_dir = %index_dir.display(),
+        "index declares its analyzers under `index.analysis` and was created by a build \
+         that did not read that block — its postings on disk were produced by the \
+         `standard` analyzer. Honouring the declaration now would silently stop queries \
+         matching them, so it is NOT being honoured: this index still analyses as \
+         `standard`. Reindex into a newly-created index to activate the declared analyzers."
+    );
+    AnalysisBinding::LegacyShorthandOnly
+}
+
+/// Record that this index's analyzer registry is built with the canonical
+/// binding, so the decision cannot change under it later.
+///
+/// Best effort: a failure here means the next boot re-derives the same answer
+/// from the same inputs, EXCEPT for the empty-index case, where documents
+/// written in between would flip it. That is worth an ERROR and is not worth
+/// refusing to open the index over.
+fn record_canonical_analysis_binding(index_dir: &Path) {
+    let path = index_dir.join(ANALYSIS_BINDING_MARKER);
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = write_file_atomic(&path, br#"{"binding":"canonical"}"#) {
+        tracing::error!(
+            path = %path.display(), error = %e,
+            "could not record this index's analysis binding — if the index is empty now \
+             and analyzers are declared under `index.analysis`, a later restart may \
+             disagree with how documents written in the meantime were analysed"
+        );
+    }
 }
 
 #[cfg(test)]
