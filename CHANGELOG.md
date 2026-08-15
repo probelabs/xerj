@@ -129,14 +129,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     document was already at the target. The field is now
     `consecutive_unapplied_polls` and rises by at most one per poll; three
     unapplied polls in a row still reports the stall.
-  - `wal_tap.max_retry_backoff_secs` is range-checked (`1..=86400`) by `PUT`
-    the way `poll_interval_ms` already was, and every multiply in the backoff
-    computation saturates. `Config::validate` does not bound the field, so
-    `xerj.toml` can put any `u64` there, and `secs.max(1) * 1000` overflowed
-    above ~1.8e16: a panic under `cargo test`'s overflow-checks that killed the
-    spawned tap task silently, and under a release profile a *wrapped* cap that
-    can be arbitrarily small — the value `18_446_744_073_709_552` wrapped to a
-    384 ms ceiling, i.e. a retry storm aimed at an already-failing target.
+  - Every multiply in the retry-backoff computation saturates.
+    `max_retry_backoff_secs.max(1) * 1000` overflowed above ~1.8e16: a panic
+    under `cargo test`'s overflow-checks that killed the spawned tap task
+    silently, and under a release profile a *wrapped* cap that can be
+    arbitrarily small — the value `18_446_744_073_709_552` wrapped to a 384 ms
+    ceiling, i.e. a retry storm aimed at an already-failing target.
+  - **Every `[wal_tap]` numeric knob is range-checked at boot as well as by
+    `PUT`,** through one shared `WalTapConfig::check_limits`. The config file
+    was the way around the API's validation: `PUT
+    {"min_retained_generations": 100}` is a `400` because the knob costs
+    `n × storage.wal_max_size_mb` per WAL shard per index, while `xerj.toml`
+    took the same `100` in silence and the node then held 100 rotated
+    generations per shard forever. Bounds are `poll_interval_ms 50..=60000`,
+    `max_retry_backoff_secs 1..=86400`, `min_retained_generations <= 64`, and
+    `max_batch_docs` / `max_batch_bytes` / `request_timeout_secs` at least 1.
+    Same precedent as `compression.block_size_docs` (#318): an out-of-range
+    value is a typo the operator should hear about at boot, not as a disk-full
+    page later.
   - XERJ's own `.xerj*` system indices are never shipped, whatever the allowlist
     says, and a wildcard never expands to a hidden index.
   - There is no backfill. A new index is shipped whole; an established one ships

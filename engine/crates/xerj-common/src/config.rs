@@ -191,6 +191,21 @@ impl Config {
         if let Err(reason) = WalTapConfig::check_target_url(&self.wal_tap.target_url) {
             return Err(XerjError::config(reason));
         }
+        // …and the numeric knobs, with the same bounds `PUT /_xerj/wal_tap`
+        // enforces. Without this the file was the way *around* the API's
+        // validation: `PUT {"min_retained_generations": 100}` is a `400`
+        // because the knob costs `n × storage.wal_max_size_mb` per WAL shard
+        // per index, but `xerj.toml` took it in silence and the node held 100
+        // rotated generations per shard forever. Same for
+        // `max_retry_backoff_secs`, where a value above `u64::MAX / 1000` used
+        // to reach an unchecked `* 1000` inside `WalTap::arm_backoff`.
+        //
+        // Same reasoning as `compression.block_size_docs` below: an
+        // out-of-range value is a typo the operator wants to hear about now,
+        // at boot, not as a disk-full page later.
+        if let Err(reason) = self.wal_tap.check_limits() {
+            return Err(XerjError::config(reason));
+        }
 
         // Compression: block_size_docs is documented as 16–4096 and was
         // accepted at any value (#318 got `999999` past startup in silence).
@@ -1850,6 +1865,62 @@ impl Default for WalTapConfig {
 }
 
 impl WalTapConfig {
+    /// Largest `min_retained_generations` this node accepts.
+    ///
+    /// The knob costs `n × storage.wal_max_size_mb` of disk per WAL shard per
+    /// index whether or not a tap is running, so an operator who types an
+    /// extra digit must not be able to fill the disk quietly.
+    pub const MAX_RETAINED_GENERATIONS: u64 = 64;
+    /// Accepted range for `poll_interval_ms`.
+    pub const POLL_INTERVAL_MS_RANGE: std::ops::RangeInclusive<u64> = 50..=60_000;
+    /// Accepted range for `max_retry_backoff_secs` — one day is already far
+    /// past any recovery window a `_bulk` target has, and the upper bound also
+    /// keeps `secs × 1000` nowhere near `u64::MAX`.
+    pub const MAX_RETRY_BACKOFF_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=86_400;
+
+    /// Range-check every numeric knob, returning the operator message.
+    ///
+    /// Shared by `Config::validate` (the config file, at boot) and
+    /// `PUT /_xerj/wal_tap` (the API), so the file cannot be used to get a
+    /// value past the bound the API enforces.
+    pub fn check_limits(&self) -> Result<(), String> {
+        if !Self::POLL_INTERVAL_MS_RANGE.contains(&self.poll_interval_ms) {
+            return Err(format!(
+                "wal_tap.poll_interval_ms must be between {} and {}, got {}",
+                Self::POLL_INTERVAL_MS_RANGE.start(),
+                Self::POLL_INTERVAL_MS_RANGE.end(),
+                self.poll_interval_ms
+            ));
+        }
+        if !Self::MAX_RETRY_BACKOFF_SECS_RANGE.contains(&self.max_retry_backoff_secs) {
+            return Err(format!(
+                "wal_tap.max_retry_backoff_secs must be between {} and {} (one day), got {}",
+                Self::MAX_RETRY_BACKOFF_SECS_RANGE.start(),
+                Self::MAX_RETRY_BACKOFF_SECS_RANGE.end(),
+                self.max_retry_backoff_secs
+            ));
+        }
+        if self.min_retained_generations > Self::MAX_RETAINED_GENERATIONS {
+            return Err(format!(
+                "wal_tap.min_retained_generations must be at most {}: it holds that many \
+                 rotated WAL files per shard per index, costing up to \
+                 n * storage.wal_max_size_mb of disk each. Got {}",
+                Self::MAX_RETAINED_GENERATIONS,
+                self.min_retained_generations
+            ));
+        }
+        if self.max_batch_docs == 0 {
+            return Err("wal_tap.max_batch_docs must be at least 1".into());
+        }
+        if self.max_batch_bytes == 0 {
+            return Err("wal_tap.max_batch_bytes must be at least 1".into());
+        }
+        if self.request_timeout_secs == 0 {
+            return Err("wal_tap.request_timeout_secs must be at least 1".into());
+        }
+        Ok(())
+    }
+
     /// Reject a `target_url` this node must not accept, returning the operator
     /// message for a `400`.
     ///
@@ -1984,6 +2055,63 @@ mod tests {
         Config::default()
             .validate()
             .expect("default config should be valid");
+    }
+
+    /// #320 — the config file must not be the way around the bounds
+    /// `PUT /_xerj/wal_tap` enforces.
+    ///
+    /// `min_retained_generations` is refused above 64 by the API because the
+    /// knob costs `n × storage.wal_max_size_mb` per WAL shard per index
+    /// whether or not a tap is running; `xerj.toml` took any `u64` in silence
+    /// and the node then held that many rotated generations per shard forever.
+    /// `max_retry_backoff_secs` is the same shape and worse: values above
+    /// `u64::MAX / 1000` used to reach an unchecked `* 1000` inside
+    /// `WalTap::arm_backoff`.
+    ///
+    /// Same precedent as `compression.block_size_docs` (#318): an
+    /// out-of-range value is a typo the operator wants to hear about at boot,
+    /// not as a disk-full page later.
+    #[test]
+    fn wal_tap_numeric_knobs_are_range_checked_in_the_config_file_too() {
+        let bad = [
+            ("min_retained_generations = 100", "min_retained_generations"),
+            ("max_retry_backoff_secs = 0", "max_retry_backoff_secs"),
+            (
+                "max_retry_backoff_secs = 18446744073709552",
+                "max_retry_backoff_secs",
+            ),
+            ("poll_interval_ms = 10", "poll_interval_ms"),
+            ("poll_interval_ms = 60001", "poll_interval_ms"),
+            ("max_batch_docs = 0", "max_batch_docs"),
+            ("max_batch_bytes = 0", "max_batch_bytes"),
+            ("request_timeout_secs = 0", "request_timeout_secs"),
+        ];
+        for (line, field) in bad {
+            // `from_toml_str` validates, so a bad file is refused at load —
+            // the node never boots with it.
+            let toml = format!("[wal_tap]\n{line}\n");
+            let err = Config::from_toml_str(&toml)
+                .err()
+                .unwrap_or_else(|| panic!("[wal_tap] {line} must be refused at boot"));
+            assert!(
+                err.to_string().contains(field),
+                "the error must name the field the operator typed ({field}): {err}"
+            );
+        }
+
+        // The bounds themselves are accepted, so this is a range check and not
+        // an accidental ban.
+        for line in [
+            "min_retained_generations = 64",
+            "max_retry_backoff_secs = 86400",
+            "max_retry_backoff_secs = 1",
+            "poll_interval_ms = 50",
+            "poll_interval_ms = 60000",
+        ] {
+            let toml = format!("[wal_tap]\n{line}\n");
+            Config::from_toml_str(&toml)
+                .unwrap_or_else(|e| panic!("[wal_tap] {line} is in range but was refused: {e}"));
+        }
     }
 
     #[test]

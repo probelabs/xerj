@@ -160,56 +160,32 @@ pub async fn put_wal_tap(
         config.indices = v;
     }
     if let Some(v) = patch.poll_interval_ms {
-        if !(50..=60_000).contains(&v) {
-            return bad_request("wal_tap.poll_interval_ms must be between 50 and 60000");
-        }
         config.poll_interval_ms = v;
     }
     if let Some(v) = patch.max_batch_docs {
-        if v == 0 {
-            return bad_request("wal_tap.max_batch_docs must be at least 1");
-        }
         config.max_batch_docs = v;
     }
     if let Some(v) = patch.max_batch_bytes {
-        if v == 0 {
-            return bad_request("wal_tap.max_batch_bytes must be at least 1");
-        }
         config.max_batch_bytes = v;
     }
     if let Some(v) = patch.request_timeout_secs {
-        if v == 0 {
-            return bad_request("wal_tap.request_timeout_secs must be at least 1");
-        }
         config.request_timeout_secs = v;
     }
     if let Some(v) = patch.max_retry_backoff_secs {
-        // Range-checked like `poll_interval_ms` above, not merely `!= 0`.
-        // `WalTap::arm_backoff` now saturates so no value here can overflow
-        // it, but a cap of "several thousand years" is not a backoff — it is a
-        // tap that stops retrying after its first failed send and reports
-        // nothing beyond `last_error`. One day is already far past any
-        // recovery window a `_bulk` target has.
-        if !(1..=86_400).contains(&v) {
-            return bad_request(
-                "wal_tap.max_retry_backoff_secs must be between 1 and 86400 (one day)",
-            );
-        }
         config.max_retry_backoff_secs = v;
     }
     if let Some(v) = patch.min_retained_generations {
-        // Bounded on purpose: this knob costs `v * storage.wal_max_size_mb`
-        // per WAL shard per index whether or not a tap is running, so an
-        // operator typing an extra digit must not be able to fill the disk
-        // quietly.
-        if v > 64 {
-            return bad_request(
-                "wal_tap.min_retained_generations must be at most 64: it holds that many \
-                 rotated WAL files per shard per index, costing up to \
-                 n * storage.wal_max_size_mb of disk each",
-            );
-        }
         config.min_retained_generations = v;
+    }
+
+    // One range check for the numeric knobs, shared verbatim with
+    // `Config::validate` so the config file cannot be used to get a value past
+    // the bound this endpoint enforces. It used to be six inline checks here
+    // and none at all at boot: `PUT {"min_retained_generations": 100}` was a
+    // `400` because the knob costs `n × storage.wal_max_size_mb` per WAL shard
+    // per index, while `xerj.toml` took the same 100 in silence.
+    if let Err(reason) = config.check_limits() {
+        return bad_request(&reason);
     }
 
     if config.enabled && config.target_url.is_empty() {
