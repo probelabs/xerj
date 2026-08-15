@@ -633,9 +633,19 @@ Notes for a real migration:
   overwrites rather than duplicates. For huge indices, checkpoint the last
   `_id`/offset and use `search_after` keyset paging instead of a long-lived
   scroll.
-* **XERJ's scroll works too.** The same three calls (`_search?scroll=`,
-  `POST /_search/scroll`, `DELETE /_search/scroll`) are implemented on XERJ, so
-  you can point this script at a XERJ source for XERJ→XERJ copies as well.
+* **XERJ's scroll works too — up to the snapshot cap.** The same three calls
+  (`_search?scroll=`, `POST /_search/scroll`, `DELETE /_search/scroll`) are
+  implemented on XERJ, so you can point this script at a XERJ source for
+  XERJ→XERJ copies. But XERJ's scroll is a bounded up-front snapshot, not a
+  segment-walking cursor: a query whose exact total exceeds the snapshot window
+  is refused with a `400` naming the ceiling, rather than paged and silently
+  truncated. Whole-index copies are normally over it, so for a XERJ source reach
+  for the `search_after` keyset paging the previous bullet describes — take each
+  cursor from the previous page's last `sort` value, and mind that `_id` sorts
+  lexicographically (`"1000" < "999"`), so a cursor computed from the page
+  number walks off into the wrong part of the sort order and ends the copy
+  early with a 200. See
+  [the cap](https://xerj.org/docs/api-es-compat.html#scroll-cap).
 
 ---
 

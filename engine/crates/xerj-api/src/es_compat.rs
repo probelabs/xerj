@@ -34730,7 +34730,13 @@ pub async fn async_search_delete(
 /// `from + size` anyway — a larger snapshot request would be rejected at
 /// the engine boundary. A result set that exceeds the cap is REFUSED with
 /// [`scroll_window_exceeded`] rather than silently truncated.
-const SCROLL_SNAPSHOT_MAX_HITS: usize = 10_000;
+///
+/// Public because it is a documented compatibility boundary, not an internal
+/// tuning knob (issue #370): the published pages that state the cap are
+/// checked against this constant by
+/// `tests/scroll_snapshot_cap_is_documented.rs`, so changing the number here
+/// fails the build until the docs follow.
+pub const SCROLL_SNAPSHOT_MAX_HITS: usize = 10_000;
 
 /// ES-shaped 400 for a scroll whose exact result set exceeds the snapshot
 /// window (issue #198).

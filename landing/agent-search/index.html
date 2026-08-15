@@ -346,7 +346,7 @@ curl -X POST localhost:9200/kb/_search -H 'Content-Type: application/json' -d '{
     { id:"chunking", title:"Auto-chunk long documents",
       text:"Split long passages into overlapping chunks and embed each chunk, then retrieve the single best-matching passage instead of a whole document." },
     { id:"paginate", title:"Sort and paginate results",
-      text:"Order hits by score or by a field value, and page through them with from and size. Deep pagination uses search_after or a scroll cursor." },
+      text:"Order hits by score or by a field value, and page through them with from and size. Deep pagination uses search_after on a unique sort key; scroll is a bounded snapshot, not a cursor." },
     { id:"security", title:"Secure the cluster with TLS and keys",
       text:"Protect XERJ with TLS encryption and API-key authentication. Tokens gate every request; the insecure flag disables both for local development only." }
   ];
