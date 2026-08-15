@@ -250,13 +250,16 @@ async fn user_mapped_dense_vector_builds_no_fts_term_dictionary() {
     //
     // TWO totals, and only the second one is quotable. The whole data dir
     // includes the write-ahead log, whose tail is reclaimed asynchronously, so
-    // it is NOT reproducible: eight runs of this test on one machine printed a
-    // whole-dir total between 858,147 B and 1,105,001 B, a 29% spread, entirely
-    // because the surviving `.wal` files ranged from 256 B to 6 MB while the
-    // segment bytes did not move at all. `durable-index` excludes `.wal` and is
-    // reproducible to ~230 B (the run-to-run jitter in the HNSW `graph.bin`):
-    // the same eight runs printed 857,843 – 858,071 B. That is the number the
-    // CHANGELOG quotes and the one the ceiling below pins.
+    // it is NOT reproducible: the eight runs below printed a whole-dir total
+    // between 1,069,604 B and 1,104,599 B, and earlier revisions of this test
+    // have printed as little as 858,147 B, entirely because the surviving
+    // `.wal` files vary by megabytes while the segment bytes do not move at
+    // all. `durable-index` excludes `.wal` and is reproducible to ~500 B (the
+    // run-to-run jitter in the HNSW `graph.bin`): eight runs on THIS revision
+    // printed 857,265 / 857,529 / 857,533 / 857,545 / 857,549 / 857,657 /
+    // 857,657 / 857,769 B — a 504 B spread. That range is what the CHANGELOG
+    // quotes and the one the ceiling below pins. Re-measure all three places
+    // together (here, `memtable.rs`'s table, `CHANGELOG.md`) if it moves.
     let whole_dir: u64 = files.iter().map(|(_, len)| *len).sum();
     let durable: u64 = files
         .iter()
@@ -921,15 +924,21 @@ async fn nested_dense_vector_is_excluded_from_its_parent_objects_term_dictionary
 /// error rather than a silent downgrade (`IndexingChain.FieldSchema
 /// .setIndexOptions` → `assertSame` → `raiseNotSame`, `:2213` / `:2193`).
 ///
-/// THREE ARMS, and the third one asserts the OPPOSITE. `keyword` and `text`
-/// yield: the sibling keeps its `.fst` and every answer above. `long` does NOT
-/// yield, because `long`/`double` is exactly what dynamic mapping infers from
-/// a real multi-vector (`infer_field_type` on an array of float arrays), so
-/// deferring to it would put `<seg>.emb_chunks.fst` back at 1,592,118 B on the
-/// 300-doc fixture and give up the larger half of #328's saving. That arm
-/// therefore requires 0 hits and `must_not` = 50 — the documented residual,
-/// asserted rather than left to chance, so it cannot silently widen. The
-/// aggregation is checked on all three arms and buckets 25/25 on all three.
+/// FOUR ARMS AND THEY ALL YIELD, including the two numeric ones. An earlier
+/// revision of this test asserted the OPPOSITE for `long`: the name rule could
+/// not yield to `long`/`double` because that is what `infer_field_type` derives
+/// from an array of float arrays, so the declaration was indistinguishable from
+/// the multi-vector's own. That residual is closed at its source —
+/// `index::is_undeclared_multi_vector_companion` stops dynamic mapping
+/// inventing the numeric `FieldConfig` in the first place, so the only `long`
+/// or `double` under this name is one a user actually wrote, and
+/// `declares_non_vector_shaped_field` now yields to every declared type except
+/// `dense_vector`. Measured here: the `[long]` arm keeps `.emb_chunks.fst` at
+/// 44 B and answers 25 on every row, while the 300-doc fixture in
+/// `user_mapped_dense_vector_builds_no_fts_term_dictionary` still reports
+/// `emb_chunks.fst=0` — the saving is not paid for with the collision.
+///
+/// The aggregation is checked on all four arms and buckets 25/25 on all four.
 #[tokio::test]
 async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_looks_like_one() {
     const DIMS: usize = 16;
@@ -942,17 +951,18 @@ async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_loo
         ((h >> 11) as f64 / (1u64 << 53) as f64 * 2.0) - 1.0
     };
 
-    for declared in [FieldType::Keyword, FieldType::Text, FieldType::Long] {
+    for declared in [
+        FieldType::Keyword,
+        FieldType::Text,
+        FieldType::Long,
+        FieldType::Double,
+    ] {
         let label = match declared {
             FieldType::Keyword => "keyword",
             FieldType::Text => "text",
-            _ => "long",
+            FieldType::Long => "long",
+            _ => "double",
         };
-        // `long`/`double` is the RESIDUAL arm: it is what dynamic mapping
-        // infers from a real multi-vector, so the name rule cannot yield to it
-        // and this field IS still excluded. Pinned here, opposite in sign to
-        // the other two arms, so the limitation cannot drift into an accident.
-        let yields = !matches!(declared, FieldType::Long);
         let dir = TempDir::new().unwrap();
         let mut schema = Schema::empty();
         schema
@@ -986,9 +996,13 @@ async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_loo
                     "{tenant} {}",
                     if d % 2 == 0 { "widgets" } else { "gadgets" }
                 )),
-                // The residual arm: a scalar number, which is the shape
-                // `infer_field_type` also produces from a real multi-vector.
-                _ => json!(if d % 2 == 0 { 7 } else { 9 }),
+                // The two numeric arms. A SCALAR, which is what a user's own
+                // `long`/`double` field looks like — and, decisively, not the
+                // rectangular array-of-numeric-arrays `looks_like_multi_vector`
+                // recognises, so nothing about this value is companion-shaped
+                // either.
+                FieldType::Long => json!(if d % 2 == 0 { 7 } else { 9 }),
+                _ => json!(if d % 2 == 0 { 7.5 } else { 9.5 }),
             };
             idx.index_document(
                 Some(format!("d{d}")),
@@ -1032,15 +1046,14 @@ async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_loo
             bytes_of(".emb.fst"),
             bytes_of(".body.fst"),
         );
-        // The DECLARED sibling keeps its term dictionary — except on the
-        // residual arm, where the declaration is indistinguishable from the
-        // multi-vector's own inferred type and the name rule wins.
-        assert_eq!(
+        // The DECLARED sibling keeps its term dictionary. On ALL FOUR arms —
+        // this is the assertion that fails if the numeric carve-out ever comes
+        // back.
+        assert!(
             files
                 .iter()
                 .any(|(name, _)| name.ends_with(".emb_chunks.fst")),
-            yields,
-            "[{label}] `.emb_chunks.fst` present should be {yields}; got {:?}",
+            "[{label}] a declared sibling must keep `.emb_chunks.fst`; got {:?}",
             files
                 .iter()
                 .filter(|(name, _)| name.contains(".emb"))
@@ -1054,11 +1067,9 @@ async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_loo
 
         // ── The answers. Every row here is 25 on the merge base `ca4d75a`; the
         // unconditional name-only rule answered 0 for all of them, and 50 for
-        // the `must_not` shape below. On the two YIELDING arms this test
-        // requires 25 — the merge base's own answer. On the residual `long`
-        // arm it requires 0, which is what the name rule produces and what the
-        // CHANGELOG documents as a behaviour change.
-        let want = if yields { (DOCS / 2) as u64 } else { 0 };
+        // the `must_not` shape below. All four arms require 25 — the merge
+        // base's own answer.
+        let want = (DOCS / 2) as u64;
         let probes: Vec<(&str, Value)> = if matches!(declared, FieldType::Keyword) {
             vec![
                 ("term", json!({"term": {"emb_chunks": "tenant-a"}})),
@@ -1087,6 +1098,16 @@ async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_loo
                 (
                     "bool-filter",
                     json!({"bool": {"filter": [{"term": {"emb_chunks": 7}}]}}),
+                ),
+            ]
+        } else if matches!(declared, FieldType::Double) {
+            vec![
+                ("term", json!({"term": {"emb_chunks": 7.5}})),
+                ("terms", json!({"terms": {"emb_chunks": [7.5]}})),
+                ("range", json!({"range": {"emb_chunks": {"gte": 8}}})),
+                (
+                    "bool-filter",
+                    json!({"bool": {"filter": [{"term": {"emb_chunks": 7.5}}]}}),
                 ),
             ]
         } else {
@@ -1136,6 +1157,11 @@ async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_loo
                 "must": [{"match_all": {}}],
                 "must_not": [{"term": {"emb_chunks": 7}}]
             }})
+        } else if matches!(declared, FieldType::Double) {
+            json!({"bool": {
+                "must": [{"match_all": {}}],
+                "must_not": [{"term": {"emb_chunks": 7.5}}]
+            }})
         } else {
             json!({"bool": {
                 "must": [{"match_all": {}}],
@@ -1146,38 +1172,30 @@ async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_loo
             .search(&make_search(must_not_probe.clone()))
             .await
             .unwrap();
-        // On the yielding arms the exclusion still works and returns exactly the
-        // other half. On the residual arm it does NOT: the clause lowers to
-        // `match_none`, the Bool fold drops it as "excludes nothing", and all
-        // 50 come back — the 25 the exclusion was written to remove included.
-        // That is the behaviour change the CHANGELOG documents, asserted here
-        // so it cannot happen by accident on a shape nobody looked at.
+        // The exclusion returns exactly the other half on all four arms. Under
+        // the name-only rule the numeric arms returned all 50 — the 25 the
+        // exclusion was written to remove included; that is the shape this
+        // assertion exists to keep out.
         assert_eq!(
             excluded.total.value,
-            if yields {
-                (DOCS / 2) as u64
-            } else {
-                DOCS as u64
-            },
+            (DOCS / 2) as u64,
             "[{label}] must_not: got {} for {must_not_probe}",
             excluded.total.value
         );
-        if yields {
-            for hit in &excluded.hits {
-                let n: usize = hit.id.trim_start_matches('d').parse().unwrap();
-                assert_eq!(
-                    n % 2,
-                    1,
-                    "[{label}] must_not returned an excluded document: {}",
-                    hit.id
-                );
-            }
+        for hit in &excluded.hits {
+            let n: usize = hit.id.trim_start_matches('d').parse().unwrap();
+            assert_eq!(
+                n % 2,
+                1,
+                "[{label}] must_not returned an excluded document: {}",
+                hit.id
+            );
         }
 
-        // Doc values were never in question — this row answers 25/25 on ALL
-        // THREE arms, including the residual one where every lexical clause
-        // says 0. That is what proves the data is present and correctly
-        // populated, and that it is the planner, not the storage, that changed.
+        // Doc values were never in question — this row answers 25/25 on all
+        // four arms. It answered 25/25 under the name-only rule too, which is
+        // what proved the data was present and correctly populated while every
+        // lexical clause on it said 0: it was the planner, not the storage.
         let agg = idx
             .search(
                 &parse_request(&json!({
@@ -1226,6 +1244,281 @@ async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_loo
         assert_eq!(knn.hits.len(), 3, "[{label}] kNN must still retrieve");
         assert_eq!(knn.hits[0].id, "d0", "[{label}] nearest must be the probe");
     }
+}
+
+/// #328, the other half of the same rule: what dynamic mapping is allowed to do
+/// with an UNDECLARED `<vector>_chunks` key, which is what decides whether the
+/// collision test above can be true at the same time as the saving.
+///
+/// Three arms, one index each, all with `emb` declared `dense_vector` and
+/// `emb_chunks` absent from the mapping. What differs is only the VALUE, and
+/// the value is the whole rule
+/// (`memtable::looks_like_multi_vector` →
+/// `index::is_undeclared_multi_vector_companion`):
+///
+///   * `[[…],[…]]` rectangular numeric — a real RFC #148 multi-vector.
+///     Dynamic mapping must not register it, it must acquire no `FieldConfig`,
+///     it must have no `.emb_chunks.fst`, and lexical clauses on it answer 0.
+///     This is where the 26,518,005 B / 67% of #328's saving comes from.
+///   * a SCALAR string — somebody's own field that happens to sit under the
+///     name. Registered as `text` and fully lexical. This one was already safe
+///     before the fix.
+///   * a SCALAR number — somebody's own field, registered as `long`, and fully
+///     lexical. THIS is the arm that was silently broken: dynamic mapping wrote
+///     a `long` config, `declares_non_vector_shaped_field` carved `long` out of
+///     its yield set precisely because it could not tell that config from the
+///     multi-vector's, and every lexical clause on a live user field lowered to
+///     `match_none`. Nothing about the mapping changed and no error was raised.
+///
+/// The value-shape test is why all three can hold at once, and it is the same
+/// place Lucene puts the distinction: a per-document multi-vector is
+/// `LateInteractionField extends BinaryDocValuesField`
+/// (`lucene/core/src/java/org/apache/lucene/document/LateInteractionField.java:36`,
+/// `:44`, `:45`) — its own field type, never a numeric one arrived at by
+/// inference.
+#[tokio::test]
+async fn an_undeclared_chunks_key_is_unmapped_only_when_its_value_is_a_multi_vector() {
+    const DIMS: usize = 16;
+    const DOCS: usize = 50;
+
+    let component = |doc: usize, dim: usize| -> f64 {
+        let h = (doc as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add((dim as u64).wrapping_mul(1_442_695_040_888_963_407));
+        ((h >> 11) as f64 / (1u64 << 53) as f64 * 2.0) - 1.0
+    };
+
+    // (label, value builder, expected-to-stay-lexical, probe)
+    #[allow(clippy::type_complexity)]
+    let arms: Vec<(&str, Box<dyn Fn(usize, &[f64]) -> Value>, bool, Value)> = vec![
+        (
+            "multi-vector",
+            Box::new(|_d, v: &[f64]| json!([v, v])),
+            false,
+            json!({"term": {"emb_chunks": "0"}}),
+        ),
+        (
+            "scalar-string",
+            Box::new(|d, _v: &[f64]| json!(if d % 2 == 0 { "tenant-a" } else { "tenant-b" })),
+            true,
+            json!({"term": {"emb_chunks": "tenant-a"}}),
+        ),
+        (
+            "scalar-number",
+            Box::new(|d, _v: &[f64]| json!(if d % 2 == 0 { 7 } else { 9 })),
+            true,
+            json!({"term": {"emb_chunks": 7}}),
+        ),
+    ];
+
+    for (label, value_of, stays_lexical, probe) in arms {
+        let dir = TempDir::new().unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("body", FieldType::Text));
+        let mut emb = FieldConfig::new("emb", FieldType::Vector);
+        emb.options.dimensions = Some(DIMS);
+        emb.options.similarity = Some("cosine".to_string());
+        schema.fields.push(emb);
+        // NOTE: no `emb_chunks` here. Whatever config it ends up with is one
+        // dynamic mapping decided, which is exactly what is under test.
+
+        let engine = make_engine(&dir);
+        engine.create_index("dyn", schema).unwrap();
+        let idx = engine.get_index("dyn").unwrap();
+
+        for d in 0..DOCS {
+            let v: Vec<f64> = (0..DIMS).map(|dim| component(d, dim)).collect();
+            idx.index_document(
+                Some(format!("d{d}")),
+                json!({
+                    "body": format!("quarterly liquidity evidence {d}"),
+                    "emb_chunks": value_of(d, &v),
+                    "emb": v,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        idx.refresh().await.unwrap();
+        idx.force_merge(1).await.unwrap();
+
+        let live = idx.schema().await;
+        let mapped = live.fields.iter().find(|f| f.name == "emb_chunks");
+
+        let mut files: Vec<(String, u64)> = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), out);
+                } else {
+                    out.push((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.metadata().unwrap().len(),
+                    ));
+                }
+            }
+        }
+        walk(dir.path(), &mut files);
+        let fst: u64 = files
+            .iter()
+            .filter(|(name, _)| name.ends_with(".emb_chunks.fst"))
+            .map(|(_, len)| *len)
+            .sum();
+        let hits = idx.search(&make_search(probe.clone())).await.unwrap();
+        eprintln!(
+            "#328 dynamic [{label}]: mapped={:?} emb_chunks.fst={fst} hits={}",
+            mapped.map(|f| f.field_type),
+            hits.total.value
+        );
+
+        if stays_lexical {
+            assert!(
+                mapped.is_some(),
+                "[{label}] dynamic mapping must still register an ordinary field \
+                 under this name"
+            );
+            assert!(
+                fst > 0,
+                "[{label}] a dynamically mapped field of the user's own must keep \
+                 its term dictionary"
+            );
+            assert_eq!(
+                hits.total.value,
+                (DOCS / 2) as u64,
+                "[{label}] a dynamically mapped field of the user's own must stay \
+                 queryable, got {} for {probe}",
+                hits.total.value
+            );
+        } else {
+            assert!(
+                mapped.is_none(),
+                "[{label}] a real multi-vector must not acquire a FieldConfig; got {mapped:?}"
+            );
+            assert_eq!(fst, 0, "[{label}] a real multi-vector must have no `.fst`");
+            assert_eq!(
+                hits.total.value, 0,
+                "[{label}] a lexical clause on a real multi-vector must answer 0"
+            );
+        }
+        // The `dense_vector` itself is unaffected on every arm.
+        assert!(
+            !files.iter().any(|(name, _)| name.ends_with(".emb.fst")),
+            "[{label}] the dense_vector must still have no term dictionary"
+        );
+    }
+}
+
+/// #328, the documented LIMIT of the rule above, asserted rather than assumed.
+///
+/// `is_undeclared_multi_vector_companion` can only refuse to map a companion it
+/// can recognise, and recognising one needs the `dense_vector` to be declared
+/// ALREADY. Index the documents first and map `emb` afterwards and dynamic
+/// mapping has already written a `double` config for `emb_chunks` — which
+/// `declares_non_vector_shaped_field` then yields to, exactly as it would to a
+/// user's own declaration, because on the information in the schema the two are
+/// the same thing.
+///
+/// The consequence is bytes, not answers: `<seg>.emb_chunks.fst` survives. That
+/// is the safe direction of the trade and the reason this limit is acceptable,
+/// so the test asserts BOTH halves — the dictionary is there AND the field
+/// still answers — so that a future change cannot quietly convert it into the
+/// silent-zero direction.
+#[tokio::test]
+async fn a_companion_mapped_before_its_vector_keeps_its_dictionary_and_its_answers() {
+    const DIMS: usize = 16;
+    const DOCS: usize = 50;
+
+    let dir = TempDir::new().unwrap();
+    let mut schema = Schema::empty();
+    schema
+        .fields
+        .push(FieldConfig::new("body", FieldType::Text));
+    let engine = make_engine(&dir);
+    engine.create_index("late", schema).unwrap();
+    let idx = engine.get_index("late").unwrap();
+
+    // Documents FIRST — no `emb` in the mapping yet, so `emb_chunks` is just an
+    // array of numeric arrays and dynamic mapping registers it as `double`.
+    for d in 0..DOCS {
+        let v: Vec<f64> = (0..DIMS).map(|dim| (d + dim) as f64 * 0.25).collect();
+        idx.index_document(
+            Some(format!("d{d}")),
+            json!({
+                "body": format!("quarterly liquidity evidence {d}"),
+                "emb_chunks": [v.clone(), v.clone()],
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    idx.refresh().await.unwrap();
+
+    let before = idx.schema().await;
+    let inferred = before
+        .fields
+        .iter()
+        .find(|f| f.name == "emb_chunks")
+        .map(|f| f.field_type);
+    assert_eq!(
+        inferred,
+        Some(FieldType::Double),
+        "with no `dense_vector` declared, the companion is an ordinary numeric \
+         field and must be mapped like one"
+    );
+
+    // …and only NOW is the vector declared. From this point on
+    // `lexically_typeless_fields` synthesises `emb_chunks` as a companion
+    // candidate — and finds the `double` config dynamic mapping already wrote.
+    let mut emb = FieldConfig::new("emb", FieldType::Vector);
+    emb.options.dimensions = Some(DIMS);
+    emb.options.similarity = Some("cosine".to_string());
+    idx.add_field(emb).await.unwrap();
+    idx.force_merge(1).await.unwrap();
+
+    let mut files: Vec<(String, u64)> = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), out);
+            } else {
+                out.push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.metadata().unwrap().len(),
+                ));
+            }
+        }
+    }
+    walk(dir.path(), &mut files);
+    let fst: u64 = files
+        .iter()
+        .filter(|(name, _)| name.ends_with(".emb_chunks.fst"))
+        .map(|(_, len)| *len)
+        .sum();
+    let hits = idx
+        .search(&make_search(json!({"exists": {"field": "emb_chunks"}})))
+        .await
+        .unwrap();
+    eprintln!(
+        "#328 mapping-after-data: emb_chunks.fst={fst} exists={}",
+        hits.total.value
+    );
+
+    // The cost of the limit: the companion's dictionary survives.
+    assert!(
+        fst > 0,
+        "mapping the vector after the data leaves the companion's dictionary in \
+         place — that is the documented cost, and it is bytes"
+    );
+    // The thing that must NOT happen: it is still a live, answering field.
+    assert_eq!(
+        hits.total.value, DOCS as u64,
+        "the companion must stay queryable when the schema says it is an \
+         ordinary numeric field"
+    );
 }
 
 #[tokio::test]

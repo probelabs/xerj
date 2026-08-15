@@ -18653,7 +18653,9 @@ impl Index {
                     continue;
                 };
                 for (key, val) in obj {
-                    if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                    if key.starts_with(PASSAGE_METADATA_PREFIX)
+                        || is_undeclared_multi_vector_companion(&schema.schema, key, val)
+                    {
                         continue;
                     }
                     match schema.schema.field(key) {
@@ -18782,7 +18784,9 @@ impl Index {
                 return;
             }
             obj.iter().any(|(key, val)| {
-                if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                if key.starts_with(PASSAGE_METADATA_PREFIX)
+                    || is_undeclared_multi_vector_companion(&schema.schema, key, val)
+                {
                     return false;
                 }
                 match schema.schema.field(key) {
@@ -18829,7 +18833,9 @@ impl Index {
         let mut schema_changed = false;
         let mut field_count = schema.schema.field_count() as u32;
         for (key, val) in obj {
-            if key.starts_with(PASSAGE_METADATA_PREFIX) {
+            if key.starts_with(PASSAGE_METADATA_PREFIX)
+                || is_undeclared_multi_vector_companion(&schema.schema, key, val)
+            {
                 continue;
             }
             if let Some(existing) = schema.schema.field_mut(key) {
@@ -30164,7 +30170,8 @@ fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
 /// float array. "Outright" is load-bearing twice over: a `fields: ["emb.*"]`
 /// PATTERN is not lowered (see `is_typeless_spec` below — measured 300 of 300
 /// on the fixture, on the merge base and here alike), and a `<field>_chunks`
-/// the user mapped as `text`/`keyword`/`date`/`boolean`/`ip` is not in
+/// the user mapped as ANYTHING other than `dense_vector` — or that dynamic
+/// mapping registered from a value that is not a multi-vector — is not in
 /// `typeless` at all, so nothing naming it is lowered either
 /// (`memtable::lexically_typeless_fields`). On the 300-doc
 /// regression fixture that is `wildcard {emb:"0*"}` and `fuzzy {emb:"0"~2}`
@@ -31786,6 +31793,89 @@ fn dynamic_field_config(key: &str, val: &Value, date_detection: bool) -> FieldCo
     dynamic_field_config_at_depth(key, val, date_detection, 1)
 }
 
+/// Is `key` the per-document MULTI-VECTOR companion of a `dense_vector` that
+/// is already declared, carrying the value shape RFC #148 gives one?
+///
+/// Dynamic mapping must NOT register such a key. `<vector>_chunks` arrives in
+/// `_source` as an array of float arrays, and `infer_field_type` walks it to
+/// its first scalar and lands on `FieldType::Double` — a `FieldConfig` that is
+/// byte-identical to what a user mapping `"type": "double"` would have
+/// produced. Once that config exists nothing downstream can tell the two
+/// apart, and `memtable::declares_non_vector_shaped_field` is left choosing
+/// between honouring a declaration nobody made (giving the companion back its
+/// term dictionary: measured `<seg>.emb_chunks.fst` 0 B → 1,592,118 B on the
+/// 300-doc `#328` fixture) and overriding a declaration the user DID make
+/// (silently unmapping their own numeric field). Not inventing the config is
+/// what removes the choice.
+///
+/// It is the same refusal the `__xerj_passage_meta__` sidecar already gets in
+/// the same `||` at each of this predicate's call sites
+/// (`key.starts_with(PASSAGE_METADATA_PREFIX)`), and the same modelling Lucene
+/// uses: a per-document multi-vector is `LateInteractionField extends
+/// BinaryDocValuesField`
+/// (`lucene/core/src/java/org/apache/lucene/document/LateInteractionField.java:36`,
+/// `:44`, `:45`) — its own field type, never a numeric one arrived at by
+/// inference.
+///
+/// THREE conditions, all required, so the blast radius is exactly the
+/// companion:
+///
+///  * the name is `<base>_chunks`;
+///  * `<base>` is ALREADY declared `dense_vector` in the live schema — a
+///    `foo_chunks` with no `foo` vector beside it is an ordinary field and is
+///    mapped as one;
+///  * the value [`looks_like_multi_vector`] — a rectangular, non-empty array of
+///    non-empty all-numeric arrays. A scalar, a string, a flat array or a
+///    ragged one is somebody's own field and is mapped as one.
+///
+/// KNOWN LIMIT, and it fails SAFE: this only fires when the `dense_vector` is
+/// declared BEFORE the documents arrive. Index first and map afterwards and
+/// `<vector>_chunks` already holds a dynamic `double` config, which
+/// `declares_non_vector_shaped_field` then (correctly, on the information it
+/// has) yields to — so the companion keeps its term dictionary. That costs
+/// bytes, not answers. Pinned by
+/// `documents_before_the_mapping_leave_the_companion_mapped_and_lexical`.
+/// ALLOCATION: this runs for every key of every ingested document that dynamic
+/// mapping does not already know, on both the read-lock pre-screen and the
+/// write-lock loop, so it allocates nothing and orders its three tests
+/// cheapest-first: an `O(1)` suffix strip, then an allocation-free schema walk
+/// ([`declares_dense_vector`], which is why `collect_dense_vector_fields`'
+/// `Vec<String>` is not used here), then the value walk.
+fn is_undeclared_multi_vector_companion(schema: &Schema, key: &str, val: &Value) -> bool {
+    let Some(base) = key.strip_suffix(crate::memtable::MULTI_VECTOR_COMPANION_SUFFIX) else {
+        return false;
+    };
+    !base.is_empty()
+        && declares_dense_vector(schema, base)
+        && crate::memtable::looks_like_multi_vector(val)
+}
+
+/// Is `path` declared `dense_vector`? Allocation-free, and resolves BOTH
+/// spellings of a nested name for the same reason
+/// `memtable::declares_non_vector_shaped_field` does: `put_mapping` stores a
+/// dotted path as one top-level `FieldConfig` named `"passages.vec"`, while
+/// `es_properties_to_fields` stores it as a `vec` child under a `passages`
+/// object. The literal lookup runs first so the flat spelling cannot fall
+/// through the segmented walk and be reported as undeclared.
+fn declares_dense_vector(schema: &Schema, path: &str) -> bool {
+    let is_vector = |fc: &FieldConfig| matches!(fc.field_type, FieldType::Vector);
+    if let Some(field) = schema.fields.iter().find(|fc| fc.name == path) {
+        return is_vector(field);
+    }
+    let mut fields: &[FieldConfig] = &schema.fields;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let Some(field) = fields.iter().find(|fc| fc.name == segment) else {
+            return false;
+        };
+        if segments.peek().is_none() {
+            return is_vector(field);
+        }
+        fields = &field.fields;
+    }
+    false
+}
+
 fn dynamic_field_config_at_depth(
     key: &str,
     val: &Value,
@@ -31912,6 +32002,26 @@ fn merge_dynamic_children_into(
     };
     let mut changed = false;
     for (key, sub_val) in obj {
+        // The nested form of `is_undeclared_multi_vector_companion`. It needs
+        // no dotted path and no `Schema`, because a companion and its
+        // `dense_vector` are SIBLINGS in the very object being merged: for a
+        // `passages` mapping carrying a `vec` child of type `dense_vector`, the
+        // companion is the `vec_chunks` child right beside it. Checking
+        // `field.fields` locally keeps this function's signature (and its four
+        // call sites) untouched.
+        if key
+            .strip_suffix(crate::memtable::MULTI_VECTOR_COMPANION_SUFFIX)
+            .filter(|base| !base.is_empty())
+            .is_some_and(|base| {
+                field
+                    .fields
+                    .iter()
+                    .any(|f| f.name == base && matches!(f.field_type, FieldType::Vector))
+            })
+            && crate::memtable::looks_like_multi_vector(sub_val)
+        {
+            continue;
+        }
         match field.fields.iter_mut().find(|f| f.name == *key) {
             Some(existing) => {
                 if merge_dynamic_children_into(
@@ -40483,6 +40593,187 @@ mod date_detection_tests {
                 "{bad} must be rejected"
             );
         }
+    }
+}
+
+/// Unit coverage for the #328 dynamic-mapping refusal — the half of the
+/// companion rule that keeps `memtable::declares_non_vector_shaped_field` free
+/// to yield to any declaration it finds.
+#[cfg(test)]
+mod multi_vector_companion_mapping_tests {
+    use super::*;
+
+    fn vector(name: &str, dims: usize) -> FieldConfig {
+        let mut fc = FieldConfig::new(name, FieldType::Vector);
+        fc.options.dimensions = Some(dims);
+        fc
+    }
+
+    fn schema_with_vector() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema.add_field(vector("emb", 2)).unwrap();
+        schema
+    }
+
+    /// ALL THREE conditions are required. Drop any one and dynamic mapping goes
+    /// back to registering the key like any other.
+    #[test]
+    fn the_refusal_needs_the_name_the_declaration_and_the_shape() {
+        let schema = schema_with_vector();
+        let mv = serde_json::json!([[1.0, 2.0], [3.0, 4.0]]);
+
+        // All three present.
+        assert!(is_undeclared_multi_vector_companion(
+            &schema,
+            "emb_chunks",
+            &mv
+        ));
+
+        // Wrong NAME: same value, no `_chunks` suffix, and a suffix with no
+        // base in front of it.
+        assert!(!is_undeclared_multi_vector_companion(&schema, "emb", &mv));
+        assert!(!is_undeclared_multi_vector_companion(
+            &schema, "matrix", &mv
+        ));
+        assert!(!is_undeclared_multi_vector_companion(
+            &schema, "_chunks", &mv
+        ));
+
+        // No DECLARATION to be a companion of: `other_chunks` has no `other`
+        // vector beside it, so it is an ordinary field even though its value is
+        // rectangular numeric.
+        assert!(!is_undeclared_multi_vector_companion(
+            &schema,
+            "other_chunks",
+            &mv
+        ));
+        // …and a base declared as something that is not a vector does not
+        // create a companion either.
+        let mut lexical_base = Schema::empty();
+        lexical_base
+            .add_field(FieldConfig::new("emb", FieldType::Text))
+            .unwrap();
+        assert!(!is_undeclared_multi_vector_companion(
+            &lexical_base,
+            "emb_chunks",
+            &mv
+        ));
+
+        // Wrong SHAPE: a user's own scalar, string, flat array or ragged array
+        // under the companion's name is still mapped.
+        for own in [
+            serde_json::json!(7),
+            serde_json::json!(7.5),
+            serde_json::json!("tenant-a"),
+            serde_json::json!([1.0, 2.0]),
+            serde_json::json!([[1.0, 2.0], [3.0]]),
+        ] {
+            assert!(
+                !is_undeclared_multi_vector_companion(&schema, "emb_chunks", &own),
+                "{own} is somebody's own field and must be mapped"
+            );
+        }
+    }
+
+    /// Both spellings of a nested vector reach the schema, so both must be
+    /// recognised — the same two shapes
+    /// `nested_dense_vector_is_excluded_from_its_parent_objects_term_dictionary`
+    /// exercises. The flat lookup runs first so it cannot fall through the
+    /// segmented walk.
+    #[test]
+    fn declares_dense_vector_resolves_both_nested_spellings() {
+        let mut dotted = Schema::empty();
+        dotted.add_field(vector("passages.vec", 2)).unwrap();
+        assert!(declares_dense_vector(&dotted, "passages.vec"));
+        assert!(!declares_dense_vector(&dotted, "passages"));
+        assert!(!declares_dense_vector(&dotted, "passages.other"));
+
+        let mut sub = Schema::empty();
+        let mut parent = FieldConfig::new("passages", FieldType::Object);
+        parent.fields.push(vector("vec", 2));
+        parent
+            .fields
+            .push(FieldConfig::new("title", FieldType::Text));
+        sub.add_field(parent).unwrap();
+        assert!(declares_dense_vector(&sub, "passages.vec"));
+        assert!(!declares_dense_vector(&sub, "passages.title"));
+        assert!(!declares_dense_vector(&sub, "passages"));
+        // Does not walk past a leaf, and does not invent missing segments.
+        assert!(!declares_dense_vector(&sub, "passages.vec.deeper"));
+        assert!(!declares_dense_vector(&sub, "absent.vec"));
+    }
+
+    /// The nested form of the refusal, which lives in
+    /// `merge_dynamic_children_into` and reads the sibling list directly rather
+    /// than a dotted path. A `vec_chunks` beside a `dense_vector vec` is not
+    /// registered; a `vec_chunks` with a scalar value, or one whose sibling is
+    /// not a vector, is.
+    #[test]
+    fn a_nested_companion_is_not_merged_in_beside_its_vector() {
+        let mut parent = FieldConfig::new("passages", FieldType::Object);
+        parent.fields.push(vector("vec", 2));
+        let mut count = 1u32;
+        let changed = merge_dynamic_children_into(
+            &mut parent,
+            &serde_json::json!({"vec_chunks": [[1.0, 2.0], [3.0, 4.0]], "title": "q3"}),
+            true,
+            1,
+            &mut count,
+            100,
+        );
+        assert!(changed, "the ordinary sibling still lands");
+        assert!(
+            parent.fields.iter().any(|f| f.name == "title"),
+            "{parent:?}"
+        );
+        assert!(
+            !parent.fields.iter().any(|f| f.name == "vec_chunks"),
+            "the nested multi-vector companion must not be registered: {parent:?}"
+        );
+        assert_eq!(count, 2, "exactly one field was added");
+
+        // A scalar under the same name IS somebody's own field.
+        let mut own = FieldConfig::new("passages", FieldType::Object);
+        own.fields.push(vector("vec", 2));
+        let mut own_count = 1u32;
+        merge_dynamic_children_into(
+            &mut own,
+            &serde_json::json!({"vec_chunks": 7}),
+            true,
+            1,
+            &mut own_count,
+            100,
+        );
+        assert_eq!(
+            own.fields
+                .iter()
+                .find(|f| f.name == "vec_chunks")
+                .map(|f| f.field_type),
+            Some(FieldType::Long),
+            "{own:?}"
+        );
+
+        // …and so is a rectangular numeric array with no vector sibling.
+        let mut no_vector = FieldConfig::new("passages", FieldType::Object);
+        no_vector
+            .fields
+            .push(FieldConfig::new("vec", FieldType::Text));
+        let mut nv_count = 1u32;
+        merge_dynamic_children_into(
+            &mut no_vector,
+            &serde_json::json!({"vec_chunks": [[1.0, 2.0]]}),
+            true,
+            1,
+            &mut nv_count,
+            100,
+        );
+        assert!(
+            no_vector.fields.iter().any(|f| f.name == "vec_chunks"),
+            "no `dense_vector` sibling means no companion: {no_vector:?}"
+        );
     }
 }
 

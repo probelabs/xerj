@@ -161,8 +161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   halves are named in that headline because the companion is where most of the
   bytes are: of the 39,796,380 B removed below, **26,518,005 B (67%) is
   `<seg>.emb_chunks.fst`**, and in that corpus `emb_chunks` is not in the
-  mapping at all — it is a dynamic field matched by NAME, not a field anyone
-  declared `dense_vector`. The field was fed
+  mapping at all — it is matched by NAME, not by anyone declaring it
+  `dense_vector`. The field was fed
   through the lexical indexing path and given an FST + postings that no query
   path can read: kNN is served by `hnsw/graph.bin`, `exists` from
   `_source`/doc values, and `_field_caps` and highlighting never open the
@@ -181,16 +181,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `.wal` is excluded from that total because its tail is reclaimed
   asynchronously and it is not reproducible: on the 300-doc fixture the
-  committed regression test uses, eight runs put the *whole directory* anywhere
-  between 858,147 B and 1,105,001 B while the durable bytes moved by 230 B. The
+  committed regression test uses, runs put the *whole directory* anywhere
+  between 858,147 B and 1,105,001 B while the durable bytes moved by ~500 B. The
   test prints both and asserts on the durable one. It reports
-  **3,249,323 B → 857,563–858,071 B** for that fixture (before-side measured by
+  **3,249,323 B → 857,265–857,769 B** for that fixture (before-side measured by
   reverting `index.rs` and `memtable.rs` to the merge base `ca4d75a` on the same
   fixture), which is the same −73.6% at 1/17th the corpus. Eight runs of the
-  committed test on this revision printed 857,563 / 857,623 / 857,643 /
-  857,659 / 857,787 / 857,827 / 857,859 / 857,955 B; the ceiling it asserts is
-  1,500,000 B, three orders of magnitude clear of that jitter and still 1.7 MB
-  below the before-side.
+  committed test on this revision printed 857,265 / 857,529 / 857,533 /
+  857,545 / 857,549 / 857,657 / 857,657 / 857,769 B, a 504 B spread; the ceiling
+  it asserts is 1,500,000 B, three orders of magnitude clear of that jitter and
+  still 1.7 MB below the before-side.
 
   A `dense_vector` nested under an object mapping is covered too — its
   components were landing in the *parent's* term dictionary, because the segment
@@ -208,14 +208,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Two rules, and they do not have the same strength.** The base field is
   excluded BY DECLARED TYPE (`dense_vector`, unconditionally). The two
-  companions are excluded BY NAME, because the passage pipeline writes them into
-  `_source` with no mapping entry behind them, so there is no declared type to
-  read — and a name-based rule YIELDS to a declaration it could not have
-  produced itself. **If you have mapped your own field called `<vector>_chunks`
-  or `__xerj_passage_meta__<vector>` as `text`, `keyword`, `date`, `boolean` or
-  `ip`, nothing about it changes**: it keeps its term dictionary, every query
-  naming it keeps answering exactly what it answered before, and only the
-  `dense_vector` beside it loses its postings. Measured on
+  companions are excluded BY NAME, because they arrive in `_source` with no
+  mapping entry behind them, so there is no declared type to read — and a
+  name-based rule YIELDS to any declaration it finds. **If you have mapped your
+  own field called `<vector>_chunks` or `__xerj_passage_meta__<vector>` as
+  anything at all other than `dense_vector` — `text`, `keyword`, `long`,
+  `integer`, `short`, `byte`, `unsigned_long`, `double`, `float`, `half_float`,
+  `scaled_float`, `date`, `date_nanos`, `boolean`, `ip`, `geo_point`, `binary`,
+  `object`, `nested`, or a type string XERJ does not recognise — nothing about
+  it changes**: it keeps its term dictionary, every query naming it keeps
+  answering exactly what it answered before, and only the `dense_vector` beside
+  it loses its postings. The same holds for a field of that name XERJ mapped for
+  you dynamically, whatever type it inferred, as long as the value is not itself
+  a multi-vector. Measured on
   `{text body, keyword emb_chunks, dense_vector emb}`, 50 docs, half `tenant-a`
   (before → after): `term {emb_chunks:"tenant-a"}` 25 → 25,
   `terms` 25 → 25, `bool{filter:[term emb_chunks]}` 25 → 25,
@@ -224,13 +229,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bool{must_not:[term emb_chunks]}` 25 → 25, `<seg>.emb_chunks.fst`
   54 B → 54 B, `<seg>.emb.fst` 16,713 B → 0. Same with a `text` mapping:
   `match` / `match_phrase` / `multi_match` / `simple_query_string` / `prefix`
-  all 25 → 25 and `<seg>.emb_chunks.fst` 71 B → 71 B. A dynamically mapped
-  string field of that name is exempt on the same rule (dynamic mapping
-  registers it as `text`) — measured 25 → 25.
+  all 25 → 25 and `<seg>.emb_chunks.fst` 71 B → 71 B. A `long` mapping keeps a
+  44 B `.fst` and a `double` mapping a 48 B one, both 25 → 25 on `term`,
+  `terms`, `range`, `bool{filter}` and `bool{must_not}`. A field of that name
+  XERJ mapped for you *dynamically* is exempt on the same rule — measured
+  25 → 25 for a `text` one (54 B `.fst`) and 25 → 25 for a `long` one
+  (44 B `.fst`).
 
-  `long` and `double` are the exception, because they are what dynamic mapping
-  infers from a real multi-vector and the rule cannot tell the two apart. See
-  the fourth behaviour change below; that case is a hard incompatibility.
+  **What makes "yields to any declaration" affordable** is that the companion
+  is stopped from ever acquiring one. `<vector>_chunks` is user-supplied
+  `_source` — an array of float arrays — so dynamic mapping used to register it
+  like any other unmapped key and infer `double` from it, producing a mapping
+  entry indistinguishable from one you wrote. Dynamic mapping now declines to
+  register a `<vector>_chunks` key when a `dense_vector` named `<vector>` is
+  already mapped *and* the value is a rectangular, non-empty array of non-empty
+  all-numeric arrays — the exact multi-vector shape, and nothing else. A scalar,
+  a string, a flat array or a ragged one under that name is your field and is
+  mapped as one. Measured on `{text body, dense_vector emb}` with `emb_chunks`
+  left out of the mapping, 50 docs: an `[[…],[…]]` value gets no mapping entry,
+  `<seg>.emb_chunks.fst` = 0 B and a lexical clause on it answers 0; a `"tenant-a"`
+  value is mapped `text`, keeps a 54 B `.fst` and answers 25; a `7` value is
+  mapped `long`, keeps a 44 B `.fst` and answers 25.
+
+  Both halves were measured on their own, by disabling each in the tree and
+  re-running the committed tests:
+
+  | | `emb_chunks.fst` (300-doc) | durable index | declared `long` sibling |
+  |---|---:|---:|---|
+  | this release | **0 B** | 857,265–857,769 B | 44 B `.fst`, answers 25 |
+  | yield restored to `long`/`double`-excluded | 0 B | 857,445 B | **0 B, answers 0, `must_not` returns 50** |
+  | dynamic-mapping refusal disabled | **1,592,118 B** | **2,451,336 B** | 44 B, answers 25 |
+
+  The middle row is the behaviour rc.16 would have shipped; the bottom row is
+  the 67% of the saving that an unconditional "any declaration wins" gives up.
+  Neither cost is paid here.
 
   A lexical clause that NAMES a `dense_vector` (or one of its companions) is now
   lowered to `match_none` at plan time rather than falling through to the
@@ -315,45 +347,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `max_score` for a bool that touches a vector field will see this. Plain
     lexical queries are unaffected; the blast radius is bools with a
     `dense_vector` clause in them.
-  - **A `long` or `double` field named `<vector>_chunks` or
-    `__xerj_passage_meta__<vector>` stops being lexically searchable.** This is
-    the by-name half of the rule above, and it is the one case where it cannot
-    yield, because `long`/`double` is precisely what dynamic mapping infers from
-    a real multi-vector (an array of float arrays walks to its first scalar).
-    Deferring to that declaration was measured and it puts
-    `<seg>.emb_chunks.fst` back at 1,592,118 B on the 300-doc fixture — i.e. it
-    gives up the larger half of the saving above. So the name wins, and a user's
-    own numeric field under that name loses its term dictionary. Measured on
-    `{text body, long emb_chunks, dense_vector emb}`, 50 docs, values 7 and 9
-    (before → after):
+  - **`GET /<index>/_mapping` no longer lists a `<vector>_chunks` field that
+    XERJ mapped for you.** The multi-vector companion beside a declared
+    `dense_vector` used to be registered by dynamic mapping as `double` (an
+    array of float arrays walks to its first scalar). It is not registered at
+    all now, so it disappears from `_mapping` and `_field_caps` — the same
+    treatment `__xerj_passage_meta__<vector>` already had. Nothing that reads
+    `_source` changes; the values are stored and returned exactly as before, and
+    `knn` and `semantic` on the vector itself are untouched. A field of that
+    name that you mapped yourself, or that XERJ mapped from a non-multi-vector
+    value, is unaffected and still listed.
 
-    | query | before | after |
-    |---|---:|---:|
-    | `term {emb_chunks: 7}` | 25 | **0** |
-    | `terms {emb_chunks: [7]}` | 25 | **0** |
-    | `range {emb_chunks: {gte: 8}}` | 25 | **0** |
-    | `bool{filter:[term emb_chunks 7]}` | 25 | **0** |
-    | `bool{must:[match_all], must_not:[term emb_chunks 7]}` | 25 | **50** |
-    | `terms` agg / `stats` on `emb_chunks` | 25/25, sum 400 | 25/25, sum 400 |
-
-    The `must_not` row returns the documents the exclusion was written to
-    remove, so treat this as a hard incompatibility rather than a footnote:
-    **if you have your own numeric field named `<vector>_chunks`, rename it
-    before upgrading.** Any other declared type (`text`, `keyword`, `date`,
-    `boolean`, `ip`) is exempt and unchanged, as is a dynamically mapped string
-    field of that name. Doc values are never affected on any of these paths —
-    the `terms` and `stats` aggregations in the last row keep working on the
-    residual case, which is how the rows above were confirmed to be a planning
-    change and not data loss.
+    One consequence worth knowing: aggregating or sorting on that companion
+    stops working, because it no longer has a mapping entry to aggregate
+    through. On a real multi-vector this was never a meaningful operation, but
+    it was a `200` before and is not now.
   - **Existing indices keep their bloat until a merge rewrites them.** This is a
     write-side rule. Segments written by an earlier release keep their `.emb.*`
     / `.emb_chunks.*` files, and the per-segment `fts_has_field` gate reads
     whichever shape it finds. Run an explicit
     `POST /<index>/_forcemerge?max_num_segments=1` to reclaim the bytes on an
-    index that already exists. The same applies to the by-name rule above: an
-    existing index with a `long`/`double` `<vector>_chunks` that is searchable
-    today stops being searchable for those clauses as soon as its segments are
-    rewritten — before any mapping change, and with no error.
+    index that already exists.
+
+    The companion rule has an ordering limit of the same kind, and it fails in
+    the safe direction: XERJ can only decline to map a companion it can
+    recognise, and recognising one needs the `dense_vector` to be mapped
+    *before* the documents arrive. Index first and add the mapping afterwards
+    and `<vector>_chunks` already carries a dynamic `double` entry, which the
+    by-name rule then yields to — so that index keeps the companion's term
+    dictionary (measured 9,467 B on a 50-doc × 16-dim fixture) instead of
+    reclaiming it. It costs bytes, not answers.
 
   *Not changed:* ES rejects `term`/`match`/`range` on a `dense_vector` outright,
   where XERJ answers `200`. This release removes bytes and adopts Lucene's

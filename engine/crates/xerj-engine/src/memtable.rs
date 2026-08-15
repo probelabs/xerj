@@ -3917,20 +3917,23 @@ pub fn semantic_derived_vector_fields(schema: &Schema) -> std::collections::Hash
 ///
 /// The row is the DURABLE index — every file in the data directory except
 /// `.wal` — because the write-ahead log's tail is reclaimed asynchronously and
-/// the whole-directory total is therefore not reproducible: eight runs of the
-/// 300-doc regression test put it anywhere between 858,147 B and 1,105,001 B
-/// while the durable bytes moved by 230 B. `.seg` (the stored documents, 11.2 MB
+/// the whole-directory total is therefore not reproducible: runs of the 300-doc
+/// regression test have put it anywhere between 858,147 B and 1,105,001 B while
+/// the durable bytes moved by ~500 B. `.seg` (the stored documents, 11.2 MB
 /// here) is counted on both sides and is why the ratio is 3.79× rather than the
 /// 39.8 MB the term dictionaries cost outright.
 ///
 /// The 300-doc × 128-dim fixture the regression tests actually run is the same
 /// shape one order of magnitude down: `emb.fst` 796,274 B, `emb.post` 591 B,
 /// `emb.norms` 313 B, `emb_chunks.fst` 1,592,118 B, `emb_chunks.post` 591 B,
-/// durable index 3,249,323 B → 857,563–858,071 B (eight runs on this revision
-/// printed 857,563 / 857,623 / 857,643 / 857,659 / 857,787 / 857,827 /
-/// 857,859 / 857,955). That test
-/// prints both totals and asserts a ceiling on the durable one, so this figure
-/// is enforced rather than merely published.
+/// durable index 3,249,323 B → 857,265–857,769 B (eight runs on this revision
+/// printed 857,265 / 857,529 / 857,533 / 857,545 / 857,549 / 857,657 /
+/// 857,657 / 857,769, a 504 B spread). That test prints both totals and asserts
+/// a ceiling on the durable one, so this figure is enforced rather than merely
+/// published. The same eight runs are quoted verbatim in `CHANGELOG.md` and in
+/// the comment above the `eprintln!` in
+/// `user_mapped_dense_vector_builds_no_fts_term_dictionary`; all three move
+/// together or none of them do.
 ///
 /// TWO RULES DECIDE THIS SET, and they are stated separately because they do
 /// not have the same strength. [`lexically_typeless_fields`] has the full
@@ -3945,19 +3948,21 @@ pub fn semantic_derived_vector_fields(schema: &Schema) -> std::collections::Hash
 ///    the vector half is droppable — that needs a value-shape-aware rule, not
 ///    a type rule.
 ///  * BY NAME, for the two companions `<field>_chunks` and
-///    `__xerj_passage_meta__<field>`, which the passage pipeline writes into
-///    `_source` with no `FieldConfig` behind them, so there is no declared type
-///    to read. This rule is the weaker of the two and YIELDS to a declaration
-///    it could not have produced itself: a field mapped `text`, `keyword`,
-///    `date`, `boolean`, `ip`, `chunk` or `object` under one of those names
-///    keeps its full lexical surface. It does NOT yield to `long`/`double`,
-///    which is exactly what dynamic mapping infers from a real multi-vector —
-///    the residual, with its measured cost and its measured A/B, is on
-///    [`lexically_typeless_fields`] and in `CHANGELOG.md`.
+///    `__xerj_passage_meta__<field>`, which arrive in `_source` with no
+///    `FieldConfig` behind them, so there is no declared type to read. This
+///    rule is the weaker of the two and YIELDS to ANY declaration: a field
+///    mapped as anything other than `dense_vector` under one of those names —
+///    `text`, `keyword`, `long`, `double`, `date`, `boolean`, `ip`,
+///    `geo_point`, `binary`, `object`, `nested`, `chunk`, or an ES type string
+///    `es_type_to_field_type` does not recognise — keeps its full lexical
+///    surface. That is only sound because the companion is prevented from ever
+///    ACQUIRING a declaration: `index::is_undeclared_multi_vector_companion`
+///    stops dynamic mapping registering a `<vector>_chunks` key whose value is
+///    a real multi-vector, so an "absent" answer here means absent.
 ///
 /// The bytes in the table above are almost all the second rule's: `emb_chunks`
-/// in that fixture is a DYNAMIC field, absent from the user's mapping and
-/// registered as `Double` by dynamic mapping, and it is 26,518,005 B of the
+/// in that fixture is absent from the user's mapping — and, since this change,
+/// absent from the evolved schema too — and it is 26,518,005 B of the
 /// 39,796,380 B removed.
 ///
 /// Removing the postings is only half of it, and the other half is NOT the
@@ -4067,6 +4072,55 @@ pub fn fts_excluded_fields(schema: &Schema) -> std::collections::HashSet<String>
     excluded
 }
 
+pub const MULTI_VECTOR_COMPANION_SUFFIX: &str = "_chunks";
+
+/// Is `val` the exact `_source` shape RFC #148 gives a per-document
+/// MULTI-VECTOR — a non-empty array of equal-length, non-empty, all-numeric
+/// arrays?
+///
+/// This is the value-shape half of the companion rule. The schema alone cannot
+/// tell a multi-vector from a user's own numeric field (see
+/// [`declares_non_vector_shaped_field`]); the VALUE can, and it is available at
+/// exactly the moment that matters — when dynamic mapping is about to invent a
+/// `FieldConfig` for an unmapped `<vector>_chunks` key
+/// (`index::evolve_schema_from_doc`/`_docs`). Refusing to invent one there is
+/// what keeps the schema honest, so the plan-time side of the rule can then
+/// defer to ANY declaration it does find.
+///
+/// The equal-length requirement is not decoration: every chunk of one document
+/// embeds with the same model, so a real multi-vector is rectangular. A ragged
+/// array of numeric arrays is therefore NOT one, is left to dynamic mapping,
+/// and keeps its term dictionary — the fail-safe direction.
+///
+/// Lucene models the same object as its own field type rather than inferring a
+/// numeric one: `LateInteractionField extends BinaryDocValuesField`
+/// (`lucene/core/src/java/org/apache/lucene/document/LateInteractionField.java:36`),
+/// constructed from a `float[][]` and encoded straight to a `BytesRef`
+/// (`:44`, `:45`) — it never reaches an analyzer or a term dictionary at all.
+pub(crate) fn looks_like_multi_vector(val: &serde_json::Value) -> bool {
+    let Some(rows) = val.as_array() else {
+        return false;
+    };
+    let mut dims: Option<usize> = None;
+    if rows.is_empty() {
+        return false;
+    }
+    for row in rows {
+        let Some(components) = row.as_array() else {
+            return false;
+        };
+        if components.is_empty() || !components.iter().all(serde_json::Value::is_number) {
+            return false;
+        }
+        match dims {
+            None => dims = Some(components.len()),
+            Some(d) if d == components.len() => {}
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
 /// Fields whose DECLARED type has no lexical representation at all — #328.
 ///
 /// Today that is exactly `FieldType::Vector` (`dense_vector`), so the base list
@@ -4103,29 +4157,47 @@ pub fn fts_excluded_fields(schema: &Schema) -> std::collections::HashSet<String>
 /// from the base name because no USER mapping declares them — they arrive in
 /// `_source` from the passage pipeline, and whatever `FieldConfig` they end up
 /// with is one dynamic mapping inferred from their values. A name-based rule
-/// can collide with a field the user actually mapped, so it yields to one —
-/// but only where the declaration rules the collision out:
+/// can collide with a field the user actually mapped, so it yields to ANY
+/// declaration it finds:
 ///
-///  * if the schema declares `<field>_chunks` (or the sidecar) with a type a
-///    MULTI-VECTOR could not have produced — `text`, `keyword`, `date`,
-///    `boolean`, `ip`, `chunk`, `object` — that declaration wins and the field
-///    keeps its term dictionary and its whole lexical surface. Lucene draws
-///    exactly this line: whether a field gets a term dictionary is read off the
-///    field's own `IndexableFieldType` (`IndexingChain.invertAndStore`,
+///  * declared as anything other than `dense_vector` — `text`, `keyword`,
+///    `long`, `double`, `date`, `boolean`, `ip`, `geo_point`, `binary`,
+///    `object`, `nested`, `chunk`, or a mapping type
+///    `es_type_to_field_type` did not recognise — the declaration wins and the
+///    field keeps its term dictionary and its whole lexical surface. Lucene
+///    draws exactly this line: whether a field gets a term dictionary is read
+///    off the field's own `IndexableFieldType` (`IndexingChain.invertAndStore`,
 ///    `lucene/core/src/java/org/apache/lucene/index/IndexingChain.java:1416`),
 ///    never off its name, and one name meaning two different things is an
 ///    outright error rather than a silent downgrade
 ///    (`IndexingChain.FieldSchema.setIndexOptions` → `assertSame` →
-///    `raiseNotSame`, `IndexingChain.java:2213` and `:2193`);
-///  * `double` / `long` / absent → the name rule applies. Not a shortcut: it is
-///    what the companion ITSELF declares. `<field>_chunks` is user-supplied
-///    `_source` (an array of float arrays), so dynamic mapping registers it
-///    like any other unmapped key and `infer_field_type` lands on
-///    `FieldType::Double`. Deferring to that declaration was measured and it
-///    brings `<seg>.emb_chunks.fst` back at 1,592,118 B on the 300-doc fixture
-///    — the whole 26,518,005 B of the 39,796,380 B saving that lives in the
-///    companion at 5,000 × 128. See [`declares_non_vector_shaped_field`] for
-///    the residual this leaves and what it costs to close.
+///    `raiseNotSame`, `IndexingChain.java:2213`, `:2187` and `:2193`);
+///  * absent → the name rule applies, and this is the companion's own case.
+///
+/// THAT SECOND BULLET IS ONLY SAFE BECAUSE THE COMPANION IS KEPT UNDECLARED.
+/// `<field>_chunks` is user-supplied `_source` (an array of float arrays), so
+/// dynamic mapping used to register it like any other unmapped key —
+/// `infer_field_type` walks to the first scalar and lands on
+/// `FieldType::Double`, a `FieldConfig` byte-identical to a user's own
+/// `"type": "double"`. That is what forced an earlier revision to carve
+/// `double`/`long` out of the yield set above, and with them a real user field
+/// under that name. `index::is_undeclared_multi_vector_companion` removes the
+/// ambiguity at its source instead: dynamic mapping refuses to invent the
+/// config when the value [`looks_like_multi_vector`], so the only `double` or
+/// `long` under this name is one somebody wrote.
+///
+/// BOTH HALVES ARE LOAD-BEARING, measured by disabling each on its own against
+/// the committed 300-doc × 128-dim fixture and the 50-doc collision fixture:
+///
+/// | | `.emb_chunks.fst` (300-doc) | durable index | declared `long` sibling |
+/// |---|---|---|---|
+/// | here | **0 B** | 857,265–857,769 B | 44 B `.fst`, answers 25 |
+/// | yield-to-numeric restored | 0 B | 857,445 B | **0 B `.fst`, answers 0** |
+/// | refusal disabled | **1,592,118 B** | **2,451,336 B** | 44 B, answers 25 |
+///
+/// The middle row is the residual this replaces; the bottom row is the 67% of
+/// the saving an unconditional "any declaration wins" gives up. Neither is
+/// paid for here.
 ///
 /// This is deliberately NOT the contract `semantic_derived_vector_fields`
 /// carries: that one synthesises `<target>_chunks` unconditionally, and a
@@ -4192,31 +4264,38 @@ pub fn fts_excluded_fields(schema: &Schema) -> std::collections::HashSet<String>
 /// The `match_all`-anchored form is the one the tests pin, because it is the
 /// one that is correct on `main` to begin with.
 ///
-/// THE RESIDUAL, stated in full because it is the same class and it is NOT
-/// fixed: a field the user declares `long` or `double` under one of these two
-/// names is still excluded by name, and the plan-time lowering still zeroes
-/// every lexical clause on it. Measured on
-/// `{text body, long emb_chunks, dense_vector emb}`, 50 docs, values 7 and 9 —
-/// merge base `ca4d75a` → here:
+/// THE NUMERIC ARM, which an earlier revision of this branch shipped as an
+/// accepted residual and which is now closed. On that revision a field the user
+/// declared `long` or `double` under one of these two names was still excluded
+/// by name and the plan-time lowering still zeroed every lexical clause on it.
+/// Measured on `{text body, long emb_chunks, dense_vector emb}`, 50 docs,
+/// values 7 and 9 — merge base `ca4d75a` → that revision → here:
 ///
-///   `term {emb_chunks:7}`                     25 → **0**
-///   `terms {emb_chunks:[7]}`                  25 → **0**
-///   `range {emb_chunks:{gte:8}}`              25 → **0**
-///   `bool{filter:[term emb_chunks 7]}`        25 → **0**
-///   `bool{must:[match_all],must_not:[term 7]}` 25 → **50**
-///   `terms` agg / `stats` on `emb_chunks`     25/25, sum 400 → 25/25, sum 400
+///   `term {emb_chunks:7}`                      25 → **0** → 25
+///   `terms {emb_chunks:[7]}`                   25 → **0** → 25
+///   `range {emb_chunks:{gte:8}}`               25 → **0** → 25
+///   `bool{filter:[term emb_chunks 7]}`         25 → **0** → 25
+///   `bool{must:[match_all],must_not:[term 7]}` 25 → **50** → 25
+///   `terms` agg / `stats` on `emb_chunks`      25/25 on all three
 ///
-/// It is narrower than what it replaces — the reported case, a `keyword`
-/// tenant discriminator, is now byte-identical to the merge base — but it is
-/// the same failure shape, and closing it needs a decision this function cannot
-/// make on its own: either give the schema per-field PROVENANCE (explicit
-/// mapping vs. dynamically inferred) so an explicit `double` can outrank the
-/// name, or drop the by-name rule entirely and give up 67% of the saving. Both
-/// are larger than #328. Documented as a behaviour change in `CHANGELOG.md`
-/// and pinned by `a_numerically_declared_sibling_is_still_excluded_by_name`
-/// here and the `[long]` arm of
-/// `declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_looks_like_one` in
-/// `tests/integration.rs`, so it cannot drift silently.
+/// The `double` arm and the DYNAMICALLY mapped numeric case (a scalar `7`/`9`
+/// under this name with no mapping at all, which dynamic mapping registers as
+/// `long`) behave identically and are pinned alongside it. It was NOT closed by
+/// per-field schema provenance and NOT by giving up the by-name rule — the two
+/// options an earlier revision of this comment called exhaustive, wrongly. It
+/// is closed by not manufacturing the ambiguous declaration in the first place
+/// (`index::is_undeclared_multi_vector_companion`), which costs nothing: the
+/// 300-doc fixture still reports `emb_chunks.fst=0` and durable 857,265–857,769 B.
+///
+/// THE LIMIT THAT REMAINS, and it fails safe: the refusal needs the
+/// `dense_vector` declared BEFORE the documents arrive. Index first and map
+/// afterwards and `emb_chunks` already carries a dynamic `double` config, which
+/// this function then yields to — measured `.emb_chunks.fst` = 9,467 B on a
+/// 50-doc × 16-dim fixture, with `exists {field: emb_chunks}` still answering
+/// 50. That costs bytes, not answers, and is pinned by
+/// `a_companion_mapped_before_its_vector_keeps_its_dictionary_and_its_answers`
+/// in `tests/integration.rs`. The nested-under-an-object spelling has the same
+/// shape of limit and the same direction.
 ///
 /// Pinned by `a_declared_sibling_keeps_its_lexical_surface` here and by
 /// `declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_looks_like_one` in
@@ -4238,7 +4317,7 @@ pub fn lexically_typeless_fields(schema: &Schema) -> std::collections::HashSet<S
     for field in crate::index::collect_dense_vector_fields(schema) {
         // BY NAME, and only where no declaration contradicts it.
         for synthesised in [
-            format!("{field}_chunks"),
+            format!("{field}{MULTI_VECTOR_COMPANION_SUFFIX}"),
             format!("{}{}", xerj_query::executor::PASSAGE_METADATA_PREFIX, field),
         ] {
             if !declares_non_vector_shaped_field(schema, &synthesised) {
@@ -4259,33 +4338,41 @@ pub fn lexically_typeless_fields(schema: &Schema) -> std::collections::HashSet<S
 /// rather than using `Schema::has_field`, which only sees root names and would
 /// answer `false` for every nested companion.
 ///
-/// THE LINE IS DRAWN AT "COULD THIS DECLARATION HAVE COME FROM THE COMPANION
-/// ITSELF", and it is drawn there because the companion is not always
-/// undeclared. `<field>_chunks` is user-supplied `_source` (RFC #148's
-/// per-document multi-vector: an array of float arrays), so DYNAMIC MAPPING
-/// registers it like any other unmapped key — `infer_field_type` walks to the
-/// first non-null element, twice, and lands on `FieldType::Double`
-/// (`index.rs`'s `Value::Array` arm). Measured: with "any declaration wins",
-/// `<seg>.emb_chunks.fst` comes back at 1,592,118 B on the 300-doc fixture and
-/// the whole 67% of the saving that lives in the companion is lost, because
-/// dynamic mapping had already declared it.
+/// THE RULE IS ITS COMPLEMENT, NOT A LIST: this yields for EVERY declared type
+/// except `dense_vector`. It is stated that way on purpose — an earlier
+/// revision enumerated `Text`/`Keyword`/`Date`/`Boolean`/`Ip`/`Chunk`/`Object`
+/// and read as exhaustive when it was not (`GeoPoint`, `Binary` and `Nested`
+/// also yielded, and `es_type_to_field_type` maps every UNRECOGNISED ES type
+/// string to `Object`, so unknown mapping types yielded too). So:
 ///
-/// So:
+///  * `Vector` — already in the set by declared type; `false` is a no-op, and
+///    the companion of a companion is not a thing.
+///  * anything else — a declaration is a declaration. The user mapped a field
+///    under this name, so the name rule yields and the field keeps its term
+///    dictionary and its whole lexical surface: `text`, `keyword`, `long`,
+///    `double`, `date`, `boolean`, `ip`, `geo_point`, `binary`, `object`,
+///    `nested`, `chunk`, and anything `es_type_to_field_type` did not
+///    recognise.
+///  * absent — nothing to defer to; the name rule applies. This is the
+///    companion's own case, and it is the ONLY one, because
+///    `index::evolve_schema_from_doc`/`_docs` refuse to invent a `FieldConfig`
+///    for an unmapped `<vector>_chunks` key whose value
+///    [`looks_like_multi_vector`]. Without that refusal this predicate would be
+///    answering about a declaration DYNAMIC MAPPING wrote: `infer_field_type`
+///    walks an array of float arrays to its first scalar and lands on
+///    `FieldType::Double`, indistinguishable from a user's own `double`. That
+///    is why an earlier revision had to carve `Double`/`Long` out of the yield
+///    set, and why a user's own numeric field under this name silently lost its
+///    lexical surface. The carve-out is gone; the ambiguity is prevented at the
+///    only place it was ever manufactured.
 ///
-///  * `Double` / `Long` — the shape `infer_field_type` produces from an array
-///    of float (or integer) arrays. Indistinguishable from the companion, so
-///    the name rule applies and this returns `false`. This is the residual
-///    case: a user's OWN numeric field named `<vector>_chunks` loses its term
-///    dictionary. It does not lose its data — doc values, `terms`/`range`
-///    aggregations and sorts are untouched — and the measured cost of the
-///    alternative is the entire companion saving.
-///  * `Vector` — already in the set by declared type; `false` is a no-op.
-///  * `Text` / `Keyword` / `Date` / `Boolean` / `Ip` / `Chunk` / `Object` — a
-///    multi-vector cannot infer to any of these, so a declaration of one is
-///    unambiguously the user's own field and the name rule yields. This is the
-///    case that matters: a tenant or ACL discriminator named `emb_chunks` keeps
-///    its whole lexical surface.
-///  * absent — nothing to defer to; the name rule applies.
+/// Lucene draws exactly this line: whether a field gets a term dictionary is
+/// read off the field's own `IndexableFieldType`
+/// (`IndexingChain.invertAndStore`,
+/// `lucene/core/src/java/org/apache/lucene/index/IndexingChain.java:1416`),
+/// never off its name, and one name meaning two different things is an outright
+/// error rather than a silent downgrade (`FieldSchema.setIndexOptions` →
+/// `assertSame` → `raiseNotSame`, `IndexingChain.java:2213`, `:2187`, `:2193`).
 ///
 /// BOTH SPELLINGS of a nested name are resolved, because both reach the schema.
 /// `put_mapping` stores a dotted path as ONE top-level `FieldConfig` named
@@ -4295,12 +4382,8 @@ pub fn lexically_typeless_fields(schema: &Schema) -> std::collections::HashSet<S
 /// exercises for the vector itself. The literal lookup runs first so the flat
 /// spelling cannot fall through the segmented walk and be treated as undeclared.
 fn declares_non_vector_shaped_field(schema: &Schema, path: &str) -> bool {
-    let is_lexical = |fc: &xerj_common::types::FieldConfig| {
-        !matches!(
-            fc.field_type,
-            FieldType::Vector | FieldType::Double | FieldType::Long
-        )
-    };
+    let is_lexical =
+        |fc: &xerj_common::types::FieldConfig| !matches!(fc.field_type, FieldType::Vector);
     if let Some(field) = schema.fields.iter().find(|fc| fc.name == path) {
         return is_lexical(field);
     }
@@ -4653,15 +4736,16 @@ mod lexically_typeless_fields_tests {
         }
     }
 
-    /// THE RESIDUAL, pinned so it cannot drift into an accident. A `Double` or
-    /// `Long` declaration is exactly what dynamic mapping produces from the
-    /// real multi-vector (`infer_field_type` walks an array of float arrays to
-    /// its first scalar), so the name rule cannot yield to it without losing
-    /// the whole companion saving — measured at `<seg>.emb_chunks.fst`
-    /// 1,592,118 B reappearing on the 300-doc fixture. Documented in the
-    /// CHANGELOG as a behaviour change rather than fixed.
+    /// THE NUMERIC ARM, which used to be the accepted residual: a `Double` or
+    /// `Long` declaration is exactly what dynamic mapping USED to produce from
+    /// a real multi-vector, so the name rule could not yield to it without
+    /// losing the whole companion saving. It yields now, because
+    /// `index::is_undeclared_multi_vector_companion` stops that config from
+    /// being invented — so a `long`/`double` under this name is necessarily
+    /// somebody's own field. This assertion is the inverse of the one it
+    /// replaces; if the carve-out ever comes back it fails here first.
     #[test]
-    fn a_numerically_declared_sibling_is_still_excluded_by_name() {
+    fn a_numerically_declared_sibling_keeps_its_lexical_surface() {
         for declared in [FieldType::Double, FieldType::Long] {
             let mut schema = Schema::empty();
             schema
@@ -4669,11 +4753,92 @@ mod lexically_typeless_fields_tests {
                 .unwrap();
             schema.add_field(vector("emb", 8)).unwrap();
             assert!(
-                lexically_typeless_fields(&schema).contains("emb_chunks"),
-                "a `{declared:?}` declaration is the multi-vector's own inferred \
-                 shape and must not rescue the name"
+                !lexically_typeless_fields(&schema).contains("emb_chunks"),
+                "a `{declared:?}` declaration is somebody's own field and the \
+                 name rule must yield to it"
             );
-            assert!(!declares_non_vector_shaped_field(&schema, "emb_chunks"));
+            assert!(declares_non_vector_shaped_field(&schema, "emb_chunks"));
+        }
+    }
+
+    /// The yield set is the COMPLEMENT of `Vector`, not the enumerated list an
+    /// earlier doc comment gave. `GeoPoint`, `Binary` and `Nested` were never
+    /// in that list and always yielded, and `es_type_to_field_type` maps every
+    /// unrecognised ES type string to `Object`, so an unknown mapping type
+    /// yields too. Pinned across every variant so the doc and the code cannot
+    /// drift apart again.
+    #[test]
+    fn every_declared_type_except_dense_vector_keeps_its_lexical_surface() {
+        for declared in [
+            FieldType::Text,
+            FieldType::Keyword,
+            FieldType::Long,
+            FieldType::Double,
+            FieldType::Boolean,
+            FieldType::Date,
+            FieldType::Ip,
+            FieldType::GeoPoint,
+            FieldType::Binary,
+            FieldType::Object,
+            FieldType::Nested,
+        ] {
+            let mut schema = Schema::empty();
+            schema
+                .add_field(FieldConfig::new("emb_chunks", declared))
+                .unwrap();
+            schema.add_field(vector("emb", 8)).unwrap();
+            assert!(
+                declares_non_vector_shaped_field(&schema, "emb_chunks"),
+                "`{declared:?}` is a declaration and must be yielded to"
+            );
+            let typeless = lexically_typeless_fields(&schema);
+            assert!(
+                !typeless.contains("emb_chunks"),
+                "`{declared:?}` sibling excluded anyway: {typeless:?}"
+            );
+            // …while the vector itself is excluded on every one of them.
+            assert!(typeless.contains("emb"));
+        }
+    }
+
+    /// The value-shape half of the rule, exhaustively. Only a rectangular,
+    /// non-empty array of non-empty all-numeric arrays is a multi-vector;
+    /// everything else is somebody's field and keeps its mapping.
+    #[test]
+    fn looks_like_multi_vector_accepts_only_the_rfc_148_shape() {
+        for yes in [
+            serde_json::json!([[1.0, 2.0], [3.0, 4.0]]),
+            serde_json::json!([[1, 2, 3]]),
+            serde_json::json!([[0.5]]),
+        ] {
+            assert!(looks_like_multi_vector(&yes), "should accept {yes}");
+        }
+        for no in [
+            // scalars and strings — a user's own field
+            serde_json::json!(7),
+            serde_json::json!(7.5),
+            serde_json::json!("tenant-a"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!({"a": 1}),
+            // a FLAT numeric array is a single vector, not a multi-vector, and
+            // is not what this rule is about
+            serde_json::json!([1.0, 2.0, 3.0]),
+            // empty outer, empty inner
+            serde_json::json!([]),
+            serde_json::json!([[]]),
+            // RAGGED — cannot have come from one embedding model, so it is left
+            // to dynamic mapping (the fail-safe direction)
+            serde_json::json!([[1.0, 2.0], [3.0]]),
+            // non-numeric elements
+            serde_json::json!([["a", "b"]]),
+            serde_json::json!([[1.0, "b"]]),
+            serde_json::json!([[1.0], null]),
+            serde_json::json!([[1.0], 2.0]),
+            // array of objects
+            serde_json::json!([{"a": 1}]),
+        ] {
+            assert!(!looks_like_multi_vector(&no), "should reject {no}");
         }
     }
 
