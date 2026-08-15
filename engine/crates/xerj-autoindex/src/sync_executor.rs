@@ -646,7 +646,7 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         &mut self,
         base: &CommittedManifest,
         desired: &GenerationManifest,
-        _snapshot: &SourceSnapshot,
+        snapshot: &SourceSnapshot,
     ) -> Result<()> {
         for dataset in &desired.plan.datasets {
             self.es.refresh(&dataset.index)?;
@@ -664,12 +664,26 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
                 "live semantic count disagrees with desired group {}",
                 group.group_id
             );
+            // Scoped to this generation's `run_id`, the same way the run-summary
+            // read-back is (`lib.rs`). `file_key` is derived from CONTENT alone
+            // (`content::full_digest`) and the catalog is one global index that no
+            // `--prefix` namespaces, so an unscoped count also sees the
+            // canonical and alias documents that ANOTHER corpus on this node
+            // published for byte-identical content — two Apache-2.0 checkouts
+            // sharing a LICENSE is enough. Those documents are that run's, not
+            // this one's: counting them aborted a generation whose own
+            // publication was exactly right (#360). What this barrier is for is
+            // "this generation published one canonical document and its aliases",
+            // and that is what it now asks.
             let catalog = self.es.search(
                 crate::catalog::CATALOG_INDEX,
                 &serde_json::json!({
                     "size": 0,
                     "track_total_hits": true,
-                    "query": {"term": {"file_key": &group.content_id}}
+                    "query": {"bool": {"filter": [
+                        {"term": {"file_key": &group.content_id}},
+                        {"term": {"run_id": &snapshot.tx_id}}
+                    ]}}
                 }),
             )?;
             anyhow::ensure!(

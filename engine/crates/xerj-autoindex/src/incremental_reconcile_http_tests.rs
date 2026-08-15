@@ -1474,6 +1474,83 @@ fn a_readme_documenting_two_tables_is_not_a_fatal_condition() {
     );
 }
 
+/// The second abort #360 reported — the one that killed both of the corpora
+/// the reporter pointed autoindex at, on one node, one after the other.
+///
+/// `content::full_digest` derives a file's identity from its CONTENT alone, and
+/// `catalog::CATALOG_INDEX` is a single global index that no `--prefix`
+/// namespaces. Two unrelated checkouts that happen to share one byte-identical
+/// file — an Apache-2.0 `LICENSE`, a `.gitignore`, an empty `__init__.py` —
+/// therefore share that file's catalog document IDs. A corpus holding the
+/// content twice publishes a canonical document plus one alias document; a
+/// corpus holding it once republishes only the canonical, so the *other*
+/// corpus's alias document survives under its own `run_id`. The generation-wide
+/// barrier counted every catalog document carrying that `file_key`, across every
+/// run on the node, against `1 + aliases.len()` for the group in front of it —
+/// so the second run aborted with `exit=1` while its data was complete.
+#[test]
+fn a_file_shared_with_another_corpus_on_the_same_node_is_not_a_fatal_condition() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let shared = "id,value\n1,apache-2.0\n2,copied-verbatim\n";
+    let first = tempfile::tempdir().unwrap();
+    let first_state = tempfile::tempdir().unwrap();
+    fs::create_dir(first.path().join("docs")).unwrap();
+    fs::write(first.path().join("LICENSE.csv"), shared).unwrap();
+    fs::write(first.path().join("docs").join("LICENSE.csv"), shared).unwrap();
+    let endpoint = HttpEndpoint::start();
+
+    let (code, summary) =
+        run_index_report(cfg(first.path(), first_state.path(), &endpoint.url, false))
+            .expect("the first corpus indexes");
+    let summary = summary.expect("the first corpus commits its generation");
+    assert_eq!(code, 0);
+    assert_eq!(
+        summary["duplicate_files"], 1,
+        "the first corpus must publish one alias document, or nothing is left \
+         behind for the second run to trip over: {summary}"
+    );
+
+    // A second, unrelated corpus on the same node, isolated exactly the way the
+    // CLI's refusals recommend: its own --state-dir and its own --prefix. Its
+    // one shared file is a group with no aliases at all.
+    let second = tempfile::tempdir().unwrap();
+    let second_state = tempfile::tempdir().unwrap();
+    fs::write(second.path().join("LICENSE.csv"), shared).unwrap();
+    fs::write(second.path().join("own.csv"), "id,value\n7,second\n").unwrap();
+    let mut config = cfg(second.path(), second_state.path(), &endpoint.url, false);
+    config.prefix = "incremental-http-second".into();
+
+    let (code, summary) = run_index_report(config)
+        .expect("a file shared with another corpus on the same node is not a fatal condition");
+    let summary = summary.expect("the second corpus commits its generation");
+    assert_eq!(code, 0, "the second corpus is a clean run: {summary}");
+    assert_eq!(summary["generation"], 1);
+    assert_eq!(summary["records_total"], 3);
+    assert_eq!(summary["duplicate_files"], 0);
+    assert_eq!(journal_events(second_state.path(), "sync_commit"), 1);
+
+    // And the first corpus's alias document is still there — the barrier stopped
+    // counting it, it was not swept away from under the other corpus's map.
+    let aliases = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .docs
+        .iter()
+        .filter(|((index, _), doc)| {
+            index == catalog::CATALOG_INDEX
+                && doc.get("status").and_then(Value::as_str) == Some("duplicate")
+        })
+        .count();
+    assert_eq!(
+        aliases, 1,
+        "the other corpus's alias document must survive this run untouched"
+    );
+}
+
 /// Where this branch and #241 meet.
 ///
 /// The generated `--no-graph` route returns from inside `run_index_report`,
