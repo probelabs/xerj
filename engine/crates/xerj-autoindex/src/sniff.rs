@@ -183,11 +183,22 @@ fn sniff_bytes(
     // ~100x its size in RAM through sectioning. Magic bytes are the reliable
     // signal.
     //
-    // Every signature whose bytes are PRINTABLE ASCII carries a `qualify`
-    // check as well, because "starts with these four letters" is also true of
-    // ordinary text: a CSV whose first column header is `ID3` and prose whose
-    // first word is `RIFF`, `OggS`, `fLaC` or `8BPS` were all junked as media
-    // by the unqualified table (measured — see the tests below). This is the
+    // Every signature ADDED BY THIS BRANCH whose bytes are printable ASCII
+    // carries a `qualify` check as well, because "starts with these letters"
+    // is also true of ordinary text: a CSV whose first column header is `ID3`,
+    // and prose whose first word is `RIFF`, `OggS`, `fLaC`, `8BPS` or
+    // `Kaydara FBX Binary`, were all junked as media by the unqualified table
+    // (measured — see the tests below). That is six of the nine signatures
+    // added here; the other three (`II*\x00`, `MM\x00*`, the EXR magic) carry
+    // a byte text cannot contain.
+    //
+    // Two printable signatures remain unqualified — `GIF8` and `BM` — and both
+    // have the same defect. They are NOT new: they are unchanged from
+    // `ca4d75a` and were measured to classify identically on both trees, so
+    // fixing them is a separate behaviour change and is filed as a follow-up
+    // rather than smuggled into a Unity PR.
+    //
+    // Qualifying a magic number is the
     // rule Lucene applies to its own containers: `CodecUtil.checkHeader`
     // (`lucene/core/src/java/org/apache/lucene/codecs/CodecUtil.java:183-201`,
     // Apache-2.0) matches `CODEC_MAGIC` and then hands straight to
@@ -217,7 +228,7 @@ fn sniff_bytes(
         (
             &b"Kaydara FBX Binary"[..],
             "fbx",
-            accept as fn(&[u8]) -> bool,
+            fbx_header as fn(&[u8]) -> bool,
         ),
         (&b"\x76\x2f\x31\x01"[..], "exr", accept as fn(&[u8]) -> bool),
     ] {
@@ -360,8 +371,19 @@ fn sniff_bytes(
 /// the bytes are text — the binary heuristics key off this exact string.
 pub const WINDOWS_1252_LOSSY: &str = "windows-1252 (lossy)";
 
-/// Magic-byte signature that needs no structural confirmation: its bytes are
-/// not printable ASCII, so no text file can begin with them by accident.
+/// Magic-byte signature taken as sufficient on its own.
+///
+/// For most callers that is because the signature contains a byte text cannot
+/// contain (`\x89PNG`, `\xff\xd8\xff`, `\x7fELF`, `\x00\x00\x01\x00`, the NUL
+/// in `II*\x00` / `MM\x00*`, the `\x01` in the EXR magic).
+///
+/// It is NOT true of the two remaining callers: `GIF8` and `BM` are printable
+/// ASCII, so prose or a CSV header beginning with those characters is junked
+/// as an image. Both predate this branch — they are unchanged from `ca4d75a`
+/// and measured identical on both trees — so they are left alone here rather
+/// than widened into an unrelated behaviour change, and are tracked as a
+/// follow-up. Do not read this function as a proof that its callers are safe;
+/// it is only a statement that no *further* check is performed.
 fn accept(_prefix: &[u8]) -> bool {
     true
 }
@@ -394,6 +416,20 @@ fn ogg_page(prefix: &[u8]) -> bool {
 /// STREAMINFO (0) for the first block; the top bit is the last-block flag.
 fn flac_metadata_block(prefix: &[u8]) -> bool {
     prefix.len() >= 5 && prefix[4] & 0x7f == 0
+}
+
+/// Autodesk FBX, binary flavour: the header is the 18 letters `Kaydara FBX
+/// Binary`, two spaces, a NUL, then `0x1A 0x00` — 23 bytes before the uint32
+/// version field. The three unprintable bytes are the entire discriminator;
+/// the letters on their own are ordinary English, and they are *more* likely
+/// to appear as prose inside this PR's own target corpus, a Unity/3D-asset
+/// tree, than anywhere else. Measured through `sniff()`: a `.md` note opening
+/// "Kaydara FBX Binary is the 20-byte magic that opens every binary FBX file
+/// exported by Autodesk tools. " was `TxtProse` on `ca4d75a` and
+/// `Binary`/`fbx` on this branch until this check existed, and `scan_file`
+/// turns `Family::Binary` into "junk: binary content (fbx)" — never indexed.
+fn fbx_header(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"Kaydara FBX Binary  \x00\x1a\x00")
 }
 
 /// ID3v2 tag header: `ID3`, a major version (2, 3 and 4 are the versions that
@@ -846,31 +882,46 @@ mod unity_sniff_tests {
     /// bytes must win before any text heuristic runs.
     #[test]
     fn media_containers_are_binary_by_magic_not_heuristics() {
-        for (name, head) in [
-            ("t.psd", &b"8BPS\x00\x01"[..]),
-            ("t.tif", &b"II*\x00\x08\x00"[..]),
-            ("t.tif2", &b"MM\x00*\x00\x08"[..]),
-            ("t.wav", &b"RIFF\x24\x08\x00\x00WAVE"[..]),
-            ("t.ogg", &b"OggS\x00\x02"[..]),
-            ("t.flac", &b"fLaC\x00\x00\x00\x22"[..]),
-            ("t.mp3", &b"ID3\x03\x00\x00\x00\x00\x0f\x76"[..]),
-            ("t.fbx", &b"Kaydara FBX Binary  \x00"[..]),
+        for (name, head, kind) in [
+            ("t.psd", &b"8BPS\x00\x01"[..], "psd"),
+            ("t.tif", &b"II*\x00\x08\x00"[..], "tiff"),
+            ("t.tif2", &b"MM\x00*\x00\x08"[..], "tiff"),
+            ("t.wav", &b"RIFF\x24\x08\x00\x00WAVE"[..], "riff"),
+            ("t.ogg", &b"OggS\x00\x02"[..], "ogg"),
+            ("t.flac", &b"fLaC\x00\x00\x00\x22"[..], "flac"),
+            ("t.mp3", &b"ID3\x03\x00\x00\x00\x00\x0f\x76"[..], "mp3"),
+            // The REAL 23-byte binary-FBX header: the 18 letters, two spaces,
+            // NUL, 0x1A, 0x00. The previous fixture stopped at the NUL, which
+            // is not a header any Autodesk tool emits and which no longer
+            // satisfies `fbx_header`.
+            ("t.fbx", &b"Kaydara FBX Binary  \x00\x1a\x00"[..], "fbx"),
         ] {
             let mut bytes = head.to_vec();
             // A printable tail that WOULD pass the prose heuristics.
             bytes.extend(b"lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(20));
             let sn = sniff_bytes(&bytes, Path::new(name), Path::new(name), false).unwrap();
             assert_eq!(sn.family, Family::Binary, "{name} must be binary");
+            assert_eq!(
+                sn.binary_kind.as_deref(),
+                Some(kind),
+                "{name} must be recognised as {kind}, not fall through to the \
+                 heuristics and land on `unknown`"
+            );
         }
     }
 
-    /// Regression (round 2): the printable-ASCII signatures added by this
-    /// branch matched TEXT. Measured through `sniff()` on `ca4d75a` vs this
-    /// branch with identical fixtures, a CSV whose first column header is
-    /// `ID3` went `Csv` -> `Binary`, and prose whose first word is `RIFF`,
-    /// `OggS`, `fLaC` or `8BPS` went `TxtProse` -> `Binary`. `scan_file` turns
-    /// `Family::Binary` into "junk: binary content (unknown)", so each of
-    /// those files stopped being indexed at all.
+    /// Regression: the printable-ASCII signatures added by this branch matched
+    /// TEXT. Measured through `sniff()` on `ca4d75a` vs this branch with
+    /// identical fixtures, a CSV whose first column header is `ID3` went `Csv`
+    /// -> `Binary`, and prose whose first word is `RIFF`, `OggS`, `fLaC`,
+    /// `8BPS` or `Kaydara FBX Binary` went `TxtProse` -> `Binary`.
+    /// `scan_file` turns `Family::Binary` into "junk: binary content (...)",
+    /// so each of those files stopped being indexed at all.
+    ///
+    /// The FBX case was missed in round 2 and found in review: it was the one
+    /// signature in the table still using `accept`, and at 18 printable
+    /// characters it is the likeliest of all of them to open a real sentence
+    /// — in a Unity/3D-asset corpus above all, which is this PR's target.
     ///
     /// The true positives above must keep passing, which is the whole point:
     /// the signature is necessary, it is just not sufficient.
@@ -900,6 +951,11 @@ mod unity_sniff_tests {
             (
                 "psd",
                 "8BPS is the magic of an Adobe Photoshop document header. ",
+            ),
+            (
+                "fbx",
+                "Kaydara FBX Binary is the 20-byte magic that opens every binary \
+                 FBX file exported by Autodesk tools. ",
             ),
         ] {
             let text = opener.repeat(30);

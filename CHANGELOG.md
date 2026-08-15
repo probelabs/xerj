@@ -147,17 +147,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uncompressed PCM) still classify as text**, exactly as they do on `ca4d75a`;
   bounding sectioning memory is the fix for that, and is not attempted here.
 
-- **The new magic-byte signatures now require structural confirmation.** PSD,
-  TIFF, RIFF, OGG, FLAC, MP3, FBX and EXR were added by the first reland
-  attempt as bare `starts_with` tests, and five of those signatures are
-  printable ASCII, so they matched text. Measured, same method as above: a CSV
-  whose first column header is `ID3` went `csv` -> `binary`, and prose whose
-  first word is `RIFF`, `OggS`, `fLaC` or `8BPS` went `txt-prose` -> `binary`.
-  Each printable signature is now qualified by the byte that follows it (PSD
-  version, RIFF FORM type, Ogg stream-structure version, FLAC block type, ID3v2
-  major version and synchsafe size), which is what Lucene's
-  `CodecUtil.checkHeader` does with `CODEC_MAGIC`. The true positives are
-  unchanged and still covered.
+- **The new magic-byte signatures now require structural confirmation.** Nine
+  signatures (PSD, both TIFF byte orders, RIFF, OGG, FLAC, MP3, FBX and EXR)
+  were added by the first reland attempt as bare `starts_with` tests. **Six** of
+  them are entirely printable ASCII — `8BPS`, `RIFF`, `OggS`, `fLaC`, `ID3` and
+  the 18 letters `Kaydara FBX Binary` — so they matched ordinary text. Measured
+  through the real `sniff()` on `ca4d75a` vs this branch with identical
+  fixtures:
+
+  | fixture | `ca4d75a` | first reland |
+  | --- | --- | --- |
+  | CSV whose first column header is `ID3` | `csv` | `binary`/`mp3` |
+  | prose opening `RIFF is a container format used by WAV files. …` | `txt-prose` | `binary`/`riff` |
+  | prose opening `OggS pages carry the packets of an Ogg stream …` | `txt-prose` | `binary`/`ogg` |
+  | prose opening `fLaC is the four byte magic of a FLAC audio …` | `txt-prose` | `binary`/`flac` |
+  | prose opening `8BPS is the magic of an Adobe Photoshop …` | `txt-prose` | `binary`/`psd` |
+  | `.md` note opening `Kaydara FBX Binary is the 20-byte magic …` | `txt-prose` | `binary`/`fbx` |
+
+  Each of the six is now qualified by what must follow it: PSD version, RIFF
+  FORM type, Ogg stream-structure version, FLAC block type, ID3v2 major version
+  and synchsafe size, and for FBX the full 23-byte header (`Kaydara FBX
+  Binary`, two spaces, NUL, `0x1A`, `0x00`). The FBX case was missed by the
+  first pass at this fix and caught in review — at 18 printable characters it is
+  the likeliest of the six to open a real sentence, and likeliest precisely
+  inside the Unity/3D-asset corpus this feature targets. Every fixture in the
+  table above now classifies exactly as it does on `ca4d75a`. The true positives
+  are unchanged and still covered; the FBX true-positive fixture was corrected
+  to the real 23-byte header, which is what any Autodesk tool emits.
+
+  This is what Lucene's `CodecUtil.checkHeader` does with `CODEC_MAGIC`
+  (`lucene/core/src/java/org/apache/lucene/codecs/CodecUtil.java:183`, which
+  hands straight to `checkHeaderNoMagic` at `:202` and refuses the file unless
+  the codec name *and* a version in range follow — the magic alone is never
+  taken as proof). Apache-2.0, same licence as XERJ; adapted, not copied.
+
+  **Not fixed here, deliberately:** `GIF8` and `BM` are printable-ASCII
+  signatures with exactly the same defect, but they are **pre-existing** — they
+  are unchanged from `ca4d75a`, and prose opening `GIF8`/`GIF89a`, a CSV whose
+  first column header is `GIF8`, and prose opening `BM` were each measured to
+  classify as `binary`/`gif` and `binary`/`bmp` on `ca4d75a` **and** on this
+  branch, identically. Fixing them changes behaviour unrelated to Unity, so it
+  is filed as a follow-up rather than smuggled in here. `GIF8` is listed
+  alongside `BM` so the next reader does not conclude `BM` is the only one.
 
 - **A junk entry could overwrite a successfully indexed file's catalog row.**
   When phase B met a record group phase A never sampled, the worker pushed a
@@ -181,6 +212,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `script_path` and `script_class` are single-valued and unaffected, so the
   documented "which scenes use this script?" query is not impacted. Fixing
   #332 is an engine-side change to the FTS writer input type.
+
+- **`GIF8` and `BM` are still unqualified printable-ASCII magic signatures**, so
+  a text file whose first characters are `GIF8`, `GIF89a` or `BM` is classified
+  `binary` and junked. This is **pre-existing, not introduced here** — measured
+  identical on `ca4d75a` and on this branch (`binary`/`gif` and `binary`/`bmp`
+  in both) — and is left unchanged because fixing it is a behaviour change with
+  no Unity content. Both names are recorded here on purpose: `BM` is the
+  obvious one and `GIF8` is the one a reader would otherwise miss. Follow-up.
 
 ## [1.0.0-rc.16] - 2026-08-13
 
