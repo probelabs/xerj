@@ -89,6 +89,10 @@ use std::time::Duration;
 const SAMPLE_LIMIT_BYTES: u64 = 4 << 20;
 /// Sampling byte cap for SQL dumps (mirrors `crate::SQLDUMP_SAMPLE_LIMIT`).
 const SQLDUMP_SAMPLE_LIMIT: u64 = 64 << 20;
+/// Sampling byte cap for Unity assets (mirrors `crate::UNITY_SAMPLE_LIMIT`).
+const UNITY_SAMPLE_LIMIT: u64 = 512 << 20;
+/// Whole-file cap for `.meta` sidecars (mirrors `extract::unity::META_CAP`).
+const UNITY_META_CAP: u64 = 16 << 20;
 
 /// Bytes phase A **provably** read in full for this file, or `None` when the
 /// read was or may have been partial.
@@ -125,8 +129,21 @@ pub fn exact_scan_bytes(
         Family::Xml => hit_eof.then_some(size),
         // Grouped: the sink never stops it early, so only the byte cap applies.
         Family::SqlDump => (size <= SQLDUMP_SAMPLE_LIMIT).then_some(size),
+        // Grouped like SqlDump — the sink reads on so every Unity class gets
+        // sampled — so again only the byte cap can have truncated the read.
+        Family::UnityYaml => (size <= UNITY_SAMPLE_LIMIT).then_some(size),
+        // `read_whole` up to META_CAP: under the cap the read is complete,
+        // over it the file is junked after reading only cap+1 bytes.
+        Family::UnityMeta => (size <= UNITY_META_CAP).then_some(size),
         // Row-capped per table; bytes read bear no fixed relation to `size`.
         Family::Sqlite => None,
+        // Deliberately partial: `bvh::extract` stops at `Frame Time:` and
+        // never pulls the motion block off disk, so `size` is not the number
+        // of bytes this machine demonstrated it can chew through.
+        Family::Bvh => None,
+        // `--stub` files are never opened. Zero bytes read for a non-zero
+        // `size` would fabricate an unbounded rate.
+        Family::Stub => None,
         // Never extracted at all.
         Family::Binary => None,
     }
@@ -619,11 +636,79 @@ mod tests {
             exact_scan_bytes(Family::SqlDump, false, 128 << 20, 1, 500),
             None
         );
+        // Unity assets are grouped like SQL dumps: byte cap only.
+        assert_eq!(
+            exact_scan_bytes(Family::UnityYaml, false, 1 << 20, 9_999, 500),
+            Some(1 << 20)
+        );
+        assert_eq!(
+            exact_scan_bytes(Family::UnityYaml, false, 1024 << 20, 1, 500),
+            None
+        );
+        // `.meta` sidecars are read whole up to META_CAP.
+        assert_eq!(
+            exact_scan_bytes(Family::UnityMeta, false, 4 << 10, 1, 500),
+            Some(4 << 10)
+        );
+        assert_eq!(
+            exact_scan_bytes(Family::UnityMeta, false, 32 << 20, 1, 500),
+            None
+        );
         // Never measurable.
         assert_eq!(exact_scan_bytes(Family::Sqlite, false, 100, 1, 500), None);
         assert_eq!(exact_scan_bytes(Family::Binary, false, 100, 1, 500), None);
+        // BVH stops at the motion header by design, so `size` is never the
+        // number of bytes it read; `--stub` files are never opened at all.
+        // Either one returning `Some(size)` would invent throughput.
+        assert_eq!(
+            exact_scan_bytes(Family::Bvh, false, 500 << 20, 1, 500),
+            None
+        );
+        assert_eq!(
+            exact_scan_bytes(Family::Stub, false, 500 << 20, 1, 500),
+            None
+        );
         // Compressed: `size` is not the number of bytes the parser worked on.
         assert_eq!(exact_scan_bytes(Family::Json, true, 100, 1, 500), None);
+    }
+
+    /// `band` and `band_from_family_str` are the SAME decision made from a
+    /// live enum and from the string the durable plan persisted. They drifted
+    /// silently once already: the string form's `_ => Bulk` catch-all meant a
+    /// resumed run demoted every Unity asset out of the source band. Every
+    /// family must agree across the two.
+    #[test]
+    fn the_two_band_functions_agree_for_every_family() {
+        use crate::order::{band, band_from_family_str};
+        for family in [
+            Family::Jsonl,
+            Family::Json,
+            Family::Csv,
+            Family::Logs,
+            Family::Xml,
+            Family::Html,
+            Family::Yaml,
+            Family::TxtProse,
+            Family::TxtLines,
+            Family::Pdf,
+            Family::Docx,
+            Family::Sqlite,
+            Family::SqlDump,
+            Family::Code,
+            Family::UnityYaml,
+            Family::UnityMeta,
+            Family::Bvh,
+            Family::Stub,
+            Family::Binary,
+        ] {
+            let rel = "a/b.dat";
+            assert_eq!(
+                band(rel, family),
+                band_from_family_str(rel, family.as_str()),
+                "{} disagrees between the enum and string band functions",
+                family.as_str()
+            );
+        }
     }
 
     #[test]

@@ -104,8 +104,22 @@ walk → sniff → sample → infer → map → extract → bulk → correlate �
    hint at best, never trusted. Formats covered by streaming extractors:
    JSON/JSONL, CSV (dialect detection: comma/semicolon/tab, decimal comma,
    quoted multiline fields, BOM), structured logs (nginx CLF, app logs,
-   syslog), SQL dumps, SQLite, PDF, DOCX, HTML, XML, YAML, plain text,
-   gzip-compressed variants of the above.
+   syslog), SQL dumps, SQLite, PDF, DOCX, HTML, XML, YAML, Unity
+   text-serialized assets (scenes/prefabs/.asset/.mat/.anim → one record per
+   GameObject/Component with `unity_class`, `file_id`, guid references, and a
+   denormalized `script_class`/`script_path` on MonoBehaviours; `.meta`
+   sidecars → a guid↔asset-path table; detected by the `%TAG !u!` header,
+   never extension — binary-serialized Unity assets stay junk, enable Force
+   Text serialization; generated dirs are pruned and recorded when a sibling
+   marker proves them, at any nesting depth — Unity `Library/`, `Temp/`,
+   `obj/`, `Logs/`, `UserSettings/` next to
+   `ProjectSettings/ProjectVersion.txt`; `--no-default-ignores` walks them;
+   additionally, when the root is inside a git repository the tree's
+   `.gitignore` rules are honored — the owner's own declaration of generated
+   noise — with `--no-ignore` to opt out, and the user's global gitignore is
+   never consulted), BVH motion capture (one metadata record per clip — skeleton
+   joint names, frame count, duration; the numeric MOTION block is never
+   read), plain text, gzip-compressed variants of the above.
 3. **Sample** — bounded per-file sampling (default 500 records,
    `--sample N`); inference cost does not grow with file size.
 4. **Infer** — field types (long/double/boolean/date/keyword/text), date

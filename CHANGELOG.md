@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`xerj autoindex` understands Unity projects.** Text-serialized scenes,
+  prefabs, `.asset`/`.mat`/`.anim` files become **one record per
+  GameObject/Component** (`unity_class`, `unity_class_id`, `file_id`,
+  `ref_guids`, `script_guid`, plus the flattened body); `.meta` sidecars become
+  a guid↔asset-path table; MonoBehaviour records carry a denormalized
+  `script_class`/`script_path` so "which scenes use this script?" is one query.
+  Detection is by the `%YAML` + `%TAG !u! tag:unity3d.com` header and never by
+  extension, so binary-serialized assets stay junk (enable Force Text
+  serialization). Unity's generated directories (`Library/`, `Temp/`, `obj/`,
+  `Logs/`, `UserSettings/`) are pruned and recorded only when a sibling
+  `ProjectSettings/ProjectVersion.txt` proves the tree really is a Unity
+  project.
+
+  Reland of community PR #274 by **@gonchar**, brought up to current `main` and
+  corrected — see Fixed below for what changed on the way in.
+
+- **BVH motion capture** — one metadata record per clip (`joints`,
+  `joint_count`, `frames`, `frame_time_s`, `duration_s`). The numeric MOTION
+  block, which is most of the file, is never read: extraction stops at the
+  `Frame Time:` line.
+
+- **`--stub <glob>`** designates files that should be *referenceable but not
+  parsed*: each match is indexed as one name-card record and its contents are
+  never opened.
+
 - **Push a filtered subset of indices to an external ES-compatible target —
   the single-node WAL tap** ([#320](https://github.com/xerj-org/xerj/issues/320)).
   Nothing pushed data out of the engine before this: `_ccr/*` answered `501`,
@@ -522,6 +547,209 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (see *Changed*); and a refusal marker is only read back at boot, so a data
   dir opened by two processes at once is outside what the sidecar can promise
   (the node lock already prevents that).
+
+- **Unity assets were sampled through a 4 MiB cap, silently junking whole
+  object classes.** Unity YAML is a grouped family — each `unity_class` is its
+  own dataset and a class's first document can sit anywhere in a scene that
+  `extract/unity.rs` itself says can exceed 200 MB. A class first appearing
+  past the cap was never sampled, got no entry in the plan, and phase B then
+  had nowhere to route its records: they became `file_junk` with nothing said.
+  The cap is now 512 MiB for this family, **and** any record whose group was
+  never sampled is now reported by name and count instead of silently counted
+  as junk.
+
+- **A `script_guid` that failed to resolve produced no counter, no warning and
+  no report line.** `build_unity_guid_map` discarded `extract_meta`'s `Result`,
+  so an unreadable `.meta` was indistinguishable from a script nothing
+  references — on the feature's own headline query. Unreadable sidecars,
+  sidecars carrying no usable guid, and unresolvable `script_guid`s are now
+  each reported.
+
+- **`script_path`/`script_class` were mapped only when the phase-A sample
+  happened to contain a `script_guid`**, while phase B stamps them whenever a
+  guid resolves. A cluster whose sampled window held no `m_Script` therefore
+  got them dynamic-mapped at index time, feeding the field-budget overshoot in
+  #312. They are now registered for every Unity cluster, and the enrichment
+  runs *before* `coerce_record` rather than after it, so the fields it stamps
+  are validated like every other field instead of bypassing coercion.
+
+- **`build_unity_guid_map` ran serially, unmetered, on the critical path of
+  every run** — including a resumed no-op incremental, which otherwise has no
+  work to do. A real Unity project has 10k-500k `.meta` sidecars. It now runs
+  on `crate::pool` under the progress meter (the unattributed-stretch pattern
+  of #241).
+
+- **A `--stub` file was named from the content path**, which under durable
+  preparation is a content-addressed blob — so every stub's one and only field
+  would have been titled after a blob ordinal (the #294 failure class).
+  It now uses `Sniffed::logical_name`.
+
+- **`order::band_from_family_str` disagreed with `order::band`.** The string
+  form's catch-all ranked `binary` as `Bulk` where the enum form ranks it
+  `Vendored`, so a resumed run could order work differently from the run that
+  planned it. Both now agree for every family, pinned by a test that iterates
+  the whole enum.
+
+- **The autoindex use-case README documented three flags and behaviours that
+  do not exist.** `--no-default-excludes` and `--no-gitignore` are spelled
+  `--no-default-ignores` and `--no-ignore`, and `cli::parse` hard-errors on an
+  unknown argument — so a reader who copied the documented invocation got an
+  error instead of an index. The marker-gated pruning of `node_modules/` and
+  `target/` was described but had been dropped from the branch. A test now
+  parses every `--flag` named in that README and fails if the CLI would reject
+  it.
+
+- **`stub_matcher_tests::an_invalid_pattern_fails_loudly_at_startup` did not
+  test its own name** — it asserted only that a *valid* pattern compiles.
+  `glob_to_regex` escapes every metacharacter, so no glob can produce a
+  syntactically invalid regex; the one reachable failure is the compiled-size
+  limit, which `?` and `**` reach at ~10^5 characters. Over-long patterns are
+  now rejected explicitly with a message naming the flag and the limit, and the
+  test exercises that path.
+
+### Changed
+
+- **Two proposed byte-statistics binary heuristics were dropped before they
+  shipped; raw TGA is detected by its header instead.** Both were attempts to
+  recognise a raw texture that decodes into printable characters, and both
+  turned out to be tests for "not written in Latin script".
+
+  The first, from PR #274, classified any text over 4 KiB with under 5%
+  whitespace as binary. `nonblank` is built from `text.lines()`, so newlines
+  are already stripped and only intra-line whitespace counts — which means
+  Chinese, Japanese, Korean, Thai, Lao, Khmer and Burmese prose, base64 blobs,
+  FASTA sequences and minified single-line files all score 0%. This repo's own
+  `failure_resume_http_tests::legacy_key_collision_fails_before_visibility_with_scoped_guidance`
+  builds a 65,537-byte fixture of one repeated ASCII letter; with that guard
+  reinstated the test fails with `left: 3, right: 0` — the run exits 3 instead
+  of 0.
+
+  The second was introduced by the first attempt to reland #274 and is
+  **removed here**: "decoded via lossy windows-1252 AND over 30% non-ASCII is
+  pixel soup". windows-1252 is the fallback every legacy 8-bit codepage decodes
+  through, so it is not a test for image data. Measured through `sniff()` on
+  `ca4d75a` versus that branch, with identical fixtures:
+
+  | fixture | `ca4d75a` | with the guard |
+  |---|---|---|
+  | windows-1251 Russian, 13,000 B | `txt-prose` | `binary` |
+  | KOI8-R Russian, 13,000 B | `txt-prose` | `binary` |
+  | windows-1253 Greek, 12,200 B | `txt-prose` | `binary` |
+  | windows-1255 Hebrew, 11,000 B | `txt-prose` | `binary` |
+  | windows-1256 Arabic, 10,800 B | `txt-prose` | `binary` |
+  | Shift-JIS Japanese, 22,401 B (byte pad 1; likewise pad 3) | `txt-prose` | `binary` |
+  | Shift-JIS Japanese + ASCII code, 13,360 B | `txt-lines` | `binary` |
+  | Shift-JIS Japanese + ASCII code, 66,800 B | `txt-lines` | `binary` |
+
+  `scan_file` turns `Family::Binary` into `junk: binary content (unknown)`, so
+  each of those files stopped being indexed. A `looks_like_legacy_cjk` escape
+  hatch shipped with it and could not carry the weight: single-byte codepages
+  never form valid Shift-JIS/GBK/Big5/EUC-KR double-byte pairs, so Cyrillic,
+  Greek, Hebrew and Arabic were never rescued at all; it required a *lossless*
+  trial decode while `sniff()` sees only the first 8192 bytes, so the same
+  Japanese document was text at byte-offset pads 0 and 2 and binary at pads 1
+  and 3; and a realistic Japanese technical document (prose around ASCII code
+  fences) sits below its 30% ideograph floor while sitting above the guard's
+  30% non-ASCII ceiling. Every fixture in the table above now classifies
+  exactly as it does on `ca4d75a`.
+
+  What replaces it is `looks_like_tga_header`: TGA has no magic number, but its
+  18-byte header is constrained enough that bytes 1 and 2 of the file must both
+  be control characters. **Headerless raw payloads (`.raw`, `.bytes`,
+  uncompressed PCM) still classify as text**, exactly as they do on `ca4d75a`.
+  Bounding what a magic-less binary costs is the fix for that and is not
+  attempted here — see [#381](https://github.com/xerj-org/xerj/issues/381);
+  `for_each_section` already streams, so the unbounded quantity is the record
+  count, not resident memory.
+
+- **The new magic-byte signatures now require structural confirmation.** Nine
+  signatures (PSD, both TIFF byte orders, RIFF, OGG, FLAC, MP3, FBX and EXR)
+  were added by the first reland attempt as bare `starts_with` tests. **Six** of
+  them are entirely printable ASCII — `8BPS`, `RIFF`, `OggS`, `fLaC`, `ID3` and
+  the 18 letters `Kaydara FBX Binary` — so they matched ordinary text. Measured
+  through the real `sniff()` on `ca4d75a` vs this branch with identical
+  fixtures:
+
+  | fixture | `ca4d75a` | first reland |
+  | --- | --- | --- |
+  | CSV whose first column header is `ID3` | `csv` | `binary`/`mp3` |
+  | prose opening `RIFF is a container format used by WAV files. …` | `txt-prose` | `binary`/`riff` |
+  | prose opening `OggS pages carry the packets of an Ogg stream …` | `txt-prose` | `binary`/`ogg` |
+  | prose opening `fLaC is the four byte magic of a FLAC audio …` | `txt-prose` | `binary`/`flac` |
+  | prose opening `8BPS is the magic of an Adobe Photoshop …` | `txt-prose` | `binary`/`psd` |
+  | `.md` note opening `Kaydara FBX Binary is the 20-byte magic …` | `txt-prose` | `binary`/`fbx` |
+
+  Each of the six is now qualified by what must follow it: PSD version, RIFF
+  FORM type, Ogg stream-structure version, FLAC block type, ID3v2 major version
+  and synchsafe size, and for FBX the full 23-byte header (`Kaydara FBX
+  Binary`, two spaces, NUL, `0x1A`, `0x00`). The FBX case was missed by the
+  first pass at this fix and caught in review — at 18 printable characters it is
+  the likeliest of the six to open a real sentence, and likeliest precisely
+  inside the Unity/3D-asset corpus this feature targets. Every fixture in the
+  table above now classifies exactly as it does on `ca4d75a`. The true positives
+  are unchanged and still covered; the FBX true-positive fixture was corrected
+  to the real 23-byte header, which is what any Autodesk tool emits.
+
+  This is what Lucene's `CodecUtil.checkHeader` does with `CODEC_MAGIC`
+  (`lucene/core/src/java/org/apache/lucene/codecs/CodecUtil.java:183`, which
+  hands straight to `checkHeaderNoMagic` at `:202` and refuses the file unless
+  the codec name *and* a version in range follow — the magic alone is never
+  taken as proof). Apache-2.0, same licence as XERJ; adapted, not copied.
+
+  **Not fixed here, deliberately:** `GIF8` and `BM` are printable-ASCII
+  signatures with exactly the same defect, but they are **pre-existing** — they
+  are unchanged from `ca4d75a`, and prose opening `GIF8`/`GIF89a`, a CSV whose
+  first column header is `GIF8`, and prose opening `BM` were each measured to
+  classify as `binary`/`gif` and `binary`/`bmp` on `ca4d75a` **and** on this
+  branch, identically. Fixing them changes behaviour unrelated to Unity, so it
+  is filed as **#380** rather than smuggled in here, and today's wrong answers
+  are pinned by `gif8_and_bm_are_still_taken_on_faith` so #380 has to flip that
+  assertion deliberately. `GIF8` is listed alongside `BM` so the next reader
+  does not conclude `BM` is the only one.
+
+- **A junk entry could overwrite a successfully indexed file's catalog row.**
+  When phase B met a record group phase A never sampled, the worker pushed a
+  whole-file junk entry while leaving `send_err` unset — so the file also
+  reached `journal.file_done`, and both passes wrote `catalog::file_doc` under
+  the same `file:{file_key}` id into the same bulk. The junk document landed
+  second and won: a file that indexed records was reported in the catalog as
+  status `junk` with `records: 0`, `files_junk` counted it, and
+  `CodeCoverage::observe` ran for it twice. Reachable with no Unity involved,
+  via a >64 MiB SQL dump whose first row for some table starts past
+  `SQLDUMP_SAMPLE_LIMIT`. The unsampled group is now reported on the progress
+  meter instead, the dropped records stay on that file's own completion where
+  they already were, and the disjointness the code claimed in a comment is now
+  enforced at the one place that holds both sets (`shadowed_junk_entries`).
+
+### Known issues
+
+- `ref_guids` (Unity) and `joints` (BVH) are multi-valued keyword arrays, and
+  #332 means array elements are joined into one FTS token, so a post-flush
+  `term`/`match` on a single element does not hit. `script_guid`,
+  `script_path` and `script_class` are single-valued and unaffected, so the
+  documented "which scenes use this script?" query is not impacted. Fixing
+  #332 is an engine-side change to the FTS writer input type.
+
+- **`GIF8` and `BM` are still unqualified printable-ASCII magic signatures**, so
+  a text file whose first characters are `GIF8`, `GIF89a` or `BM` is classified
+  `binary` and junked. This is **pre-existing, not introduced here** — measured
+  identical on `ca4d75a` and on this branch (`binary`/`gif` and `binary`/`bmp`
+  in both) — and is left unchanged because fixing it is a behaviour change with
+  no Unity content. Both names are recorded here on purpose: `BM` is the
+  obvious one and `GIF8` is the one a reader would otherwise miss. Tracked as
+  **#380**; `gif8_and_bm_are_still_taken_on_faith` pins the current behaviour.
+
+- **A magic-less binary is still sectioned and indexed in full.** The two
+  byte-statistics guards this branch removed (they junked non-Latin text) also
+  caught NUL-free binary payloads that decode printable under the
+  windows-1252 fallback. Nothing replaced them except `looks_like_tga_header`,
+  which covers TGA only. Measured on this branch: a 4,194,495-byte printable
+  NUL-free blob named `texture.bytes` sniffs `txt-prose` and expands into 2048
+  indexed records. This is **not** the peak-RSS bug from #239 —
+  `for_each_section` is still streaming and per-file memory is still bounded;
+  the unbounded quantity is the record COUNT. Removing the guards was still
+  right: they deleted CJK, Cyrillic, Greek, Hebrew and Arabic documents
+  worldwide. Tracked as **#381**.
 
 ## [1.0.0-rc.16] - 2026-08-13
 
