@@ -1477,7 +1477,7 @@ fn a_readme_documenting_two_tables_is_not_a_fatal_condition() {
 /// The second abort #360 reported — the one that killed both of the corpora
 /// the reporter pointed autoindex at, on one node, one after the other.
 ///
-/// `ids::file_key` derives a file's identity from its CONTENT alone, and
+/// `content::full_digest` derives a file's identity from its CONTENT alone, and
 /// `catalog::CATALOG_INDEX` is a single global index that no `--prefix`
 /// namespaces. Two unrelated checkouts that happen to share one byte-identical
 /// file — an Apache-2.0 `LICENSE`, a `.gitignore`, an empty `__init__.py` —

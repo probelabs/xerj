@@ -43,13 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already indexed a byte-identical file** — the second of the three aborts
   [#360](https://github.com/xerj-org/xerj/issues/360) reports, and the one that
   killed the reporter's second corpus. A file's identity is derived from its
-  CONTENT alone (`ids::file_key`) and the catalog is one global index
+  CONTENT alone (`content::full_digest`) and the catalog is one global index
   (`autoindex-catalog`) that no `--prefix` namespaces, so two unrelated
   checkouts sharing one file — an Apache-2.0 `LICENSE` is the everyday case —
   share that file's catalog document IDs. A corpus holding the content five
   times publishes a canonical document plus four alias documents; a corpus
   holding it once republishes only the canonical, and the other corpus's four
-  alias documents survive under their own `run_id`. The generation-wide barrier
+  alias documents survive under their own `run_id`. Be clear about what that
+  does *not* mean: the shared file's canonical catalog document
+  (`file:<content_id>`) belongs to whichever run published it last, so after the
+  second corpus runs, the first corpus's alias documents point at a
+  `duplicate_of` whose canonical entry is now the other corpus's. That is
+  pre-existing — the binary before this change overwrites it too, then aborts —
+  and this change removes the false abort without repairing it. The catalog
+  identity collision itself is tracked in
+  [#416](https://github.com/xerj-org/xerj/issues/416). The generation-wide barrier
   counted every catalog document carrying the group's `file_key` — across every
   run on the node — against `1 + aliases.len()` for the group in front of it, so
   the second run exited `1` with `catalog canonical/alias count disagrees with
@@ -81,7 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documents carry `"time_field": null`, `"time_min": null`, `"time_max": null`
   and `"semantic_field": null`. The exact read-back is the tripwire that caught
   the engine rewriting a document, so it is deliberately left armed rather than
-  taught to ignore the difference.
+  taught to ignore the difference. Tracked as
+  [#415](https://github.com/xerj-org/xerj/issues/415).
 
 - **A lexical query on a `semantic_text` field now says so** (#363). `match`,
   `match_phrase`, `multi_match` and `query_string` against a `semantic_text`

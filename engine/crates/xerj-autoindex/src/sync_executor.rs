@@ -666,7 +666,7 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             );
             // Scoped to this generation's `run_id`, the same way the run-summary
             // read-back is (`lib.rs`). `file_key` is derived from CONTENT alone
-            // (`ids::file_key`) and the catalog is one global index that no
+            // (`content::full_digest`) and the catalog is one global index that no
             // `--prefix` namespaces, so an unscoped count also sees the
             // canonical and alias documents that ANOTHER corpus on this node
             // published for byte-identical content — two Apache-2.0 checkouts
