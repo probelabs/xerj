@@ -6862,3 +6862,174 @@ async fn a_persisted_pipeline_the_new_checks_refuse_still_runs_after_a_restart()
         "a definition-time PUT must still refuse the same config"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — …but the door above is for definitions written by a build with
+// NO gate. A definition THIS build already refused must not walk through it.
+// `ingest-pipeline-refusals.json` is the provenance that tells them apart, the
+// same role `analysis-binding.json` plays for an index.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_definition_time_refusal_is_recorded_on_disk_and_replayed_strictly() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("ingest-pipeline-refusals.json");
+
+    {
+        let engine = make_engine(&dir);
+        engine
+            .register_unrunnable_pipeline(
+                "guarded",
+                json!({ "stages": [
+                    { "type": "drop_field",
+                      "config": { "fields": ["secret"], "if": "ctx.tenant == 'a'" } }
+                ] }),
+                "processor [drop_field] option [if] is not supported by this xerj build".into(),
+            )
+            .expect("the refusal reaches disk");
+        assert!(
+            marker.exists(),
+            "the refusal must be durable, not process-local"
+        );
+    }
+
+    let engine = make_engine(&dir);
+    assert!(
+        !engine.transform_pipelines.contains_key("guarded"),
+        "a restart must not resurrect a definition this build refused"
+    );
+    let reason = engine
+        .unrunnable_pipelines
+        .get("guarded")
+        .map(|r| r.value().clone())
+        .expect("the refusal is still recorded after the restart");
+    assert!(
+        reason.contains("if"),
+        "and it answers with the reason the operator already read: {reason}"
+    );
+    assert!(
+        engine.definition_time_refusals.contains_key("guarded"),
+        "the marker itself survives too, or the NEXT restart would soften it"
+    );
+}
+
+#[tokio::test]
+async fn a_definition_that_compiles_clears_its_refusal_marker() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("ingest-pipeline-refusals.json");
+    {
+        let engine = make_engine(&dir);
+        engine
+            .register_unrunnable_pipeline(
+                "p",
+                json!({ "stages": [{ "type": "set",
+                                     "config": { "field": "a", "value": 1, "if": "ctx.x" } }] }),
+                "processor [set] option [if] is not supported by this xerj build".into(),
+            )
+            .expect("refusal stored");
+        // The operator drops the option.
+        assert!(engine
+            .put_pipeline(
+                "p",
+                json!({ "stages": [{ "type": "set", "config": { "field": "a", "value": 1 } }] }),
+                None,
+            )
+            .expect("no IO failure")
+            .is_none());
+        let on_disk: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(&marker).expect("marker")).expect("parse");
+        assert!(
+            !on_disk.contains_key("p"),
+            "a marker that outlives its cause refuses a pipeline that runs: {on_disk:?}"
+        );
+    }
+    let engine = make_engine(&dir);
+    assert!(
+        engine.transform_pipelines.contains_key("p"),
+        "…and the accepted definition runs after the restart"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_marker_deleted_with_its_pipeline_cannot_haunt_the_next_definition() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        engine
+            .register_unrunnable_pipeline(
+                "p",
+                json!({ "stages": [{ "type": "set",
+                                     "config": { "field": "a", "value": 1, "if": "ctx.x" } }] }),
+                "processor [set] option [if] is not supported by this xerj build".into(),
+            )
+            .expect("refusal stored");
+        assert!(engine.delete_pipeline("p").expect("delete"));
+        assert!(
+            !engine.definition_time_refusals.contains_key("p"),
+            "the marker refers to a definition that no longer exists"
+        );
+        assert!(engine
+            .put_pipeline(
+                "p",
+                json!({ "stages": [{ "type": "set", "config": { "field": "a", "value": 1 } }] }),
+                None,
+            )
+            .expect("no IO failure")
+            .is_none());
+    }
+    let engine = make_engine(&dir);
+    assert!(
+        engine.transform_pipelines.contains_key("p"),
+        "a fresh definition under a reused id must not inherit the old one's 400"
+    );
+}
+
+/// "Provenance unknown" is not "no refusal". A marker file that exists but
+/// cannot be parsed must fail CLOSED — replay everything at definition
+/// strictness — rather than silently reopen the hole it closes.
+#[tokio::test]
+async fn an_unparseable_refusal_marker_makes_the_replay_strict() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        engine
+            .put_pipeline(
+                "legacy_pipe",
+                json!({ "stages": [
+                    { "type": "grok", "config": { "field": "msg", "pattern": "GENERIC" } }
+                ] }),
+                None,
+            )
+            .expect("a clean definition stores");
+    }
+    let cluster_state = dir.path().join("cluster_state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&cluster_state).unwrap()).unwrap();
+    state["pipelines"]["legacy_pipe"]["stages"][0]["config"]["pattern"] = json!("NGINX_COMBINE");
+    std::fs::write(&cluster_state, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    std::fs::write(
+        dir.path().join("ingest-pipeline-refusals.json"),
+        b"{not json",
+    )
+    .unwrap();
+
+    let engine = make_engine(&dir);
+    assert!(
+        engine
+            .pipeline_refusals_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the boot must record that it could not classify any pipeline"
+    );
+    assert!(
+        !engine.transform_pipelines.contains_key("legacy_pipe"),
+        "with no provenance the replay must not soften anything"
+    );
+    let reason = engine
+        .unrunnable_pipelines
+        .get("legacy_pipe")
+        .map(|r| r.value().clone())
+        .expect("and it must say why, naming the repair");
+    assert!(
+        reason.contains("ingest-pipeline-refusals.json"),
+        "the reason must name the file to repair: {reason}"
+    );
+}

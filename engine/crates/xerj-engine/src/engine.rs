@@ -450,6 +450,53 @@ pub struct Engine {
     /// ingested through it: `process_through_pipeline` refuses with the reason
     /// recorded here instead of quietly indexing the untransformed document.
     pub unrunnable_pipelines: Arc<DashMap<String, String>>,
+    /// pipeline_id → the reason a **gate-bearing build refused this exact
+    /// definition at PUT time**, persisted so a restart cannot overturn the
+    /// answer the operator already received.
+    ///
+    /// Issue #204. This is PROVENANCE, and it plays the same role for a
+    /// pipeline that `analysis-binding.json` plays for an index: its ABSENCE is
+    /// the load-bearing signal. A definition in `cluster_state.json` with no
+    /// entry here was written by a build that had no gate, so the boot replay
+    /// may soften it ([`CompileMode::ReplayPersisted`](xerj_wasm::pipeline::CompileMode)).
+    /// A definition WITH an entry here was already answered "no" by this
+    /// contract, and the replay must not resurrect it — without this marker,
+    /// `ReplayPersisted` cannot tell the two apart, and a plain restart turned a
+    /// PUT-time refusal back into a `201` that wrote the wrong document
+    /// (`GET` hands the operator the stored shape, they edit it, PUT it back,
+    /// get the refusal, restart, and the refusal is gone).
+    ///
+    /// Persisted in `<data_dir>/ingest-pipeline-refusals.json`, deliberately
+    /// NOT in `cluster_state.json`: that envelope is a closed format-1 contract
+    /// with `deny_unknown_fields` (see [`crate::cluster_state`]), so adding a
+    /// field to it would make every file this build writes unreadable to an
+    /// older binary. A sidecar an older build simply ignores does not.
+    ///
+    /// Reference: Lucene records the same kind of fact for the same reason.
+    /// `SegmentInfos.indexCreatedVersionMajor`
+    /// (`lucene/core/src/java/org/apache/lucene/index/SegmentInfos.java:172`,
+    /// "The Lucene version major that was used to create the index") is written
+    /// once into the commit
+    /// (`SegmentInfos.java:633`, `out.writeVInt(indexCreatedVersionMajor)`) and
+    /// then *decides how the bytes are read back* rather than being re-derived:
+    /// `readCommit` throws `CorruptIndexException` when a segment predates the
+    /// recorded creation version (`SegmentInfos.java:491-501`), and
+    /// `readLatestCommit(dir, minSupportedMajor)` refuses a commit whose
+    /// recorded creation major is below the caller's floor
+    /// (`SegmentInfos.java:572-578`). The lesson taken here is the shape, not
+    /// the code: what a *later* reader may assume about persisted bytes has to
+    /// be recorded WITH them at write time, because it cannot be recovered
+    /// afterwards. Lucene is Apache-2.0, the same licence as XERJ; no code is
+    /// reproduced.
+    pub definition_time_refusals: Arc<DashMap<String, String>>,
+    /// Set when `ingest-pipeline-refusals.json` exists but could not be read or
+    /// parsed, so no pipeline's provenance is known.
+    ///
+    /// Issue #204. "Unknown provenance" is not "no refusal": replaying softly
+    /// there would resurrect exactly the refusals the marker exists to keep.
+    /// Every persisted pipeline is replayed at DEFINITION strictness instead —
+    /// fail closed, and loudly, with the repair named in the reason.
+    pub pipeline_refusals_unreadable: Arc<std::sync::atomic::AtomicBool>,
     /// pipeline_id → configuration the running build cannot honour but that
     /// was already persisted by an older one.
     ///
@@ -737,6 +784,8 @@ impl Engine {
             scrolls: Arc::new(DashMap::new()),
             pipelines: Arc::new(DashMap::new()),
             unrunnable_pipelines: Arc::new(DashMap::new()),
+            definition_time_refusals: Arc::new(DashMap::new()),
+            pipeline_refusals_unreadable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             degraded_pipelines: Arc::new(DashMap::new()),
             closed_indices: Arc::new(DashMap::new()),
             data_streams: Arc::new(DashMap::new()),
@@ -1648,6 +1697,106 @@ impl Engine {
         }
     }
 
+    // ── Ingest-pipeline refusal provenance (issue #204) ─────────────────────
+
+    /// Sidecar holding [`Engine::definition_time_refusals`].
+    ///
+    /// A separate file rather than an eighth field in `cluster_state.json`:
+    /// that envelope is `deny_unknown_fields`, so widening it would make every
+    /// file this build writes unreadable to an older binary — a downgrade
+    /// break traded for an upgrade fix. An older binary ignores this file.
+    fn pipeline_refusals_path(&self) -> PathBuf {
+        self.data_dir.join("ingest-pipeline-refusals.json")
+    }
+
+    /// Write the whole refusal map atomically.
+    ///
+    /// `Err` means the marker did not reach disk, and the caller MUST NOT
+    /// acknowledge: without it the next boot cannot tell this definition from
+    /// one an older, gate-less build wrote, and would soften the refusal back
+    /// into a `201` (issue #204). Same rule `flush_cluster_state` already
+    /// enforces for the definition itself (issue #203).
+    fn flush_pipeline_refusals(&self) -> Result<()> {
+        let snapshot: std::collections::BTreeMap<String, String> = self
+            .definition_time_refusals
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|e| {
+            xerj_common::XerjError::internal(format!(
+                "could not serialise the ingest-pipeline refusal markers: {e}"
+            ))
+        })?;
+        crate::index::write_file_atomic(&self.pipeline_refusals_path(), &bytes).map_err(|e| {
+            EngineError::Common(xerj_common::XerjError::internal(format!(
+                "could not persist {}: {e}",
+                self.pipeline_refusals_path().display()
+            )))
+        })
+    }
+
+    /// Clearing a refusal marker is not on the acknowledge path — a marker
+    /// that outlives its cause makes a pipeline *more* refused, never less —
+    /// so a write failure is logged rather than propagated.
+    fn flush_pipeline_refusals_best_effort(&self) {
+        if let Err(e) = self.flush_pipeline_refusals() {
+            warn!(
+                error = %e,
+                "could not clear an ingest-pipeline refusal marker; the pipeline will be \
+                 refused again after the next restart until a re-PUT succeeds"
+            );
+        }
+    }
+
+    /// Read the refusal markers back at boot, before any pipeline is replayed.
+    ///
+    /// A missing file is the normal case for a data dir written before this
+    /// build — every pipeline in it is then treated as "no provenance", which
+    /// is exactly the compatibility door the replay mode exists for. A corrupt
+    /// file is NOT treated as "no refusals": that would silently reopen the
+    /// hole this marker closes, so the boot refuses to run any pipeline it
+    /// cannot classify.
+    fn load_persisted_pipeline_refusals(&self) {
+        let path = self.pipeline_refusals_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                error!(
+                    path = %path.display(), error = %e,
+                    "ingest-pipeline refusal markers are unreadable; every persisted pipeline \
+                     will be replayed at DEFINITION strictness so a refusal cannot be lost"
+                );
+                self.pipeline_refusals_unreadable
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+        match serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&bytes) {
+            Ok(map) => {
+                let n = map.len();
+                for (id, reason) in map {
+                    self.definition_time_refusals.insert(id, reason);
+                }
+                if n > 0 {
+                    info!(
+                        count = n,
+                        "restored ingest-pipeline refusals recorded at definition time"
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    path = %path.display(), error = %e,
+                    "ingest-pipeline refusal markers are corrupt; every persisted pipeline will \
+                     be replayed at DEFINITION strictness so a refusal cannot be lost"
+                );
+                self.pipeline_refusals_unreadable
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
     // ── Lifecycle management (ISM/ILM) persistence ──────────────────────────
 
     fn ism_policies_path(&self) -> PathBuf {
@@ -2163,33 +2312,78 @@ impl Engine {
         // `?pipeline=x` would be accepted after a restart and quietly do
         // nothing. Keep the stored document either way so GET round-trips
         // exactly as it did before the restart.
+        //
+        // Which strictness a definition is replayed at is decided by
+        // PROVENANCE, never by the calendar (issue #204). Load the markers
+        // first — see `definition_time_refusals`.
+        self.load_persisted_pipeline_refusals();
+        let provenance_unknown = self
+            .pipeline_refusals_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst);
         let mut pipelines_restored = 0usize;
         for (name, config) in state.pipelines {
             self.pipelines.insert(name.clone(), config.clone());
-            // Replay strictness, NOT definition-time strictness: this
-            // definition is already on disk and was accepted by whichever
-            // build wrote it. See `compile_pipeline_with_mode` (issue #204).
-            match self.compile_pipeline_with_mode(
-                &name,
-                config,
-                xerj_wasm::pipeline::CompileMode::ReplayPersisted,
-            ) {
-                Ok(()) => pipelines_restored += 1,
+            let refused_at_definition_time = self
+                .definition_time_refusals
+                .get(&name)
+                .map(|r| r.value().clone());
+            // Replay strictness is for definitions written by a build with NO
+            // gate: those were accepted by whichever build wrote them and
+            // failing them at boot would flip a working cluster's writes from
+            // 201 to 400 on a binary upgrade alone. A definition THIS contract
+            // already refused is the opposite case — the operator asked, was
+            // told 400, and a restart must not answer differently. Softening
+            // it here dropped `secret` from documents an `if` guard excluded,
+            // under a 201, with no PUT in between.
+            let mode = if refused_at_definition_time.is_some() || provenance_unknown {
+                xerj_wasm::pipeline::CompileMode::Strict
+            } else {
+                xerj_wasm::pipeline::CompileMode::ReplayPersisted
+            };
+            match self.compile_pipeline_with_mode(&name, config, mode) {
+                Ok(()) => {
+                    if refused_at_definition_time.is_some() {
+                        // This build honours what the refusing one could not,
+                        // so the marker has outlived its cause. Clearing it is
+                        // what stops a capability upgrade needing a re-PUT.
+                        info!(
+                            pipeline = name.as_str(),
+                            "a pipeline refused at definition time by an earlier build compiles \
+                             cleanly here; the recorded refusal is cleared and it now runs"
+                        );
+                        self.definition_time_refusals.remove(&name);
+                        self.flush_pipeline_refusals_best_effort();
+                    }
+                    pipelines_restored += 1
+                }
                 Err(e) => {
                     // Issue #204: record WHY there is no executable form, so
                     // every ingest path refuses loudly with the reason
                     // instead of reporting a pipeline GET plainly shows as
                     // "not found" — the same contract as a fresh PUT.
-                    self.unrunnable_pipelines.insert(
-                        name.clone(),
-                        format!(
+                    let reason = match (&refused_at_definition_time, provenance_unknown) {
+                        // Answer the operator with the words they already
+                        // read at PUT time, so the restart is visibly a
+                        // continuation rather than a new, different failure.
+                        (Some(recorded), _) => recorded.clone(),
+                        (None, true) => format!(
+                            "the persisted definition could not be recompiled at startup ({e}), \
+                             and `ingest-pipeline-refusals.json` could not be read, so this \
+                             build cannot tell an already-refused definition from one an \
+                             older build accepted; no document can be ingested through \
+                             pipeline [{name}] — repair or delete that file, or re-PUT the \
+                             definition"
+                        ),
+                        (None, false) => format!(
                             "the persisted definition could not be recompiled \
                              at startup ({e}); no document can be ingested \
                              through pipeline [{name}] — re-PUT the definition"
                         ),
-                    );
+                    };
+                    self.unrunnable_pipelines.insert(name.clone(), reason);
                     error!(
                         pipeline = name.as_str(), error = %e,
+                        refused_at_definition_time = refused_at_definition_time.is_some(),
                         "persisted ingest pipeline could not be recompiled — it is \
                          still visible to GET /_ingest/pipeline but will NOT \
                          transform anything; re-PUT the definition"
@@ -2414,6 +2608,13 @@ impl Engine {
         // (issue #204 — a rolled-back write must not turn "stored but not
         // runnable, and here is why" into a bare "not found").
         let previous_reason = self.unrunnable_pipelines.get(id).map(|r| r.value().clone());
+        // Same for the persisted refusal marker (issue #204): a rolled-back
+        // write must not silently un-refuse a definition that is still the one
+        // on disk.
+        let previous_marker = self
+            .definition_time_refusals
+            .get(id)
+            .map(|r| r.value().clone());
         // Same for the boot-replay degradation note: a rolled-back write must
         // leave the previous definition described exactly as it was.
         let previous_degradation = self.degraded_pipelines.get(id).map(|r| r.value().clone());
@@ -2437,35 +2638,81 @@ impl Engine {
                     // Issue #204: the kept definition is visible to `GET`, so
                     // ingest through it must refuse WITH the reason rather
                     // than claim the pipeline is missing.
-                    self.unrunnable_pipelines.insert(
-                        id.to_string(),
-                        format!(
-                            "the stored definition does not compile ({e}); no \
-                             document can be ingested through pipeline [{id}]"
-                        ),
+                    let reason = format!(
+                        "the stored definition does not compile ({e}); no \
+                         document can be ingested through pipeline [{id}]"
                     );
+                    self.unrunnable_pipelines
+                        .insert(id.to_string(), reason.clone());
+                    // …and the refusal must survive a restart, or the boot
+                    // replay softens it and the definition starts running
+                    // with the refused option ignored (issue #204). Flushed
+                    // below, after the definition itself reaches disk.
+                    self.definition_time_refusals.insert(id.to_string(), reason);
                     Some(e)
                 }
             },
         };
 
-        if let Err(e) = self.flush_cluster_state() {
-            match previous_doc {
-                Some(d) => self.pipelines.insert(id.to_string(), d),
-                None => self.pipelines.remove(id).map(|(_, v)| v),
-            };
-            self.transform_pipelines.remove(id);
-            if let Some(p) = previous_compiled {
-                self.transform_pipelines.insert(id.to_string(), p);
+        // Every abort path restores exactly the state this call found, so a
+        // write that did not reach disk leaves nothing only this process can
+        // see. Each expansion sits in a branch that returns, so the moves out
+        // of the `previous_*` snapshots never overlap.
+        macro_rules! rollback {
+            () => {{
+                match previous_doc {
+                    Some(d) => self.pipelines.insert(id.to_string(), d),
+                    None => self.pipelines.remove(id).map(|(_, v)| v),
+                };
+                self.transform_pipelines.remove(id);
+                if let Some(p) = previous_compiled {
+                    self.transform_pipelines.insert(id.to_string(), p);
+                }
+                match previous_reason {
+                    Some(r) => self.unrunnable_pipelines.insert(id.to_string(), r),
+                    None => self.unrunnable_pipelines.remove(id).map(|(_, v)| v),
+                };
+                match previous_marker {
+                    Some(r) => self.definition_time_refusals.insert(id.to_string(), r),
+                    None => self.definition_time_refusals.remove(id).map(|(_, v)| v),
+                };
+                match previous_degradation {
+                    Some(r) => self.degraded_pipelines.insert(id.to_string(), r),
+                    None => self.degraded_pipelines.remove(id).map(|(_, v)| v),
+                };
+            }};
+        }
+
+        // Issue #204: the persisted refusal marker reaches disk BEFORE the
+        // definition, and that order is load-bearing.
+        //
+        //   marker without its definition — the PREVIOUS definition replays at
+        //     definition strictness. It compiled once, so it compiles again,
+        //     and the boot self-heal clears the marker. Loud at worst.
+        //   definition without its marker — the boot replay softens a refusal
+        //     the operator has already been given, and the pipeline silently
+        //     starts running with the refused option ignored. That is the
+        //     defect this marker exists to close.
+        let marker_changed = self
+            .definition_time_refusals
+            .get(id)
+            .map(|r| r.value().clone())
+            != previous_marker;
+        if marker_changed {
+            if let Err(e) = self.flush_pipeline_refusals() {
+                rollback!();
+                return Err(e);
             }
-            match previous_reason {
-                Some(r) => self.unrunnable_pipelines.insert(id.to_string(), r),
-                None => self.unrunnable_pipelines.remove(id).map(|(_, v)| v),
-            };
-            match previous_degradation {
-                Some(r) => self.degraded_pipelines.insert(id.to_string(), r),
-                None => self.degraded_pipelines.remove(id).map(|(_, v)| v),
-            };
+        }
+
+        if let Err(e) = self.flush_cluster_state() {
+            rollback!();
+            // The marker file is now ahead of the definition; put it back in
+            // step. Best effort: the boot self-heal above already covers the
+            // case where it does not.
+            if marker_changed {
+                self.flush_pipeline_refusals_best_effort();
+            }
             return Err(e);
         }
 
@@ -2490,6 +2737,13 @@ impl Engine {
             // definition under this id starts from a clean slate.
             self.unrunnable_pipelines.remove(name);
             self.degraded_pipelines.remove(name);
+            // …and neither may the persisted refusal marker outlive the
+            // definition it refers to, or a later PUT of a *different*
+            // definition under the same id would inherit its 400 at the next
+            // boot (issue #204).
+            if self.definition_time_refusals.remove(name).is_some() {
+                self.flush_pipeline_refusals_best_effort();
+            }
         }
         Ok(removed)
     }
@@ -3426,8 +3680,14 @@ impl Engine {
         self.pipelines.insert(name.to_string(), config_json);
         self.transform_pipelines.insert(name.to_string(), pipeline);
         // Issue #204: a successful compile clears any recorded "stored but
-        // not runnable" reason left by a previous definition under this id.
+        // not runnable" reason left by a previous definition under this id —
+        // including the persisted refusal marker, whose only job is to keep a
+        // refusal alive across a restart. Persisting the removal is the
+        // caller's (`put_pipeline`, and the boot replay's self-heal); an
+        // orphaned marker only ever makes a pipeline more refused, and the
+        // next successful PUT clears it again.
         self.unrunnable_pipelines.remove(name);
+        self.definition_time_refusals.remove(name);
         Ok(())
     }
 
@@ -3464,27 +3724,53 @@ impl Engine {
             .unrunnable_pipelines
             .get(name)
             .map(|r| r.value().clone());
+        let previous_marker = self
+            .definition_time_refusals
+            .get(name)
+            .map(|r| r.value().clone());
         self.pipelines.insert(name.to_string(), definition);
         self.unrunnable_pipelines
+            .insert(name.to_string(), reason.clone());
+        // The marker that makes this refusal survive a restart. Without it the
+        // boot replay softens the refusal and the pipeline silently starts
+        // running, ignoring the very option it was refused for (issue #204).
+        self.definition_time_refusals
             .insert(name.to_string(), reason.clone());
         // Nothing is running under this id any more, so nothing is running
         // degraded either.
         let previous_degradation = self.degraded_pipelines.remove(name).map(|(_, v)| v);
+        macro_rules! rollback {
+            () => {{
+                match previous_doc {
+                    Some(d) => self.pipelines.insert(name.to_string(), d),
+                    None => self.pipelines.remove(name).map(|(_, v)| v),
+                };
+                match previous_reason {
+                    Some(r) => self.unrunnable_pipelines.insert(name.to_string(), r),
+                    None => self.unrunnable_pipelines.remove(name).map(|(_, v)| v),
+                };
+                match previous_marker {
+                    Some(r) => self.definition_time_refusals.insert(name.to_string(), r),
+                    None => self.definition_time_refusals.remove(name).map(|(_, v)| v),
+                };
+                if let Some(p) = previous_compiled {
+                    self.transform_pipelines.insert(name.to_string(), p);
+                }
+                if let Some(d) = previous_degradation {
+                    self.degraded_pipelines.insert(name.to_string(), d);
+                }
+            }};
+        }
+        // Marker before definition — see `put_pipeline` for why that order is
+        // load-bearing. An `Err` from either is NOT acknowledgeable: a refusal
+        // the next boot cannot see is the whole defect.
+        if let Err(e) = self.flush_pipeline_refusals() {
+            rollback!();
+            return Err(e);
+        }
         if let Err(e) = self.flush_cluster_state() {
-            match previous_doc {
-                Some(d) => self.pipelines.insert(name.to_string(), d),
-                None => self.pipelines.remove(name).map(|(_, v)| v),
-            };
-            match previous_reason {
-                Some(r) => self.unrunnable_pipelines.insert(name.to_string(), r),
-                None => self.unrunnable_pipelines.remove(name).map(|(_, v)| v),
-            };
-            if let Some(p) = previous_compiled {
-                self.transform_pipelines.insert(name.to_string(), p);
-            }
-            if let Some(d) = previous_degradation {
-                self.degraded_pipelines.insert(name.to_string(), d);
-            }
+            rollback!();
+            self.flush_pipeline_refusals_best_effort();
             return Err(e);
         }
         warn!(

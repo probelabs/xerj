@@ -29,13 +29,22 @@ use tower::ServiceExt;
 
 fn app() -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_in(dir.path());
+    (app, dir)
+}
+
+/// A node on an EXISTING data dir — i.e. a restart. Dropping the previous
+/// router and building another one over the same directory replays
+/// `cluster_state.json` exactly as a process restart does; it is the only way
+/// to reach the boot path from a request-level test.
+fn app_in(data_dir: &std::path::Path) -> axum::Router {
     let mut config = xerj_common::config::Config::default();
-    config.server.data_dir = dir.path().to_string_lossy().into_owned();
+    config.server.data_dir = data_dir.to_string_lossy().into_owned();
     config.storage.wal_sync = xerj_common::config::WalSync::Async;
     let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
     let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
     let state = xerj_api::state::AppState::new(config, engine, metrics);
-    (xerj_api::router::build_es_compat_router(state), dir)
+    xerj_api::router::build_es_compat_router(state)
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -1025,4 +1034,393 @@ async fn the_dotted_analysis_spelling_does_not_walk_past_the_settings_gate() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A refusal must survive a restart.
+//
+// The boot replay softens config this build cannot honour, so that replacing
+// the binary does not flip a working cluster's writes from 201 to 400. That
+// door was opened for definitions written by a build with NO gate — but
+// `CompileMode::ReplayPersisted` could not tell those from definitions THIS
+// build had already refused, so a plain restart resurrected a refused pipeline
+// and ran it with the refused option ignored. Verbatim repro below, using only
+// xerj's own output.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The exact sequence measured against the first cut of this branch:
+/// PUT → GET → edit → PUT (refused, 400 on write) → restart → 201, and
+/// `secret` dropped from a document the guard EXCLUDES.
+#[tokio::test]
+async fn a_refusal_recorded_at_put_time_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_in(dir.path());
+
+    // (1) a plain, runnable redaction pipeline.
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/redact",
+            json!({ "description": "redact",
+                    "processors": [{ "remove": { "field": "secret" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // (2) the operator reads it back and (3) adds a tenant guard to whatever
+    // GET handed them, then PUTs it back. Both shapes must behave the same,
+    // so drive the loop through the response body rather than a literal.
+    let (_, stored) = send(&app, get("/_ingest/pipeline/redact")).await;
+    let mut edited = stored["redact"].clone();
+    let processors = edited["processors"]
+        .as_array_mut()
+        .expect("GET must answer in the Elasticsearch `processors` vocabulary");
+    processors[0]["remove"]["if"] = json!("ctx.tenant == 'a'");
+    let (status, body) = send(&app, put("/_ingest/pipeline/redact", edited)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ES accepts a guard, so xerj stores it: {body}"
+    );
+
+    // (4) …and every write through it is refused, because the guard is not
+    // evaluated.
+    let (status, body) = send(
+        &app,
+        put(
+            "/docs/_doc/1?pipeline=redact",
+            json!({ "tenant": "b", "secret": "ssn-111" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // (5) restart the node. Nothing else — no PUT, no operator action.
+    drop(app);
+    let app = app_in(dir.path());
+
+    // (6) the identical write must still be refused.
+    let (status, body) = send(
+        &app,
+        put(
+            "/docs/_doc/2?pipeline=redact",
+            json!({ "tenant": "b", "secret": "ssn-111" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a restart must not overturn a refusal the operator was already given: {body}"
+    );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("if")),
+        "and it must answer with the same reason: {body}"
+    );
+
+    // (7) …and no document was written with `secret` dropped by a guard that
+    // excludes it.
+    let (status, doc) = send(&app, get("/docs/_doc/2")).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "the guarded write must not have happened: {doc}"
+    );
+}
+
+/// The same defect reached through the shape the engine itself persists.
+///
+/// `PUT /_ingest/pipeline/{id}` passes a body with no `processors` key straight
+/// through as a xerj `stages` definition, and that body is what
+/// `register_unrunnable_pipeline` stores. A `stages` body — unlike the raw
+/// Elasticsearch one — deserialises perfectly at boot, so the replay recompiled
+/// it softly and the refusal evaporated. This is the case the ES-vocabulary
+/// GET does not incidentally cover, and the one the persisted marker is for.
+#[tokio::test]
+async fn a_refusal_survives_a_restart_for_a_stages_shaped_definition_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_in(dir.path());
+
+    let stages = json!({
+        "description": "redact",
+        "stages": [{
+            "type": "drop_field",
+            "config": { "fields": ["secret"], "if": "ctx.tenant == 'a'" }
+        }]
+    });
+    let (status, body) = send(&app, put("/_ingest/pipeline/redact_native", stages)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["acknowledged"], true, "{body}");
+
+    let (status, body) = send(
+        &app,
+        put(
+            "/docs/_doc/1?pipeline=redact_native",
+            json!({ "tenant": "b", "secret": "ssn-111" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Restart. Nothing else.
+    drop(app);
+    let app = app_in(dir.path());
+
+    let (status, body) = send(
+        &app,
+        put(
+            "/docs/_doc/2?pipeline=redact_native",
+            json!({ "tenant": "b", "secret": "ssn-111" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "measured before the persisted refusal marker: 201, and `secret` dropped from a \
+         document the guard excludes: {body}"
+    );
+    let (status, doc) = send(&app, get("/docs/_doc/2")).await;
+    assert_ne!(status, StatusCode::OK, "{doc}");
+}
+
+/// The marker is provenance, not a tombstone: a definition this build compiles
+/// cleanly must not stay refused because some earlier build could not run it.
+#[tokio::test]
+async fn a_recorded_refusal_is_cleared_by_a_definition_that_compiles() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_in(dir.path());
+
+    // Refused: `ignore_failure: true` is a decision this build cannot make.
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/p",
+            json!({ "processors": [
+                { "set": { "field": "env", "value": "prod", "ignore_failure": true } }
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = send(&app, put("/docs/_doc/1?pipeline=p", json!({ "a": 1 }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The operator drops the option and re-PUTs.
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/p",
+            json!({ "processors": [{ "set": { "field": "env", "value": "prod" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // It runs now, and still runs after a restart — the marker did not outlive
+    // its cause.
+    drop(app);
+    let app = app_in(dir.path());
+    let (status, body) = send(
+        &app,
+        put("/docs/_doc/2?pipeline=p&refresh=true", json!({ "a": 1 })),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (_, doc) = send(&app, get("/docs/_doc/2")).await;
+    assert_eq!(doc["_source"]["env"], "prod", "{doc}");
+}
+
+/// A pipeline persisted by a build with NO gate still runs after the upgrade —
+/// the compatibility door this marker narrows must stay open for the case it
+/// was cut for.
+///
+/// Built the way `cluster_state.json` actually looked before the sweep: a
+/// definition that COMPILED (so the translated `stages` body was stored),
+/// carrying an option no build then checked, and with no marker file — which
+/// is exactly the on-disk state an older binary leaves behind.
+#[tokio::test]
+async fn a_definition_with_no_refusal_marker_still_replays_softly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = app_in(dir.path());
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/legacy",
+            json!({ "processors": [{ "set": { "field": "env", "value": "prod" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    drop(app);
+
+    let state_path = dir.path().join("cluster_state.json");
+    let mut state: Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("cluster_state.json"))
+            .expect("parse");
+    state["pipelines"]["legacy"]["stages"][0]["config"]["ignore_failure"] = json!(true);
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    assert!(
+        !dir.path().join("ingest-pipeline-refusals.json").exists(),
+        "a definition that compiled records no refusal, and older builds wrote no marker at all"
+    );
+
+    let app = app_in(dir.path());
+    let (status, body) = send(
+        &app,
+        put(
+            "/docs/_doc/1?pipeline=legacy&refresh=true",
+            json!({ "a": 1 }),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "an unmarked definition must keep working across a binary upgrade: {body}"
+    );
+    let (_, doc) = send(&app, get("/docs/_doc/1")).await;
+    assert_eq!(doc["_source"]["env"], "prod", "{doc}");
+
+    // …and a live re-PUT of the same thing is still refused, so the door is
+    // narrow and the repair path still answers.
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/legacy",
+            json!({ "processors": [
+                { "set": { "field": "env", "value": "prod", "ignore_failure": true } }
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(&app, put("/docs/_doc/2?pipeline=legacy", json!({ "a": 1 }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `GET /_ingest/pipeline/{id}` speaks Elasticsearch.
+//
+// `_simulate` was taught the ES vocabulary in this branch; GET was not, so it
+// handed back xerj's internal `stages` shape. That is what an operator edits
+// and PUTs back, which is precisely how the restart hole above is reached.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_ingest_pipeline_answers_in_elasticsearch_vocabulary() {
+    let (app, _dir) = app();
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/p_rename",
+            json!({ "description": "d",
+                    "processors": [{ "rename": { "field": "a", "target_field": "b" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, got) = send(&app, get("/_ingest/pipeline/p_rename")).await;
+    assert_eq!(got["p_rename"]["description"], "d", "{got}");
+    assert_eq!(
+        got["p_rename"]["processors"][0]["rename"]["field"], "a",
+        "GET must not leak the internal `stages` shape: {got}"
+    );
+    assert_eq!(
+        got["p_rename"]["processors"][0]["rename"]["target_field"], "b",
+        "{got}"
+    );
+    assert_eq!(
+        got["p_rename"].get("stages"),
+        None,
+        "…and must not carry both shapes: {got}"
+    );
+
+    // `GET /_ingest/pipeline` (all) answers the same way.
+    let (_, all) = send(&app, get("/_ingest/pipeline")).await;
+    assert_eq!(
+        all["p_rename"]["processors"][0]["rename"]["field"], "a",
+        "{all}"
+    );
+
+    // Round trip: what GET hands back must PUT back cleanly and still run.
+    let (status, body) = send(&app, put("/_ingest/pipeline/p2", got["p_rename"].clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &app,
+        put("/docs/_doc/1?pipeline=p2&refresh=true", json!({ "a": 1 })),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (_, doc) = send(&app, get("/docs/_doc/1")).await;
+    assert_eq!(doc["_source"]["b"], 1, "{doc}");
+    assert_eq!(doc.pointer("/_source/a"), None, "{doc}");
+}
+
+/// The ES→xerj `set` translation writes `override` into the stored config
+/// because Elasticsearch's default is `true` and xerj's native default is
+/// `false`. GET must therefore STATE it rather than echo a key the caller never
+/// wrote without explanation — and it must round-trip, so that editing the
+/// response and PUTting it back cannot silently flip the stage's behaviour.
+/// (The native-stage half of this — `override: false` — is unit-tested on
+/// `stage_to_es_processors` in `es_compat.rs`, since the native `PUT
+/// /v1/pipelines/{name}` lives on the other router.)
+#[tokio::test]
+async fn get_states_the_override_the_stage_actually_applies() {
+    let (app, _dir) = app();
+    send(
+        &app,
+        put(
+            "/_ingest/pipeline/es_set",
+            json!({ "processors": [{ "set": { "field": "e", "value": "prod" } }] }),
+        ),
+    )
+    .await;
+    let (_, got) = send(&app, get("/_ingest/pipeline/es_set")).await;
+    assert_eq!(
+        got["es_set"]["processors"][0]["set"]["override"], true,
+        "an ES `set` overrides, and GET says so: {got}"
+    );
+
+    // An explicit `override: false` survives the round trip and still
+    // preserves the existing value.
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/keeper",
+            json!({ "processors": [
+                { "set": { "field": "e", "value": "prod", "override": false } }
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got) = send(&app, get("/_ingest/pipeline/keeper")).await;
+    assert_eq!(
+        got["keeper"]["processors"][0]["set"]["override"], false,
+        "{got}"
+    );
+    let (status, body) = send(
+        &app,
+        put("/_ingest/pipeline/keeper2", got["keeper"].clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &app,
+        put(
+            "/docs/_doc/1?pipeline=keeper2&refresh=true",
+            json!({ "e": "dev" }),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (_, doc) = send(&app, get("/docs/_doc/1")).await;
+    assert_eq!(
+        doc["_source"]["e"], "dev",
+        "a re-PUT of GET's own output must not start overwriting: {doc}"
+    );
 }

@@ -24528,6 +24528,25 @@ fn stage_to_es_processors(stage: &Value) -> Vec<Value> {
                 })
                 .collect()
         }
+        "set" => {
+            // `override` is the one key whose DEFAULT differs between the two
+            // vocabularies: Elasticsearch's `set` defaults it to `true`, xerj's
+            // native `set` stage to `false` (see `put_ingest_pipeline`, which
+            // is why the translation writes it in). Rendering a stored stage
+            // without it would therefore be a lie in one direction or the
+            // other — for a native stage a bare ES `set` claims it overwrites,
+            // when it preserves. State it instead, always, with the value the
+            // stage actually applies.
+            let mut c = cfg.clone();
+            if let Some(map) = c.as_object_mut() {
+                let effective = map
+                    .get("override")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                map.insert("override".to_string(), Value::Bool(effective));
+            }
+            vec![wrap(c)]
+        }
         _ => vec![wrap(cfg)],
     }
 }
@@ -24535,6 +24554,135 @@ fn stage_to_es_processors(stage: &Value) -> Vec<Value> {
 /// Every stage of a stored pipeline, in ES processor shape.
 fn stages_to_es_processors(stages: &[Value]) -> Vec<Value> {
     stages.iter().flat_map(stage_to_es_processors).collect()
+}
+
+/// A stored pipeline definition as `GET /_ingest/pipeline` must answer it.
+///
+/// Two shapes reach `engine.pipelines`: the translated xerj `stages` body
+/// (everything that compiles) and the raw Elasticsearch body (kept verbatim
+/// for a definition this build stores but cannot run). Only the second was
+/// ever ES-shaped, so GET spoke xerj's internal vocabulary for every pipeline
+/// that worked — and that output is what an operator edits and PUTs back, which
+/// is how a `stages`-shaped body reached `put_ingest_pipeline`'s pass-through
+/// branch in the first place. `_simulate` was taught this inverse in this same
+/// sweep ([`stages_to_es_processors`]); GET was not.
+///
+/// A body that is already ES-shaped is returned untouched.
+fn stored_pipeline_as_es(doc: &Value) -> Value {
+    let Some(stages) = doc.get("stages").and_then(Value::as_array) else {
+        return doc.clone();
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = doc.as_object() {
+        for (k, v) in obj {
+            if k != "stages" {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out.insert(
+        "processors".to_string(),
+        Value::Array(stages_to_es_processors(stages)),
+    );
+    Value::Object(out)
+}
+
+#[cfg(test)]
+mod stored_pipeline_rendering_tests {
+    use super::*;
+
+    /// `GET /_ingest/pipeline/{id}` leaked xerj's internal `stages` vocabulary
+    /// for every pipeline that compiled. Measured before this fix:
+    /// `{"p":{"description":"d","stages":[{"type":"field_rename","config":
+    /// {"mappings":{"a":"b"}}}]}}`.
+    #[test]
+    fn a_stages_body_renders_as_elasticsearch_processors() {
+        let stored = json!({
+            "description": "d",
+            "stages": [{ "type": "field_rename", "config": { "mappings": { "a": "b" } } }]
+        });
+        let es = stored_pipeline_as_es(&stored);
+        assert_eq!(es["description"], "d");
+        assert_eq!(es["processors"][0]["rename"]["field"], "a", "{es}");
+        assert_eq!(es["processors"][0]["rename"]["target_field"], "b", "{es}");
+        assert_eq!(es.get("stages"), None, "{es}");
+    }
+
+    /// The raw Elasticsearch body kept for a definition this build stores but
+    /// cannot run is already ES-shaped and must not be touched.
+    #[test]
+    fn an_elasticsearch_body_is_returned_verbatim() {
+        let stored = json!({
+            "processors": [{ "grok": { "field": "m", "patterns": ["%{IP:c}"] } }]
+        });
+        assert_eq!(stored_pipeline_as_es(&stored), stored);
+    }
+
+    /// A NATIVE `set` stage preserves an existing value; a bare Elasticsearch
+    /// `set` claims the opposite, because ES defaults `override` to `true`.
+    /// Rendering must state the value the stage actually applies, in both
+    /// directions.
+    #[test]
+    fn set_renders_the_override_it_actually_applies() {
+        let native = json!({ "stages": [
+            { "type": "set", "config": { "field": "e", "value": "prod" } }
+        ] });
+        assert_eq!(
+            stored_pipeline_as_es(&native)["processors"][0]["set"]["override"],
+            false,
+            "a native `set` does not override"
+        );
+
+        let translated = json!({ "stages": [
+            { "type": "set", "config": { "field": "e", "value": "prod", "override": true } }
+        ] });
+        assert_eq!(
+            stored_pipeline_as_es(&translated)["processors"][0]["set"]["override"],
+            true,
+            "an Elasticsearch `set` does"
+        );
+
+        let explicit_false = json!({ "stages": [
+            { "type": "set", "config": { "field": "e", "value": "prod", "override": false } }
+        ] });
+        assert_eq!(
+            stored_pipeline_as_es(&explicit_false)["processors"][0]["set"]["override"],
+            false,
+            "an explicit `false` is carried through"
+        );
+    }
+
+    /// `_simulate` interpreted `set` as an unconditional overwrite, so it
+    /// reported a document the ingest path would never produce for a stage
+    /// that preserves. Now that GET states `override`, that disagreement is
+    /// reachable by copy-paste.
+    #[test]
+    fn simulate_honours_the_set_override_flag() {
+        let mut doc = json!({ "e": "dev" });
+        apply_single_processor(
+            "set",
+            &json!({ "field": "e", "value": "prod", "override": false }),
+            &mut doc,
+        )
+        .expect("set applies");
+        assert_eq!(doc["e"], "dev", "override:false preserves: {doc}");
+
+        let mut doc = json!({ "e": "dev" });
+        apply_single_processor("set", &json!({ "field": "e", "value": "prod" }), &mut doc)
+            .expect("set applies");
+        assert_eq!(doc["e"], "prod", "the ES default still overwrites: {doc}");
+
+        // A missing field is set even with `override: false` — ES only
+        // declines to REPLACE an existing non-null value.
+        let mut doc = json!({ "other": 1 });
+        apply_single_processor(
+            "set",
+            &json!({ "field": "e", "value": "prod", "override": false }),
+            &mut doc,
+        )
+        .expect("set applies");
+        assert_eq!(doc["e"], "prod", "{doc}");
+    }
 }
 
 pub async fn put_ingest_pipeline(
@@ -24801,13 +24949,13 @@ pub async fn get_ingest_pipeline(
     if id == "*" || id == "_all" {
         let mut result = serde_json::Map::new();
         for entry in state.engine.pipelines.iter() {
-            result.insert(entry.key().clone(), entry.value().clone());
+            result.insert(entry.key().clone(), stored_pipeline_as_es(entry.value()));
         }
         return Json(Value::Object(result)).into_response();
     }
     match state.engine.pipelines.get(&id) {
         Some(pipeline) => {
-            let result = json!({ id.clone(): pipeline.clone() });
+            let result = json!({ id.clone(): stored_pipeline_as_es(pipeline.value()) });
             Json(result).into_response()
         }
         None => {
@@ -24857,7 +25005,7 @@ pub struct SimulatePipelineParams {
 pub async fn get_all_ingest_pipelines(State(state): State<AppState>) -> impl IntoResponse {
     let mut out = serde_json::Map::new();
     for entry in state.engine.pipelines.iter() {
-        out.insert(entry.key().clone(), entry.value().clone());
+        out.insert(entry.key().clone(), stored_pipeline_as_es(entry.value()));
     }
     Json(Value::Object(out)).into_response()
 }
@@ -25683,6 +25831,19 @@ fn apply_single_processor(name: &str, cfg: &Value, source: &mut Value) -> Result
                 .ok_or_else(|| "set processor: 'field' required".to_string())?
                 .to_string();
             let value = cfg.get("value").cloned().unwrap_or(Value::Null);
+            // `override` is Elasticsearch's own key on `set`, defaulting to
+            // `true`. The interpreter used to overwrite unconditionally, so a
+            // `_simulate` of a stored pipeline that PRESERVES an existing value
+            // reported a document the ingest path would never produce — the
+            // same class of quiet disagreement issue #204 is about, and now
+            // reachable from GET, which states `override` explicitly.
+            let overrides = cfg.get("override").and_then(Value::as_bool).unwrap_or(true);
+            if !overrides
+                && get_dotted_path_mut(source_obj, &field)
+                    .is_some_and(|existing| !existing.is_null())
+            {
+                return Ok(());
+            }
             set_dotted_path(source_obj, &field, value);
             Ok(())
         }

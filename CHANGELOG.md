@@ -92,19 +92,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `400` for any pipeline using an ES processor or option this build does
   not implement. Read that entry for the full list.
 
-  **What is NOT broken, deliberately.** A definition already in
-  `cluster_state.json` was accepted by whichever build wrote it, and there is
-  no caller left to answer `400` at boot. Boot replay therefore compiles in a
-  compatibility mode that reproduces the *previously shipped* behaviour for
-  every check this sweep added (unknown `grok` pattern name, unknown `convert`
-  target, a bare string where an array is required, `set.copy_from`, a
-  processor-level `if`/`on_failure`/`ignore_failure`), so **an upgrade alone
-  never turns a running cluster's writes from `201` into `400`**. Each one is
-  logged at ERROR naming the pipeline and the offending config, and recorded in
-  `Engine::degraded_pipelines`; a re-`PUT` of the same definition answers `400`
-  with the same reason, which is the repair path. A definition that did not
-  compile before the upgrade either (unknown stage type, missing required
-  field) still fails at boot and is recorded unrunnable, as before.
+  **What is NOT broken, deliberately.** A definition persisted by a build with
+  **no gate** was accepted by whichever build wrote it, and there is no caller
+  left to answer `400` at boot. Boot replay therefore compiles *those*
+  definitions in a compatibility mode that reproduces the previously shipped
+  behaviour for every check this sweep added (unknown `grok` pattern name,
+  unknown `convert` target, a bare string where an array is required,
+  `set.copy_from`, a processor-level `if`/`on_failure`/`ignore_failure`), so
+  **an upgrade alone never turns a running cluster's writes from `201` into
+  `400`**. Each one is logged at ERROR naming the pipeline and the offending
+  config, and recorded in `Engine::degraded_pipelines`; a re-`PUT` of the same
+  definition answers `400` with the same reason, which is the repair path. A
+  definition that did not compile before the upgrade either (unknown stage
+  type, missing required field) still fails at boot and is recorded unrunnable,
+  as before.
+
+  **Which definitions those are is decided by provenance, not by the calendar.**
+  A definition THIS build refused at `PUT` time is recorded in
+  `<data_dir>/ingest-pipeline-refusals.json` and replayed at *definition*
+  strictness, so the refusal survives a restart. Without that marker the replay
+  could not tell "written by an older, laxer build" from "written by this build
+  and answered `400`", and a plain restart overturned the answer the operator
+  had already been given: measured, `PUT` a `{"remove": {"field": "secret"}}`
+  pipeline, add an `if` guard to it (refused — every write `400`s), restart the
+  node and nothing else, and the identical write answered `201` with `secret`
+  dropped from a document the guard EXCLUDES. It covered every check the sweep
+  added; only an unimplemented *stage* survived a restart, because the raw ES
+  body it stores does not deserialise. This is the same pattern as an index's
+  `<index>/analysis-binding.json`: the marker's ABSENCE is the load-bearing
+  signal.
+
+  The marker is provenance, not a tombstone. A marked definition that compiles
+  cleanly on the new build — because that build implements what the refusing
+  one could not — clears its own marker at boot and runs, with an INFO line; a
+  successful re-`PUT` or a `DELETE` clears it too. If the file exists but
+  cannot be read or parsed, no pipeline's provenance is known, so **every**
+  persisted pipeline is replayed at definition strictness and any that fails is
+  recorded unrunnable with the file named in the reason — fail closed and
+  loudly, rather than silently reopening the hole. An older binary reading a
+  data dir written by this one simply ignores the file; it is a sidecar
+  precisely because `cluster_state.json`'s format-1 envelope is
+  `deny_unknown_fields` and widening it would break downgrades.
 
   The same rule applies one level up. Teaching the analysis resolver the
   canonical `settings.index.analysis` nesting (see the analysis entry above) is
@@ -196,6 +224,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rename`. The stages→processors conversion now inverts both halves of the
   translation, name and config.
 
+- **`GET /_ingest/pipeline[/{id}]` answers in Elasticsearch's `processors`
+  vocabulary instead of XERJ's internal `stages` shape**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)). Two shapes reach the
+  store: the translated `stages` body (everything that compiles) and the raw ES
+  body (kept verbatim for a definition XERJ stores but cannot run). Only the
+  second was ever ES-shaped, so `GET` spoke XERJ's vocabulary for every pipeline
+  that *worked* — measured before this release, an ES `rename` pipeline came
+  back as
+  `{"p":{"description":"d","stages":[{"type":"field_rename","config":{"mappings":{"a":"b"}}}]}}`.
+  This is a wire-visible change on both `GET /_ingest/pipeline/{id}` and
+  `GET /_ingest/pipeline`. It also mattered beyond cosmetics: `GET`'s output is
+  what an operator edits and `PUT`s back, and a `stages`-shaped body takes the
+  handler's pass-through branch — which is exactly how the restart hole
+  described under *Changed* was reached in ordinary use.
+
+  `set` is rendered with an explicit `"override"`, always, because it is the one
+  key whose default differs between the two vocabularies (Elasticsearch `true`,
+  XERJ's native `set` stage `false`). Emitting a bare ES `set` for a native
+  stage would claim it overwrites when it preserves. A pipeline created through
+  `PUT /_ingest/pipeline` therefore shows `"override": true` even when the
+  caller omitted it — that is the value XERJ applies, and it round-trips: PUTting
+  `GET`'s own output back cannot silently flip the stage's behaviour. Relatedly,
+  `_simulate`'s `set` interpreter honoured no `override` at all and always
+  overwrote, so it reported a document the ingest path would never produce; it
+  now applies Elasticsearch's rule (default `true`; `false` leaves an existing
+  non-null value alone).
+
+- **Three wire-visible refusals that were fixed in this sweep but not written
+  down** ([#204](https://github.com/xerj-org/xerj/issues/204)). All three
+  replace a silent fallback with an error, which is the point of the issue, but
+  each changes a status code:
+  `POST /v1/admin/backup` answers `400` on a request body that is present but
+  unparseable, where it previously ran a *default* backup under a success
+  response; `GET /{index}/_stats` and `GET /_all/_stats` carry an added
+  non-Elasticsearch key `primaries.mappings.schema_persist_failures` inside an
+  otherwise ES-shaped response; and the authorization layer's response pruning
+  answers `500` when it cannot parse the body it was asked to filter, instead
+  of falling back to the unfiltered bytes.
+
   **The refusal now covers every ingest path, not only `PUT /{index}/_doc`.**
   `POST /_bulk?pipeline=`, `index.default_pipeline` under `_bulk`,
   `_reindex` `dest.pipeline` and `POST /{index}/_update_by_query?pipeline=`
@@ -213,24 +280,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_bulk` item no longer reports `"result": "deleted"` alongside its own
   `status: 400`, which claimed a deletion that never happened.
 
+  **`ignore_missing: false` is refused on purpose, and it is not the same call
+  as `ignore_failure: false`.** Both are Elasticsearch defaults that ES clients
+  emit verbatim, so the difference is worth stating plainly: the rule is *accept
+  the value this build actually implements*, and the two land on opposite sides
+  of it. `ignore_failure: false` means "a failing processor is not ignored",
+  which is exactly what XERJ does, so it is accepted. `ignore_missing: false`
+  means "FAIL the document when the field is absent", which XERJ cannot do at
+  all — `ProcessAction` has no error variant, and every field-reading stage
+  passes the document through untouched. Accepting it would be precisely the
+  silent lie this issue exists to remove, so it is refused: a `remove` /
+  `rename` / `convert` / `date` processor that spells out `ignore_missing:
+  false` registers and then `400`s every write through it. **Omitting the key
+  is accepted** and behaves as `true`. That asymmetry — omission accepted,
+  the ES default written out refused — is deliberate but is a hard `400` for
+  ES-generated pipelines; strip the key, or set it to `true`, to state what
+  XERJ will actually do. `ignore_empty_value` is the mirror image: omitting it
+  or writing `false` is honoured exactly, `true` is refused.
+
   **Known gaps, stated rather than closed:** `_simulate` interprets the stored
   ES body directly and covers processors the compiled path does not, so a
   pipeline recorded as unrunnable can still show a transformation under
   `_simulate` that ingest refuses to perform; `GET /_ingest/pipeline/{id}`
-  returns the stored definition (the ES body for an unrunnable pipeline, the
-  compiled shape otherwise) with no runnability signal, so an operator only
-  learns at write time; a write addressed to an **alias** does not pick up the
+  carries no runnability signal — it renders the stored definition in ES
+  vocabulary whether or not this build can run it, so an operator only learns
+  at write time; a write addressed to an **alias** does not pick up the
   backing index's `default_pipeline`; `_update_by_query` reports a `drop`
   processor as a per-document failure, because it updates in place and has no
-  delete path; `Engine::degraded_pipelines` is in-memory only and has no HTTP
-  surface yet, so a boot-replay degradation is visible in the startup log and
-  nowhere else; and **an OMITTED `ignore_missing` still diverges from
-  Elasticsearch** — ES defaults it to `false` and fails the document when the
-  field is absent, while XERJ passes the document through unchanged, because a
-  stage cannot fail a document at all (`ProcessAction` has no error variant).
-  Writing `ignore_missing: false` explicitly is refused; omitting it is
-  accepted and behaves as `true`. `ignore_empty_value` is the mirror image:
-  omitting it or writing `false` is honoured exactly, `true` is refused.
+  delete path; and `Engine::degraded_pipelines` is in-memory only and has no
+  HTTP surface yet, so a boot-replay degradation is visible in the startup log
+  and nowhere else — unlike a definition-time refusal, which is now durable
+  (see *Changed*).
 
 ## [1.0.0-rc.16] - 2026-08-13
 
