@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 54 of XERJ's 105 user-facing settings to their
+# This file sets 54 of XERJ's 115 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -501,3 +501,56 @@ format = "text"
 # default `info` filter). Turn on for request-level observability without
 # dropping the global log filter down to debug.
 access_log = false
+
+# ── WAL tap: push a filtered subset of indices to an external target ──────────
+# (10 settings, issue #320)
+#
+# One-directional, single-node, near-real-time push of selected indices to any
+# ES-compatible cluster (Elasticsearch, OpenSearch, or another XERJ node). The
+# wire format is `_bulk`, so the target needs nothing installed. This is NOT
+# cross-cluster replication: nothing flows back, and there is no follower state
+# machine.
+#
+# Before turning it on, three behaviours you are agreeing to:
+#
+#  * No backfill. A new index (nothing pruned from its WAL yet) is shipped
+#    whole; an established one starts from the moment it is allowlisted. Seed
+#    the target with snapshot/restore first if it needs the existing documents.
+#  * At-least-once. Each action carries `version_type=external` with the WAL
+#    seq_no, so redelivery is a no-op on a target that honours it.
+#  * Retention never waits for the target. WAL generations are pruned once they
+#    are durable in a segment, whether or not the tap has shipped them — a slow
+#    remote must not be able to fill this node's disk. A tap that falls that far
+#    behind loses entries and reports `gaps` in GET /_xerj/wal_tap/_stats.
+#    `min_retained_generations` buys BOUNDED slack (a floor, not a lease): at
+#    the default 0, an outage longer than one flush interval loses data.
+#
+# System indices (every .xerj* name, not just .xerj-memory-*) are never
+# shipped, whatever `indices` says.
+#
+# `target_url` must NOT carry credentials (https://user:pass@host is refused at
+# startup): it is echoed by GET /_xerj/wal_tap, by _stats and in the log.
+# `target_auth` is the credential field and is write-only.
+#
+# Everything here is also settable at runtime, without a restart, via
+# PUT /_xerj/wal_tap — which persists the patch, so it survives a restart.
+# DELETE /_xerj/wal_tap drops the runtime overlay and reverts to this file.
+# All three endpoints are superuser-only.
+#
+# [wal_tap]
+# enabled                  = true                      # not a default (false)
+# target_url               = "https://central:9200"    # not a default ("")
+# target_auth              = "ApiKey abc123"           # not a default ("")
+# indices                  = ["edge-*", "metrics"]     # not a default ([])
+# poll_interval_ms         = 500                       # 50..=60000
+# max_batch_docs           = 1000                      # >= 1
+# max_batch_bytes          = 5242880                   # >= 1
+# request_timeout_secs     = 30                        # >= 1
+# max_retry_backoff_secs   = 60                        # 1..=86400 (one day)
+# min_retained_generations = 0                         # <= 64
+#
+# The ranges above are enforced at startup, not just by PUT /_xerj/wal_tap: an
+# out-of-range value here refuses the boot rather than becoming a disk-full
+# page later. `min_retained_generations` is capped at 64 because it holds that
+# many rotated WAL files per shard per index — up to n * storage.wal_max_size_mb
+# of disk each — whether or not a tap is running.

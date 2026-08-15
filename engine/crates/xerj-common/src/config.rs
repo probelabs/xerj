@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **105 settings** versus
+//! Configuration is intentionally minimal: **115 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -92,9 +92,12 @@ pub struct Config {
     pub compat: CompatConfig,
     /// ISM/ILM index-lifecycle-management background execution — 1 setting.
     pub lifecycle: LifecycleConfig,
+    /// Single-node WAL tap: push a filtered index subset to an external
+    /// ES-compatible target — 10 settings. Off by default.
+    pub wal_tap: WalTapConfig,
 }
 
-// 20 sub-configs, 105 leaf settings in total. Do not maintain that sum by hand
+// 21 sub-configs, 115 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -180,6 +183,28 @@ impl Config {
         // Merge: min_segments must be >= 2
         if self.merge.min_segments < 2 {
             return Err(XerjError::config("merge.min_segments must be >= 2"));
+        }
+
+        // WAL tap: the target URL is a credential boundary, not just a URL.
+        // Refusing it at boot is the only way a `user:pass@host` in the config
+        // file never reaches the log line or the two endpoints that echo it.
+        if let Err(reason) = WalTapConfig::check_target_url(&self.wal_tap.target_url) {
+            return Err(XerjError::config(reason));
+        }
+        // …and the numeric knobs, with the same bounds `PUT /_xerj/wal_tap`
+        // enforces. Without this the file was the way *around* the API's
+        // validation: `PUT {"min_retained_generations": 100}` is a `400`
+        // because the knob costs `n × storage.wal_max_size_mb` per WAL shard
+        // per index, but `xerj.toml` took it in silence and the node held 100
+        // rotated generations per shard forever. Same for
+        // `max_retry_backoff_secs`, where a value above `u64::MAX / 1000` used
+        // to reach an unchecked `* 1000` inside `WalTap::arm_backoff`.
+        //
+        // Same reasoning as `compression.block_size_docs` below: an
+        // out-of-range value is a typo the operator wants to hear about now,
+        // at boot, not as a disk-full page later.
+        if let Err(reason) = self.wal_tap.check_limits() {
+            return Err(XerjError::config(reason));
         }
 
         // Compression: block_size_docs is documented as 16–4096 and was
@@ -408,7 +433,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (105 user-facing settings total; counted by
+// Sub-configs  (115 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1737,6 +1762,234 @@ impl Default for LifecycleConfig {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Single-node WAL tap — push a filtered subset of indices to an external
+/// ES-compatible target (issue #320). **10 settings.**
+///
+/// This is deliberately *not* cross-cluster replication. It is one
+/// directional, single node, and target-agnostic because the wire format is
+/// just `_bulk`: an Elasticsearch cluster, an OpenSearch cluster, or another
+/// xerj node all work.
+///
+/// Semantics that matter before you turn it on:
+///
+/// - **No backfill.** An index whose WAL has never been pruned (a new one) is
+///   shipped whole. An index that has been running long enough to prune
+///   starts from the moment it is allowlisted: it ships what happens next,
+///   not what is already in segments. Use snapshot/restore to seed the target
+///   first if you need the existing data.
+/// - **At-least-once.** A batch is re-sent if the cursor could not be
+///   advanced, so the target may see a document twice. `doc_id` is the
+///   `_bulk` `_id` and each action carries `version_type: external` with the
+///   entry's `seq_no`, so a redelivery (and an out-of-order one) is a no-op
+///   on any target that honours external versioning.
+/// - **Retention never waits for the target.** WAL generations are pruned as
+///   soon as their entries are durable in a segment, whether or not the tap
+///   has shipped them — coupling the two would let a slow remote fill the
+///   local disk. A tap that falls that far behind loses entries and *says
+///   so*: `gaps` in `GET /_xerj/wal_tap/_stats`, plus a warning per gap.
+///   `min_retained_generations` buys a **bounded** amount of slack; it is a
+///   floor, not a lease, so a stalled target still cannot fill the disk.
+/// - **System indices are never shipped**, whatever the allowlist says.
+/// - **Runtime edits are durable.** `PUT /_xerj/wal_tap` persists the patched
+///   configuration next to the cursors and re-applies it over the file
+///   config on the next boot (`DELETE /_xerj/wal_tap` drops the overlay and
+///   reverts to this file). Otherwise a restart would silently revert to
+///   `enabled = false` while the cursors froze and WAL pruning continued.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WalTapConfig {
+    /// Master switch (default: `false` — off).
+    pub enabled: bool,
+    /// Base URL of the target cluster, e.g. `"https://central:9200"`. The
+    /// tap POSTs to `{target_url}/_bulk`. Empty disables the tap even when
+    /// `enabled = true`.
+    pub target_url: String,
+    /// Verbatim `Authorization` header value for the target, e.g.
+    /// `"ApiKey abc123"` or `"Basic dXNlcjpwdw=="`. Empty sends none.
+    /// Never echoed back by the REST surface.
+    pub target_auth: String,
+    /// Index allowlist. Glob patterns (`*` only, as in `_cat` expressions);
+    /// empty ships nothing. `["*"]` ships every non-system index.
+    pub indices: Vec<String>,
+    /// How often each index's WAL is polled, in milliseconds (default:
+    /// `500`). This is the floor on end-to-end latency.
+    pub poll_interval_ms: u64,
+    /// Maximum WAL entries in one `_bulk` request (default: `1000`).
+    pub max_batch_docs: usize,
+    /// Maximum `_bulk` body size in bytes (default: 5 MiB). A single
+    /// document larger than this is still sent, alone.
+    pub max_batch_bytes: usize,
+    /// Per-request timeout against the target, in seconds (default: `30`).
+    pub request_timeout_secs: u64,
+    /// Ceiling on the exponential retry backoff, in seconds (default: `60`).
+    pub max_retry_backoff_secs: u64,
+    /// Rotated WAL generations kept per shard **after** every entry in them
+    /// is durable in a segment, so a tap whose target is briefly unreachable
+    /// still finds them (default: `0` — prune as soon as it is safe, the
+    /// pre-#320 behaviour).
+    ///
+    /// The default loses data on an outage longer than one flush interval
+    /// (`storage.flush_interval_secs`, 30 s): the entries are gone from the
+    /// WAL and the tap reports `gaps`. Set this to cover the outage you want
+    /// to survive — `2` buys roughly two flush windows.
+    ///
+    /// The cost is bounded and paid whether or not a tap is running: at most
+    /// `n * storage.wal_max_size_mb` extra megabytes per WAL shard per index.
+    /// It is deliberately **not** an Elasticsearch-style retention lease,
+    /// which holds generations for as long as a follower is behind and is how
+    /// a dead follower wedges a leader's disk.
+    ///
+    /// Unlike every other field here, this one does not live in the tap: it
+    /// lives in each index's `WalWriter`. `PUT /_xerj/wal_tap` therefore
+    /// pushes it onto the open writers itself
+    /// (`Engine::apply_wal_retention_floor`) and reports how many it reached,
+    /// rather than acknowledging a value that reaches nothing.
+    pub min_retained_generations: u64,
+}
+
+impl Default for WalTapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_url: String::new(),
+            target_auth: String::new(),
+            indices: Vec::new(),
+            poll_interval_ms: 500,
+            max_batch_docs: 1000,
+            max_batch_bytes: 5 * 1024 * 1024,
+            request_timeout_secs: 30,
+            max_retry_backoff_secs: 60,
+            min_retained_generations: 0,
+        }
+    }
+}
+
+impl WalTapConfig {
+    /// Largest `min_retained_generations` this node accepts.
+    ///
+    /// The knob costs `n × storage.wal_max_size_mb` of disk per WAL shard per
+    /// index whether or not a tap is running, so an operator who types an
+    /// extra digit must not be able to fill the disk quietly.
+    pub const MAX_RETAINED_GENERATIONS: u64 = 64;
+    /// Accepted range for `poll_interval_ms`.
+    pub const POLL_INTERVAL_MS_RANGE: std::ops::RangeInclusive<u64> = 50..=60_000;
+    /// Accepted range for `max_retry_backoff_secs` — one day is already far
+    /// past any recovery window a `_bulk` target has, and the upper bound also
+    /// keeps `secs × 1000` nowhere near `u64::MAX`.
+    pub const MAX_RETRY_BACKOFF_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=86_400;
+
+    /// Range-check every numeric knob, returning the operator message.
+    ///
+    /// Shared by `Config::validate` (the config file, at boot) and
+    /// `PUT /_xerj/wal_tap` (the API), so the file cannot be used to get a
+    /// value past the bound the API enforces.
+    pub fn check_limits(&self) -> Result<(), String> {
+        if !Self::POLL_INTERVAL_MS_RANGE.contains(&self.poll_interval_ms) {
+            return Err(format!(
+                "wal_tap.poll_interval_ms must be between {} and {}, got {}",
+                Self::POLL_INTERVAL_MS_RANGE.start(),
+                Self::POLL_INTERVAL_MS_RANGE.end(),
+                self.poll_interval_ms
+            ));
+        }
+        if !Self::MAX_RETRY_BACKOFF_SECS_RANGE.contains(&self.max_retry_backoff_secs) {
+            return Err(format!(
+                "wal_tap.max_retry_backoff_secs must be between {} and {} (one day), got {}",
+                Self::MAX_RETRY_BACKOFF_SECS_RANGE.start(),
+                Self::MAX_RETRY_BACKOFF_SECS_RANGE.end(),
+                self.max_retry_backoff_secs
+            ));
+        }
+        if self.min_retained_generations > Self::MAX_RETAINED_GENERATIONS {
+            return Err(format!(
+                "wal_tap.min_retained_generations must be at most {}: it holds that many \
+                 rotated WAL files per shard per index, costing up to \
+                 n * storage.wal_max_size_mb of disk each. Got {}",
+                Self::MAX_RETAINED_GENERATIONS,
+                self.min_retained_generations
+            ));
+        }
+        if self.max_batch_docs == 0 {
+            return Err("wal_tap.max_batch_docs must be at least 1".into());
+        }
+        if self.max_batch_bytes == 0 {
+            return Err("wal_tap.max_batch_bytes must be at least 1".into());
+        }
+        if self.request_timeout_secs == 0 {
+            return Err("wal_tap.request_timeout_secs must be at least 1".into());
+        }
+        Ok(())
+    }
+
+    /// Reject a `target_url` this node must not accept, returning the operator
+    /// message for a `400`.
+    ///
+    /// Two rules, and the second one is a credential boundary:
+    ///
+    /// 1. It has to be an absolute `http://` / `https://` URL, because the tap
+    ///    POSTs `{target_url}/_bulk` and a relative one silently targets
+    ///    nothing.
+    /// 2. **No userinfo.** `https://user:pass@host` is an ordinary URL and
+    ///    `reqwest` turns its userinfo into a `Basic` `Authorization` header —
+    ///    so it is `target_auth` wearing a disguise. `target_auth` is
+    ///    write-only precisely so that "can call the admin API" never becomes
+    ///    "holds the target's credential", and `target_url` is echoed by
+    ///    `GET /_xerj/wal_tap`, by `_stats`, and by the boot log. Accepting
+    ///    userinfo would defeat that in one line of config.
+    pub fn check_target_url(url: &str) -> Result<(), String> {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let Some(rest) = trimmed
+            .strip_prefix("http://")
+            .or_else(|| trimmed.strip_prefix("https://"))
+        else {
+            return Err(
+                "wal_tap.target_url must be an absolute http:// or https:// URL, e.g. \
+                 \"https://central:9200\""
+                    .to_string(),
+            );
+        };
+        // Userinfo is everything before the first `@` of the authority, which
+        // ends at the first `/`, `?` or `#`.
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        if authority.contains('@') {
+            return Err("wal_tap.target_url must not carry credentials in the URL \
+                 (user:password@host): target_url is echoed by GET /_xerj/wal_tap, by \
+                 /_xerj/wal_tap/_stats and in the server log. Put the credential in \
+                 wal_tap.target_auth, which is write-only."
+                .to_string());
+        }
+        Ok(())
+    }
+
+    /// `target_url` as it is safe to show: any userinfo replaced by `***`.
+    ///
+    /// [`check_target_url`](Self::check_target_url) refuses userinfo on the way
+    /// in, so this only fires for a URL that reached the process another way —
+    /// an older state file, or a hand-edited config on a node whose operator
+    /// skipped validation. Belt and braces on a credential is cheap.
+    pub fn redacted_target_url(&self) -> String {
+        redact_url_userinfo(&self.target_url)
+    }
+}
+
+/// Replace `scheme://user:pass@host/…` with `scheme://***@host/…`.
+pub fn redact_url_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://***@{host}{tail}"),
+        None => url.to_string(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Scroll + async-search context lifecycle settings (RC4 blocker 11).
 ///
 /// **7 settings.**
@@ -1802,6 +2055,63 @@ mod tests {
         Config::default()
             .validate()
             .expect("default config should be valid");
+    }
+
+    /// #320 — the config file must not be the way around the bounds
+    /// `PUT /_xerj/wal_tap` enforces.
+    ///
+    /// `min_retained_generations` is refused above 64 by the API because the
+    /// knob costs `n × storage.wal_max_size_mb` per WAL shard per index
+    /// whether or not a tap is running; `xerj.toml` took any `u64` in silence
+    /// and the node then held that many rotated generations per shard forever.
+    /// `max_retry_backoff_secs` is the same shape and worse: values above
+    /// `u64::MAX / 1000` used to reach an unchecked `* 1000` inside
+    /// `WalTap::arm_backoff`.
+    ///
+    /// Same precedent as `compression.block_size_docs` (#318): an
+    /// out-of-range value is a typo the operator wants to hear about at boot,
+    /// not as a disk-full page later.
+    #[test]
+    fn wal_tap_numeric_knobs_are_range_checked_in_the_config_file_too() {
+        let bad = [
+            ("min_retained_generations = 100", "min_retained_generations"),
+            ("max_retry_backoff_secs = 0", "max_retry_backoff_secs"),
+            (
+                "max_retry_backoff_secs = 18446744073709552",
+                "max_retry_backoff_secs",
+            ),
+            ("poll_interval_ms = 10", "poll_interval_ms"),
+            ("poll_interval_ms = 60001", "poll_interval_ms"),
+            ("max_batch_docs = 0", "max_batch_docs"),
+            ("max_batch_bytes = 0", "max_batch_bytes"),
+            ("request_timeout_secs = 0", "request_timeout_secs"),
+        ];
+        for (line, field) in bad {
+            // `from_toml_str` validates, so a bad file is refused at load —
+            // the node never boots with it.
+            let toml = format!("[wal_tap]\n{line}\n");
+            let err = Config::from_toml_str(&toml)
+                .err()
+                .unwrap_or_else(|| panic!("[wal_tap] {line} must be refused at boot"));
+            assert!(
+                err.to_string().contains(field),
+                "the error must name the field the operator typed ({field}): {err}"
+            );
+        }
+
+        // The bounds themselves are accepted, so this is a range check and not
+        // an accidental ban.
+        for line in [
+            "min_retained_generations = 64",
+            "max_retry_backoff_secs = 86400",
+            "max_retry_backoff_secs = 1",
+            "poll_interval_ms = 50",
+            "poll_interval_ms = 60000",
+        ] {
+            let toml = format!("[wal_tap]\n{line}\n");
+            Config::from_toml_str(&toml)
+                .unwrap_or_else(|e| panic!("[wal_tap] {line} is in range but was refused: {e}"));
+        }
     }
 
     #[test]
@@ -1992,7 +2302,7 @@ mod tests {
             drift.join("\n  ")
         );
 
-        // …and the file's own header quotes how many of the 105 it sets. That
+        // …and the file's own header quotes how many of the 115 it sets. That
         // number was 38, then 56, and never once the truth (#207), so count the
         // assignments instead of trusting the sentence.
         let set_here = toml_src
@@ -2445,6 +2755,7 @@ mod tests {
         ("logging", 2),
         ("compat", 2),
         ("lifecycle", 1),
+        ("wal_tap", 10),
     ];
 
     /// Count the settings by *counting them*.
@@ -2487,7 +2798,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 105,
+            total, 115,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \
