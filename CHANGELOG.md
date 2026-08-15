@@ -16,21 +16,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole-index — was the only export path. A XERJ node used as a lightweight edge
   collector had no way to stream a curated slice of its data up to a central
   cluster.
-  - New `[wal_tap]` config section (9 settings, off by default) and a runtime
-    REST surface: `GET`/`PUT /_xerj/wal_tap` and `GET /_xerj/wal_tap/_stats`.
-    The allowlist is glob-based and adjustable without a restart.
+  - New `[wal_tap]` config section (10 settings, off by default) and a runtime
+    REST surface: `GET`/`PUT`/`DELETE /_xerj/wal_tap` and
+    `GET /_xerj/wal_tap/_stats`. The allowlist is glob-based and adjustable
+    without a restart. That brings the documented config surface to
+    **115 settings** (counted by `journey_zero_config`, not by hand).
+  - **Every `/_xerj/*` route is superuser-only.** `PUT /_xerj/wal_tap` is a
+    whole-node export primitive — `target_url` names any host, `indices: ["*"]`
+    names every index, and the tap attaches an operator-supplied
+    `Authorization` header — so it is data exfiltration and authenticated SSRF
+    in one call. Same reasoning `authz.rs` already applies to snapshot and
+    restore: nothing here is index-scoped, so there is no per-index decision to
+    make. The reads are covered too — `GET /_xerj/wal_tap` echoes `target_url`
+    and `_stats` enumerates the node's whole index inventory.
+  - **`target_url` may not carry credentials.** `https://user:pass@host` is an
+    ordinary URL that `reqwest` turns into a `Basic Authorization` header — i.e.
+    `target_auth` by another spelling, in the one field the API echoes back and
+    the boot log prints. It is refused at startup and by `PUT`, and redacted
+    everywhere it is rendered.
   - The wire format is `_bulk` and nothing else, so the target can be
     Elasticsearch, OpenSearch, or another XERJ node with nothing installed.
   - **This is not CCR.** It is one-directional, single-node, and independent of
     the post-GA sharding/replication track. `_ccr/*` still answers `501`.
   - The tap adds nothing to the write path: it tails WAL files from disk on a
-    timer and takes no lock the writer wants.
+    timer and takes no lock the writer wants. A poll costs the bytes appended
+    since the last one, not the size of the file — the tail reader is a sliding
+    window over a `File`, shaped after Lucene's `BufferedIndexInput.refill`
+    (`lucene/core/src/java/org/apache/lucene/store/BufferedIndexInput.java:289-317`,
+    Apache-2.0). A caught-up poll reads the 16-byte WAL header and stops.
   - Delivery is at-least-once, with `version_type: external` carrying the WAL
     `seq_no` on every action so a redelivery converges on the same document the
-    source holds.
+    source holds. Note that XERJ's own `_bulk` ignores per-action `version` /
+    `version_type` (only the single-doc path honours them), so a XERJ target
+    degrades to last-write-wins by arrival; against Elasticsearch or OpenSearch
+    the mechanism is live.
+  - `_stats` counts what the **target accepted**, per item, not what was
+    rendered into the request. `lag_seq` is derived from the highest accepted
+    `seq_no`, and each index carries a `healthy` boolean that is false both when
+    sends are failing and when the target answers `200` while rejecting every
+    action inside it as a version conflict.
+  - Cursor state is flushed once per poll cycle rather than once per index per
+    poll; a deferred flush can only cause a redelivery, which the external
+    versioning above absorbs.
+  - Deleting an index drops its cursor at the moment of deletion, so a
+    `DELETE` + `PUT` of the same name inside one poll interval — never observed
+    as an absence at a 500 ms default — cannot leave a byte offset pointing into
+    a WAL stream that no longer exists. For a delete that happened while the
+    node was down, the reader treats a cursor offset past the end of its
+    generation as the discontinuity it is (WAL files are append-only) and
+    restarts the stream with a reported gap instead of clamping to EOF.
   - WAL retention is deliberately *not* coupled to the tap — a slow remote must
     not be able to fill the local disk. A tap that falls far enough behind loses
-    entries and says so: `gaps` in `_stats`, plus a warning per occurrence.
+    entries and says so: `gaps` in `_stats`, plus a warning per occurrence. New
+    `wal_tap.min_retained_generations` (default `0`, unchanged behaviour) buys
+    **bounded** slack: it is a floor, not an Elasticsearch-style retention
+    lease, so it holds at most `n × storage.wal_max_size_mb` per WAL shard
+    however far behind any consumer is.
+  - A configuration set through `PUT /_xerj/wal_tap` is persisted next to the
+    cursors and re-applied over the config file on the next boot, so "runtime
+    config, no restart" does not quietly mean "and gone after one".
+    `DELETE /_xerj/wal_tap` drops the overlay and reverts to the file. The state
+    file holds `target_auth`, so it is written `0600` through the same writer
+    the API-key store uses.
   - XERJ's own `.xerj*` system indices are never shipped, whatever the allowlist
     says, and a wildcard never expands to a hidden index.
   - There is no backfill. A new index is shipped whole; an established one ships

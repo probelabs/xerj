@@ -9,6 +9,20 @@
 # engine/crates/xerj-engine/tests/wal_tap_push.rs (push semantics). This script
 # is the one that proves the whole path over real HTTP.
 #
+# WHAT THIS SCRIPT DOES NOT PROVE: convergence under redelivery.
+# The tap's at-least-once story rests on `version_type: external` — a
+# redelivered action must be a no-op at the target. xerj's own `_bulk` IGNORES
+# per-action `version` / `version_type` (only the single-doc path honours them,
+# es_compat.rs:2990), so a xerj target is precisely the target that does not
+# implement the mechanism, and running two xerj nodes cannot exercise it.
+# That claim is covered instead by
+# `redelivery_converges_at_a_target_that_honours_external_versioning` and
+# `a_target_that_rejects_every_action_is_reported_unhealthy_with_real_lag` in
+# wal_tap_push.rs, against a stub that implements the ES rule. Against an
+# Elasticsearch or OpenSearch target the mechanism is live; against a xerj
+# target the tap degrades to last-write-wins by arrival, as
+# `xerj-engine/src/wal_tap.rs` documents.
+#
 #   cargo build --release -p xerj-server
 #   scripts/verify-wal-tap.sh engine/target/release/xerj
 set -uo pipefail

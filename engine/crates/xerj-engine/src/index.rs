@@ -28174,6 +28174,14 @@ fn store_config_from(config: &Config, wal_shards_override: Option<usize>) -> Ind
         schema_version: 1,
         storage_mode: xerj_storage::StorageMode::Local,
         num_wal_shards: wal_shards_override.unwrap_or(config.engine.ingest_shards),
+        // #320 — the retention floor a WAL consumer needs. Read here, from
+        // the boot config, because it is consumed once when a `WalWriter` is
+        // opened; a runtime `PUT /_xerj/wal_tap` that changes it therefore
+        // applies to stores opened after the change (and to every store after
+        // a restart, which the persisted runtime config now survives). The
+        // `PUT` handler says so in its response rather than leaving it to be
+        // discovered.
+        wal_min_retained_generations: config.wal_tap.min_retained_generations,
     }
 }
 

@@ -16,6 +16,17 @@
 //! does not depend on the post-GA multi-node track. `_ccr/*` still answers
 //! `501`, honestly, because none of that exists.
 //!
+//! ## Who may call it
+//!
+//! Every `/_xerj/*` route is **superuser-only**, enforced in
+//! [`crate::authz`](../../xerj_api/authz/index.html) on the first path
+//! segment. `PUT /_xerj/wal_tap` names an arbitrary host in `target_url` and
+//! an arbitrary index set in `indices`, and attaches an operator-supplied
+//! `Authorization` header to what it sends — a whole-node export channel and
+//! an authenticated SSRF in one request. Nothing here is index-scoped, so
+//! there is no per-index decision to make, which is the same argument that
+//! already makes snapshot and restore superuser-only.
+//!
 //! ## The four decisions
 //!
 //! **1. Where it hooks.** Nowhere on the write path. The tap reads WAL files
@@ -25,6 +36,13 @@
 //! (`WalWriter::write_one_frame_inner`), so a reader in the same process sees
 //! whole frames the moment they are acked. The price is that end-to-end
 //! latency has `poll_interval_ms` as its floor.
+//!
+//! A poll costs the bytes appended since the last one, not the size of the
+//! file: `tail_shard` reads through a sliding window over a `File`
+//! ([`xerj_storage::wal`]), so a caught-up shard costs one 16-byte header
+//! read. It has to — the cost is multiplied by `num_wal_shards` × allowlisted
+//! indices × `1000 / poll_interval_ms` per second, and `indices = ["*"]` on a
+//! node with thousands of indices is a supported configuration.
 //!
 //! **2. Ordering and dedup.** The cursor is a **byte offset**, never a
 //! sequence number: the lock-free writer reserves seq_nos outside the shard
@@ -38,6 +56,15 @@
 //! resolves to the same document the source holds. A target that ignores
 //! external versioning — which currently includes xerj's own `_bulk` — falls
 //! back to last-write-wins by arrival instead.
+//!
+//! What the target did with each action is read back per item, positionally,
+//! and that is what the counters mean: `docs_shipped` and `last_shipped_seq`
+//! move only for items the target **accepted**. A `_bulk` that returns `200`
+//! while rejecting every action inside it — a target holding a higher external
+//! version for every `_id`, i.e. a second writer got there first — is a real
+//! state and used to be indistinguishable from a healthy tap.
+//! `consecutive_conflict_only_batches` and
+//! [`IndexTapStats::healthy`] exist so it is not.
 //!
 //! **3. Backpressure.** Bounded by construction: one in-flight request per
 //! index, batches capped by `max_batch_docs` and `max_batch_bytes`, and
@@ -63,6 +90,25 @@
 //! logs at `warn` and increments `gaps` in `GET /_xerj/wal_tap/_stats`. The
 //! degradation is visible, not silent.
 //!
+//! "Visible" is not the same as "survivable", though, and at the default
+//! `storage.flush_interval_secs = 30` the WAL window is about one flush — so a
+//! minute of target downtime on a hot index loses data with nothing but a log
+//! line to offer. `wal_tap.min_retained_generations` is the middle path: a
+//! **bounded** floor under `prune_verified` that holds the newest N rotated
+//! generations whatever any consumer is doing. Deliberately not a retention
+//! lease (Elasticsearch's `ReplicationTracker.addRetentionLease`, Lucene's
+//! `SnapshotDeletionPolicy.snapshot`): a lease is held until the consumer
+//! releases it, which is exactly how a dead follower wedges a leader's disk.
+//! A floor costs `n * wal_max_size_mb` per shard and not one byte more.
+//!
+//! **4c. Where the configuration lives.** In the state file next to the
+//! cursors, not only in memory. `PUT /_xerj/wal_tap` is durable and is
+//! re-applied over the config file on the next boot; `DELETE /_xerj/wal_tap`
+//! drops it. The alternative — the shape this started as — advertised
+//! "runtime config, no restart" while a restart silently reverted the tap to
+//! `enabled = false`, froze its cursors, let WAL pruning carry on, and left
+//! `_stats` not even listing the affected indices.
+//!
 //! Prior art consulted before writing this (per the repository's
 //! reference-coding mandate):
 //!
@@ -79,6 +125,15 @@
 //!   Confirms the two primitives: an explicitly bounded write buffer (count
 //!   *and* bytes) as the whole of backpressure, and capped exponential backoff
 //!   with jitter separating retryable transport failures from fatal ones.
+//! - **lucene** `lucene/core/src/java/org/apache/lucene/store/BufferedIndexInput.java:289-317`
+//!   (`refill`) and `:221-244` (`resolvePositionInBuffer`), plus
+//!   `lucene/analysis/common/src/java/org/apache/lucene/analysis/util/SegmentingTokenizerBase.java:124-147`
+//!   (`refill`, the compact-then-read step), Apache-2.0 — the shape of the
+//!   incremental tail reader in [`xerj_storage::wal`]: a bounded window whose
+//!   absolute position is `bufferStart + buffer.position()`, read length
+//!   clamped to the file length so it never reads past EOF, and the
+//!   unconsumed remainder carried to the front before pulling more. Adapted,
+//!   not copied.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -135,6 +190,20 @@ struct IndexCursors {
 struct PersistedState {
     version: u32,
     indices: BTreeMap<String, IndexCursors>,
+    /// The last configuration applied through `PUT /_xerj/wal_tap`.
+    ///
+    /// Without this, "runtime config, no restart" was a half-truth that
+    /// failed in the direction that loses data: the live config lived only in
+    /// an `RwLock`, so a restart silently reverted the tap to the file config
+    /// — typically `enabled = false`. Cursors then froze while WAL pruning
+    /// carried on, and `_stats` did not even list the affected indices,
+    /// because it only lists what the *current* allowlist matches.
+    ///
+    /// Precedent for a persisted overlay winning over the file is
+    /// Elasticsearch's `persistent` cluster settings.
+    /// `DELETE /_xerj/wal_tap` drops it and reverts to the file.
+    #[serde(default)]
+    runtime_config: Option<WalTapConfig>,
 }
 
 impl Default for PersistedState {
@@ -142,6 +211,7 @@ impl Default for PersistedState {
         Self {
             version: STATE_VERSION,
             indices: BTreeMap::new(),
+            runtime_config: None,
         }
     }
 }
@@ -186,8 +256,44 @@ pub struct IndexTapStats {
     pub consecutive_failures: u32,
     /// Last failure, as a short string. `None` once a send succeeds.
     pub last_error: Option<String>,
-    /// Highest `seq_no` shipped so far, for the lag estimate.
+    /// Highest `seq_no` the target **accepted**, for the lag estimate.
+    ///
+    /// Accepted means the item came back without an `error`. A rejected item
+    /// — including a version conflict — does not move this, because the whole
+    /// point of the number is to answer "is our data there?" and the answer
+    /// for a rejected action is no. Deriving it from the render-time batch
+    /// instead is what let a target that rejected every single action report
+    /// `lag_seq: 0` while `docs_shipped` climbed.
     pub last_shipped_seq: u64,
+    /// Consecutive `_bulk` responses in which the target rejected **every**
+    /// action as a version conflict.
+    ///
+    /// One conflict is expected and benign: it is how external versioning
+    /// absorbs an at-least-once redelivery. A *sustained run* of batches that
+    /// are entirely conflicts is not — it means the target holds a higher
+    /// version for every `_id` this tap sends, so the tap is a no-op and the
+    /// two sides are diverging. See [`IndexTapStats::healthy`].
+    pub consecutive_conflict_only_batches: u32,
+}
+
+/// How many all-conflict batches in a row stop counting as "a redelivery
+/// landed" and start counting as "this target is not taking our writes".
+///
+/// A redelivery after a failed send re-ships exactly the chunks that did not
+/// land, so it clears on the next batch that contains anything new. Three in a
+/// row cannot be that.
+const CONFLICT_ONLY_UNHEALTHY_AFTER: u32 = 3;
+
+impl IndexTapStats {
+    /// Is this index's replication actually working?
+    ///
+    /// `false` for the two states that used to look identical to a healthy
+    /// tap in `_stats`: a send that keeps failing, and a target that accepts
+    /// every request while rejecting every action inside it.
+    pub fn healthy(&self) -> bool {
+        self.last_error.is_none()
+            && self.consecutive_conflict_only_batches < CONFLICT_ONLY_UNHEALTHY_AFTER
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,6 +312,28 @@ pub struct WalTap {
     ticks: AtomicU64,
     /// Milliseconds-since-start before which the next send must not be tried.
     retry_not_before_ms: AtomicU64,
+    /// Cursor state has moved since the last durable write.
+    ///
+    /// Cursors are flushed **once per tick**, not once per index per poll.
+    /// The old shape re-serialised and fsynced the WHOLE state file on every
+    /// cursor advance — O(N²) bytes and 2N fsyncs per tick at N allowlisted
+    /// indices, at a 500 ms default, on a node that `index_store.rs:806-813`
+    /// records reaching 9,382 indices. `indices = ["*"]` walked straight into
+    /// that.
+    ///
+    /// Deferring costs nothing that matters: the cursor is only ever
+    /// persisted *after* the entries it covers have been shipped, so a crash
+    /// in the window re-delivers a batch. Re-delivery is the documented
+    /// contract (at-least-once, absorbed by `version_type: external`); losing
+    /// a batch would not be, and that direction is impossible here.
+    dirty: std::sync::atomic::AtomicBool,
+    /// Durable writes of the state file since start.
+    ///
+    /// Instrumentation, and the only way to assert the property that matters
+    /// about [`WalTap::dirty`]: the cost of a tick must not scale with the
+    /// number of allowlisted indices. See
+    /// `cursor_state_is_written_once_per_tick_not_once_per_index`.
+    persists: AtomicU64,
     started: std::time::Instant,
 }
 
@@ -237,6 +365,24 @@ impl WalTap {
             Err(_) => PersistedState::default(),
         };
 
+        // A configuration set through the API outlives the process that took
+        // it. Without this a restart reverted to the file config — usually
+        // `enabled = false` — and the tap went quiet while its cursors froze
+        // and WAL pruning carried on regardless.
+        let config = match state.runtime_config.clone() {
+            Some(saved) => {
+                info!(
+                    target_url = %saved.redacted_target_url(),
+                    enabled = saved.enabled,
+                    indices = ?saved.indices,
+                    "WAL tap: applying the configuration last set via PUT /_xerj/wal_tap \
+                     (overrides the config file; DELETE /_xerj/wal_tap reverts)"
+                );
+                saved
+            }
+            None => config,
+        };
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_secs.max(1)))
             .build()
@@ -250,6 +396,8 @@ impl WalTap {
             client,
             ticks: AtomicU64::new(0),
             retry_not_before_ms: AtomicU64::new(0),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            persists: AtomicU64::new(0),
             started: std::time::Instant::now(),
         }
     }
@@ -259,11 +407,33 @@ impl WalTap {
         self.config.read().clone()
     }
 
-    /// Replace the live configuration. Takes effect on the next poll; no
-    /// restart, and cursors are preserved so an index that stays in the
-    /// allowlist does not re-ship or skip.
+    /// Replace the live configuration **durably**.
+    ///
+    /// Takes effect on the next poll — no restart — and cursors are preserved
+    /// so an index that stays in the allowlist does not re-ship or skip. The
+    /// configuration is also written next to the cursors and re-applied over
+    /// the file config on the next boot, so "no restart needed" does not
+    /// quietly mean "and it is gone after one".
     pub fn set_config(&self, config: WalTapConfig) {
-        *self.config.write() = config;
+        *self.config.write() = config.clone();
+        self.state.write().runtime_config = Some(config);
+        // Operator action, not a hot path: make it durable now rather than at
+        // the next tick, so a crash between the 200 and the next poll cannot
+        // lose an acknowledged configuration change.
+        self.persist_now();
+    }
+
+    /// Drop the persisted runtime overlay and revert to `config` (the value
+    /// from the config file).
+    pub fn clear_runtime_config(&self, file_config: WalTapConfig) {
+        *self.config.write() = file_config;
+        self.state.write().runtime_config = None;
+        self.persist_now();
+    }
+
+    /// Does a configuration set through the API currently override the file?
+    pub fn has_runtime_config(&self) -> bool {
+        self.state.read().runtime_config.is_some()
     }
 
     /// Number of completed poll cycles — the "it is actually running" signal
@@ -275,6 +445,43 @@ impl WalTap {
     /// Per-index counters.
     pub fn stats(&self) -> BTreeMap<String, IndexTapStats> {
         self.stats.read().clone()
+    }
+
+    /// Put an index's cursors back, verbatim.
+    ///
+    /// Test seam. Reconstructs the one state no in-process sequence can reach
+    /// on its own: a persisted cursor that outlived its WAL stream because the
+    /// delete happened while this process was **not running**, so
+    /// [`forget_index`](Self::forget_index) never fired. That is the case
+    /// `tail_shard`'s offset-past-EOF check exists for, and it is unreachable
+    /// from the public API by construction.
+    #[doc(hidden)]
+    pub fn restore_cursors_for_test(&self, index: &str, shards: BTreeMap<String, WalTailCursor>) {
+        self.state
+            .write()
+            .indices
+            .entry(index.to_string())
+            .or_default()
+            .shards = shards;
+        self.persist_now();
+    }
+
+    /// Rewind an index's cursors to the start of their oldest generation.
+    ///
+    /// Test seam for the redelivery half of the at-least-once contract: it
+    /// reproduces exactly what a crash between shipping a batch and persisting
+    /// its cursor leaves behind, which is the case `version_type: external`
+    /// exists to make safe.
+    #[doc(hidden)]
+    pub fn rewind_for_test(&self, index: &str) {
+        let mut state = self.state.write();
+        if let Some(cursors) = state.indices.get_mut(index) {
+            for cursor in cursors.shards.values_mut() {
+                *cursor = WalTailCursor::start_of(0);
+            }
+        }
+        drop(state);
+        self.persist_now();
     }
 
     /// Per-index, per-shard cursors, for `_stats`.
@@ -324,7 +531,31 @@ impl WalTap {
         f(guard.entry(index.to_string()).or_default())
     }
 
-    fn persist(&self) {
+    /// Note that cursor state has moved. The write happens once, at the end of
+    /// the tick — see [`WalTap::dirty`] for why deferring is safe.
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Flush cursor state if anything moved since the last write.
+    fn persist_if_dirty(&self) {
+        if self.dirty.swap(false, Ordering::Relaxed) {
+            self.persist_now();
+        }
+    }
+
+    /// Durable writes of the state file since start.
+    ///
+    /// The tap's I/O amplification, exposed so it can be asserted rather than
+    /// asserted about: one tick must cost one write however many indices are
+    /// allowlisted.
+    pub fn persists(&self) -> u64 {
+        self.persists.load(Ordering::Relaxed)
+    }
+
+    fn persist_now(&self) {
+        self.dirty.store(false, Ordering::Relaxed);
+        self.persists.fetch_add(1, Ordering::Relaxed);
         let snapshot = self.state.read().clone();
         let bytes = match serde_json::to_vec_pretty(&snapshot) {
             Ok(b) => b,
@@ -333,10 +564,12 @@ impl WalTap {
                 return;
             }
         };
-        // Durable replace: a torn cursor file is a silent re-ship or a silent
-        // skip on the next boot, which is exactly the class of bug this
-        // feature must not introduce.
-        if let Err(e) = xerj_common::fsio::write_file_durable(&self.state_path, &bytes) {
+        // Durable replace at 0600: a torn cursor file is a silent re-ship or a
+        // silent skip on the next boot, and the persisted runtime config in
+        // this file carries `target_auth` — a credential for another cluster,
+        // which must not be world-readable in the data directory. Same writer
+        // the API-key store uses.
+        if let Err(e) = crate::engine::write_secret_file_atomic(&self.state_path, &bytes) {
             warn!(error = %e, path = ?self.state_path, "WAL tap: cannot persist cursor state");
         }
     }
@@ -425,12 +658,22 @@ fn compact_source(source: &Value) -> String {
     source.to_string()
 }
 
+/// One rendered action, in the order it appears in the `_bulk` body.
+///
+/// The `items` array of a `_bulk` response is positionally aligned with the
+/// actions of the request, which is the only way to say *which* seq_no the
+/// target actually took. Keeping the pairing is what makes
+/// [`IndexTapStats::last_shipped_seq`] mean something.
+#[derive(Clone, Copy)]
+struct RenderedAction {
+    seq: u64,
+    is_delete: bool,
+}
+
 /// One `_bulk` request's worth of rendered actions.
 struct Chunk {
     body: String,
-    docs: u64,
-    deletes: u64,
-    max_seq: u64,
+    actions: Vec<RenderedAction>,
 }
 
 /// Split a batch into `_bulk` bodies no larger than `max_bytes`.
@@ -444,9 +687,7 @@ fn render_chunks(index: &str, batch: &[(u64, WalEntry)], max_bytes: usize) -> Ve
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut cur = Chunk {
         body: String::new(),
-        docs: 0,
-        deletes: 0,
-        max_seq: 0,
+        actions: Vec::new(),
     };
 
     for (seq, entry) in batch {
@@ -459,19 +700,15 @@ fn render_chunks(index: &str, batch: &[(u64, WalEntry)], max_bytes: usize) -> Ve
                 &mut cur,
                 Chunk {
                     body: String::new(),
-                    docs: 0,
-                    deletes: 0,
-                    max_seq: 0,
+                    actions: Vec::new(),
                 },
             ));
         }
         cur.body.push_str(&rendered);
-        if is_delete {
-            cur.deletes += 1;
-        } else {
-            cur.docs += 1;
-        }
-        cur.max_seq = cur.max_seq.max(*seq);
+        cur.actions.push(RenderedAction {
+            seq: *seq,
+            is_delete,
+        });
     }
     if !cur.body.is_empty() {
         chunks.push(cur);
@@ -483,14 +720,28 @@ fn render_chunks(index: &str, batch: &[(u64, WalEntry)], max_bytes: usize) -> Ve
 // The poll loop
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// What the target did with one action inside a 2xx `_bulk` response.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemOutcome {
+    /// The target took it. This — and only this — advances the watermark.
+    Accepted,
+    /// `version_conflict_engine_exception`: the target already holds a
+    /// version at least as high for this `_id`. Benign once (that is how
+    /// external versioning absorbs a redelivery), a divergence signal when it
+    /// is *every* action of *every* batch.
+    Conflict,
+    /// Rejected for any other reason — a mapping conflict, say. Counted,
+    /// logged, and passed over: see [`WalTap::send_bulk`].
+    Rejected,
+}
+
 /// Outcome of shipping one `_bulk` request.
 enum SendOutcome {
     /// The target accepted the request. Per-item failures may still have
     /// occurred; the cursor advances either way.
-    Accepted {
-        item_failures: u64,
-        version_conflicts: u64,
-    },
+    ///
+    /// `outcomes` is positionally aligned with the chunk's actions.
+    Accepted { outcomes: Vec<ItemOutcome> },
     /// The request did not land. The cursor must not advance.
     Failed(String),
 }
@@ -506,7 +757,7 @@ impl WalTap {
     /// loses everything behind it to WAL pruning rather than just the one bad
     /// document. That trade is deliberate and is why `item_failures` is in
     /// `_stats`.
-    async fn send_bulk(&self, config: &WalTapConfig, body: String) -> SendOutcome {
+    async fn send_bulk(&self, config: &WalTapConfig, body: String, actions: usize) -> SendOutcome {
         let url = format!("{}/_bulk", config.target_url.trim_end_matches('/'));
         let mut req = self
             .client
@@ -541,43 +792,59 @@ impl WalTap {
             Err(e) => {
                 debug!(error = %e, "WAL tap: unparseable _bulk response body");
                 return SendOutcome::Accepted {
-                    item_failures: 0,
-                    version_conflicts: 0,
+                    outcomes: vec![ItemOutcome::Accepted; actions],
                 };
             }
         };
 
-        let mut item_failures = 0u64;
-        let mut version_conflicts = 0u64;
-        if parsed.get("errors").and_then(Value::as_bool) == Some(true) {
-            for item in parsed
-                .get("items")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-            {
-                let Some(action) = item.as_object().and_then(|o| o.values().next()) else {
-                    continue;
-                };
-                let Some(error) = action.get("error") else {
-                    continue;
-                };
-                let kind = error.get("type").and_then(Value::as_str).unwrap_or("");
-                if kind == "version_conflict_engine_exception" {
-                    version_conflicts += 1;
-                } else {
-                    if item_failures == 0 {
-                        warn!(error = %error, "WAL tap: target rejected a document — \
-                              skipped (see item_failures in _stats)");
-                    }
-                    item_failures += 1;
+        // `errors: false` means every action landed, and ES omits nothing in
+        // that case worth walking.
+        if parsed.get("errors").and_then(Value::as_bool) != Some(true) {
+            return SendOutcome::Accepted {
+                outcomes: vec![ItemOutcome::Accepted; actions],
+            };
+        }
+
+        let items = parsed
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if items.len() != actions {
+            // `errors: true` with an items array that is not positionally
+            // aligned with the request. Nothing can be attributed to a
+            // specific action, so refuse to claim any of them landed: hold
+            // the cursor and retry rather than advance past writes whose fate
+            // is unknown. At-least-once is a contract; at-most-once is not.
+            return SendOutcome::Failed(format!(
+                "target reported errors with {} items for {actions} actions — cannot \
+                 attribute outcomes, holding the cursor",
+                items.len()
+            ));
+        }
+
+        let mut outcomes = Vec::with_capacity(items.len());
+        let mut warned = false;
+        for item in items {
+            let action = item.as_object().and_then(|o| o.values().next());
+            let error = action.and_then(|a| a.get("error"));
+            let Some(error) = error else {
+                outcomes.push(ItemOutcome::Accepted);
+                continue;
+            };
+            let kind = error.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "version_conflict_engine_exception" {
+                outcomes.push(ItemOutcome::Conflict);
+            } else {
+                if !warned {
+                    warned = true;
+                    warn!(error = %error, "WAL tap: target rejected a document — \
+                          skipped (see item_failures in _stats)");
                 }
+                outcomes.push(ItemOutcome::Rejected);
             }
         }
-        SendOutcome::Accepted {
-            item_failures,
-            version_conflicts,
-        }
+        SendOutcome::Accepted { outcomes }
     }
 
     /// Poll one index once: read its WAL tail, ship it, advance its cursors.
@@ -644,9 +911,13 @@ impl WalTap {
                 gaps += 1;
                 warn!(
                     index = %name, shard = %shard,
-                    "WAL tap: a WAL generation was pruned before it could be shipped — \
-                     entries are missing at the target and cannot be recovered from the \
-                     WAL. The tap is behind; raise poll throughput or check the target."
+                    "WAL tap: a discontinuity in this shard's WAL stream — either a \
+                     generation was pruned before it could be shipped, or the stream was \
+                     replaced (index deleted and recreated, or data directory rolled \
+                     back). Entries are missing at the target and cannot be recovered \
+                     from the WAL. If the tap is behind, raise poll throughput, check the \
+                     target, or set wal_tap.min_retained_generations; `tail_shard` names \
+                     which of the two it was at WARN."
                 );
             }
             corrupt += tail.corrupt_skipped as u64;
@@ -678,7 +949,7 @@ impl WalTap {
                     .entry(name.to_string())
                     .or_default()
                     .shards = new_cursors;
-                self.persist();
+                self.mark_dirty();
                 if first_look {
                     // The tap just positioned at the end of an established
                     // index: it is caught up by definition, having deliberately
@@ -707,7 +978,7 @@ impl WalTap {
                 .entry(name.to_string())
                 .or_default()
                 .shards = new_cursors;
-            self.persist();
+            self.mark_dirty();
             return more;
         }
 
@@ -716,24 +987,48 @@ impl WalTap {
         // read has to land before the cursors move, so a failure part-way
         // through redelivers the earlier chunks on the next poll — which is
         // exactly what external versioning makes free.
+        // Everything here is counted from the target's PER-ITEM verdict, not
+        // from what was rendered. A `_bulk` that returns 200 while rejecting
+        // every action inside it is a common, real state — a target holding
+        // higher external versions for the same `_id`s makes every action a
+        // no-op — and counting render-time values made that indistinguishable
+        // from a healthy tap: `docs_shipped` climbed, `lag_seq` read 0, and
+        // nothing had been replicated.
         let mut docs = 0u64;
         let mut deletes = 0u64;
-        let mut max_seq = 0u64;
+        let mut max_accepted_seq = 0u64;
         let mut item_failures = 0u64;
         let mut version_conflicts = 0u64;
         let mut batches = 0u64;
+        let mut conflict_only_batches = 0u32;
 
         for chunk in chunks {
-            match self.send_bulk(config, chunk.body).await {
-                SendOutcome::Accepted {
-                    item_failures: items,
-                    version_conflicts: conflicts,
-                } => {
-                    docs += chunk.docs;
-                    deletes += chunk.deletes;
-                    max_seq = max_seq.max(chunk.max_seq);
-                    item_failures += items;
-                    version_conflicts += conflicts;
+            let actions = chunk.actions.clone();
+            match self.send_bulk(config, chunk.body, actions.len()).await {
+                SendOutcome::Accepted { outcomes } => {
+                    let mut accepted_here = 0u64;
+                    let mut conflicts_here = 0u64;
+                    for (action, outcome) in actions.iter().zip(outcomes.iter()) {
+                        match outcome {
+                            ItemOutcome::Accepted => {
+                                accepted_here += 1;
+                                max_accepted_seq = max_accepted_seq.max(action.seq);
+                                if action.is_delete {
+                                    deletes += 1;
+                                } else {
+                                    docs += 1;
+                                }
+                            }
+                            ItemOutcome::Conflict => {
+                                conflicts_here += 1;
+                                version_conflicts += 1;
+                            }
+                            ItemOutcome::Rejected => item_failures += 1,
+                        }
+                    }
+                    if accepted_here == 0 && conflicts_here == actions.len() as u64 {
+                        conflict_only_batches += 1;
+                    }
                     batches += 1;
                 }
                 SendOutcome::Failed(err) => {
@@ -743,6 +1038,7 @@ impl WalTap {
                         s.batches_sent += batches;
                         s.item_failures += item_failures;
                         s.version_conflicts += version_conflicts;
+                        s.last_shipped_seq = s.last_shipped_seq.max(max_accepted_seq);
                         s.bulk_failures += 1;
                         s.consecutive_failures = s.consecutive_failures.saturating_add(1);
                         s.last_error = Some(err.clone());
@@ -762,29 +1058,85 @@ impl WalTap {
             .entry(name.to_string())
             .or_default()
             .shards = new_cursors;
-        self.persist();
-        self.stat(name, |s| {
+        self.mark_dirty();
+        let unhealthy = self.stat(name, |s| {
             s.docs_shipped += docs;
             s.deletes_shipped += deletes;
             s.batches_sent += batches;
             s.item_failures += item_failures;
             s.version_conflicts += version_conflicts;
-            s.last_shipped_seq = s.last_shipped_seq.max(max_seq);
+            s.last_shipped_seq = s.last_shipped_seq.max(max_accepted_seq);
             s.consecutive_failures = 0;
-            s.last_error = None;
+            // A run of batches in which the target rejected every action as a
+            // conflict is not "replication working". Only a batch that landed
+            // something clears it.
+            if conflict_only_batches > 0 && docs == 0 && deletes == 0 {
+                s.consecutive_conflict_only_batches = s
+                    .consecutive_conflict_only_batches
+                    .saturating_add(conflict_only_batches);
+            } else {
+                s.consecutive_conflict_only_batches = 0;
+            }
+            if s.consecutive_conflict_only_batches >= CONFLICT_ONLY_UNHEALTHY_AFTER {
+                s.last_error = Some(format!(
+                    "target rejected every action of the last {} batches with \
+                     version_conflict_engine_exception — it holds a higher version for \
+                     every document this tap sends, so nothing is being replicated",
+                    s.consecutive_conflict_only_batches
+                ));
+                true
+            } else {
+                s.last_error = None;
+                false
+            }
         });
+        if unhealthy {
+            warn!(
+                index = %name, version_conflicts,
+                "WAL tap: every action is being rejected as a version conflict — the \
+                 target holds higher versions than this node. _stats reports the index \
+                 unhealthy; check that the target is not also fed by another writer."
+            );
+        }
         self.clear_backoff();
         debug!(index = %name, docs, deletes, batches, "WAL tap: batch shipped");
         more
     }
 
+    /// Drop one index's cursors the moment it is deleted.
+    ///
+    /// Called from [`Engine::delete_index`](crate::engine::Engine::delete_index),
+    /// and that timing is the whole point. A deletion is the exact boundary
+    /// between two incarnations of a name: after it, any surviving cursor
+    /// belongs to a WAL stream that no longer exists.
+    ///
+    /// Waiting for a poll to *notice* the absence — which is all
+    /// [`forget_deleted`](Self::forget_deleted) can do — misses the case that
+    /// matters, because `DELETE` + `PUT` inside one 500 ms poll interval is
+    /// never observed as an absence at all. The recreated index then starts a
+    /// new WAL at generation 0, so the `cursor.generation > newest` guard
+    /// never trips, and the stale byte offset either landed past EOF (every
+    /// document silently skipped, `gap` false) or mid-frame (the shard wedged
+    /// forever with `gaps: 0` and `last_error: null`). Both are the failure a
+    /// WAL consumer must never have, and both are unreachable from here.
+    ///
+    /// `tail_shard`'s offset-past-EOF check is the second line of defence,
+    /// for a delete this process never saw — one that happened while the node
+    /// was down.
+    pub fn forget_index(&self, name: &str) {
+        let removed = self.state.write().indices.remove(name).is_some();
+        self.stats.write().remove(name);
+        if removed {
+            debug!(index = %name, "WAL tap: forgetting the cursor of a deleted index");
+            self.persist_now();
+        }
+    }
+
     /// Drop cursors for indices that no longer exist.
     ///
-    /// Hygiene, and one correctness case: an index deleted and recreated under
-    /// the same name gets a brand-new WAL starting at generation 0, which the
-    /// old cursor points far past. `tail_shard` self-heals that as a gap, but
-    /// forgetting the cursor is both cheaper and more honest — the new index
-    /// genuinely has no shipped history.
+    /// Hygiene for anything [`forget_index`](Self::forget_index) did not see:
+    /// a deletion by a path that does not route through `Engine::delete_index`,
+    /// or an index removed while this process was not running.
     fn forget_deleted(&self, live: &[String]) {
         let mut state = self.state.write();
         if state.indices.keys().all(|k| live.iter().any(|l| l == k)) {
@@ -798,7 +1150,7 @@ impl WalTap {
             kept
         });
         drop(state);
-        self.persist();
+        self.mark_dirty();
     }
 
     /// One full pass over the allowlisted indices. Exposed for tests; the
@@ -815,6 +1167,9 @@ impl WalTap {
 
         let live = engine.index_name_list();
         self.forget_deleted(&live);
+        // One durable write per tick, at the end, whatever moved — not one
+        // per index per poll. See `WalTap::dirty`.
+        let _flush = FlushOnDrop(self);
 
         for name in live {
             if !Self::ships(&config, &name) {
@@ -841,6 +1196,19 @@ impl WalTap {
                 break;
             }
         }
+    }
+}
+
+/// Flushes the tap's cursor state when a tick ends, however it ends.
+///
+/// A guard rather than a call at the bottom of `tick`, because `tick` returns
+/// early from several places (backoff armed mid-loop, a send failure) and a
+/// missed flush means the *next* boot re-ships from an older cursor.
+struct FlushOnDrop<'a>(&'a WalTap);
+
+impl Drop for FlushOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.persist_if_dirty();
     }
 }
 

@@ -335,6 +335,16 @@ pub struct IndexStoreConfig {
     /// When > 1, each shard gets its own WAL file (`wal_s{N}/`) for
     /// parallel writes without cross-shard mutex contention.
     pub num_wal_shards: usize,
+    /// Rotated WAL generations kept per shard even once every entry in them
+    /// is durable in a segment (default: `0` — prune as soon as it is safe).
+    ///
+    /// This is the retention floor a WAL consumer needs: with the default,
+    /// `prune_verified` deletes a rotated generation the moment a flush makes
+    /// it redundant, so a #320 tap whose target is down for longer than one
+    /// flush interval loses entries. Raising it buys the consumer that much
+    /// slack at a cost bounded by `n * wal_max_size_bytes` per shard — a
+    /// floor, never a lease, so a stalled consumer still cannot fill the disk.
+    pub wal_min_retained_generations: u64,
 }
 
 /// A raw JSON batch that has been completely validated before publication.
@@ -409,6 +419,7 @@ impl Default for IndexStoreConfig {
             schema_version: 1,
             storage_mode: StorageMode::Local,
             num_wal_shards: 1,
+            wal_min_retained_generations: 0,
         }
     }
 }
@@ -657,12 +668,15 @@ impl IndexStore {
                 std::fs::create_dir_all(&d)?;
                 d
             };
-            let w = WalWriter::open(
+            let mut w = WalWriter::open(
                 &shard_dir,
                 config.wal_max_size_bytes,
                 config.sync_mode,
                 Arc::clone(&seq_counter),
             )?;
+            // Retention floor for WAL consumers (#320). Zero by default, so
+            // this is a no-op unless an operator has asked for slack.
+            w.set_min_retained_generations(config.wal_min_retained_generations);
             let shard = Arc::new(Mutex::new(w));
             // Issue #334 — register with the shared, event-driven fsync
             // scheduler instead of spawning a thread per store.  Nothing is

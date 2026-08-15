@@ -843,7 +843,9 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         // would make those honest 501s a lie.
         .route(
             "/_xerj/wal_tap",
-            get(wal_tap_api::get_wal_tap).put(wal_tap_api::put_wal_tap),
+            get(wal_tap_api::get_wal_tap)
+                .put(wal_tap_api::put_wal_tap)
+                .delete(wal_tap_api::delete_wal_tap),
         )
         .route("/_xerj/wal_tap/_stats", get(wal_tap_api::wal_tap_stats))
         // ── Legacy index templates (v1) ────────────────────────────────────────────

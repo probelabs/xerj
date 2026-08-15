@@ -378,7 +378,10 @@ impl ApiKeyRecord {
 /// the secret is never briefly world-readable, then renamed over the target
 /// (the rename carries the 0600 inode). On non-unix, perms are left to the OS
 /// default. Mirrors `index::write_file_atomic` but hardens the mode.
-fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_secret_file_atomic(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     use std::io::Write as _;
     // Unique staging name, for the same reason as `index::write_file_atomic`:
     // two concurrent key mints sharing one `api_keys.tmp` can interleave into a
@@ -2556,6 +2559,12 @@ impl Engine {
         self.index_settings.remove(name);
         self.index_mappings.remove(name);
         self.index_alias_metadata.remove(name);
+
+        // The WAL tap's cursor is a byte offset into a WAL stream that has
+        // just ceased to exist. Dropping it HERE, rather than waiting for a
+        // poll to notice the index is gone, is what makes delete-and-recreate
+        // inside one poll interval safe — see `wal_tap::WalTap::forget_index`.
+        self.wal_tap.forget_index(name);
 
         // Lifecycle bookkeeping: a deleted index needs neither an execution
         // cursor nor a detach tombstone (#282) — and clearing the tombstone

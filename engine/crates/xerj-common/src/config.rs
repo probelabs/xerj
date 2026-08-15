@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **114 settings** versus
+//! Configuration is intentionally minimal: **115 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -93,11 +93,11 @@ pub struct Config {
     /// ISM/ILM index-lifecycle-management background execution — 1 setting.
     pub lifecycle: LifecycleConfig,
     /// Single-node WAL tap: push a filtered index subset to an external
-    /// ES-compatible target — 9 settings. Off by default.
+    /// ES-compatible target — 10 settings. Off by default.
     pub wal_tap: WalTapConfig,
 }
 
-// 21 sub-configs, 114 leaf settings in total. Do not maintain that sum by hand
+// 21 sub-configs, 115 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -183,6 +183,13 @@ impl Config {
         // Merge: min_segments must be >= 2
         if self.merge.min_segments < 2 {
             return Err(XerjError::config("merge.min_segments must be >= 2"));
+        }
+
+        // WAL tap: the target URL is a credential boundary, not just a URL.
+        // Refusing it at boot is the only way a `user:pass@host` in the config
+        // file never reaches the log line or the two endpoints that echo it.
+        if let Err(reason) = WalTapConfig::check_target_url(&self.wal_tap.target_url) {
+            return Err(XerjError::config(reason));
         }
 
         // Compression: block_size_docs is documented as 16–4096 and was
@@ -411,7 +418,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (114 user-facing settings total; counted by
+// Sub-configs  (115 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1741,7 +1748,7 @@ impl Default for LifecycleConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Single-node WAL tap — push a filtered subset of indices to an external
-/// ES-compatible target (issue #320). **9 settings.**
+/// ES-compatible target (issue #320). **10 settings.**
 ///
 /// This is deliberately *not* cross-cluster replication. It is one
 /// directional, single node, and target-agnostic because the wire format is
@@ -1765,7 +1772,14 @@ impl Default for LifecycleConfig {
 ///   has shipped them — coupling the two would let a slow remote fill the
 ///   local disk. A tap that falls that far behind loses entries and *says
 ///   so*: `gaps` in `GET /_xerj/wal_tap/_stats`, plus a warning per gap.
+///   `min_retained_generations` buys a **bounded** amount of slack; it is a
+///   floor, not a lease, so a stalled target still cannot fill the disk.
 /// - **System indices are never shipped**, whatever the allowlist says.
+/// - **Runtime edits are durable.** `PUT /_xerj/wal_tap` persists the patched
+///   configuration next to the cursors and re-applies it over the file
+///   config on the next boot (`DELETE /_xerj/wal_tap` drops the overlay and
+///   reverts to this file). Otherwise a restart would silently revert to
+///   `enabled = false` while the cursors froze and WAL pruning continued.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WalTapConfig {
@@ -1794,6 +1808,22 @@ pub struct WalTapConfig {
     pub request_timeout_secs: u64,
     /// Ceiling on the exponential retry backoff, in seconds (default: `60`).
     pub max_retry_backoff_secs: u64,
+    /// Rotated WAL generations kept per shard **after** every entry in them
+    /// is durable in a segment, so a tap whose target is briefly unreachable
+    /// still finds them (default: `0` — prune as soon as it is safe, the
+    /// pre-#320 behaviour).
+    ///
+    /// The default loses data on an outage longer than one flush interval
+    /// (`storage.flush_interval_secs`, 30 s): the entries are gone from the
+    /// WAL and the tap reports `gaps`. Set this to cover the outage you want
+    /// to survive — `2` buys roughly two flush windows.
+    ///
+    /// The cost is bounded and paid whether or not a tap is running: at most
+    /// `n * storage.wal_max_size_mb` extra megabytes per WAL shard per index.
+    /// It is deliberately **not** an Elasticsearch-style retention lease,
+    /// which holds generations for as long as a follower is behind and is how
+    /// a dead follower wedges a leader's disk.
+    pub min_retained_generations: u64,
 }
 
 impl Default for WalTapConfig {
@@ -1808,7 +1838,76 @@ impl Default for WalTapConfig {
             max_batch_bytes: 5 * 1024 * 1024,
             request_timeout_secs: 30,
             max_retry_backoff_secs: 60,
+            min_retained_generations: 0,
         }
+    }
+}
+
+impl WalTapConfig {
+    /// Reject a `target_url` this node must not accept, returning the operator
+    /// message for a `400`.
+    ///
+    /// Two rules, and the second one is a credential boundary:
+    ///
+    /// 1. It has to be an absolute `http://` / `https://` URL, because the tap
+    ///    POSTs `{target_url}/_bulk` and a relative one silently targets
+    ///    nothing.
+    /// 2. **No userinfo.** `https://user:pass@host` is an ordinary URL and
+    ///    `reqwest` turns its userinfo into a `Basic` `Authorization` header —
+    ///    so it is `target_auth` wearing a disguise. `target_auth` is
+    ///    write-only precisely so that "can call the admin API" never becomes
+    ///    "holds the target's credential", and `target_url` is echoed by
+    ///    `GET /_xerj/wal_tap`, by `_stats`, and by the boot log. Accepting
+    ///    userinfo would defeat that in one line of config.
+    pub fn check_target_url(url: &str) -> Result<(), String> {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let Some(rest) = trimmed
+            .strip_prefix("http://")
+            .or_else(|| trimmed.strip_prefix("https://"))
+        else {
+            return Err(
+                "wal_tap.target_url must be an absolute http:// or https:// URL, e.g. \
+                 \"https://central:9200\""
+                    .to_string(),
+            );
+        };
+        // Userinfo is everything before the first `@` of the authority, which
+        // ends at the first `/`, `?` or `#`.
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        if authority.contains('@') {
+            return Err("wal_tap.target_url must not carry credentials in the URL \
+                 (user:password@host): target_url is echoed by GET /_xerj/wal_tap, by \
+                 /_xerj/wal_tap/_stats and in the server log. Put the credential in \
+                 wal_tap.target_auth, which is write-only."
+                .to_string());
+        }
+        Ok(())
+    }
+
+    /// `target_url` as it is safe to show: any userinfo replaced by `***`.
+    ///
+    /// [`check_target_url`](Self::check_target_url) refuses userinfo on the way
+    /// in, so this only fires for a URL that reached the process another way —
+    /// an older state file, or a hand-edited config on a node whose operator
+    /// skipped validation. Belt and braces on a credential is cheap.
+    pub fn redacted_target_url(&self) -> String {
+        redact_url_userinfo(&self.target_url)
+    }
+}
+
+/// Replace `scheme://user:pass@host/…` with `scheme://***@host/…`.
+pub fn redact_url_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://***@{host}{tail}"),
+        None => url.to_string(),
     }
 }
 
@@ -2069,7 +2168,7 @@ mod tests {
             drift.join("\n  ")
         );
 
-        // …and the file's own header quotes how many of the 114 it sets. That
+        // …and the file's own header quotes how many of the 115 it sets. That
         // number was 38, then 56, and never once the truth (#207), so count the
         // assignments instead of trusting the sentence.
         let set_here = toml_src
@@ -2522,7 +2621,7 @@ mod tests {
         ("logging", 2),
         ("compat", 2),
         ("lifecycle", 1),
-        ("wal_tap", 9),
+        ("wal_tap", 10),
     ];
 
     /// Count the settings by *counting them*.
@@ -2565,7 +2664,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 114,
+            total, 115,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

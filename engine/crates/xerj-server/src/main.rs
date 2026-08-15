@@ -2242,7 +2242,10 @@ async fn async_main() -> Result<()> {
         if tap.config().enabled {
             let cfg = tap.config();
             info!(
-                target = %cfg.target_url,
+                // Redacted: a `user:pass@host` URL is refused at startup, but
+                // a log line is the wrong place to find out that one slipped
+                // through some other path.
+                target = %cfg.redacted_target_url(),
                 indices = ?cfg.indices,
                 poll_interval_ms = cfg.poll_interval_ms,
                 "WAL tap enabled — pushing to an external ES-compatible target \

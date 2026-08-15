@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 54 of XERJ's 114 user-facing settings to their
+# This file sets 54 of XERJ's 115 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -503,7 +503,7 @@ format = "text"
 access_log = false
 
 # ── WAL tap: push a filtered subset of indices to an external target ──────────
-# (9 settings, issue #320)
+# (10 settings, issue #320)
 #
 # One-directional, single-node, near-real-time push of selected indices to any
 # ES-compatible cluster (Elasticsearch, OpenSearch, or another XERJ node). The
@@ -522,19 +522,29 @@ access_log = false
 #    are durable in a segment, whether or not the tap has shipped them — a slow
 #    remote must not be able to fill this node's disk. A tap that falls that far
 #    behind loses entries and reports `gaps` in GET /_xerj/wal_tap/_stats.
+#    `min_retained_generations` buys BOUNDED slack (a floor, not a lease): at
+#    the default 0, an outage longer than one flush interval loses data.
 #
 # System indices (every .xerj* name, not just .xerj-memory-*) are never
 # shipped, whatever `indices` says.
+#
+# `target_url` must NOT carry credentials (https://user:pass@host is refused at
+# startup): it is echoed by GET /_xerj/wal_tap, by _stats and in the log.
+# `target_auth` is the credential field and is write-only.
+#
 # Everything here is also settable at runtime, without a restart, via
-# PUT /_xerj/wal_tap.
+# PUT /_xerj/wal_tap — which persists the patch, so it survives a restart.
+# DELETE /_xerj/wal_tap drops the runtime overlay and reverts to this file.
+# All three endpoints are superuser-only.
 #
 # [wal_tap]
-# enabled                = true                      # not a default (false)
-# target_url             = "https://central:9200"    # not a default ("")
-# target_auth            = "ApiKey abc123"           # not a default ("")
-# indices                = ["edge-*", "metrics"]     # not a default ([])
-# poll_interval_ms       = 500
-# max_batch_docs         = 1000
-# max_batch_bytes        = 5242880
-# request_timeout_secs   = 30
-# max_retry_backoff_secs = 60
+# enabled                  = true                      # not a default (false)
+# target_url               = "https://central:9200"    # not a default ("")
+# target_auth              = "ApiKey abc123"           # not a default ("")
+# indices                  = ["edge-*", "metrics"]     # not a default ([])
+# poll_interval_ms         = 500
+# max_batch_docs           = 1000
+# max_batch_bytes          = 5242880
+# request_timeout_secs     = 30
+# max_retry_backoff_secs   = 60
+# min_retained_generations = 0

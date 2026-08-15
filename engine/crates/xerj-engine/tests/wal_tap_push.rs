@@ -33,6 +33,39 @@ struct Received {
     bodies: Vec<String>,
     /// `Authorization` header of the last request, if any.
     last_auth: Option<String>,
+    /// `_id` → highest `version` this target currently holds, maintained only
+    /// in [`TargetSemantics::ExternalVersioning`].
+    versions: HashMap<String, u64>,
+}
+
+/// How the stub answers a `_bulk`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetSemantics {
+    /// `{"took":1,"errors":false,"items":[]}` — everything is accepted.
+    ///
+    /// Fine for "did the bytes arrive", useless for the design's central
+    /// safety claim, because it makes the whole `errors == true` branch of
+    /// `send_bulk` dead code.
+    AlwaysAccept,
+    /// Elasticsearch's `version_type: external` rule, which is what the tap's
+    /// at-least-once story rests on: an action applies only if its `version`
+    /// is **strictly greater** than the one the target holds for that `_id`;
+    /// otherwise the item comes back `version_conflict_engine_exception` and
+    /// the stored document is untouched.
+    ///
+    /// This is the target the feature is designed against, and until now
+    /// nothing in the tree implemented it —
+    /// `scripts/verify-wal-tap.sh` runs two real xerj nodes, and xerj's own
+    /// `_bulk` ignores per-action `version` / `version_type` (only the
+    /// single-doc path honours them, `es_compat.rs:2990`), so even the
+    /// end-to-end script exercised precisely the target that ignores the
+    /// mechanism.
+    ExternalVersioning,
+    /// External versioning against a target that already holds a *higher*
+    /// version for every `_id` — a second writer got there first. Every action
+    /// is a rejected no-op, and the tap must say so rather than report a
+    /// healthy zero-lag stream.
+    ExternalVersioningAheadBy(u64),
 }
 
 struct StubTarget {
@@ -43,6 +76,10 @@ struct StubTarget {
 
 impl StubTarget {
     async fn start() -> Self {
+        Self::start_with(TargetSemantics::AlwaysAccept).await
+    }
+
+    async fn start_with(semantics: TargetSemantics) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let received = Arc::new(Mutex::new(Received::default()));
@@ -54,7 +91,7 @@ impl StubTarget {
                 };
                 let sink = sink.clone();
                 tokio::spawn(async move {
-                    let _ = serve_one(stream, sink).await;
+                    let _ = serve_one(stream, sink, semantics).await;
                 });
             }
         });
@@ -63,6 +100,12 @@ impl StubTarget {
             received,
             _task: task,
         }
+    }
+
+    /// The document set the target actually holds, `_id` → version. Only
+    /// meaningful for the external-versioning semantics.
+    fn stored_versions(&self) -> HashMap<String, u64> {
+        self.received.lock().unwrap().versions.clone()
     }
 
     /// Every `_bulk` action line the target has seen, paired with the source
@@ -104,9 +147,78 @@ impl StubTarget {
     }
 }
 
+/// Apply one `_bulk` NDJSON body under [`TargetSemantics::ExternalVersioning`]
+/// and return the ES-shaped response body.
+///
+/// Deliberately implements the ES rule and not a friendlier one: an `index`
+/// action with `version_type: external` applies iff `version > stored`, a
+/// `delete` the same, and a rejection is
+/// `{"status":409,"error":{"type":"version_conflict_engine_exception", …}}`
+/// with the stored document left alone.
+fn apply_external_versioning(body: &str, held: &mut HashMap<String, u64>, ahead_by: u64) -> String {
+    let mut items = Vec::new();
+    let mut errors = false;
+    let mut lines = body.lines();
+    while let Some(meta_line) = lines.next() {
+        if meta_line.trim().is_empty() {
+            continue;
+        }
+        let meta: Value = serde_json::from_str(meta_line).expect("action line");
+        let (action, spec) = meta
+            .as_object()
+            .and_then(|o| o.iter().next())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .expect("action object");
+        if action != "delete" {
+            // Consume the source line.
+            let _ = lines.next().expect("source line");
+        }
+        let id = spec["_id"].as_str().unwrap_or_default().to_string();
+        let index = spec["_index"].as_str().unwrap_or_default().to_string();
+        let incoming = spec["version"].as_u64().unwrap_or(0);
+        assert_eq!(
+            spec["version_type"], "external",
+            "the tap must send external versioning or none of this applies"
+        );
+
+        // `ahead_by > 0` models a second writer that got to this target
+        // first: seed a version the tap can never beat.
+        let stored = *held.entry(id.clone()).or_insert(incoming + ahead_by);
+        if incoming > stored {
+            held.insert(id.clone(), incoming);
+            let result = if action == "delete" {
+                "deleted"
+            } else {
+                "created"
+            };
+            items.push(json!({action: {
+                "_index": index, "_id": id, "_version": incoming,
+                "result": result,
+                "status": 201,
+            }}));
+        } else {
+            errors = true;
+            items.push(json!({action: {
+                "_index": index, "_id": id, "_version": stored, "status": 409,
+                "error": {
+                    "type": "version_conflict_engine_exception",
+                    "reason": format!(
+                        "[{id}]: version conflict, current version [{stored}] is higher \
+                         or equal to the one provided [{incoming}]"),
+                },
+            }}));
+        }
+    }
+    json!({"took": 1, "errors": errors, "items": items}).to_string()
+}
+
 /// Read one HTTP request, record the body, answer with an ES-shaped `_bulk`
 /// response.
-async fn serve_one(mut stream: TcpStream, sink: Arc<Mutex<Received>>) -> std::io::Result<()> {
+async fn serve_one(
+    mut stream: TcpStream,
+    sink: Arc<Mutex<Received>>,
+    semantics: TargetSemantics,
+) -> std::io::Result<()> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -137,18 +249,35 @@ async fn serve_one(mut stream: TcpStream, sink: Arc<Mutex<Received>>) -> std::io
             k.eq_ignore_ascii_case("authorization")
                 .then(|| v.trim().to_string())
         });
-        {
+        let payload = {
             let mut guard = sink.lock().unwrap();
-            guard.bodies.push(body);
             guard.last_auth = auth;
-        }
-        let payload = br#"{"took":1,"errors":false,"items":[]}"#;
+            let response = match semantics {
+                TargetSemantics::AlwaysAccept => {
+                    r#"{"took":1,"errors":false,"items":[]}"#.to_string()
+                }
+                TargetSemantics::ExternalVersioning => {
+                    let mut held = std::mem::take(&mut guard.versions);
+                    let out = apply_external_versioning(&body, &mut held, 0);
+                    guard.versions = held;
+                    out
+                }
+                TargetSemantics::ExternalVersioningAheadBy(n) => {
+                    let mut held = std::mem::take(&mut guard.versions);
+                    let out = apply_external_versioning(&body, &mut held, n);
+                    guard.versions = held;
+                    out
+                }
+            };
+            guard.bodies.push(body);
+            response
+        };
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             payload.len()
         );
         stream.write_all(resp.as_bytes()).await?;
-        stream.write_all(payload).await?;
+        stream.write_all(payload.as_bytes()).await?;
         stream.flush().await?;
         break;
     }
@@ -514,30 +643,355 @@ async fn batch_limits_split_the_stream_instead_of_dropping_it() {
 /// that stalls the shard silently and forever — the worst failure mode a WAL
 /// consumer can have, because `_stats` would show a healthy tap shipping
 /// nothing.
+///
+/// **No `tick()` between the delete and the recreate.** That is the whole
+/// point: the default poll interval is 500 ms, so in production a
+/// `DELETE` + `PUT` is essentially never observed as an absence, and a test
+/// that inserts a poll there proves only that the hygiene path works. The
+/// deletion itself has to drop the cursor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recreating_an_index_under_the_same_name_does_not_stall_the_tap() {
     let target = StubTarget::start().await;
     let dir = TempDir::new().unwrap();
     let engine = engine_with_tap(&dir, tap_config(&target.url, &["edge-logs"]));
 
-    write_docs(&engine, "edge-logs", &["1"]).await;
+    // Enough documents that the surviving cursor is a long way into the file:
+    // a one-document cursor could land back inside the recreated stream by
+    // luck and hide the bug.
+    let ids: Vec<String> = (1..=40).map(|i| format!("old-{i}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    write_docs(&engine, "edge-logs", &refs).await;
     engine.wal_tap.tick(&engine).await;
-    assert_eq!(target.indexed_ids("edge-logs"), vec!["1"]);
+    assert_eq!(target.indexed_ids("edge-logs").len(), 40);
+    let stale_offset = engine.wal_tap.cursors()["edge-logs"]
+        .values()
+        .map(|c| c.offset)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        stale_offset > 16,
+        "the cursor must actually be somewhere inside the WAL for this to mean anything"
+    );
 
+    // Delete and recreate WITHOUT a poll in between — one 500 ms interval.
     engine.delete_index("edge-logs").await.unwrap();
-    // The tick that observes the deletion forgets the stale cursor.
-    engine.wal_tap.tick(&engine).await;
     assert!(
         !engine.wal_tap.cursors().contains_key("edge-logs"),
-        "the cursor of a deleted index must not outlive it"
+        "the deletion itself must drop the cursor: a poll would not see this"
     );
+    write_docs(&engine, "edge-logs", &["new-1", "new-2"]).await;
+
+    engine.wal_tap.tick(&engine).await;
+
+    let shipped = target.indexed_ids("edge-logs");
+    assert!(
+        shipped.contains(&"new-1".to_string()) && shipped.contains(&"new-2".to_string()),
+        "every document of the recreated index must ship — the stale byte offset {stale_offset} \
+         either skipped them silently or wedged the shard: {shipped:?}"
+    );
+    let stats = engine.wal_tap.stats();
+    let edge = stats.get("edge-logs").expect("stats for edge-logs");
+    assert!(
+        edge.last_error.is_none() && edge.healthy(),
+        "the recreated index must be healthy, got {:?}",
+        edge.last_error
+    );
+}
+
+/// The storage-level half of the same failure, for a delete this process never
+/// saw — the node was down when the index was dropped and recreated, so
+/// `forget_index` never ran and the persisted cursor outlives its stream.
+///
+/// A WAL generation file is append-only, so an offset past its end can only
+/// mean "different stream". Before this check the reader clamped the offset to
+/// EOF and reported a clean drain: every document skipped, `gaps` still 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_past_the_end_of_its_generation_is_a_gap_not_a_silent_skip() {
+    let target = StubTarget::start().await;
+    let dir = TempDir::new().unwrap();
+    let engine = engine_with_tap(&dir, tap_config(&target.url, &["edge-logs"]));
+
+    let ids: Vec<String> = (1..=40).map(|i| format!("old-{i}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    write_docs(&engine, "edge-logs", &refs).await;
+    engine.wal_tap.tick(&engine).await;
+    assert_eq!(target.indexed_ids("edge-logs").len(), 40);
+    let cursors = engine.wal_tap.cursors()["edge-logs"].clone();
+
+    // Recreate the index, then put the OLD cursor back — exactly the state a
+    // restart finds after an offline delete/recreate.
+    engine.delete_index("edge-logs").await.unwrap();
+    write_docs(&engine, "edge-logs", &["new-1", "new-2"]).await;
+    engine
+        .wal_tap
+        .restore_cursors_for_test("edge-logs", cursors);
+
+    engine.wal_tap.tick(&engine).await;
+
+    let shipped = target.indexed_ids("edge-logs");
+    assert!(
+        shipped.contains(&"new-1".to_string()) && shipped.contains(&"new-2".to_string()),
+        "a cursor past EOF must restart the stream, not clamp to EOF and skip: {shipped:?}"
+    );
+    assert!(
+        engine.wal_tap.stats()["edge-logs"].gaps > 0,
+        "…and it must be REPORTED as a gap, not absorbed silently"
+    );
+}
+
+/// The design's central safety claim, which had zero coverage: at-least-once
+/// delivery is only safe because `version_type: external` makes a redelivery
+/// converge instead of resurrecting an older document.
+///
+/// The `AlwaysAccept` stub every other test uses answers a hardcoded
+/// `{"errors":false,"items":[]}`, which makes the entire `errors == true`
+/// branch of `send_bulk` dead code — so this one implements the actual ES
+/// external-versioning rule and forces a real redelivery through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redelivery_converges_at_a_target_that_honours_external_versioning() {
+    let target = StubTarget::start_with(TargetSemantics::ExternalVersioning).await;
+    let dir = TempDir::new().unwrap();
+    let mut tap = tap_config(&target.url, &["edge-logs"]);
+    // Two documents per request, so a failure part-way through a poll leaves
+    // earlier chunks landed and forces the retry to re-send them.
+    tap.max_batch_bytes = 200;
+    tap.max_retry_backoff_secs = 1;
+    let engine = engine_with_tap(&dir, tap);
+
+    write_docs(&engine, "edge-logs", &["a", "b", "c", "d"]).await;
+    engine.wal_tap.tick(&engine).await;
+    let after_first = target.stored_versions();
+    assert_eq!(
+        after_first.len(),
+        4,
+        "all four documents must reach the target: {after_first:?}"
+    );
+
+    // Force the redelivery the at-least-once contract permits: rewind the
+    // cursor to the start of the stream and poll again. Every action is
+    // re-sent with the same seq_no as its external version.
+    engine.wal_tap.rewind_for_test("edge-logs");
+    engine.wal_tap.tick(&engine).await;
+
+    let after_redelivery = target.stored_versions();
+    assert_eq!(
+        after_redelivery, after_first,
+        "a redelivery must be a no-op at the target, not a resurrection: {after_redelivery:?}"
+    );
+
+    let stats = engine.wal_tap.stats();
+    let edge = stats.get("edge-logs").expect("stats");
+    assert!(
+        edge.version_conflicts >= 4,
+        "the redelivered actions must be REPORTED as conflicts, not silently counted as \
+         shipped (got {})",
+        edge.version_conflicts
+    );
+    assert_eq!(
+        edge.item_failures, 0,
+        "a version conflict is not a rejection — it must never be counted as one"
+    );
+}
+
+/// A target that holds a higher version for every `_id` — a second writer got
+/// there first — turns every action into a rejected no-op. `_stats` used to
+/// call that healthy with `lag_seq: 0` and a climbing `docs_shipped`, because
+/// the counters came from what was RENDERED rather than from what the target
+/// said it took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_that_rejects_every_action_is_reported_unhealthy_with_real_lag() {
+    let target = StubTarget::start_with(TargetSemantics::ExternalVersioningAheadBy(1_000)).await;
+    let dir = TempDir::new().unwrap();
+    let engine = engine_with_tap(&dir, tap_config(&target.url, &["edge-logs"]));
+
+    // Enough polls to cross the "this is not one absorbed redelivery" line.
+    for round in 0..5 {
+        write_docs(&engine, "edge-logs", &[&format!("d{round}")]).await;
+        engine.wal_tap.tick(&engine).await;
+    }
+
+    let stats = engine.wal_tap.stats();
+    let edge = stats.get("edge-logs").expect("stats for edge-logs");
+    assert!(
+        target.request_count() >= 5,
+        "the tap must actually have tried: {}",
+        target.request_count()
+    );
+    assert_eq!(
+        edge.docs_shipped, 0,
+        "nothing was accepted, so nothing may be counted as shipped"
+    );
+    assert_eq!(
+        edge.last_shipped_seq, 0,
+        "the watermark must come from ACCEPTED items — it is what lag_seq is computed \
+         from, and reporting zero lag while replicating nothing is the whole bug"
+    );
+    assert!(
+        edge.version_conflicts >= 5,
+        "the conflicts must be counted: {}",
+        edge.version_conflicts
+    );
+    assert!(
+        !edge.healthy(),
+        "a target rejecting every action must not read as healthy"
+    );
+    assert!(
+        edge.last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("version_conflict"),
+        "the operator must be told WHY: {:?}",
+        edge.last_error
+    );
+
+    let head = engine
+        .get_index("edge-logs")
+        .unwrap()
+        .current_seq_no()
+        .saturating_sub(1);
+    assert!(
+        head > edge.last_shipped_seq,
+        "lag must be non-zero (head {head}, watermark {})",
+        edge.last_shipped_seq
+    );
+}
+
+/// `PUT /_xerj/wal_tap` advertises "runtime config, no restart". That implied
+/// a durability that did not exist: the value lived only in an in-memory
+/// `RwLock`, so a restart reverted the tap to the file config — normally
+/// `enabled = false` — while cursors froze and WAL pruning carried on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_configuration_survives_a_restart() {
+    let target = StubTarget::start().await;
+    let dir = TempDir::new().unwrap();
+
+    // Boot from a file config with the tap OFF, as an operator's node would be.
+    {
+        let engine = engine_with_tap(&dir, WalTapConfig::default());
+        assert!(!engine.wal_tap.config().enabled);
+        engine
+            .wal_tap
+            .set_config(tap_config(&target.url, &["edge-*"]));
+        write_docs(&engine, "edge-logs", &["1"]).await;
+        engine.wal_tap.tick(&engine).await;
+        assert_eq!(target.indexed_ids("edge-logs"), vec!["1"]);
+    }
+
+    // Restart with the same (still-off) file config.
+    let engine = engine_with_tap(&dir, WalTapConfig::default());
+    let config = engine.wal_tap.config();
+    assert!(
+        config.enabled && config.indices == vec!["edge-*".to_string()],
+        "the configuration set at runtime must outlive the process that took it, got {config:?}"
+    );
+    assert!(engine.wal_tap.has_runtime_config());
 
     write_docs(&engine, "edge-logs", &["2"]).await;
     engine.wal_tap.tick(&engine).await;
     assert!(
         target.indexed_ids("edge-logs").contains(&"2".to_string()),
-        "a recreated index must keep shipping: {:?}",
+        "…and it must still be shipping after the restart: {:?}",
         target.actions()
+    );
+
+    // And the overlay is droppable, or one API call would shadow xerj.toml
+    // forever.
+    engine.wal_tap.clear_runtime_config(WalTapConfig::default());
+    assert!(!engine.wal_tap.config().enabled);
+    assert!(!engine.wal_tap.has_runtime_config());
+}
+
+/// Cursor state used to be serialised and durably rewritten in full on every
+/// cursor advance — once per index per poll, from three call sites in
+/// `poll_index` plus `forget_deleted`. At N allowlisted indices that is O(N²)
+/// bytes and 2N fsyncs per tick, at a 500 ms default, on a node
+/// `index_store.rs:806-813` records reaching 9,382 indices. `indices = ["*"]`
+/// walked straight into it.
+///
+/// The cost of a tick must not scale with the allowlist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_state_is_written_once_per_tick_not_once_per_index() {
+    let target = StubTarget::start().await;
+    let dir = TempDir::new().unwrap();
+    let engine = engine_with_tap(&dir, tap_config(&target.url, &["edge-*"]));
+
+    const INDICES: usize = 12;
+    for i in 0..INDICES {
+        write_docs(&engine, &format!("edge-{i}"), &["a", "b"]).await;
+    }
+
+    let before = engine.wal_tap.persists();
+    engine.wal_tap.tick(&engine).await;
+    let writes = engine.wal_tap.persists() - before;
+
+    assert!(
+        target.request_count() >= INDICES,
+        "every index must actually have shipped: {}",
+        target.request_count()
+    );
+    assert_eq!(
+        writes, 1,
+        "one tick over {INDICES} indices must cost ONE durable state write, not one \
+         per index (got {writes})"
+    );
+
+    // …and the cursors are still durable: a restart resumes rather than
+    // re-ships. Deferring the write may only ever cause a redelivery, which
+    // external versioning absorbs; it must never lose a position.
+    let shipped_before = target.request_count();
+    drop(engine);
+    let engine = engine_with_tap(&dir, tap_config(&target.url, &["edge-*"]));
+    engine.wal_tap.tick(&engine).await;
+    assert_eq!(
+        target.request_count(),
+        shipped_before,
+        "a deferred flush must still be a flush — nothing may be re-shipped after a restart"
+    );
+
+    // An idle tick writes nothing at all.
+    let idle_before = engine.wal_tap.persists();
+    engine.wal_tap.tick(&engine).await;
+    assert_eq!(
+        engine.wal_tap.persists(),
+        idle_before,
+        "an idle poll must not rewrite the state file"
+    );
+}
+
+/// The credential must not be readable back out of the config surface, and
+/// `https://user:pass@host` is the spelling that got round the `target_auth`
+/// omission — `reqwest` turns URL userinfo into a `Basic` header.
+#[test]
+fn a_target_url_carrying_credentials_is_refused_and_redacted() {
+    assert!(WalTapConfig::check_target_url("https://central:9200").is_ok());
+    assert!(WalTapConfig::check_target_url("").is_ok());
+    assert!(WalTapConfig::check_target_url("central:9200").is_err());
+
+    let reason = WalTapConfig::check_target_url("https://user:hunter2@central:9200")
+        .expect_err("userinfo must be refused");
+    assert!(
+        reason.contains("target_auth"),
+        "the error must point at the field that exists for this: {reason}"
+    );
+    // A path containing `@` is not userinfo and must still be accepted.
+    assert!(WalTapConfig::check_target_url("https://central:9200/a@b").is_ok());
+
+    let config = WalTapConfig {
+        target_url: "https://user:hunter2@central:9200".into(),
+        ..Default::default()
+    };
+    let shown = config.redacted_target_url();
+    assert!(
+        !shown.contains("hunter2") && shown.contains("central:9200"),
+        "a URL that reached the process another way must still not be readable back: {shown}"
+    );
+
+    // A whole-node config carrying one refuses to start.
+    let mut whole = Config::default();
+    whole.wal_tap.target_url = "http://user:pw@central:9200".into();
+    assert!(
+        whole.validate().is_err(),
+        "a credential-bearing target_url must fail startup, not reach the boot log"
     );
 }
 
