@@ -70,6 +70,7 @@ pub mod responses;
 pub mod router;
 pub mod state;
 pub mod stub;
+pub mod wal_tap_api;
 
 // ── Convenience re-exports ────────────────────────────────────────────────────
 
