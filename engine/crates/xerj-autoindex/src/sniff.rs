@@ -179,9 +179,10 @@ fn sniff_bytes(
     }
     // Compressed image/audio/model payloads routinely pass the NUL and
     // control-char heuristics below (windows-1252 decodes almost every byte
-    // to something printable), and a multi-MB PSD misread as prose costs
-    // ~100x its size in RAM through sectioning. Magic bytes are the reliable
-    // signal.
+    // to something printable), and a multi-MB PSD misread as prose turns into
+    // thousands of junk records — measured: a 4,194,360-byte printable blob
+    // yields 2,048 sections. `for_each_section` streams, so the cost is the
+    // record COUNT, not resident bytes. Magic bytes are the reliable signal.
     //
     // Every signature ADDED BY THIS BRANCH whose bytes are printable ASCII
     // carries a `qualify` check as well, because "starts with these letters"
@@ -296,8 +297,10 @@ fn sniff_bytes(
     // TGA is now caught by its header above, which is evidence of pixel data
     // rather than evidence of a non-Latin script. Headerless raw payloads
     // (`.raw`, `.bytes`, uncompressed PCM) still classify as text, exactly as
-    // they do on `main`; bounding sectioning memory is the fix for that, not
-    // byte statistics that cannot tell a texture from Cyrillic.
+    // they do on `main`. Bounding what a magic-less binary costs is the right
+    // fix for that (issue #381 — sectioning already streams, so the unbounded
+    // quantity is the record count), not byte statistics that cannot tell a
+    // texture from Cyrillic.
 
     // 2b. Unity text serialization, detected by content (never extension):
     // scenes/prefabs/assets open with `%YAML` and declare the Unity tag
@@ -881,9 +884,10 @@ mod unity_sniff_tests {
     }
 
     /// Regression: PSD image data decoded via lossy windows-1252 passed the
-    /// NUL/control-char heuristics and classified as txt-prose, turning a
-    /// multi-MB texture into ~100x its size of prose sections. Media magic
-    /// bytes must win before any text heuristic runs.
+    /// NUL/control-char heuristics and classified as txt-prose, shredding a
+    /// multi-MB texture into thousands of junk prose records (a 4 MB blob
+    /// yields ~2,048 sections). Sectioning streams, so the cost is record
+    /// count, not RAM. Media magic bytes must win before any text heuristic.
     #[test]
     fn media_containers_are_binary_by_magic_not_heuristics() {
         for (name, head, kind) in [

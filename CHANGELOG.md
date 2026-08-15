@@ -288,8 +288,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What replaces it is `looks_like_tga_header`: TGA has no magic number, but its
   18-byte header is constrained enough that bytes 1 and 2 of the file must both
   be control characters. **Headerless raw payloads (`.raw`, `.bytes`,
-  uncompressed PCM) still classify as text**, exactly as they do on `ca4d75a`;
-  bounding sectioning memory is the fix for that, and is not attempted here.
+  uncompressed PCM) still classify as text**, exactly as they do on `ca4d75a`.
+  Bounding what a magic-less binary costs is the fix for that and is not
+  attempted here — see [#381](https://github.com/xerj-org/xerj/issues/381);
+  `for_each_section` already streams, so the unbounded quantity is the record
+  count, not resident memory.
 
 - **The new magic-byte signatures now require structural confirmation.** Nine
   signatures (PSD, both TIFF byte orders, RIFF, OGG, FLAC, MP3, FBX and EXR)
