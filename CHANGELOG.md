@@ -94,6 +94,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`sort` on an ES meta-field other than `_score` / `_doc` / `_id` resolved to
+  `null` on every hit** ([#401](https://github.com/xerj-org/xerj/issues/401)).
+  `compute_sort_values` special-cased exactly those three keys and sent
+  everything else to `get_field_value(source, field)` — a lookup *inside*
+  `_source`. `_seq_no`, `_version`, `_primary_term` and `_index` are engine
+  metadata and are never literal `_source` keys, so the lookup missed on every
+  document and the whole result set tied on `[null]`. The damage lands on
+  keyset pagination: `search_after: [null]` is never strictly greater than the
+  next hit's `[null]`, so `sort: [{"_seq_no":"asc"}]` + `search_after` — the
+  consistent full-scan pattern used for migrations — either re-reads page one
+  forever or stops after it, with no error either way. Measured on a 30-document
+  index before the fix: 4 ids collected out of 30, page two empty.
+
+  These fields now resolve through the same version-map accessors that populate
+  the response meta-fields (`lookup_seq_no` / `lookup_version`), so a hit's
+  `sort` value and its `_seq_no` / `_version` agree. `_primary_term` is the
+  constant `1` the hit meta-field already emits and `_index` is the index name;
+  both are constant within one index, so they tie like any other constant sort
+  key and a client paginating on them still needs a tie-breaker. Sorting on
+  `_seq_no` under `index.disable_sequence_numbers` is unchanged — es_compat
+  rejects it at the API edge before the request reaches the engine.
+
+  Real sort values are only half of it: the memtable's bounded sort-candidate
+  path narrows the heap's input using a doc-values column keyed by the sort
+  field, which for a meta-field is derived from `_source` rather than from the
+  version map the heap now ranks on. With no such key present it classified
+  every buffered document as "missing the field" and returned an arbitrary
+  `materialisation_limit`-sized prefix. A correctly ranked page over a wrong
+  candidate set is still a silently wrong page, so that path — and the
+  segment-side sort shadow — now decline meta-fields and take the full walk.
+  The same gate fixes an independent instance of the identical defect on `_id`,
+  which already resolved to a real sort value: over a 2 000-document memtable
+  `sort: [{"_id":"desc"}]` returned
+  `["d1995","d1989","d1981","d1973","d1961"]` instead of
+  `["d1999","d1998","d1997","d1996","d1995"]`.
+
+  There is a third such prefilter, and it is the one the two gates above route
+  meta-sorts *onto*: the memtable scan's pre-clone rejection
+  (`memtable_primary_key_rejects`) skips a document whose primary sort key,
+  read from `_source`, already loses to the full heap. Once the heap ranks on
+  version-map metadata, a document carrying a `_source` key of the same name
+  is compared against the wrong frontier and dropped before the heap ever sees
+  it. Measured over ES-compat HTTP on 2 000 documents where only `d0000`
+  carried `"_seq_no": 10000000`: `{"size":5,"sort":[{"_seq_no":"asc"}]}`
+  returned `[d0001, d0002, d0003, d0004, d0005]`, omitting the true first
+  document, while `"size": 3000` returned it — a silent, size-dependent
+  missing document. That path now declines meta-fields too.
+
+  **Behaviour change:** `sort` on `_seq_no` / `_version` / `_primary_term` /
+  `_index` now ignores a `_source` key of the same name and always ranks on
+  engine metadata. Previously it ranked on the `_source` value where one
+  existed and on `null` everywhere else. This is observable because xerj —
+  unlike Elasticsearch, which rejects a metadata-named key inside a document
+  with a `document_parsing_exception` — accepts `{"_seq_no": 1}` in a document
+  body and echoes it back in `_source`. Such a key is now inert for sorting;
+  it is still stored, still returned in `_source`, and still usable for
+  ordinary queries. Rejecting metadata-named `_source` keys at the API edge is
+  deliberately **not** part of this change — xerj writes `_routing` into
+  `_source` itself, so the edge rule needs its own design.
+
 - **`xerj autoindex` aborted a whole run when one file declared two or more SQL
   tables** ([#360](https://github.com/xerj-org/xerj/issues/360)). One file can
   feed several datasets — a SQL dump is one file and N tables — but the sealed
