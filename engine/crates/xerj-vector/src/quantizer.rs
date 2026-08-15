@@ -317,10 +317,11 @@ impl Quantizer for Scalar8Quantizer {
 /// This is the serving-path counterpart to [`Scalar8Quantizer`]: instead of
 /// packing a whole batch into one blob, it exposes a fitted codec that the
 /// engine keeps *per dense_vector field*. The engine stores one shared
-/// `Sq8Params` (fitted from the first ~1000 ingested vectors for the field)
-/// plus a `doc_id -> Vec<u8>` code map, so the brute-force kNN scan reads
-/// **1 byte/dim** instead of the 4 bytes/dim an f32 vector costs — a ~4×
-/// reduction on the quantized field's vector working set.
+/// `Sq8Params` per field (fitted from the first ~1000 vectors the field is
+/// scanned with) and nothing else — the brute-force kNN scan quantizes each
+/// candidate's current vector through it and dequantizes straight back, so
+/// scores come from **1 byte/dim** codes without any per-document code cache
+/// that could go stale after an update (issue #371).
 ///
 /// `mins[d]`/`scales[d]` are the per-dimension minimum and range (`max-min`)
 /// observed in the fitting sample. `encode` maps `v[d]` linearly to a u8 in
@@ -380,18 +381,30 @@ impl Sq8Params {
     /// Encode a full-precision vector to one u8 per dimension.
     #[inline]
     pub fn encode(&self, v: &[f32]) -> Vec<u8> {
-        v.iter()
-            .enumerate()
-            .map(|(d, &x)| {
-                let min = self.mins.get(d).copied().unwrap_or(0.0);
-                let scale = self.scales.get(d).copied().unwrap_or(0.0);
-                if scale == 0.0 {
-                    return 0u8;
-                }
-                let normalized = (x - min) / scale;
-                (normalized * 255.0).round().clamp(0.0, 255.0) as u8
-            })
-            .collect()
+        let mut out = vec![0u8; v.len()];
+        self.encode_into(v, &mut out);
+        out
+    }
+
+    /// Encode into a caller-provided buffer, avoiding per-document allocation
+    /// on the hot kNN scan. `out` must be at least `v.len()` long.
+    ///
+    /// This is the counterpart to [`Sq8Params::decode_into`]: the scan
+    /// quantizes each candidate's current vector and dequantizes it straight
+    /// back, so a `scalar8` score is computed from 1-byte-per-dimension codes
+    /// without anything having to cache those codes per document.
+    #[inline]
+    pub fn encode_into(&self, v: &[f32], out: &mut [u8]) {
+        for (d, &x) in v.iter().enumerate() {
+            let min = self.mins.get(d).copied().unwrap_or(0.0);
+            let scale = self.scales.get(d).copied().unwrap_or(0.0);
+            if scale == 0.0 {
+                out[d] = 0u8;
+                continue;
+            }
+            let normalized = (x - min) / scale;
+            out[d] = (normalized * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
     }
 
     /// Decode a code slice back to approximate f32 values (allocating).
@@ -740,7 +753,10 @@ mod tests {
         }
     }
 
-    /// (b) MEMORY: the SQ8 code store is ~4× smaller than the f32 equivalent.
+    /// (b) MEMORY: SQ8 codes are ~4× smaller than the f32 vectors they encode.
+    /// This is a property of the codec, measured here on the codec. The engine
+    /// does not currently realize it as a resident saving on the kNN path — see
+    /// the note on [`Sq8Params`].
     #[test]
     fn sq8_store_is_quarter_of_f32() {
         let n = 2000usize;

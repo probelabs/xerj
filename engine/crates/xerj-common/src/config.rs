@@ -275,11 +275,14 @@ impl Config {
             ));
         }
 
-        // Vector: `scalar8` (SQ8) quantization is now wired into the kNN
-        // serving path (`Index::run_knn_brute_force`): a `scalar8` dense_vector
-        // field keeps a per-field u8 code store (1 byte/dim vs 4) and scores
-        // candidates by decoding those codes, giving a real ~4× reduction on
-        // that field's vector working set. `none` and `scalar8` are therefore
+        // Vector: `scalar8` (SQ8) quantization is wired into the kNN serving
+        // path (`Index::run_knn_brute_force`): a `scalar8` dense_vector field
+        // scores candidates from 1-byte-per-dimension codes rather than their
+        // f32 values, so it has the recall profile of SQ8. It does not reduce
+        // resident memory today — the scan quantizes each candidate's current
+        // vector per query rather than caching codes, which is what keeps an
+        // updated document from being scored on a stale code (#371).
+        // `none` and `scalar8` are therefore
         // accepted. `binary` (1-bit) has no implemented quantizer, so honouring
         // it would silently store full-precision vectors while claiming a 32×
         // saving — it stays rejected until a BinaryQuantizer lands.

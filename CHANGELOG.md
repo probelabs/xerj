@@ -21,6 +21,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hits and every ES-compat response field are unchanged, and the hint stays
   quiet when the same request already reaches the vector through `semantic`
   or `knn` (including the ES 8.x top-level `knn` block).
+- **A `quantization: "scalar8"` (`int8_hnsw`) vector field scored updated
+  documents from stale quantized codes, silently, forever**
+  ([#371](https://github.com/xerj-org/xerj/issues/371)).
+  The per-field SQ8 code store was populated write-once: the first kNN that
+  observed a document computed its codes and nothing ever recomputed them — not
+  an update, not a delete-and-reindex, not a merge. Overwrite a document's
+  vector and it kept the ranking it had at first sight.
+
+  Reproduced at the HTTP boundary before the fix, on an 8-dimension cosine
+  field, against a byte-identical full-precision control index: doc `0` starts
+  as the query vector itself and is rewritten with its exact negation (true
+  cosine -1). The control drops it as it must. The `scalar8` index returned it
+  at `_score` **0.99999774** — the same value, to the last bit, as before the
+  rewrite, with the entire 20-document score list unchanged — while
+  `GET /{index}/_doc/0` confirmed `_source` had taken the negation. Both
+  `PUT /{index}/_doc/{id}` and `_bulk` were affected; `_bulk` was untested in
+  the original report.
+
+  The fix removes the per-document cache rather than adding invalidation to it.
+  The brute-force scan already holds each candidate's live f32 vector — it just
+  read it out of `_source` to apply the filter — so it now quantizes and
+  dequantizes on the spot through a new `Sq8Params::encode_into`, into two
+  buffers reused across the scan (no per-document allocation). Only the fitted
+  per-dimension min/scale codebook is kept between queries, behind an `Arc` the
+  scan clones so it holds no lock while scoring. `scalar8` still scores from
+  1-byte-per-dimension codes, so its recall profile is unchanged; what changes
+  is that the code being scored is always the document's current vector.
+
+  Three defects in the same object went with it: unbounded growth (the map had
+  no eviction and no upper bound — one entry per document ever queried, for the
+  life of the process), an exclusive write lock taken on the query path on
+  *every* kNN over the field, and a codebook that could be fitted from an empty
+  candidate set — a single query with a wrong-length vector installed an
+  all-zero-scale codec that every later score on that field collapsed onto.
+
+  Not closed by this change: `scalar8` still reads the full-precision vector
+  from `_source` on every query, so it does not reduce resident memory today.
+  Making it do so means the ordinal-addressed, ingest-time code array described
+  in #371 — codes written next to the data they describe, as Lucene does it —
+  which is a separate change. The "~4× smaller vector working set" wording in
+  `ES_COMPATIBILITY.md` described the cache that has been removed and has been
+  corrected there rather than left standing.
 
 ## [1.0.0-rc.17] - 2026-08-15
 
