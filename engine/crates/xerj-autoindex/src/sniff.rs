@@ -195,8 +195,10 @@ fn sniff_bytes(
     // Two printable signatures remain unqualified — `GIF8` and `BM` — and both
     // have the same defect. They are NOT new: they are unchanged from
     // `ca4d75a` and were measured to classify identically on both trees, so
-    // fixing them is a separate behaviour change and is filed as a follow-up
-    // rather than smuggled into a Unity PR.
+    // fixing them is a separate behaviour change and is filed as #380 rather
+    // than smuggled into a Unity PR. Today's wrong answers are pinned by
+    // `printable_magic_regression_tests::gif8_and_bm_are_still_taken_on_faith`,
+    // so #380 has to come here and flip that assertion deliberately.
     //
     // Qualifying a magic number is the
     // rule Lucene applies to its own containers: `CodecUtil.checkHeader`
@@ -381,8 +383,8 @@ pub const WINDOWS_1252_LOSSY: &str = "windows-1252 (lossy)";
 /// ASCII, so prose or a CSV header beginning with those characters is junked
 /// as an image. Both predate this branch — they are unchanged from `ca4d75a`
 /// and measured identical on both trees — so they are left alone here rather
-/// than widened into an unrelated behaviour change, and are tracked as a
-/// follow-up. Do not read this function as a proof that its callers are safe;
+/// than widened into an unrelated behaviour change, and are tracked as #380.
+/// Do not read this function as a proof that its callers are safe;
 /// it is only a statement that no *further* check is performed.
 fn accept(_prefix: &[u8]) -> bool {
     true
@@ -648,9 +650,11 @@ fn txt_kind(nonblank: &[&str]) -> Family {
     // check ("mostly non-ASCII under the windows-1252 fallback") was tried and
     // removed in the same breath as this one and for the same reason: it
     // junked Cyrillic, Greek, Hebrew, Arabic and mixed Japanese prose.
-    // Bounding sectioning memory is the right fix for the RAM concern;
-    // silently deleting files that look unusual is not. Tracked as a
-    // follow-up.
+    // Bounding what a magic-less binary costs is the right fix for the concern
+    // those guards existed for; silently deleting files that look unusual is
+    // not. Tracked as #381, which measures the gap this NOTE leaves open: a
+    // 4,194,495-byte printable NUL-free blob sniffs `txt-prose` and expands
+    // into 2048 indexed records.
     let avg_len = nonblank.iter().map(|l| l.len()).sum::<usize>() as f64 / nonblank.len() as f64;
     if avg_len > 60.0 {
         return Family::TxtProse;
@@ -956,6 +960,20 @@ mod unity_sniff_tests {
                 "fbx",
                 "Kaydara FBX Binary is the 20-byte magic that opens every binary \
                  FBX file exported by Autodesk tools. ",
+            ),
+            // The DOUBLE-space variant is the dangerous one and was previously
+            // only measured by hand, never pinned. `fbx_header` requires the
+            // real 23-byte header `Kaydara FBX Binary  \x00\x1a\x00`, and the
+            // two spaces ARE part of it — so this sentence satisfies 20 of
+            // those 23 bytes and is refused only at offset 20, where the
+            // header needs `\x00` and prose has a letter. The one-space
+            // fixture above is refused one byte earlier, at offset 19. Both
+            // match the 18-byte table entry itself in full; the qualifier is
+            // the only thing that keeps either of them out of `Family::Binary`.
+            (
+                "fbx-two-space",
+                "Kaydara FBX Binary  is followed by a NUL and 0x1a in the real \
+                 header, which is what this note is about. ",
             ),
         ] {
             let text = opener.repeat(30);
@@ -1294,6 +1312,81 @@ mod unity_sniff_tests {
         )
         .unwrap();
         assert_eq!(sn.family, Family::Binary);
+    }
+}
+
+/// Characterisation of a KNOWN, PRE-EXISTING defect, tracked as #380.
+///
+/// Every other printable-ASCII signature in the magic table carries a
+/// structural qualifier. `GIF8` and `BM` do not: they pass `accept`, which
+/// returns `true` without looking at a single byte. So text beginning with
+/// those characters is classified `Family::Binary` and `scan_file` junks it.
+///
+/// This module asserts the WRONG answer on purpose. The behaviour is not
+/// introduced by this branch — on `origin/main` the same two entries sit in a
+/// loop with no qualifier at all (`if prefix.starts_with(magic)`), so the
+/// control flow to `Family::Binary` is identical and cannot differ — and
+/// fixing it is a behaviour change with no Unity content. Pinning it here is
+/// what stops the CHANGELOG's "known issue" wording from being the only record
+/// of it: whoever fixes #380 must come to this file and flip these assertions,
+/// which is the point.
+#[cfg(test)]
+mod printable_magic_regression_tests {
+    use super::*;
+
+    #[test]
+    fn gif8_and_bm_are_still_taken_on_faith() {
+        // Prose, and a well-formed CSV whose first column header happens to be
+        // `GIF8`. All four are text. All four are reported as images.
+        for (label, bytes, name, kind) in [
+            (
+                "gif8-prose",
+                "GIF8 is the four byte magic that opens a GIF image file. "
+                    .repeat(30)
+                    .into_bytes(),
+                "notes.txt",
+                "gif",
+            ),
+            (
+                "gif89a-prose",
+                "GIF89a is the version string of the second GIF spec. "
+                    .repeat(30)
+                    .into_bytes(),
+                "notes.txt",
+                "gif",
+            ),
+            (
+                "bm-prose",
+                "BM is the two byte magic that opens a Windows bitmap file. "
+                    .repeat(30)
+                    .into_bytes(),
+                "notes.txt",
+                "bmp",
+            ),
+            (
+                "gif8-csv",
+                b"GIF8,name,value\n1,alpha,2\n3,beta,4\n5,gamma,6\n7,delta,8\n".to_vec(),
+                "t.csv",
+                "gif",
+            ),
+        ] {
+            let p = Path::new(name);
+            let sn = sniff_bytes(&bytes, p, p, false).unwrap();
+            assert_eq!(
+                sn.family,
+                Family::Binary,
+                "{label}: if this now says text, #380 has been fixed — delete \
+                 this module, drop the CHANGELOG known-issue bullet, clear the \
+                 remaining `#380` mentions in this file (`grep -n '#380'`), and \
+                 close the issue"
+            );
+            assert_eq!(
+                sn.binary_kind.as_deref(),
+                Some(kind),
+                "{label}: pinned so a change in WHICH wrong answer is given is \
+                 also caught"
+            );
+        }
     }
 }
 

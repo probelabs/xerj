@@ -331,8 +331,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first column header is `GIF8`, and prose opening `BM` were each measured to
   classify as `binary`/`gif` and `binary`/`bmp` on `ca4d75a` **and** on this
   branch, identically. Fixing them changes behaviour unrelated to Unity, so it
-  is filed as a follow-up rather than smuggled in here. `GIF8` is listed
-  alongside `BM` so the next reader does not conclude `BM` is the only one.
+  is filed as **#380** rather than smuggled in here, and today's wrong answers
+  are pinned by `gif8_and_bm_are_still_taken_on_faith` so #380 has to flip that
+  assertion deliberately. `GIF8` is listed alongside `BM` so the next reader
+  does not conclude `BM` is the only one.
 
 - **A junk entry could overwrite a successfully indexed file's catalog row.**
   When phase B met a record group phase A never sampled, the worker pushed a
@@ -363,7 +365,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identical on `ca4d75a` and on this branch (`binary`/`gif` and `binary`/`bmp`
   in both) — and is left unchanged because fixing it is a behaviour change with
   no Unity content. Both names are recorded here on purpose: `BM` is the
-  obvious one and `GIF8` is the one a reader would otherwise miss. Follow-up.
+  obvious one and `GIF8` is the one a reader would otherwise miss. Tracked as
+  **#380**; `gif8_and_bm_are_still_taken_on_faith` pins the current behaviour.
+
+- **A magic-less binary is still sectioned and indexed in full.** The two
+  byte-statistics guards this branch removed (they junked non-Latin text) also
+  caught NUL-free binary payloads that decode printable under the
+  windows-1252 fallback. Nothing replaced them except `looks_like_tga_header`,
+  which covers TGA only. Measured on this branch: a 4,194,495-byte printable
+  NUL-free blob named `texture.bytes` sniffs `txt-prose` and expands into 2048
+  indexed records. This is **not** the peak-RSS bug from #239 —
+  `for_each_section` is still streaming and per-file memory is still bounded;
+  the unbounded quantity is the record COUNT. Removing the guards was still
+  right: they deleted CJK, Cyrillic, Greek, Hebrew and Arabic documents
+  worldwide. Tracked as **#381**.
 
 ## [1.0.0-rc.16] - 2026-08-13
 
