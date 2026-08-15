@@ -24668,9 +24668,11 @@ pub async fn put_ingest_pipeline(
                     // translation, where it applies to ES processors only and
                     // is written down explicitly instead of being a default
                     // two layers away.
-                    if !cfg.contains_key("override") {
-                        cfg.insert("override".to_string(), json!(true));
-                    }
+                    //
+                    // `entry(..).or_insert(..)` rather than a
+                    // `contains_key` guard: an `override` the caller DID
+                    // write must survive untouched, including `false`.
+                    cfg.entry("override").or_insert(json!(true));
                 }
                 _ => {}
             }
