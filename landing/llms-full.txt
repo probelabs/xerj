@@ -141,6 +141,19 @@ Content types:
       air-gapped or policy-constrained hosts, pre-download them and set
       `embedding.local_model_dir`; nothing is then fetched.
 
+- Scroll is a BOUNDED SNAPSHOT, not a cursor — the ceiling is
+  <!-- generated:scroll-snapshot-cap -->10,000<!-- /generated:scroll-snapshot-cap --> documents.
+  `_search?scroll=` materialises the entire result set into the scroll context up front,
+  so a query whose EXACT total exceeds that ceiling is refused with a 400
+  `illegal_argument_exception` ("Scroll result set is too large: [N] matching documents
+  exceed the scroll snapshot window of [<the ceiling above>] ...") rather than paged and
+  silently truncated. Nothing is lost, but nothing is returned either: read a result set
+  of any size with `search_after` on a unique sort key, which is unbounded. Assume this
+  is the case you are in — the tooling that reaches for scroll (`helpers.scan()`, reindex
+  and export scripts) reads whole indices, and whole indices are usually larger than the
+  cap. So the accurate compatibility claim is "scroll is supported, with a bounded
+  snapshot cap; use `search_after` beyond that", NOT "scroll is supported".
+
 - Default `_search` source is compact. When `_source` is omitted, ordinary source fields
   are returned but engine-generated `<field>_vector` and `<field>_vector_chunks` companions
   are omitted. Explicit `_source: true`, field lists, and include/exclude projections are
@@ -789,6 +802,7 @@ Search:
   POST/GET /{index}/_validate/query       validate a query
   GET/POST /{index}/_explain/{id}         score explanation for one doc
   POST     /{index}/_search_scroll  POST/DELETE /_search/scroll   scrolling
+                                          (bounded snapshot — see the cap in §2)
   POST     /{index}/_pit  DELETE /_pit    point-in-time
   POST     /{index}/_terms_enum           terms autocomplete
   POST     /_sql   POST /{index}/_eql/search   SQL / EQL (compatibility surface)

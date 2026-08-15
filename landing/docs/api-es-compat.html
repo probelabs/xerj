@@ -163,6 +163,18 @@
     <div class="cell dsc">NDJSON bulk. Actions: <code class="inline">index</code>, <code class="inline">create</code>, <code class="inline">update</code>, <code class="inline">delete</code>.</div>
 
     <div class="cell m">POST</div>
+    <div class="cell p">/:index/_search?scroll=</div>
+    <div class="cell dsc">Open a scroll. Bounded snapshot — see <a href="#scroll-cap">the cap</a>.</div>
+
+    <div class="cell m">POST</div>
+    <div class="cell p">/_search/scroll</div>
+    <div class="cell dsc">Next page of an open scroll, by <code class="inline">scroll_id</code>.</div>
+
+    <div class="cell m">DELETE</div>
+    <div class="cell p">/_search/scroll</div>
+    <div class="cell dsc">Release a scroll context.</div>
+
+    <div class="cell m">POST</div>
     <div class="cell p">/:index/_delete_by_query</div>
     <div class="cell dsc">Streaming delete. Respects the query's filter context.</div>
 
@@ -174,6 +186,32 @@
     <div class="cell p">/_cat/indices</div>
     <div class="cell dsc">Human-readable index listing.</div>
   </div>
+
+  <h2 id="scroll-cap">Scroll is a bounded snapshot, not a cursor</h2>
+
+  <p>Elasticsearch's scroll walks segments as it goes. XERJ's does not: the opening <code class="inline">_search?scroll=</code> materialises the whole result set into the scroll context up front and later pages read that snapshot. So the context has a ceiling, and it is the one thing to know before pointing export tooling at it — <!-- generated:scroll-snapshot-cap -->10,000<!-- /generated:scroll-snapshot-cap --> documents. A query whose <em>exact</em> total exceeds it is refused with a <code class="inline">400 illegal_argument_exception</code> instead of being paged and silently truncated. Read a result set of any size with <code class="inline">search_after</code> on a unique sort key — that path is unbounded.</p>
+
+  <p>This is the common case, not the corner case: <code class="inline">helpers.scan()</code> in <code class="inline">elasticsearch-py</code>, reindex internals, and most export and backup tooling all scroll a whole index, and whole indices are usually bigger than the cap.</p>
+
+<pre class="code"># 11,450 documents in `logs` — over the cap, so the scroll never opens
+$ curl -sX POST 'http://localhost:9200/logs/_search?scroll=1m' \
+    -H 'Content-Type: application/json' \
+    -d '{"size":1000,"query":{"match_all":{}}}'
+{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"Scroll result
+set is too large: [11450] matching documents exceed the scroll snapshot window of
+[<!-- generated:scroll-snapshot-cap -->10000<!-- /generated:scroll-snapshot-cap -->]. xerj materialises the full scroll snapshot up front and will
+not return a silently truncated result set. Page with [search_after] on a unique
+sort key instead, or narrow the query."}], ... },"status":400}
+
+# the unbounded path — sort on a unique key, then feed the last hit's `sort`
+# value back as `search_after` until a page comes back empty
+$ curl -sX POST http://localhost:9200/logs/_search \
+    -H 'Content-Type: application/json' \
+    -d '{"size":1000,"sort":[{"_id":"asc"}],"query":{"match_all":{}}}'
+$ curl -sX POST http://localhost:9200/logs/_search \
+    -H 'Content-Type: application/json' \
+    -d '{"size":1000,"sort":[{"_id":"asc"}],"search_after":["999"],"query":{"match_all":{}}}'
+# → 12 pages, all 11,450 documents, no ceiling</pre>
 
   <h2>Bulk indexing example</h2>
 <pre class="code">$ curl -sX POST http://localhost:9200/logs/_bulk \

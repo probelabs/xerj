@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **The 10,000-document scroll snapshot cap is now published, and pinned to the
+  constant that enforces it**
+  ([#370](https://github.com/xerj-org/xerj/issues/370)). XERJ's `_search?scroll=`
+  is a bounded up-front snapshot, not a segment-walking cursor, so a query whose
+  exact result set exceeds `SCROLL_SNAPSHOT_MAX_HITS` is refused with a 400
+  rather than paged and silently truncated (#198). The refusal is the right
+  behaviour and its message already names `search_after` as the way past it —
+  but the ceiling appeared in no user-facing document, and scroll is precisely
+  what the ES ecosystem reaches for to read a *whole* index
+  (`elasticsearch-py`'s `helpers.scan()`, reindex internals, export and backup
+  tooling), where the result set is normally larger than the cap. "Scroll is
+  supported, with a 10,000-document snapshot cap; use `search_after` beyond
+  that" is a different compatibility claim from "scroll is supported", and only
+  the first one is true.
+
+  The cap, the 400 it produces and the `search_after` alternative are now stated
+  on `landing/docs/api-es-compat.html` (which also gains the three scroll
+  endpoints it never listed), in the "what needs rewriting" list on
+  `landing/docs/migration-from-es.html`, and in the honesty/capability-boundary
+  section of `landing/llms-full.txt`. Every published figure sits in a
+  `<!-- generated:scroll-snapshot-cap -->` region checked against
+  `xerj_api::es_compat::SCROLL_SNAPSHOT_MAX_HITS` by
+  `xerj-api/tests/scroll_snapshot_cap_is_documented.rs`, so changing the
+  constant now fails the build until the pages follow — the mechanism already
+  used for the capability counts in `docs_capability_lists.rs`. The same test
+  drives the real ES-compat router over a corpus one document past the cap and
+  reads the enforced number back out of the 400 the server produced, so the
+  published number is checked against the server's behaviour rather than
+  against a second hand-written copy of it.
+
+  Verified against a node built from this branch (v1.0.0-rc.17, ES-compat
+  listener on :19370, 11,450 documents in `logs`): the scroll open returns
+  `400 illegal_argument_exception` naming `[11450]`, `[10000]` and
+  `[search_after]`; a 6,012-document subset scrolls normally and returns a
+  `_scroll_id`; and `search_after` on `_id` walks all 11,450 documents over 12
+  pages of 1,000.
+
 ### Fixed
 
 - **`xerj autoindex` aborted a whole run when one file declared two or more SQL
