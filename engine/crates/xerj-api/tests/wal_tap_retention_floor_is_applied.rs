@@ -72,6 +72,13 @@ async fn a_retention_floor_set_over_http_reaches_the_live_wal_writers() {
         .get_index("already-open")
         .expect("index")
         .wal_min_retained_generations();
+    // Non-empty first: every `all(...)` below is vacuously true on an empty
+    // vec, which would make this whole test pass while reading nothing.
+    let shards = before.len();
+    assert!(
+        shards > 0,
+        "the index must have WAL shards to assert about, got {before:?}"
+    );
     assert!(
         before.iter().all(|&n| n == 0),
         "the default floor is 0, got {before:?}"
@@ -101,6 +108,7 @@ async fn a_retention_floor_set_over_http_reaches_the_live_wal_writers() {
         .get_index("already-open")
         .expect("index")
         .wal_min_retained_generations();
+    assert_eq!(after.len(), shards, "shard count must not have changed");
     assert!(
         after.iter().all(|&n| n == 3),
         "an index open BEFORE the PUT must hold the new floor on every WAL shard, got {after:?}"
@@ -115,6 +123,11 @@ async fn a_retention_floor_set_over_http_reaches_the_live_wal_writers() {
         .get_index("created-after")
         .expect("index")
         .wal_min_retained_generations();
+    assert_eq!(
+        created_after.len(),
+        shards,
+        "shard count must not have changed"
+    );
     assert!(
         created_after.iter().all(|&n| n == 3),
         "an index created AFTER the PUT must open with the floor, got {created_after:?}"
@@ -146,6 +159,7 @@ async fn a_retention_floor_set_over_http_reaches_the_live_wal_writers() {
         .get_index("already-open")
         .expect("index")
         .wal_min_retained_generations();
+    assert_eq!(reopened.len(), shards, "shard count must not have changed");
     assert!(
         reopened.iter().all(|&n| n == 3),
         "after a restart the reopened index must hold the persisted floor, not the config \
@@ -172,13 +186,17 @@ async fn deleting_the_runtime_config_releases_the_retention_floor() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(state
+    let held = state
         .engine
         .get_index("logs")
         .expect("index")
-        .wal_min_retained_generations()
-        .iter()
-        .all(|&n| n == 5));
+        .wal_min_retained_generations();
+    let shards = held.len();
+    assert!(shards > 0, "no WAL shards to assert about: {held:?}");
+    assert!(
+        held.iter().all(|&n| n == 5),
+        "the floor must be on every shard before DELETE can be shown to clear it, got {held:?}"
+    );
 
     let (status, body) = request(&app, "DELETE", "/_xerj/wal_tap", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -189,6 +207,7 @@ async fn deleting_the_runtime_config_releases_the_retention_floor() {
         .get_index("logs")
         .expect("index")
         .wal_min_retained_generations();
+    assert_eq!(released.len(), shards, "shard count must not have changed");
     assert!(
         released.iter().all(|&n| n == 0),
         "reverting to the config file must release the floor on the live writers too, \
