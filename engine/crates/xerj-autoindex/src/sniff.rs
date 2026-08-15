@@ -182,28 +182,61 @@ fn sniff_bytes(
     // to something printable), and a multi-MB PSD misread as prose costs
     // ~100x its size in RAM through sectioning. Magic bytes are the reliable
     // signal.
-    for (magic, kind) in [
-        (&b"\x89PNG"[..], "png"),
-        (&b"GIF8"[..], "gif"),
-        (&b"\xff\xd8\xff"[..], "jpeg"),
-        (&b"\x7fELF"[..], "elf"),
-        (&b"BM"[..], "bmp"),
-        (&b"\x00\x00\x01\x00"[..], "ico"),
-        (&b"8BPS"[..], "psd"),
-        (&b"II*\x00"[..], "tiff"),
-        (&b"MM\x00*"[..], "tiff"),
-        (&b"RIFF"[..], "riff"),
-        (&b"OggS"[..], "ogg"),
-        (&b"fLaC"[..], "flac"),
-        (&b"ID3"[..], "mp3"),
-        (&b"Kaydara FBX Binary"[..], "fbx"),
-        (&b"\x76\x2f\x31\x01"[..], "exr"),
+    //
+    // Every signature whose bytes are PRINTABLE ASCII carries a `qualify`
+    // check as well, because "starts with these four letters" is also true of
+    // ordinary text: a CSV whose first column header is `ID3` and prose whose
+    // first word is `RIFF`, `OggS`, `fLaC` or `8BPS` were all junked as media
+    // by the unqualified table (measured — see the tests below). This is the
+    // rule Lucene applies to its own containers: `CodecUtil.checkHeader`
+    // (`lucene/core/src/java/org/apache/lucene/codecs/CodecUtil.java:183-201`,
+    // Apache-2.0) matches `CODEC_MAGIC` and then hands straight to
+    // `checkHeaderNoMagic` (`CodecUtil.java:202-246`), which refuses the file
+    // unless the codec name AND a version inside an accepted range follow —
+    // the magic alone is never taken as proof. Adapted, not copied: Lucene is
+    // validating files it wrote itself, this is declining to delete somebody
+    // else's prose.
+    for (magic, kind, qualify) in [
+        (&b"\x89PNG"[..], "png", accept as fn(&[u8]) -> bool),
+        (&b"GIF8"[..], "gif", accept as fn(&[u8]) -> bool),
+        (&b"\xff\xd8\xff"[..], "jpeg", accept as fn(&[u8]) -> bool),
+        (&b"\x7fELF"[..], "elf", accept as fn(&[u8]) -> bool),
+        (&b"BM"[..], "bmp", accept as fn(&[u8]) -> bool),
+        (&b"\x00\x00\x01\x00"[..], "ico", accept as fn(&[u8]) -> bool),
+        (&b"8BPS"[..], "psd", psd_version as fn(&[u8]) -> bool),
+        (&b"II*\x00"[..], "tiff", accept as fn(&[u8]) -> bool),
+        (&b"MM\x00*"[..], "tiff", accept as fn(&[u8]) -> bool),
+        (&b"RIFF"[..], "riff", riff_form as fn(&[u8]) -> bool),
+        (&b"OggS"[..], "ogg", ogg_page as fn(&[u8]) -> bool),
+        (
+            &b"fLaC"[..],
+            "flac",
+            flac_metadata_block as fn(&[u8]) -> bool,
+        ),
+        (&b"ID3"[..], "mp3", id3v2_header as fn(&[u8]) -> bool),
+        (
+            &b"Kaydara FBX Binary"[..],
+            "fbx",
+            accept as fn(&[u8]) -> bool,
+        ),
+        (&b"\x76\x2f\x31\x01"[..], "exr", accept as fn(&[u8]) -> bool),
     ] {
-        if prefix.starts_with(magic) {
+        if prefix.starts_with(magic) && qualify(prefix) {
             let mut s = mk(Family::Binary);
             s.binary_kind = Some(kind.into());
             return Ok(s);
         }
+    }
+    // Truevision TGA has NO magic number — the file opens straight into its
+    // 18-byte header — so a raw texture is the one image format that reaches
+    // the text heuristics on its own bytes. Its header is nevertheless highly
+    // constrained, which is what makes this safe: byte 1 must be 0 or 1 and
+    // byte 2 one of six small values, i.e. the second and third bytes of the
+    // file must BOTH be control characters, which text is not.
+    if looks_like_tga_header(prefix) {
+        let mut s = mk(Family::Binary);
+        s.binary_kind = Some("tga".into());
+        return Ok(s);
     }
 
     // 2. Binary vs text: decode UTF-8, fall back windows-1252.
@@ -224,26 +257,34 @@ fn sniff_bytes(
         s.binary_kind = Some("unknown".into());
         return Ok(s);
     }
-    // A prefix that only decoded via LOSSY windows-1252 and is majority
-    // high-byte is pixel/float soup, not prose in a legacy encoding: real
-    // windows-1252 text (accented European prose) runs well under 30%
-    // non-ASCII, while raw image channels run ~50%. Without this, a large
-    // TGA classified as txt-prose is amplified ~100x in RAM by sectioning.
+    // NOTE — a "decoded via lossy windows-1252 AND over 30% non-ASCII is
+    // pixel soup" guard was here, to catch a raw TGA. It is gone, and must
+    // not come back in that form: the windows-1252 fallback is what EVERY
+    // legacy 8-bit codepage and every legacy CJK encoding decodes through, so
+    // the test was not "is this an image", it was "is this written in a script
+    // that is not Latin". Measured through `sniff()` against `ca4d75a` with
+    // identical fixtures, it changed windows-1251 Russian, KOI8-R Russian,
+    // windows-1253 Greek, windows-1255 Hebrew and windows-1256 Arabic prose
+    // from `TxtProse` to `Binary`, and `scan_file` turns `Binary` into
+    // "junk: binary content (unknown)" — the file is never indexed and the
+    // report says only that something unreadable was skipped.
     //
-    // Gated on the windows-1252 fallback SPECIFICALLY, and skipped when the
-    // bytes are plausibly legacy CJK: Shift-JIS/GBK/Big5/EUC-KR prose is
-    // ~100% high-byte, so the unqualified test junked every legacy-encoded
-    // CJK document in the corpus.
-    let legacy_cjk = encoding == WINDOWS_1252_LOSSY && looks_like_legacy_cjk(prefix);
-    if encoding == WINDOWS_1252_LOSSY && !legacy_cjk {
-        let total = text.chars().count().max(1);
-        let non_ascii = text.chars().filter(|c| !c.is_ascii()).count();
-        if non_ascii * 10 > total * 3 {
-            let mut s = mk(Family::Binary);
-            s.binary_kind = Some("unknown".into());
-            return Ok(s);
-        }
-    }
+    // A `looks_like_legacy_cjk` escape hatch was tried and could not carry the
+    // weight, for two reasons worth recording so it is not retried:
+    //   * single-byte codepages never form valid SHIFT_JIS/GBK/BIG5/EUC_KR
+    //     double-byte pairs, so Cyrillic/Greek/Hebrew/Arabic were never
+    //     rescued by it at all;
+    //   * it required a LOSSLESS trial decode, and `sniff()` only ever sees
+    //     `read_prefix(path, gzip, 8192)`. A double-byte character straddling
+    //     that cut makes every trial decode report `had_errors`, so the same
+    //     Shift-JIS document was text or binary depending on its byte length
+    //     — measured `TxtProse` at pad 0 and 2, `Binary` at pad 1 and 3.
+    //
+    // TGA is now caught by its header above, which is evidence of pixel data
+    // rather than evidence of a non-Latin script. Headerless raw payloads
+    // (`.raw`, `.bytes`, uncompressed PCM) still classify as text, exactly as
+    // they do on `main`; bounding sectioning memory is the fix for that, not
+    // byte statistics that cannot tell a texture from Cyrillic.
 
     // 2b. Unity text serialization, detected by content (never extension):
     // scenes/prefabs/assets open with `%YAML` and declare the Unity tag
@@ -319,89 +360,91 @@ fn sniff_bytes(
 /// the bytes are text — the binary heuristics key off this exact string.
 pub const WINDOWS_1252_LOSSY: &str = "windows-1252 (lossy)";
 
-/// Scripts written without spaces between words ("scriptio continua").
-///
-/// Whitespace density cannot be used to tell prose from byte soup for these:
-/// Chinese, Japanese, Korean, Thai, Lao, Khmer and Burmese prose runs at
-/// essentially 0% intra-line whitespace, the same as random bytes. Their
-/// presence is instead POSITIVE evidence of text — neither pixel channels nor
-/// float dumps produce ideographs.
-///
-/// The script set is the one Lucene singles out for exactly this reason:
-/// `CJKBigramFilter` (`lucene/analysis/common/src/java/org/apache/lucene/
-/// analysis/cjk/CJKBigramFilter.java:52-118`, Apache-2.0) defines `HAN`,
-/// `HIRAGANA`, `KATAKANA` and `HANGUL` flags because a whitespace tokenizer
-/// cannot segment them, and its default constructor
-/// (`CJKBigramFilter.java:119-126`) enables all four together. Thai, Lao,
-/// Khmer and Myanmar are added here on the same principle — Lucene reaches
-/// for `ICUTokenizer`/dictionary breaking for those rather than a bigram
-/// filter, but the property this function tests (no inter-word spaces) is
-/// identical. Adapted, not copied: Lucene is deciding how to TOKENIZE known
-/// text; this only decides whether the bytes are text at all.
-fn is_scriptio_continua(c: char) -> bool {
-    matches!(c as u32,
-        0x1100..=0x11FF   // Hangul Jamo
-        | 0x0E00..=0x0EFF // Thai, Lao
-        | 0x1000..=0x109F // Myanmar
-        | 0x1780..=0x17FF // Khmer
-        | 0x3000..=0x303F // CJK symbols and punctuation (、。「」)
-        | 0x3040..=0x30FF // Hiragana, Katakana
-        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
-        | 0x4E00..=0x9FFF // CJK Unified Ideographs
-        | 0xAC00..=0xD7AF // Hangul Syllables
-        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
-        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
-        | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
-    )
+/// Magic-byte signature that needs no structural confirmation: its bytes are
+/// not printable ASCII, so no text file can begin with them by accident.
+fn accept(_prefix: &[u8]) -> bool {
+    true
 }
 
-/// Share of `text` that is scriptio-continua, in percent.
-fn continua_percent(text: &str) -> usize {
-    let mut total = 0usize;
-    let mut hits = 0usize;
-    for c in text.chars() {
-        total += 1;
-        if is_scriptio_continua(c) {
-            hits += 1;
-        }
-    }
-    if total == 0 {
-        return 0;
-    }
-    hits * 100 / total
+/// Adobe Photoshop: `8BPS` is followed by a big-endian version, 1 for PSD and
+/// 2 for PSB. Nothing else is defined, so a text file whose first word is
+/// `8BPS` fails here on its fifth byte.
+fn psd_version(prefix: &[u8]) -> bool {
+    prefix.len() >= 6 && prefix[4] == 0 && matches!(prefix[5], 1 | 2)
 }
 
-/// Whether `bytes` are plausibly text in a legacy CJK encoding.
+/// RIFF container: `RIFF`, a little-endian chunk size, then a four-character
+/// FORM type naming what the container actually holds. Requiring a known FORM
+/// is what separates a WAV from a sentence that opens with the word "RIFF".
+fn riff_form(prefix: &[u8]) -> bool {
+    prefix.len() >= 12
+        && matches!(
+            &prefix[8..12],
+            b"WAVE" | b"AVI " | b"WEBP" | b"RMID" | b"ANI " | b"CDDA" | b"PAL " | b"RDIB"
+        )
+}
+
+/// Ogg page header: `OggS` then the stream structure version, which has been
+/// 0 for the life of the format (RFC 3533 §6.1).
+fn ogg_page(prefix: &[u8]) -> bool {
+    prefix.len() >= 5 && prefix[4] == 0
+}
+
+/// FLAC stream: `fLaC` then a METADATA_BLOCK_HEADER whose block type must be
+/// STREAMINFO (0) for the first block; the top bit is the last-block flag.
+fn flac_metadata_block(prefix: &[u8]) -> bool {
+    prefix.len() >= 5 && prefix[4] & 0x7f == 0
+}
+
+/// ID3v2 tag header: `ID3`, a major version (2, 3 and 4 are the versions that
+/// exist), a revision that is not the reserved 0xFF, a flags byte, and a
+/// four-byte SYNCHSAFE size whose bytes each have the top bit clear.
 ///
-/// This is a TEXT-NESS test and nothing more. It deliberately does NOT return
-/// which encoding: Shift-JIS, GBK, Big5 and EUC-KR share most of the same
-/// valid double-byte space, so a GBK document also decodes losslessly as
-/// Shift-JIS (and vice versa) with a high ideograph share either way. Telling
-/// them apart needs a statistical language model — what `chardet`/ICU do —
-/// which this crate does not have, and guessing would silently replace a
-/// Chinese document with plausible-looking Japanese mojibake. Tracked as a
-/// follow-up; see CHANGELOG.
+/// Unqualified, this signature is three ASCII letters: a CSV whose first
+/// column header is `ID3` classified `Csv` on `ca4d75a` and `Binary` on this
+/// branch until the version byte was checked.
+fn id3v2_header(prefix: &[u8]) -> bool {
+    prefix.len() >= 10
+        && matches!(prefix[3], 2..=4)
+        && prefix[4] != 0xff
+        && prefix[6..10].iter().all(|b| *b < 0x80)
+}
+
+/// Truevision TGA, which has no magic number at all — every byte of its
+/// 18-byte header is data. Detection is therefore by CONSTRAINT: an image type
+/// from the defined set, a pixel depth from the defined set, a colour-map
+/// descriptor that must be all-zero when there is no colour map, and non-zero
+/// dimensions.
 ///
-/// What it IS sound for is the only question asked here: are these bytes a
-/// pixel/float payload, or somebody's prose? The pixel-soup guards below key
-/// off high-byte density and whitespace density, and legacy CJK prose looks
-/// exactly like soup under both — ~100% high-byte and ~0% whitespace — so
-/// without this they junk the file outright. Requiring a LOSSLESS decode
-/// (one undecodable pair disqualifies it) plus a substantially ideographic
-/// result keeps European windows-1252 prose out: its high bytes sit isolated
-/// among ASCII, so most form no valid double-byte pair at all.
-fn looks_like_legacy_cjk(bytes: &[u8]) -> bool {
-    [
-        encoding_rs::SHIFT_JIS,
-        encoding_rs::GBK,
-        encoding_rs::BIG5,
-        encoding_rs::EUC_KR,
-    ]
-    .into_iter()
-    .any(|enc| {
-        let (s, _, had_errors) = enc.decode(bytes);
-        !had_errors && continua_percent(&s) >= 30
-    })
+/// The reason this is safe on text is byte 1 and byte 2: `color_map_type` is 0
+/// or 1 and `image_type` is one of six values below 12, so both the second and
+/// the third byte of the file have to be control characters. Prose, CSV, JSON
+/// and source code fail on byte 1.
+fn looks_like_tga_header(prefix: &[u8]) -> bool {
+    if prefix.len() < 18 {
+        return false;
+    }
+    let color_map_type = prefix[1];
+    if color_map_type > 1 {
+        return false;
+    }
+    // 1/2/3 uncompressed colour-mapped/true-colour/greyscale, 9/10/11 the
+    // run-length encoded counterparts. Type 0 ("no image data") is excluded
+    // deliberately: it carries no pixels, so nothing is lost by letting such a
+    // file fall through to the text heuristics, and admitting it would make an
+    // all-zero prefix a TGA.
+    if !matches!(prefix[2], 1 | 2 | 3 | 9 | 10 | 11) {
+        return false;
+    }
+    if !matches!(prefix[16], 8 | 15 | 16 | 24 | 32) {
+        return false;
+    }
+    if color_map_type == 0 && prefix[3..8].iter().any(|b| *b != 0) {
+        return false;
+    }
+    let width = u16::from_le_bytes([prefix[12], prefix[13]]);
+    let height = u16::from_le_bytes([prefix[14], prefix[15]]);
+    width > 0 && height > 0
 }
 
 fn decode(bytes: &[u8]) -> (String, &'static str) {
@@ -564,10 +607,14 @@ fn txt_kind(nonblank: &[&str]) -> Family {
     //     binary and the run exits 3 instead of 0 — the false positive is
     //     reachable from this repo's own suite.
     //
-    // High-byte payloads (which is what a real TGA is) are still caught, by
-    // the windows-1252 non-ASCII test in `sniff_bytes`. Bounding sectioning
-    // memory is the right fix for the RAM concern; silently deleting files
-    // that look unusual is not. Tracked as a follow-up.
+    // A real TGA is caught by `looks_like_tga_header` in `sniff_bytes`, on the
+    // structure of its 18-byte header. The byte-statistics version of that
+    // check ("mostly non-ASCII under the windows-1252 fallback") was tried and
+    // removed in the same breath as this one and for the same reason: it
+    // junked Cyrillic, Greek, Hebrew, Arabic and mixed Japanese prose.
+    // Bounding sectioning memory is the right fix for the RAM concern;
+    // silently deleting files that look unusual is not. Tracked as a
+    // follow-up.
     let avg_len = nonblank.iter().map(|l| l.len()).sum::<usize>() as f64 / nonblank.len() as f64;
     if avg_len > 60.0 {
         return Family::TxtProse;
@@ -805,6 +852,8 @@ mod unity_sniff_tests {
             ("t.tif2", &b"MM\x00*\x00\x08"[..]),
             ("t.wav", &b"RIFF\x24\x08\x00\x00WAVE"[..]),
             ("t.ogg", &b"OggS\x00\x02"[..]),
+            ("t.flac", &b"fLaC\x00\x00\x00\x22"[..]),
+            ("t.mp3", &b"ID3\x03\x00\x00\x00\x00\x0f\x76"[..]),
             ("t.fbx", &b"Kaydara FBX Binary  \x00"[..]),
         ] {
             let mut bytes = head.to_vec();
@@ -812,6 +861,99 @@ mod unity_sniff_tests {
             bytes.extend(b"lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(20));
             let sn = sniff_bytes(&bytes, Path::new(name), Path::new(name), false).unwrap();
             assert_eq!(sn.family, Family::Binary, "{name} must be binary");
+        }
+    }
+
+    /// Regression (round 2): the printable-ASCII signatures added by this
+    /// branch matched TEXT. Measured through `sniff()` on `ca4d75a` vs this
+    /// branch with identical fixtures, a CSV whose first column header is
+    /// `ID3` went `Csv` -> `Binary`, and prose whose first word is `RIFF`,
+    /// `OggS`, `fLaC` or `8BPS` went `TxtProse` -> `Binary`. `scan_file` turns
+    /// `Family::Binary` into "junk: binary content (unknown)", so each of
+    /// those files stopped being indexed at all.
+    ///
+    /// The true positives above must keep passing, which is the whole point:
+    /// the signature is necessary, it is just not sufficient.
+    #[test]
+    fn a_printable_ascii_signature_alone_does_not_make_a_file_binary() {
+        let csv = b"ID3,name,value\n1,alpha,2\n3,beta,4\n5,gamma,6\n7,delta,8\n";
+        assert_eq!(
+            sniff_bytes(csv, Path::new("t.csv"), Path::new("t.csv"), false)
+                .unwrap()
+                .family,
+            Family::Csv,
+            "a column header may legitimately be the three letters ID3"
+        );
+        for (label, opener) in [
+            (
+                "riff",
+                "RIFF is a container format used by WAV files. It stores chunks. ",
+            ),
+            (
+                "oggs",
+                "OggS pages carry the packets of an Ogg stream in order. ",
+            ),
+            (
+                "flac",
+                "fLaC is the four byte magic of a FLAC audio stream header. ",
+            ),
+            (
+                "psd",
+                "8BPS is the magic of an Adobe Photoshop document header. ",
+            ),
+        ] {
+            let text = opener.repeat(30);
+            let sn = sniff_bytes(
+                text.as_bytes(),
+                Path::new("notes.txt"),
+                Path::new("notes.txt"),
+                false,
+            )
+            .unwrap();
+            assert_ne!(
+                sn.family,
+                Family::Binary,
+                "{label}: prose that opens with the signature word is still prose"
+            );
+        }
+    }
+
+    /// TGA is the format the removed byte-statistics guard existed for: it has
+    /// no magic number, so a raw texture reaches the text heuristics on its own
+    /// bytes. It is caught on the structure of its 18-byte header instead.
+    #[test]
+    fn a_raw_tga_texture_is_binary_by_header_structure() {
+        // id_len=0, no colour map, uncompressed true-colour, 64x64, 24bpp.
+        let mut tga: Vec<u8> = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 64, 0, 24, 0];
+        tga.extend((0..8192u32).map(|i| (0x80 + (i * 37) % 0x7f) as u8));
+        let sn = sniff_bytes(
+            &tga,
+            Path::new("texture.tga"),
+            Path::new("texture.tga"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sn.family, Family::Binary, "a real TGA header must be seen");
+        assert_eq!(sn.binary_kind.as_deref(), Some("tga"));
+
+        // And the constraint must be tight enough that text never satisfies
+        // it. Every one of these is >= 18 bytes, so length is not what saves
+        // them.
+        for (label, text) in [
+            (
+                "prose",
+                "The quick brown fox jumps over the lazy dog again.",
+            ),
+            ("csv", "id,name,value\n1,alpha,2\n3,beta,4\n"),
+            ("json", "{\"id\": 1, \"name\": \"alpha\", \"value\": 2}"),
+            ("code", "fn main() { println!(\"hello, world\"); }"),
+            ("yaml", "name: alpha\nvalue: 2\nnested:\n  a: 1\n"),
+        ] {
+            assert!(text.len() >= 18, "{label}: fixture too short to prove it");
+            assert!(
+                !looks_like_tga_header(text.as_bytes()),
+                "{label}: text must not satisfy the TGA header constraints"
+            );
         }
     }
 
@@ -902,33 +1044,65 @@ mod unity_sniff_tests {
         }
     }
 
-    /// Regression: the sibling guard keyed off `encoding != "utf-8"`, and a
-    /// legacy CJK encoding decodes as lossy windows-1252 into ~100%
-    /// high-byte mojibake — so every Shift-JIS/GBK/Big5/EUC-KR document was
-    /// junked before any family heuristic ran.
+    /// Classify a byte buffer through the REAL read path: a file on disk, read
+    /// by `sniff()`, which sees only `read_prefix(path, gzip, 8192)`.
     ///
-    /// The assertion is deliberately only "not binary". This crate cannot
-    /// tell these encodings apart (they share most of their valid
-    /// double-byte space) and does not pretend to: the file is still decoded
-    /// as windows-1252, exactly as it was before this branch, which is
-    /// mojibake — but mojibake that is INDEXED rather than deleted.
+    /// Every legacy-encoding regression below has to go through this and not
+    /// through `sniff_bytes` with the whole buffer. The escape hatch that was
+    /// supposed to protect legacy CJK required a LOSSLESS trial decode, and a
+    /// double-byte character straddling the 8192-byte cut makes every trial
+    /// decode fail — so a test that hands over the complete buffer cannot
+    /// observe half of the bug it is written for.
+    fn sniff_file(bytes: &[u8], name: &str) -> Family {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        sniff(&path).unwrap().family
+    }
+
+    /// Regression (round 2): a guard on "lossy windows-1252 AND over 30%
+    /// non-ASCII" is not a test for pixel data, it is a test for "not written
+    /// in Latin script". windows-1252 is the fallback EVERY legacy 8-bit
+    /// codepage decodes through.
+    ///
+    /// Measured through `sniff()` with these exact fixtures: on `ca4d75a` all
+    /// five are `TxtProse`; with the guard present all five are `Binary`, and
+    /// `scan_file` turns that into "junk: binary content (unknown)".
+    ///
+    /// The assertion is deliberately only "not binary" — this crate still
+    /// decodes the bytes as windows-1252 and still produces mojibake, because
+    /// telling legacy codepages apart needs a statistical language model it
+    /// does not have. Mojibake that is INDEXED beats prose that is deleted.
     #[test]
-    fn legacy_encoded_cjk_prose_is_not_junked_as_binary() {
+    fn legacy_single_byte_prose_is_not_junked_by_the_real_read_path() {
         for (label, enc, unit) in [
             (
-                "shift_jis",
-                encoding_rs::SHIFT_JIS,
-                "この文書はシステムの設計について説明します。",
+                "windows-1251-ru",
+                encoding_rs::WINDOWS_1251,
+                "Этот документ описывает архитектуру системы и детали реализации. ",
             ),
-            ("gbk", encoding_rs::GBK, "本文档描述了系统的架构设计。"),
-            ("big5", encoding_rs::BIG5, "本文件描述系統的架構設計。"),
             (
-                "euc-kr",
-                encoding_rs::EUC_KR,
-                "이문서는시스템설계를설명합니다",
+                "koi8-r-ru",
+                encoding_rs::KOI8_R,
+                "Этот документ описывает архитектуру системы и детали реализации. ",
+            ),
+            (
+                "windows-1253-el",
+                encoding_rs::WINDOWS_1253,
+                "Το έγγραφο αυτό περιγράφει την αρχιτεκτονική του συστήματος. ",
+            ),
+            (
+                "windows-1255-he",
+                encoding_rs::WINDOWS_1255,
+                "מסמך זה מתאר את ארכיטקטורת המערכת ואת פרטי היישום שלה. ",
+            ),
+            (
+                "windows-1256-ar",
+                encoding_rs::WINDOWS_1256,
+                "تصف هذه الوثيقة بنية النظام وتفاصيل تنفيذه بشكل كامل. ",
             ),
         ] {
-            let text = unit.repeat(4096 / unit.chars().count() + 2);
+            let text = unit.repeat(200);
             let (bytes, _, had_errors) = enc.encode(&text);
             assert!(!had_errors, "{label}: fixture must encode cleanly");
             assert!(
@@ -936,52 +1110,120 @@ mod unity_sniff_tests {
                 "{label}: fixture must not be valid UTF-8, or it proves nothing"
             );
             assert!(
-                looks_like_legacy_cjk(&bytes),
-                "{label}: text-ness probe must recognise this as prose"
+                bytes.len() > 8192,
+                "{label}: fixture must exceed the sniff prefix"
             );
-            let sn =
-                sniff_bytes(&bytes, Path::new("doc.txt"), Path::new("doc.txt"), false).unwrap();
-            assert_ne!(sn.family, Family::Binary, "{label}: must not be junked");
+            assert_ne!(
+                sniff_file(&bytes, "doc.txt"),
+                Family::Binary,
+                "{label}: legacy-encoded prose must not be junked as binary"
+            );
         }
     }
 
-    /// The legacy-CJK probe must not capture European text — that would
-    /// replace real windows-1252 prose with plausible-looking ideographs.
+    /// Regression (round 2): the legacy-CJK escape hatch was alignment
+    /// dependent. `sniff()` classifies from the first 8192 bytes only, so a
+    /// double-byte character split by that cut made the trial decode report
+    /// `had_errors` and the rescue declined. Measured on the branch that
+    /// carried it: the SAME Shift-JIS document was `TxtProse` at byte pads 0
+    /// and 2 and `Binary` at pads 1 and 3 — a coin flip per file.
+    ///
+    /// Sweeping the alignment is the point of this test; a single-length
+    /// fixture passes half the time by luck.
     #[test]
-    fn european_windows_1252_prose_is_not_claimed_as_cjk() {
+    fn legacy_cjk_prose_survives_every_prefix_alignment() {
+        for (label, enc, unit) in [
+            (
+                "shift_jis",
+                encoding_rs::SHIFT_JIS,
+                "この文書はシステムの設計と実装について詳しく説明します。",
+            ),
+            (
+                "gbk",
+                encoding_rs::GBK,
+                "本文档描述了系统的架构设计与实现。",
+            ),
+            (
+                "big5",
+                encoding_rs::BIG5,
+                "本文件描述系統的架構設計與實作。",
+            ),
+            (
+                "euc-kr",
+                encoding_rs::EUC_KR,
+                "이문서는시스템의설계와구현을설명합니다",
+            ),
+        ] {
+            let text = unit.repeat(400);
+            let (body, _, had_errors) = enc.encode(&text);
+            assert!(!had_errors, "{label}: fixture must encode cleanly");
+            assert!(
+                body.len() > 8192,
+                "{label}: fixture must exceed the sniff prefix, or alignment \
+                 cannot matter"
+            );
+            for pad in 0..4usize {
+                let mut bytes = vec![b'a'; pad];
+                bytes.extend_from_slice(&body);
+                assert_ne!(
+                    sniff_file(&bytes, "doc.txt"),
+                    Family::Binary,
+                    "{label}: junked at byte-offset pad {pad}"
+                );
+            }
+        }
+    }
+
+    /// Regression (round 2): a realistic Japanese technical document is not
+    /// 100% ideographs — it is prose around ASCII code fences, identifiers and
+    /// URLs. That shape sat under the 30% scriptio-continua threshold the
+    /// rescue needed while sitting over the 30% non-ASCII threshold the guard
+    /// junked on, so the ordinary shape of real CJK documentation was the case
+    /// that lost. Measured: `TxtLines` on `ca4d75a`, `Binary` on the branch,
+    /// at both 13 KB and 67 KB.
+    #[test]
+    fn mixed_script_documentation_is_not_junked() {
+        let unit = "この関数は入力データを検証してから処理を実行し、結果を呼び出し元に返します。\n\
+                    エラーが発生した場合は、詳細な理由を含む診断情報を記録します。\n\
+                    ```\nfn process(d: &[u8]) -> Result<Vec<u8>, ProcessError> {\n    \
+                    let checked = validate(d)?;\n    Ok(checked.to_vec())\n}\n```\n\
+                    See docs/process.md and the API reference for the full parameter list.\n";
+        let ideographic =
+            unit.chars().filter(|c| !c.is_ascii()).count() * 100 / unit.chars().count().max(1);
+        assert!(
+            (20..30).contains(&ideographic),
+            "fixture must sit in the band that loses — between the rescue's \
+             30% ideograph floor and the guard's 30% non-ASCII ceiling; got \
+             {ideographic}%"
+        );
+        for reps in [40usize, 200] {
+            let doc = unit.repeat(reps);
+            let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(&doc);
+            assert_ne!(
+                sniff_file(&bytes, "doc.txt"),
+                Family::Binary,
+                "mixed Japanese/ASCII documentation ({} bytes) must not be junked",
+                bytes.len()
+            );
+        }
+    }
+
+    /// Accented European prose is the case the removed guard claimed to be
+    /// safe for. It must stay safe now that the guard is gone.
+    #[test]
+    fn european_windows_1252_prose_is_still_prose() {
         let text = "Le système décrit ici gère les données réservées à \
                     l'opérateur, prêtes à être exportées. ";
-        let long = text.repeat(80);
+        let long = text.repeat(200);
         let (bytes, _, _) = encoding_rs::WINDOWS_1252.encode(&long);
         assert!(std::str::from_utf8(&bytes).is_err());
         let (_, enc) = decode(&bytes);
         assert_eq!(enc, WINDOWS_1252_LOSSY, "must stay windows-1252");
-        assert!(
-            !looks_like_legacy_cjk(&bytes),
-            "accented Latin must not be claimed as CJK"
+        assert_ne!(
+            sniff_file(&bytes, "note.txt"),
+            Family::Binary,
+            "accented prose is still prose"
         );
-        let sn = sniff_bytes(&bytes, Path::new("note.txt"), Path::new("note.txt"), false).unwrap();
-        assert_ne!(sn.family, Family::Binary, "accented prose is still prose");
-    }
-
-    /// The pixel-soup protection the guards exist for must survive the fix:
-    /// high-byte float/pixel payloads still have to be caught.
-    #[test]
-    fn high_byte_pixel_soup_is_still_binary() {
-        // Bytes that are not valid UTF-8, not valid in any legacy CJK
-        // encoding as a whole, and majority high-byte — a raw texture.
-        let soup: Vec<u8> = (0..8192u32)
-            .map(|i| (0x80 + (i * 37) % 0x7f) as u8)
-            .collect();
-        assert!(std::str::from_utf8(&soup).is_err());
-        let sn = sniff_bytes(
-            &soup,
-            Path::new("texture.tga"),
-            Path::new("texture.tga"),
-            false,
-        )
-        .unwrap();
-        assert_eq!(sn.family, Family::Binary, "pixel soup must stay binary");
     }
 
     #[test]

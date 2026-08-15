@@ -34,7 +34,7 @@ pub mod walk;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -654,6 +654,35 @@ pub fn run_cli() -> i32 {
 }
 
 const GB: u64 = 1 << 30;
+
+/// Junk entries that name a file which also reached `file_done`.
+///
+/// The catalog holds ONE document per file: `catalog::file_doc` derives its
+/// `_id` from the file key alone (`catalog::file_id`). The completion pass and
+/// the junk pass both write into the same bulk body, so an entry that appears
+/// in both is not two rows, it is one row written twice — and the junk write,
+/// which lands second, is the one that survives. The observable damage is that
+/// a file which indexed N records is reported as status "junk" with records 0,
+/// plus a double count in `junk_file_count` and a double
+/// `CodeCoverage::observe`.
+///
+/// Producers are required to keep the two sets disjoint: a worker that gives up
+/// on a file sets `send_err`, which suppresses the completion, and a worker
+/// that merely wants to report a partial problem notes it on the progress meter
+/// instead. This returns the violations rather than assuming there are none,
+/// because the caller is the only place that holds both sets and because the
+/// failure is silent everywhere else.
+fn shadowed_junk_entries<'a>(
+    all_junk: &[&'a state::JunkFile],
+    completed_keys: &HashSet<String>,
+) -> Vec<&'a state::JunkFile> {
+    all_junk
+        .iter()
+        .filter(|jf| completed_keys.contains(&jf.file_key))
+        .copied()
+        .collect()
+}
+
 /// How many entries a human-facing listing prints before it summarises the
 /// rest. These lists are bounded by the corpus, not by the fault: unmounting a
 /// bind mount under an indexed root makes every content group vanish at once,
@@ -675,6 +704,73 @@ const SQLDUMP_SAMPLE_LIMIT: u64 = 64 << 20;
 /// unsampled group and its record count in `extra_junk` instead of adding
 /// them to an anonymous counter.
 const UNITY_SAMPLE_LIMIT: u64 = 512 << 20;
+
+/// How many bytes phase A reads from a file of this family before it stops
+/// sampling. `None` means the family's extractor caps itself.
+///
+/// Split out of `scan_file` so tests can shrink it. The consequence of a
+/// GROUPED family hitting this cap is not "a slightly thinner sample", it is a
+/// whole `unity_class`/SQL table with no dataset to route to in phase B — and
+/// the only fixture that reaches it naturally is a half-gigabyte file, which
+/// is why that path shipped untested. `SampleLimitOverride` gives the suite a
+/// fixture it can afford.
+fn sample_limit_bytes(family: Family, path: &Path) -> Option<u64> {
+    // Only the test override reads the path; the shipped caps are per-family.
+    #[cfg(not(test))]
+    let _ = path;
+    #[cfg(test)]
+    {
+        // Scoped to ONE corpus root, not process-global. `cargo test` runs this
+        // binary multi-threaded, phase A itself runs on `crate::pool`, and a
+        // bare global would silently re-cap sampling for every unrelated test
+        // that happened to overlap — a flake that would look like anything but
+        // its cause.
+        if let Some((root, bytes)) = SAMPLE_LIMIT_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            if path.starts_with(root) {
+                return Some(*bytes);
+            }
+        }
+    }
+    match family {
+        Family::SqlDump => Some(SQLDUMP_SAMPLE_LIMIT),
+        Family::UnityYaml => Some(UNITY_SAMPLE_LIMIT),
+        Family::Jsonl | Family::Logs | Family::Csv | Family::TxtLines => Some(SAMPLE_LIMIT_BYTES),
+        Family::Sqlite => Some(1), // signals per-table row cap inside the extractor
+        _ => None,                 // whole-file extractors cap themselves
+    }
+}
+
+/// Test-only phase-A byte cap: `(corpus root, bytes)`, applied only to paths
+/// under that root. `None` = off.
+#[cfg(test)]
+static SAMPLE_LIMIT_OVERRIDE: Mutex<Option<(std::path::PathBuf, u64)>> = Mutex::new(None);
+
+/// Caps phase-A sampling under `root` for the lifetime of the guard.
+#[cfg(test)]
+pub(crate) struct SampleLimitOverride;
+
+#[cfg(test)]
+impl SampleLimitOverride {
+    pub(crate) fn set(root: &Path, bytes: u64) -> Self {
+        *SAMPLE_LIMIT_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((root.to_owned(), bytes));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SampleLimitOverride {
+    fn drop(&mut self) {
+        *SAMPLE_LIMIT_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
 
 #[cfg(test)]
 static REPLACEMENT_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -1086,13 +1182,7 @@ fn scan_file(
         out.sniffed = Some(sn);
         return out;
     }
-    let limit = match sn.family {
-        Family::SqlDump => Some(SQLDUMP_SAMPLE_LIMIT),
-        Family::UnityYaml => Some(UNITY_SAMPLE_LIMIT),
-        Family::Jsonl | Family::Logs | Family::Csv | Family::TxtLines => Some(SAMPLE_LIMIT_BYTES),
-        Family::Sqlite => Some(1), // signals per-table row cap inside the extractor
-        _ => None,                 // whole-file extractors cap themselves
-    };
+    let limit = sample_limit_bytes(sn.family, path);
     type GroupAcc = (
         HashMap<String, infer::FieldAcc>,
         u64,
@@ -4479,17 +4569,26 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                             } else {
                                 String::new()
                             };
-                            extra_junk.lock().unwrap().push(JunkFile {
-                                file_key: key.clone(),
-                                rel: f.rel.clone(),
-                                format: format_str(Some(&sn)),
-                                status: "junk".into(),
-                                reason: format!(
-                                    "{total} record(s) dropped: group(s) never sampled in \
-                                     phase A, so they have no dataset — {named}{suffix}"
-                                ),
-                                bytes: f.size,
-                            });
+                            // A NOTE, never an `extra_junk` entry. This file
+                            // still reaches `journal.file_done` — `send_err`
+                            // is untouched — and every junk entry is turned
+                            // into a catalog document under the same
+                            // `file:{file_key}` id as that completion
+                            // (`catalog::file_doc`, `catalog.rs`). Pushing one
+                            // here put two documents with one id in the same
+                            // bulk, and the later one wins: a file that
+                            // indexed N records was reported as status "junk"
+                            // with records 0, `junk_file_count` counted it
+                            // twice, and `code_coverage.observe` ran for it
+                            // twice. The dropped records are already carried
+                            // on that file's own completion as `junk`
+                            // (`file_junk` below), which is where a per-file
+                            // drop count belongs.
+                            pr.note(&format!(
+                                "{}: {total} record(s) dropped: group(s) never sampled in \
+                                 phase A, so they have no dataset — {named}{suffix}",
+                                f.rel
+                            ));
                         }
                     }
                     // Raw-source href pass: the HTML extractor strips markup
@@ -5062,9 +5161,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // the journal's completions are the corpus, not just this invocation's
     // slice, so a resume reports what is live rather than what it re-parsed.
     let mut code_coverage = CodeCoverage::default();
+    let mut completed_keys: HashSet<String> = HashSet::new();
     {
         let j = journal_mx.lock().unwrap();
         for fd in j.done.values() {
+            completed_keys.insert(fd.file_key.clone());
             let current_path = plan
                 .files
                 .get(&fd.file_key)
@@ -5104,13 +5205,43 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         .collect();
     all_junk.extend(extra.iter());
     all_junk.extend(new_unplanned.iter());
+    // Disjointness from the journal completions above is ENFORCED here, not
+    // merely asserted in a comment: `catalog::file_doc` derives its `_id` from
+    // the file key alone, so a junk entry for a file that also reached
+    // `file_done` is a second document with an id the completion already used
+    // — and the bulk applies them in order, so the junk one wins. A file that
+    // indexed N records would be reported in the catalog as status "junk" with
+    // records 0. See `shadowed_junk_entries`.
+    let shadowed = shadowed_junk_entries(&all_junk, &completed_keys);
+    // Debug builds stop on the producer's defect; release builds keep the
+    // truthful document and say what they dropped.
+    debug_assert!(
+        shadowed.is_empty(),
+        "junk entry for a file that reached file_done: {:?}",
+        shadowed.iter().map(|jf| &jf.rel).collect::<Vec<_>>()
+    );
+    if !shadowed.is_empty() {
+        // Not fatal: the completion document is the correct one and it is
+        // already staged, so dropping the junk entry restores the truth. It is
+        // still a defect in whichever producer emitted it, so say so.
+        pr.note(&format!(
+            "internal: {} junk entr(ies) named a file that also completed and \
+             were dropped so the catalog keeps the indexed record: {}",
+            shadowed.len(),
+            shadowed
+                .iter()
+                .take(REFUSAL_LIST_CAP)
+                .map(|jf| jf.rel.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        all_junk.retain(|jf| !completed_keys.contains(&jf.file_key));
+    }
     // Counted now: every later reader of this number outlives the borrows
     // `all_junk` holds on `plan` and `new_unplanned`, which the durable
     // junk-plan update below mutates.
     let junk_file_count = all_junk.len();
     for jf in &all_junk {
-        // Disjoint from the journal completions above: a file that reached
-        // `file_done` never appears here, so nothing is counted twice.
         code_coverage.observe(&jf.format, 0);
         let (id, doc) = catalog::file_doc(
             &jf.file_key,

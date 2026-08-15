@@ -97,27 +97,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **A proposed whitespace-density binary heuristic was dropped before it
-  shipped.** PR #274 classified any text over 4 KiB with under 5% whitespace as
-  binary, to catch raw TGA payloads. `nonblank` is built from `text.lines()`,
-  so newlines are already stripped and only intra-line whitespace counts —
-  which means Chinese, Japanese, Korean, Thai, Lao, Khmer and Burmese prose,
-  base64 blobs, FASTA sequences and minified single-line files all scored 0%
-  and would have been junked as "binary content (unknown)", worldwide, in every
-  corpus. This repo's own
-  `failure_resume_http_tests::legacy_key_collision_fails_before_visibility_with_scoped_guidance`
-  builds a 65,537-byte fixture of one repeated ASCII letter; with the guard in
-  place that run exits 3 instead of 0. High-byte payloads (what a real TGA is)
-  are still caught by the windows-1252 non-ASCII test, which is additionally
-  now skipped for byte sequences that decode losslessly as Shift-JIS/GBK/Big5/
-  EUC-KR with a substantially ideographic result — legacy-encoded CJK prose is
-  ~100% high-byte and was being junked by it. That probe deliberately reports
-  only "this is text", not *which* encoding: those four share most of their
-  valid double-byte space, and picking one without a statistical language model
-  would replace a Chinese document with plausible-looking Japanese mojibake.
+- **Two proposed byte-statistics binary heuristics were dropped before they
+  shipped; raw TGA is detected by its header instead.** Both were attempts to
+  recognise a raw texture that decodes into printable characters, and both
+  turned out to be tests for "not written in Latin script".
 
-  New magic-byte signatures (PSD, TIFF, RIFF, OGG, FLAC, MP3, FBX, EXR) are
-  kept — those are precise.
+  The first, from PR #274, classified any text over 4 KiB with under 5%
+  whitespace as binary. `nonblank` is built from `text.lines()`, so newlines
+  are already stripped and only intra-line whitespace counts — which means
+  Chinese, Japanese, Korean, Thai, Lao, Khmer and Burmese prose, base64 blobs,
+  FASTA sequences and minified single-line files all score 0%. This repo's own
+  `failure_resume_http_tests::legacy_key_collision_fails_before_visibility_with_scoped_guidance`
+  builds a 65,537-byte fixture of one repeated ASCII letter; with that guard
+  reinstated the test fails with `left: 3, right: 0` — the run exits 3 instead
+  of 0.
+
+  The second was introduced by the first attempt to reland #274 and is
+  **removed here**: "decoded via lossy windows-1252 AND over 30% non-ASCII is
+  pixel soup". windows-1252 is the fallback every legacy 8-bit codepage decodes
+  through, so it is not a test for image data. Measured through `sniff()` on
+  `ca4d75a` versus that branch, with identical fixtures:
+
+  | fixture | `ca4d75a` | with the guard |
+  |---|---|---|
+  | windows-1251 Russian, 13,000 B | `txt-prose` | `binary` |
+  | KOI8-R Russian, 13,000 B | `txt-prose` | `binary` |
+  | windows-1253 Greek, 12,200 B | `txt-prose` | `binary` |
+  | windows-1255 Hebrew, 11,000 B | `txt-prose` | `binary` |
+  | windows-1256 Arabic, 10,800 B | `txt-prose` | `binary` |
+  | Shift-JIS Japanese, 22,401 B (byte pad 1; likewise pad 3) | `txt-prose` | `binary` |
+  | Shift-JIS Japanese + ASCII code, 13,360 B | `txt-lines` | `binary` |
+  | Shift-JIS Japanese + ASCII code, 66,800 B | `txt-lines` | `binary` |
+
+  `scan_file` turns `Family::Binary` into `junk: binary content (unknown)`, so
+  each of those files stopped being indexed. A `looks_like_legacy_cjk` escape
+  hatch shipped with it and could not carry the weight: single-byte codepages
+  never form valid Shift-JIS/GBK/Big5/EUC-KR double-byte pairs, so Cyrillic,
+  Greek, Hebrew and Arabic were never rescued at all; it required a *lossless*
+  trial decode while `sniff()` sees only the first 8192 bytes, so the same
+  Japanese document was text at byte-offset pads 0 and 2 and binary at pads 1
+  and 3; and a realistic Japanese technical document (prose around ASCII code
+  fences) sits below its 30% ideograph floor while sitting above the guard's
+  30% non-ASCII ceiling. Every fixture in the table above now classifies
+  exactly as it does on `ca4d75a`.
+
+  What replaces it is `looks_like_tga_header`: TGA has no magic number, but its
+  18-byte header is constrained enough that bytes 1 and 2 of the file must both
+  be control characters. **Headerless raw payloads (`.raw`, `.bytes`,
+  uncompressed PCM) still classify as text**, exactly as they do on `ca4d75a`;
+  bounding sectioning memory is the fix for that, and is not attempted here.
+
+- **The new magic-byte signatures now require structural confirmation.** PSD,
+  TIFF, RIFF, OGG, FLAC, MP3, FBX and EXR were added by the first reland
+  attempt as bare `starts_with` tests, and five of those signatures are
+  printable ASCII, so they matched text. Measured, same method as above: a CSV
+  whose first column header is `ID3` went `csv` -> `binary`, and prose whose
+  first word is `RIFF`, `OggS`, `fLaC` or `8BPS` went `txt-prose` -> `binary`.
+  Each printable signature is now qualified by the byte that follows it (PSD
+  version, RIFF FORM type, Ogg stream-structure version, FLAC block type, ID3v2
+  major version and synchsafe size), which is what Lucene's
+  `CodecUtil.checkHeader` does with `CODEC_MAGIC`. The true positives are
+  unchanged and still covered.
+
+- **A junk entry could overwrite a successfully indexed file's catalog row.**
+  When phase B met a record group phase A never sampled, the worker pushed a
+  whole-file junk entry while leaving `send_err` unset — so the file also
+  reached `journal.file_done`, and both passes wrote `catalog::file_doc` under
+  the same `file:{file_key}` id into the same bulk. The junk document landed
+  second and won: a file that indexed records was reported in the catalog as
+  status `junk` with `records: 0`, `files_junk` counted it, and
+  `CodeCoverage::observe` ran for it twice. Reachable with no Unity involved,
+  via a >64 MiB SQL dump whose first row for some table starts past
+  `SQLDUMP_SAMPLE_LIMIT`. The unsampled group is now reported on the progress
+  meter instead, the dropped records stay on that file's own completion where
+  they already were, and the disjointness the code claimed in a comment is now
+  enforced at the one place that holds both sets (`shadowed_junk_entries`).
 
 ### Known issues
 

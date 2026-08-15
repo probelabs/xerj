@@ -3251,3 +3251,139 @@ fn junk_scan_drops_its_spool_before_indexable_spools_are_retained() {
     drop(retained);
     assert_eq!(drops.load(Ordering::SeqCst), 2);
 }
+
+/// A Unity scene whose SECOND `unity_class` starts past `after_bytes`, so a
+/// phase A capped at that many bytes never samples it and phase B has nowhere
+/// to route its records.
+fn scene_with_a_late_class(after_bytes: usize) -> String {
+    let mut s = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+    let mut id = 1;
+    while s.len() < after_bytes {
+        s.push_str(&format!(
+            "--- !u!1 &{id}\nGameObject:\n  m_Name: Pad{id:05}\n  \
+             m_TagString: Untagged\n  m_IsActive: 1\n"
+        ));
+        id += 1;
+    }
+    s.push_str(
+        "--- !u!114 &900001\nMonoBehaviour:\n  m_Name: LateBehaviour\n  \
+         m_Enabled: 1\n  speed: 4\n",
+    );
+    s
+}
+
+/// Blocker: phase B meeting a group phase A never sampled pushed a `JunkFile`
+/// for the whole file while leaving `send_err` unset — so the file ALSO
+/// reached `journal.file_done`, and both passes wrote `catalog::file_doc`
+/// under the same `file:{file_key}` id into the same bulk. The junk document
+/// landed second and won: a file that indexed real records was reported in the
+/// catalog as status "junk" with records 0, and `files_junk` counted it.
+///
+/// Reachable with no Unity involved (a >64 MiB SQL dump whose first row for
+/// some table starts past `SQLDUMP_SAMPLE_LIMIT`); Unity is used here only
+/// because the override lets the fixture be 3 KB instead of 64 MB.
+#[test]
+fn an_unsampled_group_does_not_overwrite_the_files_indexed_catalog_row() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // Scoped to this corpus, so running the suite multi-threaded cannot let
+    // the cap reach an unrelated test's fixtures.
+    let _limit = crate::SampleLimitOverride::set(corpus.path(), 2048);
+    fs::create_dir_all(corpus.path().join("Assets/Scenes")).unwrap();
+    fs::write(
+        corpus.path().join("Assets/Scenes/Main.unity"),
+        scene_with_a_late_class(2048),
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    // 3 = completed with junk: records WERE dropped, and that must still be
+    // reported. What must not happen is the whole file being called junk.
+    let (code, report) = run_index_report(config).unwrap();
+    let report = report.unwrap();
+    assert_eq!(code, 3, "{report}");
+
+    let locked = endpoint.state.lock().unwrap();
+    let files: Vec<&Value> = locked
+        .catalog_docs
+        .values()
+        .filter(|doc| doc.get("doc_kind").and_then(Value::as_str) == Some("file"))
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "one source file, one catalog row: {files:?}"
+    );
+    let file = files[0];
+    assert_eq!(file["path"], "Assets/Scenes/Main.unity", "{file}");
+    // The preconditions. Without these the test would pass on a fixture where
+    // nothing was ever dropped, which is the failure mode it exists to catch.
+    assert!(
+        file["junk"].as_u64().unwrap_or(0) > 0,
+        "precondition: the unsampled group's records must actually have been \
+         dropped, or this fixture proves nothing: {file}"
+    );
+    assert!(
+        file["records"].as_u64().unwrap_or(0) > 0,
+        "precondition: the sampled group's records must actually have been \
+         indexed: {file}"
+    );
+    assert_eq!(
+        file["status"], "indexed",
+        "a file that indexed records is not junk: {file}"
+    );
+    assert_eq!(
+        report["files_junk"], 0,
+        "the file completed; only some of its records were dropped: {report}"
+    );
+    assert!(
+        locked.unexpected_catalog_actions.is_empty(),
+        "{:?}",
+        locked.unexpected_catalog_actions
+    );
+}
+
+#[test]
+fn a_junk_entry_for_a_completed_file_is_never_turned_into_a_catalog_row() {
+    let entries = [
+        state::JunkFile {
+            file_key: "k-completed".into(),
+            rel: "a.unity".into(),
+            format: "unity".into(),
+            status: "junk".into(),
+            reason: "some group was never sampled".into(),
+            bytes: 10,
+        },
+        state::JunkFile {
+            file_key: "k-junked".into(),
+            rel: "b.bin".into(),
+            format: "binary".into(),
+            status: "junk".into(),
+            reason: "binary content".into(),
+            bytes: 20,
+        },
+    ];
+    let borrowed: Vec<&state::JunkFile> = entries.iter().collect();
+    let completed: std::collections::HashSet<String> =
+        ["k-completed".to_string()].into_iter().collect();
+    let shadowed = crate::shadowed_junk_entries(&borrowed, &completed);
+    assert_eq!(
+        shadowed
+            .iter()
+            .map(|jf| jf.rel.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.unity"],
+        "an entry naming a completed file collides with that file's own \
+         catalog id and must be reported"
+    );
+    assert!(
+        crate::shadowed_junk_entries(&borrowed, &std::collections::HashSet::new()).is_empty(),
+        "with no completions nothing is shadowed"
+    );
+}
