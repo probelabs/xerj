@@ -80,7 +80,10 @@ stackprobe = []
 [dev-dependencies]
 xerj-storage = { path = "../xerj-storage", features = ["test-hooks"] }
 tempfile  = { workspace = true }
-tokio     = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `test-util` is what lets a test pause tokio's clock (`start_paused = true`)
+# and step a background timer deterministically instead of sleeping through it.
+# Dev-only: with resolver = "2" it never reaches the release binary's graph.
+tokio     = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 criterion = { workspace = true }
 tracing-subscriber = { workspace = true }
 

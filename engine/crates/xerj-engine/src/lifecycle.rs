@@ -774,7 +774,22 @@ mod tests {
             include_bytes!("../tests/fixtures/cluster_state/v2-format-version-minimal.json");
         let state_path = dir.path().join("cluster_state.json");
         std::fs::write(&state_path, future).unwrap();
-        let engine = Engine::new(config).unwrap();
+        // The only reacher of the boot diagnostic outside `cluster_state::tests`
+        // in this `--lib` binary: preflight classifies this fixture as
+        // `UnsupportedFormat` and `PreparedClusterState::blocked` emits its
+        // `error!` from this thread, which has no subscriber.  Whichever thread
+        // first registers that callsite decides its process-global `Interest`,
+        // and a subscriber-less registration pins it to `never`, blanking any
+        // concurrent `cluster_state::tests` capture — issue #372.  Today this
+        // cannot lose that race: libtest runs a byte-sorted name list, and
+        // `cluster_state::tests::*` ends at #106 of 601 while this test is #436
+        // (measured with `--list` at this commit), so registration is long
+        // settled.  The lock is what stops the guarantee from resting on that.
+        // See `cluster_state::PREFLIGHT_CALLSITE`.
+        let engine = {
+            let _serialised = crate::cluster_state::lock_preflight_callsite();
+            Engine::new(config).unwrap()
+        };
         assert!(matches!(
             engine.get_index("logs-1"),
             Err(EngineError::Common(
