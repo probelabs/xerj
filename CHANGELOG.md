@@ -39,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   equality rather than failing it — the state directory left behind by the
   aborted repro run resumes and commits on the fixed binary.
 
+- **A lexical query on a `semantic_text` field now says so** (#363). `match`,
+  `match_phrase`, `multi_match` and `query_string` against a `semantic_text`
+  field score with BM25 over the analysed text and never consult the embedding
+  that field was indexed to produce — the response was byte-identical to the
+  same query against a plain `text` field, same ids and same scores, so a
+  caller had no way to tell which question had been answered. `_search`
+  responses now carry an additive `_xerj.hints` entry (`code:
+  "lexical_on_semantic_text"`) that names the field, says the embedding was
+  not consulted, and gives a ready-to-paste `semantic` query body. Scoring,
+  hits and every ES-compat response field are unchanged, and the hint stays
+  quiet when the same request already reaches the vector through `semantic`
+  or `knn` (including the ES 8.x top-level `knn` block).
+
 ## [1.0.0-rc.17] - 2026-08-15
 
 ### Added
