@@ -256,7 +256,11 @@ pub async fn delete_wal_tap(State(state): State<AppState>) -> Response {
 /// the index's own sequence counter the tap is; `last_error` is why it stopped
 /// advancing; `healthy` is false when either of the two states that used to
 /// be indistinguishable from working is in effect — sends failing, or a
-/// target answering 200 while rejecting every action inside it.
+/// target answering 200 while applying none of the actions inside it, for any
+/// reason (`version_conflict_engine_exception`, `mapper_parsing_exception`,
+/// anything else). `last_item_rejection` carries the target's own word for
+/// the last non-conflict rejection, because "fix the mapping" and "look for a
+/// second writer" are opposite responses.
 ///
 /// Superuser-only ([`crate::authz`]): this enumerates every index on the node
 /// that the allowlist matches, and it echoes `target_url`. It applies no

@@ -16,9 +16,11 @@
 # es_compat.rs:2990), so a xerj target is precisely the target that does not
 # implement the mechanism, and running two xerj nodes cannot exercise it.
 # That claim is covered instead by
-# `redelivery_converges_at_a_target_that_honours_external_versioning` and
-# `a_target_that_rejects_every_action_is_reported_unhealthy_with_real_lag` in
-# wal_tap_push.rs, against a stub that implements the ES rule. Against an
+# `redelivery_converges_at_a_target_that_honours_external_versioning`,
+# `a_target_that_rejects_every_action_is_reported_unhealthy_with_real_lag` and
+# `a_target_that_drops_every_item_is_reported_unhealthy` in
+# wal_tap_push.rs, against stubs that implement the ES rule and the
+# reject-everything shape. Against an
 # Elasticsearch or OpenSearch target the mechanism is live; against a xerj
 # target the tap degrades to last-write-wins by arrival, as
 # `xerj-engine/src/wal_tap.rs` documents.

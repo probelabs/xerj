@@ -43,18 +43,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     since the last one, not the size of the file — the tail reader is a sliding
     window over a `File`, shaped after Lucene's `BufferedIndexInput.refill`
     (`lucene/core/src/java/org/apache/lucene/store/BufferedIndexInput.java:289-317`,
-    Apache-2.0). A caught-up poll reads the 16-byte WAL header and stops.
+    Apache-2.0). A caught-up poll reads the 16-byte WAL header and stops —
+    measured at exactly 16 bytes over a 4,176,200-byte generation, asserted
+    through `tail_shard` itself by
+    `wal::tests::a_caught_up_poll_does_not_read_the_whole_generation`. (The
+    window's 64 KiB read-ahead is deliberately not applied to that header read:
+    it was, and it made the figure 65,536 bytes per shard per poll rather
+    than 16.)
   - Delivery is at-least-once, with `version_type: external` carrying the WAL
     `seq_no` on every action so a redelivery converges on the same document the
-    source holds. Note that XERJ's own `_bulk` ignores per-action `version` /
-    `version_type` (only the single-doc path honours them), so a XERJ target
-    degrades to last-write-wins by arrival; against Elasticsearch or OpenSearch
-    the mechanism is live.
+    source holds. Covered against a stub that implements the actual ES external
+    versioning rule — absent `_id` is created at any version, present `_id` is
+    overwritten only by a strictly greater one, everything else comes back
+    `409 version_conflict_engine_exception` — and asserted on both halves: four
+    documents accepted on the first delivery, four conflicts and zero extra
+    `docs_shipped` on the redelivery, watermark unchanged. Note that XERJ's own
+    `_bulk` ignores per-action `version` / `version_type` (only the single-doc
+    path honours them), so a XERJ target degrades to last-write-wins by
+    arrival; against Elasticsearch or OpenSearch the mechanism is live.
   - `_stats` counts what the **target accepted**, per item, not what was
     rendered into the request. `lag_seq` is derived from the highest accepted
     `seq_no`, and each index carries a `healthy` boolean that is false both when
-    sends are failing and when the target answers `200` while rejecting every
-    action inside it as a version conflict.
+    sends are failing and when the target answers `200` while applying none of
+    the actions inside it — for **any** reason, not only a version conflict.
+    A target rejecting every document with `mapper_parsing_exception` is a `200`
+    with `errors: true`, so no send fails and the cursor advances past every
+    dropped document; `last_item_rejection` in `_stats` carries the target's own
+    word for it, because "fix the mapping" and "look for a second writer" are
+    opposite responses.
   - Cursor state is flushed once per poll cycle rather than once per index per
     poll; a deferred flush can only cause a redelivery, which the external
     versioning above absorbs.

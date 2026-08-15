@@ -66,6 +66,48 @@ enum TargetSemantics {
     /// is a rejected no-op, and the tap must say so rather than report a
     /// healthy zero-lag stream.
     ExternalVersioningAheadBy(u64),
+    /// `200` with `errors: true` and a **non-conflict** rejection on every
+    /// item — the shape a target with an incompatible mapping produces.
+    ///
+    /// Operationally identical to `ExternalVersioningAheadBy`: not one
+    /// document is at the target. It exists separately because the health
+    /// signal used to count only the conflict case, so this — every document
+    /// dropped, permanently, with the cursor advancing past them — read as
+    /// `healthy: true`, `last_error: null`.
+    RejectsEveryItem,
+}
+
+/// Answer a `_bulk` the way a target with an incompatible mapping does:
+/// `200 OK`, `errors: true`, and a `mapper_parsing_exception` per item.
+///
+/// Note the status: the request succeeded. `send_bulk`'s whole-request failure
+/// path is not involved, the cursor advances past every one of these documents
+/// (deliberately — see `WalTap::send_bulk`), and they are gone.
+fn reject_every_item(body: &str) -> String {
+    let mut items = Vec::new();
+    let mut lines = body.lines();
+    while let Some(meta_line) = lines.next() {
+        if meta_line.trim().is_empty() {
+            continue;
+        }
+        let meta: Value = serde_json::from_str(meta_line).expect("action line");
+        let (action, spec) = meta
+            .as_object()
+            .and_then(|o| o.iter().next())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .expect("action object");
+        if action != "delete" {
+            let _ = lines.next().expect("source line");
+        }
+        items.push(json!({action: {
+            "_index": spec["_index"], "_id": spec["_id"], "status": 400,
+            "error": {
+                "type": "mapper_parsing_exception",
+                "reason": "failed to parse field [v] of type [long]",
+            },
+        }}));
+    }
+    json!({"took": 1, "errors": true, "items": items}).to_string()
 }
 
 struct StubTarget {
@@ -150,11 +192,23 @@ impl StubTarget {
 /// Apply one `_bulk` NDJSON body under [`TargetSemantics::ExternalVersioning`]
 /// and return the ES-shaped response body.
 ///
-/// Deliberately implements the ES rule and not a friendlier one: an `index`
-/// action with `version_type: external` applies iff `version > stored`, a
-/// `delete` the same, and a rejection is
-/// `{"status":409,"error":{"type":"version_conflict_engine_exception", …}}`
-/// with the stored document left alone.
+/// Deliberately implements the ES rule and not a friendlier one:
+///
+/// * an `_id` the target does **not** hold is CREATED, at whatever external
+///   version was supplied — external versioning exists to let an outside
+///   system own the version line, so there is no floor to clear;
+/// * an `_id` it does hold is overwritten iff `version > stored`;
+/// * otherwise the item comes back
+///   `{"status":409,"error":{"type":"version_conflict_engine_exception", …}}`
+///   with the stored document left alone.
+///
+/// The create case is load-bearing. Seeding `stored = incoming` on first
+/// sight — which `held.entry(id).or_insert(incoming + ahead_by)` did whenever
+/// `ahead_by == 0` — made `incoming > stored` false for the FIRST delivery of
+/// every document, so the tap's first send was answered `409` and the
+/// convergence test never observed a single accepted item. It passed anyway,
+/// because "the redelivery changed nothing" is trivially true when the first
+/// delivery changed nothing either.
 fn apply_external_versioning(body: &str, held: &mut HashMap<String, u64>, ahead_by: u64) -> String {
     let mut items = Vec::new();
     let mut errors = false;
@@ -181,22 +235,47 @@ fn apply_external_versioning(body: &str, held: &mut HashMap<String, u64>, ahead_
             "the tap must send external versioning or none of this applies"
         );
 
-        // `ahead_by > 0` models a second writer that got to this target
-        // first: seed a version the tap can never beat.
-        let stored = *held.entry(id.clone()).or_insert(incoming + ahead_by);
-        if incoming > stored {
-            held.insert(id.clone(), incoming);
-            let result = if action == "delete" {
-                "deleted"
-            } else {
-                "created"
+        // What the target holds for this `_id`, if anything. `ahead_by > 0`
+        // models a second writer that got to this target first, so the very
+        // first sight of an `_id` is already occupied by a version the tap can
+        // never beat; `ahead_by == 0` means the tap is the only writer and an
+        // unseen `_id` is genuinely absent.
+        let stored = match held.get(&id).copied() {
+            Some(v) => Some(v),
+            None if ahead_by > 0 => {
+                let seeded = incoming + ahead_by;
+                held.insert(id.clone(), seeded);
+                Some(seeded)
+            }
+            None => None,
+        };
+        // Absent → create. Present → strictly-greater wins. This is the ES
+        // rule; anything stricter makes the first delivery a conflict and the
+        // whole at-least-once story untestable.
+        let applies = match stored {
+            None => true,
+            Some(s) => incoming > s,
+        };
+        if applies {
+            let result = match (action.as_str(), stored) {
+                ("delete", None) => "not_found",
+                ("delete", Some(_)) => "deleted",
+                (_, None) => "created",
+                (_, Some(_)) => "updated",
             };
+            // A delete leaves a tombstone AT the external version, exactly as
+            // ES does — dropping the entry instead would let a redelivered
+            // `index` at a lower version resurrect the document, which is the
+            // failure this whole mechanism exists to prevent.
+            held.insert(id.clone(), incoming);
             items.push(json!({action: {
                 "_index": index, "_id": id, "_version": incoming,
                 "result": result,
-                "status": 201,
+                "status": if result == "created" { 201 } else { 200 },
             }}));
         } else {
+            let stored =
+                stored.expect("the conflict branch is only reachable with a stored version");
             errors = true;
             items.push(json!({action: {
                 "_index": index, "_id": id, "_version": stored, "status": 409,
@@ -268,6 +347,7 @@ async fn serve_one(
                     guard.versions = held;
                     out
                 }
+                TargetSemantics::RejectsEveryItem => reject_every_item(&body),
             };
             guard.bodies.push(body);
             response
@@ -767,6 +847,28 @@ async fn redelivery_converges_at_a_target_that_honours_external_versioning() {
         "all four documents must reach the target: {after_first:?}"
     );
 
+    // The first delivery must have been ACCEPTED, not merely attempted. Take
+    // this away and the rest of the test is vacuous: "the redelivery changed
+    // nothing" is trivially true if nothing ever landed, and the assertions
+    // below would hold even if the tap sent `version: 0` on every action.
+    let first = engine.wal_tap.stats();
+    let first = first.get("edge-logs").expect("stats");
+    assert_eq!(
+        first.docs_shipped, 4,
+        "the FIRST delivery of a document must be created at a target that honours \
+         external versioning — it is absent, so there is no version to conflict with \
+         (conflicts so far: {}, failures: {})",
+        first.version_conflicts, first.item_failures
+    );
+    assert_eq!(
+        first.version_conflicts, 0,
+        "and nothing may be reported as a conflict before anything has been redelivered"
+    );
+    assert!(
+        first.last_shipped_seq > 0,
+        "the accepted watermark must have moved off zero"
+    );
+
     // Force the redelivery the at-least-once contract permits: rewind the
     // cursor to the start of the stream and poll again. Every action is
     // re-sent with the same seq_no as its external version.
@@ -778,14 +880,27 @@ async fn redelivery_converges_at_a_target_that_honours_external_versioning() {
         after_redelivery, after_first,
         "a redelivery must be a no-op at the target, not a resurrection: {after_redelivery:?}"
     );
+    assert!(
+        target.request_count() > 1,
+        "the redelivery must actually have been sent"
+    );
 
     let stats = engine.wal_tap.stats();
     let edge = stats.get("edge-logs").expect("stats");
-    assert!(
-        edge.version_conflicts >= 4,
-        "the redelivered actions must be REPORTED as conflicts, not silently counted as \
-         shipped (got {})",
-        edge.version_conflicts
+    assert_eq!(
+        edge.version_conflicts, 4,
+        "each of the four redelivered actions must be REPORTED as a conflict, not \
+         silently counted as shipped"
+    );
+    assert_eq!(
+        edge.docs_shipped, 4,
+        "and a redelivery must not inflate the shipped count — the same four documents \
+         are at the target, they were not shipped eight times"
+    );
+    assert_eq!(
+        edge.last_shipped_seq, first.last_shipped_seq,
+        "the watermark is the highest ACCEPTED seq_no; a rejected redelivery cannot \
+         move it and must not move it backwards either"
     );
     assert_eq!(
         edge.item_failures, 0,
@@ -853,6 +968,129 @@ async fn a_target_that_rejects_every_action_is_reported_unhealthy_with_real_lag(
         head > edge.last_shipped_seq,
         "lag must be non-zero (head {head}, watermark {})",
         edge.last_shipped_seq
+    );
+}
+
+/// The same lie, told the other way round: a target that rejects every item
+/// for a reason that is **not** a version conflict.
+///
+/// `mapper_parsing_exception` on every action is `200 OK` with `errors: true`,
+/// so no send fails, `last_error` stays `None`, and the cursor advances past
+/// every dropped document — permanently, because per-item failures are passed
+/// over by design. The first version of the health signal counted only the
+/// conflict case, and this state therefore read `healthy: true`,
+/// `last_error: null`, `docs_shipped: 0`, `item_failures: 5` — measured — while
+/// every single document was being thrown away. `healthy` is the one boolean
+/// operators are told to alert on; it does not get to be right only for the
+/// failure mode we thought of first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_that_drops_every_item_is_reported_unhealthy() {
+    let target = StubTarget::start_with(TargetSemantics::RejectsEveryItem).await;
+    let dir = TempDir::new().unwrap();
+    let engine = engine_with_tap(&dir, tap_config(&target.url, &["edge-logs"]));
+
+    for round in 0..5 {
+        write_docs(&engine, "edge-logs", &[&format!("d{round}")]).await;
+        engine.wal_tap.tick(&engine).await;
+    }
+
+    let stats = engine.wal_tap.stats();
+    let edge = stats.get("edge-logs").expect("stats for edge-logs");
+    assert!(
+        target.request_count() >= 5,
+        "the tap must actually have tried: {}",
+        target.request_count()
+    );
+    assert_eq!(
+        edge.docs_shipped, 0,
+        "nothing was accepted, so nothing may be counted as shipped"
+    );
+    assert_eq!(
+        edge.item_failures, 5,
+        "every dropped document must be counted"
+    );
+    assert_eq!(
+        edge.version_conflicts, 0,
+        "these are not conflicts — that distinction is the point"
+    );
+    assert_eq!(
+        edge.last_shipped_seq, 0,
+        "the watermark must come from ACCEPTED items"
+    );
+    assert!(
+        !edge.healthy(),
+        "a target dropping every document must not read as healthy \
+         (docs_shipped {}, item_failures {}, last_error {:?})",
+        edge.docs_shipped,
+        edge.item_failures,
+        edge.last_error
+    );
+    assert_eq!(
+        edge.last_item_rejection.as_deref(),
+        Some("mapper_parsing_exception"),
+        "and the operator must be told what the target called them"
+    );
+    assert!(
+        edge.last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mapper_parsing_exception"),
+        "the reason belongs in last_error too, not only in a side counter: {:?}",
+        edge.last_error
+    );
+
+    // Lag must be real, for the same reason as in the conflict case.
+    let head = engine
+        .get_index("edge-logs")
+        .unwrap()
+        .current_seq_no()
+        .saturating_sub(1);
+    assert!(
+        head > edge.last_shipped_seq,
+        "lag must be non-zero (head {head}, watermark {})",
+        edge.last_shipped_seq
+    );
+}
+
+/// A rejection is not a permanent verdict on the index: once the target starts
+/// taking documents again, `healthy` must come back. A latch would be as
+/// useless as the missing signal was — an operator who cannot see a fix land
+/// stops trusting the boolean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_recovers_once_the_target_accepts_again() {
+    let bad = StubTarget::start_with(TargetSemantics::RejectsEveryItem).await;
+    let good = StubTarget::start().await;
+    let dir = TempDir::new().unwrap();
+    let engine = engine_with_tap(&dir, tap_config(&bad.url, &["edge-logs"]));
+
+    for round in 0..5 {
+        write_docs(&engine, "edge-logs", &[&format!("d{round}")]).await;
+        engine.wal_tap.tick(&engine).await;
+    }
+    assert!(!engine.wal_tap.stats()["edge-logs"].healthy());
+
+    // Point at a target that takes writes and ship one more document.
+    engine
+        .wal_tap
+        .set_config(tap_config(&good.url, &["edge-logs"]));
+    write_docs(&engine, "edge-logs", &["recovered"]).await;
+    engine.wal_tap.tick(&engine).await;
+
+    let stats = engine.wal_tap.stats();
+    let edge = stats.get("edge-logs").expect("stats");
+    assert!(
+        edge.healthy(),
+        "one applied batch must clear the run: {:?}",
+        edge.last_error
+    );
+    assert_eq!(
+        edge.consecutive_unapplied_batches, 0,
+        "the run counter must reset, not decay"
+    );
+    assert!(
+        edge.docs_shipped >= 1,
+        "and the document must actually have landed: {}",
+        edge.docs_shipped
     );
 }
 

@@ -1734,6 +1734,16 @@ pub struct WalShardTail {
     pub truncated: bool,
     /// Frames skipped because their payload did not decode.
     pub corrupt_skipped: usize,
+    /// Bytes this poll actually read off disk, summed over every generation
+    /// file it touched.
+    ///
+    /// The windowed reader exists to keep this proportional to the bytes
+    /// *appended since the last poll* rather than to the size of the stream —
+    /// a caught-up poll costs one 16-byte header read per generation file it
+    /// opens. Exposed so that property is testable through this entry point
+    /// instead of by inspecting the reader's internals, which is what let the
+    /// pre-window `fs::read(path)` shape go uncaught.
+    pub bytes_read: u64,
 }
 
 /// Every WAL shard stream under `wal_root`, as `(shard_name, dir)`.
@@ -1801,6 +1811,7 @@ pub fn tail_shard(dir: &Path, cursor: Option<WalTailCursor>, max_entries: usize)
             gap: false,
             truncated: false,
             corrupt_skipped: 0,
+            bytes_read: 0,
         };
     };
     let first = gens[0];
@@ -1832,6 +1843,7 @@ pub fn tail_shard(dir: &Path, cursor: Option<WalTailCursor>, max_entries: usize)
                 gap: false,
                 truncated: false,
                 corrupt_skipped: 0,
+                bytes_read: scan.bytes_read,
             };
         }
     };
@@ -1888,6 +1900,7 @@ pub fn tail_shard(dir: &Path, cursor: Option<WalTailCursor>, max_entries: usize)
 
     let mut entries: Vec<ReplayEntry> = Vec::new();
     let mut corrupt_skipped = 0usize;
+    let mut bytes_read = 0u64;
     let mut truncated = false;
     let mut out_cursor = WalTailCursor {
         generation: start_gen,
@@ -1920,6 +1933,7 @@ pub fn tail_shard(dir: &Path, cursor: Option<WalTailCursor>, max_entries: usize)
         let scan = tail_wal_file(&wal_path(dir, gen), from, allow_resync, budget, true);
 
         corrupt_skipped += scan.corrupt;
+        bytes_read += scan.bytes_read;
         entries.extend(scan.entries);
         out_cursor = WalTailCursor {
             generation: gen,
@@ -1938,6 +1952,7 @@ pub fn tail_shard(dir: &Path, cursor: Option<WalTailCursor>, max_entries: usize)
         gap,
         truncated,
         corrupt_skipped,
+        bytes_read,
     }
 }
 
@@ -1951,14 +1966,19 @@ struct FileTail {
     /// Stopped because the entry budget ran out.
     truncated: bool,
     corrupt: usize,
+    /// Bytes actually read off this file by this poll.
+    bytes_read: u64,
 }
 
-/// How much one buffer refill pulls in.
+/// How much one buffer refill reads ahead.
 ///
-/// Sized like [`WAL_BUF_CAP`] on the writer side: big enough that a caught-up
-/// reader picks up a burst of small frames in one `read`, small enough that a
-/// poll over an idle 1 GiB generation costs one 16-byte header read and
-/// nothing else.
+/// Sized like [`WAL_BUF_CAP`] on the writer side: big enough that a reader
+/// catching up on a burst of small frames pays one `read` for the lot.
+///
+/// It is deliberately **not** applied to the file-header read — see
+/// [`WalWindow::fill_exact`]. That read is the only one a caught-up poll
+/// performs, so charging it 64 KiB of read-ahead that is discarded unread put
+/// the steady-state cost back to 64 KiB per shard per poll.
 const WAL_TAIL_READ_CHUNK: usize = 64 * 1024;
 
 /// Bytes of frame header needed before the payload length is known:
@@ -1994,6 +2014,13 @@ struct WalWindow {
     buf: Vec<u8>,
     /// Read position inside `buf`.
     cur: usize,
+    /// Bytes this window has actually pulled off the file.
+    ///
+    /// Not diagnostics: it is the property the windowed reader exists to
+    /// bound, and the only way a test can fail if this path regresses to
+    /// `fs::read`. Surfaced all the way out through
+    /// [`WalShardTail::bytes_read`].
+    bytes_read: u64,
 }
 
 impl WalWindow {
@@ -2006,6 +2033,7 @@ impl WalWindow {
             base: 0,
             buf: Vec::new(),
             cur: 0,
+            bytes_read: 0,
         })
     }
 
@@ -2027,7 +2055,40 @@ impl WalWindow {
 
     /// Make at least `need` bytes readable at the cursor, pulling more of the
     /// file in if necessary. `false` means the file ends first.
+    ///
+    /// Reads ahead by [`WAL_TAIL_READ_CHUNK`] so a burst of small frames costs
+    /// one syscall. Use [`WalWindow::fill_exact`] where the read-ahead would
+    /// be pure waste.
     fn fill(&mut self, need: usize) -> bool {
+        self.fill_chunked(need, WAL_TAIL_READ_CHUNK)
+    }
+
+    /// [`WalWindow::fill`] with no read-ahead at all: pull `need` bytes and
+    /// not one more.
+    ///
+    /// Same escape hatch Lucene gives its own buffered reader:
+    /// `BufferedIndexInput.readBytes(byte[], int, int, boolean useBuffer)`
+    /// (`lucene/core/src/java/org/apache/lucene/store/BufferedIndexInput.java:91-134`,
+    /// Apache-2.0) routes a read around the read-ahead buffer whenever
+    /// buffering would not pay — "there's no performance reason not to read it
+    /// all at once … no need to reread what we had in the buffer". Adapted,
+    /// not copied: the case here is the mirror image, a read too *small* to
+    /// justify a chunk that is then discarded.
+    ///
+    /// The header read is the caller that needs this. It is followed
+    /// immediately by `seek_to(start)`, which throws the buffer away, so any
+    /// read-ahead there is discarded unread — and on a *caught-up* poll it is
+    /// the only read that happens, which made "a caught-up poll costs one
+    /// 16-byte header read" false by 4096x: `fill(16)` took the
+    /// `.max(WAL_TAIL_READ_CHUNK)` branch and pulled 64 KiB, per shard, per
+    /// poll. Measured by
+    /// [`a_caught_up_poll_does_not_read_the_whole_generation`] over a
+    /// 4,176,200-byte generation: 65,536 bytes before this split, 16 after.
+    fn fill_exact(&mut self, need: usize) -> bool {
+        self.fill_chunked(need, need)
+    }
+
+    fn fill_chunked(&mut self, need: usize, chunk: usize) -> bool {
         if self.available() >= need {
             return true;
         }
@@ -2042,7 +2103,7 @@ impl WalWindow {
             if read_from >= self.len {
                 return false;
             }
-            let want = (need - self.buf.len()).max(WAL_TAIL_READ_CHUNK);
+            let want = (need - self.buf.len()).max(chunk);
             let want = want.min((self.len - read_from) as usize);
             let start = self.buf.len();
             self.buf.resize(start + want, 0);
@@ -2055,7 +2116,10 @@ impl WalWindow {
                     self.buf.truncate(start);
                     return false;
                 }
-                Ok(n) => self.buf.truncate(start + n),
+                Ok(n) => {
+                    self.bytes_read += n as u64;
+                    self.buf.truncate(start + n);
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => self.buf.truncate(start),
                 Err(_) => {
                     self.buf.truncate(start);
@@ -2105,6 +2169,7 @@ fn tail_wal_file(
                 drained: true,
                 truncated: false,
                 corrupt: 0,
+                bytes_read: 0,
             };
         }
         Err(e) => {
@@ -2115,18 +2180,24 @@ fn tail_wal_file(
                 drained: false,
                 truncated: false,
                 corrupt: 0,
+                bytes_read: 0,
             };
         }
     };
 
     win.seek_to(0);
-    if !win.fill(WAL_HEADER_LEN as usize) || &win.buf[..4] != WAL_MAGIC {
+    // `fill_exact`, not `fill`: the very next statement is `seek_to(start)`,
+    // which discards the buffer, so read-ahead here is read-and-throw-away —
+    // and on a caught-up poll this is the ONLY read, so the read-ahead was the
+    // whole per-poll cost.
+    if !win.fill_exact(WAL_HEADER_LEN as usize) || &win.buf[..4] != WAL_MAGIC {
         return FileTail {
             entries: Vec::new(),
             end_offset: from_offset.max(WAL_HEADER_LEN),
             drained: false,
             truncated: false,
             corrupt: 0,
+            bytes_read: win.bytes_read,
         };
     }
     let generation = u64::from_le_bytes(win.buf[4..12].try_into().unwrap());
@@ -2142,6 +2213,7 @@ fn tail_wal_file(
             drained: false,
             truncated: false,
             corrupt: 0,
+            bytes_read: win.bytes_read,
         };
     }
     win.seek_to(start);
@@ -2158,6 +2230,7 @@ fn tail_wal_file(
                 drained: false,
                 truncated: true,
                 corrupt,
+                bytes_read: win.bytes_read,
             };
         }
         if win.pos() >= win.len {
@@ -2167,6 +2240,7 @@ fn tail_wal_file(
                 drained: true,
                 truncated: false,
                 corrupt,
+                bytes_read: win.bytes_read,
             };
         }
 
@@ -2213,6 +2287,7 @@ fn tail_wal_file(
                         drained: true,
                         truncated: false,
                         corrupt,
+                        bytes_read: win.bytes_read,
                     };
                 }
                 None => {
@@ -2225,6 +2300,7 @@ fn tail_wal_file(
                         drained: false,
                         truncated: false,
                         corrupt,
+                        bytes_read: win.bytes_read,
                     };
                 }
             }
@@ -3316,8 +3392,12 @@ mod tests {
     /// interval that is ~60x read amplification of the node's live ingest
     /// volume per flush window, per shard.
     ///
-    /// Asserted structurally — a caught-up poll never materialises a buffer
-    /// the size of the file — by making the file large and the poll a no-op.
+    /// Asserted **through `tail_shard`**, on the bytes it reports reading.
+    /// An earlier version of this test hand-built a `WalWindow`, seeked it
+    /// past the header read and asserted on `win.buf.len()`; it never called
+    /// the entry point, so it could not fail if this path regressed to
+    /// `fs::read(path)` — and it did not fail on the 64 KiB header read-ahead
+    /// that made a caught-up poll cost 65,536 bytes rather than 16.
     #[test]
     fn a_caught_up_poll_does_not_read_the_whole_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -3347,24 +3427,82 @@ mod tests {
         let len = std::fs::metadata(wal_path(dir.path(), 0)).unwrap().len();
         assert!(len > 512 * 1024, "the file must be big enough to matter");
 
-        // The window the caught-up poll opens: cursor is at EOF, so it reads
-        // the 16-byte header and stops. `WalWindow` is what proves it — it
-        // never buffers more than one frame plus a chunk.
-        let mut win = WalWindow::open(&wal_path(dir.path(), 0)).unwrap();
-        win.seek_to(caught_up.cursor.offset);
-        assert!(!win.fill(1), "there is nothing left to read at EOF");
-        assert!(
-            win.buf.len() < WAL_TAIL_READ_CHUNK,
-            "a caught-up poll buffered {} bytes of a {len}-byte file",
-            win.buf.len()
+        // The poll that matters: the cursor is at EOF, nothing was appended.
+        // It must read the 16-byte file header to identify the generation and
+        // then stop — not the file (`fs::read`, the original shape), and not a
+        // 64 KiB read-ahead chunk it immediately throws away.
+        let idle = tail_shard(dir.path(), Some(caught_up.cursor), 10_000);
+        assert!(idle.entries.is_empty(), "nothing was appended");
+        assert_eq!(
+            idle.bytes_read, WAL_HEADER_LEN,
+            "a caught-up poll read {} bytes of a {len}-byte generation; it must read \
+             the {WAL_HEADER_LEN}-byte header and stop",
+            idle.bytes_read
         );
 
-        // And it is still correct: a poll after new appends reads only those.
+        // And it is still correct: a poll after new appends reads only those,
+        // plus the header — never the history in front of them.
         let mut w = make_writer(dir.path());
         w.append(&doc("late")).unwrap();
         drop(w);
-        let after = tail_shard(dir.path(), Some(caught_up.cursor), 10_000);
+        let appended = std::fs::metadata(wal_path(dir.path(), 0)).unwrap().len() - len;
+        let after = tail_shard(dir.path(), Some(idle.cursor), 10_000);
         assert_eq!(doc_ids(&after), vec!["+late"]);
+        assert!(
+            after.bytes_read <= WAL_HEADER_LEN + appended,
+            "a poll that is one frame behind read {} bytes for {appended} bytes of new \
+             data in a {len}-byte generation",
+            after.bytes_read
+        );
+    }
+
+    /// The same property one level up: `tail_shard` must not read the history
+    /// in front of a cursor that is far into an established stream.
+    ///
+    /// `fs::read(path)` — the shape this replaced — passes
+    /// [`a_caught_up_poll_does_not_read_the_whole_generation`]'s *correctness*
+    /// assertions perfectly. Only the byte count separates them.
+    #[test]
+    fn a_poll_from_the_middle_of_a_generation_reads_forward_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path());
+        let mut lcg: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut noise = || {
+            let mut s = String::with_capacity(8192);
+            for _ in 0..1024 {
+                lcg = lcg.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                s.push_str(&format!("{:016x}", lcg));
+            }
+            s
+        };
+        for i in 0..256 {
+            w.append(&WalEntry::Index {
+                doc_id: format!("d{i}"),
+                source: serde_json::json!({ "v": noise() }),
+            })
+            .unwrap();
+        }
+        // Read the whole thing once so the cursor sits at the end…
+        let full = tail_shard(dir.path(), None, 10_000);
+        assert_eq!(full.entries.len(), 256);
+        let history = std::fs::metadata(wal_path(dir.path(), 0)).unwrap().len();
+        assert!(history > 512 * 1024);
+
+        // …then append one small frame and poll for exactly it.
+        w.append(&doc("tail")).unwrap();
+        drop(w);
+        let grown = std::fs::metadata(wal_path(dir.path(), 0)).unwrap().len();
+        let appended = grown - history;
+        assert!(appended < 4096, "the new frame must be small: {appended}");
+
+        let incremental = tail_shard(dir.path(), Some(full.cursor), 10_000);
+        assert_eq!(doc_ids(&incremental), vec!["+tail"]);
+        assert!(
+            incremental.bytes_read < history / 4,
+            "reading {appended} new bytes cost {} of a {grown}-byte file — the poll is \
+             re-reading history",
+            incremental.bytes_read
+        );
     }
 
     /// A rotated generation still resyncs past a corrupt region, exactly as

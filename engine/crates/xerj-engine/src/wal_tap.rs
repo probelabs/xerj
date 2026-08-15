@@ -61,10 +61,13 @@
 //! and that is what the counters mean: `docs_shipped` and `last_shipped_seq`
 //! move only for items the target **accepted**. A `_bulk` that returns `200`
 //! while rejecting every action inside it — a target holding a higher external
-//! version for every `_id`, i.e. a second writer got there first — is a real
+//! version for every `_id` because a second writer got there first, or one
+//! rejecting every document with a `mapper_parsing_exception` — is a real
 //! state and used to be indistinguishable from a healthy tap.
-//! `consecutive_conflict_only_batches` and
-//! [`IndexTapStats::healthy`] exist so it is not.
+//! `consecutive_unapplied_batches`, `last_item_rejection` and
+//! [`IndexTapStats::healthy`] exist so it is not. The counter is deliberately
+//! blind to *why* nothing applied: conflict and rejection are opposite
+//! diagnoses but the same fact, and it is the fact that `healthy` reports.
 //!
 //! **3. Backpressure.** Bounded by construction: one in-flight request per
 //! index, batches capped by `max_batch_docs` and `max_batch_bytes`, and
@@ -265,34 +268,49 @@ pub struct IndexTapStats {
     /// instead is what let a target that rejected every single action report
     /// `lag_seq: 0` while `docs_shipped` climbed.
     pub last_shipped_seq: u64,
-    /// Consecutive `_bulk` responses in which the target rejected **every**
-    /// action as a version conflict.
+    /// Consecutive `_bulk` responses in which the target accepted **nothing**
+    /// — every action inside came back with an error.
     ///
-    /// One conflict is expected and benign: it is how external versioning
-    /// absorbs an at-least-once redelivery. A *sustained run* of batches that
-    /// are entirely conflicts is not — it means the target holds a higher
-    /// version for every `_id` this tap sends, so the tap is a no-op and the
-    /// two sides are diverging. See [`IndexTapStats::healthy`].
-    pub consecutive_conflict_only_batches: u32,
+    /// Deliberately blind to *why*. A version conflict and a
+    /// `mapper_parsing_exception` are opposite diagnoses but the same
+    /// operational fact: the documents are not at the target. An earlier shape
+    /// of this counter only counted the conflict case, which meant a target
+    /// answering `200` while rejecting every single item with a mapping error
+    /// read `healthy: true` with `docs_shipped: 0` — the exact class of lie
+    /// the per-item accounting exists to remove.
+    ///
+    /// One such batch is expected and benign: it is how external versioning
+    /// absorbs an at-least-once redelivery. A *sustained run* is not — it means
+    /// the tap is a no-op and the two sides are diverging. See
+    /// [`IndexTapStats::healthy`].
+    pub consecutive_unapplied_batches: u32,
+    /// Error `type` of the most recent item the target rejected for a reason
+    /// other than a version conflict, e.g. `mapper_parsing_exception`.
+    ///
+    /// `item_failures` says how many documents were dropped; this says what
+    /// the target called them, which is the difference between "fix the
+    /// mapping" and "look for a second writer".
+    pub last_item_rejection: Option<String>,
 }
 
-/// How many all-conflict batches in a row stop counting as "a redelivery
-/// landed" and start counting as "this target is not taking our writes".
+/// How many batches in a row that applied nothing stop counting as "a
+/// redelivery landed" and start counting as "this target is not taking our
+/// writes".
 ///
 /// A redelivery after a failed send re-ships exactly the chunks that did not
 /// land, so it clears on the next batch that contains anything new. Three in a
 /// row cannot be that.
-const CONFLICT_ONLY_UNHEALTHY_AFTER: u32 = 3;
+const UNAPPLIED_UNHEALTHY_AFTER: u32 = 3;
 
 impl IndexTapStats {
     /// Is this index's replication actually working?
     ///
     /// `false` for the two states that used to look identical to a healthy
     /// tap in `_stats`: a send that keeps failing, and a target that accepts
-    /// every request while rejecting every action inside it.
+    /// every request while rejecting every action inside it — for any reason,
+    /// conflict or otherwise.
     pub fn healthy(&self) -> bool {
-        self.last_error.is_none()
-            && self.consecutive_conflict_only_batches < CONFLICT_ONLY_UNHEALTHY_AFTER
+        self.last_error.is_none() && self.consecutive_unapplied_batches < UNAPPLIED_UNHEALTHY_AFTER
     }
 }
 
@@ -741,7 +759,13 @@ enum SendOutcome {
     /// occurred; the cursor advances either way.
     ///
     /// `outcomes` is positionally aligned with the chunk's actions.
-    Accepted { outcomes: Vec<ItemOutcome> },
+    Accepted {
+        outcomes: Vec<ItemOutcome>,
+        /// Error `type` of the first non-conflict rejection in this response,
+        /// so `_stats` can say what the target called the documents it threw
+        /// away rather than only how many there were.
+        rejection: Option<String>,
+    },
     /// The request did not land. The cursor must not advance.
     Failed(String),
 }
@@ -793,6 +817,7 @@ impl WalTap {
                 debug!(error = %e, "WAL tap: unparseable _bulk response body");
                 return SendOutcome::Accepted {
                     outcomes: vec![ItemOutcome::Accepted; actions],
+                    rejection: None,
                 };
             }
         };
@@ -802,6 +827,7 @@ impl WalTap {
         if parsed.get("errors").and_then(Value::as_bool) != Some(true) {
             return SendOutcome::Accepted {
                 outcomes: vec![ItemOutcome::Accepted; actions],
+                rejection: None,
             };
         }
 
@@ -824,6 +850,7 @@ impl WalTap {
         }
 
         let mut outcomes = Vec::with_capacity(items.len());
+        let mut rejection: Option<String> = None;
         let mut warned = false;
         for item in items {
             let action = item.as_object().and_then(|o| o.values().next());
@@ -841,10 +868,20 @@ impl WalTap {
                     warn!(error = %error, "WAL tap: target rejected a document — \
                           skipped (see item_failures in _stats)");
                 }
+                if rejection.is_none() {
+                    rejection = Some(if kind.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        kind.to_string()
+                    });
+                }
                 outcomes.push(ItemOutcome::Rejected);
             }
         }
-        SendOutcome::Accepted { outcomes }
+        SendOutcome::Accepted {
+            outcomes,
+            rejection,
+        }
     }
 
     /// Poll one index once: read its WAL tail, ship it, advance its cursors.
@@ -1000,14 +1037,17 @@ impl WalTap {
         let mut item_failures = 0u64;
         let mut version_conflicts = 0u64;
         let mut batches = 0u64;
-        let mut conflict_only_batches = 0u32;
+        let mut unapplied_batches = 0u32;
+        let mut rejection_kind: Option<String> = None;
 
         for chunk in chunks {
             let actions = chunk.actions.clone();
             match self.send_bulk(config, chunk.body, actions.len()).await {
-                SendOutcome::Accepted { outcomes } => {
+                SendOutcome::Accepted {
+                    outcomes,
+                    rejection,
+                } => {
                     let mut accepted_here = 0u64;
-                    let mut conflicts_here = 0u64;
                     for (action, outcome) in actions.iter().zip(outcomes.iter()) {
                         match outcome {
                             ItemOutcome::Accepted => {
@@ -1019,15 +1059,22 @@ impl WalTap {
                                     docs += 1;
                                 }
                             }
-                            ItemOutcome::Conflict => {
-                                conflicts_here += 1;
-                                version_conflicts += 1;
-                            }
+                            ItemOutcome::Conflict => version_conflicts += 1,
                             ItemOutcome::Rejected => item_failures += 1,
                         }
                     }
-                    if accepted_here == 0 && conflicts_here == actions.len() as u64 {
-                        conflict_only_batches += 1;
+                    // Nothing in this batch was applied. WHY is a separate
+                    // question — a conflict says "a second writer beat us", a
+                    // rejection says "the target will not take this document"
+                    // — but the operational fact is identical and it is the
+                    // one `healthy` answers. Counting only the conflict case
+                    // let an all-`mapper_parsing_exception` response read as a
+                    // healthy zero-lag tap with `docs_shipped: 0`.
+                    if accepted_here == 0 && !actions.is_empty() {
+                        unapplied_batches += 1;
+                    }
+                    if rejection.is_some() {
+                        rejection_kind = rejection;
                     }
                     batches += 1;
                 }
@@ -1067,23 +1114,42 @@ impl WalTap {
             s.version_conflicts += version_conflicts;
             s.last_shipped_seq = s.last_shipped_seq.max(max_accepted_seq);
             s.consecutive_failures = 0;
-            // A run of batches in which the target rejected every action as a
-            // conflict is not "replication working". Only a batch that landed
-            // something clears it.
-            if conflict_only_batches > 0 && docs == 0 && deletes == 0 {
-                s.consecutive_conflict_only_batches = s
-                    .consecutive_conflict_only_batches
-                    .saturating_add(conflict_only_batches);
-            } else {
-                s.consecutive_conflict_only_batches = 0;
+            if let Some(kind) = &rejection_kind {
+                s.last_item_rejection = Some(kind.clone());
             }
-            if s.consecutive_conflict_only_batches >= CONFLICT_ONLY_UNHEALTHY_AFTER {
-                s.last_error = Some(format!(
-                    "target rejected every action of the last {} batches with \
-                     version_conflict_engine_exception — it holds a higher version for \
-                     every document this tap sends, so nothing is being replicated",
-                    s.consecutive_conflict_only_batches
-                ));
+            // A run of batches that applied nothing is not "replication
+            // working". Only a batch that landed something clears it.
+            if unapplied_batches > 0 && docs == 0 && deletes == 0 {
+                s.consecutive_unapplied_batches = s
+                    .consecutive_unapplied_batches
+                    .saturating_add(unapplied_batches);
+            } else {
+                s.consecutive_unapplied_batches = 0;
+            }
+            if s.consecutive_unapplied_batches >= UNAPPLIED_UNHEALTHY_AFTER {
+                let run = s.consecutive_unapplied_batches;
+                // Name the cause the target gave *this poll*, not whatever it
+                // last gave: a conflict and a mapping error need opposite
+                // responses from the operator, and a stale reason would send
+                // them the wrong way. `item_failures` is this poll's count.
+                let reason = if item_failures > 0 {
+                    let kind = rejection_kind
+                        .as_deref()
+                        .or(s.last_item_rejection.as_deref())
+                        .unwrap_or("an unnamed error");
+                    format!(
+                        "target accepted nothing in the last {run} batches — it rejected \
+                         every action, most recently with {kind}. Nothing is being \
+                         replicated; these documents are being dropped, not retried."
+                    )
+                } else {
+                    format!(
+                        "target rejected every action of the last {run} batches with \
+                         version_conflict_engine_exception — it holds a higher version for \
+                         every document this tap sends, so nothing is being replicated"
+                    )
+                };
+                s.last_error = Some(reason);
                 true
             } else {
                 s.last_error = None;
@@ -1092,10 +1158,11 @@ impl WalTap {
         });
         if unhealthy {
             warn!(
-                index = %name, version_conflicts,
-                "WAL tap: every action is being rejected as a version conflict — the \
-                 target holds higher versions than this node. _stats reports the index \
-                 unhealthy; check that the target is not also fed by another writer."
+                index = %name, version_conflicts, item_failures,
+                rejection = ?rejection_kind,
+                "WAL tap: the target is accepting the request and applying none of it. \
+                 _stats reports the index unhealthy; check last_item_rejection, and \
+                 whether the target is also fed by another writer."
             );
         }
         self.clear_backoff();
