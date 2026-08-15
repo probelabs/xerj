@@ -34,7 +34,7 @@ pub mod walk;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -241,6 +241,7 @@ fn project_reconcile_plan(
         inventory.files.len() as u64,
         inventory.files.iter().map(|file| file.size).sum(),
     );
+    let stub_matcher = StubMatcher::compile(&cfg.stub_globs).expect("validated at startup");
     let scans: Vec<FileScan> = crate::pool::install(|| {
         use rayon::prelude::*;
         inventory
@@ -256,6 +257,7 @@ fn project_reconcile_plan(
                     &ctx,
                     cfg.sample,
                     cfg.max_file_gb,
+                    stub_matcher.matches(&file.rel),
                 )
             })
             .collect()
@@ -632,7 +634,7 @@ pub fn run_cli() -> i32 {
             cli::print_help();
             return 0;
         }
-        Cmd::Index(cfg) => run_index(cfg),
+        Cmd::Index(cfg) => run_index(*cfg),
         Cmd::Map(cfg) => run_map(cfg),
         Cmd::Status(cfg) => run_status(cfg),
     };
@@ -652,6 +654,35 @@ pub fn run_cli() -> i32 {
 }
 
 const GB: u64 = 1 << 30;
+
+/// Junk entries that name a file which also reached `file_done`.
+///
+/// The catalog holds ONE document per file: `catalog::file_doc` derives its
+/// `_id` from the file key alone (`catalog::file_id`). The completion pass and
+/// the junk pass both write into the same bulk body, so an entry that appears
+/// in both is not two rows, it is one row written twice — and the junk write,
+/// which lands second, is the one that survives. The observable damage is that
+/// a file which indexed N records is reported as status "junk" with records 0,
+/// plus a double count in `junk_file_count` and a double
+/// `CodeCoverage::observe`.
+///
+/// Producers are required to keep the two sets disjoint: a worker that gives up
+/// on a file sets `send_err`, which suppresses the completion, and a worker
+/// that merely wants to report a partial problem notes it on the progress meter
+/// instead. This returns the violations rather than assuming there are none,
+/// because the caller is the only place that holds both sets and because the
+/// failure is silent everywhere else.
+fn shadowed_junk_entries<'a>(
+    all_junk: &[&'a state::JunkFile],
+    completed_keys: &HashSet<String>,
+) -> Vec<&'a state::JunkFile> {
+    all_junk
+        .iter()
+        .filter(|jf| completed_keys.contains(&jf.file_key))
+        .copied()
+        .collect()
+}
+
 /// How many entries a human-facing listing prints before it summarises the
 /// rest. These lists are bounded by the corpus, not by the fault: unmounting a
 /// bind mount under an indexed root makes every content group vanish at once,
@@ -660,6 +691,86 @@ const GB: u64 = 1 << 30;
 const REFUSAL_LIST_CAP: usize = 10;
 const SAMPLE_LIMIT_BYTES: u64 = 4 << 20;
 const SQLDUMP_SAMPLE_LIMIT: u64 = 64 << 20;
+/// Sampling byte cap for Unity assets.
+///
+/// Unity YAML is a GROUPED family: each `unity_class` is its own cluster, and
+/// a class's first document can sit anywhere in the file — `extract/unity.rs`
+/// notes real scenes exceed 200 MB. A class whose first document starts past
+/// the cap is never sampled, so it gets no entry in `fa.assignments`, and
+/// phase B then has nowhere to route its records. Under the old 4 MiB cap
+/// that silently became `file_junk`. This cap is set past the size of the
+/// scenes the format actually produces so that outcome needs a genuinely
+/// pathological file, and when it does happen phase B now names the
+/// unsampled group and its record count in `extra_junk` instead of adding
+/// them to an anonymous counter.
+const UNITY_SAMPLE_LIMIT: u64 = 512 << 20;
+
+/// How many bytes phase A reads from a file of this family before it stops
+/// sampling. `None` means the family's extractor caps itself.
+///
+/// Split out of `scan_file` so tests can shrink it. The consequence of a
+/// GROUPED family hitting this cap is not "a slightly thinner sample", it is a
+/// whole `unity_class`/SQL table with no dataset to route to in phase B — and
+/// the only fixture that reaches it naturally is a half-gigabyte file, which
+/// is why that path shipped untested. `SampleLimitOverride` gives the suite a
+/// fixture it can afford.
+fn sample_limit_bytes(family: Family, path: &Path) -> Option<u64> {
+    // Only the test override reads the path; the shipped caps are per-family.
+    #[cfg(not(test))]
+    let _ = path;
+    #[cfg(test)]
+    {
+        // Scoped to ONE corpus root, not process-global. `cargo test` runs this
+        // binary multi-threaded, phase A itself runs on `crate::pool`, and a
+        // bare global would silently re-cap sampling for every unrelated test
+        // that happened to overlap — a flake that would look like anything but
+        // its cause.
+        if let Some((root, bytes)) = SAMPLE_LIMIT_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            if path.starts_with(root) {
+                return Some(*bytes);
+            }
+        }
+    }
+    match family {
+        Family::SqlDump => Some(SQLDUMP_SAMPLE_LIMIT),
+        Family::UnityYaml => Some(UNITY_SAMPLE_LIMIT),
+        Family::Jsonl | Family::Logs | Family::Csv | Family::TxtLines => Some(SAMPLE_LIMIT_BYTES),
+        Family::Sqlite => Some(1), // signals per-table row cap inside the extractor
+        _ => None,                 // whole-file extractors cap themselves
+    }
+}
+
+/// Test-only phase-A byte cap: `(corpus root, bytes)`, applied only to paths
+/// under that root. `None` = off.
+#[cfg(test)]
+static SAMPLE_LIMIT_OVERRIDE: Mutex<Option<(std::path::PathBuf, u64)>> = Mutex::new(None);
+
+/// Caps phase-A sampling under `root` for the lifetime of the guard.
+#[cfg(test)]
+pub(crate) struct SampleLimitOverride;
+
+#[cfg(test)]
+impl SampleLimitOverride {
+    pub(crate) fn set(root: &Path, bytes: u64) -> Self {
+        *SAMPLE_LIMIT_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((root.to_owned(), bytes));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SampleLimitOverride {
+    fn drop(&mut self) {
+        *SAMPLE_LIMIT_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
 
 #[cfg(test)]
 static REPLACEMENT_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -778,6 +889,186 @@ fn section_label(locator: &str) -> Option<String> {
     (digits(page) && digits(sec)).then(|| format!("page {page} section {sec}"))
 }
 
+// ─── --stub glob matcher ──────────────────────────────────────────────────
+
+/// Longest accepted `--stub` glob. Far beyond any pattern a person types,
+/// and far below the length at which the compiled regex hits its size limit.
+const MAX_STUB_GLOB_LEN: usize = 4096;
+
+/// Compiled `--stub <glob>` patterns. A matching file is indexed as ONE
+/// name-card record (`Family::Stub`) and its contents are never opened —
+/// the owner's way of saying "this data blob should be referenceable but
+/// not parsed" without the engine hardcoding per-corpus rules.
+///
+/// Glob semantics (gitignore-flavored): `**` crosses `/`, `*` and `?` do
+/// not; a pattern without `/` matches against the file NAME anywhere in the
+/// tree, a pattern with `/` matches the full root-relative path.
+pub struct StubMatcher {
+    by_name: Vec<regex::Regex>,
+    by_path: Vec<regex::Regex>,
+}
+
+impl StubMatcher {
+    pub fn compile(globs: &[String]) -> Result<Self> {
+        let mut by_name = Vec::new();
+        let mut by_path = Vec::new();
+        for g in globs {
+            // `glob_to_regex` escapes every metacharacter, so no glob can
+            // produce a SYNTACTICALLY invalid regex — the only reachable
+            // failure is the compiled-size limit, which `?` (→ `[^/]`) and
+            // `**` (→ `.*`) reach at ~10^5 characters. Caught here by length
+            // so the message names the flag and the cause instead of
+            // surfacing a regex-internal "compiled regex exceeds size limit".
+            if g.len() > MAX_STUB_GLOB_LEN {
+                anyhow::bail!(
+                    "--stub {}…: pattern is {} characters (limit {MAX_STUB_GLOB_LEN})",
+                    g.chars().take(40).collect::<String>(),
+                    g.len()
+                );
+            }
+            let re = regex::Regex::new(&glob_to_regex(g))
+                .with_context(|| format!("--stub {g}: invalid pattern"))?;
+            if g.contains('/') {
+                by_path.push(re);
+            } else {
+                by_name.push(re);
+            }
+        }
+        Ok(Self { by_name, by_path })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty() && self.by_path.is_empty()
+    }
+
+    /// `rel` is the root-relative path with forward slashes.
+    pub fn matches(&self, rel: &str) -> bool {
+        if self.by_path.iter().any(|re| re.is_match(rel)) {
+            return true;
+        }
+        if self.by_name.is_empty() {
+            return false;
+        }
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        self.by_name.iter().any(|re| re.is_match(name))
+    }
+}
+
+fn glob_to_regex(glob: &str) -> String {
+    let mut out = String::from("^");
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    // `**/` also swallows its slash so `**/x` matches a
+                    // top-level `x`.
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        out.push_str("(?:.*/)?");
+                    } else {
+                        out.push_str(".*");
+                    }
+                } else {
+                    out.push_str("[^/]*");
+                }
+            }
+            '?' => out.push_str("[^/]"),
+            other => out.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    out.push('$');
+    out
+}
+
+/// The synthetic sniff result for a `--stub`-designated file.
+///
+/// `logical_path` is the file as the CORPUS names it, which under durable
+/// preparation is not the path the bytes live at (`blobs/00000000`). A stub's
+/// only output is a name card, so taking the name from the content path would
+/// title every stub after a blob ordinal — the #294 failure class that
+/// `Sniffed::logical_name` exists to prevent.
+fn stub_sniffed(logical_path: &Path) -> Sniffed {
+    Sniffed {
+        family: Family::Stub,
+        gzip: false,
+        binary_kind: None,
+        csv: None,
+        encoding: "utf-8",
+        logical_name: logical_path.file_name().map(std::path::PathBuf::from),
+    }
+}
+
+#[cfg(test)]
+mod stub_matcher_tests {
+    use super::StubMatcher;
+
+    fn m(globs: &[&str]) -> StubMatcher {
+        StubMatcher::compile(&globs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn a_bare_pattern_matches_file_names_anywhere() {
+        let s = m(&["*.csv"]);
+        assert!(s.matches("unity/Assets/Face/f_roommate_004.csv"));
+        assert!(s.matches("top.csv"));
+        assert!(!s.matches("unity/Assets/notes.csv.md"));
+    }
+
+    #[test]
+    fn a_path_pattern_matches_the_root_relative_path() {
+        let s = m(&["unity/**/*.csv"]);
+        assert!(s.matches("unity/Assets/Face/f_roommate_004.csv"));
+        assert!(s.matches("unity/top.csv"), "**/ also matches zero dirs");
+        assert!(!s.matches("backend/data/users.csv"), "scoped to unity/");
+    }
+
+    #[test]
+    fn single_star_does_not_cross_directories() {
+        let s = m(&["unity/*.csv"]);
+        assert!(s.matches("unity/top.csv"));
+        assert!(!s.matches("unity/Assets/deep.csv"));
+    }
+
+    #[test]
+    fn regex_metacharacters_in_patterns_are_literal() {
+        let s = m(&["data(v1).csv"]);
+        assert!(s.matches("x/data(v1).csv"));
+        assert!(!s.matches("x/dataXv1Y.csv"));
+    }
+
+    #[test]
+    fn an_invalid_pattern_fails_loudly_at_startup() {
+        // The old body asserted only that a VALID pattern compiles, so it
+        // never tested its own name and would have passed against a `compile`
+        // that could not fail at all.
+        let msg = match StubMatcher::compile(&["?".repeat(super::MAX_STUB_GLOB_LEN + 1)]) {
+            Ok(_) => panic!("an over-long pattern must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("--stub"), "message must name the flag: {msg}");
+        assert!(
+            msg.contains(&super::MAX_STUB_GLOB_LEN.to_string()),
+            "message must state the limit: {msg}"
+        );
+    }
+
+    /// Why the error above is the ONLY reachable one: `glob_to_regex`
+    /// escapes every metacharacter, so no amount of regex syntax in a glob
+    /// can produce an invalid pattern. Anything asserting otherwise is
+    /// asserting something the code makes impossible.
+    #[test]
+    fn regex_syntax_in_a_glob_is_never_a_compile_error() {
+        for g in ["[", "(", "\\", "*?[a-", "a{2,", "(?P<x>", "+", "|", "^$"] {
+            assert!(
+                StubMatcher::compile(&[g.to_string()]).is_ok(),
+                "{g} must compile: metacharacters are escaped, not interpreted"
+            );
+        }
+    }
+}
+
 // ─── Phase A: per-file scan (sniff + bounded sampling) ───────────────────
 
 struct FileScan {
@@ -842,6 +1133,7 @@ fn scan_file(
     ctx: &PhaseAContext<'_>,
     sample: usize,
     max_file_gb: u64,
+    stub: bool,
 ) -> FileScan {
     let state_dir = ctx.state_dir;
     let pdf_spool_budget = ctx.budget;
@@ -852,11 +1144,15 @@ fn scan_file(
         pdf_spool: None,
         pdf_spool_fallbacks: Vec::new(),
     };
-    let sn = match sniff::sniff(path) {
-        Ok(s) => s,
-        Err(e) => {
-            out.junk = Some(("junk".into(), format!("unreadable: {e}")));
-            return out;
+    let sn = if stub {
+        stub_sniffed(path)
+    } else {
+        match sniff::sniff(path) {
+            Ok(s) => s,
+            Err(e) => {
+                out.junk = Some(("junk".into(), format!("unreadable: {e}")));
+                return out;
+            }
         }
     };
     if sn.family == Family::Binary {
@@ -886,19 +1182,21 @@ fn scan_file(
         out.sniffed = Some(sn);
         return out;
     }
-    let limit = match sn.family {
-        Family::SqlDump => Some(SQLDUMP_SAMPLE_LIMIT),
-        Family::Jsonl | Family::Logs | Family::Csv | Family::TxtLines => Some(SAMPLE_LIMIT_BYTES),
-        Family::Sqlite => Some(1), // signals per-table row cap inside the extractor
-        _ => None,                 // whole-file extractors cap themselves
-    };
+    let limit = sample_limit_bytes(sn.family, path);
     type GroupAcc = (
         HashMap<String, infer::FieldAcc>,
         u64,
         std::collections::HashSet<String>,
     );
     let mut groups: HashMap<Option<String>, GroupAcc> = HashMap::new();
-    let grouped_family = matches!(sn.family, Family::SqlDump | Family::Sqlite);
+    // Grouped families keep reading past the per-group sample size: their
+    // groups (SQL tables, Unity classes) appear all through the file, and
+    // stopping at the first N records would leave later groups unsampled and
+    // untyped.
+    let grouped_family = matches!(
+        sn.family,
+        Family::SqlDump | Family::Sqlite | Family::UnityYaml
+    );
     let mut sink = |rec: extract::RawRecord| -> bool {
         let entry = groups.entry(rec.group.clone()).or_default();
         if (entry.1 as usize) < sample {
@@ -1044,7 +1342,7 @@ mod clustering_key_tests {
             progress: &progress,
             meter: &meter,
         };
-        scan_file(&path, size, "d0", &ctx, 500, 2)
+        scan_file(&path, size, "d0", &ctx, 500, 2, false)
     }
 
     /// The #178 mechanism, from the extractor to the clustering key: a source
@@ -1123,9 +1421,10 @@ mod clustering_key_tests {
 mod phase_a_grouping_tests {
     use super::*;
 
-    fn cfg_for(root: &Path) -> IndexCfg {
+    pub(super) fn cfg_for(root: &Path) -> IndexCfg {
         IndexCfg {
             root: root.to_path_buf(),
+            stub_globs: Vec::new(),
             url: "http://unused.invalid".into(),
             api_key: None,
             api_key_file: None,
@@ -1442,13 +1741,24 @@ fn build_phase_a(
     // file a scan-pool thread is genuinely sitting on (#241). Retaining a PDF
     // artifact happens inside that same guard, so a file whose extraction is
     // spooled is counted exactly like a plainly parsed one.
+    // Patterns were validated (loudly) at run start; a failure here would be
+    // a programming error, not user input.
+    let stub_matcher = StubMatcher::compile(&cfg.stub_globs).expect("validated at startup");
     let scans: Vec<FileScan> = crate::pool::install(|| {
         files
             .par_iter()
             .zip(digests.par_iter())
             .map(|(f, digest)| {
                 let _in_flight = pr.file(&f.rel, f.size);
-                scan_file(&f.path, f.size, digest, ctx, cfg.sample, cfg.max_file_gb)
+                scan_file(
+                    &f.path,
+                    f.size,
+                    digest,
+                    ctx,
+                    cfg.sample,
+                    cfg.max_file_gb,
+                    stub_matcher.matches(&f.rel),
+                )
             })
             .collect()
     });
@@ -1556,8 +1866,27 @@ fn build_phase_a(
 
     let mut datasets = Vec::new();
     for c in &clusters {
-        let specs =
+        let mut specs =
             infer::infer_fields_with_policy(&c.fields, c.records, cfg.no_semantic, c.is_docs);
+        // Unity script-link enrichment fields are stamped by the phase-B
+        // pipeline (not the extractor), so inference never sees them —
+        // register them here or they would be dynamic-mapped coarsely.
+        //
+        // Registered for EVERY UnityYaml cluster, not only those whose sample
+        // happened to contain a `script_guid`. Phase B stamps these whenever a
+        // record carries a resolvable guid, and phase A reads a bounded window
+        // of the file — so gating the mapping on the sample meant a cluster
+        // whose sampled window held no `m_Script` got these two fields
+        // dynamic-mapped at index time instead, feeding the field-budget
+        // overshoot in #312. Two keyword specs per Unity cluster is a fixed,
+        // predictable cost; a dynamic mapping is not.
+        if c.family == Family::UnityYaml {
+            specs.push(pipeline_keyword_spec("script_path"));
+            specs.push(pipeline_keyword_spec("script_class"));
+        }
+        if c.family == Family::UnityMeta {
+            specs.push(pipeline_keyword_spec("asset_path"));
+        }
         let time_field = infer::elect_time_field(&specs);
         let semantic_field = specs
             .iter()
@@ -1615,6 +1944,192 @@ pub const PROVENANCE_FIELDS: &[&str] = &[
     "ax_run",
     "ax_format",
 ];
+
+/// Spec for a field the PIPELINE derives at index time (Unity script-link
+/// enrichment): typed keyword in the explicit mapping, zeroed sampling stats
+/// because phase-A inference never observes it.
+fn pipeline_keyword_spec(name: &str) -> infer::FieldSpec {
+    infer::FieldSpec {
+        name: name.into(),
+        es_type: "keyword".into(),
+        date_enc: None,
+        semantic: None,
+        cardinality_est: 0,
+        cardinality_overflow: false,
+        null_ratio: 0.0,
+        avg_len: 0.0,
+        coverage: 0.0,
+        examples: Vec::new(),
+        notes: vec!["pipeline-derived: resolved from the .meta guid map at index time".into()],
+        date_min: None,
+        date_max: None,
+        date_evidence: Vec::new(),
+    }
+}
+
+/// Outcome of building the Unity script-link map, including what did NOT
+/// resolve. The failures are the whole point: `script_path`/`script_class`
+/// are absent both when a guid is unreadable and when nothing references it,
+/// and those two look identical in the index.
+#[derive(Debug, Default)]
+struct UnityGuidMap {
+    /// `.meta` guid → root-relative asset path.
+    map: std::collections::HashMap<String, String>,
+    /// `.meta` files that could not be read or parsed at all.
+    unreadable: Vec<(String, String)>,
+    /// `.meta` files that parsed but carried no `guid:` key.
+    no_guid: Vec<String>,
+}
+
+/// Unity script-link map: `.meta` guid → root-relative asset path.
+///
+/// Runs on `crate::pool` and under the progress meter. A `.meta` is tiny, but
+/// a real Unity project has 10k-500k of them, and this is on the critical
+/// path of EVERY run — including a resumed no-op incremental, which otherwise
+/// has no work to do at all. Doing that serially and unmetered is the
+/// unattributed-stretch pattern of #241: the process sits silent for minutes
+/// with the bar parked.
+fn build_unity_guid_map(files: &[walk::FileEntry], plan: &Plan, pr: &Progress) -> UnityGuidMap {
+    use rayon::prelude::*;
+
+    let by_rel: HashMap<&str, &Path> = files
+        .iter()
+        .map(|f| (f.rel.as_str(), f.path.as_path()))
+        .collect();
+    let metas: Vec<&FileAssignment> = plan
+        .files
+        .values()
+        .filter(|fa| fa.family == "unity-meta")
+        .collect();
+    if metas.is_empty() {
+        return UnityGuidMap::default();
+    }
+    pr.phase("unity-guids", metas.len() as u64, 0);
+
+    #[allow(clippy::type_complexity)]
+    let parts: Vec<(
+        Option<(String, String)>,
+        Option<(String, String)>,
+        Option<String>,
+    )> = crate::pool::install(|| {
+        metas
+            .par_iter()
+            .map(|fa| {
+                let _in_flight = pr.file(&fa.rel, 0);
+                let Some(asset_rel) = fa.rel.strip_suffix(".meta") else {
+                    return (None, None, None);
+                };
+                let Some(path) = by_rel.get(fa.rel.as_str()) else {
+                    return (None, None, None);
+                };
+                let mut guid: Option<String> = None;
+                // The Result is NOT discarded: an unreadable `.meta` is
+                // how the headline "which scenes use this script?" query
+                // silently returns nothing.
+                match extract::unity::extract_meta(path, fa.gzip, &mut |rec| {
+                    guid = rec
+                        .fields
+                        .get("guid")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    false
+                }) {
+                    Ok(_) => match guid {
+                        Some(g) => (Some((g, asset_rel.to_string())), None, None),
+                        None => (None, None, Some(fa.rel.clone())),
+                    },
+                    Err(e) => (None, Some((fa.rel.clone(), e.to_string())), None),
+                }
+            })
+            .collect()
+    });
+
+    let mut out = UnityGuidMap::default();
+    for (hit, bad, missing) in parts {
+        if let Some((g, rel)) = hit {
+            out.map.insert(g, rel);
+        }
+        if let Some(b) = bad {
+            out.unreadable.push(b);
+        }
+        if let Some(m) = missing {
+            out.no_guid.push(m);
+        }
+    }
+    out.unreadable.sort();
+    out.no_guid.sort();
+    out
+}
+
+/// Say out loud what the guid map could not resolve. Without this a broken
+/// `.meta` produces no counter, no warning and no report line, and the
+/// feature's headline query returns empty in a way that is indistinguishable
+/// from a script nothing references.
+fn report_unity_guid_map(g: &UnityGuidMap, pr: &Progress) {
+    if !g.unreadable.is_empty() {
+        pr.note(&format!(
+            "unity: {} .meta sidecar(s) could not be read — scripts they name \
+             will have no script_path/script_class: {}",
+            g.unreadable.len(),
+            g.unreadable
+                .iter()
+                .take(REFUSAL_LIST_CAP)
+                .map(|(rel, e)| format!("{rel} ({e})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !g.no_guid.is_empty() {
+        pr.note(&format!(
+            "unity: {} .meta sidecar(s) carry no guid: {}",
+            g.no_guid.len(),
+            g.no_guid
+                .iter()
+                .take(REFUSAL_LIST_CAP)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+}
+
+/// Stamp pipeline-derived Unity fields onto a record. MonoBehaviour records
+/// gain `script_path`/`script_class` when their `script_guid` resolves; meta
+/// records gain the root-relative `asset_path` their guid names. Denormalized
+/// for one-query answers — `script_guid` remains the authoritative join.
+/// Returns the `script_guid` that was present but did NOT resolve, if any.
+/// A caller that throws this away recreates the silent-failure bug: the
+/// record then ships without `script_path`/`script_class` and the index
+/// cannot distinguish "guid is broken" from "nothing references this script".
+#[must_use]
+fn enrich_unity_fields(
+    family: Family,
+    fields: &mut Map<String, Value>,
+    guid_map: &std::collections::HashMap<String, String>,
+    rel: &str,
+) -> Option<String> {
+    match family {
+        Family::UnityYaml => {
+            let g = fields.get("script_guid").and_then(Value::as_str)?;
+            let Some(p) = guid_map.get(g) else {
+                return Some(g.to_string());
+            };
+            let p = p.clone();
+            fields.insert("script_path".into(), Value::String(p.clone()));
+            if let Some(stem) = Path::new(&p).file_stem().and_then(|s| s.to_str()) {
+                fields.insert("script_class".into(), Value::String(stem.to_string()));
+            }
+            None
+        }
+        Family::UnityMeta => {
+            if let Some(asset_rel) = rel.strip_suffix(".meta") {
+                fields.insert("asset_path".into(), Value::String(asset_rel.to_string()));
+            }
+            None
+        }
+        _ => None,
+    }
+}
 
 fn build_mapping(specs: &[infer::FieldSpec]) -> Value {
     let mut props = Map::new();
@@ -2392,6 +2907,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         .with_bulk_concurrency(cfg.workers, pr.enabled());
     es.ping()?;
 
+    let stub_matcher = StubMatcher::compile(&cfg.stub_globs)?;
     let root_str = cfg
         .root
         .canonicalize()
@@ -3381,6 +3897,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     }
     replacement_failpoint(1).context("after durable replacement plan")?;
 
+    let unity_guid_map = build_unity_guid_map(&files, &plan, &pr);
+    report_unity_guid_map(&unity_guid_map, &pr);
+
     // ── Phase B: full-stream extraction + bulk indexing ─────────────────
     struct DsRt {
         index: String,
@@ -3732,7 +4251,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     let fa = plan.files.get(key).unwrap();
                     let asg: HashMap<Option<String>, String> =
                         fa.assignments.iter().cloned().collect();
-                    let sn = match sniff::sniff(&f.path) {
+                    let sn = if stub_matcher.matches(&f.rel) {
+                        Ok(stub_sniffed(Path::new(&f.rel)))
+                    } else {
+                        sniff::sniff(&f.path)
+                    };
+                    let sn = match sn {
                         Ok(s) => s,
                         Err(e) => {
                             extra_junk.lock().unwrap().push(JunkFile {
@@ -3748,6 +4272,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     };
                     let mut file_records = 0u64;
                     let mut file_junk = 0u64;
+                    // Groups phase B saw that phase A never sampled, so they
+                    // have no dataset to route to. Silently counting these as
+                    // junk is how a whole Unity class (or SQL table) can
+                    // vanish from a run with nothing in the report to say so.
+                    let mut unrouted_groups: std::collections::BTreeMap<String, u64> =
+                        std::collections::BTreeMap::new();
+                    // `script_guid`s this file referenced that no `.meta` in
+                    // the tree defines. These are exactly the records that
+                    // ship without script_path/script_class, which is what
+                    // makes the headline query come back empty.
+                    let mut unresolved_script_guids: std::collections::BTreeMap<String, u64> =
+                        std::collections::BTreeMap::new();
                     let mut file_dropped_by_dataset: HashMap<String, u64> = HashMap::new();
                     let mut send_err: Option<String> = None;
                     // Edges this file teaches — buffered apart from the node
@@ -3842,6 +4378,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                         let mut sink = |rec: extract::RawRecord| -> bool {
                             let Some(slug) = asg.get(&rec.group).or_else(|| asg.get(&None)) else {
                                 file_junk += 1;
+                                *unrouted_groups
+                                    .entry(
+                                        rec.group.clone().unwrap_or_else(|| "(ungrouped)".into()),
+                                    )
+                                    .or_insert(0) += 1;
                                 return true;
                             };
                             let Some(rt) = ds_rt.get(slug) else {
@@ -3849,6 +4390,18 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                 return true;
                             };
                             let mut fields = rec.fields;
+                            // BEFORE coercion, not after: these are ordinary
+                            // record fields once stamped, and a field that
+                            // skips `coerce_record` is a field the dataset
+                            // plan never validated.
+                            if let Some(unresolved) = enrich_unity_fields(
+                                sn.family,
+                                &mut fields,
+                                &unity_guid_map.map,
+                                &f.rel,
+                            ) {
+                                *unresolved_script_guids.entry(unresolved).or_insert(0u64) += 1;
+                            }
                             let dropped = coerce::coerce_record(&mut fields, &rt.plan);
                             if dropped > 0 {
                                 let durable =
@@ -3985,6 +4538,57 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                                     bytes: f.size,
                                 });
                             }
+                        }
+                        if !unresolved_script_guids.is_empty() {
+                            let total: u64 = unresolved_script_guids.values().sum();
+                            pr.note(&format!(
+                                "unity: {}: {total} MonoBehaviour record(s) reference {} \
+                                 script guid(s) no .meta defines — they ship without \
+                                 script_path/script_class: {}",
+                                f.rel,
+                                unresolved_script_guids.len(),
+                                unresolved_script_guids
+                                    .keys()
+                                    .take(REFUSAL_LIST_CAP)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                        if !unrouted_groups.is_empty() {
+                            let total: u64 = unrouted_groups.values().sum();
+                            let named = unrouted_groups
+                                .iter()
+                                .take(REFUSAL_LIST_CAP)
+                                .map(|(g, n)| format!("{g} ({n})"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let more = unrouted_groups.len().saturating_sub(REFUSAL_LIST_CAP);
+                            let suffix = if more > 0 {
+                                format!(" and {more} more")
+                            } else {
+                                String::new()
+                            };
+                            // A NOTE, never an `extra_junk` entry. This file
+                            // still reaches `journal.file_done` — `send_err`
+                            // is untouched — and every junk entry is turned
+                            // into a catalog document under the same
+                            // `file:{file_key}` id as that completion
+                            // (`catalog::file_doc`, `catalog.rs`). Pushing one
+                            // here put two documents with one id in the same
+                            // bulk, and the later one wins: a file that
+                            // indexed N records was reported as status "junk"
+                            // with records 0, `junk_file_count` counted it
+                            // twice, and `code_coverage.observe` ran for it
+                            // twice. The dropped records are already carried
+                            // on that file's own completion as `junk`
+                            // (`file_junk` below), which is where a per-file
+                            // drop count belongs.
+                            pr.note(&format!(
+                                "{}: {total} record(s) dropped: group(s) never sampled in \
+                                 phase A, so they have no dataset — {named}{suffix}",
+                                f.rel
+                            ));
                         }
                     }
                     // Raw-source href pass: the HTML extractor strips markup
@@ -4557,9 +5161,11 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // the journal's completions are the corpus, not just this invocation's
     // slice, so a resume reports what is live rather than what it re-parsed.
     let mut code_coverage = CodeCoverage::default();
+    let mut completed_keys: HashSet<String> = HashSet::new();
     {
         let j = journal_mx.lock().unwrap();
         for fd in j.done.values() {
+            completed_keys.insert(fd.file_key.clone());
             let current_path = plan
                 .files
                 .get(&fd.file_key)
@@ -4599,13 +5205,43 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         .collect();
     all_junk.extend(extra.iter());
     all_junk.extend(new_unplanned.iter());
+    // Disjointness from the journal completions above is ENFORCED here, not
+    // merely asserted in a comment: `catalog::file_doc` derives its `_id` from
+    // the file key alone, so a junk entry for a file that also reached
+    // `file_done` is a second document with an id the completion already used
+    // — and the bulk applies them in order, so the junk one wins. A file that
+    // indexed N records would be reported in the catalog as status "junk" with
+    // records 0. See `shadowed_junk_entries`.
+    let shadowed = shadowed_junk_entries(&all_junk, &completed_keys);
+    // Debug builds stop on the producer's defect; release builds keep the
+    // truthful document and say what they dropped.
+    debug_assert!(
+        shadowed.is_empty(),
+        "junk entry for a file that reached file_done: {:?}",
+        shadowed.iter().map(|jf| &jf.rel).collect::<Vec<_>>()
+    );
+    if !shadowed.is_empty() {
+        // Not fatal: the completion document is the correct one and it is
+        // already staged, so dropping the junk entry restores the truth. It is
+        // still a defect in whichever producer emitted it, so say so.
+        pr.note(&format!(
+            "internal: {} junk entr(ies) named a file that also completed and \
+             were dropped so the catalog keeps the indexed record: {}",
+            shadowed.len(),
+            shadowed
+                .iter()
+                .take(REFUSAL_LIST_CAP)
+                .map(|jf| jf.rel.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        all_junk.retain(|jf| !completed_keys.contains(&jf.file_key));
+    }
     // Counted now: every later reader of this number outlives the borrows
     // `all_junk` holds on `plan` and `new_unplanned`, which the durable
     // junk-plan update below mutates.
     let junk_file_count = all_junk.len();
     for jf in &all_junk {
-        // Disjoint from the journal completions above: a file that reached
-        // `file_done` never appears here, so nothing is counted twice.
         code_coverage.observe(&jf.format, 0);
         let (id, doc) = catalog::file_doc(
             &jf.file_key,
@@ -6141,3 +6777,254 @@ mod code_coverage_tests {
 mod failure_resume_http_tests;
 #[cfg(test)]
 mod incremental_reconcile_http_tests;
+
+/// The Unity PIPELINE half — `build_unity_guid_map` + `enrich_unity_fields`
+/// + the plan's field registration, driven through the real phase-A planner.
+///
+/// The PR that introduced Unity support tested `extract::unity::*` thoroughly
+/// and this half not at all, which is why the sample-conditional mapping
+/// registration survived review: no unit test of an extractor can see a bug
+/// whose cause is what phase A sampled.
+#[cfg(test)]
+mod unity_pipeline_tests {
+    use super::*;
+
+    const GUID: &str = "abc123def4560000";
+
+    /// A scene whose MonoBehaviour group's FIRST document has no `m_Script`
+    /// and whose SECOND one does. With `sample: 1`, phase A therefore never
+    /// sees `script_guid` — but phase B still stamps `script_path` from the
+    /// second record. That gap is the bug.
+    fn scene_with_late_script_ref() -> String {
+        format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n\
+             --- !u!1 &1\nGameObject:\n  m_Name: Player\n\
+             --- !u!114 &2\nMonoBehaviour:\n  m_Name: NoScriptYet\n  speed: 1\n\
+             --- !u!114 &3\nMonoBehaviour:\n  m_Name: HasScript\n  \
+             m_Script: {{fileID: 11500000, guid: {GUID}, type: 3}}\n"
+        )
+    }
+
+    fn write_project(dir: &Path) {
+        std::fs::create_dir_all(dir.join("Assets/Scripts")).unwrap();
+        std::fs::create_dir_all(dir.join("Assets/Scenes")).unwrap();
+        std::fs::write(
+            dir.join("Assets/Scripts/PlayerController.cs.meta"),
+            format!("fileFormatVersion: 2\nguid: {GUID}\nMonoImporter:\n  serializedVersion: 2\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Assets/Scenes/Main.unity"),
+            scene_with_late_script_ref(),
+        )
+        .unwrap();
+    }
+
+    fn plan_for(root: &Path, sample: usize) -> (Plan, Vec<walk::FileEntry>) {
+        let files = walk::walk(root, false).unwrap();
+        let keys: Vec<String> = files
+            .iter()
+            .map(|f| ids::file_key(&f.path, f.size).unwrap())
+            .collect();
+        let digests: Vec<String> = (0..files.len()).map(|i| format!("d{i}")).collect();
+        let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
+        let progress = Progress::silent();
+        let meter = estimate::Meter::new();
+        let ctx = PhaseAContext {
+            state_dir: root,
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+            meter: &meter,
+        };
+        let mut cfg = super::phase_a_grouping_tests::cfg_for(root);
+        cfg.sample = sample;
+        let plan = build_phase_a(root, &files, &keys, &digests, Vec::new(), &ctx, &cfg).plan;
+        (plan, files)
+    }
+
+    #[test]
+    fn the_guid_map_resolves_a_meta_sidecar_to_its_asset_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path());
+        let (plan, files) = plan_for(dir.path(), 500);
+        let g = build_unity_guid_map(&files, &plan, &Progress::silent());
+        assert_eq!(
+            g.map.get(GUID).map(String::as_str),
+            Some("Assets/Scripts/PlayerController.cs"),
+            "guid must resolve to the asset the .meta sits beside"
+        );
+        assert!(g.unreadable.is_empty(), "{:?}", g.unreadable);
+        assert!(g.no_guid.is_empty(), "{:?}", g.no_guid);
+    }
+
+    /// Blocker: `script_path`/`script_class` were registered in the explicit
+    /// mapping only when the SAMPLE happened to contain `script_guid`. Phase A
+    /// reads a bounded window, so a cluster whose window held no `m_Script`
+    /// got them dynamic-mapped at index time instead — the field-budget
+    /// overshoot of #312.
+    #[test]
+    fn script_link_fields_are_mapped_even_when_the_sample_never_saw_a_script_guid() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path());
+
+        let (plan, _) = plan_for(dir.path(), 1);
+        let mb = plan
+            .datasets
+            .iter()
+            .find(|d| d.group.as_deref() == Some("MonoBehaviour"))
+            .expect("a MonoBehaviour cluster must exist");
+        assert!(
+            !mb.specs.iter().any(|s| s.name == "script_guid"),
+            "precondition: with sample=1 the sampled window must NOT contain \
+             script_guid, or this test proves nothing"
+        );
+        for want in ["script_path", "script_class"] {
+            assert!(
+                mb.specs.iter().any(|s| s.name == want),
+                "{want} must be in the explicit mapping regardless of what the \
+                 sample saw; specs = {:?}",
+                mb.specs.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// End to end over the two halves: the guid map built from `.meta` files
+    /// resolves the `script_guid` an extractor emitted, and the enrichment
+    /// stamps both denormalized fields. This is the feature's headline query
+    /// ("which scenes use this script?") reduced to its mechanism.
+    #[test]
+    fn enrichment_resolves_a_script_guid_to_path_and_class() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path());
+        let (plan, files) = plan_for(dir.path(), 500);
+        let g = build_unity_guid_map(&files, &plan, &Progress::silent());
+
+        let mut fields = Map::new();
+        fields.insert("script_guid".into(), Value::String(GUID.into()));
+        let unresolved = enrich_unity_fields(
+            Family::UnityYaml,
+            &mut fields,
+            &g.map,
+            "Assets/Scenes/Main.unity",
+        );
+        assert_eq!(unresolved, None, "a defined guid must resolve");
+        assert_eq!(fields["script_path"], "Assets/Scripts/PlayerController.cs");
+        assert_eq!(fields["script_class"], "PlayerController");
+    }
+
+    /// Blocker: an unresolvable `script_guid` produced no counter, no warning
+    /// and no report line — the record shipped without `script_path`, and
+    /// "no users" and "broken link" became the same answer.
+    #[test]
+    fn an_unresolvable_script_guid_is_reported_not_swallowed() {
+        let mut fields = Map::new();
+        fields.insert("script_guid".into(), Value::String("deadbeef".into()));
+        let unresolved = enrich_unity_fields(
+            Family::UnityYaml,
+            &mut fields,
+            &std::collections::HashMap::new(),
+            "Assets/Scenes/Main.unity",
+        );
+        assert_eq!(
+            unresolved.as_deref(),
+            Some("deadbeef"),
+            "the caller must be told which guid failed"
+        );
+        assert!(!fields.contains_key("script_path"));
+    }
+
+    /// The enrichment was moved to run BEFORE `coerce_record` so its fields
+    /// are validated like every other field instead of bypassing coercion.
+    /// That only works if the plan actually carries them — this drives the
+    /// real `coerce::plan_from_specs` over the real planned specs and asserts
+    /// both fields survive the round trip with their values intact.
+    #[test]
+    fn enriched_fields_survive_the_coercion_they_now_pass_through() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path());
+        let (plan, files) = plan_for(dir.path(), 500);
+        let g = build_unity_guid_map(&files, &plan, &Progress::silent());
+
+        let mb = plan
+            .datasets
+            .iter()
+            .find(|d| d.group.as_deref() == Some("MonoBehaviour"))
+            .expect("a MonoBehaviour cluster must exist");
+        let coerce_plan = coerce::plan_from_specs(&mb.specs);
+        assert!(
+            coerce_plan.contains_key("script_path"),
+            "the coercion plan must know the field, else it would pass through \
+             unvalidated exactly as it did before"
+        );
+
+        let mut fields = Map::new();
+        fields.insert("script_guid".into(), Value::String(GUID.into()));
+        let _ = enrich_unity_fields(
+            Family::UnityYaml,
+            &mut fields,
+            &g.map,
+            "Assets/Scenes/Main.unity",
+        );
+        let dropped = coerce::coerce_record(&mut fields, &coerce_plan);
+        assert_eq!(dropped, 0, "nothing may be dropped: {fields:?}");
+        assert_eq!(fields["script_path"], "Assets/Scripts/PlayerController.cs");
+        assert_eq!(fields["script_class"], "PlayerController");
+    }
+
+    /// The failures the map collects have to reach a person. Counting them
+    /// into a struct nobody prints is the same silence in a different place.
+    #[test]
+    fn the_guid_map_failures_are_printed_with_names_and_counts() {
+        let (pr, buffer) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        let g = UnityGuidMap {
+            map: std::collections::HashMap::new(),
+            unreadable: vec![("Assets/A.cs.meta".into(), "permission denied".into())],
+            no_guid: vec!["Assets/B.cs.meta".into()],
+        };
+        report_unity_guid_map(&g, &pr);
+        let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("Assets/A.cs.meta"), "{text}");
+        assert!(text.contains("permission denied"), "{text}");
+        assert!(text.contains("Assets/B.cs.meta"), "{text}");
+        assert!(text.contains("no guid"), "{text}");
+
+        // A healthy map must stay quiet — a warning on every clean run is a
+        // warning nobody reads.
+        let (pr2, buf2) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        report_unity_guid_map(&UnityGuidMap::default(), &pr2);
+        assert!(String::from_utf8(buf2.lock().unwrap().clone())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Blocker: `build_unity_guid_map` discarded `extract_meta`'s `Result`.
+    /// An unparseable `.meta` therefore produced silence.
+    #[test]
+    fn a_meta_that_carries_no_guid_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Assets")).unwrap();
+        // Sniffs as UnityMeta (first line is `fileFormatVersion:` and a line
+        // starts `guid:`) but the value is a YAML integer, so `extract_meta`
+        // recovers no guid STRING — the sidecar is real and still unusable.
+        std::fs::write(
+            dir.path().join("Assets/Broken.cs.meta"),
+            "fileFormatVersion: 2\nguid: 12345\nMonoImporter:\n  serializedVersion: 2\n",
+        )
+        .unwrap();
+        let (plan, files) = plan_for(dir.path(), 500);
+        let g = build_unity_guid_map(&files, &plan, &Progress::silent());
+        assert!(g.map.is_empty(), "no guid should have resolved");
+        assert_eq!(
+            g.no_guid,
+            vec!["Assets/Broken.cs.meta".to_string()],
+            "the .meta with no usable guid must be named, not silently skipped"
+        );
+    }
+}

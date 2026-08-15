@@ -23,6 +23,54 @@ pub struct FileEntry {
     pub size: u64,
 }
 
+/// Generated/cache directories whose NAMES are too common for the blunt
+/// [`crate::ignore_rules::DEFAULT_IGNORE_PATTERNS`] (a folder named `Logs/`
+/// or `Library/` is often real data), pruned at any depth ONLY when a sibling
+/// marker file proves the parent directory is that kind of project. Part of
+/// the built-in defaults: `--no-ignore` / `--no-default-ignores` disable it,
+/// and any ignore file in the tree can re-include (`!Library/`) as usual —
+/// these run after the ignore files have had their say.
+///
+/// (dir name, marker path relative to the dir's PARENT, report label)
+const MARKER_GENERATED_DIRS: &[(&str, &str, &str)] = &[
+    (
+        "Library",
+        "ProjectSettings/ProjectVersion.txt",
+        "default:unity-generated",
+    ),
+    (
+        "Temp",
+        "ProjectSettings/ProjectVersion.txt",
+        "default:unity-generated",
+    ),
+    (
+        "obj",
+        "ProjectSettings/ProjectVersion.txt",
+        "default:unity-generated",
+    ),
+    (
+        "Logs",
+        "ProjectSettings/ProjectVersion.txt",
+        "default:unity-generated",
+    ),
+    (
+        "UserSettings",
+        "ProjectSettings/ProjectVersion.txt",
+        "default:unity-generated",
+    ),
+];
+
+/// The marker-gated verdict for one directory entry.
+fn marker_generated_dir(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?;
+    for (dir, marker, label) in MARKER_GENERATED_DIRS {
+        if name == *dir && path.parent().is_some_and(|p| p.join(marker).is_file()) {
+            return Some(label);
+        }
+    }
+    None
+}
+
 /// Walk with the default ignore rules on and the report discarded.
 pub fn walk(root: &Path, follow_symlinks: bool) -> Result<Vec<FileEntry>> {
     walk_reporting(root, follow_symlinks, IgnoreOptions::default()).map(|(files, _)| files)
@@ -46,6 +94,7 @@ pub fn walk_reporting(
         anyhow::bail!("{} is not a directory", root_canon.display());
     }
     let mut out = Vec::new();
+    let marker_defaults = ignore.enabled && ignore.defaults;
     let mut stack = IgnoreStack::new(&root_canon, ignore);
     // Manual iteration rather than `filter_entry`, because the ignore stack has
     // to load a directory's ignore files *after* that directory is admitted and
@@ -109,6 +158,18 @@ pub fn walk_reporting(
             if entry.depth() > 0 && stack.skip_dir(entry.path()).is_some() {
                 it.skip_current_dir();
                 continue;
+            }
+            // Marker-gated generated dirs (part of the built-in defaults, so
+            // `--no-ignore` / `--no-default-ignores` disable it): names like
+            // Unity's `Library/` or `Logs/` are too common for the blunt
+            // DEFAULT_IGNORE_PATTERNS, so they are pruned only when a sibling
+            // marker file proves the parent is that kind of project.
+            if entry.depth() > 0 && marker_defaults {
+                if let Some(label) = marker_generated_dir(entry.path()) {
+                    stack.record_marker_dir(entry.path(), label);
+                    it.skip_current_dir();
+                    continue;
+                }
             }
             stack.enter_dir(entry.path(), entry.depth());
             continue;
@@ -405,6 +466,98 @@ mod hidden_skip_tests {
             rels,
             vec!["a.md".to_string()],
             "root exemption failed: {rels:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod marker_generated_dir_tests {
+    use super::{walk, walk_reporting};
+    use crate::ignore_rules::IgnoreOptions;
+    use std::fs;
+    use std::path::Path;
+
+    fn make_unity_project(root: &Path, with_marker: bool) {
+        fs::create_dir_all(root.join("Assets")).unwrap();
+        fs::write(root.join("Assets/Player.cs"), "class Player {}").unwrap();
+        fs::create_dir_all(root.join("Library/Artifacts")).unwrap();
+        fs::write(root.join("Library/Artifacts/blob.bin"), b"\x00\x01").unwrap();
+        fs::create_dir_all(root.join("Logs")).unwrap();
+        fs::write(root.join("Logs/editor.log"), "x").unwrap();
+        if with_marker {
+            fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+            fs::write(
+                root.join("ProjectSettings/ProjectVersion.txt"),
+                "m_EditorVersion: 2022.3.10f1\n",
+            )
+            .unwrap();
+        }
+    }
+
+    /// Monorepo case: the Unity project is a SUBFOLDER of the walk root; the
+    /// sibling marker decides at any depth.
+    #[test]
+    fn a_nested_unity_project_is_pruned_and_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let unity = dir.path().join("platform/unity");
+        fs::create_dir_all(&unity).unwrap();
+        make_unity_project(&unity, true);
+        let (files, report) = walk_reporting(dir.path(), false, IgnoreOptions::default()).unwrap();
+        let rels: Vec<&str> = files.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"platform/unity/Assets/Player.cs"));
+        assert!(
+            !rels.iter().any(|r| r.contains("/Library/")),
+            "Library/ must be pruned whole: {rels:?}"
+        );
+        assert!(
+            report
+                .by_rule
+                .keys()
+                .any(|k| k == "default:unity-generated"),
+            "the prune must be named on the report: {report:?}"
+        );
+    }
+
+    /// Without the marker, a folder merely NAMED Library or Logs is data.
+    #[test]
+    fn without_the_marker_nothing_is_pruned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_unity_project(dir.path(), false);
+        let files = walk(dir.path(), false).unwrap();
+        let rels: Vec<&str> = files.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"Library/Artifacts/blob.bin"), "{rels:?}");
+        assert!(rels.contains(&"Logs/editor.log"), "{rels:?}");
+    }
+
+    /// The marker rule is one of the built-in defaults, so both switches
+    /// disable it.
+    #[test]
+    fn no_ignore_and_no_default_ignores_both_disable_the_marker_rule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_unity_project(dir.path(), true);
+        let no_defaults = IgnoreOptions {
+            defaults: false,
+            ..IgnoreOptions::default()
+        };
+        for opts in [IgnoreOptions::off(), no_defaults] {
+            let (files, _) = walk_reporting(dir.path(), false, opts).unwrap();
+            let rels: Vec<&str> = files.iter().map(|e| e.rel.as_str()).collect();
+            assert!(
+                rels.contains(&"Library/Artifacts/blob.bin"),
+                "opts {opts:?} must walk generated dirs: {rels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_named_like_a_generated_dir_is_not_pruned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_unity_project(dir.path(), true);
+        fs::write(dir.path().join("obj"), "a FILE named obj").unwrap();
+        let files = walk(dir.path(), false).unwrap();
+        assert!(
+            files.iter().any(|e| e.rel == "obj"),
+            "the prune applies to directories only"
         );
     }
 }

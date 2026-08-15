@@ -187,6 +187,20 @@ pub fn band(rel: &str, family: Family) -> Band {
         Family::Yaml | Family::Json | Family::Xml => Band::Config,
         Family::Csv | Family::Jsonl | Family::Sqlite | Family::SqlDump => Band::Data,
         Family::Logs | Family::TxtLines => Band::Bulk,
+        // Unity assets are the project's own authored content — scenes,
+        // prefabs and materials are to a Unity repo what source files are to
+        // a Rust one, so they rank with source, not with bulk data.
+        Family::UnityYaml => Band::SourceAndDocs,
+        // `.meta` sidecars carry the guid join key and nothing a human reads;
+        // they are plumbing for `UnityYaml`, so they rank as config.
+        Family::UnityMeta => Band::Config,
+        // A `.bvh` yields ONE metadata record for a file that is mostly a
+        // numeric motion block — data, not documentation.
+        Family::Bvh => Band::Data,
+        // `--stub` files are opened for a name card only. The owner asked for
+        // them to be referenceable, not read, so they must not displace real
+        // content in the queue.
+        Family::Stub => Band::Bulk,
         // Binary never reaches phase B (phase A junks it); ranked last so a
         // future caller that does pass one cannot jump the queue with it.
         Family::Binary => Band::Vendored,
@@ -201,9 +215,15 @@ pub fn band_from_family_str(rel: &str, family: &str) -> Band {
         return Band::Vendored;
     }
     match family {
-        "code" | "txt-prose" | "html" | "pdf" | "docx" => Band::SourceAndDocs,
-        "yaml" | "json" | "xml" => Band::Config,
-        "csv" | "jsonl" | "sqlite" | "sqldump" => Band::Data,
+        "code" | "txt-prose" | "html" | "pdf" | "docx" | "unity" => Band::SourceAndDocs,
+        "yaml" | "json" | "xml" | "unity-meta" => Band::Config,
+        "csv" | "jsonl" | "sqlite" | "sqldump" | "bvh" => Band::Data,
+        // Pre-existing drift, caught by
+        // `estimate::tests::the_two_band_functions_agree_for_every_family`:
+        // `band` ranks Binary `Vendored`, but the catch-all below ranked the
+        // persisted string `Bulk`, so a resumed run ordered it differently
+        // from the run that planned it.
+        "binary" => Band::Vendored,
         _ => Band::Bulk,
     }
 }

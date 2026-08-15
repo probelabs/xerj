@@ -40,6 +40,9 @@ pub struct IndexCfg {
     pub state_dir: Option<PathBuf>,
     pub fresh: bool,
     pub follow_symlinks: bool,
+    /// `--stub <glob>` patterns: matching files are indexed as one
+    /// existence-only name card, contents never opened.
+    pub stub_globs: Vec<String>,
     /// `.gitignore` / `.xerjignore` / built-in build-output rules (#276).
     /// `deep_count` is set from `--dry-run`.
     pub ignore: IgnoreOptions,
@@ -86,7 +89,10 @@ pub struct StatusCfg {
 
 #[derive(Debug)]
 pub enum Cmd {
-    Index(IndexCfg),
+    /// Boxed: `IndexCfg` is an order of magnitude larger than the other
+    /// variants, so inlining it made every `Cmd` — including `Help` — pay for
+    /// it (`clippy::large_enum_variant`).
+    Index(Box<IndexCfg>),
     Map(MapCfg),
     Status(StatusCfg),
     Help,
@@ -146,6 +152,12 @@ pub fn help_text_with(feedback: bool) -> String {
                                   bytes (default 64); excludes filesystem/manifest overhead\n\
              --fresh              {fresh_help}\n\
              --follow-symlinks    follow symlinks (loop-safe); off by default\n\
+             --stub <GLOB>        index matching files as ONE existence-only name\n\
+                                  card (title + provenance); contents are never\n\
+                                  opened. Repeatable. A pattern without '/'\n\
+                                  matches file names anywhere ('*.bvh'); with '/'\n\
+                                  it matches the root-relative path\n\
+                                  ('unity/**/*.csv'). '**' crosses directories\n\
              --no-ignore          index everything: no .gitignore, no .xerjignore, no\n\
                                   .git/info/exclude, no built-in defaults. Hidden files\n\
                                   (.env, .git/, .ssh) stay skipped either way — that is\n\
@@ -375,6 +387,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut state_dir: Option<PathBuf> = None;
     let mut fresh = false;
     let mut follow_symlinks = false;
+    let mut stub_globs: Vec<String> = Vec::new();
     let mut no_ignore = false;
     let mut no_default_ignores = false;
     let mut max_file_gb = 2u64;
@@ -468,6 +481,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--state-dir" => state_dir = it.next().map(PathBuf::from),
             "--fresh" => fresh = true,
             "--follow-symlinks" => follow_symlinks = true,
+            "--stub" => stub_globs.push(it.next().ok_or("--stub needs a glob pattern")?),
             "--no-ignore" => no_ignore = true,
             "--no-default-ignores" => no_default_ignores = true,
             "--max-file-gb" => {
@@ -727,7 +741,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         })),
         (None, Some(root)) => {
             let plan = crate::resources::plan(workers, pdf_workers, bulk_mb);
-            Ok(Cmd::Index(IndexCfg {
+            Ok(Cmd::Index(Box::new(IndexCfg {
                 root,
                 url,
                 api_key,
@@ -744,6 +758,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 state_dir,
                 fresh,
                 follow_symlinks,
+                stub_globs,
                 ignore: IgnoreOptions {
                     enabled: !no_ignore,
                     defaults: !no_ignore && !no_default_ignores,
@@ -763,7 +778,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 quiet,
                 progress,
                 progress_interval,
-            }))
+            })))
         }
         _ => Ok(Cmd::Help),
     }
@@ -838,7 +853,7 @@ mod tests {
 
     fn index(args: &[&str]) -> super::IndexCfg {
         match parse(args.iter().map(|s| s.to_string()).collect()).unwrap() {
-            Cmd::Index(cfg) => cfg,
+            Cmd::Index(cfg) => *cfg,
             other => panic!("expected index config, got {other:?}"),
         }
     }
@@ -1254,6 +1269,55 @@ mod tests {
         assert!(!keep_files.ignore.defaults);
 
         assert!(index(&["data", "--dry-run"]).ignore.deep_count);
+    }
+
+    /// Every `--flag` the autoindex use-case README names must be one this
+    /// parser actually accepts.
+    ///
+    /// `parse` hard-errors `unknown argument: {other}` on anything it does
+    /// not know, so a documented-but-nonexistent flag does not degrade — the
+    /// command exits. The README shipped `--no-default-excludes` and
+    /// `--no-gitignore`, which have never existed under those names (they are
+    /// `--no-default-ignores` and `--no-ignore`), so every reader who copied
+    /// the documented invocation got an error instead of an index.
+    ///
+    /// Flags belonging to the `xerj` SERVER binary are excluded by name —
+    /// the README also shows how to start a server, and those are not this
+    /// parser's vocabulary.
+    #[test]
+    fn every_flag_named_in_the_usecase_readme_is_a_real_autoindex_flag() {
+        const SERVER_ONLY: &[&str] = &["--insecure", "--data-dir"];
+
+        let readme = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../demo/usecases/autoindex/README.md");
+        let text = std::fs::read_to_string(&readme)
+            .unwrap_or_else(|e| panic!("read {}: {e}", readme.display()));
+
+        let mut named: Vec<String> = Vec::new();
+        for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+            // `---` is a YAML document marker in the sample output, not a flag.
+            if tok.starts_with("--") && tok.len() > 2 && !tok.starts_with("---") {
+                let tok = tok.trim_end_matches('-');
+                if !SERVER_ONLY.contains(&tok) && !named.contains(&tok.to_string()) {
+                    named.push(tok.to_string());
+                }
+            }
+        }
+        assert!(
+            named.len() >= 5,
+            "extraction found almost nothing ({named:?}) — the test would pass vacuously"
+        );
+
+        for flag in &named {
+            // A flag that exists but wants a value fails on the VALUE; only an
+            // unrecognised name produces "unknown argument".
+            if let Err(e) = parse(["data", flag].iter().map(|s| s.to_string()).collect()) {
+                assert!(
+                    !e.contains("unknown argument"),
+                    "README documents {flag}, which the CLI rejects: {e}"
+                );
+            }
+        }
     }
 
     /// A flag that cannot change anything is refused rather than accepted and
