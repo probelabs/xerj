@@ -2886,11 +2886,18 @@ impl Engine {
     /// that already exist rather than waiting for the next one.
     pub fn apply_wal_retention_floor(&self) -> usize {
         let floor = self.wal_retention_floor();
-        let mut applied = 0usize;
-        for entry in self.indices.iter() {
-            entry.value().set_wal_min_retained_generations(floor);
-            applied += 1;
+        // Snapshot the handles first, then take the WAL mutexes — never both
+        // at once. `DashMap::iter` holds a read guard on each map shard for as
+        // long as the iterator lives, and `set_wal_min_retained_generations`
+        // locks every `WalWriter` of the index; holding the first while
+        // acquiring the second would put a lock-order edge between two
+        // subsystems that otherwise have none, for the sake of one avoided
+        // allocation on an operator-triggered path.
+        let indices: Vec<Arc<Index>> = self.indices.iter().map(|e| e.value().clone()).collect();
+        for index in &indices {
+            index.set_wal_min_retained_generations(floor);
         }
+        let applied = indices.len();
         tracing::debug!(
             floor,
             indices = applied,
