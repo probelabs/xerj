@@ -887,6 +887,347 @@ async fn nested_dense_vector_is_excluded_from_its_parent_objects_term_dictionary
     }
 }
 
+/// #328, collision half — a field the user DECLARES under a companion's name
+/// must keep its whole lexical surface.
+///
+/// `memtable::lexically_typeless_fields` synthesises `<field>_chunks` and
+/// `__xerj_passage_meta__<field>` from the base name, because the passage
+/// pipeline writes them into `_source` with no `FieldConfig` behind them. The
+/// first revision of that rule fired UNCONDITIONALLY, so a user who mapped
+/// `emb_chunks` beside a `dense_vector emb` lost the postings for a field the
+/// schema declares — and then `lower_lexically_typeless_clauses` lowered every
+/// lexical clause naming it to `match_none`. Measured on this fixture, merge
+/// base `ca4d75a` → the name-only rule → here:
+///
+///   term      {emb_chunks:"tenant-a"}          25 →  0 → 25
+///   terms     {emb_chunks:["tenant-a"]}        25 →  0 → 25
+///   bool{filter:[term emb_chunks]}             25 →  0 → 25
+///   bool{must:[match body],filter:[term …]}    25 →  0 → 25
+///   bool{must_not:[term emb_chunks]}           25 → 50 → 25
+///   terms agg on emb_chunks                 25/25 → 25/25 → 25/25
+///
+/// The `must_not` row is the severe one and the reason this is a correctness
+/// test rather than a footprint one: the query RETURNED the 25 documents the
+/// exclusion was written to remove. The aggregation row proves the data was
+/// present and correctly populated the whole time — the planner had declared a
+/// live user field unqueryable, with no error and no mapping change. If
+/// `<vector>_chunks` is a tenant or ACL discriminator that is a silent
+/// data-exposure failure mode.
+///
+/// Lucene reads "does this field get a term dictionary" off the field's own
+/// `IndexableFieldType` and never off its name
+/// (`lucene/core/src/java/org/apache/lucene/index/IndexingChain.java:1416`),
+/// and one name carrying two different sets of index options is an outright
+/// error rather than a silent downgrade (`IndexingChain.FieldSchema
+/// .setIndexOptions` → `assertSame` → `raiseNotSame`, `:2213` / `:2193`).
+///
+/// THREE ARMS, and the third one asserts the OPPOSITE. `keyword` and `text`
+/// yield: the sibling keeps its `.fst` and every answer above. `long` does NOT
+/// yield, because `long`/`double` is exactly what dynamic mapping infers from
+/// a real multi-vector (`infer_field_type` on an array of float arrays), so
+/// deferring to it would put `<seg>.emb_chunks.fst` back at 1,592,118 B on the
+/// 300-doc fixture and give up the larger half of #328's saving. That arm
+/// therefore requires 0 hits and `must_not` = 50 — the documented residual,
+/// asserted rather than left to chance, so it cannot silently widen. The
+/// aggregation is checked on all three arms and buckets 25/25 on all three.
+#[tokio::test]
+async fn declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_looks_like_one() {
+    const DIMS: usize = 16;
+    const DOCS: usize = 50;
+
+    let component = |doc: usize, dim: usize| -> f64 {
+        let h = (doc as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add((dim as u64).wrapping_mul(1_442_695_040_888_963_407));
+        ((h >> 11) as f64 / (1u64 << 53) as f64 * 2.0) - 1.0
+    };
+
+    for declared in [FieldType::Keyword, FieldType::Text, FieldType::Long] {
+        let label = match declared {
+            FieldType::Keyword => "keyword",
+            FieldType::Text => "text",
+            _ => "long",
+        };
+        // `long`/`double` is the RESIDUAL arm: it is what dynamic mapping
+        // infers from a real multi-vector, so the name rule cannot yield to it
+        // and this field IS still excluded. Pinned here, opposite in sign to
+        // the other two arms, so the limitation cannot drift into an accident.
+        let yields = !matches!(declared, FieldType::Long);
+        let dir = TempDir::new().unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("body", FieldType::Text));
+        // The collision: a user field named exactly like the companion the
+        // vector below would otherwise synthesise.
+        schema.fields.push(FieldConfig::new("emb_chunks", declared));
+        let mut emb = FieldConfig::new("emb", FieldType::Vector);
+        emb.options.dimensions = Some(DIMS);
+        emb.options.similarity = Some("cosine".to_string());
+        schema.fields.push(emb);
+
+        let engine = make_engine(&dir);
+        engine.create_index("collide", schema).unwrap();
+        let idx = engine.get_index("collide").unwrap();
+
+        let mut first_vector = Vec::new();
+        for d in 0..DOCS {
+            let v: Vec<f64> = (0..DIMS).map(|dim| component(d, dim)).collect();
+            if d == 0 {
+                first_vector = v.clone();
+            }
+            // A keyword mapping gets the bare discriminator; a text mapping gets
+            // it plus a token that is unique to the half, because `match` on
+            // "tenant-a" analyses to [tenant, a] and would match both halves.
+            let tenant = if d % 2 == 0 { "tenant-a" } else { "tenant-b" };
+            let chunks_value: Value = match declared {
+                FieldType::Keyword => json!(tenant),
+                FieldType::Text => json!(format!(
+                    "{tenant} {}",
+                    if d % 2 == 0 { "widgets" } else { "gadgets" }
+                )),
+                // The residual arm: a scalar number, which is the shape
+                // `infer_field_type` also produces from a real multi-vector.
+                _ => json!(if d % 2 == 0 { 7 } else { 9 }),
+            };
+            idx.index_document(
+                Some(format!("d{d}")),
+                json!({
+                    "body": format!("quarterly liquidity evidence {d}"),
+                    "emb_chunks": chunks_value,
+                    "emb": v,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        idx.refresh().await.unwrap();
+        idx.force_merge(1).await.unwrap();
+
+        let mut files: Vec<(String, u64)> = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), out);
+                } else {
+                    out.push((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.metadata().unwrap().len(),
+                    ));
+                }
+            }
+        }
+        walk(dir.path(), &mut files);
+        let bytes_of = |suffix: &str| -> u64 {
+            files
+                .iter()
+                .filter(|(name, _)| name.ends_with(suffix))
+                .map(|(_, len)| *len)
+                .sum()
+        };
+        eprintln!(
+            "#328 collision [{label}]: emb_chunks.fst={} emb.fst={} body.fst={}",
+            bytes_of(".emb_chunks.fst"),
+            bytes_of(".emb.fst"),
+            bytes_of(".body.fst"),
+        );
+        // The DECLARED sibling keeps its term dictionary — except on the
+        // residual arm, where the declaration is indistinguishable from the
+        // multi-vector's own inferred type and the name rule wins.
+        assert_eq!(
+            files
+                .iter()
+                .any(|(name, _)| name.ends_with(".emb_chunks.fst")),
+            yields,
+            "[{label}] `.emb_chunks.fst` present should be {yields}; got {:?}",
+            files
+                .iter()
+                .filter(|(name, _)| name.contains(".emb"))
+                .collect::<Vec<_>>()
+        );
+        // … and the `dense_vector` beside it still loses its own.
+        assert!(
+            !files.iter().any(|(name, _)| name.ends_with(".emb.fst")),
+            "[{label}] the dense_vector must still have no term dictionary"
+        );
+
+        // ── The answers. Every row here is 25 on the merge base `ca4d75a`; the
+        // unconditional name-only rule answered 0 for all of them, and 50 for
+        // the `must_not` shape below. On the two YIELDING arms this test
+        // requires 25 — the merge base's own answer. On the residual `long`
+        // arm it requires 0, which is what the name rule produces and what the
+        // CHANGELOG documents as a behaviour change.
+        let want = if yields { (DOCS / 2) as u64 } else { 0 };
+        let probes: Vec<(&str, Value)> = if matches!(declared, FieldType::Keyword) {
+            vec![
+                ("term", json!({"term": {"emb_chunks": "tenant-a"}})),
+                ("terms", json!({"terms": {"emb_chunks": ["tenant-a"]}})),
+                (
+                    "bool-filter",
+                    json!({"bool": {"filter": [{"term": {"emb_chunks": "tenant-a"}}]}}),
+                ),
+                (
+                    "bool-must-plus-filter",
+                    json!({"bool": {
+                        "must": [{"match": {"body": "liquidity"}}],
+                        "filter": [{"term": {"emb_chunks": "tenant-a"}}]
+                    }}),
+                ),
+                (
+                    "constant-score",
+                    json!({"constant_score": {"filter": {"term": {"emb_chunks": "tenant-a"}}}}),
+                ),
+            ]
+        } else if matches!(declared, FieldType::Long) {
+            vec![
+                ("term", json!({"term": {"emb_chunks": 7}})),
+                ("terms", json!({"terms": {"emb_chunks": [7]}})),
+                ("range", json!({"range": {"emb_chunks": {"gte": 8}}})),
+                (
+                    "bool-filter",
+                    json!({"bool": {"filter": [{"term": {"emb_chunks": 7}}]}}),
+                ),
+            ]
+        } else {
+            vec![
+                ("match", json!({"match": {"emb_chunks": "widgets"}})),
+                (
+                    "match-phrase",
+                    json!({"match_phrase": {"emb_chunks": "tenant-a widgets"}}),
+                ),
+                (
+                    "multi-match",
+                    json!({"multi_match": {"query": "widgets", "fields": ["emb_chunks"]}}),
+                ),
+                (
+                    "simple-query-string",
+                    json!({"simple_query_string": {"query": "widgets", "fields": ["emb_chunks"]}}),
+                ),
+                ("prefix", json!({"prefix": {"emb_chunks": "widget"}})),
+            ]
+        };
+        for (name, q) in &probes {
+            let hits = idx.search(&make_search(q.clone())).await.unwrap();
+            assert_eq!(
+                hits.total.value, want,
+                "[{label}] {name}: expected {want}, got {} for {q}",
+                hits.total.value
+            );
+        }
+
+        // The severe one, isolated: `must_not` on the declared sibling must
+        // still EXCLUDE. Under the name-only rule the clause lowered to
+        // `match_none`, the Bool fold dropped it as "excludes nothing", and the
+        // query returned all 50 — the 25 it was written to remove included.
+        //
+        // The text half is anchored with an explicit `match_all` `must`,
+        // because bare `bool{must_not:[match …]}` answers 0 on `origin/main`
+        // too — a PRE-EXISTING quirk with nothing to do with #328 (a control
+        // index carrying no vector field at all reproduces it: `{text body,
+        // text tags}`, `bool{must_not:[match tags:"widgets"]}` = 0 while
+        // `bool{must:[match_all],must_not:[match tags:"widgets"]}` = 25). This
+        // test pins the shape that is correct on `main` to begin with, so a
+        // failure here is this change's doing and nobody else's.
+        let must_not_probe = if matches!(declared, FieldType::Keyword) {
+            json!({"bool": {"must_not": [{"term": {"emb_chunks": "tenant-a"}}]}})
+        } else if matches!(declared, FieldType::Long) {
+            json!({"bool": {
+                "must": [{"match_all": {}}],
+                "must_not": [{"term": {"emb_chunks": 7}}]
+            }})
+        } else {
+            json!({"bool": {
+                "must": [{"match_all": {}}],
+                "must_not": [{"match": {"emb_chunks": "widgets"}}]
+            }})
+        };
+        let excluded = idx
+            .search(&make_search(must_not_probe.clone()))
+            .await
+            .unwrap();
+        // On the yielding arms the exclusion still works and returns exactly the
+        // other half. On the residual arm it does NOT: the clause lowers to
+        // `match_none`, the Bool fold drops it as "excludes nothing", and all
+        // 50 come back — the 25 the exclusion was written to remove included.
+        // That is the behaviour change the CHANGELOG documents, asserted here
+        // so it cannot happen by accident on a shape nobody looked at.
+        assert_eq!(
+            excluded.total.value,
+            if yields {
+                (DOCS / 2) as u64
+            } else {
+                DOCS as u64
+            },
+            "[{label}] must_not: got {} for {must_not_probe}",
+            excluded.total.value
+        );
+        if yields {
+            for hit in &excluded.hits {
+                let n: usize = hit.id.trim_start_matches('d').parse().unwrap();
+                assert_eq!(
+                    n % 2,
+                    1,
+                    "[{label}] must_not returned an excluded document: {}",
+                    hit.id
+                );
+            }
+        }
+
+        // Doc values were never in question — this row answers 25/25 on ALL
+        // THREE arms, including the residual one where every lexical clause
+        // says 0. That is what proves the data is present and correctly
+        // populated, and that it is the planner, not the storage, that changed.
+        let agg = idx
+            .search(
+                &parse_request(&json!({
+                    "size": 0,
+                    "aggs": {"by_tenant": {"terms": {"field": "emb_chunks", "size": 10}}}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let buckets = agg.aggs.as_ref().expect("aggs present")["by_tenant"]["buckets"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            buckets.iter().any(|b| b["doc_count"] == 25),
+            "[{label}] terms agg on the declared sibling must still bucket it, \
+             got {buckets:?}"
+        );
+
+        // The vector itself is unchanged by the yield: every lexical leaf
+        // naming it still answers 0, and kNN still answers from the graph.
+        for q in [
+            json!({"term": {"emb": "0"}}),
+            json!({"wildcard": {"emb": "0*"}}),
+            json!({"multi_match": {"query": "0", "fields": ["emb"]}}),
+        ] {
+            let hits = idx.search(&make_search(q.clone())).await.unwrap();
+            assert_eq!(
+                hits.total.value, 0,
+                "[{label}] a lexical clause on the dense_vector must answer 0, \
+                 got {} for {q}",
+                hits.total.value
+            );
+        }
+        let knn = idx
+            .search(
+                &parse_request(&json!({
+                    "query": {"knn": {"field": "emb", "query_vector": first_vector, "k": 3}},
+                    "size": 10
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(knn.hits.len(), 3, "[{label}] kNN must still retrieve");
+        assert_eq!(knn.hits[0].id, "d0", "[{label}] nearest must be the probe");
+    }
+}
+
 #[tokio::test]
 async fn semantic_passage_provenance_survives_update_merge_restart_and_source_filter() {
     let dir = TempDir::new().unwrap();

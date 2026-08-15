@@ -3926,16 +3926,39 @@ pub fn semantic_derived_vector_fields(schema: &Schema) -> std::collections::Hash
 /// The 300-doc × 128-dim fixture the regression tests actually run is the same
 /// shape one order of magnitude down: `emb.fst` 796,274 B, `emb.post` 591 B,
 /// `emb.norms` 313 B, `emb_chunks.fst` 1,592,118 B, `emb_chunks.post` 591 B,
-/// durable index 3,249,323 B → 857,843–858,071 B over eight runs. That test
+/// durable index 3,249,323 B → 857,563–858,071 B (eight runs on this revision
+/// printed 857,563 / 857,623 / 857,643 / 857,659 / 857,787 / 857,827 /
+/// 857,859 / 857,955). That test
 /// prints both totals and asserts a ceiling on the durable one, so this figure
 /// is enforced rather than merely published.
 ///
-/// The exclusion is *by declared type*, not by value shape: an unmapped
-/// numeric array stays lexical exactly as before (the same line HNSW draws in
-/// `load_hnsw_artifacts_sync`, which refuses a graph pinned to a
-/// non-`dense_vector` field). `FieldType::Chunk` is deliberately NOT excluded:
-/// its declared payload is chunk *text* plus a vector, and only the vector
-/// half is droppable — that needs a value-shape-aware rule, not a type rule.
+/// TWO RULES DECIDE THIS SET, and they are stated separately because they do
+/// not have the same strength. [`lexically_typeless_fields`] has the full
+/// statement; the summary is:
+///
+///  * BY DECLARED TYPE, for the field itself: `FieldType::Vector` and nothing
+///    else. Not by value shape — an unmapped numeric array stays lexical
+///    exactly as before (the same line HNSW draws in
+///    `load_hnsw_artifacts_sync`, which refuses a graph pinned to a
+///    non-`dense_vector` field). `FieldType::Chunk` is deliberately NOT
+///    excluded: its declared payload is chunk *text* plus a vector, and only
+///    the vector half is droppable — that needs a value-shape-aware rule, not
+///    a type rule.
+///  * BY NAME, for the two companions `<field>_chunks` and
+///    `__xerj_passage_meta__<field>`, which the passage pipeline writes into
+///    `_source` with no `FieldConfig` behind them, so there is no declared type
+///    to read. This rule is the weaker of the two and YIELDS to a declaration
+///    it could not have produced itself: a field mapped `text`, `keyword`,
+///    `date`, `boolean`, `ip`, `chunk` or `object` under one of those names
+///    keeps its full lexical surface. It does NOT yield to `long`/`double`,
+///    which is exactly what dynamic mapping infers from a real multi-vector —
+///    the residual, with its measured cost and its measured A/B, is on
+///    [`lexically_typeless_fields`] and in `CHANGELOG.md`.
+///
+/// The bytes in the table above are almost all the second rule's: `emb_chunks`
+/// in that fixture is a DYNAMIC field, absent from the user's mapping and
+/// registered as `Double` by dynamic mapping, and it is 26,518,005 B of the
+/// 39,796,380 B removed.
 ///
 /// Removing the postings is only half of it, and the other half is NOT the
 /// `*`-expansion filter. Every other member of this set is protected from the
@@ -3990,8 +4013,15 @@ pub fn semantic_derived_vector_fields(schema: &Schema) -> std::collections::Hash
 /// A WHOLE CLASS OF ANSWERS CHANGES, and it is stated rather than buried. SEVEN
 /// rows above differ between `main` and this branch (nine shapes on the 300-doc
 /// regression fixture, which probes both companions), and they are all the same
-/// thing: a `dense_vector` and its `_chunks` companion no longer have any
-/// lexical surface, so every lexical leaf naming one answers 0. On `main` those
+/// thing: a `dense_vector` and its UNDECLARED `_chunks` companion no longer
+/// have any lexical surface, so every lexical leaf naming one OUTRIGHT answers
+/// 0. Two exclusions from that sentence, both measured and both stated where
+/// they live: a `fields: ["emb.*"]` PATTERN is not lowered and still answers
+/// 300 of 300 for `"0"` on the fixture, exactly as on the merge base
+/// (`index::lower_lexically_typeless_clauses`'s `is_typeless_spec`), and a
+/// `<field>_chunks` the user mapped `text`/`keyword`/`date`/`boolean`/`ip` is
+/// not in the set at all, so nothing naming it changes
+/// ([`lexically_typeless_fields`]). On `main` those
 /// clauses reached the stored-doc scan, which renders the float array back to
 /// decimal text and matches against THAT — its `Term` arm matches any ELEMENT of
 /// a JSON array (`json_values_equal`) and its `match` arm splits on
@@ -4061,17 +4091,136 @@ pub fn fts_excluded_fields(schema: &Schema) -> std::collections::HashSet<String>
 /// its per-document float[][] shape is `LateInteractionField`, which `extends
 /// BinaryDocValuesField`
 /// (`lucene/core/src/java/org/apache/lucene/document/LateInteractionField.java:36`)
-/// and hands its constructor straight to `super(name, encode(value))` (`:44`)
+/// and hands its constructor straight to `super(name, encode(value))` (`:45`;
+/// the constructor signature is `:44`)
 /// — doc values only, no index options, so no term dictionary can exist for it
 /// any more than for the single-vector `KnnFloatVectorField`
 /// (`KnnFloatVectorField.java:70`: vector attributes, then `freeze()`).
 ///
-/// NAME SYNTHESIS, stated rather than discovered: a user field literally named
-/// `emb_chunks` alongside a `dense_vector` `emb` loses its term dictionary to
-/// this collision. That is the same collision `semantic_derived_vector_fields`
-/// has always accepted for `<target>_chunks`, and the same names
-/// `observe_passage_chunks_in_source` reserves, so the ambiguity is the
-/// engine's convention rather than something introduced here.
+/// TWO RULES, and they are not the same rule. The first is BY DECLARED TYPE:
+/// `FieldType::Vector` has no lexical form, so the base name is excluded
+/// unconditionally. The second is BY NAME: the two companions are synthesised
+/// from the base name because no USER mapping declares them — they arrive in
+/// `_source` from the passage pipeline, and whatever `FieldConfig` they end up
+/// with is one dynamic mapping inferred from their values. A name-based rule
+/// can collide with a field the user actually mapped, so it yields to one —
+/// but only where the declaration rules the collision out:
+///
+///  * if the schema declares `<field>_chunks` (or the sidecar) with a type a
+///    MULTI-VECTOR could not have produced — `text`, `keyword`, `date`,
+///    `boolean`, `ip`, `chunk`, `object` — that declaration wins and the field
+///    keeps its term dictionary and its whole lexical surface. Lucene draws
+///    exactly this line: whether a field gets a term dictionary is read off the
+///    field's own `IndexableFieldType` (`IndexingChain.invertAndStore`,
+///    `lucene/core/src/java/org/apache/lucene/index/IndexingChain.java:1416`),
+///    never off its name, and one name meaning two different things is an
+///    outright error rather than a silent downgrade
+///    (`IndexingChain.FieldSchema.setIndexOptions` → `assertSame` →
+///    `raiseNotSame`, `IndexingChain.java:2213` and `:2193`);
+///  * `double` / `long` / absent → the name rule applies. Not a shortcut: it is
+///    what the companion ITSELF declares. `<field>_chunks` is user-supplied
+///    `_source` (an array of float arrays), so dynamic mapping registers it
+///    like any other unmapped key and `infer_field_type` lands on
+///    `FieldType::Double`. Deferring to that declaration was measured and it
+///    brings `<seg>.emb_chunks.fst` back at 1,592,118 B on the 300-doc fixture
+///    — the whole 26,518,005 B of the 39,796,380 B saving that lives in the
+///    companion at 5,000 × 128. See [`declares_non_vector_shaped_field`] for
+///    the residual this leaves and what it costs to close.
+///
+/// This is deliberately NOT the contract `semantic_derived_vector_fields`
+/// carries: that one synthesises `<target>_chunks` unconditionally, and a
+/// declared field of that name has always lost its postings to it. That
+/// behaviour is untouched here — it is `main`'s, on a mapping shape this PR
+/// does not introduce — but it is not a precedent this rule reuses, because it
+/// fires only when an embedding config designates the target, whereas this rule
+/// fires for every user-mapped `dense_vector`. Nor is
+/// `observe_passage_chunks_in_source` a precedent: it reserves `<field>_chunks`
+/// only when `_source` holds a NON-EMPTY ARRAY there
+/// (`index.rs`'s `Some(Value::Array(chunks)) if !chunks.is_empty()`), so a
+/// string or keyword value was never captured by it. Measured on
+/// `{text body, keyword emb_chunks, dense_vector emb}`, 50 docs × 16 dim, half
+/// `tenant-a` — three source states, all three run in one worktree: the merge
+/// base `ca4d75a` (`main` when this branch was cut), the unconditional
+/// name-only rule this replaces (`e629a58`), and here.
+///
+/// | | `main` | name-only | here |
+/// |---|---|---|---|
+/// | `<seg>.emb_chunks.fst` | 54 B | **0** | 54 B |
+/// | `<seg>.emb.fst` | 16,713 B | 0 | 0 |
+/// | `term {emb_chunks:"tenant-a"}` | 25 | **0** | 25 |
+/// | `terms {emb_chunks:["tenant-a"]}` | 25 | **0** | 25 |
+/// | `bool{filter:[term emb_chunks]}` | 25 | **0** | 25 |
+/// | `bool{must:[match body],filter:[term …]}` | 25 | **0** | 25 |
+/// | `constant_score{filter:term emb_chunks}` | 25 | **0** | 25 |
+/// | `bool{must_not:[term emb_chunks]}` | 25 | **50** | 25 |
+/// | `bool{must:[match_all],must_not:[term …]}` | 25 | **50** | 25 |
+/// | `terms` agg on `emb_chunks` | 25/25 | 25/25 | 25/25 |
+///
+/// The same schema with `emb_chunks` mapped `text` (values `tenant-a widgets` /
+/// `tenant-b gadgets`, so one token is unique to each half):
+///
+/// | | `main` | name-only | here |
+/// |---|---|---|---|
+/// | `<seg>.emb_chunks.fst` | 71 B | **0** | 71 B |
+/// | `match {emb_chunks:"widgets"}` | 25 | **0** | 25 |
+/// | `match_phrase {emb_chunks:"tenant-a widgets"}` | 25 | **0** | 25 |
+/// | `multi_match {fields:["emb_chunks"]}` | 25 | **0** | 25 |
+/// | `simple_query_string {fields:["emb_chunks"]}` | 25 | **0** | 25 |
+/// | `prefix {emb_chunks:"widget"}` | 25 | **0** | 25 |
+/// | `bool{must:[match_all],must_not:[match …]}` | 25 | **50** | 25 |
+/// | unfielded `query_string {"query":"widgets"}` | 25 | 25 | 25 |
+///
+/// Every ANSWER row is back to `main`'s value while `emb.fst` stays gone, which
+/// is the whole claim: the vector loses its term dictionary, the declared field
+/// beside it loses nothing.
+///
+/// The `must_not` rows are why this is a correctness rule and not a footprint
+/// one: under the name-only rule the clause lowered to `match_none`, the Bool
+/// fold dropped it as "excludes nothing", and the query RETURNED the 25
+/// documents the exclusion was written to remove — with the aggregation proving
+/// the data was present and correctly populated the whole time. The unfielded
+/// `query_string` row is the self-inconsistency it produced: 25 through the
+/// stored-doc scan while every fielded shape said 0.
+///
+/// One shape is NOT in these tables and deliberately not asserted anywhere:
+/// bare `bool{must_not:[match …]}` with no `must`/`filter` answers 0 on
+/// `ca4d75a` (and 50 under the name-only rule). That is a PRE-EXISTING
+/// XERJ quirk with nothing to do with #328 — a control index with no vector
+/// field at all, `{text body, text tags, keyword kw}`, answers
+/// `bool{must_not:[match tags:"widgets"]}` = 0 and
+/// `bool{must:[match_all],must_not:[match tags:"widgets"]}` = 25 there too.
+/// The `match_all`-anchored form is the one the tests pin, because it is the
+/// one that is correct on `main` to begin with.
+///
+/// THE RESIDUAL, stated in full because it is the same class and it is NOT
+/// fixed: a field the user declares `long` or `double` under one of these two
+/// names is still excluded by name, and the plan-time lowering still zeroes
+/// every lexical clause on it. Measured on
+/// `{text body, long emb_chunks, dense_vector emb}`, 50 docs, values 7 and 9 —
+/// merge base `ca4d75a` → here:
+///
+///   `term {emb_chunks:7}`                     25 → **0**
+///   `terms {emb_chunks:[7]}`                  25 → **0**
+///   `range {emb_chunks:{gte:8}}`              25 → **0**
+///   `bool{filter:[term emb_chunks 7]}`        25 → **0**
+///   `bool{must:[match_all],must_not:[term 7]}` 25 → **50**
+///   `terms` agg / `stats` on `emb_chunks`     25/25, sum 400 → 25/25, sum 400
+///
+/// It is narrower than what it replaces — the reported case, a `keyword`
+/// tenant discriminator, is now byte-identical to the merge base — but it is
+/// the same failure shape, and closing it needs a decision this function cannot
+/// make on its own: either give the schema per-field PROVENANCE (explicit
+/// mapping vs. dynamically inferred) so an explicit `double` can outrank the
+/// name, or drop the by-name rule entirely and give up 67% of the saving. Both
+/// are larger than #328. Documented as a behaviour change in `CHANGELOG.md`
+/// and pinned by `a_numerically_declared_sibling_is_still_excluded_by_name`
+/// here and the `[long]` arm of
+/// `declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_looks_like_one` in
+/// `tests/integration.rs`, so it cannot drift silently.
+///
+/// Pinned by `a_declared_sibling_keeps_its_lexical_surface` here and by
+/// `declared_chunks_sibling_of_a_dense_vector_stays_queryable_unless_it_looks_like_one` in
+/// `tests/integration.rs`.
 ///
 /// ALLOCATION: this runs once per SEARCH (`index::search_inner` calls it to
 /// decide whether the plan-time lowering has anything to do), and the vast
@@ -4087,15 +4236,86 @@ pub fn lexically_typeless_fields(schema: &Schema) -> std::collections::HashSet<S
         return excluded;
     }
     for field in crate::index::collect_dense_vector_fields(schema) {
-        excluded.insert(format!("{field}_chunks"));
-        excluded.insert(format!(
-            "{}{}",
-            xerj_query::executor::PASSAGE_METADATA_PREFIX,
-            field
-        ));
+        // BY NAME, and only where no declaration contradicts it.
+        for synthesised in [
+            format!("{field}_chunks"),
+            format!("{}{}", xerj_query::executor::PASSAGE_METADATA_PREFIX, field),
+        ] {
+            if !declares_non_vector_shaped_field(schema, &synthesised) {
+                excluded.insert(synthesised);
+            }
+        }
+        // BY DECLARED TYPE: unconditional.
         excluded.insert(field);
     }
     excluded
+}
+
+/// Does `schema` declare `path` as a field whose type a MULTI-VECTOR could not
+/// have produced — i.e. does the name-based companion rule have to yield to it?
+///
+/// `path` is dotted exactly as [`crate::index::collect_dense_vector_fields`]
+/// emits it, so the walk descends `FieldConfig::fields` segment by segment
+/// rather than using `Schema::has_field`, which only sees root names and would
+/// answer `false` for every nested companion.
+///
+/// THE LINE IS DRAWN AT "COULD THIS DECLARATION HAVE COME FROM THE COMPANION
+/// ITSELF", and it is drawn there because the companion is not always
+/// undeclared. `<field>_chunks` is user-supplied `_source` (RFC #148's
+/// per-document multi-vector: an array of float arrays), so DYNAMIC MAPPING
+/// registers it like any other unmapped key — `infer_field_type` walks to the
+/// first non-null element, twice, and lands on `FieldType::Double`
+/// (`index.rs`'s `Value::Array` arm). Measured: with "any declaration wins",
+/// `<seg>.emb_chunks.fst` comes back at 1,592,118 B on the 300-doc fixture and
+/// the whole 67% of the saving that lives in the companion is lost, because
+/// dynamic mapping had already declared it.
+///
+/// So:
+///
+///  * `Double` / `Long` — the shape `infer_field_type` produces from an array
+///    of float (or integer) arrays. Indistinguishable from the companion, so
+///    the name rule applies and this returns `false`. This is the residual
+///    case: a user's OWN numeric field named `<vector>_chunks` loses its term
+///    dictionary. It does not lose its data — doc values, `terms`/`range`
+///    aggregations and sorts are untouched — and the measured cost of the
+///    alternative is the entire companion saving.
+///  * `Vector` — already in the set by declared type; `false` is a no-op.
+///  * `Text` / `Keyword` / `Date` / `Boolean` / `Ip` / `Chunk` / `Object` — a
+///    multi-vector cannot infer to any of these, so a declaration of one is
+///    unambiguously the user's own field and the name rule yields. This is the
+///    case that matters: a tenant or ACL discriminator named `emb_chunks` keeps
+///    its whole lexical surface.
+///  * absent — nothing to defer to; the name rule applies.
+///
+/// BOTH SPELLINGS of a nested name are resolved, because both reach the schema.
+/// `put_mapping` stores a dotted path as ONE top-level `FieldConfig` named
+/// `"passages.vec_chunks"`, while `es_properties_to_fields` stores it as a
+/// `vec_chunks` child under a `passages` object — the same two shapes
+/// `nested_dense_vector_is_excluded_from_its_parent_objects_term_dictionary`
+/// exercises for the vector itself. The literal lookup runs first so the flat
+/// spelling cannot fall through the segmented walk and be treated as undeclared.
+fn declares_non_vector_shaped_field(schema: &Schema, path: &str) -> bool {
+    let is_lexical = |fc: &xerj_common::types::FieldConfig| {
+        !matches!(
+            fc.field_type,
+            FieldType::Vector | FieldType::Double | FieldType::Long
+        )
+    };
+    if let Some(field) = schema.fields.iter().find(|fc| fc.name == path) {
+        return is_lexical(field);
+    }
+    let mut fields: &[xerj_common::types::FieldConfig] = &schema.fields;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let Some(field) = fields.iter().find(|fc| fc.name == segment) else {
+            return false;
+        };
+        if segments.peek().is_none() {
+            return is_lexical(field);
+        }
+        fields = &field.fields;
+    }
+    false
 }
 
 /// Does this field list contain a `dense_vector` anywhere? Allocation-free.
@@ -4383,6 +4603,160 @@ mod lexically_typeless_fields_tests {
             ])
         );
         assert!(!typeless.contains("body"), "a text field is not typeless");
+    }
+
+    /// The name-based half YIELDS to a declaration. A user who maps a field
+    /// called `emb_chunks` beside a `dense_vector emb` gets a real keyword
+    /// field, not a silently unqueryable one — the previous revision of this
+    /// function excluded the name unconditionally, which took the postings away
+    /// from a field the schema declares and (through the plan-time lowering)
+    /// made `bool{must_not:[term emb_chunks]}` RETURN the documents it excludes.
+    ///
+    /// Lucene reads "does this field get a term dictionary" off the field's own
+    /// `IndexableFieldType` and never off its name
+    /// (`IndexingChain.java:1416`), and treats one name carrying two different
+    /// index options as an error rather than a silent downgrade (`:2213`).
+    #[test]
+    fn a_declared_sibling_keeps_its_lexical_surface() {
+        for declared in [
+            FieldType::Keyword,
+            FieldType::Text,
+            FieldType::Date,
+            FieldType::Boolean,
+            FieldType::Ip,
+        ] {
+            let mut schema = Schema::empty();
+            schema
+                .add_field(FieldConfig::new("body", FieldType::Text))
+                .unwrap();
+            schema
+                .add_field(FieldConfig::new("emb_chunks", declared))
+                .unwrap();
+            schema
+                .add_field(FieldConfig::new("__xerj_passage_meta__emb", declared))
+                .unwrap();
+            schema.add_field(vector("emb", 8)).unwrap();
+
+            let typeless = lexically_typeless_fields(&schema);
+            assert_eq!(
+                typeless,
+                std::collections::HashSet::from(["emb".to_string()]),
+                "a declared `{declared:?}` sibling must keep its term dictionary"
+            );
+            // And the union the write path actually reads agrees.
+            let excluded = fts_excluded_fields(&schema);
+            assert!(excluded.contains("emb"));
+            assert!(
+                !excluded.contains("emb_chunks"),
+                "declared sibling excluded from the inverted index: {excluded:?}"
+            );
+        }
+    }
+
+    /// THE RESIDUAL, pinned so it cannot drift into an accident. A `Double` or
+    /// `Long` declaration is exactly what dynamic mapping produces from the
+    /// real multi-vector (`infer_field_type` walks an array of float arrays to
+    /// its first scalar), so the name rule cannot yield to it without losing
+    /// the whole companion saving — measured at `<seg>.emb_chunks.fst`
+    /// 1,592,118 B reappearing on the 300-doc fixture. Documented in the
+    /// CHANGELOG as a behaviour change rather than fixed.
+    #[test]
+    fn a_numerically_declared_sibling_is_still_excluded_by_name() {
+        for declared in [FieldType::Double, FieldType::Long] {
+            let mut schema = Schema::empty();
+            schema
+                .add_field(FieldConfig::new("emb_chunks", declared))
+                .unwrap();
+            schema.add_field(vector("emb", 8)).unwrap();
+            assert!(
+                lexically_typeless_fields(&schema).contains("emb_chunks"),
+                "a `{declared:?}` declaration is the multi-vector's own inferred \
+                 shape and must not rescue the name"
+            );
+            assert!(!declares_non_vector_shaped_field(&schema, "emb_chunks"));
+        }
+    }
+
+    /// A sibling declared as a `dense_vector` is excluded — by the TYPE rule,
+    /// which is unconditional — so yielding to the declaration must not
+    /// accidentally rescue it.
+    #[test]
+    fn a_sibling_declared_as_a_vector_is_still_typeless() {
+        let mut schema = Schema::empty();
+        schema.add_field(vector("emb_chunks", 8)).unwrap();
+        schema.add_field(vector("emb", 8)).unwrap();
+
+        let typeless = lexically_typeless_fields(&schema);
+        for name in [
+            "emb",
+            "emb_chunks",
+            "emb_chunks_chunks",
+            "__xerj_passage_meta__emb",
+        ] {
+            assert!(typeless.contains(name), "{name} missing from {typeless:?}");
+        }
+    }
+
+    /// The declaration check walks DOTTED paths, because a nested vector's
+    /// companion is nested too. `Schema::has_field` only sees root names and
+    /// would answer "not declared" for every one of these.
+    #[test]
+    fn a_declared_nested_sibling_keeps_its_lexical_surface() {
+        let mut schema = Schema::empty();
+        let mut parent = FieldConfig::new("passages", FieldType::Object);
+        parent.fields.push(vector("vec", 4));
+        parent
+            .fields
+            .push(FieldConfig::new("vec_chunks", FieldType::Keyword));
+        schema.add_field(parent).unwrap();
+
+        let typeless = lexically_typeless_fields(&schema);
+        assert!(typeless.contains("passages.vec"), "got {typeless:?}");
+        assert!(
+            !typeless.contains("passages.vec_chunks"),
+            "declared nested sibling excluded: {typeless:?}"
+        );
+        assert!(declares_non_vector_shaped_field(
+            &schema,
+            "passages.vec_chunks"
+        ));
+        assert!(
+            !declares_non_vector_shaped_field(&schema, "passages.vec"),
+            "a declared vector is not a lexical declaration"
+        );
+        assert!(
+            !declares_non_vector_shaped_field(&schema, "passages.absent"),
+            "an undeclared name has no declaration to defer to"
+        );
+        assert!(
+            !declares_non_vector_shaped_field(&schema, "passages.vec_chunks.deeper"),
+            "walking past a leaf must not resolve"
+        );
+    }
+
+    /// The FLAT spelling of a nested name — one top-level `FieldConfig` called
+    /// `"passages.vec_chunks"`, which is what `put_mapping` produces — must
+    /// resolve too. Without the literal lookup the segmented walk looks for a
+    /// root `passages` object, does not find one, and treats a declared field
+    /// as undeclared.
+    #[test]
+    fn the_flat_dotted_spelling_of_a_declared_sibling_resolves() {
+        let mut schema = Schema::empty();
+        schema.add_field(vector("passages.vec", 4)).unwrap();
+        schema
+            .add_field(FieldConfig::new("passages.vec_chunks", FieldType::Keyword))
+            .unwrap();
+
+        assert!(declares_non_vector_shaped_field(
+            &schema,
+            "passages.vec_chunks"
+        ));
+        let typeless = lexically_typeless_fields(&schema);
+        assert!(typeless.contains("passages.vec"), "got {typeless:?}");
+        assert!(
+            !typeless.contains("passages.vec_chunks"),
+            "the flat spelling was treated as undeclared: {typeless:?}"
+        );
     }
 
     /// The exclusion is by DECLARED type, not by value shape: a numeric array

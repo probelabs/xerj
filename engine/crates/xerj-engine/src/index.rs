@@ -30158,9 +30158,15 @@ fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
 /// separate, breaking change.
 ///
 /// It is not answer-preserving, and the exception is a CLASS rather than a row.
-/// A `dense_vector` and its `_chunks` companion end up with no lexical surface
-/// at all, so every lexical leaf naming one answers 0 where the stored-doc scan
-/// used to match the rendered decimal text of the float array. On the 300-doc
+/// A `dense_vector` and its vector-shaped `_chunks` companion end up with no
+/// lexical surface at all, so every lexical leaf naming one OUTRIGHT answers 0
+/// where the stored-doc scan used to match the rendered decimal text of the
+/// float array. "Outright" is load-bearing twice over: a `fields: ["emb.*"]`
+/// PATTERN is not lowered (see `is_typeless_spec` below — measured 300 of 300
+/// on the fixture, on the merge base and here alike), and a `<field>_chunks`
+/// the user mapped as `text`/`keyword`/`date`/`boolean`/`ip` is not in
+/// `typeless` at all, so nothing naming it is lowered either
+/// (`memtable::lexically_typeless_fields`). On the 300-doc
 /// regression fixture that is `wildcard {emb:"0*"}` and `fuzzy {emb:"0"~2}`
 /// 300 hits (EVERY document) → 0, `prefix {emb:"0"}` 146 → 0,
 /// `match_phrase_prefix {emb:"0"}` 50 → 0, numeric `term`/`terms` 1 → 0, and the
@@ -30197,9 +30203,35 @@ fn lower_lexically_typeless_clauses(
     q: &QueryNode,
     typeless: &std::collections::HashSet<String>,
 ) -> QueryNode {
-    // One entry of a `fields: [...]` list. `"emb^3"` carries a boost; a
-    // pattern (`"*"`, `"body.*"`) is an expansion, and the expansion sets in
-    // `search_inner` already drop vector fields, so it must stay.
+    // One entry of a `fields: [...]` list. `"emb^3"` carries a boost.
+    //
+    // A PATTERN (`"*"`, `"body.*"`) is deliberately NOT lowered, and the honest
+    // reason is that this pass cannot decide it, not that it is already
+    // handled. Resolving a pattern needs the expansion universe — which
+    // includes DYNAMIC fields that are in no schema — and lowering a pattern
+    // that would have expanded onto a real lexical field is the same
+    // silent-zero failure the declared-sibling rule in
+    // `memtable::lexically_typeless_fields` exists to prevent. So the pattern
+    // stays and the gap stays with it, MEASURED rather than assumed. On the
+    // 300-doc × 128-dim fixture, identical on the `ca4d75a` merge base and
+    // here:
+    //
+    //   {"multi_match":{"query":"0","fields":["emb.*"]}}          300 of 300
+    //   {"multi_match":{"query":"liquidity","fields":["emb.*"]}}    0 of 300
+    //   {"multi_match":{"query":"0","fields":["emb_chunks.*"]}}   300 of 300
+    //   {"multi_match":{"query":"0","fields":["emb"]}}              0 of 300
+    //   {"multi_match":{"query":"0","fields":["emb*"]}}             0 of 300
+    //   {"multi_match":{"query":"0","fields":["*"]}}                0 of 300
+    //   {"simple_query_string":{"query":"0","fields":["emb.*"]}}    0 of 300
+    //
+    // `search_inner`'s expansion sets do drop vector fields, so the pattern
+    // never PROJECTS onto one — but an unprojectable `MultiMatch` falls to the
+    // stored-doc scan, and the scan resolves the pattern against the SOURCE's
+    // field names instead, where `emb` is present and renders as decimal text.
+    // That is why the first row is 300 and not 0: every rendered component
+    // contains a `0`, while `liquidity` never appears in the array. Not a
+    // regression (both columns agree) and not closed here; the CHANGELOG says
+    // "names one outright" rather than "names one" for exactly this reason.
     let is_typeless_spec = |spec: &String| -> bool {
         let (name, _boost) = parse_field_boost(spec);
         !name.contains('*') && typeless.contains(name)
