@@ -19399,14 +19399,15 @@ impl Index {
     ///
     /// Supported shapes:
     /// * `MatchAll` — sum of segment `doc_count` + memtable doc count.
-    /// * `Term { field, value }` — for a keyword field:
+    /// * `Term { field, value }` — for a field with doc-values:
     ///     - Counts matches in the memtable via `doc_values_keyword_column`.
-    ///     - For each on-disk segment, calls `FtsIndexReader::term_doc_freq`
-    ///       on the raw value; if the segment analyzer lowercased terms,
-    ///       falls back to the lowercased form.
-    ///     - If the segment has no FTS data for the field at all, the
-    ///       shortcut is abandoned (return `None`) because the segment
-    ///       would otherwise undercount.
+    ///     - For each on-disk segment, counts through that segment's
+    ///       doc-values column — the same values `_search` compares against.
+    ///     - If a segment has no column for the field, the shortcut is
+    ///       abandoned (return `None`) and the scan answers.  It used to
+    ///       consult the FTS term dictionary instead, whose ANALYZED terms
+    ///       are not what `_search` matches a `term` against, so the count
+    ///       could exceed the retrievable hit set (#362).
     ///
     /// Exact match count for a `bool` that carries `should` and/or `must_not`
     /// clauses — the shapes the fused must/filter-intersection arm bails on.
@@ -20265,15 +20266,14 @@ impl Index {
         //   2. Keyword column → `doc_freq(term)` is an O(n) ord scan.
         //   3. Numeric column → `range_count(v, v, true, true)` bisects
         //      the sorted index in O(log n).
-        //   4. Fall back to FTS `term_doc_freq` if both columns are
-        //      missing for this segment.
-        //   5. If FTS is missing too, abandon — we can't answer safely.
+        //   4. Neither column present for this segment → abandon (#362).
+        //      The FTS term dictionary used to answer here and it is the
+        //      wrong oracle; see the comment on that branch below.
         let segments_dir = self.data_dir.join("segments");
         let raw = match value {
             Value::String(s) => s.as_str().to_string(),
             other => other.to_string(),
         };
-        let lowered = raw.to_ascii_lowercase();
         // Same bool coercion as the memtable side above — `value.as_f64()`
         // alone returns `None` for a JSON boolean, which used to make
         // `served_by_dv` false for every segment whose on-disk column for
@@ -20316,25 +20316,63 @@ impl Index {
                 continue;
             }
 
-            // Fallback: FTS term dictionary.  This is the slow path that
-            // parses meta.json; we only take it when the field isn't in
-            // the segment's doc-values (e.g. text fields with positions).
-            let reader = match FtsIndexReader::open(&segments_dir, &meta.id, &[field]) {
-                Ok(r) => r,
-                Err(_) => return None, // FST missing — abandon
-            };
-            reader.field_stats(field)?;
-            let df = reader
-                .term_doc_freq(field, &raw)
-                .or_else(|| {
-                    if raw == lowered {
-                        None
-                    } else {
-                        reader.term_doc_freq(field, &lowered)
-                    }
-                })
-                .unwrap_or(0);
-            seg_matches = seg_matches.saturating_add(df as u64);
+            // No doc-values column for this field in this segment: ABANDON
+            // (#362).  This used to fall back to the segment's FTS term
+            // dictionary, which answers a DIFFERENT question than the one
+            // `_search` answers, so `_count` published totals no page of hits
+            // could reproduce:
+            //
+            //   term title=testsegmentreader.java   _count 1, _search total 0
+            //   term title=quick, "the quick brown fox"
+            //                                       _count 1, _search total 0
+            //
+            // A field only reaches here because it has no column, which on
+            // this engine means an analyzed `text` field (`es_compat`'s
+            // `doc_values_default`) or an explicit `doc_values: false`.  Its
+            // term dictionary holds ANALYZED tokens — `build_fts_field_configs`
+            // gives `Text` the standard analyzer, so the entries are
+            // tokenized and lowercased — while `query_node_to_fts_with_
+            // keyword_fields` declines the FTS projection for a bare `Term`
+            // and `_search` resolves it through `doc_matches_query`, comparing
+            // the WHOLE `_source` value.  A dictionary hit therefore says
+            // nothing about whether the scan will produce a document.
+            //
+            // The lowercase re-spelling this replaces (`term_doc_freq(raw)`
+            // `.or_else(term_doc_freq(lowered))`) was scaffolding over that:
+            // it retried with a term the caller never wrote, which is what
+            // made `term` look case-normalising next to `prefix`/`wildcard`
+            // and is what #362 was filed as.  Deleting only the retry does
+            // not fix this — the `quick` row above carries no casing at all,
+            // its dictionary hit is genuine, and the byte-exact spelling
+            // would start counting 0 where `_search` still answers 1.  The
+            // oracle is wrong, not its spelling.
+            //
+            // Lucene's counts cannot drift this way: the sub-linear answer is
+            // a method on the same `Weight` that builds the scorer, and its
+            // default is "I cannot answer" — `Weight::count`
+            // (lucene/core/src/java/org/apache/lucene/search/Weight.java:198)
+            // returns -1, documented as the count not being computable in
+            // sub-linear time, so `IndexSearcher::count`
+            // (lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java:495)
+            // collects for real.  The specialisation that does answer,
+            // `TermQuery::TermWeight::count`
+            // (lucene/core/src/java/org/apache/lucene/search/TermQuery.java:260),
+            // reads `termsEnum.docFreq()` off the query's OWN term state and
+            // hands straight back to `super.count` once deletions make that
+            // stop being the live answer.  Returning `None` here is that
+            // hand-back: the caller's delete-aware scan — the code that
+            // materialises the hits — answers instead.
+            //
+            // Cost: a `term` count on a text field is a scan again.  That is
+            // the price of the number being true, and it is paid only by the
+            // shape that was wrong.
+            //
+            // (What `_search` SHOULD do for a `term` on an analyzed field is
+            // a separate question — ES matches the analyzed dictionary, so
+            // `quick` would find "the quick brown fox" there.  Changing that
+            // moves the hit set and needs its own issue; this change only
+            // makes `_count` agree with whatever `_search` does today.)
+            return None;
         }
 
         Some(mem_matches + seg_matches)
