@@ -1409,6 +1409,71 @@ fn a_two_table_sqlite_file_commits_its_generation() {
     assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
 }
 
+/// The shape #360 was actually reported against, and the one that reaches the
+/// fan-out through the *sniffer* rather than through an extension: ordinary
+/// markdown prose with SQL blocks in it, as in `unum-cloud/usearch`'s
+/// `sqlite/README.md`. `sniff` routes any text containing `CREATE TABLE` and a
+/// `;` to the `sqldump` family, so a README documenting two tables is one
+/// content group feeding two datasets — no dump and no database file involved.
+/// Worth pinning separately: the reporter's corpus contained neither.
+#[test]
+fn a_readme_documenting_two_tables_is_not_a_fatal_condition() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("README.md"),
+        "# vectors\n\nStore them like this:\n\n```sql\n\
+         CREATE TABLE t1 (id INTEGER PRIMARY KEY, v JSON NOT NULL);\n\
+         INSERT INTO t1 (id, v) VALUES (10, '[1.0]'), (11, '[2.0]');\n\
+         CREATE TABLE t2 (id INTEGER PRIMARY KEY, v JSON NOT NULL);\n\
+         INSERT INTO t2 (id, v) VALUES (20, '[1.0]'), (21, '[2.0]');\n\
+         ```\n",
+    )
+    .unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (code, summary) = run_index_report(config).unwrap();
+    let summary = summary.expect("a README describing two tables still commits");
+    assert_eq!(code, 0, "a valid README is not a failed run");
+    assert_eq!(summary["records_total"], 4);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    let mut counts: Vec<(String, u64)> = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .docs
+        .iter()
+        .filter(|((index, _), doc)| {
+            index == catalog::CATALOG_INDEX
+                && doc.get("doc_kind").and_then(Value::as_str) == Some("dataset")
+        })
+        .map(|(_, doc)| {
+            (
+                doc["slug"].as_str().unwrap_or_default().to_owned(),
+                doc["record_count"]
+                    .as_u64()
+                    .expect("a dataset catalog document reports its record count"),
+            )
+        })
+        .collect();
+    counts.sort();
+    assert_eq!(
+        counts.len(),
+        2,
+        "one dataset per declared table: {counts:?}"
+    );
+    assert!(
+        counts.iter().all(|(_, records)| *records == 2),
+        "each dataset carries only its own rows: {counts:?}"
+    );
+}
+
 /// Where this branch and #241 meet.
 ///
 /// The generated `--no-graph` route returns from inside `run_index_report`,
