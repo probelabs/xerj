@@ -57,6 +57,14 @@ pub struct PreparedArtifact {
     /// never published, so no read-back count sees it.
     #[serde(default)]
     pub junk: u64,
+    /// Per-dataset breakdown of `records`, keyed by the dataset each record was
+    /// written under. One file can feed several datasets — a SQL dump is one
+    /// file and N tables — so the flat total is not comparable to any single
+    /// dataset's read-back. Omitted when empty: `snapshot_digest` covers the
+    /// serialized artifact, so an in-flight snapshot sealed before this field
+    /// existed must keep hashing to the same value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub records_by_dataset: BTreeMap<String, u64>,
     pub bytes: u64,
     pub digest: String,
 }
@@ -379,10 +387,18 @@ impl<'a> EsSyncBackend<'a> {
                 .iter()
                 .map(|group| group.content_id.as_str())
                 .collect();
+            // Filter on `ax_dataset` as well as `ax_file`: the read-back is then
+            // per-dataset by construction, matching the identity the records
+            // were sealed under, and stays exact even if two datasets ever share
+            // one index. `ax_dataset` is written at every sink site and is a
+            // mapped `PROVENANCE_FIELDS` keyword.
             let mut body = serde_json::json!({
                 "size": 0,
                 "track_total_hits": true,
-                "query": {"terms": {"ax_file": content_ids}}
+                "query": {"bool": {"filter": [
+                    {"terms": {"ax_file": content_ids}},
+                    {"term": {"ax_dataset": dataset.slug}}
+                ]}}
             });
             if let Some(field) = &dataset.time_field {
                 body["aggs"] = serde_json::json!({
@@ -395,16 +411,40 @@ impl<'a> EsSyncBackend<'a> {
                 .pointer("/hits/total/value")
                 .and_then(Value::as_u64)
                 .context("dataset exact read-back has no total")?;
-            let expected = groups.iter().try_fold(0u64, |sum, group| {
-                sum.checked_add(group.expected_records)
-                    .context("dataset expected record count overflow")
-            })?;
-            anyhow::ensure!(
-                record_count == expected,
-                "dataset {} exact read-back count {record_count} disagrees with sealed count \
-                 {expected}",
-                dataset.slug
-            );
+            // A group's sealed record count is a property of the *content*, not
+            // of a dataset: one file fans out over N datasets (a SQL dump is N
+            // tables), so its flat total is comparable to no single dataset's
+            // read-back. Fold the per-dataset ledger instead — the counts keyed
+            // by the identity they were written under. `None` is a group sealed
+            // before that ledger existed which fanned out anyway: genuinely
+            // unattributable, so the equality is skipped for this dataset rather
+            // than guessed at, and the exact read-back is still published as the
+            // statistic. The check itself stays fatal — a read-back that
+            // disagrees with a seal it *can* be compared against is a corruption
+            // signal, not junk.
+            let expected = groups
+                .iter()
+                .map(|group| group.expected_records_for(&dataset.slug))
+                .try_fold(Some(0u64), |sum, count| match (sum, count) {
+                    (Some(sum), Some(count)) => sum
+                        .checked_add(count)
+                        .context("dataset expected record count overflow")
+                        .map(Some),
+                    _ => Ok(None),
+                })?;
+            if let Some(expected) = expected {
+                anyhow::ensure!(
+                    record_count == expected,
+                    "dataset {} exact read-back count {record_count} disagrees with sealed count \
+                     {expected} across groups {}",
+                    dataset.slug,
+                    groups
+                        .iter()
+                        .map(|group| group.group_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
             let mut formats: Vec<String> = desired
                 .plan
                 .files
@@ -1093,6 +1133,9 @@ pub fn groups_from_inventory(
                 expected_passages: prior.map_or(0, |group| group.expected_passages),
                 expected_vectors: prior.map_or(0, |group| group.expected_vectors),
                 expected_junk_records: prior.map_or(0, |group| group.expected_junk_records),
+                expected_records_by_dataset: prior
+                    .map(|group| group.expected_records_by_dataset.clone())
+                    .unwrap_or_default(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1130,6 +1173,7 @@ pub fn bind_prepared_counts(
         group.expected_passages = prepared.passages;
         group.expected_vectors = prepared.vectors;
         group.expected_junk_records = prepared.junk;
+        group.expected_records_by_dataset = prepared.records_by_dataset.clone();
     }
     Ok(())
 }
@@ -1466,6 +1510,7 @@ fn prepare_artifact(
         budget,
     };
     let mut records = 0u64;
+    let mut records_by_dataset: BTreeMap<String, u64> = BTreeMap::new();
     let mut passages = 0u64;
     let mut vectors = 0u64;
     let mut sink_error: Option<anyhow::Error> = None;
@@ -1521,6 +1566,10 @@ fn prepare_artifact(
             return false;
         }
         records += 1;
+        // Seal the count under the same dataset identity the record was written
+        // under, so a file that fans out over several datasets stays reconcilable
+        // against each one separately.
+        *records_by_dataset.entry(slug.to_string()).or_default() += 1;
         if dataset
             .semantic_field
             .as_ref()
@@ -1552,6 +1601,7 @@ fn prepare_artifact(
         passages,
         vectors,
         junk: stats.junk,
+        records_by_dataset,
         bytes,
         digest: stream_digest(&path, "axp1")?,
     })
@@ -1766,6 +1816,155 @@ mod tests {
             alias_paths_indexed: false,
             ..Plan::default()
         }
+    }
+
+    /// One file, two tables, two datasets — the ordinary shape of a SQL dump.
+    fn sql_plan_for(inventory: &Inventory) -> Plan {
+        let key = inventory.keys[0].clone();
+        let file = &inventory.files[0];
+        let dataset = |slug: &str| PlanDataset {
+            slug: slug.into(),
+            index: format!("ax-{slug}"),
+            family: "sqldump".into(),
+            group: Some(slug.into()),
+            specs: vec![],
+            time_field: None,
+            semantic_field: None,
+            sampled_records: 2,
+            file_count: 1,
+        };
+        Plan {
+            datasets: vec![dataset("orders"), dataset("users")],
+            files: HashMap::from([(
+                key,
+                FileAssignment {
+                    rel: file.rel.clone(),
+                    path_id: file.rel_id.clone(),
+                    is_symlink: Some(file.is_symlink),
+                    family: "sqldump".into(),
+                    gzip: false,
+                    content_digest: Some(inventory.digests[0].clone()),
+                    assignments: vec![
+                        (Some("orders".into()), "orders".into()),
+                        (Some("users".into()), "users".into()),
+                    ],
+                    as_document: false,
+                },
+            )]),
+            alias_paths_indexed: false,
+            ..Plan::default()
+        }
+    }
+
+    fn two_table_dump() -> &'static str {
+        "CREATE TABLE `users` (`id` int, `name` varchar(64));\n\
+         INSERT INTO `users` VALUES (1,'ann'),(2,'bob');\n\
+         CREATE TABLE `orders` (`id` int, `total` int);\n\
+         INSERT INTO `orders` VALUES (10,100),(11,200);\n"
+    }
+
+    /// #360: the seal has to say which dataset each record went to. A flat
+    /// per-file total is comparable to no single dataset's read-back once the
+    /// file fans out, and the executor reconciled it against every one of them.
+    #[test]
+    fn preparation_seals_records_under_each_dataset_a_file_feeds() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(corpus.path().join("dump.sql"), two_table_dump()).unwrap();
+        let inventory = inventory(corpus.path());
+        let plan = sql_plan_for(&inventory);
+        let snapshot = create_prepared_snapshot(
+            state.path(),
+            "tx-fan-out",
+            &inventory,
+            &plan,
+            "test-preparation-v1",
+            u64::MAX,
+        )
+        .unwrap();
+
+        let prepared = snapshot.files[0].prepared.as_ref().unwrap();
+        assert_eq!(prepared.records, 4);
+        assert_eq!(
+            prepared.records_by_dataset,
+            BTreeMap::from([("orders".to_string(), 2), ("users".to_string(), 2)])
+        );
+
+        let mut groups = groups_from_inventory(&inventory, &plan, &[]).unwrap();
+        bind_prepared_counts(&mut groups, &snapshot, &inventory.keys).unwrap();
+        assert_eq!(groups[0].expected_records, 4);
+        assert_eq!(groups[0].expected_records_for("users"), Some(2));
+        assert_eq!(groups[0].expected_records_for("orders"), Some(2));
+        assert_eq!(groups[0].expected_records_for("absent"), Some(0));
+    }
+
+    /// `snapshot_digest` covers the serialized `PreparedArtifact` and
+    /// `open_snapshot` re-verifies it on every resume, so a snapshot sealed
+    /// before the per-dataset ledger existed has to keep hashing to the value
+    /// it was sealed with. Otherwise this fix turns a bug affecting SQL corpora
+    /// into "protected snapshot digest disagrees" for everyone mid-generation.
+    #[test]
+    fn a_snapshot_sealed_without_the_per_dataset_ledger_still_resumes() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(corpus.path().join("dump.sql"), two_table_dump()).unwrap();
+        let inventory = inventory(corpus.path());
+        let plan = sql_plan_for(&inventory);
+        let snapshot = create_prepared_snapshot(
+            state.path(),
+            "tx-legacy-ledger",
+            &inventory,
+            &plan,
+            "test-preparation-v1",
+            u64::MAX,
+        )
+        .unwrap();
+        assert!(!snapshot.files[0]
+            .prepared
+            .as_ref()
+            .unwrap()
+            .records_by_dataset
+            .is_empty());
+
+        // Rewrite the manifest exactly as a pre-upgrade binary wrote it: no
+        // `records_by_dataset` key anywhere, and a digest computed over that
+        // form. `skip_serializing_if` is what makes the two byte-identical.
+        let manifest = state
+            .path()
+            .join("sync-snapshots/tx-legacy-ledger/manifest.json");
+        let raw = std::fs::read_to_string(&manifest).unwrap();
+        assert!(raw.contains("records_by_dataset"));
+        let mut legacy: SourceSnapshot =
+            serde_json::from_str(&raw.replace("\"records_by_dataset\"", "\"ignored_by_serde\""))
+                .unwrap();
+        assert!(legacy.files[0]
+            .prepared
+            .as_ref()
+            .unwrap()
+            .records_by_dataset
+            .is_empty());
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("records_by_dataset"));
+        legacy.snapshot_digest = snapshot_digest(
+            &legacy.tx_id,
+            &legacy.started,
+            &legacy.preparation_contract_digest,
+            &legacy.footprint,
+            &legacy.files,
+        )
+        .unwrap();
+        std::fs::write(&manifest, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let resumed = open_snapshot(state.path(), "tx-legacy-ledger").unwrap();
+        assert_eq!(resumed, legacy);
+        assert_eq!(resumed.files[0].prepared.as_ref().unwrap().records, 4);
     }
 
     fn execution(tx_id: &str, digest: &str) -> ExecutionIdentity {

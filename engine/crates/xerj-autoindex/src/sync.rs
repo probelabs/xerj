@@ -56,11 +56,43 @@ pub struct ManifestGroup {
     /// Junk is recorded, never fatal (`cli.rs` EXIT CODES).
     #[serde(default)]
     pub expected_junk_records: u64,
+    /// Per-dataset breakdown of `expected_records`, keyed by the same dataset
+    /// identity the records were written under. One content can feed several
+    /// datasets — a SQL dump is one file and N tables, so N datasets — and the
+    /// flat total is then comparable to no single dataset's read-back. Empty
+    /// on a generation sealed before this ledger existed; `expected_records_for`
+    /// decides what such a group can still attribute.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expected_records_by_dataset: BTreeMap<String, u64>,
 }
 
 impl ManifestGroup {
     fn all_paths(&self) -> impl Iterator<Item = &ManifestPath> {
         std::iter::once(&self.canonical).chain(self.aliases.iter())
+    }
+
+    /// Records this group contributed to one dataset, or `None` when the seal
+    /// genuinely cannot say.
+    ///
+    /// A group sealed before `expected_records_by_dataset` existed carries only
+    /// the whole-content total. That total is attributable when the content fed
+    /// a single dataset, and zero is attributable to every dataset; a legacy
+    /// fan-out group that produced records is unattributable and must be
+    /// reported as such rather than guessed at.
+    pub fn expected_records_for(&self, slug: &str) -> Option<u64> {
+        if !self.expected_records_by_dataset.is_empty() {
+            return Some(
+                self.expected_records_by_dataset
+                    .get(slug)
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }
+        if self.expected_records == 0 || self.dataset_slugs == [slug] {
+            Some(self.expected_records)
+        } else {
+            None
+        }
     }
 }
 
@@ -559,6 +591,7 @@ pub struct DesiredContentGroup {
     pub expected_passages: u64,
     pub expected_vectors: u64,
     pub expected_junk_records: u64,
+    pub expected_records_by_dataset: BTreeMap<String, u64>,
 }
 
 /// Content identity is collision-safe and byte-verified by the inventory
@@ -642,6 +675,7 @@ pub fn reconcile_groups(
             expected_passages: candidate.expected_passages,
             expected_vectors: candidate.expected_vectors,
             expected_junk_records: candidate.expected_junk_records,
+            expected_records_by_dataset: candidate.expected_records_by_dataset,
         });
     }
     result.sort_by(|left, right| left.group_id.cmp(&right.group_id));
@@ -813,6 +847,28 @@ fn validate_groups(groups: &[ManifestGroup]) -> Result<()> {
         anyhow::ensure!(
             group.dataset_slugs.windows(2).all(|pair| pair[0] < pair[1]),
             "dataset assignments are not canonical"
+        );
+        // The per-dataset ledger is the identity the records were sealed under,
+        // so it can only name datasets the group actually feeds and must add up
+        // to the group total. Checking it here moves detection of a fan-out
+        // accounting error from catalog-publish time — where it surfaces as an
+        // opaque read-back mismatch that aborts a finished run — to manifest
+        // validation, before anything is published.
+        anyhow::ensure!(
+            group
+                .expected_records_by_dataset
+                .keys()
+                .all(|slug| group.dataset_slugs.contains(slug)),
+            "per-dataset record ledger names a dataset the group does not feed"
+        );
+        anyhow::ensure!(
+            group.expected_records_by_dataset.is_empty()
+                || group
+                    .expected_records_by_dataset
+                    .values()
+                    .try_fold(0u64, |sum, count| sum.checked_add(*count))
+                    == Some(group.expected_records),
+            "per-dataset record ledger disagrees with the group record total"
         );
     }
     anyhow::ensure!(
@@ -1274,6 +1330,7 @@ mod tests {
             expected_passages: 1,
             expected_vectors: 1,
             expected_junk_records: 0,
+            expected_records_by_dataset: BTreeMap::from([("reports".to_string(), 1)]),
         }
     }
 
@@ -1288,6 +1345,7 @@ mod tests {
             expected_passages: 1,
             expected_vectors: 1,
             expected_junk_records: 0,
+            expected_records_by_dataset: BTreeMap::from([("reports".to_string(), 1)]),
         }
     }
 
@@ -1619,6 +1677,67 @@ mod tests {
             groups: vec![group_b, group_a],
         };
         assert_eq!(manifest_digest(&a).unwrap(), manifest_digest(&b).unwrap());
+    }
+
+    /// #360 back-compat: `manifest_digest` covers the serialized groups and
+    /// every committed generation is re-verified against it. A manifest sealed
+    /// before the per-dataset ledger existed must keep hashing to the value it
+    /// was sealed with, which is exactly what `skip_serializing_if` buys.
+    #[test]
+    fn a_manifest_without_the_per_dataset_ledger_keeps_its_sealed_digest() {
+        let mut sealed = group("a", "a", path("61", false));
+        sealed.expected_records_by_dataset = BTreeMap::new();
+        let manifest = GenerationManifest {
+            generation: 0,
+            execution: None,
+            plan: Plan::default(),
+            groups: vec![sealed.clone()],
+        };
+        let encoded = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !encoded.contains("expected_records_by_dataset"),
+            "an empty ledger must serialize to nothing: {encoded}"
+        );
+        let decoded: GenerationManifest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            manifest_digest(&decoded).unwrap(),
+            manifest_digest(&manifest).unwrap()
+        );
+        // Such a group is still attributable while it feeds one dataset, and
+        // honestly unattributable once it fans out.
+        assert_eq!(sealed.expected_records_for("reports"), Some(1));
+        assert_eq!(sealed.expected_records_for("other"), None);
+        sealed.dataset_slugs = vec!["orders".into(), "users".into()];
+        assert_eq!(sealed.expected_records_for("users"), None);
+        sealed.expected_records = 0;
+        assert_eq!(sealed.expected_records_for("users"), Some(0));
+    }
+
+    /// The invariant that makes #360 impossible to reintroduce, checked at
+    /// manifest validation rather than at catalog-publish time.
+    #[test]
+    fn validation_rejects_a_per_dataset_ledger_that_does_not_add_up() {
+        let mut fan_out = group("a", "a", path("61", false));
+        fan_out.dataset_slugs = vec!["orders".into(), "users".into()];
+        fan_out.expected_records = 4;
+        fan_out.expected_records_by_dataset =
+            BTreeMap::from([("orders".to_string(), 2), ("users".to_string(), 2)]);
+        validate_groups(std::slice::from_ref(&fan_out)).unwrap();
+
+        let mut whole_file_total = fan_out.clone();
+        whole_file_total.expected_records_by_dataset =
+            BTreeMap::from([("orders".to_string(), 4), ("users".to_string(), 4)]);
+        let error = validate_groups(&[whole_file_total]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("disagrees with the group record total"),
+            "{error:#}"
+        );
+
+        let mut foreign_dataset = fan_out;
+        foreign_dataset.expected_records_by_dataset =
+            BTreeMap::from([("orders".to_string(), 2), ("invoices".to_string(), 2)]);
+        let error = validate_groups(&[foreign_dataset]).unwrap_err();
+        assert!(format!("{error:#}").contains("does not feed"), "{error:#}");
     }
 
     fn identity(inventory: &str) -> ExecutionIdentity {

@@ -381,6 +381,7 @@ mod tests {
             expected_passages: 0,
             expected_vectors: 0,
             expected_junk_records: 0,
+            expected_records_by_dataset: BTreeMap::from([("reports".to_string(), 2)]),
         }
     }
 

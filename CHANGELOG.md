@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`xerj autoindex` aborted a whole run when one file declared two or more SQL
+  tables** ([#360](https://github.com/xerj-org/xerj/issues/360)). One file can
+  feed several datasets — a SQL dump is one file and N tables — but the sealed
+  record count was a single whole-file total. Finalisation charged that total to
+  *each* of the file's datasets in turn and compared it against that one
+  dataset's read-back, so any multi-table file disagreed with itself by
+  construction and exited `1` with `dataset t1 exact read-back count 2 disagrees
+  with sealed count 4`. The rows were always indexed correctly; only the
+  reconciliation arithmetic was wrong, so `exit=1` discarded a complete corpus.
+  Reported against a real `unum-cloud/usearch` file — `sqlite/README.md`,
+  ordinary prose with three ` ```sql ` blocks in it, which the sniffer routes to
+  the `sqldump` family.
+
+  The sealed ledger is now keyed by the dataset identity each record was written
+  under (`records_by_dataset` on the prepared artifact,
+  `expected_records_by_dataset` on the manifest group), the read-back is scoped
+  by `ax_dataset` as well as `ax_file`, and `validate_groups` rejects a ledger
+  that names a dataset the group does not feed or that does not sum to the group
+  total. Measured against a local node with the fixed binary: the two-table and
+  three-table repros from the issue exit `0`, every table's rows are present
+  (`_count` 2 per table), and each dataset's catalog document reports
+  `record_count: 2` instead of the whole file's total.
+
+  Existing state directories survive the upgrade: both new fields are omitted
+  from serialization when empty, so a snapshot or manifest sealed by an older
+  version re-serializes to the same bytes and keeps its digest. A pre-upgrade
+  group that fanned out has no recoverable split, so it withdraws from that one
+  equality rather than failing it — the state directory left behind by the
+  aborted repro run resumes and commits on the fixed binary.
+
 - **A lexical query on a `semantic_text` field now says so** (#363). `match`,
   `match_phrase`, `multi_match` and `query_string` against a `semantic_text`
   field score with BM25 over the analysed text and never consult the embedding

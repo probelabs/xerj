@@ -5,7 +5,7 @@
 //! the same HTTP client and validation barriers as a real server.
 
 use super::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -371,6 +371,19 @@ fn search_http(path: &str, body: &[u8], state: &Arc<Mutex<HttpState>>) -> Value 
                         .and_then(Value::as_object)
                         .and_then(|term| term.iter().next())
                         .is_none_or(|(field, value)| doc.get(field) == Some(value))
+                        // A per-dataset read-back scopes `terms` on `ax_file`
+                        // and `term` on `ax_dataset` in the same `bool.filter`,
+                        // so an endpoint that honoured only the latter would
+                        // count every file's records into every dataset.
+                        && filter
+                            .get("terms")
+                            .and_then(Value::as_object)
+                            .and_then(|terms| terms.iter().next())
+                            .is_none_or(|(field, values)| {
+                                values.as_array().is_some_and(|values| {
+                                    values.iter().any(|value| doc.get(field) == Some(value))
+                                })
+                            })
                 })
                 && exists.map(|field| doc.get(field).is_some()).unwrap_or(true)
         })
@@ -1298,6 +1311,167 @@ fn a_junk_record_is_counted_into_the_generation_and_never_fatal() {
         .expect("the indexed file has a catalog document");
     assert_eq!(file_doc["junk"], 1);
     assert_eq!(file_doc["records"], 40);
+}
+
+/// #360: one file can feed several datasets — a SQL dump is one file and N
+/// tables — but the generated executor sealed a single flat record total per
+/// *file* and reconciled that whole-file total against *each* dataset's
+/// read-back. Every ordinary multi-table dump therefore aborted at catalog
+/// publication with `exit=1` on a run whose data was already complete.
+#[test]
+fn a_multi_table_dump_reconciles_each_dataset_against_its_own_sealed_count() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("dump.sql"),
+        "CREATE TABLE `users` (`id` int, `name` varchar(64));\n\
+         INSERT INTO `users` VALUES (1,'ann'),(2,'bob');\n\
+         CREATE TABLE `orders` (`id` int, `total` int);\n\
+         INSERT INTO `orders` VALUES (10,100),(11,200);\n",
+    )
+    .unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (code, summary) = run_index_report(config).unwrap();
+    let summary = summary.expect("a two-table dump must commit its generation");
+    assert_eq!(code, 0, "a valid multi-table dump is not a failed run");
+    assert_eq!(summary["generation"], 1);
+    assert_eq!(summary["records_total"], 4);
+    assert_eq!(summary["junk_records_total"], 0);
+    assert_eq!(endpoint.data_docs().len(), 4);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    // Both tables became datasets, and each one's catalog document reports the
+    // records it actually holds — not the whole file's total.
+    let dataset_docs: BTreeMap<String, Value> = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .docs
+        .iter()
+        .filter(|((index, _), doc)| {
+            index == catalog::CATALOG_INDEX
+                && doc.get("doc_kind").and_then(Value::as_str) == Some("dataset")
+        })
+        .map(|((_, id), doc)| (id.clone(), doc.clone()))
+        .collect();
+    assert_eq!(
+        dataset_docs.len(),
+        2,
+        "one dataset per table: {dataset_docs:?}"
+    );
+    for (id, doc) in &dataset_docs {
+        assert_eq!(doc["record_count"], 2, "dataset {id} holds two rows");
+    }
+    // Each table's rows really are in their own index, under their own slug.
+    for doc in endpoint.data_docs() {
+        let slug = doc["ax_dataset"].as_str().unwrap().to_owned();
+        assert!(
+            dataset_docs.contains_key(&format!("ds:{slug}")),
+            "record published under an uncatalogued dataset {slug}"
+        );
+    }
+}
+
+/// The other everyday shape of #360: a real database file. One `.sqlite` is
+/// one content group and one dataset per table, exactly like the dump above.
+#[test]
+fn a_two_table_sqlite_file_commits_its_generation() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let connection = rusqlite::Connection::open(corpus.path().join("shop.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n\
+             INSERT INTO users VALUES (1,'ann'),(2,'bob');\n\
+             CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER);\n\
+             INSERT INTO orders VALUES (10,100),(11,200);",
+        )
+        .unwrap();
+    drop(connection);
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (code, summary) = run_index_report(config).unwrap();
+    let summary = summary.expect("a two-table database must commit its generation");
+    assert_eq!(code, 0);
+    assert_eq!(summary["records_total"], 4);
+    assert_eq!(endpoint.data_docs().len(), 4);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+}
+
+/// The shape #360 was actually reported against, and the one that reaches the
+/// fan-out through the *sniffer* rather than through an extension: ordinary
+/// markdown prose with SQL blocks in it, as in `unum-cloud/usearch`'s
+/// `sqlite/README.md`. `sniff` routes any text containing `CREATE TABLE` and a
+/// `;` to the `sqldump` family, so a README documenting two tables is one
+/// content group feeding two datasets — no dump and no database file involved.
+/// Worth pinning separately: the reporter's corpus contained neither.
+#[test]
+fn a_readme_documenting_two_tables_is_not_a_fatal_condition() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("README.md"),
+        "# vectors\n\nStore them like this:\n\n```sql\n\
+         CREATE TABLE t1 (id INTEGER PRIMARY KEY, v JSON NOT NULL);\n\
+         INSERT INTO t1 (id, v) VALUES (10, '[1.0]'), (11, '[2.0]');\n\
+         CREATE TABLE t2 (id INTEGER PRIMARY KEY, v JSON NOT NULL);\n\
+         INSERT INTO t2 (id, v) VALUES (20, '[1.0]'), (21, '[2.0]');\n\
+         ```\n",
+    )
+    .unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+
+    let (code, summary) = run_index_report(config).unwrap();
+    let summary = summary.expect("a README describing two tables still commits");
+    assert_eq!(code, 0, "a valid README is not a failed run");
+    assert_eq!(summary["records_total"], 4);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+
+    let mut counts: Vec<(String, u64)> = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .docs
+        .iter()
+        .filter(|((index, _), doc)| {
+            index == catalog::CATALOG_INDEX
+                && doc.get("doc_kind").and_then(Value::as_str) == Some("dataset")
+        })
+        .map(|(_, doc)| {
+            (
+                doc["slug"].as_str().unwrap_or_default().to_owned(),
+                doc["record_count"]
+                    .as_u64()
+                    .expect("a dataset catalog document reports its record count"),
+            )
+        })
+        .collect();
+    counts.sort();
+    assert_eq!(
+        counts.len(),
+        2,
+        "one dataset per declared table: {counts:?}"
+    );
+    assert!(
+        counts.iter().all(|(_, records)| *records == 2),
+        "each dataset carries only its own rows: {counts:?}"
+    );
 }
 
 /// Where this branch and #241 meet.
