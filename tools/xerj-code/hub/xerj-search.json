@@ -12,5 +12,8 @@
              "note":"File-level copyleft. XERJ is Apache-2.0, so read the design and write your own code; do not lift MPL files in."}},
   {"repo":"elasticsearch","url":"https://github.com/elastic/elasticsearch","licence":"AGPL","sha":"ac375eb50ac52fb9438b26bca7cfe9ecd93e60ad","files":46387,"bytes":586728834,
    "review":{"spdx":"AGPL-3.0-only OR SSPL-1.0 OR Elastic-2.0","use":"approach-only","by":"xerj-org","at":"2026-08-12",
-             "note":"Triple-licensed; the detector reports only the first (most restrictive) match. Never copy ES code into XERJ — beyond the licence, XERJ's public position is that it shares no code and no architecture with Elasticsearch."}}
+             "note":"Triple-licensed; the detector reports only the first (most restrictive) match. Never copy ES code into XERJ — beyond the licence, XERJ's public position is that it shares no code and no architecture with Elasticsearch."}},
+  {"repo":"lucene","url":"https://github.com/apache/lucene","licence":"Apache-2.0","sha":"9cda46563a4bb30f26fd120ab9bc1397106bf945","files":7557,"bytes":197804184,
+   "review":{"spdx":"Apache-2.0","use":"adapt-with-attribution","by":"xerj-org","at":"2026-08-14",
+             "note":"Plain Apache-2.0 — the same licence as XERJ — so unlike elasticsearch in this corpus it is adapt-with-attribution, not approach-only. Lucene is the library elasticsearch is built on, so it is the primary source for postings, codecs, segment merge, BM25 scoring and HNSW; prefer it over the ES entry."}}
 ]}

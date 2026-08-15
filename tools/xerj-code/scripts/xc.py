@@ -448,10 +448,16 @@ def main():
     # Reference coding needs the actual implementation, not a keyword-in-context
     # snippet. A 320-char highlight tells the agent a file is relevant; it does
     # not tell it how the algorithm works.
-    ap.add_argument("--full", type=int, metavar="CHARS",
-                    help="emit up to CHARS of each passage's real source instead of highlights")
+    # Defaulted, not opt-in. This used to be None, which meant the documented
+    # invocation `xc.py <corpus> "<query>"` skipped the symbol path entirely and
+    # fell through to a branch that prints body[:400] — the licence header, on
+    # every Apache/BSD/MIT file in every corpus (issue #368). Retrieving the
+    # definition IS the feature; capping its length is the knob.
+    ap.add_argument("--full", type=int, metavar="CHARS", default=800,
+                    help="cap each passage at CHARS of real source (default 800; "
+                         "0 prints only the file head)")
     ap.add_argument("--no-symbol", action="store_true",
-                    help="with --full, use a raw byte window instead of the matching definition")
+                    help="use a raw byte window instead of the matching definition")
     # Default is BM25, decided on TWO corpora after an earlier default (hybrid)
     # was chosen on one and turned out to be corpus-specific.
     #
@@ -559,15 +565,15 @@ def main():
                           f"chars from offset {start:,}, window centred on the match]")
                 print(window)
         else:
-            frags = []
-            for vals in (h.get("highlight") or {}).values():
-                frags.extend(vals)
-            if frags:
-                for f in frags[:2]:
-                    print("    " + f.replace("\n", "\n    ")[:600])
-            else:
-                body = src.get("body") or ""
-                print("    " + str(body)[:400].replace("\n", "\n    "))
+            # Only reachable via `--full 0`. `highlight` is never requested
+            # (issue #177 — it reorders hits), so this is the file head and is
+            # labelled as such rather than passed off as a matching passage.
+            body = str(src.get("body") or "")
+            head = body[:400]
+            if len(body) > len(head):
+                print(f"    [file head; {len(head):,} of {len(body):,} chars — "
+                      f"pass --full N for the matching definition]")
+            print("    " + head.replace("\n", "\n    "))
         if lic and any(r in lic for r in RESTRICTED):
             print(f"    !! {lic}: adapt the APPROACH, do not copy the code")
 

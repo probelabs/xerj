@@ -472,8 +472,10 @@ fn final_snapshot_count(state_dir: &Path) -> usize {
 
 #[test]
 fn genesis_recovers_after_snapshot_budget_failure_before_sync_begin() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n").unwrap();
@@ -498,8 +500,10 @@ fn genesis_recovers_after_snapshot_budget_failure_before_sync_begin() {
 
 #[test]
 fn no_semantic_generation_does_not_require_embedding_identity_endpoint() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n").unwrap();
@@ -518,8 +522,10 @@ fn no_semantic_generation_does_not_require_embedding_identity_endpoint() {
 
 #[test]
 fn initial_generation_and_noop_are_end_to_end_idempotent() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n2,beta\n").unwrap();
@@ -561,8 +567,10 @@ fn initial_generation_and_noop_are_end_to_end_idempotent() {
 
 #[test]
 fn add_change_delete_and_rename_converge_over_real_http() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n").unwrap();
@@ -599,8 +607,10 @@ fn add_change_delete_and_rename_converge_over_real_http() {
 
 #[test]
 fn pending_generation_replays_sealed_source_after_live_source_mutates() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let source = corpus.path().join("a.csv");
@@ -636,8 +646,10 @@ fn pending_generation_replays_sealed_source_after_live_source_mutates() {
 /// duplicate or stale document surviving the half-applied attempt.
 #[test]
 fn partially_applied_data_bulk_leaves_the_generation_pending_and_the_retry_converges() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let source = corpus.path().join("rows.csv");
@@ -693,8 +705,10 @@ fn partially_applied_data_bulk_leaves_the_generation_pending_and_the_retry_conve
 
 #[test]
 fn pending_semantic_identity_drift_rejects_before_any_further_bulk() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let source = corpus.path().join("report.txt");
@@ -744,8 +758,10 @@ fn pending_semantic_identity_drift_rejects_before_any_further_bulk() {
 /// committed manifest and every sealed source the next run needs.
 #[test]
 fn fresh_cannot_destroy_a_committed_generation() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n").unwrap();
@@ -810,8 +826,10 @@ fn fresh_cannot_destroy_a_committed_generation() {
 /// different prefix before the run reaches anything else.
 #[test]
 fn the_isolated_rebuild_the_refusals_recommend_is_followable() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let committed_state = tempfile::tempdir().unwrap();
     let rebuild_state = tempfile::tempdir().unwrap();
@@ -852,8 +870,10 @@ fn the_isolated_rebuild_the_refusals_recommend_is_followable() {
 /// holds the only record of the pending transaction and its sealed source.
 #[test]
 fn fresh_cannot_destroy_a_pending_generation() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let source = corpus.path().join("a.csv");
@@ -916,8 +936,10 @@ fn fresh_cannot_destroy_a_pending_generation() {
 /// process, so this is reachable without any concurrency.
 #[test]
 fn same_second_runs_in_one_process_do_not_share_a_generation_identity() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let first_state = tempfile::tempdir().unwrap();
     let second_state = tempfile::tempdir().unwrap();
@@ -967,8 +989,10 @@ fn same_second_runs_in_one_process_do_not_share_a_generation_identity() {
 /// barrier is what turns such a leftover into a hard, unrecoverable failure.
 #[test]
 fn upsert_clears_a_survivor_under_the_desired_content_identity() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let source = corpus.path().join("a.csv");
@@ -1032,8 +1056,10 @@ fn upsert_clears_a_survivor_under_the_desired_content_identity() {
 /// directory the flag was accepted, ignored, and the destination mutated.
 #[test]
 fn dry_run_on_a_generated_state_directory_publishes_nothing() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n").unwrap();
@@ -1097,8 +1123,10 @@ fn dry_run_on_a_generated_state_directory_publishes_nothing() {
 /// folder containing one unreadable, empty or unrecognised file.
 #[test]
 fn a_junk_file_is_recorded_and_never_fatal() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n2,beta\n").unwrap();
@@ -1145,8 +1173,10 @@ fn a_junk_file_is_recorded_and_never_fatal() {
 
 #[test]
 fn issue_283_inferred_float_manifest_digest_replays_on_unchanged_rerun() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     // 2,209 bytes / 9 records produces the exact inferred f64 which used to
@@ -1171,8 +1201,10 @@ fn issue_283_inferred_float_manifest_digest_replays_on_unchanged_rerun() {
 
 #[test]
 fn issue_283_junk_bearing_generation_reconciles_a_shrinking_file_set() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     // Preserve the inferred f64 from the original failure while exercising the
@@ -1216,8 +1248,10 @@ fn issue_283_junk_bearing_generation_reconciles_a_shrinking_file_set() {
 /// "3 completed-with-junk (junk recorded, never fatal)".
 #[test]
 fn a_junk_record_is_counted_into_the_generation_and_never_fatal() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let mut log = String::from("!!! rotated by logrotate, not a log line\n");
@@ -1286,9 +1320,13 @@ fn a_junk_record_is_counted_into_the_generation_and_never_fatal() {
 /// counters that a wholly-junked corpus could not fake.
 #[test]
 fn code_files_index_with_ast_fields_and_the_run_reports_code_coverage() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -1374,9 +1412,13 @@ fn code_files_index_with_ast_fields_and_the_run_reports_code_coverage() {
 
 #[test]
 fn a_generated_run_narrates_its_scan_and_closes_its_own_stream() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
-    let _sink_guard = crate::progress::SINK_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     for n in 0..4 {
@@ -1458,8 +1500,10 @@ fn a_generated_run_narrates_its_scan_and_closes_its_own_stream() {
 /// set on the junk-bearing generation reconciles.
 #[test]
 fn two_byte_identical_junk_files_commit_reconcile_and_survive_a_shrink() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     fs::write(corpus.path().join("a.csv"), "id,value\n1,alpha\n2,beta\n").unwrap();
@@ -1511,8 +1555,10 @@ fn two_byte_identical_junk_files_commit_reconcile_and_survive_a_shrink() {
 /// keep the invariant attached as the cause.
 #[test]
 fn a_journal_that_fails_its_own_revalidation_names_the_rebuild_route() {
-    let _guard = HTTP_E2E_LOCK.lock().unwrap();
-    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK.lock().unwrap();
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let corpus = tempfile::tempdir().unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let source = corpus.path().join("rows.csv");

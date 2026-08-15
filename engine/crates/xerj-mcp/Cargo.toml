@@ -30,3 +30,6 @@ reqwest = { workspace = true }
 # engine already accepts.
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+# The feedback invitation, shared with every other --help surface so the five
+# cannot drift apart.
+xerj-common = { path = "../xerj-common" }
