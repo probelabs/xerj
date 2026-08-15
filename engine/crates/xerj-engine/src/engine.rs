@@ -2749,37 +2749,43 @@ impl Engine {
             }};
         }
 
-        // Issue #204: the persisted refusal marker reaches disk BEFORE the
-        // definition, and that order is load-bearing.
+        // Issue #204: order the two files so the crash window fails CLOSED.
         //
-        //   marker without its definition — the PREVIOUS definition replays at
-        //     definition strictness. It compiled once, so it compiles again,
-        //     and the boot self-heal clears the marker. Loud at worst.
-        //   definition without its marker — the boot replay softens a refusal
-        //     the operator has already been given, and the pipeline silently
-        //     starts running with the refused option ignored. That is the
-        //     defect this marker exists to close.
+        // Reaching here means the definition compiled, so the only marker
+        // change this function can make is a REMOVAL — `compile_pipeline`
+        // clears the marker on success, and nothing here sets one (a
+        // definition that does not compile returned above without storing
+        // anything; the caller that keeps such a definition readable goes
+        // through `register_unrunnable_pipeline`, which inserts, and therefore
+        // orders the two files the other way round for the same reason).
+        //
+        // A removal must land AFTER the definition:
+        //
+        //   definition without the clear — the marker is stale, so the boot
+        //     replays the NEW definition at definition strictness. It compiled
+        //     here, so it compiles there, and the self-heal clears the marker
+        //     and logs it. Loud at worst, and it repairs itself.
+        //   clear without the definition — the marker is gone while the OLD,
+        //     refused definition is still the one on disk, so the boot replays
+        //     it softly and the pipeline silently starts running with the
+        //     refused option ignored. That is exactly the defect this marker
+        //     exists to close, reached through the rollback path.
+        //
+        // Which is also why clearing is best-effort rather than on the
+        // acknowledge path: a failed clear only ever leaves a pipeline MORE
+        // refused, and the next boot undoes it without an operator.
+        if let Err(e) = self.flush_cluster_state() {
+            rollback!();
+            return Err(e);
+        }
+
         let marker_changed = self
             .definition_time_refusals
             .get(id)
             .map(|r| r.value().clone())
             != previous_marker;
         if marker_changed {
-            if let Err(e) = self.flush_pipeline_refusals() {
-                rollback!();
-                return Err(e);
-            }
-        }
-
-        if let Err(e) = self.flush_cluster_state() {
-            rollback!();
-            // The marker file is now ahead of the definition; put it back in
-            // step. Best effort: the boot self-heal above already covers the
-            // case where it does not.
-            if marker_changed {
-                self.flush_pipeline_refusals_best_effort();
-            }
-            return Err(e);
+            self.flush_pipeline_refusals_best_effort();
         }
 
         info!(name = id, "transform pipeline created");
