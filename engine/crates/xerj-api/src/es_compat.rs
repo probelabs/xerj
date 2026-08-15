@@ -7245,6 +7245,226 @@ fn unknown_value_hint(index: &str, field: &str, value: &str, present: &[String])
     })
 }
 
+/// Full-text clause names that score with BM25 over the analysed text and are
+/// keyed by field name (`{"match": {"<field>": …}}`).
+const LEXICAL_TEXT_CLAUSES: &[&str] = &[
+    "match",
+    "match_phrase",
+    "match_phrase_prefix",
+    "match_bool_prefix",
+];
+
+/// Full-text clause names that carry their own `fields` list instead of being
+/// keyed by field name.
+const LEXICAL_MULTI_FIELD_CLAUSES: &[&str] = &[
+    "multi_match",
+    "combined_fields",
+    "query_string",
+    "simple_query_string",
+];
+
+/// `(field, query text)` for every lexical full-text clause in a query.
+///
+/// Deliberately narrower than [`referenced_query_fields`]: `term`, `prefix`,
+/// `range` and friends are exact-match clauses a caller reaches for on
+/// purpose and which never had a semantic reading to begin with. Only the
+/// clauses someone writes when they mean *"find me documents about this"*
+/// can mislead them about which question was answered.
+fn lexical_text_clauses(q: &Value, out: &mut Vec<(String, String)>) {
+    // `{"f": "text"}` and `{"f": {"query": "text", …}}` are the same clause.
+    fn clause_text(v: &Value) -> String {
+        v.as_str()
+            .or_else(|| v.get("query").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string()
+    }
+    match q {
+        Value::Object(o) => {
+            for (k, v) in o {
+                if LEXICAL_TEXT_CLAUSES.contains(&k.as_str()) {
+                    if let Value::Object(inner) = v {
+                        for (field, spec) in inner {
+                            out.push((field.clone(), clause_text(spec)));
+                        }
+                    }
+                } else if LEXICAL_MULTI_FIELD_CLAUSES.contains(&k.as_str()) {
+                    let text = clause_text(v);
+                    let mut fields: Vec<String> = v
+                        .get("fields")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                // `ctx^2` — the boost is not part of the name.
+                                .map(|f| f.split('^').next().unwrap_or(f).to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(default_field) = v.get("default_field").and_then(Value::as_str) {
+                        fields.push(default_field.to_string());
+                    }
+                    for field in fields {
+                        out.push((field, text.clone()));
+                    }
+                } else {
+                    lexical_text_clauses(v, out);
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|v| lexical_text_clauses(v, out)),
+        _ => {}
+    }
+}
+
+/// Fields the same query already reaches through a vector clause, by whatever
+/// name that clause used — `semantic` names the text field, `knn` names the
+/// companion vector field.
+fn vector_query_fields(q: &Value, out: &mut Vec<String>) {
+    match q {
+        Value::Object(o) => {
+            for (k, v) in o {
+                if matches!(k.as_str(), "semantic" | "knn") {
+                    // `knn` accepts a single spec or an array of them.
+                    let specs: Vec<&Value> = match v {
+                        Value::Array(a) => a.iter().collect(),
+                        single => vec![single],
+                    };
+                    for spec in specs {
+                        if let Some(f) = spec.get("field").and_then(Value::as_str) {
+                            out.push(f.to_string());
+                        }
+                    }
+                }
+                vector_query_fields(v, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|v| vector_query_fields(v, out)),
+        _ => {}
+    }
+}
+
+/// Hint for a lexical full-text query aimed at a `semantic_text` field (#363).
+///
+/// `semantic_text` maps to `FieldType::Text` plus an `EmbeddingConfig`, and the
+/// scoring path never consults the embedding: `match` on such a field is
+/// byte-identical to `match` on a plain `text` field — same ids, same BM25
+/// scores — while the vector it was embedded into is reachable only through
+/// `semantic`. Nothing in the response distinguishes the two, so a caller who
+/// queried the obvious way cannot tell from the outside that they got none of
+/// the semantics. That is not free: on the corpus in the issue the semantic
+/// index cost ~12x the indexing time of the BM25-only one (20.7s vs 1.7s for
+/// 321 documents) and `match` returned exactly the BM25 answer.
+///
+/// The lexical behaviour itself is deliberate and separately tested
+/// (xerj-engine `test_semantic_text_match_survives_flush`, which exists
+/// because BM25 over `semantic_text` used to break at flush), so rewriting
+/// `match` into `semantic` would trade one silent surprise for another. This
+/// follows Lucene's uniform doctrine for "you asked this field for something
+/// it does not do" instead: say so, and name the remedy in the same breath.
+/// Both of these throw rather than answer a neighbouring question, and both
+/// spell out the fix:
+///   * `lucene/core/src/java/org/apache/lucene/index/FloatVectorValues.java:53`
+///   * `lucene/core/src/java/org/apache/lucene/index/DocValues.java:206`
+///     — closes with "Re-index with correct docvalues type."
+///
+/// Lucene throws; this only hints. A `match` on `semantic_text` is a valid,
+/// answerable request whose answer is BM25 — rejecting it would break callers
+/// who want exactly that — so the response stays intact and the diagnosis
+/// rides alongside it.
+fn lexical_on_semantic_text_hint(
+    index: &str,
+    body: &EsSearchBody,
+    schema: &xerj_common::types::Schema,
+) -> Option<Value> {
+    let query = body.query.as_ref()?;
+    // Nearly every index has no `semantic_text` at all; a linear pass over the
+    // field list is strictly cheaper than walking the query JSON, so it goes
+    // first and this whole check costs those indices nothing measurable.
+    if !schema.fields.iter().any(|f| f.embedding.is_some()) {
+        return None;
+    }
+    let mut lexical = Vec::new();
+    lexical_text_clauses(query, &mut lexical);
+    if lexical.is_empty() {
+        return None;
+    }
+    let mut vectorised = Vec::new();
+    vector_query_fields(query, &mut vectorised);
+    // The ES 8.x top-level `knn` block lives outside `query`, and pairing it
+    // with a `match` is the canonical hand-rolled hybrid — the one shape that
+    // most deserves not to be nagged.
+    if let Some(knn) = body.knn.as_ref() {
+        vector_query_fields(&json!({ "knn": knn }), &mut vectorised);
+    }
+
+    let mut flagged: Vec<(String, String)> = Vec::new();
+    for (field, text) in lexical {
+        // Only an exact field name: `ctx.keyword` is a different field with
+        // different semantics, and querying it lexically is the point of it.
+        let Some(embedding) = schema.field(&field).and_then(|f| f.embedding.as_ref()) else {
+            continue;
+        };
+        let companion = embedding
+            .target_field
+            .clone()
+            .unwrap_or_else(|| format!("{field}_vector"));
+        // A caller who already wrote `semantic`/`knn` for this field knows
+        // what the field is. Repeating it is the noise that gets a hint
+        // channel muted, and a hybrid query is a correct use, not a mistake.
+        if vectorised.iter().any(|f| *f == field || *f == companion) {
+            continue;
+        }
+        if flagged.iter().any(|(f, _)| *f == field) {
+            continue;
+        }
+        flagged.push((field, text));
+    }
+    let (first_field, first_text) = flagged.first()?.clone();
+    let names = flagged
+        .iter()
+        .map(|(f, _)| format!("`{f}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plural = flagged.len() > 1;
+    // An empty text means a clause shape we did not recognise well enough to
+    // quote back; a placeholder is honest, a wrong quote is not.
+    let suggested_text = if first_text.is_empty() {
+        "<your text>".to_string()
+    } else {
+        first_text
+    };
+
+    Some(json!({
+        "hints": [{
+            "code": "lexical_on_semantic_text",
+            "reason": format!(
+                "{names} {} `semantic_text`, but this query scored {} with BM25 over the \
+                 analysed text — the embedding written at ingest was NOT consulted, so these \
+                 hits are lexical and a paraphrase sharing no words with the target will not \
+                 find it. For meaning-based recall run the `semantic` query on `{first_field}`; \
+                 to keep both signals, combine them with `hybrid`.",
+                if plural { "are" } else { "is" },
+                if plural { "them" } else { "it" },
+            ),
+            "try": {
+                "request": format!("POST /{index}/_search"),
+                // Query only. The other hints in this module also project
+                // `_source`, but they are answering "your response is too
+                // big"; this one is answering "you ran the wrong query", and
+                // a projection to fields that may not exist in this index
+                // would be a second, unasked-for suggestion riding along.
+                "body": {
+                    "query": {"semantic": {
+                        "field": first_field,
+                        "query": suggested_text,
+                        "k": 10,
+                    }},
+                },
+            },
+        }],
+    }))
+}
+
 /// Hint attached to an oversized `GET /{index}/_doc/{id}` response.
 ///
 /// A document fetch cannot be narrowed the way a search can, so the recovery is
@@ -7659,6 +7879,379 @@ mod search_response_hint_tests {
             .expect("hints array present");
         assert_eq!(hints[0]["candidates"], json!([]));
         assert!(hints[0]["reason"].as_str().unwrap().contains("ax-*"));
+    }
+}
+
+#[cfg(test)]
+mod semantic_text_lexical_hint_tests {
+    //! #363 — `match` on a `semantic_text` field runs BM25 and answers a
+    //! different question than the caller thinks they asked. The lexical
+    //! behaviour itself is deliberate and separately tested (xerj-engine
+    //! `test_semantic_text_match_survives_flush`), so the remedy is to say
+    //! so out loud, not to rewrite `match` into `semantic` underneath the
+    //! caller. `control_index_*` is the reproduction: the same documents,
+    //! the same query, one index declaring `ctx` as `semantic_text` and one
+    //! as plain `text`, asserted to return the same ids AND the same scores.
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    async fn request_json(
+        state: &AppState,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = crate::router::build_es_compat_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "{method} {path} returned non-JSON ({error}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, json)
+    }
+
+    /// Three documents about graph pruning, indexed into `index` with `ctx`
+    /// declared as `ctx_type`. Everything except that one mapping entry is
+    /// identical between calls, which is what makes the control comparison
+    /// below a control.
+    const DOCS: [&str; 3] = [
+        "the hnsw graph builder prunes redundant neighbour edges",
+        "the segment merger rewrites postings and term dictionaries",
+        "a graph left unpruned becomes densely clustered near the entry node",
+    ];
+
+    async fn build_index(state: &AppState, index: &str, ctx_type: Value) {
+        let (status, body) = request_json(
+            state,
+            "PUT",
+            &format!("/{index}"),
+            json!({"mappings": {"properties": {
+                "ctx": ctx_type,
+                "title": {"type": "text"},
+            }}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for (id, text) in DOCS.iter().enumerate() {
+            let (status, body) = request_json(
+                state,
+                "PUT",
+                &format!("/{index}/_doc/{id}"),
+                json!({"ctx": text, "title": format!("doc {id}")}),
+            )
+            .await;
+            assert!(status.is_success(), "{body}");
+        }
+        state
+            .engine
+            .get_index(index)
+            .expect("index")
+            .refresh()
+            .await
+            .expect("refresh");
+    }
+
+    fn hint_codes(json: &Value) -> Vec<String> {
+        json["_xerj"]["hints"]
+            .as_array()
+            .map(|hints| {
+                hints
+                    .iter()
+                    .filter_map(|h| h["code"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn semantic_hint(json: &Value) -> Option<&Value> {
+        json["_xerj"]["hints"]
+            .as_array()?
+            .iter()
+            .find(|h| h["code"] == json!("lexical_on_semantic_text"))
+    }
+
+    /// THE REPRODUCTION. `match` on `semantic_text` is not merely "also
+    /// lexical" — it is indistinguishable from `match` on a field that has
+    /// no embedding at all, down to the score. Nothing about the response
+    /// tells the caller which of the two questions was answered.
+    #[tokio::test]
+    async fn control_index_proves_match_on_semantic_text_is_plain_bm25() {
+        let state = test_state();
+        build_index(
+            &state,
+            "sem-ctl-sem",
+            json!({"type": "semantic_text", "dimensions": 32}),
+        )
+        .await;
+        build_index(&state, "sem-ctl-txt", json!({"type": "text"})).await;
+
+        let query = json!({"query": {"match": {"ctx": "graph edges"}}, "_source": false});
+        let (status, semantic_index) =
+            request_json(&state, "POST", "/sem-ctl-sem/_search", query.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{semantic_index}");
+        let (status, control_index) =
+            request_json(&state, "POST", "/sem-ctl-txt/_search", query).await;
+        assert_eq!(status, StatusCode::OK, "{control_index}");
+
+        let ids = |json: &Value| -> Vec<String> {
+            json["hits"]["hits"]
+                .as_array()
+                .expect("hits")
+                .iter()
+                .map(|h| h["_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let scores = |json: &Value| -> Vec<f64> {
+            json["hits"]["hits"]
+                .as_array()
+                .expect("hits")
+                .iter()
+                .map(|h| h["_score"].as_f64().unwrap())
+                .collect()
+        };
+        assert!(!ids(&semantic_index).is_empty(), "{semantic_index}");
+        assert_eq!(
+            ids(&semantic_index),
+            ids(&control_index),
+            "semantic_text: {semantic_index}\ncontrol: {control_index}"
+        );
+        assert_eq!(
+            scores(&semantic_index),
+            scores(&control_index),
+            "identical BM25 scores prove the embedding is never consulted"
+        );
+    }
+
+    /// The fix: the response now says which question it answered and names
+    /// the query that answers the other one.
+    #[tokio::test]
+    async fn match_on_semantic_text_is_flagged_and_names_the_semantic_query() {
+        let state = test_state();
+        build_index(
+            &state,
+            "sem-hint",
+            json!({"type": "semantic_text", "dimensions": 32}),
+        )
+        .await;
+
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/sem-hint/_search",
+            json!({"query": {"match": {"ctx": "graph edges"}}, "_source": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        // Additive only: the lexical answer itself is unchanged.
+        assert!(
+            !json["hits"]["hits"].as_array().unwrap().is_empty(),
+            "the hint must not change what `match` returns: {json}"
+        );
+
+        let hint = semantic_hint(&json)
+            .unwrap_or_else(|| panic!("expected a lexical_on_semantic_text hint: {json}"));
+        let reason = hint["reason"].as_str().expect("reason string");
+        assert!(reason.contains("ctx"), "must name the field: {reason}");
+        assert!(reason.contains("BM25"), "must name what it ran: {reason}");
+        // NAME THE REMEDY, in a form that can be pasted back.
+        assert_eq!(hint["try"]["body"]["query"]["semantic"]["field"], "ctx");
+        assert_eq!(
+            hint["try"]["body"]["query"]["semantic"]["query"], "graph edges",
+            "the suggested body must carry the caller's own text: {hint}"
+        );
+
+        // A remedy that does not run is worse than no remedy: paste the
+        // hint's own body straight back and require a real answer from it.
+        let (status, remedy) = request_json(
+            &state,
+            "POST",
+            "/sem-hint/_search",
+            hint["try"]["body"].clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{remedy}");
+        assert!(
+            !remedy["hits"]["hits"].as_array().unwrap().is_empty(),
+            "the suggested `semantic` body must actually return hits: {remedy}"
+        );
+    }
+
+    /// The same trap through `multi_match` — the shape the issue flagged as
+    /// untested and expected to behave identically.
+    #[tokio::test]
+    async fn multi_match_naming_a_semantic_text_field_is_flagged() {
+        let state = test_state();
+        build_index(
+            &state,
+            "sem-mm",
+            json!({"type": "semantic_text", "dimensions": 32}),
+        )
+        .await;
+
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/sem-mm/_search",
+            json!({"query": {"multi_match": {
+                "query": "graph edges",
+                "fields": ["title", "ctx^2"],
+            }}, "_source": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let hint = semantic_hint(&json)
+            .unwrap_or_else(|| panic!("expected a lexical_on_semantic_text hint: {json}"));
+        assert!(
+            hint["reason"].as_str().unwrap().contains("ctx"),
+            "the boost suffix must not hide the field: {hint}"
+        );
+    }
+
+    /// A plain `text` field is the whole point of `match`. Firing there
+    /// would make the hint noise, and noise is how a hint channel dies.
+    #[tokio::test]
+    async fn match_on_a_plain_text_field_is_not_flagged() {
+        let state = test_state();
+        build_index(&state, "sem-plain", json!({"type": "text"})).await;
+
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/sem-plain/_search",
+            json!({"query": {"match": {"ctx": "graph edges"}}, "_source": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(
+            semantic_hint(&json).is_none(),
+            "no embedding config, nothing to warn about: {json}"
+        );
+    }
+
+    /// A caller who already reached for `semantic` on that field knows the
+    /// field is semantic. Telling them again is the noise case.
+    #[tokio::test]
+    async fn a_query_that_already_uses_semantic_on_the_field_is_not_flagged() {
+        let state = test_state();
+        build_index(
+            &state,
+            "sem-both",
+            json!({"type": "semantic_text", "dimensions": 32}),
+        )
+        .await;
+
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/sem-both/_search",
+            json!({"query": {"bool": {"should": [
+                {"match": {"ctx": "graph edges"}},
+                {"semantic": {"field": "ctx", "query": "graph edges", "k": 3}},
+            ]}}, "_source": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(
+            semantic_hint(&json).is_none(),
+            "caller already knows: {json}"
+        );
+    }
+
+    /// The ES 8.x hand-rolled hybrid — top-level `knn` over the companion
+    /// vector plus a `match` for the lexical half — lives OUTSIDE `query`,
+    /// so a suppression check that only walked `query` would nag the one
+    /// caller who did the most correct thing available to them.
+    #[tokio::test]
+    async fn a_top_level_knn_over_the_companion_vector_suppresses_the_hint() {
+        let state = test_state();
+        build_index(
+            &state,
+            "sem-knn",
+            json!({"type": "semantic_text", "dimensions": 32}),
+        )
+        .await;
+
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/sem-knn/_search",
+            json!({
+                "query": {"match": {"ctx": "graph edges"}},
+                "knn": {"field": "ctx_vector", "query_vector": vec![0.1_f32; 32], "k": 3},
+                "_source": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(
+            semantic_hint(&json).is_none(),
+            "the caller already reached the vector: {json}"
+        );
+    }
+
+    /// The hint rides alongside the existing diagnostics rather than
+    /// displacing one: a query naming a nonexistent field AND a
+    /// semantic_text field must report both.
+    #[tokio::test]
+    async fn the_hint_is_additive_to_the_unknown_field_hint() {
+        let state = test_state();
+        build_index(
+            &state,
+            "sem-multi",
+            json!({"type": "semantic_text", "dimensions": 32}),
+        )
+        .await;
+
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/sem-multi/_search",
+            json!({"query": {"bool": {"should": [
+                {"match": {"ctx": "graph edges"}},
+                {"match": {"nope": "graph edges"}},
+            ]}}, "_source": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let codes = hint_codes(&json);
+        assert!(
+            codes.contains(&"unknown_field".to_string())
+                && codes.contains(&"lexical_on_semantic_text".to_string()),
+            "both diagnostics must survive: {codes:?} / {json}"
+        );
     }
 }
 
@@ -12985,6 +13578,15 @@ async fn search_impl(
                         all_hints.extend(items.iter().cloned());
                     }
                     break;
+                }
+            }
+            // Last of the schema-derived diagnostics, deliberately: it fires
+            // on queries that returned plenty of hits, so running it earlier
+            // would starve the zero-hit checks above of their
+            // `all_hints.is_empty()` window.
+            if let Some(h) = lexical_on_semantic_text_hint(&index, &body, &schema) {
+                if let Some(Value::Array(items)) = h.get("hints") {
+                    all_hints.extend(items.iter().cloned());
                 }
             }
         }
