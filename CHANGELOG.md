@@ -289,6 +289,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the candidate vectors and removes a lock acquisition; both are small against
   the encode/decode/similarity work the scan already does.
 
+- **`_count` no longer reports documents `_search` cannot return**
+  ([#362](https://github.com/xerj-org/xerj/issues/362)). `POST /{index}/_count`
+  is `_search` at `size: 0`, so the two are supposed to answer the same
+  question. On a `text` field they did not. A `text` mapping carries no
+  doc-values, so the term-count shortcut had no column to read and answered
+  from the segment's FTS term dictionary instead — analysed tokens, tokenised
+  and lowercased — while `_search` resolves a `term` on such a field against
+  the whole `_source` value. Two oracles, two questions, wrong in **both**
+  directions on a flushed segment:
+
+  | `term` query on a `text` field | old `_count` | `_search` |
+  |---|---|---|
+  | `{"term":{"title":"testsegmentreader.java"}}` | `1` | 0 hits |
+  | `{"term":{"title":"quick"}}`, value `"the quick brown fox"` | `1` | 0 hits |
+  | `{"term":{"title":"Doc7.java the quick brown fox"}}` — the byte-exact `_source` value | `0` | **1 hit** |
+
+  The shortcut now abandons when a segment has no doc-values column for the
+  field, and the ordinary delete-aware scan — the code that produces the hits —
+  answers. That shortcut is not `_count`-only: its result also authorises the
+  bounded stored scan at `size > 0`, so `hits.total` was affected too. On a
+  200,000-document index, with a `term` on a `text` field matching 10,000
+  documents, `_search` at `size: 10` returned its 10 hits under
+  `"total": {"value": 130}`, and `_count` for the same query answered `0`. Both
+  now answer `10000`.
+
+  **This costs real time, and the bill is not only "the wrong spellings".**
+  Scan cost does not depend on how the term is spelled, so every `term` count on
+  a `text` field with no doc-values now pays a full scan — the byte-exact
+  spelling included. Its cost changes exactly as much as a misspelling's does,
+  and per the table above its *value* changes too, from an undercount to the
+  truth. Measured on this branch in the `ci-test` profile, one segment, 20
+  distinct query values per shape to defeat the request cache (median of 20,
+  same box, same corpus, only `index.rs` swapped):
+
+  | `_count` shape, 200,000 docs | before | after |
+  |---|---|---|
+  | `term` on `text`, no doc-values | 4.2 ms | 356 ms |
+  | same, byte-exact `_source` value | 4.1 ms (and answered `0`) | 356 ms (answers `1`) |
+  | `term` on `keyword`, `doc_values: false` | 21 µs | 45 µs |
+  | `term` on `keyword` with doc-values (control) | 347 µs | 216 µs |
+  | `term` on `long`, `doc_values: false` | 383 ms | 353 ms |
+  | `_search` at `size: 10`, `term` on `text` matching 10,000 docs | 9.4 ms (total `130`) | 225 ms (total `10000`) |
+
+  At 50,000 documents the first row is 2.3 ms → 81 ms. That is roughly 35× at
+  50 k and 85× at 200 k, but the box carried load average 70–85 from unrelated
+  work throughout, so treat the multiple as order-of-magnitude; the number to
+  plan around is the absolute one, about a third of a second per `_count` at
+  200,000 documents.
+
+  The middle rows are there to bound the blast radius, and they are the
+  reassuring ones. A `keyword` field with `doc_values: false` reaches the same
+  abandoned branch, but a `term` on a declared `keyword` field still projects
+  into the FTS tree, so the segment scan's own `term_doc_freq` shortcut answers
+  it: its **route** changed, its cost class did not, and it stays sub-linear
+  rather than becoming a scan. A `long` with `doc_values: false` is unchanged
+  because it was already scanning — a field with no FTS dictionary never reached
+  the removed fallback in the first place. And every count already served from a
+  doc-values column is untouched, which is what the control row shows.
+
+  **One shape's `_search` page changes, not just its total.** With the shortcut
+  gone the stored scan no longer stops after materialising `from + size`; it
+  walks every match and then picks the page. For an *unsorted* `term` on a
+  `text` field with many equally-scoring matches, that changes which documents
+  come back — measured over 2,000 identically-scoring documents at `size: 10`,
+  the ten ids differ before and after (and the total goes from `80` to `2000`).
+  Every score involved is identical, so neither page is more correct than the
+  other, but the change is observable. Queries with an explicit `sort` return
+  byte-identical pages and identical totals before and after.
+
+  **ES compatibility, stated rather than buried.** On the repaired shape this
+  moves `_count` *away* from the Elasticsearch answer while making it
+  self-consistent: ES answers `{"term":{"body":"quick"}}` with `1` against
+  `"the quick brown fox"`, XERJ used to answer `1` as well — but with zero
+  retrievable hits — and now answers `0`, which is what its own `_search`
+  returns. A count no page of hits can reproduce is a coincidence, not
+  compatibility. What `_search` *should* answer for a `term` on an analysed
+  field is the separate, hit-set-moving decision tracked in
+  [#397](https://github.com/xerj-org/xerj/issues/397); closing that is what
+  makes both properties true at once, and is also the only route back to a
+  sub-linear count for this shape.
+
+  Two things this change does **not** do. It does not touch the other half of
+  #362's thread — `case_insensitive` accepted and silently dropped on
+  `prefix`/`wildcard` — so the issue's headline symptom survives:
+  `{"term":{"title":"TestSegmentReader.java"}}` still answers `1` while
+  `{"prefix":{"title":"TestSeg"}}` answers `0`. And it is not the narrower fix
+  the issue thread proposed (dropping the lowercase retry the shortcut did on a
+  dictionary miss); that was tried and measured, and it leaves the first two
+  rows of the first table wrong while additionally making the byte-exact
+  `{"term":{"title":"TestSegmentReader.java"}}` count `0` where `_search`
+  returns `1`.
+
 ## [1.0.0-rc.17] - 2026-08-15
 
 ### Added
