@@ -178,6 +178,257 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     from the moment it is allowlisted. Seed the target with snapshot/restore
     first if it needs the existing documents.
 
+### Performance
+
+- **A field mapped `dense_vector` — and the undeclared `_chunks` companion the
+  passage pipeline writes beside it — no longer gets a full-text term
+  dictionary** ([#328](https://github.com/xerj-org/xerj/issues/328)). Both
+  halves are named in that headline because the companion is where most of the
+  bytes are: of the 39,796,380 B removed below, **26,518,005 B (67%) is
+  `<seg>.emb_chunks.fst`**, and in that corpus `emb_chunks` is not in the
+  mapping at all — it is matched by NAME, not by anyone declaring it
+  `dense_vector`. The field was fed
+  through the lexical indexing path and given an FST + postings that no query
+  path can read: kNN is served by `hnsw/graph.bin`, `exists` from
+  `_source`/doc values, and `_field_caps` and highlighting never open the
+  field's term dictionary. `extract_field_text`'s array arm joined the
+  components with spaces, so a 128-dim vector became one enormous
+  decimal-string term per document.
+
+  Measured on a 5,000-doc × 128-dim corpus (text + keyword + long +
+  `dense_vector` + its `_chunks` companion), after `force_merge(1)`, summing
+  every file in the data directory except the write-ahead log:
+  **54,068,549 B → 14,251,975 B (−73.6%, 3.79×)**. Per file, `<seg>.emb.fst`
+  13,256,659 B → 0, `<seg>.emb.post` 10,834 B → 0, `<seg>.emb.norms` 48 B → 0,
+  `<seg>.emb_chunks.fst` 26,518,005 B → 0, `<seg>.emb_chunks.post` 10,834 B → 0,
+  while the three lexical `.fst` files (`body` 278 B, `cat` 53 B, `n` 209 B) are
+  byte-identical on both sides.
+
+  `.wal` is excluded from that total because its tail is reclaimed
+  asynchronously and it is not reproducible: on the 300-doc fixture the
+  committed regression test uses, runs put the *whole directory* anywhere
+  between 858,147 B and 1,105,001 B while the durable bytes moved by ~500 B. The
+  test prints both and asserts on the durable one. It reports
+  **3,249,323 B → 857,265–857,769 B** for that fixture (before-side measured by
+  reverting `index.rs` and `memtable.rs` to the merge base `ca4d75a` on the same
+  fixture), which is the same −73.6% at 1/17th the corpus. Eight runs of the
+  committed test on this revision printed 857,265 / 857,529 / 857,533 /
+  857,545 / 857,549 / 857,657 / 857,657 / 857,769 B, a 504 B spread; the ceiling
+  it asserts is 1,500,000 B, three orders of magnitude clear of that jitter and
+  still 1.7 MB below the before-side.
+
+  A `dense_vector` nested under an object mapping is covered too — its
+  components were landing in the *parent's* term dictionary, because the segment
+  builder flattens the whole object into one text field. On the nested fixture
+  `<seg>.passages.fst` goes 398,558 B → 45 B, for both mapping shapes that reach
+  `FieldType::Vector` (a dotted top-level `passages.vec`, and a `vec`
+  sub-mapping under a `passages` object).
+
+  The exclusion covers the whole family a vector field generates, not just the
+  base name: `<field>_chunks` (the per-document multi-vector) and
+  `__xerj_passage_meta__<field>` are excluded on the same walk that decides
+  which fields get an HNSW graph. The companion is the bigger half —
+  26,518,005 B against `emb.fst`'s 13,256,659 B, 49% of the whole pre-change
+  index — so a base-name-only exclusion would leave more behind than it removes.
+
+  **Two rules, and they do not have the same strength.** The base field is
+  excluded BY DECLARED TYPE (`dense_vector`, unconditionally). The two
+  companions are excluded BY NAME, because they arrive in `_source` with no
+  mapping entry behind them, so there is no declared type to read — and a
+  name-based rule YIELDS to any declaration it finds. **If you have mapped your
+  own field called `<vector>_chunks` or `__xerj_passage_meta__<vector>` as
+  anything at all other than `dense_vector` — `text`, `keyword`, `long`,
+  `integer`, `short`, `byte`, `unsigned_long`, `double`, `float`, `half_float`,
+  `scaled_float`, `date`, `date_nanos`, `boolean`, `ip`, `geo_point`, `binary`,
+  `object`, `nested`, or a type string XERJ does not recognise — nothing about
+  it changes**: it keeps its term dictionary, every query naming it keeps
+  answering exactly what it answered before, and only the `dense_vector` beside
+  it loses its postings. The same holds for a field of that name XERJ mapped for
+  you dynamically, whatever type it inferred, as long as the value is not itself
+  a multi-vector. Measured on
+  `{text body, keyword emb_chunks, dense_vector emb}`, 50 docs, half `tenant-a`
+  (before → after): `term {emb_chunks:"tenant-a"}` 25 → 25,
+  `terms` 25 → 25, `bool{filter:[term emb_chunks]}` 25 → 25,
+  `bool{must:[match body],filter:[term …]}` 25 → 25,
+  `constant_score{filter:term}` 25 → 25,
+  `bool{must_not:[term emb_chunks]}` 25 → 25, `<seg>.emb_chunks.fst`
+  54 B → 54 B, `<seg>.emb.fst` 16,713 B → 0. Same with a `text` mapping:
+  `match` / `match_phrase` / `multi_match` / `simple_query_string` / `prefix`
+  all 25 → 25 and `<seg>.emb_chunks.fst` 71 B → 71 B. A `long` mapping keeps a
+  44 B `.fst` and a `double` mapping a 48 B one, both 25 → 25 on `term`,
+  `terms`, `range`, `bool{filter}` and `bool{must_not}`. A field of that name
+  XERJ mapped for you *dynamically* is exempt on the same rule — measured
+  25 → 25 for a `text` one (54 B `.fst`) and 25 → 25 for a `long` one
+  (44 B `.fst`).
+
+  **What makes "yields to any declaration" affordable** is that the companion
+  is stopped from ever acquiring one. `<vector>_chunks` is user-supplied
+  `_source` — an array of float arrays — so dynamic mapping used to register it
+  like any other unmapped key and infer `double` from it, producing a mapping
+  entry indistinguishable from one you wrote. Dynamic mapping now declines to
+  register a `<vector>_chunks` key when a `dense_vector` named `<vector>` is
+  already mapped *and* the value is a rectangular, non-empty array of non-empty
+  all-numeric arrays — the exact multi-vector shape, and nothing else. A scalar,
+  a string, a flat array or a ragged one under that name is your field and is
+  mapped as one. Measured on `{text body, dense_vector emb}` with `emb_chunks`
+  left out of the mapping, 50 docs: an `[[…],[…]]` value gets no mapping entry,
+  `<seg>.emb_chunks.fst` = 0 B and a lexical clause on it answers 0; a `"tenant-a"`
+  value is mapped `text`, keeps a 54 B `.fst` and answers 25; a `7` value is
+  mapped `long`, keeps a 44 B `.fst` and answers 25.
+
+  Both halves were measured on their own, by disabling each in the tree and
+  re-running the committed tests:
+
+  | | `emb_chunks.fst` (300-doc) | durable index | declared `long` sibling |
+  |---|---:|---:|---|
+  | this release | **0 B** | 857,265–857,769 B | 44 B `.fst`, answers 25 |
+  | yield restored to `long`/`double`-excluded | 0 B | 857,445 B | **0 B, answers 0, `must_not` returns 50** |
+  | dynamic-mapping refusal disabled | **1,592,118 B** | **2,451,336 B** | 44 B, answers 25 |
+
+  The middle row is the behaviour rc.16 would have shipped; the bottom row is
+  the 67% of the saving that an unconditional "any declaration wins" gives up.
+  Neither cost is paid here.
+
+  A lexical clause that NAMES a `dense_vector` (or one of its companions) is now
+  lowered to `match_none` at plan time rather than falling through to the
+  stored-doc scan. That is the correctness half of the change, not only the
+  speed half: with the postings removed and no lowering,
+  `{"multi_match":{"fields":["emb"],"query":"0"}}` returns **every document**
+  instead of none, because the scan renders the float array to text and every
+  component contains a `0`. Measured on the corpus above, first call for each
+  shape (`main` → postings-gone-without-lowering → this release):
+
+  | query | `main` | no lowering | this release |
+  |---|---|---|---|
+  | `multi_match {fields:["emb"], query:"0"}` | 0 hits, 0.409 ms | **5,000 hits**, 123.5 ms | 0 hits, 0.012 ms |
+  | `multi_match {fields:["emb_chunks"], query:"0"}` | 0 hits, 2.24 ms | **5,000 hits**, 138.5 ms | 0 hits, 0.014 ms |
+  | `term {emb: "<component>"}` | 0 hits, 89.2 ms | 0 hits, 186.8 ms | 0 hits, 0.061 ms |
+  | `range {emb: {gte:-2, lte:2}}` | 0 hits, 119.8 ms | 0 hits, 134.5 ms | 0 hits, 0.009 ms |
+  | `simple_query_string {fields:["emb"]}` | 0 hits, 0.033 ms | 0 hits, 114.5 ms | 0 hits, 0.015 ms |
+  | `constant_score {filter: term emb}` | 0 hits, 83.0 ms | 0 hits, 110.3 ms | 0 hits, 0.012 ms |
+  | `exists {field: "emb"}` | 5,000 hits, 83.0 ms | 5,000 hits, 108.0 ms | 5,000 hits, 88.5 ms |
+  | `match {body: "liquidity"}` | 5,000 hits, 5.18 ms | 5,000 hits, 5.96 ms | 5,000 hits, 4.95 ms |
+  | `term {cat: "even"}` | 2,500 hits, 2.32 ms | 2,500 hits, 2.87 ms | 2,500 hits, 2.27 ms |
+
+  `exists`, `knn` and `semantic` on the field are untouched, a mixed `fields`
+  list keeps its lexical members, and a `nested` query is deliberately not
+  rewritten (its field names resolve against the element, not the root).
+
+  **Four behaviour changes to know about:**
+
+  - **A `dense_vector` (and its undeclared `_chunks` companion) now has no
+    lexical surface at all: every lexical leaf naming one *outright* answers 0
+    hits.** "Outright" excludes one shape, measured rather than assumed: a
+    `fields` entry that is a PATTERN (`["emb.*"]`) is NOT lowered, because
+    resolving a pattern needs the expansion universe — dynamic fields included —
+    and lowering one that would have expanded onto a real lexical field is the
+    silent-zero failure this release goes out of its way to avoid. So
+    `{"multi_match":{"query":"0","fields":["emb.*"]}}` still answers 300 of 300
+    on the 300-doc fixture, exactly as on `main`: the unprojectable clause falls
+    to the stored-doc scan, which resolves the pattern against the source's
+    field names and matches the rendered decimals. Unchanged in both columns, so
+    not a regression — but not closed either. `["emb"]`, `["emb*"]` and `["*"]`
+    all answer 0. Before this release
+    such a clause fell through to the stored-doc scan, which renders the float
+    array back to decimal text and matches against *that*, so whether a shape
+    answered 0 or answered most of the corpus depended entirely on whether the
+    rendered decimals happened to contain the probe. This is a CLASS of changed
+    answers, not one row. Measured on the 300-doc × 128-dim regression fixture,
+    `main` → this release:
+
+    | query | before | after |
+    |---|---:|---:|
+    | `wildcard {emb: "0*"}` | **300** (every document) | 0 |
+    | `fuzzy {emb: {value:"0", fuzziness:2}}` | **300** (every document) | 0 |
+    | `wildcard {emb_chunks: "0*"}` | **300** (every document) | 0 |
+    | `fuzzy {emb_chunks: {value:"0", fuzziness:2}}` | **300** | 0 |
+    | `prefix {emb: "0"}` | 146 | 0 |
+    | `prefix {emb_chunks: "0"}` | 146 | 0 |
+    | `match_phrase_prefix {emb: "0"}` | 50 | 0 |
+    | `term {emb: <exact component>}` numeric | 1 | 0 |
+    | `terms {emb: [<exact component>]}` numeric | 1 | 0 |
+
+    Shapes whose probe text never appeared in a rendered float (`term` with a
+    string, `match`, `match_phrase`, `regexp`, `range`, `simple_query_string`,
+    `query_string`) answered 0 on both sides. ES rejects these queries on a
+    `dense_vector` outright and Lucene gives a field with no terms an empty
+    scorer, so 0 is the answer this release adopts for all of them. The
+    regression test pins the whole class rather than sampling it.
+  - **A `bool` that mentions a `dense_vector` can change `_score` and
+    `max_score` without changing its hit count.** Dropping the dead clause makes
+    the surviving bool projectable onto the inverted index, so BM25 scores it
+    where the stored-doc scan used to. Measured on the same fixture:
+
+    | query | hits | `_score` | `max_score` |
+    |---|---|---|---|
+    | `bool{should:[term emb, term cat:"even"]}` | 150 → 150 | 0.008402659 → 0.6931471 | 1.6931472 → 0.6931471 |
+    | `bool{must:[match body], must_not:[term emb]}` | 300 → 300 | 0.008402659 (unchanged) | 1.6931472 → 0.008402659 |
+
+    Both moves are toward consistency — on `main` these queries reported a
+    `max_score` that **no returned hit carried**, and the first now scores
+    exactly like `{"term":{"cat":"even"}}` on its own, which is what it reduces
+    to. Absolute scores are not part of XERJ's compatibility surface, but
+    anything comparing scores across a version boundary or asserting on
+    `max_score` for a bool that touches a vector field will see this. Plain
+    lexical queries are unaffected; the blast radius is bools with a
+    `dense_vector` clause in them.
+  - **`GET /<index>/_mapping` no longer lists a `<vector>_chunks` field that
+    XERJ mapped for you.** The multi-vector companion beside a declared
+    `dense_vector` used to be registered by dynamic mapping as `double` (an
+    array of float arrays walks to its first scalar). It is not registered at
+    all now, so it disappears from `_mapping` and `_field_caps` — the same
+    treatment `__xerj_passage_meta__<vector>` already had. Nothing that reads
+    `_source` changes; the values are stored and returned exactly as before, and
+    `knn` and `semantic` on the vector itself are untouched. A field of that
+    name that you mapped yourself, or that XERJ mapped from a non-multi-vector
+    value, is unaffected and still listed.
+
+    Aggregating and sorting on that companion still answer `200` — measured on
+    the wire against a live node with `emb` mapped `dense_vector` and
+    `emb_chunks` unregistered: `terms` returns real buckets, `stats` returns
+    `count: 0` byte-identical to the previous release, and `sort` returns sort
+    values. Nothing that worked before returns an error now.
+  - **Existing indices keep their bloat until a merge rewrites them, and an
+    index created by rc.16 or earlier only ever reclaims the base-vector half.**
+    This is a write-side rule. Segments written by an earlier release keep their
+    `.emb.*` / `.emb_chunks.*` files, and the per-segment `fts_has_field` gate
+    reads whichever shape it finds.
+
+    `POST /<index>/_forcemerge?max_num_segments=1` reclaims `.emb.*`. **It does
+    not reclaim the companion.** Measured by building an index on an rc.16
+    server (`emb` mapped `dense_vector` before ingest, 500 docs × 32 dim with
+    `emb_chunks` multi-vectors), then reopening the same data directory with
+    this release and force-merging: `.emb.fst` 262,904 B → 0, but
+    `.emb_chunks.fst` 525,200 B → 525,355 B, and
+    `wildcard {emb_chunks: "0*"}` still answers 501 of 501. The reason is not a
+    bug in the merge: rc.16 persisted `emb_chunks: {"type": "double"}` into the
+    mapping, and the by-name rule correctly yields to a field you (or an earlier
+    release) declared. Since a mapping entry cannot be dropped in place, the
+    remediation for an existing index is to **reindex into a fresh index**. On
+    the corpus this entry headlines that companion is 67% of the saving, so an
+    in-place upgrade recovers roughly a third of the published number.
+
+    The companion rule has an ordering limit of the same kind, and it fails in
+    the safe direction: XERJ can only decline to map a companion it can
+    recognise, and recognising one needs the `dense_vector` to be mapped
+    *before* the documents arrive. Index first and add the mapping afterwards
+    and `<vector>_chunks` already carries a dynamic `double` entry, which the
+    by-name rule then yields to — so that index keeps the companion's term
+    dictionary (measured 9,467 B on a 50-doc × 16-dim fixture) instead of
+    reclaiming it. It costs bytes, not answers.
+
+  *Known limitation, filed as [#382](https://github.com/xerj-org/xerj/issues/382):*
+  refusing a `FieldConfig` for the companion leaves the pre-existing schema-hash
+  throttle asserting the key set is unchanged, so if a later document puts a
+  differently-typed value under `<vector>_chunks` it stays unregistered for up
+  to 100 documents and queries on it answer zero until the throttle expires.
+  Doc-order-dependent and self-healing. The throttle is pre-existing and the fix
+  belongs to it.
+
+  *Not changed:* ES rejects `term`/`match`/`range` on a `dense_vector` outright,
+  where XERJ answers `200`. This release removes bytes and adopts Lucene's
+  zero-hit answer; it does not add the rejection.
+
 ### Fixed
 
 - **Unity assets were sampled through a 4 MiB cap, silently junking whole
