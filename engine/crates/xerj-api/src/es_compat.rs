@@ -24198,6 +24198,31 @@ async fn sync_display_blocks(state: &AppState, name: &str) {
         .insert(name.to_string(), display);
 }
 
+/// Does this settings object reach into the `analysis` namespace, in ANY of the
+/// spellings Elasticsearch clients send?
+///
+/// Nested (`{"analysis": {..}}`, `{"index": {"analysis": {..}}}`), fully dotted
+/// (`{"index.analysis.analyzer.x.type": "custom"}`) and half-dotted
+/// (`{"index": {"analysis.analyzer.x.type": "custom"}}`) are the same request;
+/// this handler already accepts all three for other settings, so a gate that
+/// tests only the nested one is not a gate (issue #204).
+fn declares_analysis(settings: &Value) -> bool {
+    let Some(obj) = settings.as_object() else {
+        return false;
+    };
+    obj.keys().any(|k| {
+        let k = k.strip_prefix("index.").unwrap_or(k);
+        k == "analysis" || k.starts_with("analysis.")
+    }) || settings.pointer("/index/analysis").is_some()
+        || settings
+            .get("index")
+            .and_then(Value::as_object)
+            .is_some_and(|ix| {
+                ix.keys()
+                    .any(|k| k == "analysis" || k.starts_with("analysis."))
+            })
+}
+
 pub async fn put_settings(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -24222,7 +24247,14 @@ pub async fn put_settings(
     // Refuse it. Elasticsearch also refuses analysis updates on an open index
     // (they are non-dynamic settings), so this narrows behaviour towards ES
     // rather than away from it (issue #204).
-    if inner.pointer("/analysis").is_some() || body.pointer("/analysis").is_some() {
+    //
+    // The gate has to cover every spelling this handler ACCEPTS, not just the
+    // nested one. ES clients routinely send flat dotted keys
+    // (`{"index.analysis.analyzer.x.type": "custom"}`), this handler merges
+    // them into `index_settings` verbatim, and `GET /{index}/_settings` then
+    // echoes an analyzer that analyses nothing — the same silent lie the
+    // nested spelling was closed against, one string away.
+    if declares_analysis(&body) || declares_analysis(&inner) {
         let e = xerj_common::XerjError::config(format!(
             "index [{index}]: `analysis` settings cannot be updated after the index is \
              created — the analyzer registry is built at index creation and this request \
@@ -24384,6 +24416,127 @@ fn pipeline_empty_result_error(pipeline: &str) -> ApiError {
     )))
 }
 
+/// ES processor name → xerj stage type, for the processors whose names differ.
+///
+/// Paired with [`es_proc_name`], which MUST stay its inverse: `_simulate` walks
+/// a STORED pipeline, and after this sweep made ES `rename` compile, stored
+/// pipelines are in xerj's `stages` shape rather than the raw ES body. Renaming
+/// them back is what keeps `processor_type` reading `rename` and not
+/// `field_rename` in the simulate response (the ES-compat YAML conformance case
+/// "Test verbose simulate with error in pipeline").
+fn map_proc_name(es_name: &str) -> String {
+    match es_name {
+        "remove" => "drop_field".to_string(),
+        "rename" => "field_rename".to_string(),
+        "date" => "timestamp_parse".to_string(),
+        "json" => "json_parse".to_string(),
+        "convert" => "convert".to_string(),
+        // `append` used to be folded into `set` here, which REPLACES the
+        // field instead of extending it — a different document, under a
+        // 200, and in disagreement with the `_simulate` interpreter below,
+        // which has always implemented a real append (issue #204). There is
+        // now an `append` stage; the two agree.
+        "set" => "set".to_string(),
+        "copy" => "copy_field".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Inverse of [`map_proc_name`]: xerj stage type → ES processor name.
+fn es_proc_name(xerj_type: &str) -> &str {
+    match xerj_type {
+        "drop_field" => "remove",
+        "field_rename" => "rename",
+        "timestamp_parse" => "date",
+        "json_parse" => "json",
+        "copy_field" => "copy",
+        other => other,
+    }
+}
+
+/// Render one stored xerj stage back into the Elasticsearch processor shape
+/// `_simulate` interprets.
+///
+/// The inverse of the name mapping AND of the config adaptation in
+/// [`put_ingest_pipeline`]: `drop_field`'s `{"fields": [..]}` becomes
+/// `remove`'s `{"field": ..}`, and `field_rename`'s `{"mappings": {a: b}}`
+/// becomes one `rename` per entry (ES's `rename` is 1:1). Everything else on
+/// the stage config — `tag`, `description`, `if`, `on_failure` — is carried
+/// through untouched, because `_simulate`'s interpreter reads those to build
+/// its per-processor result entries.
+///
+/// Returns a list because one `field_rename` stage can hold several mappings.
+fn stage_to_es_processors(stage: &Value) -> Vec<Value> {
+    let Some(obj) = stage.as_object() else {
+        return Vec::new();
+    };
+    let Some(ty) = obj.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let cfg = obj
+        .get("config")
+        .cloned()
+        .unwrap_or(Value::Object(serde_json::Map::new()));
+    let es_name = es_proc_name(ty);
+
+    let wrap = |c: Value| {
+        let mut m = serde_json::Map::new();
+        m.insert(es_name.to_string(), c);
+        Value::Object(m)
+    };
+
+    match ty {
+        "drop_field" => {
+            let mut c = cfg.clone();
+            let fields = cfg.get("fields").and_then(Value::as_array).cloned();
+            if let Some(map) = c.as_object_mut() {
+                map.remove("fields");
+                match fields {
+                    // ES's `remove` accepts a single name or an array; emit the
+                    // single-name form for the common one-field case so the
+                    // response reads the way the caller wrote it.
+                    Some(f) if f.len() == 1 => {
+                        map.insert("field".to_string(), f[0].clone());
+                    }
+                    Some(f) => {
+                        map.insert("field".to_string(), Value::Array(f));
+                    }
+                    None => {}
+                }
+            }
+            vec![wrap(c)]
+        }
+        "field_rename" => {
+            let mappings = cfg
+                .get("mappings")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            if mappings.is_empty() {
+                return vec![wrap(cfg)];
+            }
+            mappings
+                .into_iter()
+                .map(|(from, to)| {
+                    let mut c = cfg.clone();
+                    if let Some(map) = c.as_object_mut() {
+                        map.remove("mappings");
+                        map.insert("field".to_string(), Value::String(from));
+                        map.insert("target_field".to_string(), to);
+                    }
+                    wrap(c)
+                })
+                .collect()
+        }
+        _ => vec![wrap(cfg)],
+    }
+}
+
+/// Every stage of a stored pipeline, in ES processor shape.
+fn stages_to_es_processors(stages: &[Value]) -> Vec<Value> {
+    stages.iter().flat_map(stage_to_es_processors).collect()
+}
+
 pub async fn put_ingest_pipeline(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -24400,24 +24553,9 @@ pub async fn put_ingest_pipeline(
     // parsing the caller asked for silently did not happen. Compile first,
     // store only on success, and answer 400 like ES does.
     //
-    // ES → xerj name mapping for processors whose names differ:
-    fn map_proc_name(es_name: &str) -> String {
-        match es_name {
-            "remove" => "drop_field".to_string(),
-            "rename" => "field_rename".to_string(),
-            "date" => "timestamp_parse".to_string(),
-            "json" => "json_parse".to_string(),
-            "convert" => "convert".to_string(),
-            // `append` used to be folded into `set` here, which REPLACES the
-            // field instead of extending it — a different document, under a
-            // 200, and in disagreement with the `_simulate` interpreter below,
-            // which has always implemented a real append (issue #204). There is
-            // now an `append` stage; the two agree.
-            "set" => "set".to_string(),
-            "copy" => "copy_field".to_string(),
-            other => other.to_string(),
-        }
-    }
+    // ES → xerj name mapping lives at module scope (`map_proc_name`), paired
+    // with its inverse `es_proc_name`, so `_simulate` can render a stored
+    // pipeline back in ES vocabulary.
 
     /// Elasticsearch `convert` target types that name exactly the same
     /// conversion as one of xerj's, under a different word.
@@ -24451,17 +24589,40 @@ pub async fn put_ingest_pipeline(
             };
             let xerj_type = map_proc_name(proc_type.as_str());
             // Adapt ES config shapes to xerj config shapes where they differ.
-            let adapted_config = match proc_type.as_str() {
-                "remove" => {
+            //
+            // EVERY branch here starts from `proc_config.clone()` and edits it.
+            // `remove` and `rename` used to build a fresh `json!({..})` holding
+            // only the translated keys, which threw away the processor-level
+            // `if` / `on_failure` / `ignore_failure` / `ignore_missing` BEFORE
+            // `build_plugin` — the exact keys the compile-time gate exists to
+            // refuse. `{"remove": {"field": "secret", "if": "ctx.tenant ==
+            // 'a'"}}` then compiled, was acknowledged, and dropped the field on
+            // EVERY document: "compiled implies honoured" made false inside the
+            // gate meant to guarantee it, and self-inconsistent too — the same
+            // `if` on `set` was refused. Translate by editing, never by
+            // rebuilding.
+            let mut adapted_config = proc_config.clone();
+            let adapted_obj = adapted_config.as_object_mut();
+            match (proc_type.as_str(), adapted_obj) {
+                ("remove", Some(cfg)) => {
                     // ES: {"field": "x"} or {"field": ["x","y"]}
                     // xerj drop_field: {"fields": ["x","y"]}
-                    match proc_config.get("field") {
-                        Some(Value::String(s)) => json!({"fields": [s]}),
-                        Some(Value::Array(a)) => json!({"fields": a}),
-                        _ => proc_config.clone(),
+                    match cfg.remove("field") {
+                        Some(Value::String(s)) => {
+                            cfg.insert("fields".to_string(), json!([s]));
+                        }
+                        Some(Value::Array(a)) => {
+                            cfg.insert("fields".to_string(), Value::Array(a));
+                        }
+                        // Put back whatever it was; the plugin's own
+                        // validation produces the error message.
+                        Some(other) => {
+                            cfg.insert("field".to_string(), other);
+                        }
+                        None => {}
                     }
                 }
-                "rename" => {
+                ("rename", Some(cfg)) => {
                     // ES: {"field": "old", "target_field": "new"}
                     // xerj field_rename: {"mappings": {"old": "new"}}
                     //
@@ -24473,31 +24634,46 @@ pub async fn put_ingest_pipeline(
                     // GET, and renamed nothing at ingest. Issue #204 is what
                     // surfaced it; the translation is fixed here rather than
                     // left as a permanently-unrunnable processor.
-                    match (
-                        proc_config.get("field").and_then(Value::as_str),
-                        proc_config.get("target_field").and_then(Value::as_str),
-                    ) {
-                        (Some(from), Some(to)) => json!({ "mappings": { from: to } }),
-                        // Leave malformed input alone; the plugin's own
-                        // validation produces the error message.
-                        _ => proc_config.clone(),
+                    let from = cfg.get("field").and_then(Value::as_str).map(str::to_string);
+                    let to = cfg
+                        .get("target_field")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let (Some(from), Some(to)) = (from, to) {
+                        cfg.remove("field");
+                        cfg.remove("target_field");
+                        cfg.insert("mappings".to_string(), json!({ from: to }));
                     }
                 }
-                "convert" => {
+                ("convert", Some(cfg)) => {
                     // ES vocabulary → xerj vocabulary for the two targets that
                     // are the same conversion under a different name.
-                    let mut cfg = proc_config.clone();
-                    if let Some(mapped) = proc_config
+                    if let Some(mapped) = cfg
                         .get("type")
                         .and_then(Value::as_str)
                         .and_then(map_convert_type)
                     {
-                        cfg["type"] = json!(mapped);
+                        cfg.insert("type".to_string(), json!(mapped));
                     }
-                    cfg
                 }
-                _ => proc_config.clone(),
-            };
+                ("set", Some(cfg)) => {
+                    // Elasticsearch's `set` processor defaults `override` to
+                    // TRUE (`SetProcessor.java:135` — read for semantics only,
+                    // no code reproduced). xerj's NATIVE `set` stage defaults it
+                    // to false and must keep doing so: native definitions are
+                    // recompiled from `cluster_state.json` at every boot, so
+                    // flipping the stage default would change what an
+                    // already-running cluster's pipelines do to documents on a
+                    // binary upgrade alone. ES parity belongs here, in the
+                    // translation, where it applies to ES processors only and
+                    // is written down explicitly instead of being a default
+                    // two layers away.
+                    if !cfg.contains_key("override") {
+                        cfg.insert("override".to_string(), json!(true));
+                    }
+                }
+                _ => {}
+            }
             stages.push(json!({"type": xerj_type, "config": adapted_config}));
         }
         json!({
@@ -24816,20 +24992,10 @@ fn expand_pipeline_processors(state: &AppState, processors: &[Value]) -> Vec<Val
                     let inner = if let Some(p) = pipe.get("processors").and_then(Value::as_array) {
                         p.clone()
                     } else if let Some(stages) = pipe.get("stages").and_then(Value::as_array) {
-                        stages
-                            .iter()
-                            .filter_map(|st| {
-                                let obj = st.as_object()?;
-                                let ty = obj.get("type").and_then(Value::as_str)?;
-                                let cfg = obj
-                                    .get("config")
-                                    .cloned()
-                                    .unwrap_or(Value::Object(serde_json::Map::new()));
-                                let mut m = serde_json::Map::new();
-                                m.insert(ty.to_string(), cfg);
-                                Some(Value::Object(m))
-                            })
-                            .collect()
+                        // Back into ES vocabulary — `field_rename` is `rename`
+                        // to every caller of `_simulate`. See
+                        // `stages_to_es_processors`.
+                        stages_to_es_processors(stages)
                     } else {
                         Vec::new()
                     };
@@ -25704,24 +25870,18 @@ pub async fn simulate_ingest_pipeline(
     // when it was round-tripped verbatim, OR in xerj internal shape
     // (`stages: [{type: "set", config: {...}}]`) after compilation.
     // Accept either — convert stages back into the ES-processor shape.
+    //
+    // The conversion has to invert BOTH halves of the translation
+    // `put_ingest_pipeline` applied, name and config. Emitting the internal
+    // name here reported `processor_type: "field_rename"` where ES reports
+    // `"rename"` — invisible while every ES `rename` failed to compile (the
+    // raw ES body was stored, so this branch was never taken), and a
+    // conformance failure the moment `rename` started compiling.
     let processors: Vec<Value> = if let Some(p) = stored.get("processors").and_then(Value::as_array)
     {
         p.clone()
     } else if let Some(stages) = stored.get("stages").and_then(Value::as_array) {
-        stages
-            .iter()
-            .filter_map(|st| {
-                let obj = st.as_object()?;
-                let ty = obj.get("type").and_then(Value::as_str)?;
-                let cfg = obj
-                    .get("config")
-                    .cloned()
-                    .unwrap_or(Value::Object(serde_json::Map::new()));
-                let mut m = serde_json::Map::new();
-                m.insert(ty.to_string(), cfg);
-                Some(Value::Object(m))
-            })
-            .collect()
+        stages_to_es_processors(stages)
     } else {
         Vec::new()
     };

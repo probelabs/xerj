@@ -450,6 +450,17 @@ pub struct Engine {
     /// ingested through it: `process_through_pipeline` refuses with the reason
     /// recorded here instead of quietly indexing the untransformed document.
     pub unrunnable_pipelines: Arc<DashMap<String, String>>,
+    /// pipeline_id → configuration the running build cannot honour but that
+    /// was already persisted by an older one.
+    ///
+    /// Issue #204. The pipeline RUNS — exactly as the build that stored it ran
+    /// it — because failing it at boot would turn a working cluster's writes
+    /// from 201 into 400 on a binary upgrade alone. This map is what stops that
+    /// compatibility door from being silent: it is populated only by the boot
+    /// replay ([`Engine::compile_pipeline_with_mode`] with
+    /// [`CompileMode::ReplayPersisted`](xerj_wasm::pipeline::CompileMode)), and
+    /// a re-`PUT` of the same definition answers 400 with the same reason.
+    pub degraded_pipelines: Arc<DashMap<String, String>>,
     /// index_name → open/closed state (true = closed)
     pub closed_indices: Arc<DashMap<String, bool>>,
     /// data stream name → DataStream. Persisted in
@@ -726,6 +737,7 @@ impl Engine {
             scrolls: Arc::new(DashMap::new()),
             pipelines: Arc::new(DashMap::new()),
             unrunnable_pipelines: Arc::new(DashMap::new()),
+            degraded_pipelines: Arc::new(DashMap::new()),
             closed_indices: Arc::new(DashMap::new()),
             data_streams: Arc::new(DashMap::new()),
             ilm_policies: Arc::new(DashMap::new()),
@@ -2154,7 +2166,14 @@ impl Engine {
         let mut pipelines_restored = 0usize;
         for (name, config) in state.pipelines {
             self.pipelines.insert(name.clone(), config.clone());
-            match self.compile_pipeline(&name, config) {
+            // Replay strictness, NOT definition-time strictness: this
+            // definition is already on disk and was accepted by whichever
+            // build wrote it. See `compile_pipeline_with_mode` (issue #204).
+            match self.compile_pipeline_with_mode(
+                &name,
+                config,
+                xerj_wasm::pipeline::CompileMode::ReplayPersisted,
+            ) {
                 Ok(()) => pipelines_restored += 1,
                 Err(e) => {
                     // Issue #204: record WHY there is no executable form, so
@@ -2395,6 +2414,9 @@ impl Engine {
         // (issue #204 — a rolled-back write must not turn "stored but not
         // runnable, and here is why" into a bare "not found").
         let previous_reason = self.unrunnable_pipelines.get(id).map(|r| r.value().clone());
+        // Same for the boot-replay degradation note: a rolled-back write must
+        // leave the previous definition described exactly as it was.
+        let previous_degradation = self.degraded_pipelines.get(id).map(|r| r.value().clone());
 
         // `compile_pipeline` mutates nothing when it fails, so an abort only
         // has to undo the two lines above.
@@ -2409,6 +2431,9 @@ impl Engine {
                 }
                 Some(doc) => {
                     self.pipelines.insert(id.to_string(), doc);
+                    // A definition that does not compile has nothing running,
+                    // so it cannot be running *degraded* either.
+                    self.degraded_pipelines.remove(id);
                     // Issue #204: the kept definition is visible to `GET`, so
                     // ingest through it must refuse WITH the reason rather
                     // than claim the pipeline is missing.
@@ -2437,6 +2462,10 @@ impl Engine {
                 Some(r) => self.unrunnable_pipelines.insert(id.to_string(), r),
                 None => self.unrunnable_pipelines.remove(id).map(|(_, v)| v),
             };
+            match previous_degradation {
+                Some(r) => self.degraded_pipelines.insert(id.to_string(), r),
+                None => self.degraded_pipelines.remove(id).map(|(_, v)| v),
+            };
             return Err(e);
         }
 
@@ -2460,6 +2489,7 @@ impl Engine {
             // "stored but not runnable" reason behind either — the next
             // definition under this id starts from a clean slate.
             self.unrunnable_pipelines.remove(name);
+            self.degraded_pipelines.remove(name);
         }
         Ok(removed)
     }
@@ -3351,9 +3381,48 @@ impl Engine {
         name: &str,
         config_json: Value,
     ) -> std::result::Result<(), xerj_wasm::WasmError> {
+        self.compile_pipeline_with_mode(name, config_json, xerj_wasm::pipeline::CompileMode::Strict)
+    }
+
+    /// [`Self::compile_pipeline`], with the strictness chosen by the caller.
+    ///
+    /// Issue #204. The boot replay passes
+    /// [`CompileMode::ReplayPersisted`](xerj_wasm::pipeline::CompileMode) — a
+    /// definition already in `cluster_state.json` was accepted by whichever
+    /// build wrote it, and there is no caller left to answer 400. Refusing it
+    /// at boot would flip a working cluster's writes from 201 to 400 on a
+    /// binary upgrade alone, with no PUT and no operator action. Whatever the
+    /// replay had to wave through is recorded in `degraded_pipelines` and
+    /// logged at ERROR, so it is loud instead of silent.
+    fn compile_pipeline_with_mode(
+        &self,
+        name: &str,
+        config_json: Value,
+        mode: xerj_wasm::pipeline::CompileMode,
+    ) -> std::result::Result<(), xerj_wasm::WasmError> {
         let cfg: xerj_wasm::pipeline::PipelineConfig =
             serde_json::from_value(config_json.clone()).map_err(xerj_wasm::WasmError::Json)?;
-        let pipeline = xerj_wasm::pipeline::Pipeline::from_config(name, &cfg)?;
+        let pipeline = match mode {
+            xerj_wasm::pipeline::CompileMode::Strict => {
+                xerj_wasm::pipeline::Pipeline::from_config(name, &cfg)?
+            }
+            xerj_wasm::pipeline::CompileMode::ReplayPersisted => {
+                xerj_wasm::pipeline::Pipeline::from_config_replaying_persisted(name, &cfg)?
+            }
+        };
+        if pipeline.degradations.is_empty() {
+            self.degraded_pipelines.remove(name);
+        } else {
+            let summary = pipeline.degradations.join("; ");
+            error!(
+                pipeline = name,
+                degradations = summary.as_str(),
+                "persisted ingest pipeline uses configuration this build cannot honour — it \
+                 is still running exactly as the build that stored it ran it, but it is NOT \
+                 doing what the definition says; re-PUT the definition to see the error"
+            );
+            self.degraded_pipelines.insert(name.to_string(), summary);
+        }
         self.pipelines.insert(name.to_string(), config_json);
         self.transform_pipelines.insert(name.to_string(), pipeline);
         // Issue #204: a successful compile clears any recorded "stored but
@@ -3398,6 +3467,9 @@ impl Engine {
         self.pipelines.insert(name.to_string(), definition);
         self.unrunnable_pipelines
             .insert(name.to_string(), reason.clone());
+        // Nothing is running under this id any more, so nothing is running
+        // degraded either.
+        let previous_degradation = self.degraded_pipelines.remove(name).map(|(_, v)| v);
         if let Err(e) = self.flush_cluster_state() {
             match previous_doc {
                 Some(d) => self.pipelines.insert(name.to_string(), d),
@@ -3409,6 +3481,9 @@ impl Engine {
             };
             if let Some(p) = previous_compiled {
                 self.transform_pipelines.insert(name.to_string(), p);
+            }
+            if let Some(d) = previous_degradation {
+                self.degraded_pipelines.insert(name.to_string(), d);
             }
             return Err(e);
         }

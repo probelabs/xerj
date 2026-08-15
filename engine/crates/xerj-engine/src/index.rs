@@ -14,7 +14,7 @@ use uuid::Uuid;
 use xerj_common::config::Config;
 use xerj_common::schema::ManagedSchema;
 use xerj_common::types::{FieldConfig, FieldType, IndexName, Schema};
-use xerj_fts::analyzer::AnalyzerRegistry;
+use xerj_fts::analyzer::{AnalysisBinding, AnalyzerRegistry};
 use xerj_fts::index::FtsIndexReader;
 use xerj_fts::search::{
     BoolQuery as FtsBool, DisMaxQuery as FtsDisMax, FtsSearcher, Query as FtsQuery,
@@ -5946,6 +5946,9 @@ impl Index {
         }
 
         // Build analyzer registry, applying any custom analysis settings.
+        // A NEW index always gets the canonical binding, and records that it
+        // did — see `analysis_binding_for_open` (issue #204).
+        record_canonical_analysis_binding(&index_dir);
         let registry = Arc::new(build_registry_from_settings(&settings));
 
         info!(name = name.as_str(), "index created");
@@ -6141,8 +6144,19 @@ impl Index {
 
         // Build analyzer registry from persisted settings so WAL replay uses
         // the same custom analyzers (synonyms, ngrams, etc.) that were active
-        // when the documents were originally indexed.
-        let registry = Arc::new(build_registry_from_settings(&settings));
+        // when the documents were originally indexed — INCLUDING which
+        // `analysis` spelling was in force when they were written, which is
+        // not necessarily the one this build resolves at create time
+        // (issue #204; see `analysis_binding_for_open`).
+        let analysis_binding = analysis_binding_for_open(
+            &index_dir,
+            &settings,
+            segment_doc_count > 0 || store.version_map.live_count() > 0,
+        );
+        let registry = Arc::new(build_registry_from_settings_with_binding(
+            &settings,
+            analysis_binding,
+        ));
         let passage_scored_fields_at_open = passage_scored_vector_fields(&schema.schema);
         let mut wal_passage_chunk_fields = HashSet::new();
 
@@ -39115,6 +39129,13 @@ fn combine_scores(query_score: f32, fn_score: f32, boost_mode: BoostMode) -> f32
 /// }
 /// ```
 fn build_registry_from_settings(settings: &Value) -> AnalyzerRegistry {
+    build_registry_from_settings_with_binding(settings, AnalysisBinding::Canonical)
+}
+
+fn build_registry_from_settings_with_binding(
+    settings: &Value,
+    binding: AnalysisBinding,
+) -> AnalyzerRegistry {
     let mut registry = AnalyzerRegistry::default();
 
     // Settings may be stored as the full settings envelope or as the inner
@@ -39122,8 +39143,87 @@ fn build_registry_from_settings(settings: &Value) -> AnalyzerRegistry {
     // as-is so that both shapes work.
     let analysis_root = settings.pointer("/settings").unwrap_or(settings);
 
-    registry.apply_settings(analysis_root);
+    registry.apply_settings_with_binding(analysis_root, binding);
     registry
+}
+
+/// Marker written into an index directory when its analyzer registry was built
+/// with [`AnalysisBinding::Canonical`].
+///
+/// Its ABSENCE is the load-bearing signal: an index directory laid down before
+/// the #204 sweep has no such file, and its postings were produced by a build
+/// that read `settings.analysis` only.
+const ANALYSIS_BINDING_MARKER: &str = "analysis-binding.json";
+
+/// Which `analysis` spellings to honour when REOPENING an existing index.
+///
+/// Issue #204. `analysis_block` learning to resolve the canonical
+/// `settings.index.analysis` is a fix at index-create time and a silent data
+/// bug at index-open time: `settings.json` persists the caller's nesting
+/// verbatim, so an index created before the sweep with the canonical ES shape
+/// was written with `standard` and would, after a binary upgrade alone, reopen
+/// with the declared analyzers live. Query-time analysis then stops matching
+/// the on-disk postings — no error, no log, results that quietly disappear.
+///
+/// The decision is stable for the life of the index:
+///
+/// * marker present → the index was created by a build that honoured the
+///   canonical form; honour it.
+/// * no canonical-only block → the two bindings resolve identically; nothing to
+///   decide, and the marker is written so this stays true.
+/// * canonical-only block, index EMPTY → no postings to disagree with. Adopt
+///   the canonical binding and record it, so adding documents now cannot flip
+///   the answer at the next boot.
+/// * canonical-only block, index has documents → keep the legacy binding, and
+///   say so at ERROR. Reindex is the only correct repair and only the operator
+///   can order it.
+fn analysis_binding_for_open(
+    index_dir: &Path,
+    settings: &Value,
+    has_documents: bool,
+) -> AnalysisBinding {
+    if index_dir.join(ANALYSIS_BINDING_MARKER).exists() {
+        return AnalysisBinding::Canonical;
+    }
+    if !AnalyzerRegistry::declares_namespaced_analysis_only(settings) {
+        record_canonical_analysis_binding(index_dir);
+        return AnalysisBinding::Canonical;
+    }
+    if !has_documents {
+        record_canonical_analysis_binding(index_dir);
+        return AnalysisBinding::Canonical;
+    }
+    tracing::error!(
+        index_dir = %index_dir.display(),
+        "index declares its analyzers under `index.analysis` and was created by a build \
+         that did not read that block — its postings on disk were produced by the \
+         `standard` analyzer. Honouring the declaration now would silently stop queries \
+         matching them, so it is NOT being honoured: this index still analyses as \
+         `standard`. Reindex into a newly-created index to activate the declared analyzers."
+    );
+    AnalysisBinding::LegacyShorthandOnly
+}
+
+/// Record that this index's analyzer registry is built with the canonical
+/// binding, so the decision cannot change under it later.
+///
+/// Best effort: a failure here means the next boot re-derives the same answer
+/// from the same inputs, EXCEPT for the empty-index case, where documents
+/// written in between would flip it. That is worth an ERROR and is not worth
+/// refusing to open the index over.
+fn record_canonical_analysis_binding(index_dir: &Path) {
+    let path = index_dir.join(ANALYSIS_BINDING_MARKER);
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = write_file_atomic(&path, br#"{"binding":"canonical"}"#) {
+        tracing::error!(
+            path = %path.display(), error = %e,
+            "could not record this index's analysis binding — if the index is empty now \
+             and analyzers are declared under `index.analysis`, a later restart may \
+             disagree with how documents written in the meantime were analysed"
+        );
+    }
 }
 
 #[cfg(test)]

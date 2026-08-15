@@ -94,10 +94,57 @@ pub struct Pipeline {
     pub on_error: ErrorPolicy,
     /// Per-document timeout (informational — enforced by the caller).
     pub timeout: Duration,
+    /// Config this build could not honour but accepted anyway because the
+    /// definition was **already persisted** by an older, laxer build.
+    ///
+    /// Always empty for [`Pipeline::from_config`]. Non-empty only via
+    /// [`Pipeline::from_config_replaying_persisted`] — see [`CompileMode`].
+    /// One human-readable line per degraded stage; the caller logs them and
+    /// exposes them so the operator can re-`PUT` the definition.
+    pub degradations: Vec<String>,
+}
+
+/// How strictly [`Pipeline::from_config`] enforces the issue-#204 contract.
+///
+/// The two call sites are not the same situation and must not get the same
+/// answer:
+///
+/// * `Strict` — a caller is on the other end of a `PUT /_ingest/pipeline` and
+///   can still act on a 400. Anything this build cannot honour is refused.
+/// * `ReplayPersisted` — boot replay of a definition that is *already* in
+///   `cluster_state.json`, accepted by whichever build wrote it. There is no
+///   caller to fail: refusing it turns a working cluster's writes from `201`
+///   into `400` on a binary upgrade alone, with no `PUT` and no operator
+///   action. Lucene keys back-compat off the version an index was *created*
+///   with rather than the running one for exactly this reason
+///   (`LiveIndexWriterConfig.getIndexCreatedVersionMajor`,
+///   lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java:290-298;
+///   set by `IndexWriterConfig.setIndexCreatedVersionMajor`,
+///   .../IndexWriterConfig.java:188-220). So replay reproduces the
+///   *previously shipped* behaviour for the checks this sweep newly added, and
+///   records every one of them in [`Pipeline::degradations`] so it is loud
+///   rather than silent.
+///
+/// Checks that predate the sweep (a missing required field, an unknown stage
+/// type) fail in BOTH modes: those definitions did not work before the upgrade
+/// either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileMode {
+    /// Definition time. Refuse anything this build cannot honour.
+    Strict,
+    /// Boot replay of an already-persisted definition. Reproduce the
+    /// pre-sweep behaviour for newly-added checks, and report it.
+    ReplayPersisted,
+}
+
+impl CompileMode {
+    fn is_replay(self) -> bool {
+        matches!(self, Self::ReplayPersisted)
+    }
 }
 
 impl Pipeline {
-    /// Build a [`Pipeline`] from a [`PipelineConfig`].
+    /// Build a [`Pipeline`] from a [`PipelineConfig`] at **definition time**.
     ///
     /// Three outcomes, deliberately distinct (issue #204):
     ///
@@ -111,31 +158,64 @@ impl Pipeline {
     ///   a `grok` `patterns` array). Silently dropping these is what makes a
     ///   compiled pipeline write the wrong document under a `201`.
     pub fn from_config(name: impl Into<String>, config: &PipelineConfig) -> Result<Self> {
+        Self::compile(name, config, CompileMode::Strict)
+    }
+
+    /// Build a [`Pipeline`] from a definition that is **already on disk**.
+    ///
+    /// See [`CompileMode::ReplayPersisted`]. Callers MUST surface
+    /// [`Pipeline::degradations`]; a silent success here would be the same
+    /// defect this sweep exists to remove, only at boot instead of at `PUT`.
+    pub fn from_config_replaying_persisted(
+        name: impl Into<String>,
+        config: &PipelineConfig,
+    ) -> Result<Self> {
+        Self::compile(name, config, CompileMode::ReplayPersisted)
+    }
+
+    fn compile(
+        name: impl Into<String>,
+        config: &PipelineConfig,
+        mode: CompileMode,
+    ) -> Result<Self> {
         let name = name.into();
         let mut stages: Vec<Arc<dyn TransformPlugin>> = Vec::new();
+        let mut degradations: Vec<String> = Vec::new();
 
         for stage_cfg in &config.stages {
-            let plugin =
-                build_plugin(&stage_cfg.stage_type, &stage_cfg.config).map_err(|e| match e {
-                    StageBuildError::Unsupported(stage) => WasmError::UnsupportedStage { stage },
-                    StageBuildError::UnsupportedOption { option, reason } => {
-                        WasmError::UnsupportedOption {
-                            stage: stage_cfg.stage_type.clone(),
-                            option,
-                            reason,
-                        }
-                    }
-                    StageBuildError::Config(reason) => WasmError::InvalidConfig {
-                        plugin: stage_cfg.stage_type.clone(),
+            let mut stage_degradations: Vec<String> = Vec::new();
+            let plugin = build_plugin(
+                &stage_cfg.stage_type,
+                &stage_cfg.config,
+                mode,
+                &mut stage_degradations,
+            )
+            .map_err(|e| match e {
+                StageBuildError::Unsupported(stage) => WasmError::UnsupportedStage { stage },
+                StageBuildError::UnsupportedOption { option, reason } => {
+                    WasmError::UnsupportedOption {
+                        stage: stage_cfg.stage_type.clone(),
+                        option,
                         reason,
-                    },
-                })?;
+                    }
+                }
+                StageBuildError::Config(reason) => WasmError::InvalidConfig {
+                    plugin: stage_cfg.stage_type.clone(),
+                    reason,
+                },
+            })?;
+            degradations.extend(
+                stage_degradations
+                    .into_iter()
+                    .map(|d| format!("stage [{}]: {d}", stage_cfg.stage_type)),
+            );
             stages.push(plugin);
         }
 
         Ok(Self {
             name,
             stages,
+            degradations,
             on_error: config.on_error.clone(),
             timeout: if config.timeout_ms == 0 {
                 Duration::from_secs(30)
@@ -221,11 +301,60 @@ impl From<String> for StageBuildError {
     }
 }
 
-/// Elasticsearch processor-level keys that decide **whether** a processor runs
-/// or **what happens when it fails**, none of which the compiled pipeline can
-/// act on.
+impl StageBuildError {
+    /// One human-readable line, for [`Pipeline::degradations`].
+    pub(crate) fn to_reason(&self) -> String {
+        match self {
+            Self::Unsupported(stage) => format!("stage type [{stage}] is not implemented"),
+            Self::UnsupportedOption { option, reason } => format!("`{option}` — {reason}"),
+            Self::Config(reason) => reason.clone(),
+        }
+    }
+}
+
+/// Read a processor-level boolean whose *written* value decides whether this
+/// build can honour the processor.
 ///
-/// Issue #204, applied to this PR's own new surface. `PUT /_ingest/pipeline`
+/// `honoured` is the one value this build actually implements. Absence returns
+/// `Ok(())` — an omitted key is not configuration, and it is what every
+/// pre-existing definition looks like. A written value that equals `honoured`
+/// also returns `Ok(())`: **spelling the honoured value out is exactly
+/// equivalent to omitting it**, and refusing it is what made
+/// `{"set": {…, "ignore_failure": false}}` — Elasticsearch's own default,
+/// which ES clients emit verbatim — register a pipeline that 400s every write
+/// through it. Anything else is a request this build cannot serve.
+///
+/// This is Lucene's consume-then-complain shape rather than a presence check:
+/// `AbstractAnalysisFactory.getBoolean(args, name, defaultVal)`
+/// (lucene/core/src/java/org/apache/lucene/analysis/AbstractAnalysisFactory.java:213-217)
+/// does `args.remove(name)` and falls back to the default only when the key was
+/// ABSENT; `ArabicStemFilterFactory`
+/// (lucene/analysis/common/src/java/org/apache/lucene/analysis/ar/ArabicStemFilterFactory.java:44-51)
+/// then throws `Unknown parameters` on whatever is LEFT. Presence alone never
+/// decides anything.
+fn honoured_bool(
+    config: &Value,
+    key: &'static str,
+    honoured: bool,
+    reason: &str,
+) -> std::result::Result<(), StageBuildError> {
+    match config.get(key) {
+        None => Ok(()),
+        Some(Value::Bool(b)) if *b == honoured => Ok(()),
+        Some(Value::Bool(_)) => Err(StageBuildError::UnsupportedOption {
+            option: key.to_string(),
+            reason: reason.to_string(),
+        }),
+        Some(other) => Err(StageBuildError::Config(format!(
+            "'{key}' must be a boolean, got {other}"
+        ))),
+    }
+}
+
+/// Processor-level keys that decide **whether** a processor runs or **what
+/// happens when it fails**, none of which the compiled pipeline can act on.
+///
+/// Issue #204, applied to this sweep's own new surface. `PUT /_ingest/pipeline`
 /// now means "compiled ⇒ xerj honours this"; a `{"set": {…, "if": "ctx.foo ==
 /// 'never'"}}` that compiles and then sets the field on every document makes
 /// that promise false, and writes the wrong document under a `201`. The
@@ -234,33 +363,106 @@ impl From<String> for StageBuildError {
 ///
 /// `tag` and `description` are deliberately NOT here: they are identification
 /// metadata that changes no document and no decision on this path.
-const UNHONOURED_PROCESSOR_KEYS: &[(&str, &str)] = &[
-    (
-        "if",
-        "the guard is not evaluated, so the processor would run on documents it excludes",
-    ),
-    (
-        "on_failure",
-        "the recovery processors are not run; the pipeline's `on_error` policy applies instead",
-    ),
-    (
+///
+/// The rule this applies, uniformly: **accept the value this build actually
+/// implements (and absence, which is not configuration); refuse any other
+/// written value.** It is the same rule `append`'s `allow_duplicates` already
+/// used — ES's default there is `true`, which is what `AppendPlugin` does, so
+/// `true`/absent are accepted and `false` is refused.
+fn check_unhonourable_processor_keys(config: &Value) -> std::result::Result<(), StageBuildError> {
+    // `if`: EVERY value changes which documents the processor runs on, and
+    // none of them is evaluated here. Unlike the booleans below there is no
+    // spelling of `if` that means "no guard" — that spelling is omitting it.
+    if config.get("if").is_some() {
+        return Err(StageBuildError::UnsupportedOption {
+            option: "if".to_string(),
+            reason: "the guard is not evaluated, so the processor would run on documents \
+                     it excludes"
+                .to_string(),
+        });
+    }
+    // `on_failure`: an EMPTY recovery chain asks for nothing, which is what
+    // happens. A non-empty one is a chain that would not run.
+    match config.get("on_failure") {
+        None => {}
+        Some(Value::Array(a)) if a.is_empty() => {}
+        Some(_) => {
+            return Err(StageBuildError::UnsupportedOption {
+                option: "on_failure".to_string(),
+                reason: "the recovery processors are not run; the pipeline's `on_error` \
+                         policy applies instead"
+                    .to_string(),
+            })
+        }
+    }
+    // `ignore_failure`: ES's default is `false` and `false` is what this build
+    // does — `ProcessAction` has no error variant, so a stage cannot report a
+    // runtime failure for anything to ignore in the first place. `true` asks
+    // for a decision this build cannot make.
+    honoured_bool(
+        config,
         "ignore_failure",
+        false,
         "a failing processor is not ignored; the pipeline's `on_error` policy applies instead",
-    ),
-];
+    )
+}
+
+/// `ignore_missing`, for the four stages that read one named field
+/// (`drop_field`, `field_rename`, `convert`, `timestamp_parse`).
+///
+/// Every one of those plugins returns `ProcessAction::Pass` when the field is
+/// absent — `DropFieldPlugin::process` (`builtins.rs`) calls `obj.remove` and
+/// moves on; `ConvertTypePlugin::process` returns early on `None`. That is
+/// exactly `ignore_missing: true`, so `true` is honoured to the letter.
+/// `false` asks for the document to be FAILED when the field is absent, and
+/// this build cannot fail a document from inside a stage at all:
+/// [`ProcessAction`] has no error variant.
+///
+/// **Known, documented divergence** (`CHANGELOG.md`, "Known gaps"): when
+/// `ignore_missing` is OMITTED, ES's default is `false` and xerj still does
+/// not fail the document. Absence is not configuration — nothing was written
+/// for this build to break its word on — and refusing it would 400 every ES
+/// `remove`/`rename`/`convert`/`date` processor ever written. Writing `false`
+/// explicitly IS configuration, and is refused.
+fn check_ignore_missing(config: &Value, stage: &str) -> std::result::Result<(), StageBuildError> {
+    honoured_bool(
+        config,
+        "ignore_missing",
+        true,
+        &format!(
+            "xerj's `{stage}` stage passes the document through unchanged when the field is \
+             absent; failing the document on a missing field is not implemented"
+        ),
+    )
+}
 
 /// Instantiate a built-in plugin by name.
+///
+/// `mode` decides what happens to config this build cannot honour; see
+/// [`CompileMode`]. Every check that `ReplayPersisted` waves through pushes one
+/// line onto `degradations` — the pipeline runs exactly as the previous build
+/// ran it, and the caller reports that it is doing so.
 fn build_plugin(
     stage_type: &str,
     config: &Value,
+    mode: CompileMode,
+    degradations: &mut Vec<String>,
 ) -> std::result::Result<Arc<dyn TransformPlugin>, StageBuildError> {
-    for (key, reason) in UNHONOURED_PROCESSOR_KEYS {
-        if config.get(key).is_some() {
-            return Err(StageBuildError::UnsupportedOption {
-                option: (*key).to_string(),
-                reason: (*reason).to_string(),
-            });
-        }
+    // `soften` turns a refusal into a recorded degradation under
+    // `ReplayPersisted`, and leaves it a refusal under `Strict`.
+    macro_rules! soften {
+        ($err:expr, $legacy:expr) => {{
+            let e: StageBuildError = $err;
+            if mode.is_replay() {
+                degradations.push(e.to_reason());
+                $legacy
+            } else {
+                return Err(e);
+            }
+        }};
+    }
+    if let Err(e) = check_unhonourable_processor_keys(config) {
+        soften!(e, ());
     }
     match stage_type {
         "json_parse" => {
@@ -275,7 +477,14 @@ fn build_plugin(
 
         "timestamp_parse" => {
             let field = str_field(config, "field")?;
-            let formats = optional_string_array(config, "formats")?.unwrap_or_default();
+            if let Err(e) = check_ignore_missing(config, "timestamp_parse") {
+                soften!(e, ());
+            }
+            let formats = match optional_string_array(config, "formats") {
+                Ok(v) => v,
+                Err(e) => soften!(e.into(), None),
+            }
+            .unwrap_or_default();
             let target = config
                 .get("target")
                 .and_then(Value::as_str)
@@ -284,6 +493,9 @@ fn build_plugin(
         }
 
         "field_rename" => {
+            if let Err(e) = check_ignore_missing(config, "field_rename") {
+                soften!(e, ());
+            }
             let mappings = config
                 .get("mappings")
                 .and_then(Value::as_object)
@@ -296,6 +508,9 @@ fn build_plugin(
         }
 
         "drop_field" => {
+            if let Err(e) = check_ignore_missing(config, "drop_field") {
+                soften!(e, ());
+            }
             let fields = string_array(config, "fields")?;
             Ok(Arc::new(DropFieldPlugin::new(fields)))
         }
@@ -339,14 +554,17 @@ fn build_plugin(
             // `{"message": "10.0.0.1 GET"}` came back with no `client` field).
             for key in ["patterns", "pattern_definitions"] {
                 if config.get(key).is_some() {
-                    return Err(StageBuildError::UnsupportedOption {
-                        option: key.to_string(),
-                        reason: format!(
-                            "xerj's grok stage takes a named `pattern` from [{}], not \
-                             arbitrary grok expressions",
-                            GROK_PATTERN_NAMES.join(", ")
-                        ),
-                    });
+                    soften!(
+                        StageBuildError::UnsupportedOption {
+                            option: key.to_string(),
+                            reason: format!(
+                                "xerj's grok stage takes a named `pattern` from [{}], not \
+                                 arbitrary grok expressions",
+                                GROK_PATTERN_NAMES.join(", ")
+                            ),
+                        },
+                        ()
+                    );
                 }
             }
             let pattern_name = match config.get("pattern") {
@@ -356,17 +574,21 @@ fn build_plugin(
                     // through to the generic catch-all, which extracts a
                     // single `message` field and nothing else (issue #204).
                     if !GROK_PATTERN_NAMES.contains(&s.as_str()) {
-                        return Err(format!(
-                            "unknown grok pattern '{s}' (known patterns: {})",
-                            GROK_PATTERN_NAMES.join(", ")
-                        )
-                        .into());
+                        soften!(
+                            format!(
+                                "unknown grok pattern '{s}' (known patterns: {})",
+                                GROK_PATTERN_NAMES.join(", ")
+                            )
+                            .into(),
+                            ()
+                        );
                     }
                     s.clone()
                 }
-                Some(other) => {
-                    return Err(format!("'pattern' must be a string, got {other}").into());
-                }
+                Some(other) => soften!(
+                    format!("'pattern' must be a string, got {other}").into(),
+                    "SYSLOG".to_string()
+                ),
             };
             Ok(Arc::new(GrokPlugin::new(field, pattern_name)))
         }
@@ -375,16 +597,23 @@ fn build_plugin(
             // Fail closed on an unknown PII type: it used to contribute no
             // regex, so a typo'd `types` list produced a stage that redacted
             // nothing while reporting success (issue #204).
-            let types = match optional_string_array(config, "types")? {
+            let declared = match optional_string_array(config, "types") {
+                Ok(v) => v,
+                Err(e) => soften!(e.into(), None),
+            };
+            let types = match declared {
                 None => vec!["email".into(), "ip".into(), "credit_card".into()],
                 Some(requested) => {
                     for t in &requested {
                         if !PII_TYPE_NAMES.contains(&t.as_str()) {
-                            return Err(format!(
-                                "unknown pii type '{t}' (known types: {})",
-                                PII_TYPE_NAMES.join(", ")
-                            )
-                            .into());
+                            soften!(
+                                format!(
+                                    "unknown pii type '{t}' (known types: {})",
+                                    PII_TYPE_NAMES.join(", ")
+                                )
+                                .into(),
+                                ()
+                            );
                         }
                     }
                     requested
@@ -401,15 +630,21 @@ fn build_plugin(
 
         "convert" => {
             let field = str_field(config, "field")?;
+            if let Err(e) = check_ignore_missing(config, "convert") {
+                soften!(e, ());
+            }
             let target_type = str_field(config, "type")?;
             // Fail closed: an unknown target type used to no-op per document
             // rather than fail the pipeline definition (issue #204).
             if !CONVERT_TARGET_TYPES.contains(&target_type.as_str()) {
-                return Err(format!(
-                    "unknown convert target type '{target_type}' (known types: {})",
-                    CONVERT_TARGET_TYPES.join(", ")
-                )
-                .into());
+                soften!(
+                    format!(
+                        "unknown convert target type '{target_type}' (known types: {})",
+                        CONVERT_TARGET_TYPES.join(", ")
+                    )
+                    .into(),
+                    ()
+                );
             }
             Ok(Arc::new(ConvertTypePlugin::new(field, target_type)))
         }
@@ -445,30 +680,55 @@ fn build_plugin(
             // write) rather than falling through to `missing 'value'`, which
             // told the caller their correct ES pipeline was malformed.
             if config.get("copy_from").is_some() {
-                return Err(StageBuildError::UnsupportedOption {
-                    option: "copy_from".to_string(),
-                    reason: "xerj's set stage assigns a literal `value`; copying the value \
-                             from another field at ingest time is not implemented"
-                        .to_string(),
-                });
+                soften!(
+                    StageBuildError::UnsupportedOption {
+                        option: "copy_from".to_string(),
+                        reason: "xerj's set stage assigns a literal `value`; copying the value \
+                                 from another field at ingest time is not implemented"
+                            .to_string(),
+                    },
+                    ()
+                );
+            }
+            // `ignore_empty_value: true` asks the stage to skip when the value
+            // is null or empty. `SetPlugin` always assigns, which is ES's
+            // default (`false`) — so `false`/absent are honoured exactly and
+            // `true` is a request this build cannot serve.
+            if let Err(e) = honoured_bool(
+                config,
+                "ignore_empty_value",
+                false,
+                "the value is assigned even when it is null or empty; skipping on an empty \
+                 value is not implemented",
+            ) {
+                soften!(e, ());
             }
             let value = config
                 .get("value")
                 .cloned()
                 .ok_or_else(|| "missing 'value'".to_string())?;
-            // Elasticsearch's `set` processor defaults `override` to TRUE
-            // (`SetProcessor.java:135` — `readBooleanProperty(…, "override",
-            // true)`; ES is read for semantics only, no code reproduced). This
-            // was `unwrap_or(false)`, so `{"set": {"field": "env", "value":
-            // "prod"}}` left an existing `{"env": "dev"}` untouched: a weaker
-            // fallback on user configuration, in the file the #204 sweep
-            // rewrote. A present-but-non-boolean `override` is a caller error
-            // rather than a silent fall-through to the default.
+            // `override` defaults to FALSE for a native `type: "set"` stage and
+            // always has. Elasticsearch's `set` defaults it to TRUE
+            // (`SetProcessor.java:135` — read for semantics only, no code
+            // reproduced), and that parity is applied where it belongs: the
+            // ES→xerj translation in `es_compat::put_ingest_pipeline` writes
+            // `"override": true` explicitly when an ES `set` processor omits
+            // it. Flipping the default HERE would have changed the meaning of
+            // every already-persisted NATIVE pipeline as well — native
+            // definitions are recompiled from `cluster_state.json` at every
+            // boot, so a `set` stage that had been preserving an existing field
+            // value for the life of a cluster would start overwriting it on a
+            // binary upgrade alone, with no PUT and no operator action.
+            //
+            // A present-but-non-boolean `override` is a caller error rather
+            // than a silent fall-through to the default.
             let override_existing = match config.get("override") {
-                None => true,
-                Some(v) => v
-                    .as_bool()
-                    .ok_or_else(|| format!("'override' must be a boolean, got {v}"))?,
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(v) => soften!(
+                    format!("'override' must be a boolean, got {v}").into(),
+                    false
+                ),
             };
             Ok(Arc::new(SetPlugin::new(field, value, override_existing)))
         }
@@ -483,16 +743,13 @@ fn build_plugin(
             // .java:121`) and that is what `AppendPlugin` does; the
             // de-duplicating variant is not implemented, so asking for it must
             // not be silently ignored.
-            match config.get("allow_duplicates") {
-                None | Some(Value::Bool(true)) => {}
-                Some(_) => {
-                    return Err(StageBuildError::UnsupportedOption {
-                        option: "allow_duplicates".to_string(),
-                        reason: "values are always appended; de-duplicating append is not \
-                                 implemented"
-                            .to_string(),
-                    })
-                }
+            if let Err(e) = honoured_bool(
+                config,
+                "allow_duplicates",
+                true,
+                "values are always appended; de-duplicating append is not implemented",
+            ) {
+                soften!(e, ());
             }
             Ok(Arc::new(AppendPlugin::new(field, value)))
         }
@@ -860,11 +1117,16 @@ mod fallback_regression_tests {
         );
     }
 
-    /// Elasticsearch's `set` defaults `override` to true (SetProcessor.java:135
-    /// — read for semantics only). `unwrap_or(false)` made `{"set": {"field":
-    /// "env", "value": "prod"}}` a no-op against an existing `{"env": "dev"}`.
+    /// The NATIVE `set` stage keeps `override: false` as its default, and must
+    /// keep it: native definitions live in `cluster_state.json` and are
+    /// recompiled at every boot, so flipping the default here would silently
+    /// change what an already-running cluster's pipelines do to documents on a
+    /// binary upgrade alone — no PUT, no operator action. ES parity for the
+    /// `set` PROCESSOR is applied in the translation layer instead, which
+    /// writes `"override": true` explicitly (see
+    /// `es_compat::put_ingest_pipeline`).
     #[test]
-    fn set_overrides_by_default_like_elasticsearch() {
+    fn native_set_stage_keeps_its_non_overriding_default() {
         let pl = build(
             "set",
             serde_json::json!({ "field": "env", "value": "prod" }),
@@ -872,17 +1134,26 @@ mod fallback_regression_tests {
         .expect("set builds");
         let mut doc = serde_json::json!({ "env": "dev" });
         pl.process(&mut doc);
+        assert_eq!(
+            doc["env"], "dev",
+            "a native `set` stage with no `override` must NOT overwrite an existing value"
+        );
+
+        // An absent field is still filled in.
+        let mut doc = serde_json::json!({});
+        pl.process(&mut doc);
         assert_eq!(doc["env"], "prod");
 
-        // …and the opt-out still works.
+        // …and the explicit opt-in overwrites, which is what the ES
+        // translation writes for every ES `set` processor.
         let pl = build(
             "set",
-            serde_json::json!({ "field": "env", "value": "prod", "override": false }),
+            serde_json::json!({ "field": "env", "value": "prod", "override": true }),
         )
         .expect("set builds");
         let mut doc = serde_json::json!({ "env": "dev" });
         pl.process(&mut doc);
-        assert_eq!(doc["env"], "dev");
+        assert_eq!(doc["env"], "prod");
 
         // A non-boolean `override` is refused rather than defaulted.
         assert!(build(
@@ -890,6 +1161,169 @@ mod fallback_regression_tests {
             serde_json::json!({ "field": "env", "value": "prod", "override": "yes" })
         )
         .is_err());
+    }
+
+    /// `ignore_failure: false` is Elasticsearch's OWN default, and ES clients
+    /// write it out verbatim. Testing `config.get(key).is_some()` refused it,
+    /// so `{"set": {"field": "env", "value": "prod", "ignore_failure": false}}`
+    /// registered a pipeline that 400'd every write through it — while the
+    /// byte-identical processor without the key compiled fine.
+    #[test]
+    fn writing_the_honoured_default_is_the_same_as_omitting_it() {
+        for cfg in [
+            serde_json::json!({ "field": "env", "value": "prod", "ignore_failure": false }),
+            serde_json::json!({ "field": "env", "value": "prod", "on_failure": [] }),
+            serde_json::json!({ "field": "env", "value": "prod", "ignore_empty_value": false }),
+        ] {
+            let pl = build("set", cfg.clone())
+                .unwrap_or_else(|e| panic!("{cfg} must compile like the bare processor: {e}"));
+            let mut doc = serde_json::json!({});
+            pl.process(&mut doc);
+            assert_eq!(doc["env"], "prod");
+        }
+
+        // `ignore_missing: true` is what every field-reading stage already
+        // does, so it is honoured to the letter rather than refused.
+        for (stage, cfg) in [
+            (
+                "drop_field",
+                serde_json::json!({ "fields": ["a"], "ignore_missing": true }),
+            ),
+            (
+                "field_rename",
+                serde_json::json!({ "mappings": { "a": "b" }, "ignore_missing": true }),
+            ),
+            (
+                "convert",
+                serde_json::json!({ "field": "a", "type": "integer", "ignore_missing": true }),
+            ),
+            (
+                "timestamp_parse",
+                serde_json::json!({ "field": "a", "ignore_missing": true }),
+            ),
+        ] {
+            assert!(
+                build(stage, cfg.clone()).is_ok(),
+                "{stage} must accept the ignore_missing value it implements: {cfg}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: a written value this build does NOT
+    /// implement is refused, whether or not it happens to be ES's default.
+    #[test]
+    fn writing_an_unhonoured_value_is_refused_even_when_it_is_the_es_default() {
+        // `ignore_missing: false` asks for the document to be failed on a
+        // missing field. `ProcessAction` has no error variant.
+        let err = build(
+            "drop_field",
+            serde_json::json!({ "fields": ["a"], "ignore_missing": false }),
+        )
+        .expect_err("ignore_missing:false must not compile");
+        assert!(
+            matches!(&err, WasmError::UnsupportedOption { option, .. } if option == "ignore_missing"),
+            "expected UnsupportedOption(ignore_missing), got: {err:?}"
+        );
+
+        // `ignore_empty_value: true` asks `set` to skip on an empty value.
+        let err = build(
+            "set",
+            serde_json::json!({ "field": "env", "value": "", "ignore_empty_value": true }),
+        )
+        .expect_err("ignore_empty_value:true must not compile");
+        assert!(
+            matches!(&err, WasmError::UnsupportedOption { option, .. }
+                     if option == "ignore_empty_value"),
+            "expected UnsupportedOption(ignore_empty_value), got: {err:?}"
+        );
+
+        // A non-boolean is the caller's mistake, not a capability gap.
+        assert!(matches!(
+            build(
+                "set",
+                serde_json::json!({ "field": "e", "value": 1, "ignore_failure": "no" })
+            )
+            .expect_err("non-boolean ignore_failure must not compile"),
+            WasmError::InvalidConfig { .. }
+        ));
+    }
+
+    /// Boot replay is not definition time. A definition that is ALREADY in
+    /// `cluster_state.json` was accepted by whichever build wrote it; refusing
+    /// it now turns a working cluster's writes from 201 into 400 on a binary
+    /// upgrade alone. Replay reproduces the previously-shipped behaviour and
+    /// reports every instance in `degradations`.
+    #[test]
+    fn replaying_a_persisted_definition_does_not_break_on_a_newly_added_check() {
+        fn replay(stage_type: &str, config: Value) -> Result<Pipeline> {
+            Pipeline::from_config_replaying_persisted(
+                "t",
+                &PipelineConfig {
+                    description: String::new(),
+                    stages: vec![PipelineStageConfig {
+                        stage_type: stage_type.into(),
+                        config,
+                    }],
+                    on_error: ErrorPolicy::Drop,
+                    timeout_ms: 0,
+                },
+            )
+        }
+
+        // Every check this sweep added, in the shape a pre-upgrade
+        // cluster_state.json can legitimately hold.
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "grok",
+                serde_json::json!({ "field": "m", "pattern": "NGINX_COMBINE" }),
+            ),
+            (
+                "convert",
+                serde_json::json!({ "field": "status", "type": "int" }),
+            ),
+            (
+                "timestamp_parse",
+                serde_json::json!({ "field": "ts", "formats": "%Y-%m-%d" }),
+            ),
+            ("pii_redaction", serde_json::json!({ "types": "ssn" })),
+            (
+                "set",
+                serde_json::json!({ "field": "e", "value": "p", "copy_from": "other" }),
+            ),
+            (
+                "set",
+                serde_json::json!({ "field": "e", "value": "p", "if": "ctx.x == 'y'" }),
+            ),
+        ];
+        for (stage, cfg) in cases {
+            // Strict (a live PUT) refuses…
+            assert!(
+                build(stage, cfg.clone()).is_err(),
+                "{stage} {cfg} must be refused at definition time"
+            );
+            // …replay of the same persisted definition keeps running, loudly.
+            let pl = replay(stage, cfg.clone())
+                .unwrap_or_else(|e| panic!("replay of {stage} {cfg} must not fail the boot: {e}"));
+            assert!(
+                !pl.degradations.is_empty(),
+                "replay of {stage} {cfg} must record why it is degraded"
+            );
+            assert!(
+                pl.degradations[0].starts_with(&format!("stage [{stage}]:")),
+                "degradation must name the stage: {:?}",
+                pl.degradations
+            );
+        }
+
+        // A definition that did NOT work before the upgrade either still
+        // fails in both modes — replay is a compatibility door, not a mute.
+        assert!(replay("no_such_stage", serde_json::json!({})).is_err());
+        assert!(replay("drop_field", serde_json::json!({})).is_err());
+
+        // And a clean definition replays with nothing to report.
+        let pl = replay("set", serde_json::json!({ "field": "e", "value": "p" }))
+            .expect("a clean definition replays");
+        assert!(pl.degradations.is_empty());
     }
 
     /// `append` used to be mapped onto `set` in the ES translation, so it

@@ -21,7 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build. `PUT /{index}/_settings` with an `analysis` block is likewise refused
   (it only ever changed what `GET /_settings` echoed; the registry is built
   once, at create/open, and there is no rebuild path — Elasticsearch also
-  refuses analysis updates on an open index).
+  refuses analysis updates on an open index). That refusal covers every
+  spelling this handler *accepts*, not just the nested one: the flat dotted
+  `{"index.analysis.analyzer.x.type": "custom"}` and half-dotted
+  `{"index": {"analysis.analyzer.x.type": "custom"}}` forms that ES clients
+  routinely send used to walk straight past it into the display copy, and
+  `GET /_settings` then echoed back an analyzer that analysed nothing.
 
   **This rejects settings blocks that XERJ used to accept with a `200`, and the
   ES-YAML conformance suite does not cover them — CI being green is not
@@ -78,6 +83,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it, and option-level divergence inside a supported type (`synonyms_path`,
   `length.min`, `asciifolding.preserve_original`) is not checked at all.**
 
+- **BREAKING — `PUT /_ingest/pipeline/{id}` refuses processor configuration
+  XERJ cannot honour, so a pipeline that used to be acknowledged can now be a
+  `400`, and a stored one can start refusing writes**
+  ([#204](https://github.com/xerj-org/xerj/issues/204)). This is the same
+  change as the "`200 acknowledged` … means we will run this" entry under
+  *Fixed* below, stated from the upgrader's side, because it converts `201`
+  into `400` for any pipeline using an ES processor or option this build does
+  not implement. Read that entry for the full list.
+
+  **What is NOT broken, deliberately.** A definition already in
+  `cluster_state.json` was accepted by whichever build wrote it, and there is
+  no caller left to answer `400` at boot. Boot replay therefore compiles in a
+  compatibility mode that reproduces the *previously shipped* behaviour for
+  every check this sweep added (unknown `grok` pattern name, unknown `convert`
+  target, a bare string where an array is required, `set.copy_from`, a
+  processor-level `if`/`on_failure`/`ignore_failure`), so **an upgrade alone
+  never turns a running cluster's writes from `201` into `400`**. Each one is
+  logged at ERROR naming the pipeline and the offending config, and recorded in
+  `Engine::degraded_pipelines`; a re-`PUT` of the same definition answers `400`
+  with the same reason, which is the repair path. A definition that did not
+  compile before the upgrade either (unknown stage type, missing required
+  field) still fails at boot and is recorded unrunnable, as before.
+
+  The same rule applies one level up. Teaching the analysis resolver the
+  canonical `settings.index.analysis` nesting (see the analysis entry above) is
+  a fix at index *create* and a data bug at index *open*: `settings.json` keeps
+  the caller's nesting verbatim, so an index created before this release with
+  the canonical shape has postings that were written with `standard`, and
+  honouring the declaration on reopen would tokenise every new write
+  differently from everything already on disk. An index now records the
+  analysis binding it was created with (`<index>/analysis-binding.json`) and
+  keeps it for life. An index with no marker and analyzers declared *only*
+  under `index.analysis` keeps the legacy binding if it holds documents — with
+  an ERROR naming the index and saying a reindex is the repair — and adopts the
+  canonical binding if it is empty, recording that so a later restart cannot
+  disagree.
+
 ### Fixed
 
 - **`200 acknowledged` on an ingest pipeline now means "we will run this", and
@@ -96,9 +138,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handler emitted `{from, to}`, the plugin requires `{mappings: {…}}`) and
   renamed nothing; ES `append` was executed as `set`, replacing the field
   instead of extending it, and disagreeing with `_simulate`, which implemented
-  a real append; `set.override` defaulted to `false` where Elasticsearch
-  defaults it to `true`; an unknown `pii_redaction` type built an empty pattern
-  set and redacted nothing; an unknown `grok` pattern name silently became the
+  a real append; an ES `set` processor did not override an existing value where
+  Elasticsearch does (the ES→XERJ translation now writes `"override": true`
+  explicitly when the processor omits it — the **native** `type: "set"` stage
+  keeps its long-standing `override: false` default, because native definitions
+  are recompiled from `cluster_state.json` at every boot and flipping the stage
+  default would have changed what an already-running cluster's pipelines do to
+  documents on a binary upgrade alone); an unknown `pii_redaction` type built an
+  empty pattern set and redacted nothing; an unknown `grok` pattern name
+  silently became the
   catch-all; an unknown `convert` target left the field unconverted per
   document; array-typed keys given as a bare string were dropped and the stage
   behaved as if unconfigured; and `DELETE /_ingest/pipeline/{id}` removed the
@@ -113,6 +161,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Elasticsearch's `copy_from` is reported as an unsupported *option* (accepted
   at `PUT`, refused at the write) rather than as `mapper_parsing_exception:
   missing value`, which told the caller their valid ES pipeline was malformed.
+
+  **The refusal reads the value, not the key.** A processor-level option is
+  refused only when what the caller *wrote* asks for behaviour this build does
+  not have; writing the value XERJ already implements is the same as omitting
+  it. `ignore_failure: false` is Elasticsearch's own default and ES clients emit
+  it verbatim — a presence check made that pipeline register and then `400`
+  every write through it, while the byte-identical processor without the key
+  indexed fine. Accepted: `ignore_failure: false`, an empty `on_failure: []`,
+  `ignore_missing: true` (which is exactly what `remove`/`rename`/`convert`/
+  `date` already do — they pass the document through unchanged when the field
+  is absent), `ignore_empty_value: false`, `allow_duplicates: true`. Refused:
+  the opposite value in each case, and any `if` at all. (Modelled on Lucene's
+  consume-then-complain: `AbstractAnalysisFactory.getBoolean(args, name,
+  default)` at `lucene/core/src/java/org/apache/lucene/analysis/AbstractAnalysisFactory.java:213-217`
+  removes the key and returns the default only when it was absent, and
+  `ArabicStemFilterFactory` at
+  `lucene/analysis/common/src/java/org/apache/lucene/analysis/ar/ArabicStemFilterFactory.java:44-51`
+  then throws on whatever is left. Lucene is Apache-2.0, the same licence as
+  XERJ; no code is reproduced.)
+
+  **`remove` and `rename` no longer walk around the gate.** Their ES→XERJ
+  translation built a fresh config object holding only the translated keys, so
+  a processor-level `if` / `on_failure` / `ignore_failure` / `ignore_missing` on
+  them was dropped *before* the gate ran: `{"remove": {"field": "secret", "if":
+  "ctx.tenant == 'a'"}}` compiled, was acknowledged, and dropped the field on
+  every document — while the identical `if` on `set` was refused. Every branch
+  of the translation now edits the caller's config instead of rebuilding it.
+
+  **`_simulate` speaks Elasticsearch's vocabulary again.** It walks the
+  *stored* pipeline, and once ES `rename` started compiling the stored form
+  became XERJ's internal `stages` shape — whose stage names leaked straight into
+  the response, so `processor_type` read `field_rename` where ES reports
+  `rename`. The stages→processors conversion now inverts both halves of the
+  translation, name and config.
 
   **The refusal now covers every ingest path, not only `PUT /{index}/_doc`.**
   `POST /_bulk?pipeline=`, `index.default_pipeline` under `_bulk`,
@@ -138,9 +220,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns the stored definition (the ES body for an unrunnable pipeline, the
   compiled shape otherwise) with no runnability signal, so an operator only
   learns at write time; a write addressed to an **alias** does not pick up the
-  backing index's `default_pipeline`; and `_update_by_query` reports a `drop`
+  backing index's `default_pipeline`; `_update_by_query` reports a `drop`
   processor as a per-document failure, because it updates in place and has no
-  delete path.
+  delete path; `Engine::degraded_pipelines` is in-memory only and has no HTTP
+  surface yet, so a boot-replay degradation is visible in the startup log and
+  nowhere else; and **an OMITTED `ignore_missing` still diverges from
+  Elasticsearch** — ES defaults it to `false` and fails the document when the
+  field is absent, while XERJ passes the document through unchanged, because a
+  stage cannot fail a document at all (`ProcessAction` has no error variant).
+  Writing `ignore_missing: false` explicitly is refused; omitting it is
+  accepted and behaves as `true`. `ignore_empty_value` is the mirror image:
+  omitting it or writing `false` is honoured exactly, `true` is refused.
 
 ## [1.0.0-rc.16] - 2026-08-13
 

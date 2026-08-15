@@ -903,6 +903,33 @@ pub const SUPPORTED_FILTER_TYPES: &[&str] = &["synonym", "length", "shingle", "a
 /// actually build. Must stay in step with the `match tok_type` arms there.
 pub const SUPPORTED_TOKENIZER_TYPES: &[&str] = &["ngram", "edge_ngram", "pattern"];
 
+/// Which spellings of the index `analysis` block a registry build honours.
+///
+/// Elasticsearch accepts both the shorthand (`settings.analysis.*`) and the
+/// canonical namespaced form (`settings.index.analysis.*`). Only the shorthand
+/// used to be read here, so an index created with the canonical shape was
+/// written with `standard` for every field that named a custom analyzer
+/// (issue #204).
+///
+/// Fixing that at index CREATE is a fix. Applying it on the index OPEN path
+/// would be a silent data bug: an index created before the fix, with the
+/// canonical shape, has postings on disk that were produced by `standard`.
+/// Reopening it with the declared analyzers live makes query-time analysis stop
+/// matching them — no error, no log, just results that quietly disappear. So
+/// the binding is a property of the index, decided when it is created, exactly
+/// as Lucene keys back-compat off the version an index was created with rather
+/// than the running one (`LiveIndexWriterConfig.getIndexCreatedVersionMajor`,
+/// lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java:290-298).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisBinding {
+    /// `settings.analysis` and `settings.index.analysis`. What a NEW index
+    /// gets, and what the create-time gate validates against.
+    Canonical,
+    /// `settings.analysis` only — what every build before the #204 sweep did,
+    /// and therefore what an index created by one of them was written with.
+    LegacyShorthandOnly,
+}
+
 /// Central registry that maps analyzer names to their pipelines.
 ///
 /// Built-in analyzers are registered by default; custom analyzers can be
@@ -1091,7 +1118,17 @@ impl AnalyzerRegistry {
     /// }
     /// ```
     pub fn apply_settings(&mut self, settings: &serde_json::Value) {
-        let analysis = match Self::analysis_block(settings) {
+        self.apply_settings_with_binding(settings, AnalysisBinding::Canonical);
+    }
+
+    /// [`Self::apply_settings`], with the set of accepted `analysis` spellings
+    /// chosen by the caller. See [`AnalysisBinding`].
+    pub fn apply_settings_with_binding(
+        &mut self,
+        settings: &serde_json::Value,
+        binding: AnalysisBinding,
+    ) {
+        let analysis = match Self::analysis_block_with_binding(settings, binding) {
             Some(a) => a,
             None => return,
         };
@@ -1669,9 +1706,28 @@ impl AnalyzerRegistry {
     /// [`AnalyzerRegistry::unsupported_analysis`] can never disagree about
     /// which block is in force.
     fn analysis_block(settings: &serde_json::Value) -> Option<&serde_json::Value> {
-        settings
-            .pointer("/analysis")
-            .or_else(|| settings.pointer("/index/analysis"))
+        Self::analysis_block_with_binding(settings, AnalysisBinding::Canonical)
+    }
+
+    fn analysis_block_with_binding(
+        settings: &serde_json::Value,
+        binding: AnalysisBinding,
+    ) -> Option<&serde_json::Value> {
+        let shorthand = settings.pointer("/analysis");
+        match binding {
+            AnalysisBinding::Canonical => shorthand.or_else(|| settings.pointer("/index/analysis")),
+            AnalysisBinding::LegacyShorthandOnly => shorthand,
+        }
+    }
+
+    /// True when the only `analysis` block in `settings` is the canonical
+    /// namespaced one — i.e. this is exactly the settings shape whose meaning
+    /// [`AnalysisBinding`] changes.
+    ///
+    /// Accepts the same two envelopes as [`Self::unsupported_analysis`].
+    pub fn declares_namespaced_analysis_only(settings: &serde_json::Value) -> bool {
+        let root = settings.pointer("/settings").unwrap_or(settings);
+        root.pointer("/analysis").is_none() && root.pointer("/index/analysis").is_some()
     }
 
     /// Resolve a tokenizer by its built-in name.
@@ -2480,6 +2536,71 @@ mod unsupported_analysis_tests {
         let bad = json!({ "index": { "analysis": { "analyzer": {
             "ac": { "type": "custom", "tokenizer": "nope" } } } } });
         assert_eq!(AnalyzerRegistry::unsupported_analysis(&bad).len(), 1);
+    }
+
+    /// Honouring `index.analysis` is a fix when an index is CREATED and a data
+    /// bug when one is REOPENED — an index written before this build resolved
+    /// that block has postings the declared analyzers do not match. The
+    /// binding is therefore selectable, and `declares_namespaced_analysis_only`
+    /// is what tells the open path whether the choice even matters.
+    #[test]
+    fn the_legacy_binding_reads_the_shorthand_only() {
+        let namespaced = json!({ "index": { "analysis": { "analyzer": {
+            "ac": { "type": "custom", "tokenizer": "whitespace" } } } } });
+        let shorthand = json!({ "analysis": { "analyzer": {
+            "ac": { "type": "custom", "tokenizer": "whitespace" } } } });
+
+        // Canonical resolves both spellings…
+        for settings in [&namespaced, &shorthand] {
+            let mut registry = AnalyzerRegistry::with_defaults();
+            registry.apply_settings_with_binding(settings, AnalysisBinding::Canonical);
+            assert!(
+                registry.get_analyzer("ac").is_some(),
+                "canonical binding must resolve {settings}"
+            );
+        }
+
+        // …the legacy binding resolves only the shorthand, which is exactly
+        // what every build before the #204 sweep did.
+        let mut registry = AnalyzerRegistry::with_defaults();
+        registry.apply_settings_with_binding(&namespaced, AnalysisBinding::LegacyShorthandOnly);
+        assert!(
+            registry.get_analyzer("ac").is_none(),
+            "the legacy binding must NOT resolve `index.analysis`"
+        );
+        let mut registry = AnalyzerRegistry::with_defaults();
+        registry.apply_settings_with_binding(&shorthand, AnalysisBinding::LegacyShorthandOnly);
+        assert!(
+            registry.get_analyzer("ac").is_some(),
+            "the legacy binding still resolves the shorthand"
+        );
+    }
+
+    #[test]
+    fn declares_namespaced_analysis_only_identifies_the_shape_that_diverges() {
+        // Only the canonical nesting → the binding decides the outcome.
+        assert!(AnalyzerRegistry::declares_namespaced_analysis_only(
+            &json!({ "index": { "analysis": { "analyzer": {} } } })
+        ));
+        // …including through the outer `settings` envelope.
+        assert!(AnalyzerRegistry::declares_namespaced_analysis_only(
+            &json!({ "settings": { "index": { "analysis": { "analyzer": {} } } } })
+        ));
+        // Shorthand present → both bindings resolve identically.
+        assert!(!AnalyzerRegistry::declares_namespaced_analysis_only(
+            &json!({ "analysis": { "analyzer": {} } })
+        ));
+        assert!(!AnalyzerRegistry::declares_namespaced_analysis_only(
+            &json!({ "analysis": { "analyzer": {} },
+                     "index": { "analysis": { "analyzer": {} } } })
+        ));
+        // No analysis at all → nothing to decide.
+        assert!(!AnalyzerRegistry::declares_namespaced_analysis_only(
+            &json!({})
+        ));
+        assert!(!AnalyzerRegistry::declares_namespaced_analysis_only(
+            &json!({ "index": { "number_of_replicas": 0 } })
+        ));
     }
 
     #[test]

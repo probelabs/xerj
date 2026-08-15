@@ -728,3 +728,301 @@ async fn a_synonym_filter_given_a_bare_string_is_refused_not_silently_emptied() 
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+// ── Round 2 of the sweep: the gate's own blind spots ─────────────────────────
+
+/// `_simulate` walks the STORED pipeline. Once ES `rename` started compiling,
+/// the stored form became xerj's `stages` shape — and the stages→processors
+/// conversion emitted the INTERNAL stage name, so `processor_type` read
+/// `field_rename` where Elasticsearch reports `rename`. This is the ES-compat
+/// YAML conformance case "Test verbose simulate with error in pipeline"
+/// (`40_simulate.yml`) as a Rust test.
+#[tokio::test]
+async fn simulate_reports_elasticsearch_processor_names_for_a_compiled_pipeline() {
+    let (app, _dir) = app();
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/my_pipeline",
+            json!({
+                "description": "_description",
+                "processors": [
+                    { "rename": { "field": "does_not_exist", "target_field": "_value" } }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["acknowledged"], true, "{body}");
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/_ingest/pipeline/my_pipeline/_simulate?verbose=true",
+            json!({ "docs": [{ "_index": "index", "_id": "id",
+                               "_source": { "foo": "bar" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body
+        .pointer("/docs/0/processor_results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("processor_results missing: {body}"));
+    assert_eq!(results.len(), 1, "{body}");
+    assert_eq!(
+        results[0]["processor_type"], "rename",
+        "the internal stage name must not leak into the simulate response: {body}"
+    );
+    assert_eq!(results[0]["status"], "error", "{body}");
+    assert_eq!(
+        results[0]["error"]["reason"], "field [does_not_exist] doesn't exist",
+        "{body}"
+    );
+
+    // The `remove` translation round-trips too: `drop_field`'s `fields` array
+    // must come back as ES's single `field`.
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/rm",
+            json!({ "processors": [{ "remove": { "field": "secret" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = send(
+        &app,
+        post(
+            "/_ingest/pipeline/rm/_simulate?verbose=true",
+            json!({ "docs": [{ "_source": { "secret": "s", "keep": 1 } }] }),
+        ),
+    )
+    .await;
+    let results = body
+        .pointer("/docs/0/processor_results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("processor_results missing: {body}"));
+    assert_eq!(results[0]["processor_type"], "remove", "{body}");
+    assert_eq!(
+        results[0].pointer("/doc/_source/secret"),
+        None,
+        "the simulated `remove` must actually remove: {body}"
+    );
+}
+
+/// `ignore_failure: false` is Elasticsearch's OWN default and ES clients write
+/// it out. Testing key presence refused it, so this pipeline registered and
+/// then 400'd every write through it — while the byte-identical processor
+/// without the key indexed fine.
+#[tokio::test]
+async fn spelling_out_the_elasticsearch_default_does_not_break_the_pipeline() {
+    let (app, _dir) = app();
+    let (status, body) = write_through(
+        &app,
+        "defaults_spelled_out",
+        json!([{ "set": { "field": "env", "value": "prod",
+                          "ignore_failure": false, "on_failure": [] } }]),
+        json!({ "msg": "hello" }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "ignore_failure:false is the ES default and must not make a pipeline \
+         unrunnable: {body}"
+    );
+    let (_, doc) = send(&app, get("/docs/_doc/1")).await;
+    assert_eq!(doc["_source"]["env"], "prod", "{doc}");
+
+    // `ignore_failure: true` still asks for something this build cannot do.
+    let (status, _) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/ignoring",
+            json!({ "processors": [
+                { "set": { "field": "e", "value": "p", "ignore_failure": true } }
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ES accepts it, so xerj stores it");
+    let (status, body) = send(
+        &app,
+        put("/docs/_doc/9?pipeline=ignoring", json!({ "a": 1 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// `remove` and `rename` built their xerj config from scratch, so a
+/// processor-level `if` on them was DROPPED before the gate ever saw it: the
+/// pipeline compiled, was acknowledged, and dropped the field on EVERY
+/// document — the exact defect this sweep exists to eliminate, surviving
+/// inside its own gate, and self-inconsistent with `set`, which refused the
+/// identical key.
+#[tokio::test]
+async fn a_guard_on_remove_or_rename_is_not_dropped_by_the_translation() {
+    for (name, processor) in [
+        (
+            "guarded_remove",
+            json!({ "remove": { "field": "secret", "if": "ctx.tenant == 'a'" } }),
+        ),
+        (
+            "guarded_rename",
+            json!({ "rename": { "field": "a", "target_field": "b",
+                                "if": "ctx.tenant == 'a'" } }),
+        ),
+        (
+            "failing_remove",
+            json!({ "remove": { "field": "secret", "ignore_failure": true } }),
+        ),
+        (
+            "recovering_rename",
+            json!({ "rename": { "field": "a", "target_field": "b",
+                                "on_failure": [{ "set": { "field": "x", "value": 1 } }] } }),
+        ),
+    ] {
+        let (app, _dir) = app();
+        let (status, body) = write_through(
+            &app,
+            name,
+            json!([processor]),
+            json!({ "tenant": "b", "secret": "s", "a": 1 }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{name}: a processor-level key the gate refuses on `set` must not be \
+             silently dropped on `remove`/`rename`: {body}"
+        );
+
+        // And the untransformed document was not indexed behind a 2xx.
+        let (status, _) = send(&app, get("/docs/_doc/1")).await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "{name}: the write must not have happened"
+        );
+    }
+}
+
+/// The bare `remove`/`rename` still work — the translation was fixed by
+/// editing the config rather than rebuilding it, so nothing was lost.
+#[tokio::test]
+async fn remove_and_rename_still_do_their_job() {
+    let (app, _dir) = app();
+    let (status, body) = write_through(
+        &app,
+        "cleanup",
+        json!([
+            { "remove": { "field": "secret" } },
+            { "rename": { "field": "a", "target_field": "b" } }
+        ]),
+        json!({ "secret": "s", "a": 1 }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (_, doc) = send(&app, get("/docs/_doc/1")).await;
+    assert_eq!(doc.pointer("/_source/secret"), None, "{doc}");
+    assert_eq!(doc["_source"]["b"], 1, "{doc}");
+}
+
+/// `ignore_missing: true` is exactly what every field-reading stage already
+/// does, so it is honoured. `false` asks for the document to be FAILED on a
+/// missing field, which no stage can do — `ProcessAction` has no error
+/// variant — so it is refused rather than silently accepted.
+#[tokio::test]
+async fn ignore_missing_is_honoured_or_refused_never_silently_accepted() {
+    let (app, _dir) = app();
+    let (status, body) = write_through(
+        &app,
+        "lenient",
+        json!([{ "rename": { "field": "nope", "target_field": "b",
+                             "ignore_missing": true } }]),
+        json!({ "a": 1 }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "ignore_missing:true is honoured: {body}"
+    );
+
+    let (status, body) = send(
+        &app,
+        put(
+            "/_ingest/pipeline/strict_missing",
+            json!({ "processors": [
+                { "rename": { "field": "nope", "target_field": "b",
+                              "ignore_missing": false } }
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ES accepts it, so xerj stores it: {body}"
+    );
+    let (status, body) = send(
+        &app,
+        put("/docs/_doc/7?pipeline=strict_missing", json!({ "a": 1 })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ignore_missing:false must not be silently accepted: {body}"
+    );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("ignore_missing")),
+        "{body}"
+    );
+}
+
+/// The `analysis` refusal in `PUT /{index}/_settings` tested two nested
+/// pointers only. ES clients routinely send flat dotted keys, this handler
+/// accepts them for every other setting, and `GET /_settings` then echoed back
+/// an analyzer that analyses nothing.
+#[tokio::test]
+async fn the_dotted_analysis_spelling_does_not_walk_past_the_settings_gate() {
+    for body in [
+        json!({ "index.analysis.analyzer.x.type": "custom" }),
+        json!({ "index": { "analysis.analyzer.x.type": "custom" } }),
+        json!({ "analysis.analyzer.x.type": "custom" }),
+        json!({ "index": { "analysis": { "analyzer": { "x": { "type": "custom" } } } } }),
+    ] {
+        let (app, _dir) = app();
+        let (status, _) = send(&app, put("/blog", json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, resp) = send(&app, put("/blog/_settings", body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{body} must be refused like the nested spelling: {resp}"
+        );
+
+        // …and nothing was echoed back into the display copy.
+        let (_, settings) = send(&app, get("/blog/_settings")).await;
+        assert!(
+            !settings.to_string().contains("analysis"),
+            "a refused settings PUT must leave no analysis trace: {settings}"
+        );
+    }
+
+    // A dotted setting that is NOT analysis is unaffected.
+    let (app, _dir) = app();
+    send(&app, put("/blog", json!({}))).await;
+    let (status, body) = send(
+        &app,
+        put("/blog/_settings", json!({ "index.number_of_replicas": 0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

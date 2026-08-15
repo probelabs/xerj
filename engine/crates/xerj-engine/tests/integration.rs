@@ -6599,3 +6599,266 @@ async fn create_index_still_accepts_every_analysis_construct_we_support() {
         .create_index_with_settings("plain_idx", Schema::empty(), json!({}))
         .expect("empty settings must still create");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — teaching the analysis resolver the canonical
+// `settings.index.analysis` nesting is a fix at index CREATE and a silent data
+// bug at index OPEN. `settings.json` keeps the caller's nesting verbatim, so an
+// index created before the sweep with the canonical shape has postings on disk
+// that were produced by `standard` — reopening it with the declared analyzers
+// live makes query-time analysis stop matching them, with no error and no log.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A 3-gram `default` analyzer under the CANONICAL `index.analysis` nesting.
+/// Chosen because the mismatch is unmistakable in one direction: a document
+/// indexed with `standard` holds the whole term, and a query analysed with this
+/// holds only 3-grams, so an exact-term search silently returns nothing.
+fn namespaced_ngram_settings() -> Value {
+    json!({
+        "index": {
+            "analysis": {
+                "tokenizer": { "ngram_tok": { "type": "ngram",
+                                              "min_gram": 3, "max_gram": 3 } },
+                "analyzer": { "default": { "type": "custom",
+                                           "tokenizer": "ngram_tok",
+                                           "filter": ["lowercase"] } }
+            }
+        }
+    })
+}
+
+/// Rewrite an index directory into the state a pre-sweep build would have left:
+/// `settings.json` holding the canonical nesting verbatim, and no record that
+/// the canonical binding was ever honoured.
+fn make_index_dir_look_pre_sweep(dir: &std::path::Path, index: &str) {
+    let index_dir = dir.join(index);
+    std::fs::write(
+        index_dir.join("settings.json"),
+        serde_json::to_vec_pretty(&namespaced_ngram_settings()).unwrap(),
+    )
+    .expect("rewrite settings.json");
+    let marker = index_dir.join("analysis-binding.json");
+    if marker.exists() {
+        std::fs::remove_file(&marker).expect("remove binding marker");
+    }
+}
+
+#[tokio::test]
+async fn reopening_a_pre_sweep_index_does_not_silently_change_how_it_analyses() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        // Created with no analysis at all: every token on disk is `standard`.
+        engine
+            .create_index_with_settings("legacy_idx", Schema::empty(), json!({}))
+            .unwrap();
+        let idx = engine.get_index("legacy_idx").unwrap();
+        idx.index_document(Some("1".into()), json!({ "name": "basketball" }))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        let result = idx
+            .search(&make_search(json!({"match": {"name": "basketball"}})))
+            .await
+            .unwrap();
+        assert_eq!(result.total.value, 1, "sanity: the term is findable");
+    }
+
+    // Now make it look exactly like an index a pre-sweep build created with
+    // the canonical nesting — settings declared, never honoured.
+    make_index_dir_look_pre_sweep(dir.path(), "legacy_idx");
+
+    let engine = make_engine(&dir);
+    let idx = engine.get_index("legacy_idx").unwrap();
+    // The document already on disk is still findable…
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "basketball"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 1,
+        "the existing document is still findable"
+    );
+
+    // …and a document written AFTER the reopen goes into the SAME term space.
+    //
+    // This is the half that actually breaks. A declared `default` analyzer is
+    // what the memtable indexes and searches with (`memtable.rs` —
+    // `get_analyzer("default").or_else(standard)`), while the on-disk segments
+    // hold `standard` postings. Honouring `index.analysis` on the open path
+    // therefore makes the reopened index tokenise every new write differently
+    // from everything already on disk: the same query answers differently
+    // depending on whether a document has been flushed yet, with no error and
+    // no log. `ket` is a 3-gram of `basketball` and matches under the declared
+    // analyzer only.
+    idx.index_document(Some("2".into()), json!({ "name": "basketball" }))
+        .await
+        .unwrap();
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "ket"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 0,
+        "reopening a pre-sweep index must keep analysing the way its postings \
+         were written — switching to the declared analyzers silently splits the \
+         index into two incompatible term spaces"
+    );
+
+    // And the plain term still finds both, before and after a flush.
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "basketball"}})))
+        .await
+        .unwrap();
+    assert_eq!(result.total.value, 2, "both documents share one term space");
+}
+
+#[tokio::test]
+async fn an_empty_pre_sweep_index_adopts_the_canonical_binding_and_records_it() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        engine
+            .create_index_with_settings("empty_idx", Schema::empty(), json!({}))
+            .unwrap();
+    }
+    // Same doctoring, but nothing was ever indexed: there are no postings for
+    // the declared analyzers to disagree with, so honouring them is free.
+    make_index_dir_look_pre_sweep(dir.path(), "empty_idx");
+
+    let marker = dir.path().join("empty_idx").join("analysis-binding.json");
+    assert!(!marker.exists(), "precondition: the marker was removed");
+
+    {
+        let engine = make_engine(&dir);
+        let idx = engine.get_index("empty_idx").unwrap();
+        idx.index_document(Some("1".into()), json!({ "name": "basketball" }))
+            .await
+            .unwrap();
+        // The 3-gram analyzer really is in force now.
+        let result = idx
+            .search(&make_search(json!({"match": {"name": "ket"}})))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.total.value, 1,
+            "an empty index may adopt the canonical binding"
+        );
+    }
+
+    // …and the decision was written down, so adding documents cannot make the
+    // next boot answer differently.
+    assert!(
+        marker.exists(),
+        "the adopted binding must be recorded, or a later restart would fall \
+         back to the legacy binding and stop matching what was just written"
+    );
+    let engine = make_engine(&dir);
+    let idx = engine.get_index("empty_idx").unwrap();
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "ket"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 1,
+        "the recorded binding must survive the restart"
+    );
+}
+
+#[tokio::test]
+async fn a_freshly_created_index_honours_the_canonical_analysis_nesting() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index_with_settings("new_idx", Schema::empty(), namespaced_ngram_settings())
+        .expect("the canonical nesting is a supported analysis block");
+    let idx = engine.get_index("new_idx").unwrap();
+    idx.index_document(Some("1".into()), json!({ "name": "basketball" }))
+        .await
+        .unwrap();
+    let result = idx
+        .search(&make_search(json!({"match": {"name": "ket"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total.value, 1,
+        "a NEW index must honour `index.analysis` — that half of the fix stands"
+    );
+    assert!(
+        dir.path()
+            .join("new_idx")
+            .join("analysis-binding.json")
+            .exists(),
+        "a new index records the binding it was created with"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #204 — boot replay of an ALREADY-PERSISTED pipeline is not definition
+// time. Refusing it at startup turns a working cluster's writes from 201 into
+// 400 on a binary upgrade alone, with no PUT and no operator action.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_persisted_pipeline_the_new_checks_refuse_still_runs_after_a_restart() {
+    let dir = TempDir::new().unwrap();
+    let cluster_state = dir.path().join("cluster_state.json");
+
+    // Write a cluster_state.json holding a pipeline in exactly the shape a
+    // pre-sweep build would have persisted and happily run: an unknown grok
+    // pattern name, which used to fall through to the catch-all.
+    {
+        let engine = make_engine(&dir);
+        engine
+            .put_pipeline(
+                "legacy_pipe",
+                json!({ "stages": [
+                    { "type": "grok", "config": { "field": "msg", "pattern": "GENERIC" } }
+                ] }),
+                None,
+            )
+            .expect("a clean definition stores");
+    }
+    let mut state: Value =
+        serde_json::from_slice(&std::fs::read(&cluster_state).expect("cluster_state.json"))
+            .expect("parse cluster_state.json");
+    state["pipelines"]["legacy_pipe"]["stages"][0]["config"]["pattern"] = json!("NGINX_COMBINE");
+    std::fs::write(&cluster_state, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    // Boot again. The definition is on disk and must keep working.
+    let engine = make_engine(&dir);
+    assert!(
+        engine.transform_pipelines.contains_key("legacy_pipe"),
+        "a persisted pipeline must not be dropped by a check added after it was stored"
+    );
+    assert!(
+        !engine.unrunnable_pipelines.contains_key("legacy_pipe"),
+        "…and writes through it must not start 400ing on a binary upgrade alone"
+    );
+    // But the compatibility door is loud, not silent.
+    let degraded = engine
+        .degraded_pipelines
+        .get("legacy_pipe")
+        .map(|r| r.value().clone())
+        .expect("the replay must record what it had to wave through");
+    assert!(
+        degraded.contains("NGINX_COMBINE"),
+        "the degradation must name the offending config: {degraded}"
+    );
+
+    // A live re-PUT of the same definition is still refused — the operator's
+    // repair path answers with the real error.
+    let err = engine
+        .put_pipeline(
+            "legacy_pipe",
+            json!({ "stages": [
+                { "type": "grok", "config": { "field": "msg", "pattern": "NGINX_COMBINE" } }
+            ] }),
+            None,
+        )
+        .expect("put_pipeline returns the compile error, not an Err");
+    assert!(
+        err.is_some_and(|e| e.to_string().contains("NGINX_COMBINE")),
+        "a definition-time PUT must still refuse the same config"
+    );
+}
