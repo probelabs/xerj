@@ -18,21 +18,34 @@
 //! (`lucene/core/src/java/org/apache/lucene/search/SortedNumericSortField.java:49-59`)
 //! and `NumericComparator` compares those column values directly
 //! (`lucene/core/src/java/org/apache/lucene/search/comparators/NumericComparator.java:47-63`).
-//! xerj has no column for a meta-field, so `Index::meta_sort_value` resolves
-//! it through the same version-map accessors that populate the response
-//! meta-fields (`lookup_seq_no` / `lookup_version`).
+//! xerj indexes no column for a meta-field, so `Index::meta_sort_value`
+//! resolves it through the same version-map accessors that populate the
+//! response meta-fields (`lookup_seq_no` / `lookup_version`).
 //!
-//! Two collectors had to agree for that to be enough, and the second one is
-//! the trap: the memtable's bounded sort-candidate path
-//! (`sort_candidates_numeric`) cuts the candidate set with a dv column keyed
-//! by the sort field.  There is no `_seq_no` column, so it classified every
-//! buffered doc as "missing the field" and handed back an arbitrary
-//! `materialisation_limit`-sized prefix.  Real sort values over a wrong
-//! candidate set is still a silently wrong page — the same defect wearing
-//! the other hat — so `is_meta_sort_field` also gates that path.  The same
-//! gate is what fixes `_id` at the cap: `_id` already resolved to a real
-//! sort value, and `sort: [{"_id":"desc"}]` over a >cap memtable STILL
+//! Real sort values are NOT enough on their own, and that is what the rest of
+//! this file is about.  Three prefilters narrow the heap's input by deriving
+//! the primary sort key from `_source`, and once the heap ranks a meta-field
+//! on version-map metadata, any of them ranking on `_source` is comparing two
+//! different frontiers.  A correctly ranked page over a wrong candidate set is
+//! still a silently wrong page — the same defect wearing the other hat — so
+//! all three now decline meta-fields via `is_meta_sort_field`:
+//!
+//!   1. `sort_candidates_numeric` (memtable bounded candidate cut),
+//!   2. `sorted_shadow_for` (segment sort shadow),
+//!   3. `memtable_primary_key_rejects` (memtable pre-clone rejection) — the
+//!      one gates 1 and 2 route meta-sorts ONTO, missed in the first pass.
+//!
+//! Gate 1 is also what fixes `_id` at the cap: `_id` already resolved to a
+//! real sort value, and `sort: [{"_id":"desc"}]` over a >cap memtable STILL
 //! returned the wrong five documents on main.
+//!
+//! Note the premise these gates do NOT rest on: "a meta-field name can never
+//! be a `_source` key".  It can — xerj accepts `{"_seq_no": 1}` in a document
+//! body where ES rejects it — and the shadowing tests at the end of this file
+//! exercise exactly that.  Segments happen to be safe today only because
+//! `build_doc_value_columns` skips every `_`-prefixed source key; the memtable
+//! has no such skip, which is why gates 1 and 3 are load-bearing rather than
+//! defensive.
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -302,4 +315,181 @@ async fn seq_no_sort_is_exact_after_flush() {
             hit.id
         );
     }
+}
+
+/// A `_source` key that SHADOWS the meta-field being sorted on.
+///
+/// xerj — unlike ES, which rejects `_seq_no` inside a document with a
+/// `document_parsing_exception` — accepts one and echoes it back in
+/// `_source`, so this is wire-reachable, not a synthetic shape.
+///
+/// The trap is that #401 moved meta-field RESOLUTION to the version map
+/// while three prefilters still derived the sort key from `_source`.  Two
+/// were gated with `is_meta_sort_field`; `memtable_primary_key_rejects` —
+/// the pre-clone rejection on the very full-walk path the other two gates
+/// FORCE meta-sorts onto — was not.  A shadowing key then made the
+/// prefilter's frontier and the heap's frontier disagree, and the doc was
+/// dropped before `offer` ever saw it: silently, and only when `size` is
+/// small enough for the heap to fill.
+///
+/// Before the gate, with only d0000 carrying `"_seq_no": 10000000`,
+/// `sort _seq_no asc size 5` returned [d0001..d0005] — the true first
+/// document missing — while `size 3000` returned it, which is what makes
+/// the loss silent.
+#[tokio::test]
+async fn source_key_shadowing_a_meta_sort_field_drops_no_document() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine.create_index("shadow_sort", Schema::empty()).unwrap();
+    let idx = engine.get_index("shadow_sort").unwrap();
+
+    // > materialisation_limit (256), memtable-resident: the only path where
+    // a source-derived prefilter still runs for a meta sort.
+    const N: u64 = 2000;
+    for i in 0..N {
+        // SPARSE shadow: one doc claims a `_seq_no` far past the corpus, so
+        // the prefilter ranks it last while its real `_seq_no` (0) ranks it
+        // first.  Every other doc is underivable and admitted, which is why
+        // the page looks plausible instead of empty.
+        let body = if i == 0 {
+            json!({ "n": i, "_seq_no": 10_000_000 })
+        } else {
+            json!({ "n": i })
+        };
+        idx.index_document(Some(format!("d{i:04}")), body)
+            .await
+            .unwrap();
+    }
+
+    let res = idx.search(&sorted_req("_seq_no", "asc", 5)).await.unwrap();
+    let ids: Vec<String> = res.hits.iter().map(|h| h.id.clone()).collect();
+    let oldest: Vec<String> = (0..5).map(|i| format!("d{i:04}")).collect();
+    assert_eq!(
+        ids, oldest,
+        "a shadowing `_source._seq_no` must not drop the true first document"
+    );
+    // The sort value must be the METADATA, not the shadowing source value.
+    assert_eq!(
+        res.hits
+            .first()
+            .and_then(|h| h.sort.first())
+            .and_then(Value::as_u64),
+        idx.lookup_seq_no("d0000"),
+        "d0000 must rank and report on its real _seq_no, not `_source._seq_no`"
+    );
+
+    // Size-independence is the actual contract: the page must not change
+    // when the heap is large enough that no doc is ever rejected early.
+    let big = idx
+        .search(&sorted_req("_seq_no", "asc", 3000))
+        .await
+        .unwrap();
+    let big_ids: Vec<String> = big.hits.iter().take(5).map(|h| h.id.clone()).collect();
+    assert_eq!(
+        ids, big_ids,
+        "the size-5 page must equal the first 5 of the size-3000 page"
+    );
+}
+
+/// DENSE shadow: EVERY doc carries a `_source._seq_no` counting down, so the
+/// prefilter's frontier is the exact inverse of the heap's — no doc is
+/// "underivable" and the rejection fires on every comparison.  Before the
+/// gate this returned [d1995, d1989, d1981, d1973, d1961]: the true maximum
+/// dropped, and not even a contiguous run.
+#[tokio::test]
+async fn dense_shadowing_source_key_does_not_displace_the_meta_sort_page() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine
+        .create_index("dense_shadow", Schema::empty())
+        .unwrap();
+    let idx = engine.get_index("dense_shadow").unwrap();
+
+    const N: u64 = 2000;
+    for i in 0..N {
+        idx.index_document(
+            Some(format!("d{i:04}")),
+            json!({ "n": i, "_seq_no": N - i }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let res = idx.search(&sorted_req("_seq_no", "desc", 5)).await.unwrap();
+    let ids: Vec<String> = res.hits.iter().map(|h| h.id.clone()).collect();
+    let newest: Vec<String> = (N - 5..N).rev().map(|i| format!("d{i:04}")).collect();
+    assert_eq!(
+        ids, newest,
+        "a dense shadowing `_source._seq_no` must not displace the true top 5"
+    );
+    for hit in &res.hits {
+        assert_eq!(
+            hit.sort.first().and_then(Value::as_u64),
+            idx.lookup_seq_no(&hit.id),
+            "hit {} must rank on real metadata, not `_source._seq_no`",
+            hit.id
+        );
+    }
+
+    // The same corpus flushed to a segment. This passes with or without the
+    // segment-side guard, because `build_doc_value_columns` skips every
+    // `_`-prefixed source key so no `_seq_no` dv column is written — pinning
+    // that here so relaxing the skip trips a test instead of a user.
+    idx.flush().await.unwrap();
+    let res = idx.search(&sorted_req("_seq_no", "desc", 5)).await.unwrap();
+    let ids: Vec<String> = res.hits.iter().map(|h| h.id.clone()).collect();
+    assert_eq!(
+        ids, newest,
+        "flushed: dense shadowing key must not displace the page"
+    );
+}
+
+/// `_version` shadow. Worth its own case because it is the one where the
+/// pre-#401 engine happened to return the RIGHT document (incidentally — its
+/// sort values were `[0]` for the shadowed doc and `[null]` for the rest), so
+/// an ungated prefilter turns #401 into an observable regression rather than
+/// merely leaving a defect unfixed.
+#[tokio::test]
+async fn shadowing_source_key_does_not_regress_version_sort() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine.create_index("ver_shadow", Schema::empty()).unwrap();
+    let idx = engine.get_index("ver_shadow").unwrap();
+
+    const N: u64 = 2000;
+    for i in 0..N {
+        let body = if i == 7 {
+            json!({ "n": i, "_version": 0 })
+        } else {
+            json!({ "n": i })
+        };
+        idx.index_document(Some(format!("d{i:04}")), body)
+            .await
+            .unwrap();
+    }
+    // Second write => d0007 has real `_version` 2, the unique maximum, while
+    // its `_source._version` still claims 0, the unique minimum.
+    idx.index_document(Some("d0007".to_string()), json!({ "n": 7, "_version": 0 }))
+        .await
+        .unwrap();
+
+    let res = idx
+        .search(&sorted_req("_version", "desc", 5))
+        .await
+        .unwrap();
+    let ids: Vec<String> = res.hits.iter().map(|h| h.id.clone()).collect();
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("d0007"),
+        "the unique maximum _version must lead the page, not be rejected by \
+         its own shadowing `_source._version`"
+    );
+    assert_eq!(
+        res.hits
+            .first()
+            .and_then(|h| h.sort.first())
+            .and_then(Value::as_u64),
+        Some(2),
+        "d0007 must rank on its real _version (2), not `_source._version` (0)"
+    );
 }

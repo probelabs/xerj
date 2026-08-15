@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Real sort values are only half of it: the memtable's bounded sort-candidate
   path narrows the heap's input using a doc-values column keyed by the sort
-  field, and no such column exists for a meta-field, so it classified every
-  buffered document as "missing the field" and returned an arbitrary
+  field, which for a meta-field is derived from `_source` rather than from the
+  version map the heap now ranks on. With no such key present it classified
+  every buffered document as "missing the field" and returned an arbitrary
   `materialisation_limit`-sized prefix. A correctly ranked page over a wrong
   candidate set is still a silently wrong page, so that path — and the
   segment-side sort shadow — now decline meta-fields and take the full walk.
@@ -43,6 +44,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sort: [{"_id":"desc"}]` returned
   `["d1995","d1989","d1981","d1973","d1961"]` instead of
   `["d1999","d1998","d1997","d1996","d1995"]`.
+
+  There is a third such prefilter, and it is the one the two gates above route
+  meta-sorts *onto*: the memtable scan's pre-clone rejection
+  (`memtable_primary_key_rejects`) skips a document whose primary sort key,
+  read from `_source`, already loses to the full heap. Once the heap ranks on
+  version-map metadata, a document carrying a `_source` key of the same name
+  is compared against the wrong frontier and dropped before the heap ever sees
+  it. Measured over ES-compat HTTP on 2 000 documents where only `d0000`
+  carried `"_seq_no": 10000000`: `{"size":5,"sort":[{"_seq_no":"asc"}]}`
+  returned `[d0001, d0002, d0003, d0004, d0005]`, omitting the true first
+  document, while `"size": 3000` returned it — a silent, size-dependent
+  missing document. That path now declines meta-fields too.
+
+  **Behaviour change:** `sort` on `_seq_no` / `_version` / `_primary_term` /
+  `_index` now ignores a `_source` key of the same name and always ranks on
+  engine metadata. Previously it ranked on the `_source` value where one
+  existed and on `null` everywhere else. This is observable because xerj —
+  unlike Elasticsearch, which rejects a metadata-named key inside a document
+  with a `document_parsing_exception` — accepts `{"_seq_no": 1}` in a document
+  body and echoes it back in `_source`. Such a key is now inert for sorting;
+  it is still stored, still returned in `_source`, and still usable for
+  ordinary queries. Rejecting metadata-named `_source` keys at the API edge is
+  deliberately **not** part of this change — xerj writes `_routing` into
+  `_source` itself, so the edge rule needs its own design.
 
 - **`xerj autoindex` aborted a whole run when one file declared two or more SQL
   tables** ([#360](https://github.com/xerj-org/xerj/issues/360)). One file can

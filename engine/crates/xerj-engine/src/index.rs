@@ -14743,14 +14743,19 @@ impl Index {
                         if sf.is_score()
                             || sf.is_doc_order()
                             || sf.field == "_id"
-                            // An ES meta-field has no memtable dv column, so
-                            // `sort_candidates_numeric` would classify EVERY
-                            // buffered doc as "missing this field" and hand
-                            // back an arbitrary `cap`-sized prefix as the
-                            // candidate set.  With #401's real `_seq_no`
-                            // values that prefix is no longer a superset of
-                            // the true top-cap — it would rank the wrong
-                            // documents correctly.  Take the full walk.
+                            // `sort_candidates_numeric` cuts the candidate set
+                            // by reading the sort field out of each buffered
+                            // doc's `_source`, but #401 resolves a meta-field
+                            // from the version map — so the cut and the heap
+                            // would rank on different data.  Usually `_source`
+                            // has no such key at all and EVERY doc classifies
+                            // as "missing the field", yielding an arbitrary
+                            // `cap`-sized prefix; where a doc DOES carry a
+                            // literal `_seq_no` (xerj accepts one, see
+                            // `memtable_primary_key_rejects`) the cut ranks on
+                            // the shadowing value instead.  Both give a page
+                            // of the wrong documents, correctly ranked.  Take
+                            // the full walk.
                             || is_meta_sort_field(&sf.field)
                             || sf.mode != SortMode::default()
                             || sf.missing != SortMissing::default()
@@ -23062,13 +23067,25 @@ impl Index {
         field: &str,
         seg_doc_count: u64,
     ) -> Option<Resident<Option<Arc<Vec<(i64, u32)>>>>> {
-        // An ES meta-field (`_seq_no`, `_version`, …) is engine metadata, not
-        // a `_source` key, so no segment ever writes a dv column under that
-        // name.  Bail BEFORE the registry insert so the publish-time warm
-        // doesn't burn one of its 16 slots probing a column that cannot
-        // exist, and so a future column that happened to share the name
-        // could never silently drive the candidate cut for a key the
-        // engine resolves from the version map instead (#401).
+        // An ES meta-field (`_seq_no`, `_version`, …) is resolved from the
+        // version map, never from the segment, so a dv column keyed by that
+        // name must not drive the candidate cut (#401).
+        //
+        // Today no such column exists — but NOT because the name is
+        // impossible: xerj accepts a literal `_seq_no` inside a document
+        // (real ES rejects it), so it can reach `_source`.  It is the dv
+        // sidecar builder that drops it, skipping every `_`-prefixed source
+        // key as envelope bookkeeping (the `starts_with('_')` skip in
+        // `build_doc_value_columns`).  That invariant lives elsewhere and
+        // is not this path's to assume, so the guard is kept as the local
+        // enforcement: relax the skip and the cut would silently rank on a
+        // user-supplied value while the heap ranks on real metadata — the
+        // memtable's identical shape, which IS reachable today, is what
+        // `memtable_primary_key_rejects` had to be gated for.
+        //
+        // Bailing BEFORE the registry insert also stops the publish-time
+        // warm burning one of its 16 slots probing a column that is not
+        // written.
         if is_meta_sort_field(field) {
             return None;
         }
@@ -37005,6 +37022,26 @@ fn memtable_primary_key_rejects(topk: &SortTopK, source: &Value) -> bool {
         return false;
     };
     if sf.is_score() || sf.is_doc_order() {
+        return false;
+    }
+    // An ES meta-field is resolved by `compute_sort_values` from the version
+    // map, NOT from `_source` — so deriving it here from `_source` would
+    // compare the prefilter's frontier against a heap ranked on different
+    // data.  xerj (unlike ES, which rejects the key outright) accepts a
+    // literal `_seq_no` / `_version` / `_primary_term` / `_index` inside a
+    // document, so that disagreement is wire-reachable: the shadowing value
+    // rejects a doc whose REAL metadata belongs on the page, and it is
+    // dropped before `offer` ever sees it — silently, and only at small
+    // `size`.  Meta-sorts take the unaccelerated full walk (#401).
+    //
+    // `_id` is deliberately absent from `is_meta_sort_field` and needs no
+    // gate here only because `compute_sort_values` emits it as a STRING:
+    // `primary_f64_rejects` reads the heap frontier through `as_f64()`, gets
+    // `None` for a string, and can never reject.  Verified over the wire with
+    // a dense numeric `_source._id` — the `_id desc` page is identical at
+    // size 5 and size 3000.  Give `_id` a numeric sort value and it becomes
+    // the same defect; add it here if that ever changes.
+    if is_meta_sort_field(&sf.field) {
         return false;
     }
     // Root-level literal key only — mirrors `get_field_value`'s fast path.
