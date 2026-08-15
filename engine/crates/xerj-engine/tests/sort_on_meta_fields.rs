@@ -221,7 +221,7 @@ async fn search_after_on_seq_no_pages_the_whole_index() {
              (first repeat page starts at {:?})",
             collected.len(),
             total,
-            &collected[total.min(collected.len().saturating_sub(1))]
+            collected[total.min(collected.len().saturating_sub(1))]
         );
     }
 
